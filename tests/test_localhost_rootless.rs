@@ -16,9 +16,15 @@ mod common;
 use anyhow::{Context, Result};
 
 /// Build a simple test container image using podman with a unique tag.
-/// Each test uses its own image name to avoid races when tests run in parallel —
-/// concurrent `podman build` to the same tag causes `podman save` to see a digest
-/// change mid-export ("image changed while it was being exported").
+/// Each test uses its own image NAME and its own CONTENT to avoid parallel races.
+/// Unique names stop concurrent `podman build` to the same tag from making
+/// `podman save` see a digest change mid-export. Unique content is also required:
+/// fcvm caches the delivered image archive by content digest and the guest loads
+/// it tagged with whichever name first populated that digest, so identical
+/// content under different names would make a later test's `podman run <name>`
+/// miss the cached archive and fall back to pulling from registry `localhost`
+/// (which fails). Embedding `image_name` in the CMD makes each image's content —
+/// and therefore its digest — distinct.
 async fn build_test_image(image_name: &str) -> Result<()> {
     use std::io::Write;
     use tempfile::TempDir;
@@ -30,7 +36,7 @@ async fn build_test_image(image_name: &str) -> Result<()> {
     writeln!(
         file,
         r#"FROM public.ecr.aws/nginx/nginx:alpine
-CMD ["sh", "-c", "echo 'btrfs-rootless-test-ok' && sleep 600"]"#
+CMD ["sh", "-c", "echo 'btrfs-rootless-test-ok {image_name}' && sleep 600"]"#
     )?;
 
     let output = tokio::process::Command::new("podman")
