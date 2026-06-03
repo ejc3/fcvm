@@ -72,7 +72,7 @@ filter = "package(fcvm) & test(/hugepage/)"
 test-group = "hugepage-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
-# Snapshot tests: limited to 3 concurrent (each creates ~5.6GB snapshot on disk)
+# Snapshot tests: limited to 2 concurrent (each creates ~5.6GB snapshot on disk)
 [[profile.default.overrides]]
 filter = "package(fcvm) & (test(/snapshot/) | test(/clone/))"
 test-group = "snapshot-tests"
