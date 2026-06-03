@@ -142,9 +142,13 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     let fcvm_args = build_fcvm_args(&vm_name, &map_args, &cmd, &user_spec);
 
     // Phase 1: Cold boot
+    // Use the quiet spawner: this container emits thousands of long lines to both
+    // stdout and stderr. Echoing that to the CI job log can overwhelm the
+    // self-hosted runner's log uploader and drop the runner. The debug log file
+    // still captures everything, which is what the assertions poll.
     println!("Phase 1: Cold boot with {NUM_FUSE_MOUNTS} FUSE mounts...");
     let (mut child, fcvm_pid, _cold_log_path) =
-        common::spawn_fcvm_with_log_path(&fcvm_args, &vm_name)
+        common::spawn_fcvm_with_log_path_quiet(&fcvm_args, &vm_name)
             .await
             .context("spawning cold boot VM")?;
 
@@ -181,7 +185,7 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     println!("\nPhase 2: Warm start from snapshot...");
     let warm_log_name = format!("{}-warm", vm_name);
     let (mut child2, fcvm_pid2, warm_log_path) =
-        common::spawn_fcvm_with_log_path(&fcvm_args, &warm_log_name)
+        common::spawn_fcvm_with_log_path_quiet(&fcvm_args, &warm_log_name)
             .await
             .context("spawning warm start VM")?;
 

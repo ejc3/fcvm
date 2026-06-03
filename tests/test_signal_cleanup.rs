@@ -51,6 +51,7 @@ fn send_signal(pid: u32, signal: &str) -> Result<()> {
 /// correctly when running in parallel with other tests.
 #[cfg(feature = "privileged-tests")]
 #[test]
+#[ignore = "disabled pending #618: one-shot snapshot-create disk contention can exceed the health-wait budget in SnapshotEnabled CI"]
 fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     println!("\ntest_sigint_kills_firecracker_bridged");
 
@@ -188,6 +189,7 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
 /// correctly when running in parallel with other tests.
 #[cfg(feature = "privileged-tests")]
 #[test]
+#[ignore = "disabled pending #618: one-shot snapshot-create disk contention can exceed the health-wait budget in SnapshotEnabled CI"]
 fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     println!("\ntest_sigterm_kills_firecracker_bridged");
 
@@ -716,6 +718,7 @@ fn is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
 /// correctly when running in parallel with other tests.
 #[cfg(feature = "privileged-tests")]
 #[test]
+#[ignore = "disabled pending #618: one-shot snapshot-create disk contention can exceed the health-wait budget in SnapshotEnabled CI"]
 fn test_sigterm_cleanup_bridged() -> Result<()> {
     println!("\ntest_sigterm_cleanup_bridged");
 

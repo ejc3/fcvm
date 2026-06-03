@@ -64,6 +64,13 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
         "bridged",
         "--kernel-profile",
         "nested",
+        // No pre-start snapshot: this is a one-shot test that never restores, so
+        // the snapshot is pure overhead. Worse, creating it pauses/resumes the
+        // NV2 nested-kernel VM, which intermittently wedges vsock recovery on
+        // resume (exec/status connections drop and only recover at the host's
+        // 300s status timeout, blowing the test budget). The sibling nested test
+        // test_copy_file_range_in_vm disables snapshots for the same reason.
+        "--no-snapshot",
         "--map",
         &map_arg,
         "--cmd",

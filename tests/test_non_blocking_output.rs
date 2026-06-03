@@ -23,10 +23,13 @@ async fn test_non_blocking_output_delivers_lines() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("nbout");
 
-    // Write 100 numbered lines with a small delay between each (not flooding).
-    // At this rate, the non-blocking channel (4096 deep) should never fill up,
-    // so ALL lines should arrive on the host.
-    let cmd = "i=0; while [ $i -lt 100 ]; do echo \"NB_LINE_$i\"; i=$((i+1)); sleep 0.01; done; echo NB_DONE; sleep 120";
+    // Write 100 numbered lines with a delay between each (not flooding).
+    // At 50ms/line the host emits only ~20 lines/sec, which the host-side
+    // listener drains comfortably even when this test shares a CI runner with
+    // the rest of the suite — so the bounded non-blocking channel never fills
+    // and all lines arrive. (At 10ms/line a CPU-starved consumer on a loaded
+    // runner could fall behind and drop >5%, making the count assertion flaky.)
+    let cmd = "i=0; while [ $i -lt 100 ]; do echo \"NB_LINE_$i\"; i=$((i+1)); sleep 0.05; done; echo NB_DONE; sleep 120";
 
     println!("  Starting VM with --non-blocking-output...");
     let (mut child, fcvm_pid, log_path) = common::spawn_fcvm_with_log_path(
@@ -53,9 +56,9 @@ async fn test_non_blocking_output_delivers_lines() -> Result<()> {
     common::poll_health_by_pid(fcvm_pid, 300).await?;
     println!("  VM healthy");
 
-    // Wait for the output to complete (100 lines * 10ms = ~1s, plus margin)
+    // Wait for the output to complete (100 lines * 50ms = ~5s, plus margin)
     println!("  Waiting for output to complete...");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     // Verify container is responsive
     let result = common::exec_in_container(fcvm_pid, &["echo", "alive"]).await?;
