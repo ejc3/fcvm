@@ -1358,6 +1358,16 @@ async fn test_exec_parallel_pipe_stress() -> Result<()> {
         &vm_name,
         "--network",
         "rootless",
+        // No pre-start snapshot: this test boots one VM, runs 100 execs, and
+        // kills it — it never restores, so the snapshot is pure overhead and
+        // irrelevant to what it validates (the async exec pipe path under load).
+        // In SnapshotEnabled CI the pre-start snapshot sits on the boot->healthy
+        // path; under peak concurrent disk contention the ~1GB memory dump can
+        // take ~45s, blowing the 60s health budget before any exec runs. The
+        // snapshot machinery is covered by the dedicated snapshot suite and every
+        // other VM test; disabling it here also drops this VM's contribution to
+        // box-wide dump contention.
+        "--no-snapshot",
         common::TEST_IMAGE,
     ])
     .await
