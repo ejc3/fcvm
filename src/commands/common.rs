@@ -712,6 +712,64 @@ pub struct RestoreParams<'a> {
     pub track_dirty_pages: bool,
 }
 
+/// Recover the `vm-disks/<vm_id>` directory IDs that are embedded as block-device
+/// `path_on_host` strings inside a Firecracker `vmstate.bin`.
+///
+/// Firecracker serializes each drive's host path as a plain UTF-8 string, so we can
+/// read the exact paths `LoadSnapshot` will open instead of trusting (possibly stale)
+/// snapshot metadata. This is the ground truth for the bind-mount redirects (#608):
+/// a multi-level snapshot chain (cache → snapshot → cache → snapshot) can embed an
+/// intermediate VM's disk path that the metadata — which only tracks the immediate
+/// creator (`vm_id`) and the original vsock VM (`original_vsock_vm_id`) — no longer
+/// names. Without a redirect for that directory, `LoadSnapshot` opens the embedded
+/// path directly: it fails (ENOENT) once that sibling has been cleaned up, or, worse,
+/// silently opens a different live VM's rootfs.
+///
+/// Returns the de-duplicated vm_ids found in any `…/vm-disks/<vm_id>/disks…` path.
+/// Best-effort: an unreadable file or no matches yields an empty vec, leaving the
+/// metadata-derived redirects untouched (purely additive, never removes a redirect).
+pub(crate) fn disk_vm_ids_in_vmstate(vmstate_path: &Path) -> Vec<String> {
+    const PREFIX: &[u8] = b"/vm-disks/";
+    const SUFFIX: &[u8] = b"/disks";
+
+    let Ok(bytes) = std::fs::read(vmstate_path) else {
+        return Vec::new();
+    };
+
+    let mut ids: Vec<String> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = bytes[search_from..]
+        .windows(PREFIX.len())
+        .position(|w| w == PREFIX)
+    {
+        let id_start = search_from + rel + PREFIX.len();
+        // The vm_id runs until the next '/'. vm_ids are ASCII [A-Za-z0-9-]; stop early
+        // on anything else so binary noise after a non-path occurrence is ignored.
+        let mut id_end = id_start;
+        while id_end < bytes.len() {
+            let c = bytes[id_end];
+            if c == b'/' {
+                break;
+            }
+            if !(c.is_ascii_alphanumeric() || c == b'-') {
+                id_end = id_start; // not a real path segment
+                break;
+            }
+            id_end += 1;
+        }
+        // Require the canonical `…/vm-disks/<id>/disks` shape before trusting it.
+        if id_end > id_start && bytes[id_end..].starts_with(SUFFIX) {
+            if let Ok(id) = std::str::from_utf8(&bytes[id_start..id_end]) {
+                if !ids.iter().any(|e| e == id) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        search_from = id_start.max(search_from + rel + 1);
+    }
+    ids
+}
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -950,6 +1008,22 @@ pub async fn restore_from_snapshot(
     if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
         if snapshot_vm_id != &restore_config.original_vm_id {
             baseline_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
+        }
+    }
+    // Ground truth (#608): redirect every vm-disks dir actually embedded in
+    // vmstate.bin, not just the ones the metadata names. A multi-level snapshot
+    // chain can embed an intermediate VM's disk path that original_vm_id /
+    // snapshot_vm_id no longer reference; without a redirect for it, LoadSnapshot
+    // opens that (possibly cleaned-up sibling) path directly. This is additive —
+    // it only ever adds a correct redirect, never drops one.
+    for embedded_id in disk_vm_ids_in_vmstate(&restore_config.vmstate_path) {
+        let dir = paths::vm_runtime_dir(&embedded_id);
+        if !baseline_dirs.contains(&dir) {
+            info!(
+                embedded_disk_vm_id = %embedded_id,
+                "redirecting vmstate-embedded disk dir not named by snapshot metadata (#608)"
+            );
+            baseline_dirs.push(dir);
         }
     }
     info!(
@@ -2156,5 +2230,47 @@ mod tests {
         }
 
         assert_eq!(chain, vec!["my-snap", "startup-def", "pre-start-abc"]);
+    }
+
+    /// #608: the vmstate disk-path scanner must recover every embedded `vm-disks/<id>`
+    /// directory from a binary blob, including ids the snapshot metadata no longer
+    /// names, while ignoring binary noise and non-canonical occurrences.
+    #[test]
+    fn test_disk_vm_ids_in_vmstate_extracts_embedded_paths() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut f = NamedTempFile::new().unwrap();
+        // Binary noise, then a rootfs path, more noise, an extra-disk path for a
+        // DIFFERENT vm_id (the dropped-intermediate case), a duplicate, and a
+        // non-canonical `/vm-disks/...` without the `/disks` suffix that must be ignored.
+        f.write_all(&[0x00, 0xFF, 0x07, 0x42]).unwrap();
+        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-c09f1234/disks/rootfs.raw")
+            .unwrap();
+        f.write_all(&[0x00, 0x00, 0x13]).unwrap();
+        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-5ba53cAA/disks/disk-dir-0.raw")
+            .unwrap();
+        f.write_all(&[0x99]).unwrap();
+        // duplicate of the first id — must be de-duplicated
+        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-c09f1234/disks/extra.raw")
+            .unwrap();
+        // non-canonical: no `/disks` segment — must be ignored
+        f.write_all(b"/vm-disks/not-a-disk-dir/state\x00").unwrap();
+        f.flush().unwrap();
+
+        let mut ids = disk_vm_ids_in_vmstate(f.path());
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["vm-5ba53cAA".to_string(), "vm-c09f1234".to_string()],
+            "should recover both embedded disk vm_ids (deduped), ignoring noise and non-disk paths"
+        );
+    }
+
+    /// An unreadable vmstate path yields no ids (best-effort, never panics or errors).
+    #[test]
+    fn test_disk_vm_ids_in_vmstate_missing_file_is_empty() {
+        let ids = disk_vm_ids_in_vmstate(Path::new("/nonexistent/vmstate.bin"));
+        assert!(ids.is_empty());
     }
 }

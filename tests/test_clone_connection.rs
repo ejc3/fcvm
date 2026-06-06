@@ -1258,3 +1258,125 @@ done
         anyhow::bail!("Clone's resilient client did not reconnect")
     }
 }
+
+/// Read a VM's `vm_id` from `fcvm ls --json --pid <pid>`.
+async fn vm_id_for_pid(fcvm_path: &std::path::Path, pid: u32) -> Result<String> {
+    let output = tokio::process::Command::new(fcvm_path)
+        .args(["ls", "--json", "--pid", &pid.to_string()])
+        .output()
+        .await
+        .context("running fcvm ls")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let vms: serde_json::Value = serde_json::from_str(&stdout).context("parsing fcvm ls json")?;
+    vms.as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.get("vm_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("no vm_id for pid {} in: {}", pid, stdout))
+}
+
+/// Regression for #608: restoring from a snapshot must succeed even after the
+/// creating VM's `vm-disks/<id>` directory — whose rootfs path is embedded in
+/// vmstate.bin — has been cleaned up.
+///
+/// Before the fix, `LoadSnapshot` opened the embedded path directly and failed with
+/// "No such file or directory" once that sibling directory was gone (or, worse,
+/// silently opened a different live VM's rootfs). The restore now redirects every
+/// vm-disks dir actually embedded in vmstate.bin onto the clone's own disk, so a
+/// cleaned-up creator no longer breaks (or misdirects) the restore.
+#[tokio::test]
+async fn test_clone_restore_after_creator_dir_removed_rootless() -> Result<()> {
+    println!("\ntest_clone_restore_after_creator_dir_removed_rootless (#608)");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = common::unique_names("sib608");
+
+    // 1. Start the baseline VM and capture its vm_id (its disk dir is the one whose
+    //    path gets embedded in the snapshot's vmstate.bin).
+    let (mut baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let baseline_vm_id = vm_id_for_pid(&fcvm_path, baseline_pid).await?;
+    println!("  baseline vm_id = {}", baseline_vm_id);
+
+    // 2. Snapshot it.
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("creating snapshot")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 3. Stop the baseline and delete its vm-disks directory, simulating the
+    //    sibling-cleanup that triggers #608. The snapshot keeps its own disk.raw,
+    //    so the only thing now missing is the creator path embedded in vmstate.bin.
+    common::kill_process(baseline_pid).await;
+    let _ = baseline_child.wait().await;
+    let creator_dir = fcvm::paths::vm_runtime_dir(&baseline_vm_id);
+    if creator_dir.exists() {
+        std::fs::remove_dir_all(&creator_dir)
+            .with_context(|| format!("removing creator dir {}", creator_dir.display()))?;
+    }
+    anyhow::ensure!(
+        !creator_dir.exists(),
+        "creator dir should be gone: {}",
+        creator_dir.display()
+    );
+    println!("  removed creator dir {}", creator_dir.display());
+
+    // 4. Serve the snapshot and restore a clone — must become healthy despite the
+    //    embedded creator path no longer existing on disk.
+    let (mut serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning serve")?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+    let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone")?;
+
+    let restore_ok = common::poll_health_by_pid(clone_pid, 120).await;
+
+    // Cleanup regardless of outcome.
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.wait().await;
+    common::kill_process(serve_pid).await;
+    let _ = serve_child.wait().await;
+
+    restore_ok.context("clone restore must succeed after the creator's disk dir was removed")?;
+    println!("✅ clone restored healthy despite removed creator dir (#608)");
+    Ok(())
+}
