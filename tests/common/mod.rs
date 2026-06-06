@@ -908,24 +908,41 @@ pub async fn poll_serve_state_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Res
     }
 }
 
-/// Execute a command in the guest VM via exec (--vm flag for VM-level, default is container)
-pub async fn exec_in_vm(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
+/// Host-side timeout for an exec helper. A hung guest exec server (e.g. #617: exec
+/// into a restored VM that never accepts the connection) must fail fast with a clear
+/// message instead of blocking to the 600s nextest ceiling, which hides the cause.
+/// 120s is well under that ceiling but generous for any legitimately slow command.
+const EXEC_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run `fcvm exec` with a host-side timeout, returning stdout on success.
+/// `vm == true` execs at VM level (`--vm`); otherwise inside the container.
+async fn exec_with_timeout(pid: u32, cmd: &[&str], vm: bool) -> anyhow::Result<String> {
     let fcvm_path = find_fcvm_binary()?;
     let script = cmd.join(" ");
 
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "exec",
-            "--pid",
-            &pid.to_string(),
-            "--vm",
-            "--",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .output()
-        .await?;
+    let mut command = tokio::process::Command::new(&fcvm_path);
+    command.arg("exec").arg("--pid").arg(pid.to_string());
+    if vm {
+        command.arg("--vm");
+    }
+    command
+        .args(["--", "sh", "-c", &script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Kill the child if we drop it on timeout so it doesn't linger.
+        .kill_on_drop(true);
+
+    let child = command.spawn().context("spawning fcvm exec")?;
+    let output = match tokio::time::timeout(EXEC_HELPER_TIMEOUT, child.wait_with_output()).await {
+        Ok(result) => result.context("waiting for fcvm exec")?,
+        Err(_) => anyhow::bail!(
+            "fcvm exec timed out after {:?} (pid {}, cmd {:?}) — the guest exec server never \
+             responded. On a restored VM this is #617 (restored-VM exec hang).",
+            EXEC_HELPER_TIMEOUT,
+            pid,
+            cmd
+        ),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -935,22 +952,14 @@ pub async fn exec_in_vm(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Execute a command in the guest VM via exec (--vm flag for VM-level, default is container)
+pub async fn exec_in_vm(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
+    exec_with_timeout(pid, cmd, true).await
+}
+
 /// Execute a command in the container via exec (default behavior)
 pub async fn exec_in_container(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
-    let fcvm_path = find_fcvm_binary()?;
-    let script = cmd.join(" ");
-
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &pid.to_string(), "sh", "-c", &script])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("exec failed: {}", stderr);
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    exec_with_timeout(pid, cmd, false).await
 }
 
 /// Create a snapshot from a running VM by PID

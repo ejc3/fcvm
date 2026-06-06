@@ -75,6 +75,15 @@ pub async fn run_server(
             result = listener.accept() => {
                 match result {
                     Ok(client_fd) => {
+                        // Diagnostic for #617: confirms accept() actually fired after a
+                        // restore. If a restored-VM exec hangs and this line is absent
+                        // from the serial log while "re-registered" is present, the
+                        // re-registered listener is not delivering readiness for new
+                        // connections (vs. the hang being downstream in handle_connection).
+                        eprintln!(
+                            "[fc-agent] exec server: accepted connection on vsock port {}",
+                            vsock::EXEC_PORT
+                        );
                         tokio::spawn(handle_connection(client_fd));
                     }
                     Err(e) => {
