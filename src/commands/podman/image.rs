@@ -106,10 +106,17 @@ pub(super) async fn get_image_cache_ref(image: &str) -> Result<ImageCacheRef> {
         )
     })?;
 
-    let cache_key = digest.trim().trim_start_matches("sha256:").to_string();
     let image_id = id.trim().to_string();
     if image_id.is_empty() {
         bail!("podman returned an empty image id for '{}'", image);
+    }
+
+    // A locally-built image can report an empty manifest digest. Fall back to the
+    // (always-present, immutable) image id so distinct images never collide on an empty
+    // cache key — which would conflate their cached archives/snapshots.
+    let mut cache_key = digest.trim().trim_start_matches("sha256:").to_string();
+    if cache_key.is_empty() {
+        cache_key = image_id.trim_start_matches("sha256:").to_string();
     }
 
     Ok(ImageCacheRef {
