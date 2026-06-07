@@ -712,6 +712,56 @@ pub struct RestoreParams<'a> {
     pub track_dirty_pages: bool,
 }
 
+/// Diagnostic helper (#608): the `vm-disks/<id>` directory ids whose **rootfs** path is
+/// embedded in a Firecracker `vmstate.bin`.
+///
+/// Firecracker serializes each drive's `path_on_host` as a plain UTF-8 string, so we can
+/// read which rootfs path `LoadSnapshot` will open. Anchored to the `…/disks/rootfs.raw`
+/// suffix so an external `--disk` that merely lives under a vm-disks dir is not matched.
+/// Best-effort: an unreadable file or no matches yields an empty vec. Used log-only at
+/// restore to detect (and make diagnosable) any case where the embedded rootfs dir is not
+/// covered by `baseline_dirs` — empirically that never happens (CreateSnapshot serializes
+/// the patched creator path, always in baseline_dirs), but this turns the rare observed
+/// failure into evidence instead of a guess.
+fn rootfs_disk_vm_ids_in_vmstate(vmstate_path: &Path) -> Vec<String> {
+    const PREFIX: &[u8] = b"/vm-disks/";
+    const SUFFIX: &[u8] = b"/disks/rootfs.raw";
+
+    let Ok(bytes) = std::fs::read(vmstate_path) else {
+        return Vec::new();
+    };
+
+    let mut ids: Vec<String> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = bytes[search_from..]
+        .windows(PREFIX.len())
+        .position(|w| w == PREFIX)
+    {
+        let id_start = search_from + rel + PREFIX.len();
+        let mut id_end = id_start;
+        while id_end < bytes.len() {
+            let c = bytes[id_end];
+            if c == b'/' {
+                break;
+            }
+            if !(c.is_ascii_alphanumeric() || c == b'-') {
+                id_end = id_start;
+                break;
+            }
+            id_end += 1;
+        }
+        if id_end > id_start && bytes[id_end..].starts_with(SUFFIX) {
+            if let Ok(id) = std::str::from_utf8(&bytes[id_start..id_end]) {
+                if !ids.iter().any(|e| e == id) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        search_from = id_start.max(search_from + rel + 1);
+    }
+    ids
+}
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -957,6 +1007,28 @@ pub async fn restore_from_snapshot(
         clone_dir = %data_dir.display(),
         "enabling mount namespace for path isolation"
     );
+
+    // #608 diagnostic (log-only, no behavior change). LoadSnapshot opens the rootfs
+    // path embedded in vmstate.bin before patch_drive retargets it, so that path must
+    // be covered by a baseline_dir bind-mount. Empirically (see #608) CreateSnapshot
+    // serializes the patched (creator) path, which is always in baseline_dirs — so this
+    // should always be covered. If it is ever NOT, that is the real ~0.7% sibling-disk
+    // failure: capture this WARN (with the embedded id and baseline_dirs) to diagnose it
+    // instead of guessing.
+    for embedded_id in rootfs_disk_vm_ids_in_vmstate(&restore_config.vmstate_path) {
+        let dir = paths::vm_runtime_dir(&embedded_id);
+        if baseline_dirs.contains(&dir) {
+            debug!(embedded_disk_vm_id = %embedded_id, "vmstate rootfs dir covered by baseline_dirs");
+        } else {
+            warn!(
+                embedded_disk_vm_id = %embedded_id,
+                baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "#608: vmstate-embedded rootfs dir NOT covered by baseline_dirs — restore may \
+                 open a sibling VM's disk; please capture this for #608"
+            );
+        }
+    }
+
     vm_manager.set_mount_redirects(baseline_dirs, data_dir.to_path_buf());
 
     // Copy extra disk images (disk-dir) from snapshot to clone's disk directory.
@@ -2156,5 +2228,37 @@ mod tests {
         }
 
         assert_eq!(chain, vec!["my-snap", "startup-def", "pre-start-abc"]);
+    }
+
+    /// #608 diagnostic scanner: recover embedded rootfs vm-disks ids from a binary blob,
+    /// de-duplicated, ignoring binary noise, non-canonical paths, and — crucially — a
+    /// non-rootfs external disk that merely lives under a vm-disks dir.
+    #[test]
+    fn test_rootfs_disk_vm_ids_in_vmstate() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(&[0x00, 0xFF, 0x07]).unwrap();
+        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-aaa111/disks/rootfs.raw")
+            .unwrap();
+        f.write_all(&[0x13]).unwrap();
+        // a second, distinct rootfs (different vm)
+        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-bbb222/disks/rootfs.raw")
+            .unwrap();
+        // duplicate of the first -> deduped
+        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-aaa111/disks/rootfs.raw")
+            .unwrap();
+        // an external (non-rootfs) disk under a vm-disks dir -> must be ignored
+        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-ext999/disks/data.raw")
+            .unwrap();
+        f.write_all(b"\x00garbage").unwrap();
+        f.flush().unwrap();
+
+        let mut ids = rootfs_disk_vm_ids_in_vmstate(f.path());
+        ids.sort();
+        assert_eq!(ids, vec!["vm-aaa111".to_string(), "vm-bbb222".to_string()]);
+
+        assert!(rootfs_disk_vm_ids_in_vmstate(Path::new("/no/such/vmstate.bin")).is_empty());
     }
 }
