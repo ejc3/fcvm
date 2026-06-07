@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fcvm — design docs</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--ink:#e6edf3;--muted:#9aa7b4;--line:#2b3440;--accent:#58a6ff;--accent2:#3fb950;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;--mono:"SFMono-Regular",Consolas,Menlo,monospace}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6}
+  .wrap{max-width:860px;margin:0 auto;padding:64px 24px}
+  h1{font-size:34px;margin:0 0 4px;letter-spacing:-.4px}
+  .sub{color:var(--muted);font-size:17px;margin:0 0 36px}
+  a.card{display:block;text-decoration:none;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:14px 0;transition:border-color .15s,transform .15s}
+  a.card:hover{border-color:var(--accent);transform:translateY(-1px)}
+  a.card h2{margin:0 0 6px;font-size:20px;color:var(--accent)}
+  a.card p{margin:0;color:var(--muted);font-size:14.5px}
+  .tag{font-family:var(--mono);font-size:11px;background:#21262d;border:1px solid var(--line);color:var(--muted);padding:2px 8px;border-radius:999px;margin-left:8px;vertical-align:middle}
+  .tag.rfc{color:var(--accent)}
+  .tag.merged{color:var(--accent2)}
+  footer{color:var(--muted);font-size:13px;margin-top:40px;border-top:1px solid var(--line);padding-top:18px}
+  footer a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>fcvm design docs</h1>
+  <p class="sub">Architecture &amp; design notes for the Firecracker microVM manager.</p>
+
+  <a class="card" href="disk-only-clone.html">
+    <h2>Disk-only clone <span class="tag rfc">RFC #625</span></h2>
+    <p>Cold-boot fresh, fully independent VMs from a captured disk — free choice of memory, CPU, and hugepages. The abstraction, verified reuse seams, fc-agent storage policy, and a green-at-every-step stacked-PR plan.</p>
+  </a>
+
+  <a class="card" href="https://github.com/ejc3/fcvm/blob/main/docs/hypervisor-abstraction.md">
+    <h2>Hypervisor-agnostic abstraction <span class="tag merged">epic #632</span></h2>
+    <p>Making fcvm pluggable across Firecracker and Cloud Hypervisor via a capability-gated <code>Hypervisor</code> trait. (Rendered on GitHub.)</p>
+  </a>
+
+  <footer>
+    Source: <a href="https://github.com/ejc3/fcvm">github.com/ejc3/fcvm</a> · Published from <code>docs/</code> via GitHub Pages.
+  </footer>
+</div>
+</body>
+</html>
