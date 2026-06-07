@@ -93,8 +93,13 @@ jobs:
             # A comment with no associated PR (e.g. `@claude` on a plain issue → PR_NUM=0)
             # is never trusted. Do NOT fall through to the OWNER default below.
             echo "assoc=NONE" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "workflow_run" ] && [ "${{ github.event.workflow_run.head_repository.full_name }}" != "${{ github.repository }}" ]; then
+            # A workflow_run whose head came from a FORK is never trusted — even if its
+            # head_branch is literally "main" (a fork's default branch is "main" too, which
+            # would otherwise hit the OWNER default and let fork code reach ci-fix).
+            echo "assoc=NONE" >> $GITHUB_OUTPUT
           else
-            # No PR and not a comment (main-branch CI / workflow_run) - treat as owner.
+            # No PR and not a comment: main-branch CI / SAME-REPO workflow_run - owner.
             echo "assoc=OWNER" >> $GITHUB_OUTPUT
           fi
 
@@ -431,6 +436,7 @@ jobs:
     if: |
       needs.safety-check.outputs.eligible == 'true' &&
       github.event_name == 'workflow_run' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.conclusion == 'failure' &&
       !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
       github.event.workflow_run.name != 'Claude Assistant'
