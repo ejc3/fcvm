@@ -305,6 +305,47 @@ async fn handle_connection(client_fd: OwnedFd) {
     }
 }
 
+/// Resolve when the vsock peer (host `fcvm exec`) closes the connection.
+///
+/// Polls a dup'd, independent `AsyncFd` for readability and peeks one byte: 0 (EOF), or a
+/// reset/disconnect error (ECONNRESET/ENOTCONN/EPIPE), means the host is gone. In the
+/// non-TTY pipe path the host sends nothing after the request (it only reads responses), so
+/// any readable EOF is equivalent to "host gone" — used to kill the guest child (#636).
+async fn wait_for_peer_close(watch: &AsyncFd<OwnedFd>) {
+    loop {
+        let mut guard = match watch.readable().await {
+            Ok(g) => g,
+            Err(_) => return, // fd error -> treat as closed
+        };
+        let fd = watch.get_ref().as_raw_fd();
+        let mut byte = [0u8; 1];
+        let n = unsafe {
+            libc::recv(
+                fd,
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if n == 0 {
+            return; // EOF: peer closed its write half
+        }
+        if n < 0 {
+            // EAGAIN/EWOULDBLOCK (same value on Linux): spurious readiness, keep watching.
+            // Any other error (ECONNRESET/ENOTCONN/EPIPE/…) means the peer is gone.
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+                guard.clear_ready();
+                continue;
+            }
+            return;
+        }
+        // n > 0: the host should send nothing after the request. Drain one byte so we don't
+        // busy-spin on persistent readiness, then keep watching for the eventual close.
+        let _ = unsafe { libc::recv(fd, byte.as_mut_ptr().cast(), 1, libc::MSG_DONTWAIT) };
+        guard.clear_ready();
+    }
+}
+
 async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     let proxy_settings = crate::system::read_proxy_settings();
 
@@ -344,6 +385,9 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     if request.interactive {
         cmd.stdin(std::process::Stdio::piped());
     }
+    // Own process group so a host disconnect can kill the whole subtree (the command and
+    // anything it spawns), not just the immediate child (#636).
+    cmd.process_group(0);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -355,12 +399,24 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
         }
     };
 
+    // Capture the child's PID now (used as the PGID for killpg on host disconnect, #636).
+    let child_pid = child.id();
+
     // Spawn succeeded — set non-blocking, take ownership, wrap in AsyncFd
     nix::fcntl::fcntl(
         raw_fd,
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
     )
     .ok();
+    // Independent CLOEXEC dup of the connection for read-side peer-close detection. Polling
+    // readability on a separate fd avoids holding the write Mutex across readable().await
+    // (which would deadlock the stdout/stderr writer tasks). The two OwnedFds own distinct
+    // fd numbers, so there is no double-close.
+    let peer_watch: Option<AsyncFd<OwnedFd>> =
+        match nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0)) {
+            Ok(dup) => AsyncFd::new(unsafe { OwnedFd::from_raw_fd(dup) }).ok(),
+            Err(_) => None,
+        };
     let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let async_fd = match AsyncFd::new(owned_fd) {
         Ok(fd) => Arc::new(Mutex::new(fd)),
@@ -398,7 +454,40 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
         })
     });
 
-    let exit_status = child.wait().await;
+    // Wait for the child, but also watch for the host (vsock peer) disconnecting. If the
+    // host `fcvm exec` dies (e.g. host-side timeout, #622), the connection closes; without
+    // this we would `child.wait()` forever while the guest command keeps running (#636).
+    let mut peer_closed = false;
+    let exit_status = match peer_watch {
+        Some(watch) => {
+            tokio::select! {
+                status = child.wait() => status,
+                _ = wait_for_peer_close(&watch) => {
+                    peer_closed = true;
+                    if let Some(pid) = child_pid {
+                        // Negative pid -> the child's process group (process_group(0) above),
+                        // so the whole subtree is killed, not just the immediate child.
+                        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                    }
+                    let _ = child.start_kill();
+                    child.wait().await
+                }
+            }
+        }
+        None => child.wait().await,
+    };
+
+    if peer_closed {
+        // Host is gone: stop the writer tasks (nothing to deliver to) and don't bother
+        // writing Exit. fds close on drop.
+        if let Some(task) = stdout_task {
+            task.abort();
+        }
+        if let Some(task) = stderr_task {
+            task.abort();
+        }
+        return;
+    }
 
     if let Some(task) = stdout_task {
         let _ = task.await;
