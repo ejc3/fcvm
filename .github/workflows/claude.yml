@@ -29,6 +29,10 @@ jobs:
       pr_number: ${{ steps.get-pr.outputs.number }}
       author_ok: ${{ steps.author.outputs.ok }}
       commits_ok: ${{ steps.commits.outputs.ok }}
+      # Single allowlist gate every Claude-executing job must pass (see the
+      # "Compute eligibility" step). Centralizes the trust model so a future job
+      # cannot accidentally run outside the allowed situations.
+      eligible: ${{ steps.eligible.outputs.ok }}
     steps:
       - name: Generate token
         id: token
@@ -150,13 +154,38 @@ jobs:
             echo "safe=true" >> $GITHUB_OUTPUT
           fi
 
+      - name: Compute eligibility (allowlist gate)
+        id: eligible
+        run: |
+          SAFE="${{ steps.check.outputs.safe }}"
+          AUTHOR="${{ steps.author.outputs.ok }}"
+          COMMITS="${{ steps.commits.outputs.ok }}"
+          EVENT="${{ github.event_name }}"
+          # ALLOWLIST of the only trigger CONTEXTS Claude may run in. Anything not
+          # explicitly enumerated here is denied. Note: issue_comment is allowed ONLY
+          # when the issue is actually a pull request (never a plain issue).
+          CONTEXT=false
+          case "$EVENT" in
+            pull_request) CONTEXT=true ;;
+            issue_comment) [ -n "${{ github.event.issue.pull_request.url }}" ] && CONTEXT=true ;;
+            pull_request_review_comment) CONTEXT=true ;;
+            workflow_run) CONTEXT=true ;;
+          esac
+          # Eligible only when the actor is trusted (author_ok, per the commenter for
+          # comment events), there are no non-member commits/comments, AND the trigger
+          # is an allowlisted context.
+          if [ "$SAFE" = "true" ] && [ "$AUTHOR" = "true" ] && [ "$COMMITS" = "true" ] && [ "$CONTEXT" = "true" ]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Claude not eligible (safe=$SAFE author=$AUTHOR commits=$COMMITS event=$EVENT context=$CONTEXT)"
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
+
   # Review PRs from org members, auto-fix medium/critical issues
   review:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       github.event_name == 'pull_request' &&
       !startsWith(github.event.pull_request.head.ref, 'claude/fix-')
     runs-on: ubuntu-latest
@@ -226,9 +255,7 @@ jobs:
   manual-review:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/claude-review')
@@ -310,9 +337,7 @@ jobs:
   respond:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       !contains(github.event.comment.body, '/claude-review') &&
       ((github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude')) ||
        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')))
@@ -401,9 +426,7 @@ jobs:
   ci-fix:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'failure' &&
       !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
