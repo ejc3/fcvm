@@ -799,8 +799,12 @@ fn assert_vmstate_rootfs_covered(
 ) -> Result<()> {
     // Fail CLOSED: if we cannot read vmstate we cannot verify coverage, and Firecracker
     // may still open whatever path it has embedded — so abort rather than proceed blind.
-    let bytes = std::fs::read(vmstate_path)
-        .with_context(|| format!("reading vmstate for #608 coverage check: {}", vmstate_path.display()))?;
+    let bytes = std::fs::read(vmstate_path).with_context(|| {
+        format!(
+            "reading vmstate for #608 coverage check: {}",
+            vmstate_path.display()
+        )
+    })?;
     let mut covered_dirs = vec![paths::vm_runtime_dir(original_vm_id)];
     if let Some(s) = snapshot_vm_id {
         if s != original_vm_id {
@@ -2333,6 +2337,9 @@ mod tests {
             Path::new("/data/vm-disks/vm-ext999/disks/rootfs.raw")
         ));
         assert!(!vmstate_contains_path(vmstate, Path::new("")));
-        assert!(!vmstate_contains_path(b"x".as_slice(), Path::new("/long/path")));
+        assert!(!vmstate_contains_path(
+            b"x".as_slice(),
+            Path::new("/long/path")
+        ));
     }
 }
