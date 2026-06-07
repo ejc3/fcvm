@@ -155,13 +155,14 @@ jobs:
             exit 0
           fi
           # Block if any commit author is not a collaborator (permission lookup failure
-          # also fails closed: defaults to "none").
-          NON_MEMBER=$(printf '%s\n' "$LOGINS" | while read -r LOGIN; do
-            if [ -n "$LOGIN" ]; then
-              ASSOC=$(gh api "repos/$REPO/collaborators/$LOGIN/permission" --jq '.permission' 2>/dev/null || echo "none")
-              [ "$ASSOC" = "none" ] && echo "$LOGIN"
-            fi
-          done | head -1)
+          # also fails closed: defaults to "none"). Here-string (not a pipe into `while`)
+          # so a member match doesn't make the pipeline exit non-zero under pipefail+`-e`.
+          NON_MEMBER=""
+          while IFS= read -r LOGIN; do
+            [ -n "$LOGIN" ] || continue
+            ASSOC=$(gh api "repos/$REPO/collaborators/$LOGIN/permission" --jq '.permission' 2>/dev/null || echo "none")
+            if [ "$ASSOC" = "none" ]; then NON_MEMBER="$LOGIN"; break; fi
+          done <<< "$LOGINS"
           if [ -n "$NON_MEMBER" ]; then
             echo "::warning::Blocking Claude - non-member commit author: $NON_MEMBER"
             echo "ok=false" >> "$GITHUB_OUTPUT"
