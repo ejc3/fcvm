@@ -299,15 +299,31 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
 
     // Use binary framing for any mode needing TTY or stdin forwarding
     // JSON line mode only for plain non-interactive commands
-    if tty || interactive {
-        let exit_code = super::tty::run_tty_session_connected(stream, tty, interactive)?;
-        if exit_code != 0 {
-            std::process::exit(exit_code);
+    let result = if tty || interactive {
+        match super::tty::run_tty_session_connected(stream, tty, interactive) {
+            Ok(exit_code) => {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        Ok(())
     } else {
         run_line_mode(stream)
+    };
+
+    // Downgrade the benign "stream closed before exit" race to debug ONLY for quiet
+    // (subprocess) callers — e.g. the health monitor's `--quiet` inspect during
+    // teardown. Still exit non-zero. A user-invoked exec (not quiet) propagates the
+    // error so `main` logs a visible ERROR rather than failing silently.
+    if let Err(e) = &result {
+        if is_benign_quiet_exec_close(quiet, e) {
+            debug!("{:#}", e);
+            std::process::exit(1);
+        }
     }
+    result
 }
 
 /// Read JSON-line exec responses until an Exit (or Error) message arrives.
@@ -350,8 +366,9 @@ fn read_exec_responses<R: BufRead>(
 /// This is a real failure — the command's outcome is unknown, so the caller
 /// still exits non-zero. But it is also the expected, benign terminal
 /// condition when an exec races VM or container shutdown (for example the
-/// health monitor's `podman inspect` healthcheck during teardown), so `main`
-/// logs it at debug rather than alarming at ERROR.
+/// health monitor's `--quiet podman inspect` healthcheck during teardown), so
+/// `cmd_exec` logs it at debug rather than alarming at ERROR *for quiet
+/// (subprocess) callers only* — see `is_benign_quiet_exec_close`.
 #[derive(Debug)]
 pub struct ExecConnectionClosed;
 
@@ -365,6 +382,17 @@ impl std::fmt::Display for ExecConnectionClosed {
 }
 
 impl std::error::Error for ExecConnectionClosed {}
+
+/// Whether an exec error is the benign "stream closed before exit" race AND the caller
+/// opted into quiet mode (the health monitor's `--quiet` inspect subprocess).
+///
+/// Only quiet/subprocess callers get the log downgrade: a user-invoked `fcvm exec`
+/// whose VM/container dies or vsock resets before an Exit frame must still surface a
+/// visible ERROR (not exit 1 silently), so the downgrade is scoped to `quiet` here
+/// rather than applied globally in `main`.
+fn is_benign_quiet_exec_close(quiet: bool, err: &anyhow::Error) -> bool {
+    quiet && err.downcast_ref::<ExecConnectionClosed>().is_some()
+}
 
 /// Run in line-buffered mode (non-TTY), returns exit code
 fn run_line_mode_with_exit_code(stream: UnixStream) -> Result<i32> {
@@ -562,5 +590,23 @@ mod tests {
             err.to_string().contains("before an exit status"),
             "unexpected error: {err}"
         );
+    }
+
+    /// #607 regression (Codex P2): the log downgrade for the benign "stream closed
+    /// before exit" race must be scoped to quiet (subprocess) callers. A user-invoked
+    /// exec (not quiet) must NOT be downgraded — it has to surface a visible error
+    /// instead of exiting 1 silently. This fails if the downgrade is applied globally.
+    #[test]
+    fn benign_close_downgrade_is_scoped_to_quiet() {
+        let closed: anyhow::Error = ExecConnectionClosed.into();
+        // Quiet subprocess (health monitor): downgrade the benign close.
+        assert!(is_benign_quiet_exec_close(true, &closed));
+        // User-invoked exec (not quiet): must stay visible (the regression Codex flagged).
+        assert!(!is_benign_quiet_exec_close(false, &closed));
+
+        // Only the benign close qualifies — other errors are never downgraded.
+        let other = anyhow::anyhow!("some other failure");
+        assert!(!is_benign_quiet_exec_close(true, &other));
+        assert!(!is_benign_quiet_exec_close(false, &other));
     }
 }

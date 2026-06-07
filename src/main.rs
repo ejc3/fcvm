@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use fcvm::cli::Commands;
 use fcvm::{cli, commands, paths};
-use tracing::{debug, error};
+use tracing::error;
 use tracing_log::LogTracer;
 use tracing_subscriber::EnvFilter;
 
@@ -102,15 +102,6 @@ async fn main() -> Result<()> {
 
     // Handle errors
     if let Err(e) = &result {
-        // A benign terminal race: an exec stream that closed before an exit
-        // status (e.g. a healthcheck inspect racing VM/container shutdown).
-        // Still exit non-zero so callers see the failure, but don't alarm at ERROR.
-        if e.downcast_ref::<commands::exec::ExecConnectionClosed>()
-            .is_some()
-        {
-            debug!("{:#}", e);
-            std::process::exit(1);
-        }
         error!("Error: {:#}", e);
         std::process::exit(1);
     }
