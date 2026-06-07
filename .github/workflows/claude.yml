@@ -45,7 +45,14 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
           elif [ "${{ github.event_name }}" = "issue_comment" ]; then
-            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            # issue_comment fires for BOTH issues and PRs; only PRs carry
+            # .issue.pull_request. For a comment on a plain issue there is no PR,
+            # so emit 0 (downstream PR API calls would 404 and fail the job).
+            if [ -n "${{ github.event.issue.pull_request.url }}" ]; then
+              echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            else
+              echo "number=0" >> $GITHUB_OUTPUT
+            fi
           elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
             echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
           elif [ "${{ github.event_name }}" = "workflow_run" ]; then
@@ -67,10 +74,13 @@ jobs:
         run: |
           PR_NUM="${{ steps.get-pr.outputs.number }}"
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            # No PR (e.g., main branch CI) - treat as owner
+            # No PR (e.g., main branch CI, or a comment on a plain issue) - treat as owner.
             echo "assoc=OWNER" >> $GITHUB_OUTPUT
           else
-            ASSOC=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.author_association')
+            # Tolerate a 404 (e.g. number is not actually a PR) instead of failing the
+            # whole safety-check job under `bash -e`. An empty/blank assoc is treated as
+            # non-member by the next step, which fails safe (blocks Claude).
+            ASSOC=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.author_association' 2>/dev/null || echo "")
             echo "assoc=$ASSOC" >> $GITHUB_OUTPUT
           fi
 
