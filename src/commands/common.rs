@@ -723,13 +723,9 @@ pub struct RestoreParams<'a> {
 /// covered by `baseline_dirs` — empirically that never happens (CreateSnapshot serializes
 /// the patched creator path, always in baseline_dirs), but this turns the rare observed
 /// failure into evidence instead of a guess.
-fn rootfs_disk_vm_ids_in_vmstate(vmstate_path: &Path) -> Vec<String> {
+fn rootfs_disk_vm_ids_in_bytes(bytes: &[u8]) -> Vec<String> {
     const PREFIX: &[u8] = b"/vm-disks/";
     const SUFFIX: &[u8] = b"/disks/rootfs.raw";
-
-    let Ok(bytes) = std::fs::read(vmstate_path) else {
-        return Vec::new();
-    };
 
     let mut ids: Vec<String> = Vec::new();
     let mut search_from = 0usize;
@@ -762,6 +758,70 @@ fn rootfs_disk_vm_ids_in_vmstate(vmstate_path: &Path) -> Vec<String> {
     ids
 }
 
+/// Whether `needle` (an absolute path) appears verbatim in the vmstate bytes.
+fn vmstate_contains_path(bytes: &[u8], needle: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let needle = needle.as_os_str().as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
+/// True if vmstate references a rootfs path under one of the baseline bind-mount dirs,
+/// i.e. `<dir>/disks/rootfs.raw` for some `dir` in `covered_dirs` appears verbatim.
+///
+/// Presence-based on purpose (#638): we confirm the EXPECTED covered rootfs path is the
+/// one vmstate stores, rather than enumerating every embedded path and rejecting unknowns
+/// — the latter would false-abort a restore that legitimately attaches a read-only
+/// external `--disk` pointing under another VM's `vm-disks/<id>/disks/...`. Checking the
+/// exact absolute path (current `data_dir` prefix) also catches a same-id/different-prefix
+/// mismatch that a vm-id reconstruction would miss.
+fn vmstate_rootfs_covered(bytes: &[u8], covered_dirs: &[PathBuf]) -> bool {
+    covered_dirs
+        .iter()
+        .any(|d| vmstate_contains_path(bytes, &d.join("disks").join("rootfs.raw")))
+}
+
+/// #608 real fix: refuse to restore if vmstate.bin does not reference a rootfs disk path
+/// covered by the mount-namespace redirect (`vm_runtime_dir(original|snapshot)`).
+///
+/// `LoadSnapshot` reopens the rootfs path embedded in vmstate BEFORE `patch_drive`
+/// retargets it; the redirect only covers the baseline VM dirs. If the embedded rootfs
+/// path is not one of those (sibling VM, or a different `data_dir` prefix), restore would
+/// open another VM's real disk and corrupt it (the ~0.7% #608 failure). Aborting here —
+/// called at the very start of restore, before any holder/disk side effects — converts
+/// that silent corruption into a clear, actionable error.
+fn assert_vmstate_rootfs_covered(
+    vmstate_path: &Path,
+    original_vm_id: &str,
+    snapshot_vm_id: Option<&str>,
+) -> Result<()> {
+    let Ok(bytes) = std::fs::read(vmstate_path) else {
+        // Unreadable vmstate fails downstream with a clearer error; don't block here.
+        return Ok(());
+    };
+    let mut covered_dirs = vec![paths::vm_runtime_dir(original_vm_id)];
+    if let Some(s) = snapshot_vm_id {
+        if s != original_vm_id {
+            covered_dirs.push(paths::vm_runtime_dir(s));
+        }
+    }
+    if vmstate_rootfs_covered(&bytes, &covered_dirs) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "#608: refusing to restore — vmstate.bin does not reference a rootfs disk under any \
+         baseline bind-mount {:?} (it references vm-disks ids {:?}). LoadSnapshot would open \
+         an uncovered/sibling VM's disk and corrupt it.",
+        covered_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        rootfs_disk_vm_ids_in_bytes(&bytes),
+    )
+}
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -789,6 +849,14 @@ pub async fn restore_from_snapshot(
         track_dirty_pages,
     } = params;
     let vm_dir = data_dir.join("disks");
+
+    // #608: abort BEFORE any side effects (holder/disk) if vmstate's rootfs path would not
+    // be covered by the mount redirect — otherwise LoadSnapshot opens a sibling VM's disk.
+    assert_vmstate_rootfs_covered(
+        &restore_config.vmstate_path,
+        &restore_config.original_vm_id,
+        restore_config.snapshot_vm_id.as_deref(),
+    )?;
 
     // Configure namespace isolation if network provides one
     let mut holder_child: Option<tokio::process::Child> = None;
@@ -1008,27 +1076,7 @@ pub async fn restore_from_snapshot(
         "enabling mount namespace for path isolation"
     );
 
-    // #608 diagnostic (log-only, no behavior change). LoadSnapshot opens the rootfs
-    // path embedded in vmstate.bin before patch_drive retargets it, so that path must
-    // be covered by a baseline_dir bind-mount. Empirically (see #608) CreateSnapshot
-    // serializes the patched (creator) path, which is always in baseline_dirs — so this
-    // should always be covered. If it is ever NOT, that is the real ~0.7% sibling-disk
-    // failure: capture this WARN (with the embedded id and baseline_dirs) to diagnose it
-    // instead of guessing.
-    for embedded_id in rootfs_disk_vm_ids_in_vmstate(&restore_config.vmstate_path) {
-        let dir = paths::vm_runtime_dir(&embedded_id);
-        if baseline_dirs.contains(&dir) {
-            debug!(embedded_disk_vm_id = %embedded_id, "vmstate rootfs dir covered by baseline_dirs");
-        } else {
-            warn!(
-                embedded_disk_vm_id = %embedded_id,
-                baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-                "#608: vmstate-embedded rootfs dir NOT covered by baseline_dirs — restore may \
-                 open a sibling VM's disk; please capture this for #608"
-            );
-        }
-    }
-
+    // (#608 coverage is asserted at the top of this function, before any side effects.)
     vm_manager.set_mount_redirects(baseline_dirs, data_dir.to_path_buf());
 
     // Copy extra disk images (disk-dir) from snapshot to clone's disk directory.
@@ -2235,30 +2283,56 @@ mod tests {
     /// non-rootfs external disk that merely lives under a vm-disks dir.
     #[test]
     fn test_rootfs_disk_vm_ids_in_vmstate() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(&[0x00, 0xFF, 0x07]).unwrap();
-        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-aaa111/disks/rootfs.raw")
-            .unwrap();
-        f.write_all(&[0x13]).unwrap();
+        let mut buf: Vec<u8> = vec![0x00, 0xFF, 0x07];
+        buf.extend_from_slice(b"/mnt/fcvm-btrfs/vm-disks/vm-aaa111/disks/rootfs.raw");
+        buf.push(0x13);
         // a second, distinct rootfs (different vm)
-        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-bbb222/disks/rootfs.raw")
-            .unwrap();
+        buf.extend_from_slice(b"/mnt/fcvm-btrfs/vm-disks/vm-bbb222/disks/rootfs.raw");
         // duplicate of the first -> deduped
-        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-aaa111/disks/rootfs.raw")
-            .unwrap();
+        buf.extend_from_slice(b"/mnt/fcvm-btrfs/vm-disks/vm-aaa111/disks/rootfs.raw");
         // an external (non-rootfs) disk under a vm-disks dir -> must be ignored
-        f.write_all(b"/mnt/fcvm-btrfs/vm-disks/vm-ext999/disks/data.raw")
-            .unwrap();
-        f.write_all(b"\x00garbage").unwrap();
-        f.flush().unwrap();
+        buf.extend_from_slice(b"/mnt/fcvm-btrfs/vm-disks/vm-ext999/disks/data.raw");
+        buf.extend_from_slice(b"\x00garbage");
 
-        let mut ids = rootfs_disk_vm_ids_in_vmstate(f.path());
+        let mut ids = rootfs_disk_vm_ids_in_bytes(&buf);
         ids.sort();
         assert_eq!(ids, vec!["vm-aaa111".to_string(), "vm-bbb222".to_string()]);
 
-        assert!(rootfs_disk_vm_ids_in_vmstate(Path::new("/no/such/vmstate.bin")).is_empty());
+        assert!(rootfs_disk_vm_ids_in_bytes(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_vmstate_rootfs_coverage() {
+        // A snapshot whose rootfs lives under vm-aaa111, plus a read-only external --disk
+        // that points at ANOTHER vm's rootfs.raw (vm-ext999) — the latter must NOT cause a
+        // false "covered" nor (in the assert) a false abort.
+        let vmstate = b"\x00pre\x00/data/vm-disks/vm-aaa111/disks/rootfs.raw\x00\
+                        /data/vm-disks/vm-ext999/disks/rootfs.raw\x00tail"
+            .as_slice();
+
+        // The baseline bind-mount covers vm-aaa111 -> covered.
+        assert!(vmstate_rootfs_covered(
+            vmstate,
+            &[PathBuf::from("/data/vm-disks/vm-aaa111")]
+        ));
+        // Same id, DIFFERENT data_dir prefix -> NOT covered (a vm-id reconstruction would
+        // have wrongly said covered). This is the #638 regression class.
+        assert!(!vmstate_rootfs_covered(
+            vmstate,
+            &[PathBuf::from("/other/vm-disks/vm-aaa111")]
+        ));
+        // A baseline for a vm whose rootfs is NOT the one stored -> NOT covered.
+        assert!(!vmstate_rootfs_covered(
+            vmstate,
+            &[PathBuf::from("/data/vm-disks/vm-zzz000")]
+        ));
+
+        // vmstate_contains_path: exact match required, empty/oversized are false.
+        assert!(vmstate_contains_path(
+            vmstate,
+            Path::new("/data/vm-disks/vm-ext999/disks/rootfs.raw")
+        ));
+        assert!(!vmstate_contains_path(vmstate, Path::new("")));
+        assert!(!vmstate_contains_path(b"x".as_slice(), Path::new("/long/path")));
     }
 }
