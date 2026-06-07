@@ -286,6 +286,10 @@ async fn check_container_running(
     // With --user, podman runs as the target user (rootless), so we need runuser.
     let mut cmd_args: Vec<String> = vec![
         "exec".into(),
+        // Quiet: health-monitor subprocess. A benign "stream closed before exit" race
+        // during teardown is downgraded to debug for quiet callers (#607); user-invoked
+        // execs still surface a visible error.
+        "--quiet".into(),
         "--pid".into(),
         pid.to_string(),
         "--vm".into(),
@@ -367,6 +371,10 @@ async fn check_podman_healthcheck(
 
     let mut cmd_args: Vec<String> = vec![
         "exec".into(),
+        // Quiet: health-monitor subprocess. A benign "stream closed before exit" race
+        // during teardown is downgraded to debug for quiet callers (#607); user-invoked
+        // execs still surface a visible error.
+        "--quiet".into(),
         "--pid".into(),
         pid.to_string(),
         "--vm".into(),
@@ -452,6 +460,10 @@ async fn run_podman_healthcheck(pid: u32, username: Option<&str>, user_spec: Opt
 
     let mut cmd_args: Vec<String> = vec![
         "exec".into(),
+        // Quiet: health-monitor subprocess. A benign "stream closed before exit" race
+        // during teardown is downgraded to debug for quiet callers (#607); user-invoked
+        // execs still surface a visible error.
+        "--quiet".into(),
         "--pid".into(),
         pid.to_string(),
         "--vm".into(),
