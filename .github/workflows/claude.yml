@@ -29,6 +29,10 @@ jobs:
       pr_number: ${{ steps.get-pr.outputs.number }}
       author_ok: ${{ steps.author.outputs.ok }}
       commits_ok: ${{ steps.commits.outputs.ok }}
+      # Single allowlist gate every Claude-executing job must pass (see the
+      # "Compute eligibility" step). Centralizes the trust model so a future job
+      # cannot accidentally run outside the allowed situations.
+      eligible: ${{ steps.eligible.outputs.ok }}
     steps:
       - name: Generate token
         id: token
@@ -39,39 +43,83 @@ jobs:
 
       - name: Get PR number
         id: get-pr
+        # SECURITY: every value below is passed through `env:` and referenced as a shell
+        # variable. NEVER interpolate ${{ github.event.* }} directly into `run:` — a
+        # field like workflow_run.head_branch is attacker-controlled (a fork can name a
+        # branch with shell metacharacters) and direct interpolation is script injection.
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_PR_URL: ${{ github.event.issue.pull_request.url }}
+          WR_EVENT: ${{ github.event.workflow_run.event }}
+          WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WR_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
-            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
-            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
-            BRANCH="${{ github.event.workflow_run.head_branch }}"
-            if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
-              echo "number=0" >> $GITHUB_OUTPUT
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+            # issue_comment fires for BOTH issues and PRs; only PRs carry
+            # .issue.pull_request. For a comment on a plain issue there is no PR,
+            # so emit 0 (downstream PR API calls would 404 and fail the job).
+            if [ -n "$ISSUE_PR_URL" ]; then
+              echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
             else
-              PR_NUM=$(gh pr list --repo ${{ github.repository }} --head "$BRANCH" --json number --jq '.[0].number // 0')
-              echo "number=$PR_NUM" >> $GITHUB_OUTPUT
+              echo "number=0" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+            echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_run" ]; then
+            # A FORK-originated run is never trusted. Emit 0 (get-author maps a fork
+            # workflow_run to assoc=NONE, and ci-fix independently requires same-repo).
+            # Do NOT look up a PR by branch name — branch names are attacker-controlled
+            # and are not an identity. For a same-repo PR derive the number from the
+            # event payload; a same-repo push is collaborator-only, treat as no-PR (0).
+            if [ "$WR_HEAD_REPO" != "$REPO" ]; then
+              echo "number=0" >> "$GITHUB_OUTPUT"
+            elif [ "$WR_EVENT" = "push" ]; then
+              echo "number=0" >> "$GITHUB_OUTPUT"
+            else
+              echo "number=$(printf '%s' "$WR_PRS" | jq -r '.[0].number // 0')" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "number=0" >> $GITHUB_OUTPUT
+            echo "number=0" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Get PR author association
         id: get-author
+        # SECURITY: values via `env:` only (see get-pr). PR_NUM is our own computed output.
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR_NUM: ${{ steps.get-pr.outputs.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUM="${{ steps.get-pr.outputs.number }}"
-          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            # No PR (e.g., main branch CI) - treat as owner
-            echo "assoc=OWNER" >> $GITHUB_OUTPUT
+          if [ -n "$PR_NUM" ] && [ "$PR_NUM" != "0" ]; then
+            # A real PR: trust is the PR AUTHOR's association — NOT the commenter's. This is
+            # the gate that matters because the privileged jobs check out and BUILD the PR
+            # HEAD (refs/pull/<n>/head), i.e. they execute the PR's code with secrets. A
+            # member commenting @claude/claude-review on an EXTERNAL fork PR must not cause
+            # that fork's untrusted code to run with secrets, so we gate on the code's
+            # author. The PR-author association cannot be spoofed via commit-author email.
+            # (Non-member comments are independently blocked by the `check` step; tolerate a
+            # 404 so a stray non-PR number fails safe rather than erroring under `bash -e`.)
+            ASSOC=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq '.author_association' 2>/dev/null || echo "")
+            echo "assoc=$ASSOC" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "issue_comment" ] || [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+            # A comment with no associated PR (e.g. @claude on a plain issue → PR_NUM=0) is
+            # never trusted. Do NOT fall through to the OWNER default below.
+            echo "assoc=NONE" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_run" ] && [ "$WR_HEAD_REPO" != "$REPO" ]; then
+            # A workflow_run whose head came from a FORK is never trusted — even if its
+            # head_branch is literally "main" (a fork's default branch is "main" too).
+            echo "assoc=NONE" >> "$GITHUB_OUTPUT"
           else
-            ASSOC=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.author_association')
-            echo "assoc=$ASSOC" >> $GITHUB_OUTPUT
+            # No PR and not a comment: main-branch CI / SAME-REPO workflow_run - owner.
+            echo "assoc=OWNER" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check author is member
@@ -89,57 +137,104 @@ jobs:
         id: commits
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR_NUM: ${{ steps.get-pr.outputs.number }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUM="${{ steps.get-pr.outputs.number }}"
+          set -o pipefail   # so `gh api | jq/sort` propagates a gh failure (not jq/sort's status)
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
+            echo "ok=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Check each commit author's association
-          NON_MEMBER=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/commits --jq \
-            '[.[] | select(.author.type != "Bot" and .author.login != null) | .author.login] | unique | .[]' | while read -r LOGIN; do
-            if [ -n "$LOGIN" ]; then
-              ASSOC=$(gh api repos/${{ github.repository }}/collaborators/$LOGIN/permission --jq '.permission' 2>/dev/null || echo "none")
-              # Block if not a collaborator (permission = none)
-              if [ "$ASSOC" = "none" ]; then
-                echo "$LOGIN"
-              fi
-            fi
-          done | head -1)
+          # FAIL CLOSED if the commits API errors. --paginate so a non-member commit past
+          # page 1 is not missed. A non-bot commit with no linked GitHub login is UNLINKED
+          # (unverifiable) -> treated as non-member below (its permission lookup 404s).
+          if ! LOGINS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/commits?per_page=100" --jq \
+            '.[] | select(.author.type != "Bot") | (.author.login // "UNLINKED")' | sort -u); then
+            echo "::warning::Blocking Claude - commits API failed (failing closed)"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Block if any commit author is not a collaborator (permission lookup failure
+          # also fails closed: defaults to "none"). Here-string (not a pipe into `while`)
+          # so a member match doesn't make the pipeline exit non-zero under pipefail+`-e`.
+          NON_MEMBER=""
+          while IFS= read -r LOGIN; do
+            [ -n "$LOGIN" ] || continue
+            ASSOC=$(gh api "repos/$REPO/collaborators/$LOGIN/permission" --jq '.permission' 2>/dev/null || echo "none")
+            if [ "$ASSOC" = "none" ]; then NON_MEMBER="$LOGIN"; break; fi
+          done <<< "$LOGINS"
           if [ -n "$NON_MEMBER" ]; then
             echo "::warning::Blocking Claude - non-member commit author: $NON_MEMBER"
-            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "ok=false" >> "$GITHUB_OUTPUT"
           else
-            echo "ok=true" >> $GITHUB_OUTPUT
+            echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check for non-member comments
         id: check
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR_NUM: ${{ steps.get-pr.outputs.number }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUM="${{ steps.get-pr.outputs.number }}"
+          set -o pipefail   # so `gh api | jq` propagates a gh failure (not jq's status)
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            echo "safe=true" >> $GITHUB_OUTPUT
+            echo "safe=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER" 2>/dev/null || echo 0)
-          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER" 2>/dev/null || echo 0)
-          TOTAL=$((ISSUE + REVIEW))
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Blocking Claude - $TOTAL non-member comment(s) detected"
-            echo "safe=false" >> $GITHUB_OUTPUT
+          # FAIL CLOSED: an API error must block Claude, not allow it. (No `|| echo 0`,
+          # which would turn a transient 5xx/rate-limit into safe=true and let a
+          # non-member comment through.)
+          # --paginate so a non-member comment past page 1 is not missed; sum the
+          # per-page counts. Any API/parse failure fails closed.
+          if ! ISSUE=$(gh api --paginate "repos/$REPO/issues/$PR_NUM/comments?per_page=100" --jq "$NONMEMBER_FILTER" | jq -s 'add // 0') \
+             || ! REVIEW=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/comments?per_page=100" --jq "$NONMEMBER_FILTER" | jq -s 'add // 0'); then
+            echo "::warning::Blocking Claude - comments API failed (failing closed)"
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$((ISSUE + REVIEW))" -gt 0 ]; then
+            echo "::warning::Blocking Claude - non-member comment(s) detected"
+            echo "safe=false" >> "$GITHUB_OUTPUT"
           else
-            echo "safe=true" >> $GITHUB_OUTPUT
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute eligibility (allowlist gate)
+        id: eligible
+        # SECURITY: values via `env:` only — no ${{ github.event.* }} in the script body.
+        env:
+          SAFE: ${{ steps.check.outputs.safe }}
+          AUTHOR: ${{ steps.author.outputs.ok }}
+          COMMITS: ${{ steps.commits.outputs.ok }}
+          EVENT: ${{ github.event_name }}
+          ISSUE_PR_URL: ${{ github.event.issue.pull_request.url }}
+        run: |
+          # ALLOWLIST of the only trigger CONTEXTS Claude may run in. Anything not
+          # explicitly enumerated here is denied. Note: issue_comment is allowed ONLY
+          # when the issue is actually a pull request (never a plain issue).
+          CONTEXT=false
+          case "$EVENT" in
+            pull_request) CONTEXT=true ;;
+            issue_comment) [ -n "$ISSUE_PR_URL" ] && CONTEXT=true ;;
+            pull_request_review_comment) CONTEXT=true ;;
+            workflow_run) CONTEXT=true ;;
+          esac
+          # Eligible only when the PR author is trusted (author_ok — the code that runs
+          # with secrets), there are no non-member commits/comments, AND the trigger is an
+          # allowlisted context.
+          if [ "$SAFE" = "true" ] && [ "$AUTHOR" = "true" ] && [ "$COMMITS" = "true" ] && [ "$CONTEXT" = "true" ]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Claude not eligible (safe=$SAFE author=$AUTHOR commits=$COMMITS event=$EVENT context=$CONTEXT)"
+            echo "ok=false" >> $GITHUB_OUTPUT
           fi
 
   # Review PRs from org members, auto-fix medium/critical issues
   review:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       github.event_name == 'pull_request' &&
       !startsWith(github.event.pull_request.head.ref, 'claude/fix-')
     runs-on: ubuntu-latest
@@ -209,9 +304,7 @@ jobs:
   manual-review:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/claude-review')
@@ -259,13 +352,15 @@ jobs:
       - name: Get PR info
         id: pr
         working-directory: fcvm
-        run: |
-          PR_DATA=$(gh pr view ${{ github.event.issue.number }} --json headRefName,headRefOid,baseRefName)
-          echo "head_branch=$(echo $PR_DATA | jq -r .headRefName)" >> $GITHUB_OUTPUT
-          echo "head_sha=$(echo $PR_DATA | jq -r .headRefOid)" >> $GITHUB_OUTPUT
-          echo "base_branch=$(echo $PR_DATA | jq -r .baseRefName)" >> $GITHUB_OUTPUT
+        # SECURITY: pass the issue number via env, not interpolated into the shell.
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          PR_DATA=$(gh pr view "$ISSUE_NUMBER" --json headRefName,headRefOid,baseRefName)
+          echo "head_branch=$(echo "$PR_DATA" | jq -r .headRefName)" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(echo "$PR_DATA" | jq -r .headRefOid)" >> "$GITHUB_OUTPUT"
+          echo "base_branch=$(echo "$PR_DATA" | jq -r .baseRefName)" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude review
         working-directory: fcvm
@@ -293,11 +388,9 @@ jobs:
   respond:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       !contains(github.event.comment.body, '/claude-review') &&
-      ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      ((github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude')) ||
        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -384,10 +477,9 @@ jobs:
   ci-fix:
     needs: safety-check
     if: |
-      needs.safety-check.outputs.safe == 'true' &&
-      needs.safety-check.outputs.author_ok == 'true' &&
-      needs.safety-check.outputs.commits_ok == 'true' &&
+      needs.safety-check.outputs.eligible == 'true' &&
       github.event_name == 'workflow_run' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.conclusion == 'failure' &&
       !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
       github.event.workflow_run.name != 'Claude Assistant'

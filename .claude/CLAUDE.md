@@ -737,6 +737,19 @@ gh pr close <fix-pr-number>  # Close the auto-generated PR
 gh pr view <pr-number> --json comments --jq '.comments[] | .body'
 ```
 
+### GitHub Actions Workflow Security (claude.yml)
+
+Jobs run with secrets, so editing `.github/workflows/claude.yml` is security-critical. Rules
+(Anthropic `claude-code-action/docs/security.md` + GitHub "pwn requests"); re-run local codex
+until SAFE:
+- `pull_request` from forks has no secrets; `issue_comment`/`pull_request_target`/`workflow_run` do.
+- Never check out/build untrusted PR head in a secret job (postinstall/build.rs → exfil).
+- Gate on PR-author `author_association`, not the commenter (commit email is spoofable).
+- `workflow_run`: require `head_repository.full_name == github.repository`, not branch name.
+- Never interpolate `${{ github.event.* }}` into `run:` (injection) — pass via `env:`.
+- `issue_comment` fires for issues too; gate on `github.event.issue.pull_request`.
+- Centralize into one `eligible` allowlist every job gates on.
+
 ### PR Descriptions: Show, Don't Tell
 
 **CRITICAL: Review commits in THIS branch before writing PR description.**
