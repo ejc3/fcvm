@@ -1508,14 +1508,14 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
-    // verify_port_forwarding() confirmed the L2 channel is ready (ping + TCP connect).
-    // Use retry because the guest application may need a moment after restore.
+    // verify_port_forwarding() confirmed the L2 channel is ready, so the first
+    // request through the forward must succeed.
     println!(
-        "  Testing access via loopback {}:{} (with retries)...",
+        "  Testing access via loopback {}:{}...",
         loopback_ip, host_port
     );
     let loopback_check =
-        common::curl_check_retry(&loopback_ip, host_port, 10, Some(clone_pid)).await;
+        common::curl_check_with_diag(&loopback_ip, host_port, 10, Some(clone_pid)).await;
     let loopback_works = loopback_check.success && loopback_check.body_len > 0;
     if loopback_works {
         println!(
@@ -1668,13 +1668,13 @@ async fn test_clone_port_forward_routed() -> Result<()> {
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
-    // Use retry because the guest application may need a moment after restore.
+    // The first request through the forward must succeed.
     println!(
-        "  Testing access via loopback {}:{} (with retries)...",
+        "  Testing access via loopback {}:{}...",
         loopback_ip, host_port
     );
     let loopback_check =
-        common::curl_check_retry(&loopback_ip, host_port, 10, Some(clone_pid)).await;
+        common::curl_check_with_diag(&loopback_ip, host_port, 10, Some(clone_pid)).await;
     let loopback_works = loopback_check.success && loopback_check.body_len > 0;
     if loopback_works {
         println!(
