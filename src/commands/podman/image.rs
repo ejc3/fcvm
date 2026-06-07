@@ -78,6 +78,79 @@ pub(super) async fn get_image_identifier(image: &str) -> Result<String> {
     }
 }
 
+/// Get the immutable image ID (config digest, e.g. `sha256:abc…`) for a localhost image.
+///
+/// Captured at inspect time so the later export can pin the exact content the digest
+/// cache key names, even if a parallel build repoints the tag in between (#598).
+/// Unlike a manifest digest, an image ID is accepted by `skopeo copy
+/// containers-storage:<id>`, which lets us export immutable content while still
+/// writing the original repo tag into the archive's RepoTags.
+pub(super) async fn get_localhost_image_id(image: &str) -> Result<String> {
+    let output = tokio::process::Command::new("podman")
+        .args(["image", "inspect", image, "--format", "{{.Id}}"])
+        .output()
+        .await
+        .context("running podman inspect for image id")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to get image id for '{}': {}", image, stderr);
+    }
+
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        bail!("podman returned an empty image id for '{}'", image);
+    }
+    Ok(id)
+}
+
+/// Export a localhost image's content to a docker-archive at `dest`, by immutable
+/// image ID, tagged as `repo_tag`.
+///
+/// `skopeo copy containers-storage:<image_id>` reads the exact image content named by
+/// the ID — immune to a concurrent `podman build` repointing the tag (#598) — while the
+/// `docker-archive:<dest>:<repo_tag>` destination records `repo_tag` in the archive's
+/// RepoTags so the guest can `podman load` and run it by name. This is non-destructive:
+/// unlike `podman tag <id> <repo_tag>`, it never mutates the caller's live image store.
+///
+/// `repo_tag` may contain a `:` (e.g. `localhost/foo:latest`); skopeo treats everything
+/// after the archive path as the reference, so the colon is preserved.
+pub async fn export_image_archive(image_id: &str, repo_tag: &str, dest: &Path) -> Result<()> {
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("archive path is not valid UTF-8: {}", dest.display()))?;
+
+    let output = tokio::process::Command::new("skopeo")
+        .args([
+            "copy",
+            &format!("containers-storage:{}", image_id),
+            &format!("docker-archive:{}:{}", dest_str, repo_tag),
+        ])
+        .output()
+        .await
+        .context("running skopeo copy")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "skopeo copy failed for image '{}' (id {}): {}",
+            repo_tag,
+            image_id,
+            stderr
+        );
+    }
+
+    // docker-archive format requires manifest.json; guard against a malformed archive.
+    if !validate_docker_archive(dest)? {
+        bail!(
+            "skopeo copy produced an invalid archive (missing manifest.json) for image '{}'",
+            repo_tag
+        );
+    }
+
+    Ok(())
+}
+
 /// Create an ext4 disk image from a directory's contents.
 ///
 /// When `shrink` is true, runs `resize2fs -M` after creation to minimize the image size.

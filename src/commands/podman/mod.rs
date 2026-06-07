@@ -16,6 +16,10 @@ mod vm_config;
 use types::VolumeMapping;
 pub use types::{CacheRequest, LogLine, SnapshotOutcome, VmContext, VmHandle};
 
+// Re-exported for the #598 regression test (export must pin immutable content by image
+// ID even when the tag is rebuilt mid-export).
+pub use image::export_image_archive;
+
 pub(crate) use listeners::run_output_listener;
 use listeners::run_status_listener;
 
@@ -34,7 +38,9 @@ use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, 
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
-use image::{build_storage_image, get_image_identifier, validate_docker_archive};
+use image::{
+    build_storage_image, get_image_identifier, get_localhost_image_id, validate_docker_archive,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Resolve the rootfs filesystem type from CLI args and kernel profile config.
@@ -315,6 +321,15 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // tag is rebuilt between two separate inspects.
     let image_identifier = get_image_identifier(&args.image).await?;
 
+    // For localhost/ images, also capture the immutable image ID now, right next to the
+    // digest cache key, so the export below pins the exact content this key names even if
+    // a parallel build repoints the tag before the export runs (#598).
+    let localhost_image_id = if args.image.starts_with("localhost/") {
+        Some(get_localhost_image_id(&args.image).await?)
+    } else {
+        None
+    };
+
     // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
     let no_snapshot = args.no_snapshot
@@ -503,58 +518,22 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             // .docker.docker.tar.tmp (double .docker). Use format! to just append .tmp.
             let tmp_path = PathBuf::from(format!("{}.tmp", archive_path.display()));
 
-            // Remove stale tmp file if it exists (podman save won't overwrite)
+            // Remove stale tmp file if it exists (skopeo won't overwrite)
             let _ = tokio::fs::remove_file(&tmp_path).await;
 
-            let output = tokio::process::Command::new("podman")
-                .args([
-                    "save",
-                    "--format",
-                    "docker-archive",
-                    "-o",
-                    tmp_path.to_str().unwrap(),
-                    &args.image,
-                ])
-                .output()
-                .await
-                .context("running podman save")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
+            // tag (#598). A parallel build can repoint the tag between the cache-key
+            // inspect and this export; `podman save <tag>` would then archive the newer
+            // build under the older digest's cache entry. export_image_archive pins the
+            // exact content the cache key names and writes the original repo tag into the
+            // archive's RepoTags, so the guest still loads and runs it by name.
+            let image_id = localhost_image_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("internal: localhost image id was not captured at inspect time")
+            })?;
+            if let Err(e) = image::export_image_archive(image_id, &args.image, &tmp_path).await {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 drop(lock_file);
-                bail!(
-                    "Failed to export image '{}' with podman save: {}",
-                    args.image,
-                    stderr
-                );
-            }
-
-            // Validate the archive contains manifest.json (required for docker-archive format)
-            if !validate_docker_archive(&tmp_path)? {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                drop(lock_file);
-                bail!(
-                    "podman save produced invalid archive (missing manifest.json) for image '{}'",
-                    args.image
-                );
-            }
-
-            // podman save operates on the mutable tag, so re-check whether the tag still
-            // resolves to the digest used as the cache key. A concurrent rebuild of the
-            // same tag (parallel tests routinely rebuild shared localhost images) is
-            // legitimate, so this is a warning rather than an error: the archive may
-            // contain the newer build under the older digest's cache entry, which is the
-            // pre-existing race for mutable tags. Exporting by an immutable reference
-            // (while preserving the repo tag for the guest-side load) is the real fix.
-            let digest_after = get_image_identifier(&args.image).await?;
-            if digest_after != digest {
-                warn!(
-                    image = %args.image,
-                    digest_at_key = %digest,
-                    digest_at_export = %digest_after,
-                    "image was rebuilt while it was being exported; cached archive may be newer than its cache key"
-                );
+                return Err(e);
             }
 
             // Atomic rename within the same filesystem
