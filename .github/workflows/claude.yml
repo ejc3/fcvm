@@ -140,6 +140,7 @@ jobs:
           PR_NUM: ${{ steps.get-pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: |
+          set -o pipefail   # so `gh api | jq/sort` propagates a gh failure (not jq/sort's status)
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -175,6 +176,7 @@ jobs:
           PR_NUM: ${{ steps.get-pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: |
+          set -o pipefail   # so `gh api | jq` propagates a gh failure (not jq's status)
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
             echo "safe=true" >> "$GITHUB_OUTPUT"
             exit 0
