@@ -48,34 +48,128 @@ pub(super) fn validate_docker_archive(archive_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Get the image identifier for cache key computation.
+/// An image's cache key and (for localhost images) its immutable export source.
 ///
-/// For localhost/ images: returns SHA256 digest from podman (requires podman)
-/// For remote images: returns the image URL/name as-is (no podman needed)
-pub(super) async fn get_image_identifier(image: &str) -> Result<String> {
-    if image.starts_with("localhost/") {
-        // Use podman to get the digest for localhost images
-        let output = tokio::process::Command::new("podman")
-            .args(["image", "inspect", image, "--format", "{{.Digest}}"])
-            .output()
-            .await
-            .context("running podman inspect")?;
+/// `cache_key` is the snapshot/image-cache key: the SHA256 manifest digest for
+/// `localhost/` images, or the image reference itself for remote images. `image_id`
+/// is the immutable image ID (`sha256:…`) used to export by content; it is `None` for
+/// remote images (which are pulled in the guest, not exported).
+pub(super) struct ImageCacheRef {
+    pub cache_key: String,
+    pub image_id: Option<String>,
+}
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to get digest for image '{}': {}", image, stderr);
-        }
-
-        let digest = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .trim_start_matches("sha256:")
-            .to_string();
-
-        Ok(digest)
-    } else {
-        // For remote images, use the image name/URL as identifier
-        Ok(image.to_string())
+/// Resolve an image's cache key and immutable export id in a SINGLE `podman image
+/// inspect`.
+///
+/// Capturing both fields from one observation is required for correctness (#598):
+/// taking the digest and the id from two separate inspects lets a parallel
+/// `podman build` repoint the tag in between, so the cache key would name the old
+/// manifest while the export id names the new image — caching the wrong content under
+/// the old key. One inspect makes them an atomic view of the same image.
+///
+/// For remote images there is no local id and the reference is used as the key.
+pub(super) async fn get_image_cache_ref(image: &str) -> Result<ImageCacheRef> {
+    if !image.starts_with("localhost/") {
+        // Remote images: the reference is the key; no local id (pulled in the guest).
+        return Ok(ImageCacheRef {
+            cache_key: image.to_string(),
+            image_id: None,
+        });
     }
+
+    // `\t` never appears in a digest or an image id, so it is a safe field separator.
+    let output = tokio::process::Command::new("podman")
+        .args([
+            "image",
+            "inspect",
+            image,
+            "--format",
+            "{{.Digest}}\t{{.Id}}",
+        ])
+        .output()
+        .await
+        .context("running podman inspect")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to inspect image '{}': {}", image, stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.trim();
+    let (digest, id) = line.split_once('\t').ok_or_else(|| {
+        anyhow::anyhow!(
+            "unexpected `podman image inspect` output for '{}': {:?}",
+            image,
+            line
+        )
+    })?;
+
+    let image_id = id.trim().to_string();
+    if image_id.is_empty() {
+        bail!("podman returned an empty image id for '{}'", image);
+    }
+
+    // A locally-built image can report an empty manifest digest. Fall back to the
+    // (always-present, immutable) image id so distinct images never collide on an empty
+    // cache key — which would conflate their cached archives/snapshots.
+    let mut cache_key = digest.trim().trim_start_matches("sha256:").to_string();
+    if cache_key.is_empty() {
+        cache_key = image_id.trim_start_matches("sha256:").to_string();
+    }
+
+    Ok(ImageCacheRef {
+        cache_key,
+        image_id: Some(image_id),
+    })
+}
+
+/// Export a localhost image's content to a docker-archive at `dest`, by immutable
+/// image ID, tagged as `repo_tag`.
+///
+/// `skopeo copy containers-storage:<image_id>` reads the exact image content named by
+/// the ID — immune to a concurrent `podman build` repointing the tag (#598) — while the
+/// `docker-archive:<dest>:<repo_tag>` destination records `repo_tag` in the archive's
+/// RepoTags so the guest can `podman load` and run it by name. This is non-destructive:
+/// unlike `podman tag <id> <repo_tag>`, it never mutates the caller's live image store.
+///
+/// `repo_tag` may contain a `:` (e.g. `localhost/foo:latest`); skopeo treats everything
+/// after the archive path as the reference, so the colon is preserved.
+pub async fn export_image_archive(image_id: &str, repo_tag: &str, dest: &Path) -> Result<()> {
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("archive path is not valid UTF-8: {}", dest.display()))?;
+
+    let output = tokio::process::Command::new("skopeo")
+        .args([
+            "copy",
+            &format!("containers-storage:{}", image_id),
+            &format!("docker-archive:{}:{}", dest_str, repo_tag),
+        ])
+        .output()
+        .await
+        .context("running skopeo copy")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "skopeo copy failed for image '{}' (id {}): {}",
+            repo_tag,
+            image_id,
+            stderr
+        );
+    }
+
+    // docker-archive format requires manifest.json; guard against a malformed archive.
+    if !validate_docker_archive(dest)? {
+        bail!(
+            "skopeo copy produced an invalid archive (missing manifest.json) for image '{}'",
+            repo_tag
+        );
+    }
+
+    Ok(())
 }
 
 /// Create an ext4 disk image from a directory's contents.

@@ -229,3 +229,130 @@ CMD ["echo", "{marker}"]"#
     println!("  Built {} image", image_name);
     Ok(())
 }
+
+/// Get the immutable image ID (`sha256:…`) of a localhost image via podman.
+async fn podman_image_id(image_name: &str) -> Result<String> {
+    let out = tokio::process::Command::new("podman")
+        .args(["image", "inspect", image_name, "--format", "{{.Id}}"])
+        .output()
+        .await
+        .context("podman image inspect")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "podman inspect failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The container `Cmd` recorded in a docker-archive, via `skopeo inspect --config`.
+async fn archive_config_cmd(archive: &std::path::Path) -> Result<Vec<String>> {
+    let out = tokio::process::Command::new("skopeo")
+        .args([
+            "inspect",
+            "--config",
+            &format!("docker-archive:{}", archive.display()),
+        ])
+        .output()
+        .await
+        .context("skopeo inspect --config")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "skopeo inspect --config failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg: serde_json::Value = serde_json::from_slice(&out.stdout).context("parsing config")?;
+    Ok(cfg["config"]["Cmd"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// The RepoTags recorded in a docker-archive's manifest.json (what `podman load` uses
+/// to name the loaded image). Read directly from the tar — `skopeo inspect` does not
+/// surface docker-archive RepoTags reliably.
+async fn archive_repo_tags(archive: &std::path::Path) -> Result<Vec<String>> {
+    let out = tokio::process::Command::new("tar")
+        .args(["-xOf", &archive.to_string_lossy(), "manifest.json"])
+        .output()
+        .await
+        .context("extracting manifest.json")?;
+    anyhow::ensure!(out.status.success(), "tar extract manifest.json failed");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parsing manifest.json")?;
+    Ok(manifest
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|m| m["RepoTags"].as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// #598: the export must pin the immutable image ID's content even when the tag is
+/// rebuilt between the inspect (cache-key capture) and the export — otherwise the
+/// cached archive holds newer content than the digest used as its cache key. It must
+/// also preserve the repo tag so the guest can `podman load` and run it by name.
+#[tokio::test]
+async fn test_export_pins_immutable_content_across_tag_rebuild() -> Result<()> {
+    println!("\ntest_export_pins_immutable_content_across_tag_rebuild (#598)");
+    let image_name = image_name_for_suffix("export-pin-598");
+    let marker_v1 = "MARKER_V1_export598";
+    let marker_v2 = "MARKER_V2_export598";
+
+    // Build v1 and capture the immutable id fcvm would record at inspect time.
+    build_test_image(&image_name, marker_v1).await?;
+    let v1_id = podman_image_id(&image_name).await?;
+
+    // Rebuild the SAME tag with different content. The tag now resolves to v2, but the
+    // v1 image still exists under v1_id — exactly the race #598 describes.
+    build_test_image(&image_name, marker_v2).await?;
+    let v2_id = podman_image_id(&image_name).await?;
+    anyhow::ensure!(v1_id != v2_id, "rebuild should produce a new image id");
+
+    // Export by the v1 id (what fcvm captured before the rebuild).
+    let tmp = tempfile::TempDir::new()?;
+    let archive = tmp.path().join("out.docker.tar");
+    fcvm::commands::podman::export_image_archive(&v1_id, &image_name, &archive)
+        .await
+        .context("export_image_archive")?;
+
+    // The archive must hold v1's content, NOT the rebuilt v2.
+    let cmd = archive_config_cmd(&archive).await?;
+    assert!(
+        cmd.iter().any(|s| s.contains(marker_v1)),
+        "archive must hold v1 content; got Cmd {:?}",
+        cmd
+    );
+    assert!(
+        !cmd.iter().any(|s| s.contains(marker_v2)),
+        "archive must NOT hold the rebuilt v2 content; got Cmd {:?}",
+        cmd
+    );
+
+    // The original repo tag must be preserved for guest-side `podman load`. skopeo
+    // normalizes an untagged reference to `:latest`, so accept either form.
+    let repo_tags = archive_repo_tags(&archive).await?;
+    let tagged = format!("{}:latest", image_name);
+    assert!(
+        repo_tags.iter().any(|t| t == &image_name || t == &tagged),
+        "archive RepoTags must include {} (or {}); got {:?}",
+        image_name,
+        tagged,
+        repo_tags
+    );
+
+    let _ = tokio::process::Command::new("podman")
+        .args(["rmi", "-f", &image_name, &v1_id, &v2_id])
+        .output()
+        .await;
+    println!("✅ export pinned v1 content across tag rebuild (#598)");
+    Ok(())
+}
