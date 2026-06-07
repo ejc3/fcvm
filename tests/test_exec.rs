@@ -13,6 +13,7 @@ mod common;
 use anyhow::{Context, Result};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
@@ -1823,4 +1824,103 @@ async fn test_podman_run_no_tty() -> Result<()> {
     println!("✓ fcvm podman run (no -t) correctly has no TTY");
 
     Ok(())
+}
+
+/// #636: when the host `fcvm exec` process disconnects (e.g. host-side timeout kills it),
+/// fc-agent must kill the guest command instead of leaving it running. Regression test for
+/// the VM-level (non-container) pipe path, which `killpg` fully covers. (The in-container
+/// payload is a documented separate concern — see #636 — so this asserts only the VM path.)
+#[tokio::test]
+async fn test_exec_host_disconnect_kills_guest_child() -> Result<()> {
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("exec-disconnect");
+
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning fcvm podman run")?;
+
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
+        common::kill_process(fcvm_pid).await;
+        return Err(e.context("VM failed to become healthy"));
+    }
+
+    // Unique marker the guest command `touch`es only AFTER an 8s sleep. It first prints
+    // READY so we can wait until the command is actually running before severing the host
+    // exec — otherwise, on a slow runner, we might kill the host exec before the guest
+    // command even started, and the marker would be absent even in the broken impl (a false
+    // pass). Run the work inside an async block so the cleanup below runs on every path.
+    let marker = format!("/tmp/fcvm636-{}", fcvm_pid);
+    let guest_cmd = format!("echo READY; sleep 8; touch {}", marker);
+
+    let result: Result<()> = async {
+        // Host `fcvm exec --vm` we control directly so we can sever it mid-flight.
+        let mut exec = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "exec",
+                "--pid",
+                &fcvm_pid.to_string(),
+                "--vm",
+                "--",
+                "sh",
+                "-c",
+                &guest_cmd,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning host fcvm exec")?;
+
+        // Wait for READY (proves the guest command is running) before severing.
+        let stdout = exec.stdout.take().context("exec stdout missing")?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let ready = tokio::time::timeout(Duration::from_secs(120), async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("READY") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        anyhow::ensure!(ready, "guest command never signaled READY");
+
+        // Sever the host exec now that the guest is mid-`sleep 8`.
+        let _ = exec.start_kill();
+        let _ = exec.wait().await;
+
+        // Wait past when the marker WOULD appear if the guest sleep had survived.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let check = common::exec_in_vm(
+            fcvm_pid,
+            &[
+                "sh",
+                "-c",
+                &format!("test -f {} && echo EXISTS || echo GONE", marker),
+            ],
+        )
+        .await
+        .context("checking marker in guest")?;
+
+        anyhow::ensure!(
+            check.contains("GONE"),
+            "#636 regression: guest command survived host exec disconnect (marker present): {:?}",
+            check
+        );
+        Ok(())
+    }
+    .await;
+
+    // Cleanup on every post-health path (the async block above may return early).
+    common::kill_process(fcvm_pid).await;
+    result
 }
