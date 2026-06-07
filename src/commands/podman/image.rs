@@ -97,7 +97,18 @@ pub(super) async fn get_image_cache_ref(image: &str) -> Result<ImageCacheRef> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.trim();
+    parse_image_cache_ref(image, &stdout)
+}
+
+/// Parse the `{{.Digest}}\t{{.Id}}` output of `podman image inspect` into an
+/// [`ImageCacheRef`]. Split out from the command call so the empty-digest fallback can
+/// be unit-tested without a live podman.
+fn parse_image_cache_ref(image: &str, stdout: &str) -> Result<ImageCacheRef> {
+    // Strip ONLY the trailing newline. A locally-built image reports an EMPTY digest,
+    // so podman emits "\t<id>" — a leading tab. `str::trim()` would eat that leading tab
+    // (a tab is whitespace), collapsing the two fields into one and making `split_once`
+    // fail before the empty-digest fallback below could run (#623).
+    let line = stdout.trim_end_matches(['\n', '\r']);
     let (digest, id) = line.split_once('\t').ok_or_else(|| {
         anyhow::anyhow!(
             "unexpected `podman image inspect` output for '{}': {:?}",
@@ -123,6 +134,42 @@ pub(super) async fn get_image_cache_ref(image: &str) -> Result<ImageCacheRef> {
         cache_key,
         image_id: Some(image_id),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_digest_falls_back_to_image_id() {
+        // Locally-built image: podman reports an empty .Digest, so the line begins with
+        // a tab. The cache key must fall back to the image id (regression test for #623,
+        // where `stdout.trim()` ate the leading tab and the fallback was dead code).
+        let out = "\tsha256:abc123def456\n";
+        let r = parse_image_cache_ref("localhost/foo", out).expect("must parse empty digest");
+        assert_eq!(r.cache_key, "abc123def456");
+        assert_eq!(r.image_id.as_deref(), Some("sha256:abc123def456"));
+    }
+
+    #[test]
+    fn present_digest_used_as_cache_key() {
+        let out = "sha256:digest9999\tsha256:id0000\n";
+        let r = parse_image_cache_ref("localhost/bar", out).expect("must parse");
+        assert_eq!(r.cache_key, "digest9999");
+        assert_eq!(r.image_id.as_deref(), Some("sha256:id0000"));
+    }
+
+    #[test]
+    fn empty_image_id_is_an_error() {
+        // An empty id (both fields blank) is unusable and must error, not silently key
+        // the cache on "".
+        assert!(parse_image_cache_ref("localhost/baz", "\t\n").is_err());
+    }
+
+    #[test]
+    fn missing_separator_is_an_error() {
+        assert!(parse_image_cache_ref("localhost/qux", "no-tab-here\n").is_err());
+    }
 }
 
 /// Export a localhost image's content to a docker-archive at `dest`, by immutable
