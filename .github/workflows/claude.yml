@@ -78,21 +78,24 @@ jobs:
         run: |
           PR_NUM="${{ steps.get-pr.outputs.number }}"
           EVENT="${{ github.event_name }}"
-          if [ "$EVENT" = "issue_comment" ] || [ "$EVENT" = "pull_request_review_comment" ]; then
-            # Comment-triggered runs are gated on the COMMENTER's association, never the PR
-            # author's nor a PR_NUM=0 fallback. This blocks an external user who comments
-            # `@claude` on a plain issue (PR_NUM=0), which would otherwise be treated as
-            # OWNER below and bypass every safety output.
-            echo "assoc=${{ github.event.comment.author_association }}" >> $GITHUB_OUTPUT
-          elif [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            # No PR and not a comment (e.g., main-branch CI / workflow_run) - treat as owner.
-            echo "assoc=OWNER" >> $GITHUB_OUTPUT
-          else
-            # Tolerate a 404 (e.g. number is not actually a PR) instead of failing the
-            # whole safety-check job under `bash -e`. An empty/blank assoc is treated as
-            # non-member by the next step, which fails safe (blocks Claude).
+          if [ -n "$PR_NUM" ] && [ "$PR_NUM" != "0" ]; then
+            # A real PR: trust is the PR AUTHOR's association — NOT the commenter's. This is
+            # the gate that matters because the privileged jobs check out and BUILD the PR
+            # HEAD (`refs/pull/<n>/head`), i.e. they execute the PR's code with secrets. A
+            # member commenting `@claude`/`/claude-review` on an EXTERNAL fork PR must not
+            # cause that fork's untrusted code to run with secrets, so we gate on the code's
+            # author. The PR-author association cannot be spoofed via commit-author email.
+            # (Non-member *comments* are independently blocked by the `check` step; tolerate
+            # a 404 so a stray non-PR number fails safe rather than erroring under `bash -e`.)
             ASSOC=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.author_association' 2>/dev/null || echo "")
             echo "assoc=$ASSOC" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "issue_comment" ] || [ "$EVENT" = "pull_request_review_comment" ]; then
+            # A comment with no associated PR (e.g. `@claude` on a plain issue → PR_NUM=0)
+            # is never trusted. Do NOT fall through to the OWNER default below.
+            echo "assoc=NONE" >> $GITHUB_OUTPUT
+          else
+            # No PR and not a comment (main-branch CI / workflow_run) - treat as owner.
+            echo "assoc=OWNER" >> $GITHUB_OUTPUT
           fi
 
       - name: Check author is member
@@ -171,9 +174,9 @@ jobs:
             pull_request_review_comment) CONTEXT=true ;;
             workflow_run) CONTEXT=true ;;
           esac
-          # Eligible only when the actor is trusted (author_ok, per the commenter for
-          # comment events), there are no non-member commits/comments, AND the trigger
-          # is an allowlisted context.
+          # Eligible only when the PR author is trusted (author_ok — the code that runs
+          # with secrets), there are no non-member commits/comments, AND the trigger is an
+          # allowlisted context.
           if [ "$SAFE" = "true" ] && [ "$AUTHOR" = "true" ] && [ "$COMMITS" = "true" ] && [ "$CONTEXT" = "true" ]; then
             echo "ok=true" >> $GITHUB_OUTPUT
           else
