@@ -266,7 +266,15 @@ fn reader_loop(mut stream: std::os::unix::net::UnixStream, done: Arc<AtomicBool>
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     debug!("reader_loop: EOF");
-                    // EOF without Exit message - return error
+                    // EOF before an Exit message: the exec stream closed before the remote
+                    // command reported its status (e.g. the VM/agent shut down or the vsock
+                    // peer dropped). Surface it instead of exiting 1 with no explanation —
+                    // this is the interactive/TTY path (the quiet non-TTY path is handled at
+                    // the CLI boundary in #607), so an interactive user should see why (#640).
+                    eprintln!(
+                        "\r\nfcvm: exec connection closed before the command's exit status \
+                         was received (the VM or agent may have exited)\r"
+                    );
                     done.store(true, Ordering::Relaxed);
                     return Some(1);
                 }
