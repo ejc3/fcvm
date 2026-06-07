@@ -50,58 +50,51 @@ pub(super) fn validate_docker_archive(archive_path: &Path) -> Result<bool> {
 
 /// Get the image identifier for cache key computation.
 ///
-/// For localhost/ images: returns SHA256 digest from podman (requires podman)
-/// For remote images: returns the image URL/name as-is (no podman needed)
-pub(super) async fn get_image_identifier(image: &str) -> Result<String> {
+/// For localhost/ images: returns SHA256 digest and immutable image ID from a single
+/// `podman inspect` call — atomic w.r.t. a concurrent `podman build` repointing the
+/// tag (#598). The digest feeds the snapshot/image cache key; the image ID lets the
+/// later export pin the exact content the cache key names even if the tag is rebuilt
+/// before the export runs.
+///
+/// For remote images: returns the image URL/name as-is (no podman needed) and `None`
+/// for the image ID (remote images are pulled by digest, so there's no mutable-tag
+/// race).
+pub(super) async fn get_image_identifier(image: &str) -> Result<(String, Option<String>)> {
     if image.starts_with("localhost/") {
-        // Use podman to get the digest for localhost images
+        // Single inspect for both digest and image ID — a concurrent `podman build`
+        // cannot repoint the tag between the two values.
         let output = tokio::process::Command::new("podman")
-            .args(["image", "inspect", image, "--format", "{{.Digest}}"])
+            .args(["image", "inspect", image, "--format", "{{.Digest}} {{.Id}}"])
             .output()
             .await
             .context("running podman inspect")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to get digest for image '{}': {}", image, stderr);
+            bail!("Failed to inspect image '{}': {}", image, stderr);
         }
 
-        let digest = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .trim_start_matches("sha256:")
-            .to_string();
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let trimmed = raw.trim();
+        let (digest_raw, id) = trimmed.split_once(' ').ok_or_else(|| {
+            anyhow::anyhow!(
+                "unexpected podman inspect output for '{}': expected 'DIGEST ID', got '{}'",
+                image,
+                trimmed
+            )
+        })?;
 
-        Ok(digest)
+        let digest = digest_raw.trim_start_matches("sha256:").to_string();
+        let id = id.to_string();
+        if id.is_empty() {
+            bail!("podman returned an empty image id for '{}'", image);
+        }
+
+        Ok((digest, Some(id)))
     } else {
         // For remote images, use the image name/URL as identifier
-        Ok(image.to_string())
+        Ok((image.to_string(), None))
     }
-}
-
-/// Get the immutable image ID (config digest, e.g. `sha256:abc…`) for a localhost image.
-///
-/// Captured at inspect time so the later export can pin the exact content the digest
-/// cache key names, even if a parallel build repoints the tag in between (#598).
-/// Unlike a manifest digest, an image ID is accepted by `skopeo copy
-/// containers-storage:<id>`, which lets us export immutable content while still
-/// writing the original repo tag into the archive's RepoTags.
-pub(super) async fn get_localhost_image_id(image: &str) -> Result<String> {
-    let output = tokio::process::Command::new("podman")
-        .args(["image", "inspect", image, "--format", "{{.Id}}"])
-        .output()
-        .await
-        .context("running podman inspect for image id")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to get image id for '{}': {}", image, stderr);
-    }
-
-    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if id.is_empty() {
-        bail!("podman returned an empty image id for '{}'", image);
-    }
-    Ok(id)
 }
 
 /// Export a localhost image's content to a docker-archive at `dest`, by immutable

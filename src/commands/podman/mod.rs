@@ -38,9 +38,7 @@ use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, 
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
-use image::{
-    build_storage_image, get_image_identifier, get_localhost_image_id, validate_docker_archive,
-};
+use image::{build_storage_image, get_image_identifier, validate_docker_archive};
 use tokio_util::sync::CancellationToken;
 
 /// Resolve the rootfs filesystem type from CLI args and kernel profile config.
@@ -315,20 +313,11 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
-    // Resolve the image identifier ONCE: digest for localhost/ images (single podman
-    // inspect), name for remote images. The same value feeds both the snapshot cache key
-    // and the image export cache below, so the two can never disagree when a localhost
-    // tag is rebuilt between two separate inspects.
-    let image_identifier = get_image_identifier(&args.image).await?;
-
-    // For localhost/ images, also capture the immutable image ID now, right next to the
-    // digest cache key, so the export below pins the exact content this key names even if
-    // a parallel build repoints the tag before the export runs (#598).
-    let localhost_image_id = if args.image.starts_with("localhost/") {
-        Some(get_localhost_image_id(&args.image).await?)
-    } else {
-        None
-    };
+    // Resolve the image identifier ONCE: digest + image ID for localhost/ images (single
+    // podman inspect), name for remote images. The single inspect is atomic w.r.t. a
+    // concurrent `podman build` repointing the tag (#598) — the digest (cache key) and
+    // the image ID (export ref) are guaranteed to refer to the same image.
+    let (image_identifier, localhost_image_id) = get_image_identifier(&args.image).await?;
 
     // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
