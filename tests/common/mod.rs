@@ -250,6 +250,42 @@ fn ensure_config_exists() {
     });
 }
 
+/// Make a spawned fcvm child die when THIS test process exits, via `PR_SET_PDEATHSIG`.
+///
+/// A failing test (a panic, or — far more common — an `?`/`bail!` Err-return from an
+/// `async fn -> Result<()>`) and even a passing test that forgets `kill_process` would
+/// otherwise leave its fcvm VM running. Under nextest each test runs in its own process and
+/// a retry is a fresh process, so when the test process exits the kernel SIGKILLs fcvm —
+/// whose firecracker + rootless holder die via their own `PR_SET_PDEATHSIG`, and whose
+/// `pasta` exits once the holder's namespace it serves is torn down — so a leaked VM cannot
+/// survive into the retry and accumulate hugepages/disks/sockets/netns (#637).
+///
+/// This only governs process teardown: during the test fcvm runs normally, and the usual
+/// `kill_process` cleanup still does the graceful shutdown on the success path. Zero blast
+/// radius — it does not change what any test must hold or do.
+fn set_test_pdeathsig(cmd: &mut tokio::process::Command) {
+    let parent = std::process::id() as i32;
+    // SAFETY: pre_exec runs in the forked child before exec; prctl/getppid are
+    // async-signal-safe and we allocate nothing here.
+    unsafe {
+        cmd.pre_exec(move || {
+            // Full varargs form (the kernel ignores args 3-5 for PR_SET_PDEATHSIG, but pass
+            // them explicitly for the C varargs ABI).
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the fork-vs-prctl race: if the parent (test process) already exited
+            // between fork and here, getppid() no longer matches — abort the spawn rather
+            // than launch an unsupervised fcvm. Use a raw OS error (no allocation in the
+            // forked child); ESRCH ("no such process") fits "parent gone".
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Check if we're running inside a container.
 ///
 /// Containers create marker files that we can use to detect containerized environments.
@@ -459,6 +495,7 @@ pub async fn spawn_fcvm_with_env(
     for (key, value) in env_vars {
         cmd.env(key, value);
     }
+    set_test_pdeathsig(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -547,6 +584,7 @@ async fn spawn_fcvm_with_log_path_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("RUST_LOG", "debug");
+    set_test_pdeathsig(&mut cmd);
 
     let mut child = cmd
         .spawn()
