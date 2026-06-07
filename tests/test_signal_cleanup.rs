@@ -25,9 +25,112 @@ fn is_vm_healthy(json_str: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a process with the given PID exists
-fn process_exists(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+/// Read `(state, start_time)` from `/proc/<pid>/stat`. `start_time` (field 22) together
+/// with the pid uniquely identifies a process even after PID reuse. `comm` (field 2) can
+/// contain spaces and `)`, so parse the remainder after the last `") "`.
+fn proc_state_start(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let after = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let state = fields.first()?.chars().next()?;
+    let start = fields.get(19)?.parse::<u64>().ok()?; // field 22 = index 19 after "pid (comm) "
+    Some((state, start))
+}
+
+/// Read `comm` (the executable basename, field 2 of `/proc/<pid>/stat`) — the text between
+/// the FIRST `(` and the LAST `)`, which tolerates a `comm` containing `(`/`)`/spaces.
+fn proc_comm(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    (open < close).then(|| stat[open + 1..close].to_string())
+}
+
+/// A terminal/zombie state means the process is gone for our purposes: `Z` (zombie,
+/// SIGKILL'd-but-unreaped) and the rare dead states `X`/`x`. `/proc/<pid>` still exists in
+/// these windows, so a bare existence check spuriously reports "running" (the #628 flake).
+fn is_dead_state(state: char) -> bool {
+    matches!(state, 'Z' | 'X' | 'x')
+}
+
+/// True iff the SAME process (matched by pid + captured `start_time`) is still present and
+/// not in a dead state. Defeats BOTH the post-kill zombie window and PID reuse — the two
+/// causes of the #628 flake. `start_time` is `None` when the process was already gone at capture.
+fn same_process_running(pid: u32, start_time: Option<u64>) -> bool {
+    let Some(start) = start_time else {
+        return false;
+    };
+    matches!(proc_state_start(pid), Some((state, st)) if !is_dead_state(state) && st == start)
+}
+
+/// `pidfd_open(2)` — returns a fd that refers to THIS exact process for its whole lifetime.
+/// Unlike a bare PID, a pidfd never aliases a reused PID, so signalling through it can never
+/// hit a stranger. Returns `None` if the process is already gone.
+fn pidfd_open(pid: u32) -> Option<i32> {
+    // SAFETY: pidfd_open has no memory effects; we check the return value.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        None
+    } else {
+        Some(fd as i32)
+    }
+}
+
+/// A child process tracked by `(pid, start_time)` for liveness checks plus a `pidfd` for
+/// race-free signalling. Liveness survives the post-kill zombie window and PID reuse under
+/// parallel load (#628); kills target the exact captured process, never a reused PID.
+///
+/// `Copy` for ergonomics: the `pidfd` is intentionally never closed (test-lifetime leak of
+/// at most three fds — firecracker/pasta/holder — reclaimed when the test process exits).
+#[derive(Clone, Copy, Debug)]
+struct Tracked {
+    pid: u32,
+    start: u64,
+    pidfd: i32,
+}
+
+impl Tracked {
+    /// Capture identity for a live pid; `None` if it is already gone/unreadable. Opens the
+    /// pidfd FIRST so the handle is pinned to the process observed at this instant.
+    fn capture(pid: u32) -> Option<Self> {
+        let pidfd = pidfd_open(pid)?;
+        let Some((_, start)) = proc_state_start(pid) else {
+            // Process died between pidfd_open and the stat read; drop the (now-useless) fd.
+            // SAFETY: fd was just returned by pidfd_open and is not used elsewhere.
+            unsafe { libc::close(pidfd) };
+            return None;
+        };
+        Some(Tracked { pid, start, pidfd })
+    }
+    /// Is this exact process still present and not in a dead/zombie state?
+    fn running(&self) -> bool {
+        same_process_running(self.pid, Some(self.start))
+    }
+    /// SIGKILL the exact captured process via its pidfd. No-op (ESRCH) if already dead, and
+    /// can NEVER signal a reused stranger PID because the pidfd refers to the original process.
+    fn kill_if_running(&self) {
+        // SAFETY: pidfd is a valid open fd; the siginfo arg is NULL (kernel synthesises it).
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd as libc::c_long,
+                libc::SIGKILL as libc::c_long,
+                std::ptr::null::<libc::siginfo_t>(),
+                0 as libc::c_long,
+            );
+        }
+    }
+    /// Close the pidfd. Only used on a discovery rejection path (the process turned out not to
+    /// be ours), where keeping the fd would be a genuine leak rather than an intended one.
+    fn close(self) {
+        // SAFETY: pidfd is a valid open fd owned here and not used after this point.
+        unsafe { libc::close(self.pidfd) };
+    }
+}
+
+/// True iff the tracked process (if any) is still running.
+fn opt_running(t: Option<Tracked>) -> bool {
+    t.is_some_and(|p| p.running())
 }
 
 /// Send a signal to a process
@@ -114,11 +217,9 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
         our_fc_pid.is_some(),
         "should have started a firecracker process"
     );
-    let fc_pid = our_fc_pid.unwrap();
-    assert!(
-        process_exists(fc_pid),
-        "firecracker should be running before SIGINT"
-    );
+    let fc = our_fc_pid.unwrap();
+    let fc_pid = fc.pid;
+    assert!(fc.running(), "firecracker should be running before SIGINT");
 
     // Send SIGINT to fcvm (simulates Ctrl-C)
     println!("Sending SIGINT to fcvm (PID {})", fcvm_pid);
@@ -153,22 +254,22 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     // Poll for firecracker cleanup (max 15 seconds — under CI load, cleanup can be slow)
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
-        if !process_exists(fc_pid) {
+        if !fc.running() {
             break;
         }
         std::thread::sleep(common::POLL_INTERVAL);
     }
 
     // Check if our specific firecracker is still running
-    let still_running = process_exists(fc_pid);
+    let still_running = fc.running();
     if still_running {
         // This is a bug - firecracker should have been killed
         println!(
             "BUG: firecracker (PID {}) is still running after fcvm exit!",
             fc_pid
         );
-        // Clean up for the test
-        let _ = send_signal(fc_pid, "KILL");
+        // Clean up for the test (race-free: pidfd targets the exact captured process)
+        fc.kill_if_running();
     }
     assert!(
         !still_running,
@@ -177,11 +278,8 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     );
 
     // Verify fcvm process itself is gone
-    assert!(
-        !process_exists(fcvm_pid),
-        "fcvm process (PID {}) should be terminated",
-        fcvm_pid
-    );
+    // fcvm.wait()/kill above already reaped the exact child; a bare /proc check here would
+    // only risk a PID-reuse false failure, so we don't re-assert it.
 
     println!("test_sigint_kills_firecracker_bridged PASSED");
     Ok(())
@@ -255,7 +353,8 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
         our_fc_pid.is_some(),
         "should have started a firecracker process"
     );
-    let fc_pid = our_fc_pid.unwrap();
+    let fc = our_fc_pid.unwrap();
+    let fc_pid = fc.pid;
 
     // Send SIGTERM to fcvm
     println!("Sending SIGTERM to fcvm (PID {})", fcvm_pid);
@@ -287,20 +386,21 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     // Poll for firecracker cleanup (max 15 seconds — under CI load, cleanup can be slow)
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
-        if !process_exists(fc_pid) {
+        if !fc.running() {
             break;
         }
         std::thread::sleep(common::POLL_INTERVAL);
     }
 
     // Check if our specific firecracker is still running
-    let still_running = process_exists(fc_pid);
+    let still_running = fc.running();
     if still_running {
         println!(
             "BUG: firecracker (PID {}) is still running after fcvm exit!",
             fc_pid
         );
-        let _ = send_signal(fc_pid, "KILL");
+        // Clean up for the test (race-free: pidfd targets the exact captured process)
+        fc.kill_if_running();
     }
     assert!(
         !still_running,
@@ -309,11 +409,8 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     );
 
     // Verify fcvm process itself is gone
-    assert!(
-        !process_exists(fcvm_pid),
-        "fcvm process (PID {}) should be terminated",
-        fcvm_pid
-    );
+    // fcvm.wait()/kill above already reaped the exact child; a bare /proc check here would
+    // only risk a PID-reuse false failure, so we don't re-assert it.
 
     println!("test_sigterm_kills_firecracker_bridged PASSED");
     Ok(())
@@ -423,8 +520,8 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     // Poll for child process cleanup (max 15 seconds — snapshot abort may extend cleanup)
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
-        let fc_alive = our_fc_pid.is_some_and(process_exists);
-        let pasta_alive = our_pasta_pid.is_some_and(process_exists);
+        let fc_alive = opt_running(our_fc_pid);
+        let pasta_alive = opt_running(our_pasta_pid);
         if !fc_alive && !pasta_alive {
             break;
         }
@@ -432,32 +529,29 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     }
 
     // Verify our SPECIFIC processes are cleaned up
-    if let Some(fc_pid) = our_fc_pid {
-        let still_running = process_exists(fc_pid);
+    if let Some(fc) = our_fc_pid {
+        let still_running = fc.running();
         assert!(
             !still_running,
             "our firecracker (PID {}) should be killed after SIGTERM",
-            fc_pid
+            fc.pid
         );
-        println!("Firecracker PID {} correctly cleaned up", fc_pid);
+        println!("Firecracker PID {} correctly cleaned up", fc.pid);
     }
 
-    if let Some(pasta_pid) = our_pasta_pid {
-        let still_running = process_exists(pasta_pid);
+    if let Some(pasta) = our_pasta_pid {
+        let still_running = pasta.running();
         assert!(
             !still_running,
             "our pasta (PID {}) should be killed after SIGTERM",
-            pasta_pid
+            pasta.pid
         );
-        println!("pasta PID {} correctly cleaned up", pasta_pid);
+        println!("pasta PID {} correctly cleaned up", pasta.pid);
     }
 
     // Verify fcvm process itself is gone
-    assert!(
-        !process_exists(fcvm_pid),
-        "fcvm process (PID {}) should be terminated",
-        fcvm_pid
-    );
+    // fcvm.wait()/kill above already reaped the exact child; a bare /proc check here would
+    // only risk a PID-reuse false failure, so we don't re-assert it.
 
     println!("test_sigterm_cleanup_rootless PASSED");
     Ok(())
@@ -531,11 +625,10 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
         our_fc_pid.is_some(),
         "should have started a firecracker process"
     );
-    let fc_pid = our_fc_pid.unwrap();
-    assert!(
-        process_exists(fc_pid),
-        "firecracker should be running before SIGKILL"
-    );
+    // `fc`/`holder` are tracked by (pid, start_time) so the post-kill checks below survive
+    // both the SIGKILL'd-but-unreaped zombie window and PID reuse under parallel load (#628).
+    let fc = our_fc_pid.unwrap();
+    assert!(fc.running(), "firecracker should be running before SIGKILL");
 
     // Send SIGKILL to fcvm — no cleanup handler runs
     println!("Sending SIGKILL to fcvm (PID {})", fcvm_pid);
@@ -549,50 +642,45 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
     // Poll briefly in case of scheduling delay.
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        let fc_alive = process_exists(fc_pid);
-        let holder_alive = our_holder_pid.is_some_and(process_exists);
-        if !fc_alive && !holder_alive {
+        if !fc.running() && !opt_running(our_holder_pid) {
             break;
         }
         std::thread::sleep(common::POLL_INTERVAL);
     }
 
-    let fc_still_running = process_exists(fc_pid);
+    let fc_still_running = fc.running();
     if fc_still_running {
         println!(
             "BUG: firecracker (PID {}) still running after fcvm SIGKILL!",
-            fc_pid
+            fc.pid
         );
-        let _ = send_signal(fc_pid, "KILL");
+        fc.kill_if_running();
     }
     assert!(
         !fc_still_running,
         "firecracker (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
-        fc_pid
+        fc.pid
     );
 
-    if let Some(holder_pid) = our_holder_pid {
-        let holder_still_running = process_exists(holder_pid);
+    if let Some(holder) = our_holder_pid {
+        let holder_still_running = holder.running();
         if holder_still_running {
             println!(
                 "BUG: namespace holder (PID {}) still running after fcvm SIGKILL!",
-                holder_pid
+                holder.pid
             );
-            let _ = send_signal(holder_pid, "KILL");
+            holder.kill_if_running();
         }
         assert!(
             !holder_still_running,
             "namespace holder (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
-            holder_pid
+            holder.pid
         );
-        println!("Holder PID {} correctly cleaned up", holder_pid);
+        println!("Holder PID {} correctly cleaned up", holder.pid);
     }
 
-    assert!(
-        !process_exists(fcvm_pid),
-        "fcvm process (PID {}) should be dead",
-        fcvm_pid
-    );
+    // fcvm.wait() above already reaped the exact child, so no procfs assert needed (a bare
+    // /proc check would only add a PID-reuse false failure).
 
     println!("test_sigkill_kills_firecracker_rootless PASSED");
     Ok(())
@@ -600,7 +688,7 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
 
 /// Find the firecracker process spawned by a specific fcvm process
 /// by looking at the parent PID chain
-fn find_firecracker_for_fcvm(fcvm_pid: u32) -> Option<u32> {
+fn find_firecracker_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     // Get all firecracker PIDs
     let output = Command::new("pgrep")
         .args(["-f", "firecracker.*--api-sock"])
@@ -636,15 +724,40 @@ fn find_firecracker_for_fcvm(fcvm_pid: u32) -> Option<u32> {
             );
             // Check if this firecracker's parent chain includes our fcvm PID
             if is_desc {
-                return Some(fc_pid);
+                if let Some(t) = capture_descendant(fc_pid, fcvm_pid, "firecracker") {
+                    return Some(t);
+                }
             }
         }
     }
     None
 }
 
+/// Pin `pid` via a pidfd, then RE-confirm it is STILL the process we want: a descendant of
+/// `fcvm_pid`, still alive, and whose `comm` still starts with `comm_prefix`. The ancestry
+/// pre-filter and the capture are separate procfs reads, so the pid could be reaped and reused
+/// in between; re-checking ancestry rejects a reused non-descendant, and re-checking `comm`
+/// rejects the (vanishingly rare) case where the pid is reused by ANOTHER descendant of the
+/// same fcvm with a different role.
+///
+/// `comm` is the executable basename truncated to 15 chars (`TASK_COMM_LEN`), e.g. the
+/// firecracker binary `firecracker-default-….bin` shows as `firecracker-def`, so we match by
+/// prefix rather than equality. Returns `None`, closing the pidfd, if gone or no longer ours.
+fn capture_descendant(pid: u32, fcvm_pid: u32, comm_prefix: &str) -> Option<Tracked> {
+    let t = Tracked::capture(pid)?;
+    let ours = is_descendant_of(t.pid, fcvm_pid)
+        && t.running()
+        && proc_comm(t.pid).is_some_and(|c| c.starts_with(comm_prefix));
+    if ours {
+        Some(t)
+    } else {
+        t.close();
+        None
+    }
+}
+
 /// Find the pasta process spawned by a specific fcvm process
-fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<u32> {
+fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     let output = Command::new("pgrep").args(["-f", "pasta"]).output().ok()?;
 
     if !output.status.success() {
@@ -656,14 +769,16 @@ fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<u32> {
         if let Ok(pasta_pid) = line.trim().parse::<u32>() {
             // Check if this pasta's parent chain includes our fcvm PID
             if is_descendant_of(pasta_pid, fcvm_pid) {
-                return Some(pasta_pid);
+                if let Some(t) = capture_descendant(pasta_pid, fcvm_pid, "pasta") {
+                    return Some(t);
+                }
             }
         }
     }
     None
 }
 
-fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<u32> {
+fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     let output = Command::new("pgrep")
         .args(["-f", "sleep infinity"])
         .output()
@@ -677,7 +792,10 @@ fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<u32> {
     for line in stdout.lines() {
         if let Ok(pid) = line.trim().parse::<u32>() {
             if is_descendant_of(pid, fcvm_pid) {
-                return Some(pid);
+                // The holder is `sleep infinity`, whose comm is "sleep".
+                if let Some(t) = capture_descendant(pid, fcvm_pid, "sleep") {
+                    return Some(t);
+                }
             }
         }
     }
@@ -823,7 +941,7 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     // Poll for child process cleanup (max 5 seconds)
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        let fc_alive = our_fc_pid.is_some_and(process_exists);
+        let fc_alive = opt_running(our_fc_pid);
         if !fc_alive {
             break;
         }
@@ -831,22 +949,19 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     }
 
     // Verify our SPECIFIC processes are cleaned up
-    if let Some(fc_pid) = our_fc_pid {
-        let still_running = process_exists(fc_pid);
+    if let Some(fc) = our_fc_pid {
+        let still_running = fc.running();
         assert!(
             !still_running,
             "our firecracker (PID {}) should be killed after SIGTERM",
-            fc_pid
+            fc.pid
         );
-        println!("Firecracker PID {} correctly cleaned up", fc_pid);
+        println!("Firecracker PID {} correctly cleaned up", fc.pid);
     }
 
     // Verify fcvm process itself is gone
-    assert!(
-        !process_exists(fcvm_pid),
-        "fcvm process (PID {}) should be terminated",
-        fcvm_pid
-    );
+    // fcvm.wait()/kill above already reaped the exact child; a bare /proc check here would
+    // only risk a PID-reuse false failure, so we don't re-assert it.
 
     println!("test_sigterm_cleanup_bridged PASSED");
     Ok(())
@@ -991,7 +1106,7 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
     // Poll for child process cleanup (max 15 seconds)
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
-        let fc_alive = our_fc_pid.is_some_and(process_exists);
+        let fc_alive = opt_running(our_fc_pid);
         if !fc_alive {
             break;
         }
@@ -1001,11 +1116,11 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
     // === Verify ALL resources are cleaned up ===
 
     // 1. Firecracker process
-    if let Some(fc_pid) = our_fc_pid {
+    if let Some(fc) = our_fc_pid {
         assert!(
-            !process_exists(fc_pid),
+            !fc.running(),
             "firecracker (PID {}) should be killed after SIGTERM",
-            fc_pid
+            fc.pid
         );
         println!("  [OK] Firecracker process cleaned up");
     }
@@ -1075,11 +1190,8 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
     println!("  [OK] ip6tables MASQUERADE rule for {} removed", vm_ipv6);
 
     // 8. fcvm process itself is gone
-    assert!(
-        !process_exists(fcvm_pid),
-        "fcvm process (PID {}) should be terminated",
-        fcvm_pid
-    );
+    // fcvm.wait()/kill above already reaped the exact child; a bare /proc check here would
+    // only risk a PID-reuse false failure, so we don't re-assert it.
     println!("  [OK] fcvm process terminated");
 
     // 9. State file cleaned up
@@ -1099,4 +1211,105 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
 
     println!("test_sigterm_cleanup_routed PASSED");
     Ok(())
+}
+
+/// Regression test for #628: a SIGKILL'd-but-unreaped child is a zombie whose `/proc/<pid>`
+/// still exists, so the OLD liveness check (bare `/proc/<pid>` existence) reported it as "still
+/// running" right after the kill — exactly the spurious failure the cleanup tests hit.
+///
+/// This reproduces the bug deterministically with no VM and no root: spawn a child, SIGKILL it
+/// WITHOUT reaping, and assert the zombie window is handled correctly.
+#[test]
+fn test_zombie_is_not_running_regression_628() {
+    // Spawn a child we fully own (no root needed) and pin its identity while alive.
+    let mut child = Command::new("sleep")
+        .arg("1000")
+        .spawn()
+        .expect("spawn sleep child");
+    let pid = child.id();
+
+    let tracked = Tracked::capture(pid).expect("capture live child");
+    assert!(
+        tracked.running(),
+        "child should be running right after spawn"
+    );
+
+    // Kill it but DELIBERATELY do not reap (no wait()), so it lingers as a zombie — the exact
+    // state that produced the #628 flake.
+    send_signal(pid, "KILL").expect("SIGKILL child");
+
+    // Wait for it to actually enter the zombie state (Z). Bounded so a stuck test fails loudly.
+    let start = std::time::Instant::now();
+    let mut became_zombie = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        if matches!(proc_state_start(pid), Some(('Z', _))) {
+            became_zombie = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        became_zombie,
+        "child (PID {}) should be a zombie after SIGKILL without reaping",
+        pid
+    );
+
+    // The trap that broke the old check: the bare procfs entry STILL exists for a zombie.
+    assert!(
+        std::path::Path::new(&format!("/proc/{}", pid)).exists(),
+        "/proc/<pid> still exists for a zombie — this is exactly why a bare existence check \
+         spuriously reported the killed process as 'running' (#628)"
+    );
+
+    // THE FIX: identity-aware liveness treats the zombie as gone.
+    assert!(
+        !tracked.running(),
+        "Tracked::running() must report a SIGKILL'd zombie as NOT running (#628 regression)"
+    );
+
+    // Reap so we leave no zombie behind.
+    let _ = child.wait();
+
+    // After reaping, the pid is gone entirely.
+    assert!(
+        !tracked.running(),
+        "Tracked::running() must stay false after the zombie is reaped"
+    );
+}
+
+/// Regression test for #628 (PID-reuse half): identity is `(pid, start_time)`, so a live pid
+/// whose `start_time` differs from the captured one (i.e. the PID was reused by a different
+/// process) is correctly reported as NOT our process — a bare PID check would be fooled.
+#[test]
+fn test_start_time_identity_defeats_pid_reuse_628() {
+    // Our own process is guaranteed alive; field 22 start_time is stable for its lifetime.
+    let me = std::process::id();
+    let (_, real_start) = proc_state_start(me).expect("read own /proc stat");
+
+    // Same pid, correct start_time -> recognised as alive.
+    assert!(
+        same_process_running(me, Some(real_start)),
+        "matching (pid, start_time) should report running"
+    );
+
+    // Same (alive) pid, WRONG start_time -> recognised as a different (reused) process.
+    let wrong_start = real_start.wrapping_add(1);
+    assert!(
+        !same_process_running(me, Some(wrong_start)),
+        "a mismatched start_time must defeat PID reuse, even though the PID is alive (#628)"
+    );
+
+    // No captured start_time (process was already gone at capture) -> never running.
+    assert!(
+        !same_process_running(me, None),
+        "absent start_time must report not running"
+    );
+
+    // Dead/zombie states are all treated as gone.
+    for s in ['Z', 'X', 'x'] {
+        assert!(is_dead_state(s), "{} should count as a dead state", s);
+    }
+    for s in ['R', 'S', 'D', 'T', 't', 'I'] {
+        assert!(!is_dead_state(s), "{} should count as a live state", s);
+    }
 }
