@@ -3,24 +3,45 @@
 Analyze CI test run artifacts - counts VMs spawned during tests.
 
 Usage:
-    python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
+    python3 scripts/analyze_ci_vms.py [--allow-missing] /tmp/ci-artifacts
 """
 import sys
 from pathlib import Path
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: analyze_ci_vms.py <artifacts-dir>")
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    allow_missing = "--allow-missing" in flags
+    # Reject unknown flags rather than silently discarding them — a typo like
+    # `--allow-misssing` must not be quietly ignored back into strict mode.
+    unknown = [f for f in flags if f != "--allow-missing"]
+    if unknown or len(args) != 1:
+        print(
+            f"Usage: analyze_ci_vms.py [--allow-missing] <artifacts-dir>"
+            + (f"\nUnknown argument(s): {' '.join(unknown)}" if unknown else ""),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    artifacts_dir = Path(sys.argv[1])
+    artifacts_dir = Path(args[0])
     if not artifacts_dir.is_dir():
-        # No artifacts to analyze. The Summary job already gates this step on the
-        # test matrix having run, so reaching here means the matrix produced no
-        # artifacts (e.g. it was skipped). Report it without failing the job.
-        print("No CI artifacts to analyze (test matrix skipped or uploaded nothing)")
-        return
+        # Missing artifacts directory. This is only benign when the caller KNOWS
+        # the matrix was intentionally skipped (pass --allow-missing). Otherwise
+        # the matrix ran but produced no artifacts — e.g. jobs died before
+        # creating their log dir, with uploads set to `if-no-files-found: ignore`
+        # — which is a real loss of diagnostics, NOT success. Fail loudly so the
+        # Summary signal is not silently green (#639).
+        if allow_missing:
+            print("No CI artifacts to analyze (test matrix skipped)")
+            return
+        print(
+            f"ERROR: artifacts directory {artifacts_dir} is missing, but the test "
+            "matrix was expected to run. Test jobs likely failed before uploading "
+            "logs. Pass --allow-missing only on the intentional skip path.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Count VMs from log files
     base_vms = 0
