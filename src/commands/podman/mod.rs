@@ -38,9 +38,7 @@ use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, 
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
-use image::{
-    build_storage_image, get_image_identifier, get_localhost_image_id, validate_docker_archive,
-};
+use image::{build_storage_image, get_image_cache_ref, validate_docker_archive};
 use tokio_util::sync::CancellationToken;
 
 /// Resolve the rootfs filesystem type from CLI args and kernel profile config.
@@ -315,20 +313,13 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
-    // Resolve the image identifier ONCE: digest for localhost/ images (single podman
-    // inspect), name for remote images. The same value feeds both the snapshot cache key
-    // and the image export cache below, so the two can never disagree when a localhost
-    // tag is rebuilt between two separate inspects.
-    let image_identifier = get_image_identifier(&args.image).await?;
-
-    // For localhost/ images, also capture the immutable image ID now, right next to the
-    // digest cache key, so the export below pins the exact content this key names even if
-    // a parallel build repoints the tag before the export runs (#598).
-    let localhost_image_id = if args.image.starts_with("localhost/") {
-        Some(get_localhost_image_id(&args.image).await?)
-    } else {
-        None
-    };
+    // Resolve the cache key (manifest digest for localhost/, reference for remote) AND
+    // the immutable export id in ONE inspect, so they are an atomic view of the same
+    // image: a parallel build that repoints the tag can't make the cache key name one
+    // image while the export pins another (#598). For remote images image_id is None.
+    let image_ref = get_image_cache_ref(&args.image).await?;
+    let image_identifier = image_ref.cache_key;
+    let localhost_image_id = image_ref.image_id;
 
     // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
