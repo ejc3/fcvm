@@ -339,10 +339,13 @@ async fn wait_for_peer_close(watch: &AsyncFd<OwnedFd>) {
             }
             return;
         }
-        // n > 0: the host should send nothing after the request. Drain one byte so we don't
-        // busy-spin on persistent readiness, then keep watching for the eventual close.
+        // n > 0: the host should send nothing after the request (it only reads responses,
+        // and never half-closes its write side while waiting — see the host exec client).
+        // This branch is therefore defensive: drain one byte and loop WITHOUT clear_ready
+        // (calling clear_ready after a successful read is a tokio anti-pattern). The fd
+        // stays marked ready, so the next readable() drains again until EAGAIN, which then
+        // clears readiness and parks until the eventual close edge.
         let _ = unsafe { libc::recv(fd, byte.as_mut_ptr().cast(), 1, libc::MSG_DONTWAIT) };
-        guard.clear_ready();
     }
 }
 
@@ -414,8 +417,26 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     // fd numbers, so there is no double-close.
     let peer_watch: Option<AsyncFd<OwnedFd>> =
         match nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0)) {
-            Ok(dup) => AsyncFd::new(unsafe { OwnedFd::from_raw_fd(dup) }).ok(),
-            Err(_) => None,
+            Ok(dup) => match AsyncFd::new(unsafe { OwnedFd::from_raw_fd(dup) }) {
+                Ok(afd) => Some(afd),
+                // Extremely rare (reactor registration failure). Don't fail the exec, but
+                // don't fail silently either: without the watcher, host-disconnect kill is
+                // disabled for this exec (degrades to the pre-#636 wait-only behavior).
+                Err(e) => {
+                    eprintln!(
+                        "[fc-agent] WARN: peer-close watcher AsyncFd failed ({e}); \
+                         host-disconnect kill disabled for this exec"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[fc-agent] WARN: peer-close watcher dup failed ({e}); \
+                     host-disconnect kill disabled for this exec"
+                );
+                None
+            }
         };
     let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let async_fd = match AsyncFd::new(owned_fd) {

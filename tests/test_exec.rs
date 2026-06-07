@@ -13,6 +13,7 @@ mod common;
 use anyhow::{Context, Result};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
@@ -1850,51 +1851,76 @@ async fn test_exec_host_disconnect_kills_guest_child() -> Result<()> {
         return Err(e.context("VM failed to become healthy"));
     }
 
-    // Unique marker the guest command will `touch` only AFTER an 8s sleep. If the guest
-    // subtree is killed when we drop the host exec, the sleep dies and the marker is never
-    // created.
+    // Unique marker the guest command `touch`es only AFTER an 8s sleep. It first prints
+    // READY so we can wait until the command is actually running before severing the host
+    // exec — otherwise, on a slow runner, we might kill the host exec before the guest
+    // command even started, and the marker would be absent even in the broken impl (a false
+    // pass). Run the work inside an async block so the cleanup below runs on every path.
     let marker = format!("/tmp/fcvm636-{}", fcvm_pid);
-    let guest_cmd = format!("sleep 8 && touch {}", marker);
+    let guest_cmd = format!("echo READY; sleep 8; touch {}", marker);
 
-    // Spawn a host `fcvm exec --vm` directly so we can kill it mid-flight (kill_on_drop).
-    let mut exec = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "exec",
-            "--pid",
-            &fcvm_pid.to_string(),
-            "--vm",
-            "--",
-            "sh",
-            "-c",
-            &guest_cmd,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawning host fcvm exec")?;
+    let result: Result<()> = async {
+        // Host `fcvm exec --vm` we control directly so we can sever it mid-flight.
+        let mut exec = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "exec",
+                "--pid",
+                &fcvm_pid.to_string(),
+                "--vm",
+                "--",
+                "sh",
+                "-c",
+                &guest_cmd,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning host fcvm exec")?;
 
-    // Let the guest command start (it is now mid-`sleep 8`), then sever the host exec.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let _ = exec.start_kill();
-    let _ = exec.wait().await;
+        // Wait for READY (proves the guest command is running) before severing.
+        let stdout = exec.stdout.take().context("exec stdout missing")?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let ready = tokio::time::timeout(Duration::from_secs(120), async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("READY") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        anyhow::ensure!(ready, "guest command never signaled READY");
 
-    // Wait past when the marker WOULD appear if the guest sleep had survived.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+        // Sever the host exec now that the guest is mid-`sleep 8`.
+        let _ = exec.start_kill();
+        let _ = exec.wait().await;
 
-    let check = common::exec_in_vm(
-        fcvm_pid,
-        &["sh", "-c", &format!("test -f {} && echo EXISTS || echo GONE", marker)],
-    )
-    .await
-    .context("checking marker in guest")?;
+        // Wait past when the marker WOULD appear if the guest sleep had survived.
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
+        let check = common::exec_in_vm(
+            fcvm_pid,
+            &[
+                "sh",
+                "-c",
+                &format!("test -f {} && echo EXISTS || echo GONE", marker),
+            ],
+        )
+        .await
+        .context("checking marker in guest")?;
+
+        anyhow::ensure!(
+            check.contains("GONE"),
+            "#636 regression: guest command survived host exec disconnect (marker present): {:?}",
+            check
+        );
+        Ok(())
+    }
+    .await;
+
+    // Cleanup on every post-health path (the async block above may return early).
     common::kill_process(fcvm_pid).await;
-
-    assert!(
-        check.contains("GONE"),
-        "#636 regression: guest command survived host exec disconnect (marker present): {:?}",
-        check
-    );
-    Ok(())
+    result
 }
