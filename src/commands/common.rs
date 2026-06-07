@@ -712,25 +712,34 @@ pub struct RestoreParams<'a> {
     pub track_dirty_pages: bool,
 }
 
-/// Recover the `vm-disks/<vm_id>` directory IDs that are embedded as block-device
-/// `path_on_host` strings inside a Firecracker `vmstate.bin`.
+/// Recover the `vm-disks/<vm_id>` directory IDs that own the rootfs `path_on_host`
+/// strings embedded inside a Firecracker `vmstate.bin`.
 ///
 /// Firecracker serializes each drive's host path as a plain UTF-8 string, so we can
-/// read the exact paths `LoadSnapshot` will open instead of trusting (possibly stale)
-/// snapshot metadata. This is the ground truth for the bind-mount redirects (#608):
-/// a multi-level snapshot chain (cache → snapshot → cache → snapshot) can embed an
-/// intermediate VM's disk path that the metadata — which only tracks the immediate
+/// read the exact rootfs path `LoadSnapshot` will open instead of trusting (possibly
+/// stale) snapshot metadata. This is the ground truth for the bind-mount redirects
+/// (#608): a multi-level snapshot chain (cache → snapshot → cache → snapshot) can embed
+/// an intermediate VM's disk path that the metadata — which only tracks the immediate
 /// creator (`vm_id`) and the original vsock VM (`original_vsock_vm_id`) — no longer
-/// names. Without a redirect for that directory, `LoadSnapshot` opens the embedded
-/// path directly: it fails (ENOENT) once that sibling has been cleaned up, or, worse,
+/// names. Without a redirect for that directory, `LoadSnapshot` opens the embedded path
+/// directly: it fails (ENOENT) once that sibling has been cleaned up, or, worse,
 /// silently opens a different live VM's rootfs.
 ///
-/// Returns the de-duplicated vm_ids found in any `…/vm-disks/<vm_id>/disks…` path.
-/// Best-effort: an unreadable file or no matches yields an empty vec, leaving the
-/// metadata-derived redirects untouched (purely additive, never removes a redirect).
+/// The match is anchored to fcvm's own rootfs filename, `…/vm-disks/<id>/disks/rootfs.raw`,
+/// NOT any `…/vm-disks/<id>/disks…` path. An external `--disk` whose host path happens to
+/// live under such a directory must not be redirected: it is deliberately not copied into
+/// the clone dir (`extra_disks_to_snapshot` filters it out), so shadowing it with a
+/// bind-mount would break `LoadSnapshot`. Bind-mounting the matched `vm-disks/<id>` dir
+/// still redirects any sibling extra disks in the same dir, so this only narrows what we
+/// *match on*, not what a matched redirect covers.
+///
+/// Returns the de-duplicated vm_ids whose rootfs path is embedded. Best-effort: an
+/// unreadable file or no matches yields an empty vec, leaving the metadata-derived
+/// redirects untouched (purely additive, never removes a redirect).
 pub(crate) fn disk_vm_ids_in_vmstate(vmstate_path: &Path) -> Vec<String> {
     const PREFIX: &[u8] = b"/vm-disks/";
-    const SUFFIX: &[u8] = b"/disks";
+    // Anchor on the rootfs filename so an external --disk under a vm-disks dir is ignored.
+    const SUFFIX: &[u8] = b"/disks/rootfs.raw";
 
     let Ok(bytes) = std::fs::read(vmstate_path) else {
         return Vec::new();
@@ -757,7 +766,7 @@ pub(crate) fn disk_vm_ids_in_vmstate(vmstate_path: &Path) -> Vec<String> {
             }
             id_end += 1;
         }
-        // Require the canonical `…/vm-disks/<id>/disks` shape before trusting it.
+        // Require the canonical `…/vm-disks/<id>/disks/rootfs.raw` shape before trusting it.
         if id_end > id_start && bytes[id_end..].starts_with(SUFFIX) {
             if let Ok(id) = std::str::from_utf8(&bytes[id_start..id_end]) {
                 if !ids.iter().any(|e| e == id) {
@@ -2232,29 +2241,34 @@ mod tests {
         assert_eq!(chain, vec!["my-snap", "startup-def", "pre-start-abc"]);
     }
 
-    /// #608: the vmstate disk-path scanner must recover every embedded `vm-disks/<id>`
-    /// directory from a binary blob, including ids the snapshot metadata no longer
-    /// names, while ignoring binary noise and non-canonical occurrences.
+    /// #608: the vmstate scanner must recover every embedded rootfs `vm-disks/<id>`
+    /// directory from a binary blob (including ids the metadata no longer names) while
+    /// ignoring binary noise, non-canonical occurrences, AND — per Codex review — any
+    /// non-rootfs disk path (an external `--disk` that happens to live under a vm-disks
+    /// dir must not be redirected).
     #[test]
     fn test_disk_vm_ids_in_vmstate_extracts_embedded_paths() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
         let mut f = NamedTempFile::new().unwrap();
-        // Binary noise, then a rootfs path, more noise, an extra-disk path for a
-        // DIFFERENT vm_id (the dropped-intermediate case), a duplicate, and a
-        // non-canonical `/vm-disks/...` without the `/disks` suffix that must be ignored.
+        // Binary noise, then a rootfs path, more noise, a SECOND distinct rootfs path
+        // (the dropped-intermediate case in a multi-level chain), and a duplicate.
         f.write_all(&[0x00, 0xFF, 0x07, 0x42]).unwrap();
         f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-c09f1234/disks/rootfs.raw")
             .unwrap();
         f.write_all(&[0x00, 0x00, 0x13]).unwrap();
-        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-5ba53cAA/disks/disk-dir-0.raw")
+        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-5ba53cAA/disks/rootfs.raw")
             .unwrap();
         f.write_all(&[0x99]).unwrap();
         // duplicate of the first id — must be de-duplicated
-        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-c09f1234/disks/extra.raw")
+        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-c09f1234/disks/rootfs.raw")
             .unwrap();
-        // non-canonical: no `/disks` segment — must be ignored
+        // An external --disk that lives under a vm-disks dir but is NOT a rootfs — must
+        // be ignored so we don't shadow a drive the clone dir doesn't contain.
+        f.write_all(b"/mnt/fcvm-btrfs/container/vm-disks/vm-extern99/disks/my-external.raw")
+            .unwrap();
+        // non-canonical: no `/disks/rootfs.raw` suffix — must be ignored
         f.write_all(b"/vm-disks/not-a-disk-dir/state\x00").unwrap();
         f.flush().unwrap();
 
@@ -2263,7 +2277,8 @@ mod tests {
         assert_eq!(
             ids,
             vec!["vm-5ba53cAA".to_string(), "vm-c09f1234".to_string()],
-            "should recover both embedded disk vm_ids (deduped), ignoring noise and non-disk paths"
+            "should recover only the embedded rootfs vm_ids (deduped), ignoring noise, \
+             non-canonical paths, and non-rootfs (external) disks"
         );
     }
 
