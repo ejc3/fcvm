@@ -3,17 +3,25 @@
 Analyze CI test run artifacts - counts VMs spawned during tests.
 
 Usage:
-    python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
+    python3 scripts/analyze_ci_vms.py [--allow-missing] /tmp/ci-artifacts
 """
 import sys
 from pathlib import Path
 
 
 def main():
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    allow_missing = "--allow-missing" in sys.argv[1:]
-    if len(args) < 1:
-        print("Usage: analyze_ci_vms.py [--allow-missing] <artifacts-dir>")
+    allow_missing = "--allow-missing" in flags
+    # Reject unknown flags rather than silently discarding them — a typo like
+    # `--allow-misssing` must not be quietly ignored back into strict mode.
+    unknown = [f for f in flags if f != "--allow-missing"]
+    if unknown or len(args) != 1:
+        print(
+            f"Usage: analyze_ci_vms.py [--allow-missing] <artifacts-dir>"
+            + (f"\nUnknown argument(s): {' '.join(unknown)}" if unknown else ""),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     artifacts_dir = Path(args[0])
