@@ -13,8 +13,14 @@ test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 2 }
 # Fail fast on first failure
 fail-fast = false
-# Retry flaky tests once
-retries = 0
+# Retry flaky tests under load before failing the run. The e2e suite runs ~538 tests
+# (twice in the SnapshotEnabled matrix) on contended self-hosted runners, where genuine
+# load/contention flakes (snapshot-create disk contention, clone stress, orphan-zombie
+# reaping) occasionally trip a single test. A short delay lets a contention spike pass.
+# `final-status-level = "flaky"` still REPORTS any test that only passed on retry, so
+# flakes stay visible and tracked (see #619 and the per-test flake tickets) rather than
+# hidden — retries mitigate, they do not excuse leaving a flake un-root-caused.
+retries = { backoff = "fixed", count = 1, delay = "5s" }
 # Status level for output
 status-level = "pass"
 final-status-level = "flaky"
@@ -27,7 +33,7 @@ failure-output = "immediate"
 test-threads = "num-cpus"
 slow-timeout = { period = "120s", terminate-after = 2 }
 fail-fast = false
-retries = 0
+retries = { backoff = "fixed", count = 1, delay = "5s" }
 status-level = "all"
 final-status-level = "all"
 
@@ -96,7 +102,7 @@ slow-timeout = { period = "120s", terminate-after = 1 }
 test-threads = 1  # avoid container name conflicts (fcvm-container)
 slow-timeout = { period = "120s", terminate-after = 2 }
 fail-fast = false
-retries = 0
+retries = { backoff = "fixed", count = 1, delay = "5s" }
 status-level = "pass"
 final-status-level = "flaky"
 success-output = "immediate"
