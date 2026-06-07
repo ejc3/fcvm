@@ -73,8 +73,15 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           PR_NUM="${{ steps.get-pr.outputs.number }}"
-          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            # No PR (e.g., main branch CI, or a comment on a plain issue) - treat as owner.
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" = "issue_comment" ] || [ "$EVENT" = "pull_request_review_comment" ]; then
+            # Comment-triggered runs are gated on the COMMENTER's association, never the PR
+            # author's nor a PR_NUM=0 fallback. This blocks an external user who comments
+            # `@claude` on a plain issue (PR_NUM=0), which would otherwise be treated as
+            # OWNER below and bypass every safety output.
+            echo "assoc=${{ github.event.comment.author_association }}" >> $GITHUB_OUTPUT
+          elif [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
+            # No PR and not a comment (e.g., main-branch CI / workflow_run) - treat as owner.
             echo "assoc=OWNER" >> $GITHUB_OUTPUT
           else
             # Tolerate a 404 (e.g. number is not actually a PR) instead of failing the
@@ -307,7 +314,7 @@ jobs:
       needs.safety-check.outputs.author_ok == 'true' &&
       needs.safety-check.outputs.commits_ok == 'true' &&
       !contains(github.event.comment.body, '/claude-review') &&
-      ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      ((github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude')) ||
        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
