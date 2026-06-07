@@ -144,9 +144,11 @@ jobs:
             echo "ok=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # FAIL CLOSED if the commits API errors (don't let an empty result pass).
-          if ! LOGINS=$(gh api "repos/$REPO/pulls/$PR_NUM/commits" --jq \
-            '[.[] | select(.author.type != "Bot" and .author.login != null) | .author.login] | unique | .[]'); then
+          # FAIL CLOSED if the commits API errors. --paginate so a non-member commit past
+          # page 1 is not missed. A non-bot commit with no linked GitHub login is UNLINKED
+          # (unverifiable) -> treated as non-member below (its permission lookup 404s).
+          if ! LOGINS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/commits?per_page=100" --jq \
+            '.[] | select(.author.type != "Bot") | (.author.login // "UNLINKED")' | sort -u); then
             echo "::warning::Blocking Claude - commits API failed (failing closed)"
             echo "ok=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -180,8 +182,10 @@ jobs:
           # FAIL CLOSED: an API error must block Claude, not allow it. (No `|| echo 0`,
           # which would turn a transient 5xx/rate-limit into safe=true and let a
           # non-member comment through.)
-          if ! ISSUE=$(gh api "repos/$REPO/issues/$PR_NUM/comments" --jq "$NONMEMBER_FILTER") \
-             || ! REVIEW=$(gh api "repos/$REPO/pulls/$PR_NUM/comments" --jq "$NONMEMBER_FILTER"); then
+          # --paginate so a non-member comment past page 1 is not missed; sum the
+          # per-page counts. Any API/parse failure fails closed.
+          if ! ISSUE=$(gh api --paginate "repos/$REPO/issues/$PR_NUM/comments?per_page=100" --jq "$NONMEMBER_FILTER" | jq -s 'add // 0') \
+             || ! REVIEW=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/comments?per_page=100" --jq "$NONMEMBER_FILTER" | jq -s 'add // 0'); then
             echo "::warning::Blocking Claude - comments API failed (failing closed)"
             echo "safe=false" >> "$GITHUB_OUTPUT"
             exit 0
