@@ -25,10 +25,10 @@ The research proved FC and CH are closely aligned:
 - Both support **direct kernel boot**, **UFFD lazy restore**, **static single binaries**,
   and **seccomp** — similar security posture (no QEMU large-surface concern).
 
-## Current Firecracker coupling (~6k LOC / ~21%)
-`src/firecracker/` (api/config/vm) is the trait boundary; snapshot/restore lives in
-`src/commands/common.rs`; the UFFD server in `src/uffd/`; guest comms = vsock ports +
-**MMDS** (the boot plan to fc-agent).
+## Current Firecracker coupling (~5k LOC / ~17%)
+`src/firecracker/` (~1.7k LOC: api/config/vm) is the trait boundary; snapshot/restore lives
+in `src/commands/common.rs` (~2.3k LOC); the UFFD server in `src/uffd/` (~0.9k LOC); guest
+comms = vsock ports + **MMDS** (the boot plan to fc-agent).
 
 ## Capability mapping (FC vs CH) — load-bearing conclusions
 Full table + citations in #632.
@@ -45,8 +45,10 @@ Full table + citations in #632.
 | metadata service (boot plan) | ✅ MMDS | ❌ no MMDS | **boot-plan over vsock** (portable; keep MMDS as FC fast path) |
 | nested ARM64 (FEAT_NV2) | ✅ (custom fork + DSB kernel patches) | ❌ (CH nested is x86-only) | cap `nested_arm64` (FC-only) |
 
-Net: only **four** capability gates separate the two (memory-share verification, diff
-snapshots, native metadata, ARM64 nesting) — everything else is shared.
+Net: only **five** capability gates separate the two (memory-share verification, diff
+snapshots, drive retarget, native metadata, ARM64 nesting) — everything else is shared.
+`uffd_lazy_restore` is a capability (both support it) to future-proof the trait if a
+backend without UFFD is ever added.
 
 ## Proposed abstraction
 Move `src/firecracker/` → `src/hypervisor/{firecracker,cloud_hypervisor}/`.
