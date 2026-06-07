@@ -737,40 +737,18 @@ gh pr close <fix-pr-number>  # Close the auto-generated PR
 gh pr view <pr-number> --json comments --jq '.comments[] | .body'
 ```
 
-### GitHub Actions Workflow Security (claude.yml et al.)
+### GitHub Actions Workflow Security (claude.yml)
 
-`.github/workflows/claude.yml` runs jobs (`review`/`manual-review`/`respond`/`ci-fix`) with
-`CLAUDE_CODE_OAUTH_TOKEN` + a GitHub App token. Editing it is security-critical. Hardening it
-(PR #634) took multiple rounds because each hand-rolled patch introduced a new hole that the
-**local codex CLI caught and our own `/security-review` missed**. The canonical rules
-(Anthropic `claude-code-action/docs/security.md` + GitHub Security Lab "Preventing pwn
-requests") — follow them, don't reinvent:
-
-1. **`pull_request` from forks gets NO secrets** (GitHub sandboxes it). The dangerous
-   triggers run in *our* repo context WITH secrets regardless of trigger:
-   `issue_comment`, `pull_request_target`, `workflow_run`.
-2. **Never check out / build untrusted PR head in a secret-bearing job** (the "pwn request").
-   `ref: refs/pull/<n>/head` or `workflow_run.head_sha` + `pnpm install`/`cargo build`
-   executes fork code (postinstall, build.rs, malicious deps) with secrets → exfiltration.
-3. **Gate on the CODE author, not the commenter.** A member commenting `/claude-review` on an
-   external fork PR must not build that fork's code. Use the **PR author's
-   `author_association`** (un-spoofable; commit-author *email* is spoofable so `commits_ok`
-   alone is insufficient), or the actor's write permission via the collaborators API.
-4. **`workflow_run` trust ≠ branch name** (a fork's default branch is also `main`). Require
-   `github.event.workflow_run.head_repository.full_name == github.repository`; derive the PR
-   number from `github.event.workflow_run.pull_requests`, never a branch-name lookup.
-5. **NEVER interpolate `${{ github.event.* }}` into a `run:` body** — script injection. A fork
-   branch named `x";<cmd>;#` runs `<cmd>` with the token. Pass every event value via `env:`
-   and reference `$VAR`. (`env:` blocks, `concurrency.group:`, `with: ref:` with validated
-   ints/SHAs are fine.)
-6. **Plain issues:** `issue_comment` fires for issues AND PRs; gate on
-   `github.event.issue.pull_request`; a plain-issue comment must be `assoc=NONE` (no OWNER
-   fallback).
-
-Best shape: one centralized `eligible` allowlist output
-(`safe && author_ok && commits_ok && context_allowed`) that every job gates on. **Always
-re-run the local codex CLI on workflow security changes until it returns SAFE TO MERGE
-(see "Claude Review Workflow"); prefer codex's security verdict over our own.**
+Jobs run with secrets, so editing `.github/workflows/claude.yml` is security-critical. Rules
+(Anthropic `claude-code-action/docs/security.md` + GitHub "pwn requests"); re-run local codex
+until SAFE:
+- `pull_request` from forks has no secrets; `issue_comment`/`pull_request_target`/`workflow_run` do.
+- Never check out/build untrusted PR head in a secret job (postinstall/build.rs → exfil).
+- Gate on PR-author `author_association`, not the commenter (commit email is spoofable).
+- `workflow_run`: require `head_repository.full_name == github.repository`, not branch name.
+- Never interpolate `${{ github.event.* }}` into `run:` (injection) — pass via `env:`.
+- `issue_comment` fires for issues too; gate on `github.event.issue.pull_request`.
+- Centralize into one `eligible` allowlist every job gates on.
 
 ### PR Descriptions: Show, Don't Tell
 

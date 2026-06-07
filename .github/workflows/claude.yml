@@ -137,48 +137,60 @@ jobs:
         id: commits
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR_NUM: ${{ steps.get-pr.outputs.number }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUM="${{ steps.get-pr.outputs.number }}"
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
+            echo "ok=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Check each commit author's association
-          NON_MEMBER=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/commits --jq \
-            '[.[] | select(.author.type != "Bot" and .author.login != null) | .author.login] | unique | .[]' | while read -r LOGIN; do
+          # FAIL CLOSED if the commits API errors (don't let an empty result pass).
+          if ! LOGINS=$(gh api "repos/$REPO/pulls/$PR_NUM/commits" --jq \
+            '[.[] | select(.author.type != "Bot" and .author.login != null) | .author.login] | unique | .[]'); then
+            echo "::warning::Blocking Claude - commits API failed (failing closed)"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Block if any commit author is not a collaborator (permission lookup failure
+          # also fails closed: defaults to "none").
+          NON_MEMBER=$(printf '%s\n' "$LOGINS" | while read -r LOGIN; do
             if [ -n "$LOGIN" ]; then
-              ASSOC=$(gh api repos/${{ github.repository }}/collaborators/$LOGIN/permission --jq '.permission' 2>/dev/null || echo "none")
-              # Block if not a collaborator (permission = none)
-              if [ "$ASSOC" = "none" ]; then
-                echo "$LOGIN"
-              fi
+              ASSOC=$(gh api "repos/$REPO/collaborators/$LOGIN/permission" --jq '.permission' 2>/dev/null || echo "none")
+              [ "$ASSOC" = "none" ] && echo "$LOGIN"
             fi
           done | head -1)
           if [ -n "$NON_MEMBER" ]; then
             echo "::warning::Blocking Claude - non-member commit author: $NON_MEMBER"
-            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "ok=false" >> "$GITHUB_OUTPUT"
           else
-            echo "ok=true" >> $GITHUB_OUTPUT
+            echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check for non-member comments
         id: check
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR_NUM: ${{ steps.get-pr.outputs.number }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUM="${{ steps.get-pr.outputs.number }}"
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
-            echo "safe=true" >> $GITHUB_OUTPUT
+            echo "safe=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER" 2>/dev/null || echo 0)
-          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER" 2>/dev/null || echo 0)
-          TOTAL=$((ISSUE + REVIEW))
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Blocking Claude - $TOTAL non-member comment(s) detected"
-            echo "safe=false" >> $GITHUB_OUTPUT
+          # FAIL CLOSED: an API error must block Claude, not allow it. (No `|| echo 0`,
+          # which would turn a transient 5xx/rate-limit into safe=true and let a
+          # non-member comment through.)
+          if ! ISSUE=$(gh api "repos/$REPO/issues/$PR_NUM/comments" --jq "$NONMEMBER_FILTER") \
+             || ! REVIEW=$(gh api "repos/$REPO/pulls/$PR_NUM/comments" --jq "$NONMEMBER_FILTER"); then
+            echo "::warning::Blocking Claude - comments API failed (failing closed)"
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$((ISSUE + REVIEW))" -gt 0 ]; then
+            echo "::warning::Blocking Claude - non-member comment(s) detected"
+            echo "safe=false" >> "$GITHUB_OUTPUT"
           else
-            echo "safe=true" >> $GITHUB_OUTPUT
+            echo "safe=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Compute eligibility (allowlist gate)
