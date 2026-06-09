@@ -222,11 +222,30 @@ check-disk:
 		ln -sf /mnt/fcvm-btrfs/cargo "$$HOME/.cargo"; \
 		echo "==> Symlinked ~/.cargo → /mnt/fcvm-btrfs/cargo"; \
 	fi
-	@# Fix broken ~/.cargo symlink (target dir was cleaned up)
-	@if [ -L "$$HOME/.cargo" ] && ! [ -e "$$HOME/.cargo" ] && [ -d /mnt/fcvm-btrfs ]; then \
-		echo "==> Fixing broken ~/.cargo symlink..."; \
-		mkdir -p /mnt/fcvm-btrfs/cargo; \
-		echo "==> Restored /mnt/fcvm-btrfs/cargo"; \
+	@# Self-heal a wiped cargo home. The btrfs above is ephemeral and can be reset
+	@# out from under us, leaving ~/.cargo a dangling symlink. cargo can't restore
+	@# itself, so recreate the symlink's TARGET dir (mkdir through a dangling symlink
+	@# fails, so operate on the readlink'd path) and relink the rustup toolchain
+	@# shims; the registry re-downloads on the next build.
+	@if [ -L "$$HOME/.cargo" ] && ! [ -e "$$HOME/.cargo/bin/cargo" ]; then \
+		echo "==> cargo home wiped; restoring toolchain..."; \
+		TGT=$$(readlink "$$HOME/.cargo"); \
+		mkdir -p "$$TGT/bin"; \
+		TCBIN=$$(ls -d "$$HOME"/.rustup/toolchains/*/bin 2>/dev/null | head -1); \
+		if [ -n "$$TCBIN" ]; then \
+			for b in cargo rustc cargo-clippy clippy-driver rustfmt cargo-fmt rustdoc; do \
+				[ -e "$$TCBIN/$$b" ] && ln -sf "$$TCBIN/$$b" "$$TGT/bin/$$b"; \
+			done; \
+			echo "==> Restored cargo shims from $$TCBIN into $$TGT/bin"; \
+		else echo "==> WARNING: no rustup toolchain found to restore cargo from"; fi; \
+	fi
+	@# Ensure cargo-nextest (the test runner; a separate install from rustup).
+	@if ! PATH="$$HOME/.cargo/bin:$$PATH" cargo nextest --version >/dev/null 2>&1; then \
+		echo "==> Installing cargo-nextest..."; \
+		case "$$(uname -m)" in aarch64|arm64) NURL=https://get.nexte.st/latest/linux-arm ;; *) NURL=https://get.nexte.st/latest/linux ;; esac; \
+		mkdir -p "$$HOME/.cargo/bin"; \
+		curl -LsSf "$$NURL" | tar zxf - -C "$$HOME/.cargo/bin" \
+			|| PATH="$$HOME/.cargo/bin:$$PATH" cargo install cargo-nextest --locked; \
 	fi
 	@if [ -d /mnt/fcvm-btrfs ] && ! [ -L target ]; then \
 		if [ -d target ]; then \
