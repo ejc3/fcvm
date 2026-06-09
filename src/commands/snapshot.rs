@@ -279,18 +279,32 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .name
         .as_deref()
         .unwrap_or(truncate_id(&vm_state.vm_id, 8));
-    println!(
-        "✓ Snapshot '{}' created from VM '{}'",
-        snapshot_name, vm_name
-    );
-    println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
-    println!("  Files:");
-    println!("    {}", snapshot_config.memory_path.display());
-    println!("    {}", snapshot_config.disk_path.display());
-    println!(
-        "\nOriginal VM '{}' has been resumed and is still running.",
-        vm_name
-    );
+    if args.disk_only {
+        println!(
+            "✓ Disk-only snapshot '{}' created from VM '{}'",
+            snapshot_name, vm_name
+        );
+        println!("  Kind: disk-only (no memory image)");
+        println!("  Files:");
+        println!("    {}", snapshot_config.disk_path.display());
+        println!(
+            "\nOriginal VM '{}' is still running (was briefly frozen for disk copy).",
+            vm_name
+        );
+    } else {
+        println!(
+            "✓ Snapshot '{}' created from VM '{}'",
+            snapshot_name, vm_name
+        );
+        println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
+        println!("  Files:");
+        println!("    {}", snapshot_config.memory_path.display());
+        println!("    {}", snapshot_config.disk_path.display());
+        println!(
+            "\nOriginal VM '{}' has been resumed and is still running.",
+            vm_name
+        );
+    }
 
     Ok(())
 }
