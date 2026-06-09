@@ -1413,6 +1413,9 @@ pub fn build_snapshot_config(
             ipv6_prefix: vm_state.config.ipv6_prefix.clone(),
             tty: vm_state.config.tty,
             interactive: vm_state.config.interactive,
+            kernel_profile: vm_state.config.kernel_profile.clone(),
+            image_mode: vm_state.config.image_mode.clone(),
+            image_disk_path: vm_state.config.image_disk_path.clone(),
         },
     }
 }
@@ -1501,6 +1504,19 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
     Ok(lock_file)
 }
 
+/// Sibling path for a snapshot directory's auxiliary files (lock, .creating,
+/// .old): APPENDS `.suffix` to the directory name. `Path::with_extension` would
+/// REPLACE everything after the last dot, so a tag like "app.v1" would map onto
+/// "app.creating"/"app.old"/"app.lock" — colliding with (and deleting) files of
+/// an unrelated tag.
+pub(crate) fn snapshot_sibling(dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dir.with_file_name(format!("{name}.{suffix}"))
+}
+
 /// Acquire the per-snapshot directory lock (`<snapshot_dir>.lock`).
 ///
 /// Creators take it exclusively while writing or atomically replacing a snapshot
@@ -1511,7 +1527,7 @@ pub async fn acquire_snapshot_dir_lock(
     snapshot_dir: &Path,
     exclusive: bool,
 ) -> Result<std::fs::File> {
-    let lock_path = snapshot_dir.with_extension("lock");
+    let lock_path = snapshot_sibling(snapshot_dir, "lock");
     let lock_file = std::fs::File::create(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     loop {
@@ -1545,6 +1561,200 @@ pub async fn acquire_snapshot_dir_lock(
 /// portable-volume inode tables.
 pub type SnapshotExtraFiles<'a> = Option<&'a (dyn Fn() -> Vec<(String, Vec<u8>)> + Send + Sync)>;
 
+/// Disk-only capture: quiesce the guest, reflink only the disk (no memory dump,
+/// no vCPU pause — `fsfreeze` provides consistency), unfreeze, and finalize a
+/// `DiskOnly` snapshot. Clones cold-boot from this disk. See
+/// docs/disk-only-clone.html.
+///
+/// `snapshot_config.kind` must already be `DiskOnly`. `vsock_socket` is the VM's
+/// exec vsock (`vm_runtime_dir/<vm_id>/vsock.sock`), used to run the quiesce
+/// commands in the guest.
+///
+/// # Locking
+/// Caller holds the per-snapshot-dir + per-VM locks (same as `create_snapshot_core`).
+pub async fn create_disk_only_snapshot_core(
+    snapshot_config: crate::storage::snapshot::SnapshotConfig,
+    disk_path: &Path,
+    vsock_socket: &Path,
+) -> Result<()> {
+    use crate::commands::exec::run_exec_in_vm_captured;
+
+    let snapshot_dir = snapshot_config
+        .disk_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid disk_path in snapshot config"))?
+        .to_path_buf();
+    let temp_snapshot_dir = snapshot_sibling(&snapshot_dir, "creating");
+
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    tokio::fs::create_dir_all(&temp_snapshot_dir)
+        .await
+        .context("creating temp snapshot directory")?;
+
+    // The provisioned marker gates the clone's boot behavior: without it, a clone
+    // of this disk would WIPE the captured container storage on boot. Refuse to
+    // capture a disk that isn't marked (old fc-agent, or provisioning failed).
+    let marker_cmd = vec![
+        "test".to_string(),
+        "-f".to_string(),
+        "/var/lib/fcvm/provisioned".to_string(),
+    ];
+    let marker_out = run_exec_in_vm_captured(vsock_socket, &marker_cmd, false)
+        .await
+        .context("checking provisioned marker in guest")?;
+    if marker_out.exit_code != 0 {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        anyhow::bail!(
+            "source VM has no provisioned marker (/var/lib/fcvm/provisioned); a clone \
+             of this disk would wipe its container storage on boot. The source must be \
+             running a current fc-agent that completed provisioning."
+        );
+    }
+
+    // Quiesce so the reflink captures a crash-consistent filesystem. No vCPU pause.
+    // `sync` flushes dirty pages, then fsfreeze blocks new writes across the reflink.
+    // The podman container store is its own filesystem (btrfs loopback mounted at
+    // /var/lib/containers/storage, backed by a file on the rootfs) — it must be
+    // frozen FIRST, then the rootfs: freezing it flushes its data through the loop
+    // device into the backing file while the rootfs is still writable. (Freezing the
+    // rootfs first would deadlock that flush.) Unfreeze happens in reverse order.
+    let sync_cmd = vec!["sync".to_string()];
+    let sync_out = run_exec_in_vm_captured(vsock_socket, &sync_cmd, false)
+        .await
+        .context("guest sync before freeze")?;
+    if sync_out.exit_code != 0 {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        anyhow::bail!(
+            "guest sync failed before disk capture (exit {}): {}",
+            sync_out.exit_code,
+            sync_out.stderr
+        );
+    }
+
+    const STORAGE_MOUNT: &str = "/var/lib/containers/storage";
+    let freeze_script = format!(
+        "if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --freeze {m} || exit 1; fi; \
+         fsfreeze --freeze /",
+        m = STORAGE_MOUNT
+    );
+    let freeze_cmd = vec!["sh".to_string(), "-c".to_string(), freeze_script];
+    // An exec-level error (vsock reset after the request was written) can leave the
+    // guest frozen with no response — always attempt a best-effort thaw of BOTH
+    // mounts before bailing, never leave the source wedged.
+    let freeze_out = match run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false).await {
+        Ok(out) => out,
+        Err(e) => {
+            let thaw = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "fsfreeze --unfreeze / 2>/dev/null; \
+                     fsfreeze --unfreeze {m} 2>/dev/null; true",
+                    m = STORAGE_MOUNT
+                ),
+            ];
+            let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false).await;
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            return Err(e).context("freezing guest filesystems");
+        }
+    };
+    if freeze_out.exit_code != 0 {
+        // Best-effort thaw in case the storage mount froze but the rootfs didn't.
+        let thaw = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "fsfreeze --unfreeze {m} 2>/dev/null; true",
+                m = STORAGE_MOUNT
+            ),
+        ];
+        let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false).await;
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        anyhow::bail!(
+            "fsfreeze failed (exit {}): {}",
+            freeze_out.exit_code,
+            freeze_out.stderr
+        );
+    }
+    info!(snapshot = %snapshot_config.name, "guest frozen; reflinking disk");
+
+    // Reflink the disk (+ any disk-dir images) while frozen.
+    let copy_result: Result<()> = async {
+        let temp_disk = temp_snapshot_dir.join("disk.raw");
+        reflink_copy(disk_path, &temp_disk).await?;
+        for extra in &snapshot_config.metadata.extra_disks {
+            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
+                .join("disks")
+                .join(&extra.filename);
+            let dest = temp_snapshot_dir.join(&extra.filename);
+            reflink_copy(&source, &dest).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // Unfreeze ALWAYS, in reverse order (rootfs first so the loop device can write
+    // again, then the storage mount). A failed unfreeze wedges the source VM — that
+    // is a hard error even when the reflink succeeded, so the caller knows.
+    let unfreeze_script = format!(
+        "fsfreeze --unfreeze /; rc=$?; \
+         if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --unfreeze {m} || rc=1; fi; \
+         exit $rc",
+        m = STORAGE_MOUNT
+    );
+    let unfreeze_cmd = vec!["sh".to_string(), "-c".to_string(), unfreeze_script];
+    let unfreeze_result = run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false).await;
+
+    if let Err(e) = copy_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("reflinking disk for disk-only snapshot");
+    }
+
+    match unfreeze_result {
+        Ok(o) if o.exit_code == 0 => info!(snapshot = %snapshot_config.name, "guest unfrozen"),
+        Ok(o) => {
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            anyhow::bail!(
+                "fsfreeze --unfreeze failed (exit {}): {} — source VM may be wedged",
+                o.exit_code,
+                o.stderr
+            );
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            return Err(e).context("unfreezing guest — source VM may be wedged");
+        }
+    }
+
+    // Write config.json (kind = DiskOnly; no memory.bin / vmstate.bin).
+    let temp_config = temp_snapshot_dir.join("config.json");
+    let config_json = serde_json::to_string_pretty(&snapshot_config)
+        .context("serializing disk-only snapshot config")?;
+    tokio::fs::write(&temp_config, &config_json)
+        .await
+        .context("writing disk-only snapshot config")?;
+
+    // Atomic replace into the final location.
+    if snapshot_dir.exists() {
+        let old = snapshot_sibling(&snapshot_dir, "old");
+        let _ = tokio::fs::remove_dir_all(&old).await;
+        tokio::fs::rename(&snapshot_dir, &old)
+            .await
+            .context("moving old snapshot aside")?;
+        tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
+            .await
+            .context("finalizing snapshot")?;
+        let _ = tokio::fs::remove_dir_all(&old).await;
+    } else {
+        tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
+            .await
+            .context("finalizing snapshot")?;
+    }
+
+    info!(snapshot = %snapshot_config.name, "disk-only snapshot created");
+    Ok(())
+}
+
 /// Create a snapshot of the running VM.
 ///
 /// # Locking
@@ -1574,7 +1784,7 @@ pub async fn create_snapshot_core(
         .memory_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?;
-    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+    let temp_snapshot_dir = snapshot_sibling(snapshot_dir, "creating");
 
     // Determine base memory for diff snapshot support.
     //
@@ -1914,7 +2124,7 @@ pub async fn create_snapshot_core(
     // Atomic replace: rename old out of the way, then rename new into place.
     // Handles both cases: snapshot_dir exists (re-creating) or doesn't (first creation).
     if snapshot_dir.exists() {
-        let old_snapshot_dir = snapshot_dir.with_extension("old");
+        let old_snapshot_dir = snapshot_sibling(snapshot_dir, "old");
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
         tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
             .await
@@ -1946,6 +2156,29 @@ mod tests {
     use crate::state::VmState;
     use crate::storage::SnapshotType;
     use std::path::Path;
+
+    /// `with_extension` would map "app.v1" onto "app.creating", colliding with an
+    /// unrelated tag's files — snapshot_sibling must APPEND instead.
+    #[test]
+    fn snapshot_sibling_appends_suffix_even_with_dotted_tags() {
+        assert_eq!(
+            snapshot_sibling(Path::new("/snaps/app"), "creating"),
+            Path::new("/snaps/app.creating")
+        );
+        assert_eq!(
+            snapshot_sibling(Path::new("/snaps/app.v1"), "creating"),
+            Path::new("/snaps/app.v1.creating")
+        );
+        assert_eq!(
+            snapshot_sibling(Path::new("/snaps/app.v1"), "old"),
+            Path::new("/snaps/app.v1.old")
+        );
+        // Distinct dotted tags must never collide on their auxiliary files.
+        assert_ne!(
+            snapshot_sibling(Path::new("/snaps/app.v1"), "lock"),
+            snapshot_sibling(Path::new("/snaps/app.v2"), "lock")
+        );
+    }
 
     fn make_vm_state(vm_id: &str, original_vsock: Option<&str>) -> VmState {
         let mut state = VmState::new(vm_id.to_string(), "nginx:alpine".to_string(), 2, 1024);

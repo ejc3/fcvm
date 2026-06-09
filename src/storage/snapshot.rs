@@ -134,6 +134,21 @@ pub struct SnapshotMetadata {
     /// Whether stdin is forwarded to the container
     #[serde(default)]
     pub interactive: bool,
+    /// Kernel profile the source VM booted with (None = "default"). Cold-boot
+    /// clones and reboot plans resolve the same profile so a btrfs/nested-profile
+    /// disk boots with a kernel that can actually mount it.
+    #[serde(default)]
+    pub kernel_profile: Option<String>,
+    /// Image delivery mode of the source ("overlay" | "btrfs" | "archive");
+    /// None for registry-pulled images.
+    #[serde(default)]
+    pub image_mode: Option<String>,
+    /// Host path of the read-only image device the source had attached (overlay
+    /// additionalImageStore or docker archive). Content-addressed cache file —
+    /// cold-boot clones re-attach it so the captured container's image layers
+    /// stay reachable.
+    #[serde(default)]
+    pub image_disk_path: Option<PathBuf>,
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -320,6 +335,9 @@ mod tests {
                 ipv6_prefix: None,
                 tty: false,
                 interactive: false,
+                kernel_profile: None,
+                image_mode: None,
+                image_disk_path: None,
             },
         };
 
@@ -447,6 +465,9 @@ mod tests {
                 ipv6_prefix: None,
                 tty: false,
                 interactive: false,
+                kernel_profile: None,
+                image_mode: None,
+                image_disk_path: None,
             },
         };
 
@@ -518,6 +539,9 @@ mod tests {
                     ipv6_prefix: None,
                     tty: false,
                     interactive: false,
+                    kernel_profile: None,
+                    image_mode: None,
+                    image_disk_path: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -576,6 +600,9 @@ mod tests {
                 ipv6_prefix: None,
                 tty: false,
                 interactive: false,
+                kernel_profile: None,
+                image_mode: None,
+                image_disk_path: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -687,6 +714,9 @@ mod tests {
                 ipv6_prefix: None,
                 tty: false,
                 interactive: false,
+                kernel_profile: None,
+                image_mode: None,
+                image_disk_path: None,
             },
         };
 
@@ -728,6 +758,33 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_config_kind_disk_only_roundtrip() {
+        // A SnapshotConfig tagged DiskOnly must preserve kind through JSON — the
+        // run dispatch in later PRs depends on this field surviving.
+        let json = r#"{
+            "name": "do",
+            "vm_id": "x",
+            "memory_path": "/m",
+            "vmstate_path": "/v",
+            "disk_path": "/d",
+            "created_at": "2024-01-15T10:30:00Z",
+            "kind": "DiskOnly",
+            "metadata": {
+                "image": "alpine",
+                "vcpu": 1,
+                "memory_mib": 256,
+                "network_config": { "tap_device": "t", "guest_mac": "AA:BB:CC:DD:EE:FF" }
+            }
+        }"#;
+        let config: SnapshotConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.kind, SnapshotKind::DiskOnly);
+        // ...and survives a re-serialize round-trip.
+        let reparsed: SnapshotConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.kind, SnapshotKind::DiskOnly);
+    }
+
+    #[test]
     fn test_snapshot_metadata_ipv6_prefix_roundtrip() {
         let metadata = SnapshotMetadata {
             image: "nginx:alpine".to_string(),
@@ -747,6 +804,9 @@ mod tests {
             ipv6_prefix: Some("2600:1f1c:494:201".to_string()),
             tty: false,
             interactive: false,
+            kernel_profile: None,
+            image_mode: None,
+            image_disk_path: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

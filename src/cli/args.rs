@@ -297,6 +297,18 @@ pub struct RunArgs {
     /// Example: fcvm podman run --name foo --network bridged alpine:latest sh -c "echo hello"
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub command_args: Vec<String>,
+
+    /// Internal (not a CLI flag): cold-boot from this captured disk instead of the
+    /// content-addressed base rootfs. Set by the disk-only clone dispatcher.
+    #[arg(skip)]
+    pub rootfs_override: Option<std::path::PathBuf>,
+
+    /// Internal (not a CLI flag): attach this pre-built read-only image device
+    /// (overlay additionalImageStore / docker archive) instead of exporting one.
+    /// Set by the disk-only clone dispatcher from snapshot metadata so the captured
+    /// container's image layers stay reachable.
+    #[arg(skip)]
+    pub image_disk_override: Option<std::path::PathBuf>,
 }
 
 // ============================================================================
@@ -334,6 +346,11 @@ pub struct SnapshotCreateArgs {
     /// Optional: custom snapshot name (defaults to VM name)
     #[arg(long)]
     pub tag: Option<String>,
+
+    /// Capture only the disk (no memory image). Clones cold-boot fresh from the
+    /// captured disk instead of resuming via UFFD. See docs/disk-only-clone.html.
+    #[arg(long)]
+    pub disk_only: bool,
 }
 
 #[derive(Args, Debug)]

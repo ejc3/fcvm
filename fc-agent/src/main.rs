@@ -47,6 +47,17 @@ where
 
 #[tokio::main]
 async fn main() {
+    // `fc-agent --notify-reboot`: a one-shot invoked by the systemd system-shutdown
+    // hook when the shutdown verb is "reboot". It sends a single vsock message to the
+    // host so the host relaunches the VM in place (disk-only-clone semantics) instead
+    // of treating the firecracker exit as termination. Must be fast and side-effect
+    // free (it runs late in shutdown after services are stopped), so it short-circuits
+    // before any of the normal agent setup.
+    if std::env::args().any(|a| a == "--notify-reboot") {
+        let ok = vsock::notify_reboot();
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     // Use a non-blocking writer for stderr so that log writes never block the
     // tokio runtime. Without this, heavy FUSE traffic generates thousands of
     // INFO messages/sec which synchronously write to the serial console (virtio),

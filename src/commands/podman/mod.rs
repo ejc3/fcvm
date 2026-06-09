@@ -13,20 +13,24 @@ mod snapshot;
 mod types;
 mod vm_config;
 
-use types::VolumeMapping;
 pub use types::{CacheRequest, LogLine, SnapshotOutcome, VmContext, VmHandle};
+// Re-exported for the snapshot restore path's up-front reboot plan (a rebooted VM
+// relaunches in place via the same shared primitive, on every lifecycle path).
+pub(crate) use types::{RebootSpec, VolumeMapping};
 
 // Re-exported for the #598 regression test (export must pin immutable content by image
 // ID even when the tag is rebuilt mid-export).
 pub use image::export_image_archive;
 
-pub(crate) use listeners::run_output_listener;
-use listeners::run_status_listener;
+pub(crate) use listeners::{run_output_listener, run_status_listener};
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
     CreateSnapshotParams,
+};
+pub(crate) use vm_config::{
+    build_launch_config, build_runtime_boot_args, configure_and_boot_firecracker,
 };
 use vm_config::{cleanup_nfs_exports, run_vm_setup, VmSetupParams};
 
@@ -294,9 +298,14 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
     let rootfs_type = resolve_rootfs_type(&args);
 
-    let base_rootfs = crate::setup::ensure_rootfs(args.setup, rootfs_type.as_deref())
-        .await
-        .context("setting up rootfs")?;
+    // Disk-only clone: cold-boot from the captured disk instead of the
+    // content-addressed base rootfs. create_cow_disk reflinks whatever it's given.
+    let base_rootfs = match &args.rootfs_override {
+        Some(p) => p.clone(),
+        None => crate::setup::ensure_rootfs(args.setup, rootfs_type.as_deref())
+            .await
+            .context("setting up rootfs")?,
+    };
     let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
         .await
         .context("setting up fc-agent initrd")?;
@@ -317,13 +326,21 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // the immutable export id in ONE inspect, so they are an atomic view of the same
     // image: a parallel build that repoints the tag can't make the cache key name one
     // image while the export pins another (#598). For remote images image_id is None.
-    let image_ref = get_image_cache_ref(&args.image).await?;
-    let image_identifier = image_ref.cache_key;
-    let localhost_image_id = image_ref.image_id;
+    // A disk-only clone has the image baked into the captured rootfs, so it must
+    // NOT require the original host image tag to still exist (or re-export it).
+    let (image_identifier, localhost_image_id) = if args.rootfs_override.is_some() {
+        (args.image.clone(), None)
+    } else {
+        let image_ref = get_image_cache_ref(&args.image).await?;
+        (image_ref.cache_key, image_ref.image_id)
+    };
 
     // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
+    // A disk-only clone cold-boots from the captured disk and must never divert
+    // into the snapshot-cache / UFFD restore path.
     let no_snapshot = args.no_snapshot
+        || args.rootfs_override.is_some()
         || std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
             .unwrap_or(false);
@@ -447,8 +464,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         .context("parsing volume mappings")?;
 
     // For localhost/ images, export as OCI archive for direct podman run
-    // Uses content-addressable cache to avoid re-exporting the same image
-    let image_disk_path = if args.image.starts_with("localhost/") {
+    // Uses content-addressable cache to avoid re-exporting the same image.
+    // A disk-only clone never attaches an image device — the image already lives
+    // in the captured container storage on the reflinked rootfs — so skip export
+    // (and don't require the original host image tag to still exist).
+    let image_disk_path = if args.image.starts_with("localhost/") && args.rootfs_override.is_none()
+    {
         // Reuse the digest resolved by get_image_identifier above (already stripped of
         // the "sha256:" prefix). Using the same inspect result for the snapshot key and
         // the export cache prevents a tag rebuilt in between from being exported under
@@ -577,7 +598,10 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
         Some(disk_path)
     } else {
-        None
+        // Disk-only clone of an overlay/archive-mode VM: re-attach the recorded
+        // image device (content-addressed cache file) so the captured container's
+        // image layers stay reachable. None for registry-pulled images.
+        args.image_disk_override.clone()
     };
 
     if !volume_mappings.is_empty() {
@@ -626,6 +650,14 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.tty = args.tty;
     vm_state.config.interactive = args.interactive;
     vm_state.config.user = args.user.clone();
+    // Recorded so snapshots of this VM carry what a cold-boot clone / reboot plan
+    // needs: the kernel profile (a btrfs-profile disk needs a btrfs kernel) and the
+    // image device (overlay/archive image layers live on a separate read-only disk).
+    vm_state.config.kernel_profile = args.kernel_profile.clone();
+    vm_state.config.image_disk_path = image_disk_path.clone();
+    vm_state.config.image_mode = image_disk_path
+        .as_ref()
+        .map(|_| resolve_image_mode(&args).to_string());
     // Store the username for health checks (runuser -u <username>).
     // USER env var was resolved from host /etc/passwd above (or explicitly passed).
     if args.user.is_some() {
@@ -816,13 +848,26 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // - "exit:{code}" on port 4999 -> creates container-exit file with exit code
     // - "cache-ready:{digest}" on port 4999 -> trigger cache creation
     let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
+    // Set by the status listener when the guest signals a reboot / a container
+    // exit; consumed by run_vm_loop to decide relaunch-in-place vs terminate.
+    let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let status_handle = {
         let runtime_dir = data_dir.clone();
         let socket_path = status_socket_path.clone();
         let vm_id_clone = vm_id.clone();
+        let reboot_flag = reboot_requested.clone();
+        let exit_flag = container_exit_seen.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, cache_tx).await
+            if let Err(e) = run_status_listener(
+                &socket_path,
+                &runtime_dir,
+                &vm_id_clone,
+                cache_tx,
+                reboot_flag,
+                exit_flag,
+            )
+            .await
             {
                 tracing::warn!("Status listener error: {}", e);
             }
@@ -954,7 +999,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         return Err(e);
     }
 
-    let (vm_manager, holder_child) = setup_result.unwrap();
+    let (vm_manager, holder_child, reboot_spec) = setup_result.unwrap();
 
     info!(vm_id = %vm_id, "VM started successfully");
 
@@ -998,6 +1043,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         log_tx,
         output_reconnect,
         vm_state,
+        reboot_requested,
+        container_exit_seen,
+        reboot_spec,
     }))
 }
 
@@ -1042,17 +1090,68 @@ async fn join_tty_session(
 ///
 /// The exit notification stays buffered in the host-side unix socket even after
 /// Firecracker exits, but the listener task may not have processed it yet when the VM
-/// exit is observed — give it a bounded window to finish before reading the file.
+/// exit is observed — wait on the exit-seen flag for a bounded window (the listener
+/// itself stays alive to catch a racing reboot signal, so we can't join it).
 async fn read_container_exit_code(ctx: &mut VmContext) -> Option<i32> {
-    let drain_window = std::time::Duration::from_secs(5);
-    let drained = tokio::time::timeout(drain_window, &mut ctx.status_handle).await;
-    if drained.is_err() {
-        warn!("status listener still running 5s after VM exit");
+    use std::sync::atomic::Ordering;
+    // wait_for_reboot_decision's drain handshake already proved the listener
+    // processed everything the guest sent; the short wait here is only a backstop
+    // for the listener-stuck case where the drain timed out.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !ctx.container_exit_seen.load(Ordering::Acquire) {
+        if tokio::time::Instant::now() >= deadline {
+            warn!("no container exit notification after VM exit");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let exit_file = ctx.data_dir.join("container-exit");
     std::fs::read_to_string(&exit_file)
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
+}
+
+/// After the Firecracker child exits, decide whether it was a guest reboot (→ relaunch
+/// in place) or a real termination (poweroff / container exit / crash → stop).
+///
+/// Every guest signal ("exit:", "reboot") is SENT before the firecracker reset/poweroff
+/// (the reboot-notify unit runs Before=systemd-reboot.service; fc-agent sends "exit:"
+/// before `poweroff -f`), so once `wait()` wakes us the messages are at worst buffered
+/// in the host-side listener socket. Rather than guessing with timing windows, this
+/// performs a positive drain handshake: connect to our own status socket and send
+/// "drain". The listener processes connections strictly in accept order, so its
+/// "drain-ack" proves every guest message sent before the exit has been handled — at
+/// that point the reboot flag is authoritative. The 2s timeout is only a backstop for
+/// a dead/stuck listener (in which case no more signals are coming anyway).
+///
+/// Shared by both VM run loops (podman run and snapshot restore).
+pub(crate) async fn wait_for_reboot_decision(
+    reboot_requested: &std::sync::atomic::AtomicBool,
+    status_handle: &tokio::task::JoinHandle<()>,
+    status_socket_path: &str,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if reboot_requested.load(Ordering::Acquire) {
+        return true;
+    }
+    if !status_handle.is_finished() {
+        let drain = async {
+            let mut stream = tokio::net::UnixStream::connect(status_socket_path)
+                .await
+                .ok()?;
+            stream.write_all(b"drain\n").await.ok()?;
+            let mut buf = [0u8; 16];
+            let n = stream.read(&mut buf).await.ok()?;
+            (n > 0).then_some(())
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), drain).await {
+            Ok(Some(())) => {}
+            _ => warn!("status listener did not ack drain probe; deciding on current flags"),
+        }
+    }
+    reboot_requested.load(Ordering::Acquire)
 }
 
 /// Event loop: waits for VM exit, cancellation, or snapshot requests.
@@ -1065,7 +1164,102 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 return Ok(None);
             }
             status = ctx.vm_manager.wait() => {
-                info!(status = ?status, "VM exited");
+                info!(status = ?status, "Firecracker child exited");
+
+                // A guest `reboot` exits the firecracker child just like a poweroff,
+                // but the guest first sends "reboot" on the status channel. If that
+                // signal arrived (grace-polled to absorb the race with the exit
+                // notification), relaunch Firecracker in place against the same disk
+                // — the provisioned rootfs makes the re-boot behave like a disk-only
+                // clone (storage preserved, captured container restarted) — and keep
+                // looping. The fcvm process, network, holder, listeners, and health
+                // monitor all stay alive, so the fcvm PID is stable across the reboot.
+                let status_socket_path = format!(
+                    "{}_{}",
+                    ctx.reboot_spec.vsock_socket_path.display(),
+                    VSOCK_STATUS_PORT
+                );
+                let rebooted = wait_for_reboot_decision(
+                    &ctx.reboot_requested,
+                    &ctx.status_handle,
+                    &status_socket_path,
+                )
+                .await;
+                // TTY sessions accept exactly one connection and remove their socket
+                // on exit — a relaunch would come back with no terminal. Fail loud
+                // and treat the reboot as termination instead of half-relaunching.
+                if rebooted && ctx.args.tty {
+                    warn!(
+                        "guest rebooted but reboot-in-place is not supported for TTY \
+                         VMs; treating as termination"
+                    );
+                }
+                if rebooted && !ctx.args.tty {
+                    ctx.reboot_requested
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    // Clear any racing pre-reboot exit signal/files: the relaunched
+                    // VM starts a fresh lifecycle, and a stale container-exit file
+                    // would make the health monitor (and a later exit-code read)
+                    // see the OLD container as stopped.
+                    ctx.container_exit_seen
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    let _ = std::fs::remove_file(ctx.data_dir.join("container-exit"));
+                    let _ = std::fs::remove_file(ctx.data_dir.join("container-ready"));
+                    info!("guest rebooted — relaunching VM in place");
+                    // A reboot is a clean cold boot from the already-provisioned disk
+                    // (disk-only-clone semantics) — don't re-create the pre-start /
+                    // startup snapshot. Dropping the receivers makes the relaunched
+                    // fc-agent's cache-ready resolve to a cold start (the status
+                    // listener still acks), so it proceeds straight to the container.
+                    ctx.cache_rx = None;
+                    ctx.startup_rx = None;
+                    // The rebooted VM's memory is a fresh boot, not a descendant of
+                    // any snapshot — a later diff snapshot against the recorded
+                    // parent would mix incompatible memory lineages. Clear it so a
+                    // future `snapshot create` takes a full snapshot.
+                    ctx.vm_state.config.snapshot_name = None;
+                    let _ = ctx
+                        .state_manager
+                        .update_state(&ctx.vm_id, |state| {
+                            state.config.snapshot_name = None;
+                        })
+                        .await;
+                    // Fresh Firecracker child on the same api socket; start() removes
+                    // the stale socket and re-enters the same network namespace via the
+                    // holder_pid/namespace fields VmManager still holds. Then the shared
+                    // configure-and-boot primitive replays the per-child config; None
+                    // skips the host-once-only steps (the live substrate is reused).
+                    ctx.vm_manager
+                        .start(
+                            &ctx.reboot_spec.firecracker_bin,
+                            None,
+                            ctx.reboot_spec.fc_args.as_deref(),
+                        )
+                        .await
+                        .context("relaunching Firecracker after guest reboot")?;
+                    let volume_mappings: Vec<VolumeMapping> = ctx
+                        .args
+                        .map
+                        .iter()
+                        .map(|s| VolumeMapping::parse(s))
+                        .collect::<Result<Vec<_>>>()
+                        .context("parsing volume mappings for reboot relaunch")?;
+                    vm_config::configure_and_boot_firecracker(
+                        &mut ctx.vm_manager,
+                        &ctx.reboot_spec,
+                        &ctx.args,
+                        &ctx.network_config,
+                        &mut ctx.vm_state,
+                        &ctx.data_dir,
+                        &ctx.vm_id,
+                        &volume_mappings,
+                        None,
+                    )
+                    .await
+                    .context("relaunching VM after guest reboot")?;
+                    continue;
+                }
+
                 let exit_code = if let Some(handle) = ctx.tty_handle.take() {
                     let socket_path = ctx.tty_socket_path.take();
                     let exit_code = join_tty_session(handle, socket_path).await;
@@ -1234,7 +1428,11 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
 }
 
 /// CLI entrypoint for `fcvm podman run`. Thin wrapper around prepare_vm/run_vm_loop/cleanup.
-async fn cmd_podman_run(args: RunArgs) -> Result<()> {
+///
+/// Public so the disk-only `snapshot run` dispatcher can reuse the exact same
+/// boot/loop/cleanup sequence after synthesizing RunArgs (rootfs_override set to
+/// the captured disk).
+pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Setup signal handlers → cancellation token.
     // Installed before prepare_vm so a SIGTERM/SIGINT during the (potentially long)
     // setup phase is recorded instead of killing the process and leaving host network
@@ -1321,6 +1519,8 @@ mod tests {
             ipv6_prefix: None,
             image: "alpine:latest".to_string(),
             command_args: vec![],
+            rootfs_override: None,
+            image_disk_override: None,
         }
     }
 

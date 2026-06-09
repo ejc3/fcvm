@@ -345,6 +345,32 @@ pub fn notify_container_exit(exit_code: i32) {
     );
 }
 
+/// Notify the host that the guest is rebooting (vs powering off).
+///
+/// Sent by the systemd system-shutdown hook (which runs `fc-agent --notify-reboot`)
+/// only when the shutdown verb is "reboot". The host uses this as the positive
+/// signal to relaunch Firecracker in place instead of treating the firecracker
+/// exit as VM termination — so a guest `reboot` behaves like a disk-only clone
+/// cold boot (storage preserved, captured container restarted, identity regenerated).
+///
+/// Best-effort with a few retries: the hook runs late in shutdown, so the send must
+/// be fast and must never block (vsock connect is local/instant).
+pub fn notify_reboot() -> bool {
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    for attempt in 1..=MAX_ATTEMPTS {
+        if send_status(b"reboot\n") {
+            eprintln!("[fc-agent] notified host of reboot intent via vsock");
+            return true;
+        }
+        if attempt < MAX_ATTEMPTS {
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
+    eprintln!("[fc-agent] WARNING: failed to send reboot notification to host");
+    false
+}
+
 /// Notify host that the container has started.
 pub fn notify_container_started() {
     if send_status(b"ready\n") {

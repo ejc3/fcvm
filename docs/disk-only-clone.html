@@ -87,11 +87,32 @@
     <div class="tags">
       <span class="tag">fcvm design</span>
       <span class="tag">issue #625</span>
-      <span class="tag new">status: design / RFC</span>
+      <span class="tag new">status: implemented (as-built design below)</span>
       <span class="tag ok">code-grounded · verified file:line</span>
     </div>
   </div>
 </header>
+
+<div class="wrap" style="margin-top:1.5rem">
+  <div style="border:2px solid #2da44e;border-radius:8px;padding:1rem 1.25rem;background:#f0fff4">
+    <strong>Implementation outcome (2026-06).</strong> The feature shipped with a
+    <em>simpler</em> design than this RFC's policy enums. <code>StoragePolicy</code> and
+    <code>ContainerStatePolicy</code> were <strong>dropped</strong>: the guest self-detects a
+    cold boot of an already-provisioned disk via a <strong>provisioned marker</strong>
+    (<code>/var/lib/fcvm/provisioned</code>, written by fc-agent after first-boot
+    provisioning). When present, fc-agent skips the storage wipe and image import,
+    re-mounts the existing storage loopback (never mkfs), <code>podman start</code>s the
+    captured <code>fcvm-container</code>, and regenerates identity. No MMDS plumbing —
+    the disk itself carries the signal. The host keys solely off
+    <code>rootfs_override</code> (boot the captured disk; skip image resolution and the
+    snapshot cache). The same machinery powers <strong>in-place reboot</strong>: every VM
+    builds its launch plan up front and all lifecycle paths boot through one shared
+    <code>configure_and_boot_firecracker</code> primitive, so a guest <code>reboot</code>
+    relaunches the VM from its own disk — semantically identical to a disk-only clone
+    cold boot. The capture path (freeze → reflink → unfreeze, no vCPU pause) shipped as
+    designed. See <code>DESIGN.md → Storage &amp; Cloning</code> for the as-built reference.
+  </div>
+</div>
 
 <nav class="toc"><div class="wrap"><ul>
   <li><a href="#tldr">TL;DR</a></li>

@@ -4,11 +4,31 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use std::sync::atomic::AtomicBool;
+
 use crate::cli::RunArgs;
-use crate::firecracker::VmManager;
+use crate::firecracker::{FirecrackerConfig, VmManager};
 use crate::network::{NetworkConfig, NetworkManager};
 use crate::state::{StateManager, VmState};
 use crate::volume::VolumeConfig;
+
+/// Everything needed to re-run the Firecracker API configuration + boot for an
+/// in-place relaunch (a guest reboot). Captured once during initial setup; the
+/// host-side substrate (disk, network namespace/holder, vsock listeners) is reused
+/// untouched, so a relaunch only replays the per-firecracker-child config.
+///
+/// Consumed by the shared `configure_and_boot_firecracker` primitive (vm_config.rs),
+/// which both the initial boot and the reboot relaunch call.
+pub struct RebootSpec {
+    pub firecracker_bin: PathBuf,
+    pub fc_args: Option<String>,
+    /// Fully-resolved launch config (rootfs_path points at the per-VM CoW disk).
+    pub launch_config: FirecrackerConfig,
+    pub boot_args: String,
+    pub track_dirty_pages: bool,
+    pub image_disk_path: Option<PathBuf>,
+    pub vsock_socket_path: PathBuf,
+}
 
 /// All state accumulated during VM setup, bundled for the event loop and cleanup.
 pub struct VmContext {
@@ -44,6 +64,15 @@ pub struct VmContext {
     /// VM state snapshot for cache snapshot creation. Config fields (image, vcpu,
     /// memory_mib, network, original_vsock_vm_id, etc.) are immutable after setup.
     pub vm_state: crate::state::VmState,
+    /// Set by the status listener when the guest signals a reboot. run_vm_loop checks
+    /// it when Firecracker exits and relaunches in place instead of terminating.
+    pub reboot_requested: Arc<AtomicBool>,
+    /// Set by the status listener when the container's "exit:" notification arrives.
+    /// Distinguishes a real termination from a reboot in wait_for_reboot_decision and
+    /// gates the exit-code read (the listener stays alive, so it can't be joined).
+    pub container_exit_seen: Arc<AtomicBool>,
+    /// Inputs to replay the Firecracker API config + boot on an in-place relaunch.
+    pub reboot_spec: RebootSpec,
 }
 
 /// A log line from the VM's container output.
@@ -144,7 +173,7 @@ pub enum SnapshotOutcome {
 }
 
 /// Parsed volume mapping from --map HOST:GUEST[:ro] specification.
-pub(super) struct VolumeMapping {
+pub(crate) struct VolumeMapping {
     pub host_path: PathBuf,
     pub guest_path: String,
     pub read_only: bool,

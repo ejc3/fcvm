@@ -183,9 +183,20 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Disk-only clone detection: a reflink of an already-provisioned rootfs carries
+    // the provisioned marker. When present, this boot must preserve the captured
+    // storage + container (skip the wipe, skip re-import, re-mount the loopback,
+    // start the existing container) and only regenerate per-machine identity.
+    let provisioned = container::is_provisioned();
+    if provisioned {
+        eprintln!("[fc-agent] provisioned marker present — disk-only clone cold boot");
+    }
+
     // Set up btrfs storage if kernel supports it (avoids overlay idmap issues).
     // Skip for overlay mode — it manages its own storage.
     // For btrfs/archive/pull: creates loopback btrfs if kernel supports it.
+    // For a clone, setup_btrfs_storage_if_available mounts the existing loopback
+    // instead of reformatting it (guarded by the provisioned marker).
     match plan.image_mode.as_deref() {
         Some("overlay") => {
             eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
@@ -193,7 +204,8 @@ pub async fn run() -> Result<()> {
         _ => {
             // Btrfs, archive, and pull modes all use btrfs loopback on rootfs.
             // The btrfs kernel module must be available (CONFIG_BTRFS_FS=y in btrfs profile).
-            container::setup_btrfs_storage_if_available();
+            container::setup_btrfs_storage_if_available()
+                .context("setting up container storage")?;
         }
     }
 
@@ -222,7 +234,7 @@ pub async fn run() -> Result<()> {
                 .zip(plan.subuid_count)
                 .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
             let (username, _uid, runtime_dir) =
-                container::create_vm_user(user_spec, desired_name, subuid_range);
+                container::create_vm_user(user_spec, desired_name, subuid_range, provisioned);
             Some((username, runtime_dir))
         }
     } else {
@@ -243,34 +255,59 @@ pub async fn run() -> Result<()> {
     // db.sql with the wrong graph driver. Only needed for root podman — user mode
     // already resets in create_vm_user(), and a root reset would destroy the
     // user's storage directory.
-    if cmd_prefix.is_empty() {
+    // A clone's storage already matches storage.conf and holds the captured
+    // container — a reset would erase it. Only wipe on a fresh first boot.
+    if cmd_prefix.is_empty() && !provisioned {
         container::reset_podman_state();
     }
 
-    // Prepare image based on delivery mode
-    let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
-        (Some("overlay"), Some(device)) => {
+    // Prepare image based on delivery mode. A clone already has the image in
+    // captured storage; re-importing is wasteful (and the host no longer ships
+    // an image device), so skip straight to the launch using the recorded name.
+    // Exception: overlay mode serves the image from a read-only additionalImageStore
+    // device whose MOUNT doesn't survive a reboot — re-mount it (no re-import).
+    let image_ref = if provisioned {
+        if let (Some("overlay"), Some(device)) = (plan.image_mode.as_deref(), &plan.image_device) {
+            eprintln!("[fc-agent] re-mounting overlay image store (provisioned re-boot)");
             let username = user_info.as_ref().map(|(name, _)| name.as_str());
-            container::mount_overlay_image(device, &plan.image, username)?
+            container::mount_overlay_image(device, &plan.image, username, false)?
+        } else {
+            eprintln!("[fc-agent] skipping image import (clone — image already in storage)");
+            plan.image.clone()
         }
-        (Some("btrfs"), Some(device)) => {
-            // Btrfs loopback was created in Phase 1 (setup_btrfs_storage_if_available).
-            // Load the Docker archive from the block device into btrfs storage.
-            container::import_image(device, &plan.image, &output, &cmd_prefix).await?
-        }
-        (Some("archive"), Some(device)) => {
-            container::import_image(device, &plan.image, &output, &cmd_prefix).await?
-        }
-        (None, None) => {
-            // Remote image — pull from registry
-            container::pull_image(&plan).await?
-        }
-        (Some(mode), _) => {
-            anyhow::bail!("unknown image_mode: {}", mode);
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("image_device set but image_mode is missing");
-        }
+    } else {
+        let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
+            (Some("overlay"), Some(device)) => {
+                let username = user_info.as_ref().map(|(name, _)| name.as_str());
+                container::mount_overlay_image(device, &plan.image, username, true)?
+            }
+            (Some("btrfs"), Some(device)) => {
+                // Btrfs loopback was created in Phase 1 (setup_btrfs_storage_if_available).
+                // Load the Docker archive from the block device into btrfs storage.
+                container::import_image(device, &plan.image, &output, &cmd_prefix).await?
+            }
+            (Some("archive"), Some(device)) => {
+                container::import_image(device, &plan.image, &output, &cmd_prefix).await?
+            }
+            (None, None) => {
+                // Remote image — pull from registry
+                container::pull_image(&plan).await?
+            }
+            (Some(mode), _) => {
+                anyhow::bail!("unknown image_mode: {}", mode);
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("image_device set but image_mode is missing");
+            }
+        };
+        // Storage + image are now in place; mark the disk provisioned so a
+        // disk-only snapshot of this VM cold-boots clones without redoing it.
+        // The marker deliberately does NOT assert the container exists — a capture
+        // taken before `podman run` creates it is still valid (the clone's
+        // container_exists probe falls back to a fresh `podman run` from the
+        // preserved image, which is the correct degradation).
+        container::write_provisioned_marker();
+        image_ref
     };
 
     // Capture egress generation before cache handshake — used to detect reconnection
@@ -406,14 +443,27 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // A clone shares its source's machine-id / SSH host keys via the reflinked
+    // disk. Regenerate them so concurrent clones have distinct identities.
+    if provisioned {
+        container::regenerate_identity();
+    }
+
     eprintln!("[fc-agent] launching container: {}", image_ref);
     system::wait_for_cgroup_controllers().await;
 
-    // Build podman args (pass user info if available for rootless setup)
+    // Build podman args (pass user info if available for rootless setup).
+    // On a clone the container already exists — start it (preserving its
+    // captured writable layer) instead of `podman run`-ing a fresh one.
     let user_ref = user_info
         .as_ref()
         .map(|(username, runtime_dir)| (username.as_str(), runtime_dir.as_str()));
-    let podman_args = container::build_podman_args(&plan, &image_ref, user_ref);
+    let podman_args = if provisioned && container::container_exists(&cmd_prefix) {
+        eprintln!("[fc-agent] starting captured fcvm-container (clone cold boot)");
+        container::build_start_args(&plan, user_ref)
+    } else {
+        container::build_podman_args(&plan, &image_ref, user_ref)
+    };
 
     // TTY mode: blocks, never returns
     if plan.tty {

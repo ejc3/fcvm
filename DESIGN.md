@@ -435,6 +435,48 @@ Each VM has:
 - Regenerate machine IDs
 - Update MMDS with new config
 
+### Disk-Only Snapshots & Cold-Boot Clones
+
+`fcvm snapshot create --disk-only` captures only the disk (`kind: DiskOnly`):
+`sync` → `fsfreeze --freeze /` over the exec vsock → btrfs reflink of the disk →
+`fsfreeze --unfreeze /`. No vCPU pause, no memory/vmstate files. The podman
+container store (`btrfs.img` loopback) is a file ON the rootfs, so freezing `/`
+freezes it too — the capture is crash-consistent.
+
+Clones of a disk-only tag **cold-boot** (`snapshot run --snapshot <tag>` dispatches
+to the podman boot machinery with `rootfs_override` = captured disk). The guest
+self-detects the situation via a **provisioned marker** (`/var/lib/fcvm/provisioned`,
+written by fc-agent after first-boot provisioning): when present, fc-agent skips the
+storage wipe and image import, re-mounts the existing storage loopback (never mkfs),
+`podman start`s the captured `fcvm-container` (preserving its writable layer), and
+regenerates per-machine identity (machine-id, SSH host keys). No policies, no MMDS
+plumbing — the disk itself carries the signal.
+
+### In-Place Reboot (and the shared boot primitive)
+
+Every VM is configured "reboot possible" **up front**: each lifecycle path builds a
+launch plan (`RebootSpec`: firecracker binary/args, fully-resolved launch config,
+boot args, vsock path) before the VM runs, and all paths boot through one shared
+primitive, `configure_and_boot_firecracker`:
+
+- initial `fcvm podman run` boot
+- disk-only clone cold boot (via `prepare_vm` with `rootfs_override`)
+- in-place relaunch after a guest reboot (both the podman run loop and the
+  snapshot-restore run loop)
+
+Reboot detection: a systemd unit in the guest (`fcvm-reboot-notify.service`,
+`WantedBy=reboot.target` — pulled in only on reboot, never poweroff/halt) runs
+`fc-agent --notify-reboot`, which sends `reboot` on the vsock status port before
+the guest resets. The host's status listener sets a flag and stays alive; when the
+Firecracker child exits, the run loop sees the flag and relaunches in place —
+same fcvm process/PID, same disk, same network namespace/holder, same listeners
+and health monitor. The re-boot lands on the provisioned-marker path, so a reboot
+is semantically identical to a disk-only clone cold boot. fc-agent's own
+post-container shutdown uses `poweroff -f`, which never reaches `reboot.target`,
+so normal termination is unaffected. After a relaunch the recorded snapshot parent
+is cleared (fresh-boot memory must never be diff-snapshotted against the old
+lineage).
+
 ---
 
 ## Networking
@@ -2012,6 +2054,23 @@ ARM64 FEAT_NV2 has architectural issues with cache coherency under double Stage 
 ### Snapshot + FUSE Volumes
 
 Snapshots are disabled when `--map` volumes are present because the FUSE-over-vsock connection state may not survive the pause/resume cycle cleanly. This means VMs with volume mounts always do a fresh boot. Block device mounts (`--disk`, `--disk-dir`) do not have this limitation.
+
+### Disk-Only Clone / Reboot Edge Cases
+
+Snapshot metadata records the source's `kernel_profile`, `image_mode`, and
+`image_disk_path` (all `#[serde(default)]`, so old snapshots still load):
+
+- **Custom kernel profiles**: cold-boot clones and reboot plans resolve the
+  recorded profile, so a btrfs/nested-profile disk boots with a kernel that can
+  mount it. Snapshots created before these fields existed fall back to "default".
+- **Overlay/archive (localhost/) images**: the recorded image device
+  (content-addressed cache file) is re-attached on cold-boot clones and reboot
+  relaunches, and the MMDS plan carries the mode so fc-agent re-mounts the
+  additionalImageStore on a provisioned boot. The image layers stay reachable.
+- **Extra disks** (`--disk-dir`): intentionally fail-fast — disk-only capture
+  rejects sources with extra disks, and reboot-in-place is disabled for restored
+  clones that have them (a relaunch would silently drop the data disks).
+  Re-attaching captured extra-disk images on cold boot is a follow-up.
 
 ---
 
