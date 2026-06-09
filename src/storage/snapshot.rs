@@ -728,6 +728,33 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_config_kind_disk_only_roundtrip() {
+        // A SnapshotConfig tagged DiskOnly must preserve kind through JSON — the
+        // run dispatch in later PRs depends on this field surviving.
+        let json = r#"{
+            "name": "do",
+            "vm_id": "x",
+            "memory_path": "/m",
+            "vmstate_path": "/v",
+            "disk_path": "/d",
+            "created_at": "2024-01-15T10:30:00Z",
+            "kind": "DiskOnly",
+            "metadata": {
+                "image": "alpine",
+                "vcpu": 1,
+                "memory_mib": 256,
+                "network_config": { "tap_device": "t", "guest_mac": "AA:BB:CC:DD:EE:FF" }
+            }
+        }"#;
+        let config: SnapshotConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.kind, SnapshotKind::DiskOnly);
+        // ...and survives a re-serialize round-trip.
+        let reparsed: SnapshotConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.kind, SnapshotKind::DiskOnly);
+    }
+
+    #[test]
     fn test_snapshot_metadata_ipv6_prefix_roundtrip() {
         let metadata = SnapshotMetadata {
             image: "nginx:alpine".to_string(),

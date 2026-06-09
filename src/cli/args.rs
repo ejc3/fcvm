@@ -334,6 +334,11 @@ pub struct SnapshotCreateArgs {
     /// Optional: custom snapshot name (defaults to VM name)
     #[arg(long)]
     pub tag: Option<String>,
+
+    /// Capture only the disk (no memory image). Clones cold-boot fresh from the
+    /// captured disk instead of resuming via UFFD. See docs/disk-only-clone.html.
+    #[arg(long)]
+    pub disk_only: bool,
 }
 
 #[derive(Args, Debug)]

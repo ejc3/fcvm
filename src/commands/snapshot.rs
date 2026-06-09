@@ -101,6 +101,17 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await
         .context("loading VM state")?;
 
+    // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
+    // memory dump) is not wired yet. The --disk-only flag is reserved so the CLI
+    // surface is stable; refusing here is honest rather than silently producing a
+    // Full snapshot. Capture lands in a follow-up. See docs/disk-only-clone.html.
+    if args.disk_only {
+        anyhow::bail!(
+            "--disk-only capture is not implemented yet (the flag is reserved); \
+             this would otherwise silently create a full snapshot."
+        );
+    }
+
     // Block snapshots when VM has read-write extra disks
     let rw_disks: Vec<_> = vm_state
         .config
@@ -261,6 +272,22 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 /// How long serve shutdown waits for clones to exit after SIGTERM before escalating to SIGKILL.
 const CLONE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Reject a disk-only snapshot in the memory-restore (UFFD) paths — `snapshot
+/// serve` and `snapshot run --pid/--snapshot` operate on a memory image, which a
+/// disk-only snapshot does not have. Clones of a disk-only tag must cold-boot
+/// (the P4 `snapshot run --tag` dispatcher), not resume. Guarding here keeps the
+/// old paths from panicking on a missing memory.bin.
+fn ensure_not_disk_only(kind: crate::storage::SnapshotKind, command: &str) -> Result<()> {
+    if kind == crate::storage::SnapshotKind::DiskOnly {
+        anyhow::bail!(
+            "snapshot is disk-only (no memory image); `{command}` needs a full \
+             snapshot. Disk-only snapshots are cold-booted, not resumed (cold-boot \
+             support is in progress)."
+        );
+    }
+    Ok(())
+}
+
 /// Serve snapshot memory (foreground)
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     info!(
@@ -274,6 +301,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         .load_snapshot(&args.snapshot_name)
         .await
         .context("loading snapshot configuration")?;
+    ensure_not_disk_only(snapshot_config.kind, "snapshot serve")?;
 
     info!(
         snapshot = %args.snapshot_name,
@@ -643,6 +671,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .load_snapshot(&snapshot_name)
         .await
         .context("loading snapshot configuration")?;
+    // The --pid (UFFD) and --snapshot (direct memory restore) paths both resume
+    // from a memory image; a disk-only tag has none. Cold-boot is the P4 path.
+    ensure_not_disk_only(snapshot_config.kind, "snapshot run --pid/--snapshot")?;
 
     info!(
         snapshot = %snapshot_name,
@@ -1554,6 +1585,18 @@ async fn cmd_snapshot_ls() -> Result<()> {
 mod tests {
     use super::*;
     use crate::storage::snapshot::SnapshotVolumeConfig;
+    use crate::storage::SnapshotKind;
+
+    #[test]
+    fn ensure_not_disk_only_rejects_disk_only_and_allows_full() {
+        // Memory-restore paths must refuse a disk-only tag (no memory image)...
+        assert!(ensure_not_disk_only(SnapshotKind::DiskOnly, "snapshot serve").is_err());
+        assert!(
+            ensure_not_disk_only(SnapshotKind::DiskOnly, "snapshot run --pid/--snapshot").is_err()
+        );
+        // ...but full snapshots pass through unchanged.
+        assert!(ensure_not_disk_only(SnapshotKind::Full, "snapshot serve").is_ok());
+    }
 
     #[test]
     fn test_volume_state_from_snapshot_rebuilds_specs_and_portable_flag() {
