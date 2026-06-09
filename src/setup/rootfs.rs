@@ -1343,6 +1343,34 @@ ln -sf ../fc-agent.service /newroot/etc/systemd/system/multi-user.target.wants/f
 
 echo "fc-agent installed successfully"
 
+# Install a systemd service that tells the host, on a guest `reboot`, to relaunch
+# the VM in place (disk-only-clone semantics) instead of terminating.
+#
+# It is WantedBy=reboot.target, so it is pulled in ONLY on reboot — never on
+# poweroff/halt (those isolate to poweroff.target/halt.target). It is ordered
+# Before=systemd-reboot.service so it runs while the full rootfs is still mounted
+# and the fc-agent binary + vsock are available — crucially BEFORE systemd pivots
+# to the finalrd shutdown ramdisk (a system-shutdown hook would run in that
+# minimal ramdisk, where /usr/local/bin/fc-agent does not exist).
+#
+# fc-agent's own post-container shutdown uses `poweroff -f`, which never reaches
+# reboot.target, so a normal shutdown never emits the reboot signal.
+cat > /newroot/etc/systemd/system/fcvm-reboot-notify.service << 'REBOOTUNIT'
+[Unit]
+Description=Signal fcvm host of reboot intent (relaunch in place)
+DefaultDependencies=no
+Before=systemd-reboot.service reboot.target shutdown.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fc-agent --notify-reboot
+TimeoutStartSec=5
+[Install]
+WantedBy=reboot.target
+REBOOTUNIT
+mkdir -p /newroot/etc/systemd/system/reboot.target.wants
+ln -sf ../fcvm-reboot-notify.service \
+    /newroot/etc/systemd/system/reboot.target.wants/fcvm-reboot-notify.service
+
 # Also ensure MMDS route config exists (in case setup script failed)
 mkdir -p /newroot/etc/systemd/network/10-eth0.network.d
 if [ ! -f /newroot/etc/systemd/network/10-eth0.network.d/mmds.conf ]; then

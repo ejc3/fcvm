@@ -277,7 +277,11 @@ fn get_filesystem_size_bytes(path: &str) -> Option<u64> {
 /// Creates a sparse loopback btrfs filesystem sized to the root disk capacity
 /// and configures podman to use it.
 /// This avoids overlay's idmap issues that cause expensive chown-copy on rootless podman.
-pub fn setup_btrfs_storage_if_available() {
+/// Errors only when a PROVISIONED disk's existing storage loopback fails to mount —
+/// continuing would silently detach the captured container (the boot would fall back
+/// to an empty store and `podman run` a fresh container). Fresh-boot setup problems
+/// remain best-effort warnings (the VM can still run with the default driver).
+pub fn setup_btrfs_storage_if_available() -> anyhow::Result<()> {
     // Check if kernel has btrfs support via /proc/filesystems.
     // Note: /sys/fs/btrfs only appears after a btrfs filesystem is mounted,
     // so it can't detect built-in (CONFIG_BTRFS_FS=y) support before first mount.
@@ -286,7 +290,7 @@ pub fn setup_btrfs_storage_if_available() {
         .unwrap_or(false);
     if !has_btrfs {
         eprintln!("[fc-agent] btrfs not available in kernel, using default storage driver");
-        return;
+        return Ok(());
     }
 
     // If root filesystem is natively btrfs, resize to fill disk and skip loopback.
@@ -322,7 +326,7 @@ pub fn setup_btrfs_storage_if_available() {
             storage_dir,
             "/run/containers/storage",
         );
-        return;
+        return Ok(());
     }
 
     let storage_dir = "/var/lib/containers/storage";
@@ -345,7 +349,48 @@ pub fn setup_btrfs_storage_if_available() {
             storage_dir,
             "/run/containers/storage",
         );
-        return;
+        return Ok(());
+    }
+
+    // Disk-only clone: the loopback was formatted and populated on the source's
+    // first boot and reflinked into this disk. Mount it as-is — NEVER mkfs, which
+    // would erase the captured image + container. Mounts don't survive a reboot,
+    // so the file exists but isn't mounted yet.
+    if is_provisioned() && std::path::Path::new(loopback_path).exists() {
+        match std::process::Command::new("mount")
+            .args(["-o", "loop", loopback_path, storage_dir])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                use std::os::unix::fs::PermissionsExt;
+                if let Some(parent) = std::path::Path::new(storage_dir).parent() {
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+                }
+                let _ =
+                    std::fs::set_permissions(storage_dir, std::fs::Permissions::from_mode(0o755));
+                write_btrfs_storage_conf(
+                    "/etc/containers/storage.conf",
+                    storage_dir,
+                    "/run/containers/storage",
+                );
+                eprintln!("[fc-agent] mounted existing btrfs storage loopback (clone)");
+                return Ok(());
+            }
+            Ok(o) => {
+                anyhow::bail!(
+                    "mounting existing provisioned btrfs loopback failed: {} — refusing \
+                     to continue (the captured container storage would be silently lost)",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "mount of existing provisioned btrfs loopback failed: {e} — refusing \
+                     to continue (the captured container storage would be silently lost)"
+                );
+            }
+        }
     }
 
     // Size the sparse loopback to the root filesystem capacity.
@@ -365,11 +410,11 @@ pub fn setup_btrfs_storage_if_available() {
                 "[fc-agent] WARNING: truncate failed: {}",
                 String::from_utf8_lossy(&o.stderr)
             );
-            return;
+            return Ok(());
         }
         Err(e) => {
             eprintln!("[fc-agent] WARNING: failed to create btrfs loopback: {}", e);
-            return;
+            return Ok(());
         }
     }
 
@@ -384,11 +429,11 @@ pub fn setup_btrfs_storage_if_available() {
                 "[fc-agent] WARNING: mkfs.btrfs failed: {}",
                 String::from_utf8_lossy(&o.stderr)
             );
-            return;
+            return Ok(());
         }
         Err(e) => {
             eprintln!("[fc-agent] WARNING: mkfs.btrfs not found: {}", e);
-            return;
+            return Ok(());
         }
     }
 
@@ -403,11 +448,11 @@ pub fn setup_btrfs_storage_if_available() {
                 "[fc-agent] WARNING: mount btrfs failed: {}",
                 String::from_utf8_lossy(&o.stderr)
             );
-            return;
+            return Ok(());
         }
         Err(e) => {
             eprintln!("[fc-agent] WARNING: mount failed: {}", e);
-            return;
+            return Ok(());
         }
     }
 
@@ -437,6 +482,7 @@ pub fn setup_btrfs_storage_if_available() {
         "[fc-agent] btrfs storage configured at {} ({} sparse loopback)",
         storage_dir, loopback_size
     );
+    Ok(())
 }
 
 /// Reset root podman state to match the current storage.conf.
@@ -465,6 +511,92 @@ pub fn reset_podman_state() {
         Err(e) => {
             eprintln!("[fc-agent] WARNING: podman system reset error: {}", e);
         }
+    }
+}
+
+/// Marker written on the rootfs once first-boot provisioning (storage + image +
+/// container) completes. A disk-only clone cold-boots from a reflink of that
+/// rootfs, so the marker is already present — the signal that says "the work is
+/// already here, don't redo (or destroy) it; just regenerate the identity."
+const PROVISIONED_MARKER: &str = "/var/lib/fcvm/provisioned";
+
+/// True if this boot is from an already-provisioned disk (a disk-only clone).
+pub fn is_provisioned() -> bool {
+    std::path::Path::new(PROVISIONED_MARKER).exists()
+}
+
+/// Record that first-boot provisioning completed. Idempotent.
+pub fn write_provisioned_marker() {
+    if let Some(parent) = std::path::Path::new(PROVISIONED_MARKER).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(PROVISIONED_MARKER, b"1\n") {
+        eprintln!("[fc-agent] WARNING: failed to write provisioned marker: {e}");
+    }
+}
+
+/// Whether a container named `fcvm-container` already exists in podman storage.
+/// On a clone boot the container is already created — we start it rather than
+/// `podman run` a fresh one, preserving its writable layer (the captured work).
+pub fn container_exists(cmd_prefix: &[String]) -> bool {
+    let mut cmd = if cmd_prefix.is_empty() {
+        std::process::Command::new("podman")
+    } else {
+        let mut c = std::process::Command::new(&cmd_prefix[0]);
+        c.args(&cmd_prefix[1..]);
+        c.arg("podman");
+        c
+    };
+    cmd.args(["container", "exists", "fcvm-container"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build the argv to start (and attach to) the captured `fcvm-container`.
+/// Mirrors `build_podman_args`' rootless prefixing so the same run_tty/run_async
+/// path drives it.
+pub fn build_start_args(plan: &Plan, user_info: Option<(&str, &str)>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some((username, runtime_dir)) = user_info {
+        args.extend(run_as_user_prefix(username, runtime_dir));
+    }
+    args.push("podman".to_string());
+    args.push("start".to_string());
+    // Attach stdout/stderr (and stdin when interactive) so fc-agent forwards
+    // the container's output exactly as it does for `podman run`.
+    if plan.interactive {
+        args.push("--attach".to_string());
+        args.push("--interactive".to_string());
+    } else {
+        args.push("--attach".to_string());
+    }
+    args.push("fcvm-container".to_string());
+    args
+}
+
+/// Regenerate per-machine identity on a clone so concurrently-running clones of
+/// the same disk don't collide. Hostname is set separately from the Plan.
+pub fn regenerate_identity() {
+    // machine-id: a fresh random id (systemd/dbus and many apps key off it).
+    if let Ok(uuid) = std::fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let id = format!("{}\n", uuid.trim().replace('-', ""));
+        let _ = std::fs::write("/etc/machine-id", &id);
+        if std::path::Path::new("/var/lib/dbus").is_dir() {
+            let _ = std::fs::write("/var/lib/dbus/machine-id", &id);
+        }
+        eprintln!("[fc-agent] regenerated machine-id for clone");
+    }
+    // SSH host keys: regenerate if sshd is present (best-effort).
+    if std::path::Path::new("/etc/ssh").is_dir() {
+        if let Ok(entries) = std::fs::read_dir("/etc/ssh") {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("ssh_host_") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let _ = std::process::Command::new("ssh-keygen").arg("-A").output();
     }
 }
 
