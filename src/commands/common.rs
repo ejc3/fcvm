@@ -1392,6 +1392,9 @@ pub fn build_snapshot_config(
         disk_path: snapshot_dir.join("disk.raw"),
         created_at: chrono::Utc::now(),
         snapshot_type,
+        // Prod builder always produces Full snapshots; the disk-only path (P2)
+        // sets DiskOnly in create_disk_only_snapshot_core.
+        kind: crate::storage::SnapshotKind::Full,
         metadata: crate::storage::SnapshotMetadata {
             image: vm_state.config.image.clone(),
             vcpu: vm_state.config.vcpu,

@@ -29,6 +29,27 @@ impl std::fmt::Display for SnapshotType {
     }
 }
 
+/// Kind of snapshot — distinguishes a full memory+disk snapshot from a
+/// disk-only snapshot (no memory image; clones cold-boot from the captured disk).
+/// Defaults to Full for backward compatibility with existing snapshots.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SnapshotKind {
+    /// Memory + disk snapshot; clones resume mid-execution via UFFD.
+    #[default]
+    Full,
+    /// Disk-only snapshot; clones cold-boot fresh from the captured disk.
+    DiskOnly,
+}
+
+impl std::fmt::Display for SnapshotKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotKind::Full => write!(f, "full"),
+            SnapshotKind::DiskOnly => write!(f, "disk-only"),
+        }
+    }
+}
+
 /// Snapshot configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
@@ -60,6 +81,10 @@ pub struct SnapshotConfig {
     /// Defaults to System for backward compatibility with existing snapshots
     #[serde(default)]
     pub snapshot_type: SnapshotType,
+    /// Full (memory+disk) vs DiskOnly (no memory image — clones cold-boot).
+    /// Defaults to Full so existing snapshots deserialize unchanged.
+    #[serde(default)]
+    pub kind: SnapshotKind,
     pub metadata: SnapshotMetadata,
 }
 
@@ -263,6 +288,7 @@ mod tests {
             disk_path: PathBuf::from("/path/to/disk.raw"),
             created_at: chrono::Utc::now(),
             snapshot_type: SnapshotType::User,
+            kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {
                 image: "nginx:alpine".to_string(),
                 vcpu: 2,
@@ -389,6 +415,7 @@ mod tests {
             disk_path: PathBuf::from("/disk.raw"),
             created_at: chrono::Utc::now(),
             snapshot_type: SnapshotType::User,
+            kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {
                 image: "alpine:latest".to_string(),
                 vcpu: 2,
@@ -459,6 +486,7 @@ mod tests {
                 disk_path: PathBuf::from("/disk.raw"),
                 created_at: chrono::Utc::now(),
                 snapshot_type: SnapshotType::System,
+                kind: SnapshotKind::Full,
                 metadata: SnapshotMetadata {
                     image: "alpine".to_string(),
                     vcpu: 1,
@@ -516,6 +544,7 @@ mod tests {
             disk_path: PathBuf::from("/disk.raw"),
             created_at: chrono::Utc::now(),
             snapshot_type: SnapshotType::System,
+            kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {
                 image: "alpine".to_string(),
                 vcpu: 1,
@@ -609,6 +638,8 @@ mod tests {
         assert_eq!(config.name, "old-snapshot");
         // Missing snapshot_type should default to System
         assert_eq!(config.snapshot_type, SnapshotType::System);
+        // Missing kind should default to Full (existing snapshots are memory+disk)
+        assert_eq!(config.kind, SnapshotKind::Full);
     }
 
     #[test]
@@ -624,6 +655,7 @@ mod tests {
             disk_path: PathBuf::from("/disk.raw"),
             created_at: chrono::Utc::now(),
             snapshot_type: SnapshotType::User,
+            kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {
                 image: "alpine".to_string(),
                 vcpu: 1,
@@ -671,6 +703,28 @@ mod tests {
         let json = serde_json::to_string(&system_config).unwrap();
         let parsed: SnapshotConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.snapshot_type, SnapshotType::System);
+    }
+
+    #[test]
+    fn test_snapshot_kind_default_is_full() {
+        // Verify SnapshotKind::default() is Full (existing snapshots are memory+disk)
+        assert_eq!(SnapshotKind::default(), SnapshotKind::Full);
+    }
+
+    #[test]
+    fn test_snapshot_kind_display() {
+        assert_eq!(format!("{}", SnapshotKind::Full), "full");
+        assert_eq!(format!("{}", SnapshotKind::DiskOnly), "disk-only");
+    }
+
+    #[test]
+    fn test_snapshot_kind_json_roundtrip() {
+        // Both kinds round-trip through JSON unchanged.
+        for kind in [SnapshotKind::Full, SnapshotKind::DiskOnly] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let parsed: SnapshotKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, kind);
+        }
     }
 
     #[test]
