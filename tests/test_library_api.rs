@@ -53,6 +53,8 @@ fn test_run_args(name: &str) -> RunArgs {
         ipv6_prefix: None,
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],
+        rootfs_override: None,
+        image_disk_override: None,
     }
 }
 

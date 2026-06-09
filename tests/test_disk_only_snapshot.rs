@@ -90,3 +90,114 @@ async fn test_disk_only_capture_artifacts_and_source_survives() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+/// End-to-end: a disk-only clone cold-boots from the captured disk, preserves the
+/// container's writable layer (the "work"), and regenerates its identity.
+///
+/// This is also the shutdown→start lifecycle test: the source VM is SHUT DOWN
+/// before the clone boots, so the sequence (capture, stop, start) must behave
+/// identically to an in-place reboot — work preserved, identity regenerated,
+/// healthy. (Same provisioned-marker path; see tests/test_reboot.rs.)
+///
+/// 1. Boot a baseline VM, write a marker file *inside the container*.
+/// 2. `snapshot create --disk-only` (freeze → reflink → unfreeze).
+/// 3. Shut the source down (stop).
+/// 4. `snapshot run --snapshot <tag>` cold-boots a fresh clone (start).
+/// 5. The clone's container has the marker file (work preserved), the clone boots
+///    healthy, and its machine-id differs from the source (identity regenerated).
+#[tokio::test]
+async fn test_disk_only_clone_preserves_work_and_regenerates_identity() -> Result<()> {
+    let (name, _clone, snap, _serve) = common::unique_names("disk-only-clone");
+
+    // Baseline VM (rootless, long-running container so it restarts cleanly).
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &name, "nginx:alpine"],
+        "disk-only-clone-base",
+    )
+    .await?;
+    common::poll_health_by_pid(pid, 120).await?;
+
+    // Write a marker into the container's writable layer (the captured "work").
+    // The exec helper already wraps argv in `sh -c "<joined>"`, so pass the
+    // redirect as plain tokens — don't add another `sh -c` (it double-wraps).
+    let token = format!("clone-token-{}", std::process::id());
+    common::exec_in_container(pid, &["echo", &token, ">", "/work.txt"]).await?;
+    let src_file = common::exec_in_container(pid, &["cat", "/work.txt"]).await?;
+    assert!(
+        src_file.contains(&token),
+        "source container should hold the marker file, got: {src_file}"
+    );
+    let src_machine_id = common::exec_in_vm(pid, &["cat", "/etc/machine-id"])
+        .await
+        .unwrap_or_default();
+
+    // Capture disk-only.
+    let fcvm_path = common::find_fcvm_binary()?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            &snap,
+            "--disk-only",
+        ])
+        .output()
+        .await
+        .context("running snapshot create --disk-only")?;
+    assert!(
+        output.status.success(),
+        "snapshot create --disk-only failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // SHUT DOWN the source first — the clone must be fully independent of it
+    // (true stop→start sequence, not a side-by-side copy).
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    // Cold-boot a clone from the disk-only tag (the "start").
+    let clone_name = format!("{snap}-c1");
+    let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snap,
+            "--name",
+            &clone_name,
+        ],
+        "disk-only-clone-c1",
+    )
+    .await?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
+
+    // The clone's container must carry the preserved file.
+    let clone_file = common::exec_in_container(clone_pid, &["cat", "/work.txt"]).await?;
+    assert!(
+        clone_file.contains(&token),
+        "clone container missing the preserved file (work not carried over): {clone_file}"
+    );
+
+    // Identity must be regenerated: the clone's machine-id differs from the source.
+    let clone_machine_id = common::exec_in_vm(clone_pid, &["cat", "/etc/machine-id"])
+        .await
+        .unwrap_or_default();
+    assert!(
+        !clone_machine_id.trim().is_empty(),
+        "clone machine-id should be regenerated (non-empty)"
+    );
+    assert_ne!(
+        src_machine_id.trim(),
+        clone_machine_id.trim(),
+        "clone machine-id must differ from source (identity regenerated)"
+    );
+
+    // Cleanup (source already shut down above).
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.kill().await;
+    let _ = std::fs::remove_dir_all(snapshot_dir().join(&snap));
+    Ok(())
+}
