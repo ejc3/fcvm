@@ -287,6 +287,23 @@ impl Filesystem for FuseClient {
             }
         }
 
+        // Raise max_background well above the kernel default (fuser default: 16).
+        // RELEASE (and writeback/readahead) are *background* FUSE requests, capped
+        // by the kernel at max_background in flight. Under sustained parallel load
+        // — e.g. the throughput benchmark's 256 workers churning open/read/close —
+        // releases drain at only ~16/RTT while opens proceed at full speed, so the
+        // server's per-open handle fds accumulate within a mount's lifetime until
+        // the process hits its nofile limit (EMFILE — the intermittent Nightly
+        // benchmark failures). Raising the cap lets releases keep pace with opens;
+        // fuser derives congestion_threshold = 3/4·max_background automatically.
+        if let Err(prev) = config.set_max_background(1024) {
+            tracing::warn!(
+                target: "fuse-pipe::client",
+                prev,
+                "Failed to raise max_background, using kernel default"
+            );
+        }
+
         // Spawn additional readers now that INIT is done
         if let Some(callback) = self.init_callback.lock().unwrap().take() {
             callback();
