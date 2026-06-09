@@ -228,6 +228,30 @@ check-disk:
 		mkdir -p /mnt/fcvm-btrfs/cargo; \
 		echo "==> Restored /mnt/fcvm-btrfs/cargo"; \
 	fi
+	@# Ensure cargo toolchain binaries exist in ~/.cargo/bin (restored from rustup
+	@# if the cargo home was wiped — e.g. ephemeral btrfs reset). Without this,
+	@# `cargo` itself is missing after a wipe and every make target fails.
+	@if ! command -v cargo >/dev/null 2>&1 && ! [ -x "$$HOME/.cargo/bin/cargo" ]; then \
+		TC=$$(rustup show active-toolchain 2>/dev/null | awk '{print $$1}'); \
+		TCBIN="$$HOME/.rustup/toolchains/$$TC/bin"; \
+		if [ -z "$$TC" ]; then TCBIN=$$(ls -d "$$HOME"/.rustup/toolchains/*/bin 2>/dev/null | head -1); fi; \
+		if [ -n "$$TCBIN" ] && [ -d "$$TCBIN" ]; then \
+			echo "==> cargo missing; restoring shims from $$TCBIN"; \
+			mkdir -p "$$HOME/.cargo/bin"; \
+			for b in cargo rustc cargo-clippy clippy-driver rustfmt cargo-fmt rustdoc; do \
+				[ -e "$$TCBIN/$$b" ] && ln -sf "$$TCBIN/$$b" "$$HOME/.cargo/bin/$$b"; \
+			done; \
+		fi; \
+	fi
+	@# Ensure cargo-nextest (the test runner) is installed; install prebuilt if missing.
+	@if ! PATH="$$HOME/.cargo/bin:$$PATH" $(CARGO) nextest --version >/dev/null 2>&1; then \
+		echo "==> cargo-nextest missing; installing prebuilt binary..."; \
+		case "$$(uname -m)" in aarch64|arm64) NURL=https://get.nexte.st/latest/linux-arm ;; *) NURL=https://get.nexte.st/latest/linux ;; esac; \
+		mkdir -p "$$HOME/.cargo/bin"; \
+		curl -LsSf "$$NURL" | tar zxf - -C "$$HOME/.cargo/bin" \
+			|| PATH="$$HOME/.cargo/bin:$$PATH" $(CARGO) install cargo-nextest --locked; \
+		echo "==> cargo-nextest installed"; \
+	fi
 	@if [ -d /mnt/fcvm-btrfs ] && ! [ -L target ]; then \
 		if [ -d target ]; then \
 			echo "==> Moving existing target/ to /mnt/fcvm-btrfs/cargo-target..."; \
