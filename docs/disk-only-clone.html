@@ -328,7 +328,7 @@ fcvm snapshot run --tag base --name c2          # another fresh, independent cop
   <p><code>SnapshotMetadata</code> (<span class="src">src/storage/snapshot.rs:66–112</span>) already records image, vcpu, memory, network, volumes, hugepages, extra_disks, user, ports, forward-localhost, network-mode, ipv6-prefix, tty, interactive. To reconstruct a cold-boot plan it additionally needs fields that are currently <b>not persisted</b> anywhere:</p>
   <table>
     <tr><th>Field</th><th>Why needed</th><th>Status today</th></tr>
-    <tr><td><code>kind: SnapshotKind</code></td><td>distinguish Full vs DiskOnly at run dispatch</td><td>does not exist (<code>#[serde(default)]</code> ⇒ Full)</td></tr>
+    <tr><td><code>kind: SnapshotKind</code></td><td>distinguish Full vs DiskOnly at run dispatch</td><td><b>added in P1</b> (<a href="https://github.com/ejc3/fcvm/pull/649">#649</a>); <code>#[serde(default)]</code> ⇒ Full so old snapshots load unchanged</td></tr>
     <tr><td>effective image delivery</td><td>did a <em>separate read-only store</em> get attached? (overlay) vs rootfs-baked (btrfs/archive/remote). v1 rejects only the separate-store case</td><td>not stored; raw <code>resolve_image_mode</code> (<span class="src">mod.rs:58</span>) even defaults to Overlay for remote — so persist the <b>effective</b> delivery, i.e. whether MMDS attached a store device (<span class="src">src/firecracker/config.rs:377–378</span>)</td></tr>
     <tr><td><code>container_cmd</code> — <b>intentionally NOT persisted</b></td><td>persisting it would leak secrets into world-readable state (<span class="src">types.rs:108</span>, perms 0644 <span class="src">manager.rs:144</span>) — commands come from <code>--cmd</code>/trailing args (<span class="src">args.rs:182,296</span>) and can hold secrets, exactly like env. It's also unnecessary: <code>StartCaptured</code> replays the command from the captured container, and <code>FreshContainer</code> takes an explicit new one at run</td><td>omitted by design (mirrors the env-secret rule)</td></tr>
     <tr><td><code>nfs_shares</code> (+ host-served mounts)</td><td>NFS (and FUSE) mounts are served by the <em>host</em>, not baked into the disk — a clone must re-establish them at run time</td><td>parsed to <code>VmConfig.nfs_shares</code> (<span class="src">vm_config.rs:1048</span>) but <b>not</b> in <code>SnapshotMetadata</code> (<span class="src">snapshot.rs:66</span>); persist + re-setup, or require re-supply at run</td></tr>
@@ -391,6 +391,14 @@ MachineConfig {
 <section id="prs">
   <h2>Stacked PR sequence — green at every step</h2>
   <p>The work is decomposed so each PR <b>compiles, passes tests locally, and is independently mergeable</b>. Early PRs are purely additive (new fields default to existing behavior), so nothing changes until the final wiring PR turns the feature on. Each branch is stacked on the previous one (<code>main → P1 → P2 → …</code>).</p>
+
+  <div class="callout"><p><b>Implementation status</b> (open stacked PRs; foundations first, additive, validated against the VM test suite):</p>
+  <ul>
+    <li><b>P1</b> <a href="https://github.com/ejc3/fcvm/pull/649">#649</a> — <code>SnapshotKind</code> foundation <b>landed</b> (serde back-compat + round-trip tested). The full provenance/boot-config fields land with the PRs that consume them.</li>
+    <li><b>P2</b> <a href="https://github.com/ejc3/fcvm/pull/651">#651</a> — <code>--disk-only</code> flag (fail-fast until capture wires) + DiskOnly run/serve guards <b>landed</b> (tested). The freeze→reflink→unfreeze capture core follows.</li>
+    <li><b>P3</b> <a href="https://github.com/ejc3/fcvm/pull/653">#653</a> — <code>StoragePolicy</code>/<code>ContainerStatePolicy</code> boot-<code>Plan</code> foundation <b>landed</b> (defaults = today; fc-agent warns on unimplemented variants). The <code>Preserve</code>/<code>StartCaptured</code>/identity behavior + host-side emission follow.</li>
+    <li><b>P4</b> — cold-boot run wiring + e2e; <b>pending</b>.</li>
+  </ul></div>
 
   <svg viewBox="0 0 980 120" role="img" aria-label="stacked PR chain">
     <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#58a6ff"/></marker></defs>

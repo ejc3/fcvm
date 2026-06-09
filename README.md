@@ -105,6 +105,12 @@ Snapshot a running VM and restore clones from it. Two modes: UFFD (memory server
 ./fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
 ```
 
+> **Disk-only (cold-boot) clones — in development.** A third mode that captures
+> *only* the disk at a consistent point and cold-boots fresh, fully independent
+> VMs from it (with a free choice of memory / cpu / hugepages, unlike a memory
+> clone) is being built as a stack of PRs. See the design doc
+> ([docs/disk-only-clone.html](docs/disk-only-clone.html)) and issue #625.
+
 ### Container Image Cache
 
 After the first run with a given image, fcvm snapshots the VM state post-image-pull. Subsequent runs restore from snapshot instead of re-pulling — ~6x faster (540ms vs 3100ms).

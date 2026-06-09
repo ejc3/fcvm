@@ -435,6 +435,22 @@ Each VM has:
 - Regenerate machine IDs
 - Update MMDS with new config
 
+### Disk-only Clones (in development)
+
+The snapshot/clone above captures a running VM's **memory + disk** and resumes it
+mid-execution via UFFD. A second variant — **disk-only clone** — captures *only*
+the disk at a consistent point and **cold-boots** fresh, fully independent VMs
+from it (no memory image, no UFFD, free choice of memory/cpu/hugepages).
+
+It is framed as the empty cell of a `RootfsSource × BootMode` matrix that the
+cold-boot and snapshot-restore paths already share, plus one capture-side policy
+(`QuiescePolicy`: `fsfreeze` before the reflink — there is no vCPU pause) and
+three boot-side `Preserve`-vs-`Fresh` policies over categories of captured guest
+state — `StoragePolicy`, `ContainerStatePolicy`, `IdentityPolicy` — summarized as
+**"preserve the work, regenerate the identity."**
+
+Full design (code-grounded, with the stacked-PR plan): **[docs/disk-only-clone.html](docs/disk-only-clone.html)** · issue #625.
+
 ---
 
 ## Networking
