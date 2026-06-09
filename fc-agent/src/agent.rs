@@ -36,6 +36,23 @@ pub async fn run() -> Result<()> {
 
     system::save_proxy_settings(&plan);
 
+    // Disk-only clone boot policies (additive; serde defaults = today's behavior).
+    // The Preserve / StartCaptured / FreshContainer behavior lands in a follow-up;
+    // acknowledge a non-default request honestly instead of silently doing the
+    // wrong thing. Default boots are unaffected (empty match arms).
+    match plan.storage_policy {
+        crate::types::StoragePolicy::Provision => {}
+        crate::types::StoragePolicy::Preserve => eprintln!(
+            "[fc-agent] WARNING: storage_policy=Preserve requested but not yet implemented; using Provision"
+        ),
+    }
+    match plan.container_state_policy {
+        crate::types::ContainerStatePolicy::RunNew => {}
+        other => eprintln!(
+            "[fc-agent] WARNING: container_state_policy={other:?} requested but not yet implemented; using RunNew"
+        ),
+    }
+
     if !plan.forward_localhost.is_empty() {
         network::setup_localhost_forwarding(&plan.forward_localhost);
     }

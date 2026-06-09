@@ -1,6 +1,29 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// How the guest handles podman storage on boot. Defaults to `Provision`
+/// (today's behavior: wipe + rebuild). A disk-only clone sets `Preserve` to keep
+/// the captured store. See docs/disk-only-clone.html.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePolicy {
+    #[default]
+    Provision,
+    Preserve,
+}
+
+/// How the guest brings up the container on boot. Defaults to `RunNew` (today's
+/// `podman run`). A disk-only clone uses `StartCaptured` (replay the captured
+/// container) or `FreshContainer` (new container, keep image + volumes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerStatePolicy {
+    #[default]
+    RunNew,
+    StartCaptured,
+    FreshContainer,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Plan {
     pub image: String,
@@ -51,6 +74,14 @@ pub struct Plan {
     /// the TAP/bridge/pasta data path for outbound connections.
     #[serde(default)]
     pub egress_proxy: bool,
+    /// Disk-only clone: how to treat captured podman storage. Default `Provision`
+    /// (today's wipe + rebuild). See docs/disk-only-clone.html.
+    #[serde(default)]
+    pub storage_policy: StoragePolicy,
+    /// Disk-only clone: how to bring up the container. Default `RunNew` (today's
+    /// `podman run`).
+    #[serde(default)]
+    pub container_state_policy: ContainerStatePolicy,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +147,27 @@ pub enum ExecResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_plan_policies_default_to_today_behavior() {
+        // Every existing plan has no policy fields; they must deserialize to the
+        // current behavior so disk-only is purely additive.
+        let plan: Plan = serde_json::from_str(r#"{ "image": "alpine" }"#).unwrap();
+        assert_eq!(plan.storage_policy, StoragePolicy::Provision);
+        assert_eq!(plan.container_state_policy, ContainerStatePolicy::RunNew);
+    }
+
+    #[test]
+    fn test_plan_disk_only_policies_parse() {
+        let json = r#"{
+            "image": "alpine",
+            "storage_policy": "preserve",
+            "container_state_policy": "start_captured"
+        }"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.storage_policy, StoragePolicy::Preserve);
+        assert_eq!(plan.container_state_policy, ContainerStatePolicy::StartCaptured);
+    }
 
     #[test]
     fn test_plan_minimal() {
