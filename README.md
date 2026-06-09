@@ -105,6 +105,31 @@ Snapshot a running VM and restore clones from it. Two modes: UFFD (memory server
 ./fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
 ```
 
+### Disk-Only (Cold-Boot) Clones
+
+`--disk-only` captures just the disk — no vCPU pause, no memory image. The guest
+filesystem is frozen (`fsfreeze`) for crash consistency, the disk is reflinked
+(~ms), and the guest resumes. Clones cold-boot fresh from the captured disk: the
+container storage and writable layer are preserved, the container restarts, and
+per-machine identity (machine-id, SSH host keys) is regenerated.
+
+```bash
+./fcvm snapshot create --pid <vm_pid> --tag my-app --disk-only
+./fcvm snapshot run --snapshot my-app --name clone1   # cold boot, no memory restore
+```
+
+This is also the stop→start lifecycle: capture, shut the VM down, start again later
+from the captured disk. The sequence behaves identically to an in-place reboot —
+same guest path (preserve storage, restart container, regenerate identity).
+
+### In-Place Reboot
+
+A guest `reboot` does not terminate the VM. The host relaunches Firecracker
+against the same disk, network, and listeners — the fcvm process and its PID stay
+stable — and the guest comes back exactly like a disk-only clone cold boot:
+storage preserved, container restarted, identity regenerated. A guest `poweroff`
+still terminates the VM normally.
+
 ### Container Image Cache
 
 After the first run with a given image, fcvm snapshots the VM state post-image-pull. Subsequent runs restore from snapshot instead of re-pulling — ~6x faster (540ms vs 3100ms).
