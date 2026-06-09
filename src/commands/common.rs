@@ -1545,6 +1545,127 @@ pub async fn acquire_snapshot_dir_lock(
 /// portable-volume inode tables.
 pub type SnapshotExtraFiles<'a> = Option<&'a (dyn Fn() -> Vec<(String, Vec<u8>)> + Send + Sync)>;
 
+/// Disk-only capture: quiesce the guest, reflink only the disk (no memory dump,
+/// no vCPU pause — `fsfreeze` provides consistency), unfreeze, and finalize a
+/// `DiskOnly` snapshot. Clones cold-boot from this disk. See
+/// docs/disk-only-clone.html.
+///
+/// `snapshot_config.kind` must already be `DiskOnly`. `vsock_socket` is the VM's
+/// exec vsock (`vm_runtime_dir/<vm_id>/vsock.sock`), used to run the quiesce
+/// commands in the guest.
+///
+/// # Locking
+/// Caller holds the per-snapshot-dir + per-VM locks (same as `create_snapshot_core`).
+pub async fn create_disk_only_snapshot_core(
+    snapshot_config: crate::storage::snapshot::SnapshotConfig,
+    disk_path: &Path,
+    vsock_socket: &Path,
+) -> Result<()> {
+    use crate::commands::exec::run_exec_in_vm_captured;
+
+    let snapshot_dir = snapshot_config
+        .disk_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid disk_path in snapshot config"))?
+        .to_path_buf();
+    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    tokio::fs::create_dir_all(&temp_snapshot_dir)
+        .await
+        .context("creating temp snapshot directory")?;
+
+    // Quiesce so the reflink captures a crash-consistent filesystem. No vCPU pause:
+    // `sync` flushes dirty pages, then `fsfreeze --freeze /` blocks new writes to
+    // the rootfs across the reflink. The podman btrfs.img store is a file ON the
+    // rootfs, so freezing the rootfs also blocks writes to the container store.
+    let sync_cmd = vec!["sync".to_string()];
+    let sync_out = run_exec_in_vm_captured(vsock_socket, &sync_cmd, false)
+        .await
+        .context("guest sync before freeze")?;
+    if sync_out.exit_code != 0 {
+        warn!(stderr = %sync_out.stderr, "guest sync returned non-zero (continuing)");
+    }
+
+    let freeze_cmd = vec![
+        "fsfreeze".to_string(),
+        "--freeze".to_string(),
+        "/".to_string(),
+    ];
+    let freeze_out = run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false)
+        .await
+        .context("freezing guest rootfs")?;
+    if freeze_out.exit_code != 0 {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        anyhow::bail!(
+            "fsfreeze --freeze / failed (exit {}): {}",
+            freeze_out.exit_code,
+            freeze_out.stderr
+        );
+    }
+    info!(snapshot = %snapshot_config.name, "guest frozen; reflinking disk");
+
+    // Reflink the disk (+ any disk-dir images) while frozen.
+    let copy_result: Result<()> = async {
+        let temp_disk = temp_snapshot_dir.join("disk.raw");
+        reflink_copy(disk_path, &temp_disk).await?;
+        for extra in &snapshot_config.metadata.extra_disks {
+            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
+                .join("disks")
+                .join(&extra.filename);
+            let dest = temp_snapshot_dir.join(&extra.filename);
+            reflink_copy(&source, &dest).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // Unfreeze ALWAYS — a frozen rootfs left frozen wedges the source VM.
+    let unfreeze_cmd = vec![
+        "fsfreeze".to_string(),
+        "--unfreeze".to_string(),
+        "/".to_string(),
+    ];
+    match run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false).await {
+        Ok(o) if o.exit_code == 0 => info!(snapshot = %snapshot_config.name, "guest unfrozen"),
+        Ok(o) => error!(exit = o.exit_code, stderr = %o.stderr, "fsfreeze --unfreeze / non-zero"),
+        Err(e) => error!(error = %e, "fsfreeze --unfreeze / failed — source VM may be wedged"),
+    }
+
+    if let Err(e) = copy_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("reflinking disk for disk-only snapshot");
+    }
+
+    // Write config.json (kind = DiskOnly; no memory.bin / vmstate.bin).
+    let temp_config = temp_snapshot_dir.join("config.json");
+    let config_json = serde_json::to_string_pretty(&snapshot_config)
+        .context("serializing disk-only snapshot config")?;
+    tokio::fs::write(&temp_config, &config_json)
+        .await
+        .context("writing disk-only snapshot config")?;
+
+    // Atomic replace into the final location.
+    if snapshot_dir.exists() {
+        let old = snapshot_dir.with_extension("old");
+        let _ = tokio::fs::remove_dir_all(&old).await;
+        tokio::fs::rename(&snapshot_dir, &old)
+            .await
+            .context("moving old snapshot aside")?;
+        tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
+            .await
+            .context("finalizing snapshot")?;
+        let _ = tokio::fs::remove_dir_all(&old).await;
+    } else {
+        tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
+            .await
+            .context("finalizing snapshot")?;
+    }
+
+    info!(snapshot = %snapshot_config.name, "disk-only snapshot created");
+    Ok(())
+}
+
 /// Create a snapshot of the running VM.
 ///
 /// # Locking

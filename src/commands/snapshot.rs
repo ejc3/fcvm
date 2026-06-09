@@ -102,15 +102,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .context("loading VM state")?;
 
     // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
-    // memory dump) is not wired yet. The --disk-only flag is reserved so the CLI
-    // surface is stable; refusing here is honest rather than silently producing a
-    // Full snapshot. Capture lands in a follow-up. See docs/disk-only-clone.html.
-    if args.disk_only {
-        anyhow::bail!(
-            "--disk-only capture is not implemented yet (the flag is reserved); \
-             this would otherwise silently create a full snapshot."
-        );
-    }
+    // memory dump) is dispatched below when args.disk_only is set.
 
     // Block snapshots when VM has read-write extra disks
     let rw_disks: Vec<_> = vm_state
@@ -183,7 +175,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     let extra_disk_configs = super::common::extra_disks_to_snapshot(&vm_state);
 
     // Build snapshot config from VmState (single source of truth)
-    let snapshot_config = super::common::build_snapshot_config(
+    let mut snapshot_config = super::common::build_snapshot_config(
         &vm_state,
         &snapshot_name,
         SnapshotType::User,
@@ -191,6 +183,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         volume_configs,
         extra_disk_configs,
     );
+    if args.disk_only {
+        snapshot_config.kind = crate::storage::SnapshotKind::DiskOnly;
+    }
 
     // Acquire the per-snapshot lock (exclusive) BEFORE the per-VM lock — same order as
     // create_podman_snapshot. Re-creating an existing tag atomically swaps the snapshot
@@ -220,14 +215,26 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .as_ref()
         .map(|name| paths::snapshot_dir().join(name));
 
-    super::common::create_snapshot_core(
-        &client,
-        snapshot_config.clone(),
-        &vm_disk_path,
-        parent_dir.as_deref(),
-        None,
-    )
-    .await?;
+    if args.disk_only {
+        // Disk-only: no vCPU pause, no memory dump — fsfreeze the guest over the
+        // exec vsock, reflink the disk, unfreeze. Cold-boot clones run from it.
+        let vsock_socket = paths::vm_runtime_dir(&vm_state.vm_id).join("vsock.sock");
+        super::common::create_disk_only_snapshot_core(
+            snapshot_config.clone(),
+            &vm_disk_path,
+            &vsock_socket,
+        )
+        .await?;
+    } else {
+        super::common::create_snapshot_core(
+            &client,
+            snapshot_config.clone(),
+            &vm_disk_path,
+            parent_dir.as_deref(),
+            None,
+        )
+        .await?;
+    }
 
     // Track this snapshot as the latest base for future diff snapshots.
     // Use a locked read-modify-write so we only change snapshot_name — this
