@@ -1094,10 +1094,13 @@ async fn join_tty_session(
 /// itself stays alive to catch a racing reboot signal, so we can't join it).
 async fn read_container_exit_code(ctx: &mut VmContext) -> Option<i32> {
     use std::sync::atomic::Ordering;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    // wait_for_reboot_decision's drain handshake already proved the listener
+    // processed everything the guest sent; the short wait here is only a backstop
+    // for the listener-stuck case where the drain timed out.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while !ctx.container_exit_seen.load(Ordering::Acquire) {
         if tokio::time::Instant::now() >= deadline {
-            warn!("no container exit notification 5s after VM exit");
+            warn!("no container exit notification after VM exit");
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1111,48 +1114,44 @@ async fn read_container_exit_code(ctx: &mut VmContext) -> Option<i32> {
 /// After the Firecracker child exits, decide whether it was a guest reboot (→ relaunch
 /// in place) or a real termination (poweroff / container exit / crash → stop).
 ///
-/// Both signals are SENT by the guest before the firecracker reset/poweroff (the
-/// reboot-notify unit runs Before=systemd-reboot.service; fc-agent sends "exit:"
-/// before `poweroff -f`), so by the time `wait()` wakes us the messages are at worst
-/// buffered in the host-side socket — only host processing latency remains:
-///   * reboot flag set → reboot (a racing container "exit:" may also be set; the
-///     trailing reboot wins — the guest chose to reboot).
-///   * container exit seen → wait a short trailing grace for a racing reboot that
-///     is still in the listener's accept backlog, then terminate.
-///   * neither (crash / forced poweroff with lost message) → full 2s grace, then
-///     terminate.
+/// Every guest signal ("exit:", "reboot") is SENT before the firecracker reset/poweroff
+/// (the reboot-notify unit runs Before=systemd-reboot.service; fc-agent sends "exit:"
+/// before `poweroff -f`), so once `wait()` wakes us the messages are at worst buffered
+/// in the host-side listener socket. Rather than guessing with timing windows, this
+/// performs a positive drain handshake: connect to our own status socket and send
+/// "drain". The listener processes connections strictly in accept order, so its
+/// "drain-ack" proves every guest message sent before the exit has been handled — at
+/// that point the reboot flag is authoritative. The 2s timeout is only a backstop for
+/// a dead/stuck listener (in which case no more signals are coming anyway).
 ///
 /// Shared by both VM run loops (podman run and snapshot restore).
 pub(crate) async fn wait_for_reboot_decision(
     reboot_requested: &std::sync::atomic::AtomicBool,
-    container_exited: &std::sync::atomic::AtomicBool,
     status_handle: &tokio::task::JoinHandle<()>,
+    status_socket_path: &str,
 ) -> bool {
     use std::sync::atomic::Ordering;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut exit_grace: Option<tokio::time::Instant> = None;
-    loop {
-        if reboot_requested.load(Ordering::Acquire) {
-            return true;
-        }
-        // Listener gone (accept timeout / error): no more signals are coming.
-        if status_handle.is_finished() {
-            return false;
-        }
-        let now = tokio::time::Instant::now();
-        if container_exited.load(Ordering::Acquire) {
-            // "exit:" processed — a racing "reboot" connection would already be in
-            // the backlog; give the listener a short window to drain it.
-            let grace_end = *exit_grace.get_or_insert(now + std::time::Duration::from_millis(300));
-            if now >= grace_end {
-                return false;
-            }
-        }
-        if now >= deadline {
-            return false;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if reboot_requested.load(Ordering::Acquire) {
+        return true;
     }
+    if !status_handle.is_finished() {
+        let drain = async {
+            let mut stream = tokio::net::UnixStream::connect(status_socket_path)
+                .await
+                .ok()?;
+            stream.write_all(b"drain\n").await.ok()?;
+            let mut buf = [0u8; 16];
+            let n = stream.read(&mut buf).await.ok()?;
+            (n > 0).then_some(())
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), drain).await {
+            Ok(Some(())) => {}
+            _ => warn!("status listener did not ack drain probe; deciding on current flags"),
+        }
+    }
+    reboot_requested.load(Ordering::Acquire)
 }
 
 /// Event loop: waits for VM exit, cancellation, or snapshot requests.
@@ -1175,13 +1174,27 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 // clone (storage preserved, captured container restarted) — and keep
                 // looping. The fcvm process, network, holder, listeners, and health
                 // monitor all stay alive, so the fcvm PID is stable across the reboot.
-                if wait_for_reboot_decision(
+                let status_socket_path = format!(
+                    "{}_{}",
+                    ctx.reboot_spec.vsock_socket_path.display(),
+                    VSOCK_STATUS_PORT
+                );
+                let rebooted = wait_for_reboot_decision(
                     &ctx.reboot_requested,
-                    &ctx.container_exit_seen,
                     &ctx.status_handle,
+                    &status_socket_path,
                 )
-                .await
-                {
+                .await;
+                // TTY sessions accept exactly one connection and remove their socket
+                // on exit — a relaunch would come back with no terminal. Fail loud
+                // and treat the reboot as termination instead of half-relaunching.
+                if rebooted && ctx.args.tty {
+                    warn!(
+                        "guest rebooted but reboot-in-place is not supported for TTY \
+                         VMs; treating as termination"
+                    );
+                }
+                if rebooted && !ctx.args.tty {
                     ctx.reboot_requested
                         .store(false, std::sync::atomic::Ordering::Release);
                     // Clear any racing pre-reboot exit signal/files: the relaunched

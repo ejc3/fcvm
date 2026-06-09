@@ -329,6 +329,7 @@ pub(super) async fn attach_extra_disks(
     data_dir: &std::path::Path,
     image_disk_path: Option<&std::path::Path>,
     image_disk_read_only: bool,
+    rebuild_disk_dir_images: bool,
 ) -> Result<(Vec<crate::state::types::ExtraDisk>, Option<String>)> {
     let mut extra_disks = Vec::new();
 
@@ -439,12 +440,22 @@ pub(super) async fn attach_extra_disks(
             );
         }
 
-        // Create disk image in VM's data directory
+        // Create disk image in VM's data directory. On an in-place reboot relaunch
+        // the image already exists and holds the guest's writes — rebuilding it from
+        // the host directory would silently destroy them, so the relaunch re-attaches
+        // the existing image instead.
         let disk_idx = disk_offset + i;
         let image_path = data_dir
             .join("disks")
             .join(format!("disk-dir-{}.raw", disk_idx));
-        super::image::create_disk_from_dir(source_dir, &image_path, false).await?;
+        if rebuild_disk_dir_images || !image_path.exists() {
+            super::image::create_disk_from_dir(source_dir, &image_path, false).await?;
+        } else {
+            info!(
+                image = %image_path.display(),
+                "re-attaching existing disk-dir image (in-place relaunch preserves guest writes)"
+            );
+        }
 
         let drive_id = format!("disk{}", disk_idx);
 
@@ -885,7 +896,9 @@ pub(crate) async fn configure_and_boot_firecracker(
         .apply(client, &plan.boot_args, plan.track_dirty_pages)
         .await?;
 
-    // Attach extra disks and image disk (read-only for all image modes).
+    // Attach extra disks and image disk (read-only for all image modes). disk-dir
+    // images are only BUILT on the initial boot (network = Some); a reboot relaunch
+    // re-attaches the existing images so guest writes survive the reboot.
     let image_disk_read_only = true;
     let (extra_disks, image_device) = attach_extra_disks(
         args,
@@ -893,6 +906,7 @@ pub(crate) async fn configure_and_boot_firecracker(
         data_dir,
         plan.image_disk_path.as_deref(),
         image_disk_read_only,
+        network.is_some(),
     )
     .await?;
     vm_state.config.extra_disks = extra_disks;

@@ -234,7 +234,7 @@ pub async fn run() -> Result<()> {
                 .zip(plan.subuid_count)
                 .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
             let (username, _uid, runtime_dir) =
-                container::create_vm_user(user_spec, desired_name, subuid_range);
+                container::create_vm_user(user_spec, desired_name, subuid_range, provisioned);
             Some((username, runtime_dir))
         }
     } else {
@@ -270,7 +270,7 @@ pub async fn run() -> Result<()> {
         if let (Some("overlay"), Some(device)) = (plan.image_mode.as_deref(), &plan.image_device) {
             eprintln!("[fc-agent] re-mounting overlay image store (provisioned re-boot)");
             let username = user_info.as_ref().map(|(name, _)| name.as_str());
-            container::mount_overlay_image(device, &plan.image, username)?
+            container::mount_overlay_image(device, &plan.image, username, false)?
         } else {
             eprintln!("[fc-agent] skipping image import (clone — image already in storage)");
             plan.image.clone()
@@ -279,7 +279,7 @@ pub async fn run() -> Result<()> {
         let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
             (Some("overlay"), Some(device)) => {
                 let username = user_info.as_ref().map(|(name, _)| name.as_str());
-                container::mount_overlay_image(device, &plan.image, username)?
+                container::mount_overlay_image(device, &plan.image, username, true)?
             }
             (Some("btrfs"), Some(device)) => {
                 // Btrfs loopback was created in Phase 1 (setup_btrfs_storage_if_available).

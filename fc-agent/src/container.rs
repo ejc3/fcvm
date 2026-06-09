@@ -20,6 +20,7 @@ pub fn mount_overlay_image(
     device: &str,
     image_name: &str,
     username: Option<&str>,
+    reset_podman_state: bool,
 ) -> Result<String> {
     eprintln!("[fc-agent] mounting overlay storage image: {}", device);
 
@@ -65,9 +66,15 @@ pub fn mount_overlay_image(
     // that may have been created by health monitor's `podman inspect` racing
     // with storage setup. Without this, the db.sql graph driver won't match
     // the new storage.conf, causing "database graph driver does not match".
-    let _ = std::process::Command::new("podman")
-        .args(["system", "reset", "--force"])
-        .output();
+    // NEVER on a provisioned re-mount (clone/reboot): the graphroot holds the
+    // captured container — a reset would erase it.
+    if reset_podman_state {
+        let _ = std::process::Command::new("podman")
+            .args(["system", "reset", "--force"])
+            .output();
+    } else {
+        eprintln!("[fc-agent] skipping podman reset (provisioned overlay re-mount)");
+    }
 
     eprintln!(
         "[fc-agent] overlay image mounted at {}, configured as additional image store (conf: {})",
@@ -1197,6 +1204,7 @@ pub fn create_vm_user(
     user_spec: &str,
     desired_name: &str,
     subuid_range: Option<(u64, u64)>,
+    provisioned: bool,
 ) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
     let uid = parts[0].to_string();
@@ -1236,20 +1244,28 @@ pub fn create_vm_user(
     // changed between runs (e.g., /tmp vs /run/user), causing "database
     // configuration mismatch" errors.
     // HOME is set so podman finds user-level config (if it exists at this point).
-    let _ = std::process::Command::new("env")
-        .args([
-            &format!("HOME=/home/{}", username),
-            &format!("XDG_RUNTIME_DIR={}", runtime_dir),
-            "runuser",
-            "-u",
-            &username,
-            "--",
-            "podman",
-            "system",
-            "reset",
-            "--force",
-        ])
-        .output();
+    // NEVER on a provisioned boot (disk-only clone / in-place reboot): the user's
+    // storage holds the captured container — a reset would erase it.
+    if provisioned {
+        eprintln!(
+            "[fc-agent] skipping user podman reset (provisioned disk — captured storage preserved)"
+        );
+    } else {
+        let _ = std::process::Command::new("env")
+            .args([
+                &format!("HOME=/home/{}", username),
+                &format!("XDG_RUNTIME_DIR={}", runtime_dir),
+                "runuser",
+                "-u",
+                &username,
+                "--",
+                "podman",
+                "system",
+                "reset",
+                "--force",
+            ])
+            .output();
+    }
 
     let cgroup_dir = format!("/sys/fs/cgroup/user.slice/user-{}.slice", uid);
     let _ = std::fs::create_dir_all(&cgroup_dir);

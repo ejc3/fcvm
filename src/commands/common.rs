@@ -1504,6 +1504,19 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
     Ok(lock_file)
 }
 
+/// Sibling path for a snapshot directory's auxiliary files (lock, .creating,
+/// .old): APPENDS `.suffix` to the directory name. `Path::with_extension` would
+/// REPLACE everything after the last dot, so a tag like "app.v1" would map onto
+/// "app.creating"/"app.old"/"app.lock" — colliding with (and deleting) files of
+/// an unrelated tag.
+pub(crate) fn snapshot_sibling(dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dir.with_file_name(format!("{name}.{suffix}"))
+}
+
 /// Acquire the per-snapshot directory lock (`<snapshot_dir>.lock`).
 ///
 /// Creators take it exclusively while writing or atomically replacing a snapshot
@@ -1514,7 +1527,7 @@ pub async fn acquire_snapshot_dir_lock(
     snapshot_dir: &Path,
     exclusive: bool,
 ) -> Result<std::fs::File> {
-    let lock_path = snapshot_dir.with_extension("lock");
+    let lock_path = snapshot_sibling(snapshot_dir, "lock");
     let lock_file = std::fs::File::create(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     loop {
@@ -1571,7 +1584,7 @@ pub async fn create_disk_only_snapshot_core(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid disk_path in snapshot config"))?
         .to_path_buf();
-    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+    let temp_snapshot_dir = snapshot_sibling(&snapshot_dir, "creating");
 
     let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
     tokio::fs::create_dir_all(&temp_snapshot_dir)
@@ -1625,9 +1638,26 @@ pub async fn create_disk_only_snapshot_core(
         m = STORAGE_MOUNT
     );
     let freeze_cmd = vec!["sh".to_string(), "-c".to_string(), freeze_script];
-    let freeze_out = run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false)
-        .await
-        .context("freezing guest filesystems")?;
+    // An exec-level error (vsock reset after the request was written) can leave the
+    // guest frozen with no response — always attempt a best-effort thaw of BOTH
+    // mounts before bailing, never leave the source wedged.
+    let freeze_out = match run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false).await {
+        Ok(out) => out,
+        Err(e) => {
+            let thaw = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "fsfreeze --unfreeze / 2>/dev/null; \
+                     fsfreeze --unfreeze {m} 2>/dev/null; true",
+                    m = STORAGE_MOUNT
+                ),
+            ];
+            let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false).await;
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            return Err(e).context("freezing guest filesystems");
+        }
+    };
     if freeze_out.exit_code != 0 {
         // Best-effort thaw in case the storage mount froze but the rootfs didn't.
         let thaw = vec![
@@ -1706,7 +1736,7 @@ pub async fn create_disk_only_snapshot_core(
 
     // Atomic replace into the final location.
     if snapshot_dir.exists() {
-        let old = snapshot_dir.with_extension("old");
+        let old = snapshot_sibling(&snapshot_dir, "old");
         let _ = tokio::fs::remove_dir_all(&old).await;
         tokio::fs::rename(&snapshot_dir, &old)
             .await
@@ -1754,7 +1784,7 @@ pub async fn create_snapshot_core(
         .memory_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?;
-    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+    let temp_snapshot_dir = snapshot_sibling(snapshot_dir, "creating");
 
     // Determine base memory for diff snapshot support.
     //
@@ -2094,7 +2124,7 @@ pub async fn create_snapshot_core(
     // Atomic replace: rename old out of the way, then rename new into place.
     // Handles both cases: snapshot_dir exists (re-creating) or doesn't (first creation).
     if snapshot_dir.exists() {
-        let old_snapshot_dir = snapshot_dir.with_extension("old");
+        let old_snapshot_dir = snapshot_sibling(snapshot_dir, "old");
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
         tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
             .await
@@ -2126,6 +2156,29 @@ mod tests {
     use crate::state::VmState;
     use crate::storage::SnapshotType;
     use std::path::Path;
+
+    /// `with_extension` would map "app.v1" onto "app.creating", colliding with an
+    /// unrelated tag's files — snapshot_sibling must APPEND instead.
+    #[test]
+    fn snapshot_sibling_appends_suffix_even_with_dotted_tags() {
+        assert_eq!(
+            snapshot_sibling(Path::new("/snaps/app"), "creating"),
+            Path::new("/snaps/app.creating")
+        );
+        assert_eq!(
+            snapshot_sibling(Path::new("/snaps/app.v1"), "creating"),
+            Path::new("/snaps/app.v1.creating")
+        );
+        assert_eq!(
+            snapshot_sibling(Path::new("/snaps/app.v1"), "old"),
+            Path::new("/snaps/app.v1.old")
+        );
+        // Distinct dotted tags must never collide on their auxiliary files.
+        assert_ne!(
+            snapshot_sibling(Path::new("/snaps/app.v1"), "lock"),
+            snapshot_sibling(Path::new("/snaps/app.v2"), "lock")
+        );
+    }
 
     fn make_vm_state(vm_id: &str, original_vsock: Option<&str>) -> VmState {
         let mut state = VmState::new(vm_id.to_string(), "nginx:alpine".to_string(), 2, 1024);

@@ -124,6 +124,91 @@ async fn test_vm_reboot_comes_back_healthy_and_preserves_work() -> Result<()> {
     Ok(())
 }
 
+/// Data-disk preservation: an in-place reboot must NOT rebuild --disk-dir
+/// images from the host directory — guest writes to the data disk live only in
+/// the per-VM image and would be silently destroyed (confirmed review finding).
+#[tokio::test]
+async fn test_vm_reboot_preserves_disk_dir_writes() -> Result<()> {
+    let (name, _clone, _snap, _serve) = common::unique_names("reboot-disk");
+
+    // Host directory seeding the data disk.
+    let host_dir =
+        std::path::PathBuf::from(format!("/tmp/fcvm-reboot-disk-{}", std::process::id()));
+    std::fs::create_dir_all(&host_dir)?;
+    std::fs::write(host_dir.join("seed.txt"), "seed\n")?;
+
+    let disk_spec = format!("{}:/data", host_dir.display());
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--no-snapshot",
+            "--disk-dir",
+            &disk_spec,
+            "nginx:alpine",
+        ],
+        "reboot-disk-base",
+    )
+    .await?;
+    common::poll_health_by_pid(pid, 120).await?;
+
+    // Write onto the data disk from inside the VM (lives ONLY in disk-dir-0.raw),
+    // and fsync via remount-cycle-free sync so it reaches the image.
+    let token = format!("disk-token-{}", std::process::id());
+    common::exec_in_vm(pid, &["echo", &token, ">", "/data/guest-write.txt"]).await?;
+    common::exec_in_vm(pid, &["sync"]).await?;
+    let before = common::exec_in_vm(pid, &["cat", "/data/guest-write.txt"]).await?;
+    assert!(
+        before.contains(&token),
+        "guest write missing before reboot: {before}"
+    );
+
+    // Reboot; wait for the relaunch (machine-id change is the positive witness).
+    let mid_before = common::exec_in_vm(pid, &["cat", "/etc/machine-id"])
+        .await
+        .unwrap_or_default();
+    let _ = common::exec_in_vm(pid, &["reboot"]).await;
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        assert!(
+            process_alive(pid),
+            "fcvm process must stay alive across the reboot"
+        );
+        if let Ok(mid) = common::exec_in_vm(pid, &["cat", "/etc/machine-id"]).await {
+            if !mid.trim().is_empty() && mid.trim() != mid_before.trim() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "VM did not relaunch after reboot"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    common::poll_health_by_pid(pid, 60).await?;
+
+    // THE assertion: the guest's data-disk write survived the relaunch (the disk
+    // image was re-attached, not rebuilt from the host directory).
+    let after = common::exec_in_vm(pid, &["cat", "/data/guest-write.txt"]).await?;
+    assert!(
+        after.contains(&token),
+        "guest write to --disk-dir was destroyed by the reboot relaunch: {after}"
+    );
+    // The seeded file is still there too.
+    let seed = common::exec_in_vm(pid, &["cat", "/data/seed.txt"]).await?;
+    assert!(
+        seed.contains("seed"),
+        "seed file missing after reboot: {seed}"
+    );
+
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&host_dir);
+    Ok(())
+}
+
 /// Snapshot-restore path: a clone restored via `snapshot run --snapshot` must
 /// also relaunch in place on guest reboot (the snapshot.rs run loop).
 #[tokio::test]

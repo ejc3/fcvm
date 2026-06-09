@@ -42,23 +42,17 @@ pub(crate) async fn run_status_listener(
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
 
-    // Accept connections in a loop (we get "cache-ready" then "ready" then "exit")
+    // Accept connections for the lifetime of the VM ("cache-ready", "ready",
+    // "exit:", "reboot", host-side "drain" probes). No idle timeout: a VM can run
+    // for days before its only end-of-life message arrives, and losing the
+    // listener (plus its socket) would silently break reboot-in-place and exit
+    // reporting. The run loop's cleanup aborts this task.
     loop {
-        let accept_result = tokio::time::timeout(
-            std::time::Duration::from_secs(3600), // 1 hour timeout
-            listener.accept(),
-        )
-        .await;
-
-        let (stream, _) = match accept_result {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => {
+        let (stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
                 warn!(vm_id = %vm_id, error = %e, "Error accepting status connection");
                 continue;
-            }
-            Err(_) => {
-                // Timeout - VM probably shut down without sending exit
-                break;
             }
         };
 
@@ -120,6 +114,16 @@ pub(crate) async fn run_status_listener(
                 // aborts this task.
                 container_exited.store(true, std::sync::atomic::Ordering::Release);
                 break;
+            } else if msg == "drain" {
+                // Host-side probe (wait_for_reboot_decision): connections are
+                // processed in accept order, so acking proves every message the
+                // guest sent before the Firecracker exit has been handled — the
+                // reboot/exit flags are authoritative once the ack is read.
+                if let Err(e) = write_half.write_all(b"drain-ack\n").await {
+                    warn!(vm_id = %vm_id, error = %e, "Failed to ack drain probe");
+                }
+                let _ = write_half.flush().await;
+                break;
             } else if msg == "reboot" {
                 // Guest is rebooting (systemd system-shutdown hook fired with verb
                 // "reboot"). Record the intent so run_vm_loop relaunches Firecracker
@@ -179,12 +183,6 @@ pub(crate) async fn run_status_listener(
             }
         }
     }
-
-    // Clean up socket (reached only via the accept timeout; normal lifecycle
-    // ends with the run loop aborting this task during cleanup).
-    let _ = std::fs::remove_file(socket_path);
-
-    Ok(())
 }
 
 /// Bidirectional I/O listener for container stdin/stdout/stderr.
@@ -558,6 +556,62 @@ mod tests {
             std::fs::read_to_string(runtime_dir.join("container-exit")).unwrap(),
             "0\n"
         );
+    }
+
+    /// The drain probe is the positive handshake wait_for_reboot_decision uses:
+    /// connections are processed in accept order, so the "drain-ack" reply proves
+    /// every earlier guest message has been handled.
+    #[tokio::test]
+    async fn test_status_listener_acks_drain_probe_after_prior_messages() {
+        use tokio::io::AsyncReadExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = temp_dir.path().to_path_buf();
+        let socket_path = runtime_dir.join("status.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let runtime_dir_for_task = runtime_dir.clone();
+
+        let reboot_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reboot_for_task = reboot_flag.clone();
+        let exit_for_task = exit_flag.clone();
+        let listener_task = tokio::spawn(async move {
+            run_status_listener(
+                &socket_path_string,
+                &runtime_dir_for_task,
+                "vm-test",
+                None,
+                reboot_for_task,
+                exit_for_task,
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Earlier guest message (reboot), then the host's drain probe.
+        let mut s1 = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        s1.write_all(b"reboot\n").await.unwrap();
+        drop(s1);
+        let mut probe = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        probe.write_all(b"drain\n").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), probe.read(&mut buf))
+            .await
+            .expect("drain ack timed out")
+            .unwrap();
+        assert!(n > 0, "listener must ack the drain probe");
+        // By accept-order, the earlier reboot message MUST be processed by now.
+        assert!(
+            reboot_flag.load(std::sync::atomic::Ordering::Acquire),
+            "drain-ack received but earlier reboot message not yet processed"
+        );
+        listener_task.abort();
     }
 
     /// A container "exit:" followed by a "reboot" on a separate connection (the

@@ -252,13 +252,21 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // process's copy of the state is minutes old by now, and a whole-state save
     // would clobber fields the VM owner wrote in the meantime (health status,
     // exit code, its own startup-snapshot key).
-    let recorded_snapshot_name = snapshot_name.clone();
-    let recorded = state_manager
-        .update_state(&vm_state.vm_id, |state| {
-            state.config.snapshot_name = Some(recorded_snapshot_name);
-        })
-        .await
-        .context("saving snapshot name to VM state")?;
+    // A disk-only tag has no memory image — recording it as snapshot_name would
+    // poison the diff lineage (the next `snapshot create` would silently take a
+    // full snapshot instead of a diff against the still-valid memory parent).
+    let recorded = if args.disk_only {
+        Ok(Some(()))
+    } else {
+        let recorded_snapshot_name = snapshot_name.clone();
+        state_manager
+            .update_state(&vm_state.vm_id, |state| {
+                state.config.snapshot_name = Some(recorded_snapshot_name);
+            })
+            .await
+            .map(|opt| opt.map(|_| ()))
+    }
+    .context("saving snapshot name to VM state")?;
     if recorded.is_none() {
         warn!(
             vm_id = %vm_state.vm_id,
@@ -1172,6 +1180,36 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     } else {
         !args.no_dirty_tracking // CLI default: on. --no-dirty-tracking: off.
     };
+    // Reboot-in-place support: listen for the guest's reboot signal on the status
+    // port (also records the container ready/exit notifications the restore path
+    // previously dropped). Spawned BEFORE the restore resumes the VM — fc-agent's
+    // status messages retry only briefly, so the socket must already exist when the
+    // guest starts running (same ordering as the podman path).
+    let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let status_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_STATUS_PORT);
+    let status_handle = {
+        let socket_path = status_socket_path.clone();
+        let runtime_dir = data_dir.clone();
+        let vm_id_clone = vm_id.clone();
+        let reboot_flag = reboot_requested.clone();
+        let exit_flag = container_exit_seen.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_status_listener(
+                &socket_path,
+                &runtime_dir,
+                &vm_id_clone,
+                None,
+                reboot_flag,
+                exit_flag,
+            )
+            .await
+            {
+                warn!("Status listener error: {}", e);
+            }
+        })
+    };
+
     let restore_params = RestoreParams {
         vm_id: &vm_id,
         vm_name: &vm_name,
@@ -1236,35 +1274,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    // Reboot-in-place support: a guest `reboot` must relaunch this VM as a cold boot
-    // from its current (provisioned) disk — identical to a disk-only clone cold boot.
-    // Listen for the guest's reboot signal on the status port (also records the
-    // container ready/exit notifications the restore path previously dropped) and
-    // build the cold-boot launch plan UP FRONT, before the VM runs.
-    let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let status_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_STATUS_PORT);
-    let status_handle = {
-        let socket_path = status_socket_path.clone();
-        let runtime_dir = data_dir.clone();
-        let vm_id_clone = vm_id.clone();
-        let reboot_flag = reboot_requested.clone();
-        let exit_flag = container_exit_seen.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_status_listener(
-                &socket_path,
-                &runtime_dir,
-                &vm_id_clone,
-                None,
-                reboot_flag,
-                exit_flag,
-            )
-            .await
-            {
-                warn!("Status listener error: {}", e);
-            }
-        })
-    };
+    // Build the cold-boot relaunch plan up front (consumed if the guest reboots).
     let clone_disk_path = data_dir.join("disks/rootfs.raw");
     let reboot_plan = match build_clone_reboot_plan(
         &snapshot_config.metadata,
@@ -1374,6 +1384,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
         // Stop implicit UFFD server if running (hugepage cache restore)
         implicit_uffd_cancel.cancel();
+        status_handle.abort();
 
         super::common::cleanup_vm(
             super::common::CleanupContext {
@@ -1516,8 +1527,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     // process, network, holder, listeners, and health monitor.
                     if super::podman::wait_for_reboot_decision(
                         &reboot_requested,
-                        &container_exit_seen,
                         &status_handle,
+                        &status_socket_path,
                     )
                     .await
                     {
@@ -1554,9 +1565,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                                     // recorded parent so a later `snapshot create`
                                     // takes a full snapshot, never a bogus diff.
                                     vm_state.config.snapshot_name = None;
+                                    // The rebooted clone no longer depends on (or
+                                    // belongs to) its serve process — a serve
+                                    // shutdown must not SIGTERM it.
+                                    vm_state.config.serve_pid = None;
                                     let _ = state_manager
                                         .update_state(&vm_id, |state| {
                                             state.config.snapshot_name = None;
+                                            state.config.serve_pid = None;
                                         })
                                         .await;
                                     startup_rx = None;
@@ -1652,6 +1668,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Stop implicit UFFD server if running
     implicit_uffd_cancel.cancel();
+    // The status listener never exits on its own (no idle timeout) — abort it.
+    status_handle.abort();
 
     // Cleanup common resources
     super::common::cleanup_vm(
@@ -1712,6 +1730,9 @@ async fn build_clone_reboot_plan(
             "clone has {} extra disk(s); reboot-in-place doesn't re-attach them yet",
             meta.extra_disks.len()
         );
+    }
+    if meta.tty {
+        bail!("clone uses TTY mode; reboot-in-place doesn't re-create the TTY session yet");
     }
 
     let synth_args = run_args_from_snapshot_metadata(
@@ -1821,7 +1842,12 @@ fn run_args_from_snapshot_metadata(
         disk: vec![],
         disk_dir: vec![],
         nfs: vec![],
-        env: vec![],
+        // fc-agent derives the rootless username from env USER; without it a --user
+        // clone would set up "fcvm-user" and diverge from the captured passwd entry.
+        env: match (&meta.user, &meta.username) {
+            (Some(_), Some(username)) => vec![format!("USER={username}")],
+            _ => vec![],
+        },
         cmd: None,
         publish,
         balloon: None,
@@ -2022,6 +2048,54 @@ mod tests {
     use super::*;
     use crate::storage::snapshot::SnapshotVolumeConfig;
     use crate::storage::SnapshotKind;
+
+    /// The synthesized RunArgs must carry the recorded boot-plan metadata:
+    /// kernel profile (a btrfs disk needs a btrfs kernel), image mode + device
+    /// (overlay layers live on a separate read-only disk), and the USER env
+    /// (fc-agent maps the rootless username from it — without it a --user clone
+    /// would diverge from the captured passwd entry).
+    #[test]
+    fn run_args_from_metadata_carries_boot_plan_fields() {
+        let meta = crate::storage::SnapshotMetadata {
+            image: "localhost/myapp:latest".to_string(),
+            vcpu: 2,
+            memory_mib: 1024,
+            network_config: crate::network::NetworkConfig::default(),
+            volumes: vec![],
+            health_check_url: None,
+            health_check_timeout: 5,
+            hugepages: false,
+            extra_disks: vec![],
+            username: Some("ubuntu".to_string()),
+            user: Some("1000:1000".to_string()),
+            port_mappings: vec![],
+            forward_localhost: vec![],
+            network_mode: crate::firecracker::FcNetworkMode::Rootless,
+            ipv6_prefix: None,
+            tty: false,
+            interactive: false,
+            kernel_profile: Some("btrfs".to_string()),
+            image_mode: Some("overlay".to_string()),
+            image_disk_path: Some(std::path::PathBuf::from("/cache/img.storage-v2.img")),
+        };
+        let args =
+            run_args_from_snapshot_metadata(&meta, "clone".to_string(), 2, 1024, false, None);
+        assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
+        assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
+        assert_eq!(
+            args.image_disk_override.as_deref(),
+            Some(std::path::Path::new("/cache/img.storage-v2.img"))
+        );
+        assert_eq!(args.env, vec!["USER=ubuntu".to_string()]);
+        assert_eq!(args.user.as_deref(), Some("1000:1000"));
+
+        // Without a recorded user there must be no USER env.
+        let mut meta2 = meta.clone();
+        meta2.user = None;
+        meta2.username = None;
+        let args2 = run_args_from_snapshot_metadata(&meta2, "c".to_string(), 1, 512, false, None);
+        assert!(args2.env.is_empty());
+    }
 
     #[test]
     fn ensure_not_disk_only_rejects_disk_only_and_allows_full() {
