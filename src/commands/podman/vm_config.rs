@@ -182,7 +182,7 @@ fn rebuild_proxy_url(parsed: &Url, host: String, port: u16) -> String {
 ///
 /// These are per-instance values NOT included in the snapshot cache key:
 /// network IP config, IPv6, DNS, strace, profile boot args, FUSE tuning.
-pub(super) fn build_runtime_boot_args(
+pub(crate) fn build_runtime_boot_args(
     args: &RunArgs,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &crate::commands::common::RuntimeConfig,
@@ -727,7 +727,11 @@ pub(super) async fn run_vm_setup(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-) -> Result<(VmManager, Option<tokio::process::Child>)> {
+) -> Result<(
+    VmManager,
+    Option<tokio::process::Child>,
+    super::types::RebootSpec,
+)> {
     let vm_id = params.vm_id.to_string();
 
     // The inner setup publishes the Firecracker manager and holder process into these
@@ -735,6 +739,9 @@ pub(super) async fn run_vm_setup(
     // when the failure happens partway through configuration.
     let mut vm_manager_slot: Option<VmManager> = None;
     let mut holder_slot: Option<tokio::process::Child> = None;
+    // Inputs to replay the firecracker config on an in-place relaunch (guest reboot),
+    // captured once the launch config is fully resolved.
+    let mut reboot_spec_slot: Option<super::types::RebootSpec> = None;
 
     let result = run_vm_setup_inner(
         params,
@@ -743,6 +750,7 @@ pub(super) async fn run_vm_setup(
         vm_state,
         &mut vm_manager_slot,
         &mut holder_slot,
+        &mut reboot_spec_slot,
     )
     .await;
 
@@ -768,7 +776,266 @@ pub(super) async fn run_vm_setup(
     }
 
     let vm_manager = vm_manager_slot.expect("run_vm_setup_inner sets vm_manager on success");
-    Ok((vm_manager, holder_slot))
+    let reboot_spec = reboot_spec_slot.expect("run_vm_setup_inner sets reboot_spec on success");
+    Ok((vm_manager, holder_slot, reboot_spec))
+}
+
+/// Build the FirecrackerConfig used to cold-boot a VM from a disk.
+///
+/// Single source of truth for launch-config construction, shared by:
+///   * initial `fcvm podman run` (run_vm_setup_inner, cache miss)
+///   * the snapshot-restore path's up-front reboot plan (a rebooted restored clone
+///     cold-boots from its current provisioned disk — disk-only-clone semantics)
+pub(crate) fn build_launch_config(
+    args: &RunArgs,
+    rootfs_path: &std::path::Path,
+    kernel_path: &std::path::Path,
+    initrd_path: &std::path::Path,
+    cmd_args: &Option<Vec<String>>,
+    runtime_config: &crate::commands::common::RuntimeConfig,
+) -> crate::firecracker::FirecrackerConfig {
+    use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
+    let network_mode: FcNetworkMode = args.network.into();
+    // Collect extra disk specifications
+    let mut extra_disks: Vec<String> = Vec::new();
+    extra_disks.extend(args.disk.iter().cloned());
+    extra_disks.extend(args.disk_dir.iter().cloned());
+    extra_disks.extend(args.nfs.iter().cloned());
+
+    let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
+
+    FirecrackerConfig {
+        boot_source: BootSource {
+            kernel_image_path: kernel_path.to_path_buf(),
+            initrd_path: initrd_path.to_path_buf(),
+            ..Default::default()
+        },
+        machine_config: MachineConfig {
+            vcpu_count: args.cpu,
+            mem_size_mib: args.mem,
+            huge_pages: if args.hugepages {
+                Some("2M".to_string())
+            } else {
+                None
+            },
+        },
+        drives: vec![Drive {
+            drive_id: "rootfs".to_string(),
+            path_on_host: rootfs_path.to_path_buf(),
+            is_root_device: true,
+            is_read_only: false,
+        }],
+        container_image_name: args.image.clone(),
+        container_image: args.image.clone(),
+        container_cmd: cmd_args.clone(),
+        network_mode,
+        data_dir: crate::paths::data_dir(),
+        extra_disks,
+        env_vars: args.env.to_vec(),
+        volume_mounts: args.map.to_vec(),
+        privileged: args.privileged,
+        tty: args.tty,
+        interactive: args.interactive,
+        non_blocking_output: args.non_blocking_output,
+        rootfs_size: args.rootfs_size.clone(),
+        health_check_url: args.health_check.clone(),
+        user: args.user.clone(),
+        forward_localhost: args.forward_localhost.clone(),
+        ipv6_prefix: args.ipv6_prefix.clone(),
+        portable_volumes: args.portable_volumes,
+        image_mode: super::resolve_image_mode(args),
+        rootfs_type: super::resolve_rootfs_type(args),
+        port_mappings,
+        firecracker_bin: runtime_config.firecracker_bin.clone(),
+    }
+}
+
+/// Apply a launch plan to a freshly-started Firecracker child and boot the VM.
+///
+/// This is the SHARED configure-and-boot primitive used by three flows:
+///   * initial `fcvm podman run` (via run_vm_setup_inner)
+///   * disk-only clone cold boot (via prepare_vm -> run_vm_setup_inner)
+///   * in-place relaunch after a guest reboot (via run_vm_loop)
+///
+/// The caller must have already started Firecracker (`vm_manager.start(...)`); this
+/// replays the full per-child API configuration (apply -> attach disks -> add eth0 ->
+/// MMDS config -> vsock -> MMDS data -> entropy -> balloon -> InstanceStart).
+///
+/// `network` gates the host-once-only steps:
+///   * `Some(network)` (initial boot / clone): runs NFS exports + pasta `post_start`.
+///   * `None` (reboot relaunch): the host substrate (disk, namespace/holder, pasta,
+///     NFS exports, listeners, persisted state) is already live and is reused untouched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn configure_and_boot_firecracker(
+    vm_manager: &mut VmManager,
+    plan: &super::types::RebootSpec,
+    args: &RunArgs,
+    network_config: &crate::network::NetworkConfig,
+    vm_state: &mut VmState,
+    data_dir: &std::path::Path,
+    vm_id: &str,
+    volume_mappings: &[VolumeMapping],
+    network: Option<&mut dyn NetworkManager>,
+) -> Result<()> {
+    let vm_pid = vm_manager.pid()?;
+    let client = vm_manager.client()?;
+
+    info!("configuring VM via Firecracker API");
+    plan.launch_config
+        .apply(client, &plan.boot_args, plan.track_dirty_pages)
+        .await?;
+
+    // Attach extra disks and image disk (read-only for all image modes).
+    let image_disk_read_only = true;
+    let (extra_disks, image_device) = attach_extra_disks(
+        args,
+        client,
+        data_dir,
+        plan.image_disk_path.as_deref(),
+        image_disk_read_only,
+    )
+    .await?;
+    vm_state.config.extra_disks = extra_disks;
+
+    // Host-once-only steps — skipped on an in-place reboot relaunch (network=None).
+    if let Some(network) = network {
+        // Process --nfs: export directories via NFS for the guest to mount.
+        let mut nfs_shares = Vec::new();
+        for nfs_spec in args.nfs.iter() {
+            let (spec_without_ro, read_only) = if nfs_spec.ends_with(":ro") {
+                (&nfs_spec[..nfs_spec.len() - 3], true)
+            } else {
+                (nfs_spec.as_str(), false)
+            };
+            let parts: Vec<&str> = spec_without_ro.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                anyhow::bail!(
+                    "Invalid NFS spec '{}'. Expected format: HOST_DIR:GUEST_MOUNT[:ro]",
+                    nfs_spec
+                );
+            }
+            let host_dir = std::path::Path::new(parts[0]);
+            let mount_path = parts[1].to_string();
+            if !host_dir.is_dir() {
+                anyhow::bail!(
+                    "NFS source directory does not exist or is not a directory: {}",
+                    host_dir.display()
+                );
+            }
+            if !mount_path.starts_with('/') {
+                anyhow::bail!(
+                    "NFS mount path must be absolute: {} (got '{}')",
+                    nfs_spec,
+                    mount_path
+                );
+            }
+            let abs_path = host_dir.canonicalize().context(format!(
+                "Failed to resolve NFS path: {}",
+                host_dir.display()
+            ))?;
+            nfs_shares.push(crate::state::types::NfsShare {
+                host_path: abs_path.display().to_string(),
+                mount_path: mount_path.clone(),
+                read_only,
+            });
+            info!(
+                "NFS share: {} -> {} ({})",
+                abs_path.display(),
+                mount_path,
+                if read_only { "ro" } else { "rw" }
+            );
+        }
+        if !nfs_shares.is_empty() {
+            setup_nfs_exports(vm_id, &nfs_shares, network_config).await?;
+        }
+        vm_state.config.nfs_shares = nfs_shares;
+
+        // For rootless mode with pasta: post_start starts pasta + bridge in the namespace.
+        // For bridged mode: post_start is a no-op (TAP already created by BridgedNetwork).
+        // Use holder_pid for rootless (pasta attaches to the holder's namespace).
+        let post_start_pid = vm_state.holder_pid.unwrap_or(vm_pid);
+        network
+            .post_start(post_start_pid)
+            .await
+            .context("post-start network setup")?;
+    }
+
+    // Network interface - required for MMDS V2 in all modes.
+    client
+        .add_network_interface(
+            "eth0",
+            crate::firecracker::api::NetworkInterface {
+                iface_id: "eth0".to_string(),
+                host_dev_name: network_config.tap_device.clone(),
+                guest_mac: Some(network_config.guest_mac.clone()),
+                rx_rate_limiter: None,
+                tx_rate_limiter: None,
+            },
+        )
+        .await?;
+
+    // MMDS configuration - V2 works in rootless mode as long as the interface exists.
+    client
+        .set_mmds_config(crate::firecracker::api::MmdsConfig {
+            version: "V2".to_string(),
+            network_interfaces: Some(vec!["eth0".to_string()]),
+            ipv4_address: Some("169.254.169.254".to_string()),
+        })
+        .await?;
+
+    // Always configure vsock device for status channel (and optionally volumes).
+    info!(
+        "Configuring vsock device at {:?} (status + {} volume(s))",
+        plan.vsock_socket_path,
+        volume_mappings.len()
+    );
+    // Remove any stale host-side vsock socket left by a prior Firecracker child so
+    // the new one can bind it. On a reboot relaunch the exited child's uds_path
+    // socket file persists, which otherwise fails set_vsock with EADDRINUSE. This
+    // removes ONLY the main uds_path socket — the per-port listener sockets
+    // (uds_path_4999 / _4997), owned by the long-lived status/output listeners,
+    // use their own paths and are untouched.
+    let _ = std::fs::remove_file(&plan.vsock_socket_path);
+    client
+        .set_vsock(crate::firecracker::api::Vsock {
+            guest_cid: 3, // Guest CID (host is always 2)
+            uds_path: plan.vsock_socket_path.display().to_string(),
+        })
+        .await?;
+
+    // Build and send MMDS data (container plan).
+    build_and_send_mmds(
+        &plan.launch_config,
+        client,
+        network_config,
+        vm_state,
+        volume_mappings,
+        image_device,
+    )
+    .await?;
+
+    // Configure entropy device (virtio-rng) for better random number generation.
+    client
+        .set_entropy_device(crate::firecracker::api::EntropyDevice { rate_limiter: None })
+        .await?;
+
+    // Balloon (if specified).
+    if let Some(balloon_mib) = args.balloon {
+        client
+            .set_balloon(crate::firecracker::api::Balloon {
+                amount_mib: balloon_mib,
+                deflate_on_oom: true,
+                stats_polling_interval_s: Some(1),
+            })
+            .await?;
+    }
+
+    // Start VM.
+    client
+        .put_action(crate::firecracker::api::InstanceAction::InstanceStart)
+        .await?;
+
+    Ok(())
 }
 
 /// Inner VM setup: creates the CoW disk, starts Firecracker, and configures the VM.
@@ -783,6 +1050,7 @@ async fn run_vm_setup_inner(
     vm_state: &mut VmState,
     vm_manager_slot: &mut Option<VmManager>,
     holder_slot: &mut Option<tokio::process::Child>,
+    reboot_spec_slot: &mut Option<super::types::RebootSpec>,
 ) -> Result<()> {
     let VmSetupParams {
         args,
@@ -888,12 +1156,6 @@ async fn run_vm_setup_inner(
         .await
         .context("starting Firecracker")?;
 
-    let vm_pid = vm_manager.pid()?;
-    let client = vm_manager.client()?;
-
-    // Configure VM via API
-    info!("configuring VM via Firecracker API");
-
     // Build FirecrackerConfig for launch (single source of truth for VM config)
     // Use fc_config from cache check if available, otherwise build fresh.
     // IMPORTANT: fc_config uses content-addressed base_rootfs path for cache key,
@@ -906,229 +1168,53 @@ async fn run_vm_setup_inner(
     let launch_config = fc_config
         .map(|config| config.with_rootfs_path(rootfs_path.to_path_buf()))
         .unwrap_or_else(|| {
-            use crate::firecracker::{
-                BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig,
-            };
-            let network_mode: FcNetworkMode = args.network.into();
-            // Collect extra disk specifications
-            let mut extra_disks: Vec<String> = Vec::new();
-            extra_disks.extend(args.disk.iter().cloned());
-            extra_disks.extend(args.disk_dir.iter().cloned());
-            extra_disks.extend(args.nfs.iter().cloned());
-
-            let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
-
-            FirecrackerConfig {
-                boot_source: BootSource {
-                    kernel_image_path: kernel_path.to_path_buf(),
-                    initrd_path: initrd_path.to_path_buf(),
-                    ..Default::default()
-                },
-                machine_config: MachineConfig {
-                    vcpu_count: args.cpu,
-                    mem_size_mib: args.mem,
-                    huge_pages: if args.hugepages {
-                        Some("2M".to_string())
-                    } else {
-                        None
-                    },
-                },
-                drives: vec![Drive {
-                    drive_id: "rootfs".to_string(),
-                    path_on_host: rootfs_path.to_path_buf(),
-                    is_root_device: true,
-                    is_read_only: false,
-                }],
-                container_image_name: args.image.clone(),
-                container_image: args.image.clone(),
-                container_cmd: cmd_args.clone(),
-                network_mode,
-                data_dir: crate::paths::data_dir(),
-                extra_disks,
-                env_vars: args.env.to_vec(),
-                volume_mounts: args.map.to_vec(),
-                privileged: args.privileged,
-                tty: args.tty,
-                interactive: args.interactive,
-                non_blocking_output: args.non_blocking_output,
-                rootfs_size: args.rootfs_size.clone(),
-                health_check_url: args.health_check.clone(),
-                user: args.user.clone(),
-                forward_localhost: args.forward_localhost.clone(),
-                ipv6_prefix: args.ipv6_prefix.clone(),
-                portable_volumes: args.portable_volumes,
-                image_mode: super::resolve_image_mode(args),
-                rootfs_type: super::resolve_rootfs_type(args),
-                port_mappings,
-                firecracker_bin: runtime_config.firecracker_bin.clone(),
-            }
+            build_launch_config(
+                args,
+                &rootfs_path,
+                kernel_path,
+                initrd_path,
+                &cmd_args,
+                runtime_config,
+            )
         });
 
-    // Build runtime boot args and apply FirecrackerConfig
     let runtime_boot_args = build_runtime_boot_args(args, network_config, runtime_config);
-    launch_config
-        .apply(client, &runtime_boot_args, track_dirty_pages)
-        .await?;
 
-    // Attach extra disks and image disk.
-    // All image modes use read-only: overlay (additionalImageStore), btrfs (Docker archive),
-    // and archive (Docker archive). Btrfs creates loopback storage on rootfs internally.
-    let image_disk_read_only = true;
-    let (extra_disks, image_device) = attach_extra_disks(
+    // The launch plan: everything needed to (re)boot this VM. Built UP FRONT so the
+    // exact same descriptor boots the VM now and relaunches it on a guest reboot, and
+    // is shared with the disk-only clone path (which boots via prepare_vm -> here).
+    let plan = super::types::RebootSpec {
+        firecracker_bin,
+        fc_args: fc_args.map(|s| s.to_string()),
+        launch_config,
+        boot_args: runtime_boot_args,
+        track_dirty_pages,
+        image_disk_path: image_disk_path.map(|p| p.to_path_buf()),
+        vsock_socket_path: vsock_socket_path.to_path_buf(),
+    };
+
+    // Apply the plan and bring the VM up via the shared primitive. `Some(network)`
+    // runs the host-once-only steps (NFS exports + pasta post_start); an in-place
+    // reboot relaunch passes `None` and reuses the already-live host substrate.
+    configure_and_boot_firecracker(
+        vm_manager,
+        &plan,
         args,
-        client,
-        data_dir,
-        image_disk_path,
-        image_disk_read_only,
-    )
-    .await?;
-    vm_state.config.extra_disks = extra_disks;
-
-    // Process --nfs: export directories via NFS for guest to mount
-    let mut nfs_shares = Vec::new();
-    for nfs_spec in args.nfs.iter() {
-        // Check for :ro suffix
-        let (spec_without_ro, read_only) = if nfs_spec.ends_with(":ro") {
-            (&nfs_spec[..nfs_spec.len() - 3], true)
-        } else {
-            (nfs_spec.as_str(), false)
-        };
-
-        // Split HOST_DIR:GUEST_MOUNT
-        let parts: Vec<&str> = spec_without_ro.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            anyhow::bail!(
-                "Invalid NFS spec '{}'. Expected format: HOST_DIR:GUEST_MOUNT[:ro]",
-                nfs_spec
-            );
-        }
-        let host_dir = std::path::Path::new(parts[0]);
-        let mount_path = parts[1].to_string();
-
-        // Validate host directory exists
-        if !host_dir.is_dir() {
-            anyhow::bail!(
-                "NFS source directory does not exist or is not a directory: {}",
-                host_dir.display()
-            );
-        }
-
-        // Validate mount path is absolute
-        if !mount_path.starts_with('/') {
-            anyhow::bail!(
-                "NFS mount path must be absolute: {} (got '{}')",
-                nfs_spec,
-                mount_path
-            );
-        }
-
-        let abs_path = host_dir.canonicalize().context(format!(
-            "Failed to resolve NFS path: {}",
-            host_dir.display()
-        ))?;
-
-        nfs_shares.push(crate::state::types::NfsShare {
-            host_path: abs_path.display().to_string(),
-            mount_path: mount_path.clone(),
-            read_only,
-        });
-
-        info!(
-            "NFS share: {} -> {} ({})",
-            abs_path.display(),
-            mount_path,
-            if read_only { "ro" } else { "rw" }
-        );
-    }
-
-    // Set up NFS exports if we have any shares
-    if !nfs_shares.is_empty() {
-        setup_nfs_exports(vm_id, &nfs_shares, network_config).await?;
-    }
-    vm_state.config.nfs_shares = nfs_shares;
-
-    // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
-    // For bridged mode: post_start is a no-op (TAP already created by BridgedNetwork)
-    // Use holder_pid for rootless (pasta attaches to holder's namespace)
-    let post_start_pid = vm_state.holder_pid.unwrap_or(vm_pid);
-    network
-        .post_start(post_start_pid)
-        .await
-        .context("post-start network setup")?;
-
-    // Network interface - required for MMDS V2 in all modes
-    // For rootless: pasta already created TAP, Firecracker attaches to it
-    // For bridged: TAP is created by BridgedNetwork and added to bridge
-    client
-        .add_network_interface(
-            "eth0",
-            crate::firecracker::api::NetworkInterface {
-                iface_id: "eth0".to_string(),
-                host_dev_name: network_config.tap_device.clone(),
-                guest_mac: Some(network_config.guest_mac.clone()),
-                rx_rate_limiter: None,
-                tx_rate_limiter: None,
-            },
-        )
-        .await?;
-
-    // MMDS configuration - V2 works in rootless mode as long as interface exists
-    client
-        .set_mmds_config(crate::firecracker::api::MmdsConfig {
-            version: "V2".to_string(),
-            network_interfaces: Some(vec!["eth0".to_string()]),
-            ipv4_address: Some("169.254.169.254".to_string()),
-        })
-        .await?;
-
-    // Always configure vsock device for status channel (and optionally volumes)
-    info!(
-        "Configuring vsock device at {:?} (status + {} volume(s))",
-        vsock_socket_path,
-        volume_mappings.len()
-    );
-    client
-        .set_vsock(crate::firecracker::api::Vsock {
-            guest_cid: 3, // Guest CID (host is always 2)
-            uds_path: vsock_socket_path.display().to_string(),
-        })
-        .await?;
-
-    // Build and send MMDS data (container plan)
-    build_and_send_mmds(
-        &launch_config,
-        client,
         network_config,
         vm_state,
+        data_dir,
+        vm_id,
         volume_mappings,
-        image_device,
+        Some(network),
     )
     .await?;
-
-    // Configure entropy device (virtio-rng) for better random number generation
-    client
-        .set_entropy_device(crate::firecracker::api::EntropyDevice { rate_limiter: None })
-        .await?;
-
-    // Balloon (if specified)
-    if let Some(balloon_mib) = args.balloon {
-        client
-            .set_balloon(crate::firecracker::api::Balloon {
-                amount_mib: balloon_mib,
-                deflate_on_oom: true,
-                stats_polling_interval_s: Some(1),
-            })
-            .await?;
-    }
-
-    // Start VM
-    client
-        .put_action(crate::firecracker::api::InstanceAction::InstanceStart)
-        .await?;
 
     // Save VM state with complete network configuration
     crate::commands::common::save_vm_state_with_network(state_manager, vm_state, network_config)
         .await?;
+
+    // Publish the launch plan so a guest reboot can relaunch the VM in place.
+    *reboot_spec_slot = Some(plan);
 
     Ok(())
 }

@@ -1413,6 +1413,9 @@ pub fn build_snapshot_config(
             ipv6_prefix: vm_state.config.ipv6_prefix.clone(),
             tty: vm_state.config.tty,
             interactive: vm_state.config.interactive,
+            kernel_profile: vm_state.config.kernel_profile.clone(),
+            image_mode: vm_state.config.image_mode.clone(),
+            image_disk_path: vm_state.config.image_disk_path.clone(),
         },
     }
 }
@@ -1575,30 +1578,70 @@ pub async fn create_disk_only_snapshot_core(
         .await
         .context("creating temp snapshot directory")?;
 
-    // Quiesce so the reflink captures a crash-consistent filesystem. No vCPU pause:
-    // `sync` flushes dirty pages, then `fsfreeze --freeze /` blocks new writes to
-    // the rootfs across the reflink. The podman btrfs.img store is a file ON the
-    // rootfs, so freezing the rootfs also blocks writes to the container store.
+    // The provisioned marker gates the clone's boot behavior: without it, a clone
+    // of this disk would WIPE the captured container storage on boot. Refuse to
+    // capture a disk that isn't marked (old fc-agent, or provisioning failed).
+    let marker_cmd = vec![
+        "test".to_string(),
+        "-f".to_string(),
+        "/var/lib/fcvm/provisioned".to_string(),
+    ];
+    let marker_out = run_exec_in_vm_captured(vsock_socket, &marker_cmd, false)
+        .await
+        .context("checking provisioned marker in guest")?;
+    if marker_out.exit_code != 0 {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        anyhow::bail!(
+            "source VM has no provisioned marker (/var/lib/fcvm/provisioned); a clone \
+             of this disk would wipe its container storage on boot. The source must be \
+             running a current fc-agent that completed provisioning."
+        );
+    }
+
+    // Quiesce so the reflink captures a crash-consistent filesystem. No vCPU pause.
+    // `sync` flushes dirty pages, then fsfreeze blocks new writes across the reflink.
+    // The podman container store is its own filesystem (btrfs loopback mounted at
+    // /var/lib/containers/storage, backed by a file on the rootfs) — it must be
+    // frozen FIRST, then the rootfs: freezing it flushes its data through the loop
+    // device into the backing file while the rootfs is still writable. (Freezing the
+    // rootfs first would deadlock that flush.) Unfreeze happens in reverse order.
     let sync_cmd = vec!["sync".to_string()];
     let sync_out = run_exec_in_vm_captured(vsock_socket, &sync_cmd, false)
         .await
         .context("guest sync before freeze")?;
     if sync_out.exit_code != 0 {
-        warn!(stderr = %sync_out.stderr, "guest sync returned non-zero (continuing)");
-    }
-
-    let freeze_cmd = vec![
-        "fsfreeze".to_string(),
-        "--freeze".to_string(),
-        "/".to_string(),
-    ];
-    let freeze_out = run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false)
-        .await
-        .context("freezing guest rootfs")?;
-    if freeze_out.exit_code != 0 {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         anyhow::bail!(
-            "fsfreeze --freeze / failed (exit {}): {}",
+            "guest sync failed before disk capture (exit {}): {}",
+            sync_out.exit_code,
+            sync_out.stderr
+        );
+    }
+
+    const STORAGE_MOUNT: &str = "/var/lib/containers/storage";
+    let freeze_script = format!(
+        "if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --freeze {m} || exit 1; fi; \
+         fsfreeze --freeze /",
+        m = STORAGE_MOUNT
+    );
+    let freeze_cmd = vec!["sh".to_string(), "-c".to_string(), freeze_script];
+    let freeze_out = run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false)
+        .await
+        .context("freezing guest filesystems")?;
+    if freeze_out.exit_code != 0 {
+        // Best-effort thaw in case the storage mount froze but the rootfs didn't.
+        let thaw = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "fsfreeze --unfreeze {m} 2>/dev/null; true",
+                m = STORAGE_MOUNT
+            ),
+        ];
+        let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false).await;
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        anyhow::bail!(
+            "fsfreeze failed (exit {}): {}",
             freeze_out.exit_code,
             freeze_out.stderr
         );
@@ -1620,21 +1663,37 @@ pub async fn create_disk_only_snapshot_core(
     }
     .await;
 
-    // Unfreeze ALWAYS — a frozen rootfs left frozen wedges the source VM.
-    let unfreeze_cmd = vec![
-        "fsfreeze".to_string(),
-        "--unfreeze".to_string(),
-        "/".to_string(),
-    ];
-    match run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false).await {
-        Ok(o) if o.exit_code == 0 => info!(snapshot = %snapshot_config.name, "guest unfrozen"),
-        Ok(o) => error!(exit = o.exit_code, stderr = %o.stderr, "fsfreeze --unfreeze / non-zero"),
-        Err(e) => error!(error = %e, "fsfreeze --unfreeze / failed — source VM may be wedged"),
-    }
+    // Unfreeze ALWAYS, in reverse order (rootfs first so the loop device can write
+    // again, then the storage mount). A failed unfreeze wedges the source VM — that
+    // is a hard error even when the reflink succeeded, so the caller knows.
+    let unfreeze_script = format!(
+        "fsfreeze --unfreeze /; rc=$?; \
+         if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --unfreeze {m} || rc=1; fi; \
+         exit $rc",
+        m = STORAGE_MOUNT
+    );
+    let unfreeze_cmd = vec!["sh".to_string(), "-c".to_string(), unfreeze_script];
+    let unfreeze_result = run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false).await;
 
     if let Err(e) = copy_result {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         return Err(e).context("reflinking disk for disk-only snapshot");
+    }
+
+    match unfreeze_result {
+        Ok(o) if o.exit_code == 0 => info!(snapshot = %snapshot_config.name, "guest unfrozen"),
+        Ok(o) => {
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            anyhow::bail!(
+                "fsfreeze --unfreeze failed (exit {}): {} — source VM may be wedged",
+                o.exit_code,
+                o.stderr
+            );
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            return Err(e).context("unfreezing guest — source VM may be wedged");
+        }
     }
 
     // Write config.json (kind = DiskOnly; no memory.bin / vmstate.bin).

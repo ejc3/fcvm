@@ -142,6 +142,18 @@ pub struct VmConfig {
     /// User-defined labels for tagging/filtering VMs
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Kernel profile this VM booted with (None = "default"). Carried into
+    /// snapshot metadata so cold-boot clones / reboot plans use the same kernel.
+    #[serde(default)]
+    pub kernel_profile: Option<String>,
+    /// Image delivery mode for localhost images ("overlay" | "btrfs" | "archive");
+    /// None for registry-pulled images.
+    #[serde(default)]
+    pub image_mode: Option<String>,
+    /// Host path of the read-only image device attached to this VM (overlay
+    /// additionalImageStore or docker archive). Content-addressed cache file.
+    #[serde(default)]
+    pub image_disk_path: Option<std::path::PathBuf>,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -218,6 +230,9 @@ impl VmState {
                 user: None,
                 username: None,
                 ipv6_prefix: None,
+                kernel_profile: None,
+                image_mode: None,
+                image_disk_path: None,
             },
         }
     }

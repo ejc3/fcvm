@@ -330,6 +330,8 @@ async fn create_sandbox(
         portable_volumes: false,
         image,
         command_args: vec![],
+        rootfs_override: None,
+        image_disk_override: None,
     };
 
     info!(name = %name, "Creating sandbox");
