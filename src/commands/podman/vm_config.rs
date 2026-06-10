@@ -654,6 +654,36 @@ pub(super) async fn setup_nfs_exports(
     // Create exports directory if needed
     tokio::fs::create_dir_all("/etc/exports.d").await.ok();
 
+    // Self-heal: drop fcvm export files whose exported directories no longer
+    // exist (left behind when a VM was SIGKILLed before its cleanup ran).
+    // Stale entries make `exportfs -ra` fail with "Failed to stat ..." and can
+    // keep THIS VM's brand-new export from taking effect — the guest's hard
+    // NFS mount then hangs forever.
+    if let Ok(mut entries) = tokio::fs::read_dir("/etc/exports.d").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("fcvm-") || !name.ends_with(".exports") {
+                continue;
+            }
+            let Ok(content) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            let stale = content.lines().any(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|path| !std::path::Path::new(path).exists())
+            });
+            if stale {
+                info!(
+                    exports_file = %entry.path().display(),
+                    "removing stale fcvm NFS exports (exported path no longer exists)"
+                );
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+
     // Guest IP for access control (use /30 subnet for the VM)
     let guest_ip = network_config
         .guest_ip
@@ -685,7 +715,13 @@ pub(super) async fn setup_nfs_exports(
         .await?;
 
     if !refresh.success() {
-        warn!("exportfs -ra failed, NFS mounts may not work");
+        // A failed refresh means this VM's export is not active; the guest's
+        // hard NFS mount would hang until the test budget kills it. Fail
+        // loudly instead.
+        anyhow::bail!(
+            "exportfs -ra failed; NFS export for {} is not active (check              /etc/exports.d for stale entries)",
+            exports_path
+        );
     }
 
     Ok(())
