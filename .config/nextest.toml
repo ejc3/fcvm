@@ -56,12 +56,13 @@ max-threads = 1
 [test-groups.snapshot-tests]
 max-threads = 3
 
-# Nested (NV2) tests: each boots a 4GB L1 VM that itself boots an L2 VM.
-# Capped at 3 concurrent chains — fresh runners create one ~4GB pre-start
-# snapshot per distinct config (same rationale as snapshot-tests), and the
-# first run serializes on the podman image-build lock anyway.
+# Nested (NV2) tests run one at a time: each chain is an L1 (4GB) plus an L2
+# VM — the heaviest tests in the suite, and the L2 boots a 10GB disk copy
+# INSIDE the L1 where there is no reflink. A 3-concurrent experiment under
+# full-suite load produced an L2 in-guest failure; serialized is the proven
+# configuration. Revisit with #660.
 [test-groups.nested-tests]
-max-threads = 3
+max-threads = 1
 
 # VM tests run at full parallelism (num-cpus)
 [test-groups.vm-tests]

@@ -1492,6 +1492,7 @@ echo "L{level}: Starting L{next_level} VM..."
 # Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
 mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
 FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+    --no-snapshot \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1530,6 +1531,7 @@ echo "L{level}: Starting L{next_level} VM..."
 # Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
 mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
 FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+    --no-snapshot \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1567,6 +1569,7 @@ echo "L{level}: Starting L{next_level} VM..."
 # Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
 mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
 FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+    --no-snapshot \
     --name l{next_level} \
     --network bridged \
     --privileged \

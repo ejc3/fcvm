@@ -137,6 +137,22 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
 }
 
 /// Best-effort removal of host state persisted during a failed `prepare_vm`.
+/// True when the VM's kernel profile enables ARM64 NV2 nested virtualization
+/// (the profile's firecracker_args carry --enable-nv2). Drives the
+/// miss-path-converges-on-restore behavior, which exists for NV2 guests only.
+fn nv2_profile(kernel_profile: &Option<String>) -> bool {
+    let Some(name) = kernel_profile.as_deref() else {
+        return false;
+    };
+    matches!(
+        crate::setup::get_kernel_profile(name),
+        Ok(Some(profile)) if profile
+            .firecracker_args
+            .as_deref()
+            .is_some_and(|args| args.contains("--enable-nv2"))
+    )
+}
+
 /// True when an error chain ends at Firecracker's `PUT /snapshot/load` step —
 /// i.e. the cached snapshot artifact itself is unusable (most commonly: it was
 /// created by an incompatible Firecracker version and no longer deserializes).
@@ -1359,19 +1375,40 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             return Ok(None);
                         }
                         SnapshotOutcome::Created => {
-                            info!(
-                                snapshot_key = %key,
-                                "Pre-start snapshot created; relaunching by restoring it \
-                                 (miss path converges on the hit path)"
-                            );
-                            // Do NOT ack fc-agent and do NOT resume into this VM: tear it
-                            // down and restore the snapshot we just produced, so the miss
-                            // path runs the exact same restore flow as a hit. Resuming the
-                            // paused VM is the one lifecycle that intermittently starves
-                            // Firecracker's device event loop (#630: NETDEV watchdog,
-                            // stalled FUSE, 100x guest slowdowns).
-                            ctx.restore_from_cache = Some(key.clone());
-                            return Ok(None);
+                            // NV2 (vEL2) guests: do NOT ack fc-agent and do NOT resume
+                            // into this VM — tear it down and restore the snapshot we just
+                            // produced, so the miss path runs the exact same restore flow
+                            // as a hit. Resuming the paused VM is the lifecycle that
+                            // intermittently starves Firecracker's device event loop under
+                            // NV2 timer/vsock churn (#630: NETDEV watchdog, stalled FUSE,
+                            // 100x guest slowdowns; create+resume stormed 3/3 under load,
+                            // restore was clean 12/12).
+                            //
+                            // All other profiles keep the resume flow: the storms were
+                            // never observed outside NV2, resume has long CI mileage
+                            // there, and several flows (RW extra disks, rootless port
+                            // forwarding, NFS shares) historically never restored because
+                            // per-run paths make their cache keys unique — forcing them
+                            // through restore regressed all three classes.
+                            if nv2_profile(&ctx.vm_state.config.kernel_profile) {
+                                info!(
+                                    snapshot_key = %key,
+                                    "Pre-start snapshot created; relaunching by restoring it \
+                                     (NV2 miss path converges on the hit path)"
+                                );
+                                ctx.restore_from_cache = Some(key.clone());
+                                return Ok(None);
+                            }
+                            info!(snapshot_key = %key, "Pre-start snapshot created successfully");
+                            ctx.vm_state.config.snapshot_name = Some(key.clone());
+                            // Locked read-modify-write: only update snapshot_name so the
+                            // health monitor's concurrent writes are not clobbered.
+                            let _ = ctx
+                                .state_manager
+                                .update_state(&ctx.vm_state.vm_id, |state| {
+                                    state.config.snapshot_name = Some(key.clone());
+                                })
+                                .await;
                         }
                         SnapshotOutcome::Failed(e) => {
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
