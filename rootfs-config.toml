@@ -144,6 +144,16 @@ Destination=169.254.169.254/32
 Scope=link
 """
 
+[files."/etc/sysctl.d/99-fcvm-forwarding.conf"]
+content = """
+# fcvm guests are provisioned for nested fcvm: bridged networking inside the
+# guest requires IP forwarding, and fcvm deliberately refuses to flip this
+# system-wide setting at runtime (see src/network/portmap.rs) — so the rootfs
+# provides it, the same way fcvm's host setup provisions the host.
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+"""
+
 # NOTE: fc-agent.service is NOT defined here - it's injected per-VM via initrd
 
 [fstab]
