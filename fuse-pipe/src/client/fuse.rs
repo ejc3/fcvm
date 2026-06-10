@@ -296,11 +296,19 @@ impl Filesystem for FuseClient {
         // the process hits its nofile limit (EMFILE — the intermittent Nightly
         // benchmark failures). Raising the cap lets releases keep pace with opens;
         // fuser derives congestion_threshold = 3/4·max_background automatically.
-        if let Err(prev) = config.set_max_background(1024) {
+        const MAX_BACKGROUND: u16 = 1024;
+        if let Err(clamped) = config.set_max_background(MAX_BACKGROUND) {
             tracing::warn!(
                 target: "fuse-pipe::client",
-                prev,
-                "Failed to raise max_background, using kernel default"
+                requested = MAX_BACKGROUND,
+                clamped,
+                "Failed to set max_background, using clamped value"
+            );
+        } else {
+            tracing::debug!(
+                target: "fuse-pipe::client",
+                max_background = MAX_BACKGROUND,
+                "Set FUSE max_background"
             );
         }
 
