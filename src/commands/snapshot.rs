@@ -39,7 +39,10 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
     }
 }
 
-async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
+async fn snapshot_restore_runtime_config(
+    args: &SnapshotRunArgs,
+    kernel_profile: Option<&str>,
+) -> RuntimeConfig {
     let mut config = RuntimeConfig {
         firecracker_bin: args.firecracker_bin.as_ref().map(PathBuf::from),
         firecracker_args: args.firecracker_args.clone(),
@@ -47,19 +50,26 @@ async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfi
         fuse_readers: None,
     };
 
-    // If no explicit firecracker_bin, check the default profile for custom Firecracker
-    // (matches podman run behavior — ensures snapshot restore uses same binary as create)
+    // If no explicit firecracker_bin, resolve the Firecracker (and its args) from
+    // the SNAPSHOT's kernel profile — the clone must run on the same binary the
+    // snapshot was created with. Resolving "default" for a nested-profile
+    // snapshot would restore a vEL2 (NV2) guest on a Firecracker without NV2
+    // support.
     if config.firecracker_bin.is_none() {
-        if let Ok(Some(profile)) = crate::setup::get_kernel_profile("default") {
+        let profile_name = kernel_profile.unwrap_or("default");
+        if let Ok(Some(profile)) = crate::setup::get_kernel_profile(profile_name) {
             if profile.firecracker_repo.is_some() {
-                match crate::setup::get_firecracker_for_profile(&profile, "default").await {
+                match crate::setup::get_firecracker_for_profile(&profile, profile_name).await {
                     Ok(fc_path) => {
                         config.firecracker_bin = Some(fc_path);
                     }
                     Err(e) => {
-                        warn!(error = %e, "custom Firecracker not found for snapshot restore, falling back to system binary");
+                        warn!(error = %e, profile = profile_name, "custom Firecracker not found for snapshot restore, falling back to system binary");
                     }
                 }
+            }
+            if config.firecracker_args.is_none() {
+                config.firecracker_args = profile.firecracker_args.clone();
             }
         }
     }
@@ -736,7 +746,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Generate VM ID and name
     let vm_id = generate_vm_id();
-    let runtime_config = snapshot_restore_runtime_config(&args).await;
+    let runtime_config = snapshot_restore_runtime_config(
+        &args,
+        snapshot_config.metadata.kernel_profile.as_deref(),
+    )
+    .await;
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -2183,7 +2197,7 @@ mod tests {
             no_swap: false,
         };
 
-        let runtime = snapshot_restore_runtime_config(&args).await;
+        let runtime = snapshot_restore_runtime_config(&args, Some("nested")).await;
         assert_eq!(
             runtime.firecracker_bin,
             Some(PathBuf::from("/opt/firecracker-profile"))

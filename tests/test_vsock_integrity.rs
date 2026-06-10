@@ -22,7 +22,6 @@ use anyhow::{Context, Result};
 /// 2. Starts L1 VM which runs the built-in test script
 /// 3. L1 starts echo server, then L2 with vsock client
 /// 4. Verifies no corruption in the vsock data path
-#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_vsock_integrity_nested() -> Result<()> {
     println!("\nVsock Integrity Test (NV2 Nested)");
@@ -40,6 +39,11 @@ async fn test_vsock_integrity_nested() -> Result<()> {
     // 3. Start L1 VM with vsock-integrity container
     // The container's ENTRYPOINT runs the test automatically
     let (vm_name, _, _, _) = common::unique_names("vsock-int");
+
+    // Remove any stale result file from a previous (crashed/killed) run BEFORE
+    // starting the VM — otherwise a leftover "PASS" would be read as this run's
+    // verdict even if L1 dies before writing one (false pass).
+    std::fs::remove_file("/mnt/fcvm-btrfs/vsock-test-result.txt").ok();
 
     println!("3. Starting L1 VM with localhost/vsock-integrity...");
 

@@ -232,7 +232,6 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 and kvm-arm.mode=nested, or x86 with Intel VT-x/AMD-V nested=1
 /// Skips if nested KVM isn't available.
-#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("\nNested VM Test: Run fcvm inside fcvm");
@@ -753,7 +752,6 @@ except OSError as e:
 ///
 /// The container OCI archive is loaded via FUSE-over-vsock.
 /// This is the original/default behavior.
-#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -768,7 +766,6 @@ async fn test_nested_l2_fuse() -> Result<()> {
 /// Test L1→L2 nesting with image cache via NFS (--nfs)
 ///
 /// The container OCI archive is loaded from an NFS share.
-#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_nfs() -> Result<()> {
     run_nested_n_levels(
@@ -801,7 +798,6 @@ async fn test_nested_l2_with_benchmarks() -> Result<()> {
 /// Tests FUSE-over-vsock with 100MB file copies at each nesting level.
 /// This validates the 32KB max_write limit that prevents vsock fragmentation
 /// issues under nested virtualization.
-#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_with_large_files() -> Result<()> {
     run_nested_n_levels(
@@ -818,7 +814,6 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
 /// Measures egress/ingress throughput from VMs at each level to host using iperf3.
 /// Tests various block sizes (128K, 1M) and parallelism (1, 4, 8 streams).
 /// Network tests don't depend on FUSE for data path, but need image cache mount.
-#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_network_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -831,7 +826,6 @@ async fn test_nested_l2_network_fuse() -> Result<()> {
 }
 
 /// Test L2 network benchmarks with image cache via NFS
-#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_network_nfs() -> Result<()> {
     run_nested_n_levels(
@@ -1604,16 +1598,32 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
         BenchmarkMode::WithLargeFiles => "large",
         BenchmarkMode::WithNetwork => "network",
     };
+    // Unique per attempt: a fixed VM name collides with the previous attempt's
+    // leftover VM/state when nextest retries after a timeout kill.
+    let attempt_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 100_000
+    );
     let log_file = format!(
-        "/tmp/nested-l{}-{}-{}.log",
+        "/tmp/nested-l{}-{}-{}-{}.log",
         n,
         mode_suffix,
-        image_cache_mount.name()
+        image_cache_mount.name(),
+        attempt_id
     );
     let image_cache_args = image_cache_mount_args.join(" ");
+    // `timeout` bounds the L1 VM's lifetime: when nextest kills a timed-out
+    // test, this spawned pipeline would otherwise survive as an orphan and
+    // collide with the retry. 840s < the 900s nextest budget so the VM dies
+    // (and cleans up) before the test harness gives up.
     let fcvm_cmd = format!(
-        "sudo ./target/release/fcvm podman run \
-         --name l1-nested-{}-{}-{} \
+        "timeout -k 10 840 sudo ./target/release/fcvm podman run \
+         --name l1-nested-{}-{}-{}-{} \
          --network bridged \
          --privileged \
          --mem {} \
@@ -1625,6 +1635,7 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
         n,
         mode_suffix,
         image_cache_mount.name(),
+        attempt_id,
         intermediate_mem,
         image_cache_args,
         l1_script,
