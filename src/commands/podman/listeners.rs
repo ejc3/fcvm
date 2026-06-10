@@ -148,12 +148,59 @@ pub(crate) async fn run_status_listener(
                     };
 
                     if tx.send(request).await.is_ok() {
-                        // Wait for main task to complete cache creation
-                        // No timeout - host is responsible for completing
-                        if ack_rx.await.is_ok() {
-                            info!(vm_id = %vm_id, "Cache created, sending ack to fc-agent");
-                        } else {
-                            warn!(vm_id = %vm_id, "Cache creation failed or was cancelled");
+                        // Wait for the main task to complete cache creation — no
+                        // overall timeout (the host is responsible for completing),
+                        // but emit a "cache-wait" keepalive every 5s. Under the
+                        // SnapshotEnabled matrix the snapshot path queues on the
+                        // global 10-permit snapshot semaphore BEFORE pausing the
+                        // VM, so the guest keeps running with its fixed 30s
+                        // cache-ack deadline ticking; without a liveness signal
+                        // the guest abandons a perfectly alive handshake
+                        // (CacheResult::Failed) and launches the container out of
+                        // step with the host's pause (#627). The guest extends its
+                        // deadline on each keepalive. While the VM is paused the
+                        // bytes just queue in the socket and are drained on resume.
+                        //
+                        // The select also DRAINS the guest's 500ms liveness probe
+                        // bytes ("\n" writes) as they arrive: leaving them unread
+                        // would turn our eventual close into a vsock RST that can
+                        // flush the guest's receive buffer before it reads the
+                        // cache-ack, misclassifying a cold start as a warm restore
+                        // (the failure mode documented in fc-agent's read path).
+                        let mut ack_rx = ack_rx;
+                        let mut probe_line = String::new();
+                        loop {
+                            probe_line.clear();
+                            tokio::select! {
+                                ack = &mut ack_rx => {
+                                    match ack {
+                                        Ok(()) => info!(vm_id = %vm_id, "Cache created, sending ack to fc-agent"),
+                                        Err(_) => warn!(vm_id = %vm_id, "Cache creation failed or was cancelled"),
+                                    }
+                                    break;
+                                }
+                                read = reader.read_line(&mut probe_line) => {
+                                    match read {
+                                        // Probe bytes drained; nothing to do.
+                                        Ok(n) if n > 0 => {}
+                                        // EOF / read error: guest side gone (e.g.
+                                        // snapshot restore reset). Keep waiting for
+                                        // the ack so the main task's oneshot isn't
+                                        // dropped mid-snapshot.
+                                        _ => {
+                                            let _ = (&mut ack_rx).await;
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                                    if write_half.write_all(b"cache-wait\n").await.is_err() {
+                                        let _ = (&mut ack_rx).await;
+                                        break;
+                                    }
+                                    let _ = write_half.flush().await;
+                                }
+                            }
                         }
                     } else {
                         warn!(vm_id = %vm_id, "Failed to send cache request to main task");
@@ -165,6 +212,17 @@ pub(crate) async fn run_status_listener(
                     warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
                 }
                 let _ = write_half.flush().await;
+
+                // Grace-drain before the connection drops at the `break` below:
+                // consume any last in-flight guest probe bytes so the close is
+                // clean — an unread byte at close becomes a vsock RST that can
+                // flush the guest's receive buffer before it reads the ack.
+                let mut tail = String::new();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    reader.read_line(&mut tail),
+                )
+                .await;
 
                 // Stop reading this connection and go back to accept(). fc-agent
                 // sends each status message ("cache-ready", then "ready", then
@@ -610,6 +668,79 @@ mod tests {
         assert!(
             reboot_flag.load(std::sync::atomic::Ordering::Acquire),
             "drain-ack received but earlier reboot message not yet processed"
+        );
+        listener_task.abort();
+    }
+
+    /// A slow cache-snapshot (host queued on the snapshot semaphore) must emit
+    /// "cache-wait" keepalives on the cache-ready connection BEFORE the final
+    /// "cache-ack", so the guest can extend its fixed deadline instead of
+    /// abandoning a live handshake (#627).
+    #[tokio::test]
+    async fn test_status_listener_emits_cache_wait_keepalive_before_ack() {
+        use tokio::io::AsyncReadExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = temp_dir.path().to_path_buf();
+        let socket_path = runtime_dir.join("status.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let runtime_dir_for_task = runtime_dir.clone();
+
+        // cache handler that takes >5s (one keepalive interval) to ack.
+        let (cache_tx, mut cache_rx) = mpsc::channel::<CacheRequest>(1);
+        tokio::spawn(async move {
+            if let Some(req) = cache_rx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_millis(5600)).await;
+                let _ = req.ack_tx.send(());
+            }
+        });
+
+        let reboot_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener_task = tokio::spawn(async move {
+            run_status_listener(
+                &socket_path_string,
+                &runtime_dir_for_task,
+                "vm-test",
+                Some(cache_tx),
+                reboot_flag,
+                exit_flag,
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        stream.write_all(b"cache-ready:sha256:abc\n").await.unwrap();
+
+        // Collect everything the host writes until the ack arrives.
+        let mut received = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut buf = [0u8; 256];
+        while !received.contains("cache-ack") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no cache-ack within deadline; got: {received:?}"
+            );
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .unwrap();
+            assert!(n > 0, "connection closed before ack; got: {received:?}");
+            received.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+        }
+
+        let wait_pos = received.find("cache-wait");
+        let ack_pos = received.find("cache-ack").unwrap();
+        assert!(
+            wait_pos.is_some() && wait_pos.unwrap() < ack_pos,
+            "expected at least one cache-wait keepalive before cache-ack; got: {received:?}"
         );
         listener_task.abort();
     }

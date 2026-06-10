@@ -880,6 +880,30 @@ pub enum CacheResult {
 /// The `restore_flag` is set by the restore-epoch watcher when it detects
 /// a snapshot restore. This breaks the poll loop early when POLLHUP is not
 /// detected (e.g., after pre-start snapshot restore in rootless mode).
+/// Compact the cache-handshake read buffer after checking for "cache-ack":
+/// drop all COMPLETE lines (host "cache-wait" keepalives — the only complete
+/// lines the host sends before the ack) and keep any partial tail, so repeated
+/// keepalives can't overflow the small buffer while a "cache-ack" split across
+/// reads (e.g. "cache-a" + "ck\n") still assembles correctly from the tail.
+///
+/// Returns (new_total_read, saw_cache_wait_keepalive).
+fn consume_cache_wait_lines(buf: &mut [u8; 64], total_read: usize) -> (usize, bool) {
+    let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
+    let saw = received.contains("cache-wait");
+    if !saw {
+        return (total_read, false);
+    }
+    match received.rfind('\n') {
+        Some(pos) => {
+            let tail_start = pos + 1;
+            let tail_len = total_read - tail_start;
+            buf.copy_within(tail_start..total_read, 0);
+            (tail_len, true)
+        }
+        None => (total_read, true),
+    }
+}
+
 pub fn notify_cache_ready_and_wait(
     digest: &str,
     restore_flag: &std::sync::atomic::AtomicBool,
@@ -953,8 +977,24 @@ pub fn notify_cache_ready_and_wait(
     // 2. POLLHUP / read returns 0 — vsock reset from snapshot RESTORE
     //    (warm start: VM was restored from cached pre-start snapshot)
     // 3. restore_flag set by restore-epoch watcher (warm start, POLLHUP not delivered)
-    // 4. 30s deadline — failsafe timeout
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // 4. 30s since the last sign of host liveness — failsafe timeout. The host
+    //    emits a "cache-wait" keepalive every 5s while it is queued on the global
+    //    snapshot semaphore (and while the snapshot runs), and each keepalive
+    //    extends this deadline (#627): under the SnapshotEnabled CI matrix the
+    //    semaphore queue alone can exceed a fixed 30s while the host is perfectly
+    //    alive, and abandoning the wait launches the container out of step with
+    //    the host's pause. The deadline expires only when the host has gone
+    //    genuinely silent — bounded by an absolute 10-minute cap so a wedged host
+    //    that keeps ticking keepalives can't stall container launch forever.
+    //
+    //    Ordering matters: the deadline is checked AFTER each poll/drain cycle,
+    //    never before. Keepalives can queue while the VM is paused for the
+    //    snapshot, and the guest clock can jump forward across the pause (the ARM
+    //    virtual counter keeps running) — checking expiry before draining would
+    //    discard extensions that are already sitting in the socket buffer.
+    let started = std::time::Instant::now();
+    let absolute_deadline = started + std::time::Duration::from_secs(600);
+    let mut deadline = started + std::time::Duration::from_secs(30);
 
     loop {
         // Check if the restore-epoch watcher detected a snapshot restore.
@@ -965,16 +1005,8 @@ pub fn notify_cache_ready_and_wait(
             return CacheResult::WarmStart;
         }
 
-        let remaining_ms = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_millis();
-        if remaining_ms == 0 {
-            eprintln!("[fc-agent] cache-ack deadline expired (30s)");
-            return CacheResult::Failed;
-        }
-
-        // Poll with 500ms intervals (or remaining time, whichever is shorter)
-        let poll_ms = remaining_ms.min(500) as u16;
+        // Fixed 500ms poll; expiry is evaluated after the poll/drain below.
+        let poll_ms = 500u16;
         let mut poll_fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
 
         match poll(&mut poll_fds, PollTimeout::from(poll_ms)) {
@@ -1003,6 +1035,17 @@ pub fn notify_cache_ready_and_wait(
                         // Write succeeded or other error — connection still alive, continue
                     }
                 }
+                // No data arrived this cycle — judge expiry now (never before a
+                // drain: queued keepalives must be consumed first).
+                let now = std::time::Instant::now();
+                if now >= absolute_deadline {
+                    eprintln!("[fc-agent] cache-ack absolute deadline expired (10 min)");
+                    return CacheResult::Failed;
+                }
+                if now >= deadline {
+                    eprintln!("[fc-agent] cache-ack deadline expired (host silent for 30s)");
+                    return CacheResult::Failed;
+                }
                 continue;
             }
             Ok(_) => {}
@@ -1025,6 +1068,17 @@ pub fn notify_cache_ready_and_wait(
                 if received.contains("cache-ack") {
                     eprintln!("[fc-agent] received cache-ack from host");
                     return CacheResult::ColdStart;
+                }
+                // Host keepalive: it is alive but still queued on the snapshot
+                // semaphore / writing the snapshot. Extend the deadline (bounded
+                // by the absolute cap) and compact the buffer so repeated
+                // keepalives can't overflow it.
+                let (new_total, saw_keepalive) = consume_cache_wait_lines(&mut buf, total_read);
+                total_read = new_total;
+                if saw_keepalive {
+                    deadline = (std::time::Instant::now() + std::time::Duration::from_secs(30))
+                        .min(absolute_deadline);
+                    eprintln!("[fc-agent] cache-wait keepalive from host, extending deadline");
                 }
                 if total_read >= buf.len() {
                     eprintln!("[fc-agent] cache-ack buffer overflow, giving up");
@@ -1497,4 +1551,70 @@ pub async fn run_async(
     }
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::consume_cache_wait_lines;
+
+    fn buf_with(data: &[u8]) -> ([u8; 64], usize) {
+        let mut buf = [0u8; 64];
+        buf[..data.len()].copy_from_slice(data);
+        (buf, data.len())
+    }
+
+    #[test]
+    fn keepalive_lines_are_consumed_and_flagged() {
+        let (mut buf, n) = buf_with(b"cache-wait\ncache-wait\n");
+        let (rest, saw) = consume_cache_wait_lines(&mut buf, n);
+        assert!(saw);
+        assert_eq!(rest, 0, "complete keepalive lines must be drained");
+    }
+
+    #[test]
+    fn split_cache_ack_tail_survives_compaction() {
+        // "cache-ack" arriving split across reads must not be destroyed by the
+        // keepalive drain: the partial tail is preserved so the next read
+        // completes it.
+        let (mut buf, n) = buf_with(b"cache-wait\ncache-a");
+        let (rest, saw) = consume_cache_wait_lines(&mut buf, n);
+        assert!(saw);
+        assert_eq!(&buf[..rest], b"cache-a");
+        // Simulate the next read appending the remainder.
+        buf[rest..rest + 3].copy_from_slice(b"ck\n");
+        let total = rest + 3;
+        let received = std::str::from_utf8(&buf[..total]).unwrap();
+        assert!(
+            received.contains("cache-ack"),
+            "split ack must assemble: {received}"
+        );
+    }
+
+    #[test]
+    fn no_keepalive_means_no_compaction() {
+        let (mut buf, n) = buf_with(b"cache-a");
+        let (rest, saw) = consume_cache_wait_lines(&mut buf, n);
+        assert!(!saw);
+        assert_eq!(rest, n, "partial ack untouched when no keepalive present");
+        assert_eq!(&buf[..rest], b"cache-a");
+    }
+
+    #[test]
+    fn repeated_keepalives_never_overflow_buffer() {
+        let mut buf = [0u8; 64];
+        let mut total = 0usize;
+        for _ in 0..50 {
+            let msg = b"cache-wait\n";
+            assert!(
+                total + msg.len() <= buf.len(),
+                "buffer overflow before drain"
+            );
+            buf[total..total + msg.len()].copy_from_slice(msg);
+            total += msg.len();
+            let (rest, saw) = consume_cache_wait_lines(&mut buf, total);
+            assert!(saw);
+            total = rest;
+            assert_eq!(total, 0);
+        }
+    }
 }
