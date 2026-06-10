@@ -260,9 +260,22 @@ impl VsockListener {
     }
 
     /// Accept a connection. Returns a blocking OwnedFd for spawn_blocking handlers.
+    ///
+    /// Robust against lost readiness edges: a vsock connection that is delivered
+    /// while the VM is PAUSED (snapshot create: pause → dump → resume) can leave the
+    /// accept queue non-empty without ever producing an EPOLLIN edge for the
+    /// listener after resume (#617 — host exec CONNECT is ACKed by Firecracker, but
+    /// the guest's `readable().await` never wakes; the create path, unlike restore,
+    /// never re-registers the listener). Waiting on readiness alone therefore hangs
+    /// forever. The fallback: every 2s of idle waiting, optimistically try a
+    /// non-blocking accept4 — a queued-but-edgeless connection is then served with
+    /// at most 2s latency, while the common path (readiness edge) is unchanged and
+    /// the idle cost is one EAGAIN syscall per tick.
     pub async fn accept(&self) -> Result<OwnedFd> {
         loop {
-            let mut guard = self.inner.readable().await?;
+            // Optimistic non-blocking accept first: serves connections whose edge
+            // was consumed by a previous cycle (readiness persists until EAGAIN
+            // clears it) and connections whose edge was lost across pause/resume.
             let client_fd = unsafe {
                 libc::accept4(
                     self.inner.get_ref().as_raw_fd(),
@@ -271,15 +284,41 @@ impl VsockListener {
                     libc::SOCK_CLOEXEC,
                 )
             };
-            if client_fd < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    guard.clear_ready();
+            if client_fd >= 0 {
+                return Ok(unsafe { OwnedFd::from_raw_fd(client_fd) });
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) => {} // queue empty — fall through to wait
+                // Transient per-connection / signal conditions: retry without
+                // failing the listener (the caller's accept loop would otherwise
+                // log-and-retry with no await point — a hot loop under sustained
+                // EMFILE pressure).
+                Some(libc::EINTR) | Some(libc::ECONNABORTED) => continue,
+                Some(libc::EMFILE) | Some(libc::ENFILE) => {
+                    eprintln!("[fc-agent] accept: fd exhaustion ({err}); retrying in 100ms");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                bail!("accept failed: {}", err);
+                _ => bail!("accept failed: {}", err),
             }
-            return Ok(unsafe { OwnedFd::from_raw_fd(client_fd) });
+
+            // Queue empty — wait for readiness, with the periodic re-poll fallback.
+            match tokio::time::timeout(std::time::Duration::from_secs(2), self.inner.readable())
+                .await
+            {
+                Ok(guard_result) => {
+                    let mut guard = guard_result?;
+                    // Clear and loop: the accept4 at the top of the loop consumes
+                    // the connection(s); readiness re-arms on the next edge, and
+                    // the EAGAIN path above re-clears if this edge was stale.
+                    guard.clear_ready();
+                }
+                Err(_) => {
+                    // Tick: no edge observed — loop to the optimistic accept4,
+                    // which catches a lost-edge connection (#617).
+                }
+            }
         }
     }
 }
