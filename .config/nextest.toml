@@ -72,14 +72,17 @@ filter = "package(fcvm) & (test(/stress_100/) | test(/8000_concurrent/))"
 test-group = "stress-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
-# Nested (NV2) tests: 3-concurrent + 15-minute budget. An L1+L2 chain takes
-# ~3-6 minutes end to end (image build/export on first run, two VM boots,
-# in-guest podman load). Must be listed BEFORE the snapshot/vm-tests overrides
-# so it wins for test names that also match those filters.
+# Nested (NV2) tests: 3-concurrent + 20-minute budget. An L1+L2 chain takes
+# ~3-6 minutes end to end; the budget leaves room for the in-test
+# 'timeout -k 10 840' around the L1 pipeline (which starts AFTER the
+# image build/export prep) to always fire-and-clean-up BEFORE nextest's
+# kill — a nextest kill orphans the sudo'd VM pipeline. Must be listed
+# BEFORE the snapshot/vm-tests overrides so it wins for test names that
+# also match those filters.
 [[profile.default.overrides]]
 filter = "package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))"
 test-group = "nested-tests"
-slow-timeout = { period = "900s", terminate-after = 1 }
+slow-timeout = { period = "1200s", terminate-after = 1 }
 
 # Hugepage tests must run sequentially (shared hugepage pool: 512 pages, each VM needs 256)
 [[profile.default.overrides]]

@@ -1112,7 +1112,10 @@ fn network_script(server_ip: &str, port: u16) -> String {
 set -e
 LEVEL=${{1:-unknown}}
 SERVER="{server_ip}"
-PORT={port}
+# Per-level port: L1 and L2 hitting the same server port seconds apart through
+# stacked NAT intermittently hung the second connection (conntrack reuse);
+# the test spawns one iperf3 server per level.
+PORT=$(({port} + LEVEL))
 
 echo "=== NETWORK BENCHMARK L${{LEVEL}} ==="
 echo "Server: $SERVER:$PORT"
@@ -1142,7 +1145,7 @@ echo ""
 echo "--- Egress Throughput (VM -> Host) ---"
 for bs in $BLOCK_SIZES; do
     for p in $PARALLEL; do
-        result=$(iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -J 2>/dev/null || echo '{{"error":"failed"}}')
+        result=$(timeout 60 iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -J 2>/dev/null || echo '{{"error":"failed"}}')
         throughput=$(echo "$result" | python3 -c "
 import sys, json
 try:
@@ -1164,7 +1167,7 @@ echo ""
 echo "--- Ingress Throughput (Host -> VM) ---"
 for bs in $BLOCK_SIZES; do
     for p in $PARALLEL; do
-        result=$(iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -R -J 2>/dev/null || echo '{{"error":"failed"}}')
+        result=$(timeout 60 iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -R -J 2>/dev/null || echo '{{"error":"failed"}}')
         throughput=$(echo "$result" | python3 -c "
 import sys, json
 try:
@@ -1328,23 +1331,28 @@ async fn run_nested_n_levels(
         String::new()
     };
 
-    // Start iperf3 server for network benchmarks with unique port per test
-    let mut iperf_server: Option<tokio::process::Child> = None;
+    // Start one iperf3 server PER NESTING LEVEL (the guest script uses
+    // base_port + level) with a unique base port per test process. Sharing one
+    // server port across levels through stacked NAT intermittently hung the
+    // second level's connection for minutes (conntrack tuple reuse).
+    let mut iperf_servers: Vec<tokio::process::Child> = Vec::new();
     let iperf_port: u16 = if mode == BenchmarkMode::WithNetwork {
-        // Generate unique port based on process ID to avoid conflicts in parallel tests
-        let port = 5201 + (std::process::id() % 1000) as u16;
-        println!("Starting iperf3 server on host ({}:{})...", host_ip, port);
-        iperf_server = Some(
-            tokio::process::Command::new("iperf3")
-                .args(["-s", "-p", &port.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("starting iperf3 server")?,
-        );
-        // Give server time to start
+        let base_port = 5201 + (std::process::id() % 1000) as u16;
+        for level in 1..=n {
+            let port = base_port + level as u16;
+            println!("Starting iperf3 server on host ({}:{})...", host_ip, port);
+            iperf_servers.push(
+                tokio::process::Command::new("iperf3")
+                    .args(["-s", "-p", &port.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .context("starting iperf3 server")?,
+            );
+        }
+        // Give servers time to start
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        port
+        base_port
     } else {
         5201 // Default, unused
     };
@@ -1711,10 +1719,12 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
         );
     }
 
-    // Clean up iperf3 server if started
-    if let Some(mut server) = iperf_server {
-        println!("Stopping iperf3 server...");
-        server.kill().await.ok();
+    // Clean up iperf3 servers if started
+    if !iperf_servers.is_empty() {
+        println!("Stopping iperf3 servers...");
+        for mut server in iperf_servers {
+            server.kill().await.ok();
+        }
     }
 
     Ok(())

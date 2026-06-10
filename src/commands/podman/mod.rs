@@ -149,6 +149,10 @@ fn is_snapshot_load_failure(err: &anyhow::Error) -> bool {
 
 /// Delete a cached snapshot that failed to load so the run can fall back to a
 /// fresh boot (which re-creates the snapshot with the current Firecracker).
+///
+/// Takes the per-snapshot flock EXCLUSIVELY first: restores hold it shared for
+/// their whole duration, so this can never yank memory/vmstate/disk files out
+/// from under a concurrent clone of the same snapshot.
 async fn invalidate_unusable_snapshot(snapshot_key: &str, err: &anyhow::Error) {
     warn!(
         snapshot_key = %snapshot_key,
@@ -156,6 +160,18 @@ async fn invalidate_unusable_snapshot(snapshot_key: &str, err: &anyhow::Error) {
         "cached snapshot failed to load (incompatible Firecracker snapshot \
          format?); invalidating it and falling back to a fresh boot"
     );
+    let snapshot_path = paths::snapshot_dir().join(snapshot_key);
+    let _excl_lock = match super::common::acquire_snapshot_dir_lock(&snapshot_path, true).await {
+        Ok(lock) => lock,
+        Err(lock_err) => {
+            warn!(
+                snapshot_key = %snapshot_key,
+                error = %lock_err,
+                "could not lock unusable snapshot for deletion; leaving it in place"
+            );
+            return;
+        }
+    };
     let manager = crate::storage::SnapshotManager::new(paths::snapshot_dir());
     if let Err(delete_err) = manager.delete_snapshot(snapshot_key).await {
         warn!(
@@ -1508,7 +1524,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     }
 
     // Run the VM loop, then always clean up — even when the loop reports an error.
-    let result = run_vm_loop(&mut ctx, cancel).await;
+    let result = run_vm_loop(&mut ctx, cancel.clone()).await;
     let restore_key = ctx.restore_from_cache.take();
     let restore_args = restore_key.as_ref().map(|key| crate::cli::SnapshotRunArgs {
         pid: None,
@@ -1530,6 +1546,13 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // The run loop stopped on purpose right after producing the pre-start
     // snapshot: relaunch through the restore path (identical to a cache hit).
     if let Some(snapshot_args) = restore_args {
+        // A signal during the teardown window lands on a token nothing else
+        // checks anymore (cmd_snapshot_run installs fresh handlers) — honor it
+        // here or the "killed" VM would resurrect as a clone.
+        if cancel.is_cancelled() {
+            info!("shutdown requested during snapshot relaunch, not restoring");
+            bail!("interrupted by signal during snapshot relaunch");
+        }
         return super::snapshot::cmd_snapshot_run(snapshot_args).await;
     }
 

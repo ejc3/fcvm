@@ -54,23 +54,31 @@ async fn snapshot_restore_runtime_config(
     // the SNAPSHOT's kernel profile — the clone must run on the same binary the
     // snapshot was created with. Resolving "default" for a nested-profile
     // snapshot would restore a vEL2 (NV2) guest on a Firecracker without NV2
-    // support.
+    // support. Profiles that define no firecracker of their own (e.g. btrfs)
+    // were CREATED on the default profile's custom Firecracker (prepare_vm
+    // falls back to it), so the restore must fall back the same way — a plain
+    // PATH `firecracker` would be a different binary than created the snapshot.
     if config.firecracker_bin.is_none() {
         let profile_name = kernel_profile.unwrap_or("default");
-        if let Ok(Some(profile)) = crate::setup::get_kernel_profile(profile_name) {
-            if profile.firecracker_repo.is_some() {
-                match crate::setup::get_firecracker_for_profile(&profile, profile_name).await {
-                    Ok(fc_path) => {
-                        config.firecracker_bin = Some(fc_path);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, profile = profile_name, "custom Firecracker not found for snapshot restore, falling back to system binary");
-                    }
-                }
-            }
+        for candidate in [profile_name, "default"] {
+            let Ok(Some(profile)) = crate::setup::get_kernel_profile(candidate) else {
+                continue;
+            };
             if config.firecracker_args.is_none() {
                 config.firecracker_args = profile.firecracker_args.clone();
             }
+            if profile.firecracker_repo.is_none() {
+                continue;
+            }
+            match crate::setup::get_firecracker_for_profile(&profile, candidate).await {
+                Ok(fc_path) => {
+                    config.firecracker_bin = Some(fc_path);
+                }
+                Err(e) => {
+                    warn!(error = %e, profile = candidate, "custom Firecracker not found for snapshot restore, falling back to system binary");
+                }
+            }
+            break;
         }
     }
 
