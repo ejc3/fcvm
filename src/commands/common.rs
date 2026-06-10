@@ -812,17 +812,35 @@ fn assert_vmstate_rootfs_covered(
         }
     }
     if vmstate_rootfs_covered(&bytes, &covered_dirs) {
+        // #608 diagnostics: the observed ~0.7% sibling-disk failure has never been
+        // caught with its inputs visible (the metadata-divergence hypothesis was
+        // empirically refuted — the embedded path's vm_id always matched). Log the
+        // exact coverage inputs on every restore so the next occurrence is
+        // self-diagnosing instead of a reconstruction from artifacts: which vm_ids
+        // vmstate embeds, which dirs the bind-mount will cover, and the data_dir
+        // prefix (a prefix change between create and restore is the leading
+        // remaining hypothesis — #638-class).
+        debug!(
+            embedded_vm_ids = ?rootfs_disk_vm_ids_in_bytes(&bytes),
+            covered_dirs = ?covered_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            data_dir = %paths::data_dir().display(),
+            "#608 coverage check passed"
+        );
         return Ok(());
     }
     anyhow::bail!(
         "#608: refusing to restore — vmstate.bin does not reference a rootfs disk under any \
-         baseline bind-mount {:?} (it references vm-disks ids {:?}). LoadSnapshot would open \
-         an uncovered/sibling VM's disk and corrupt it.",
+         baseline bind-mount {:?} (it references vm-disks ids {:?}; data_dir prefix {}). \
+         LoadSnapshot would open an uncovered/sibling VM's disk and corrupt it.",
         covered_dirs
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
         rootfs_disk_vm_ids_in_bytes(&bytes),
+        paths::data_dir().display(),
     )
 }
 
