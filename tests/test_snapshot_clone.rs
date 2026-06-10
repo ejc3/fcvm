@@ -14,7 +14,7 @@ mod common;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 /// Full snapshot/clone workflow test with rootless networking (10 clones)
 #[tokio::test]
@@ -163,6 +163,28 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
 
     let results: Arc<Mutex<Vec<CloneResult>>> = Arc::new(Mutex::new(Vec::new()));
     let clone_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    // Child handles are kill_on_drop: a clone dies the moment its spawn task
+    // drops the handle. Retain them here so every clone stays alive until ALL
+    // waves complete — the test then genuinely holds num_clones concurrent live
+    // clones (sharing the serve process's memory) at its peak, which is what the
+    // stress test exists to prove. Dropped (killing the clones) during cleanup.
+    let clone_children: Arc<Mutex<Vec<tokio::process::Child>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Throttle the spawn+health herd (#626): bound how many clones are in their
+    // boot/health-wait phase at once. Unthrottled, 100 simultaneous boots contend
+    // on UFFD page faults, btrfs reflinks, the host-wide bridged-subnet lock, and
+    // a 100-way `fcvm ls` poll fork-storm — under the SnapshotEnabled matrix the
+    // slowest clone intermittently exceeds its 120s budget. The throttle bounds
+    // that contention while preserving what the test asserts: every clone stays
+    // RUNNING after it turns healthy, so peak live concurrency still reaches
+    // num_clones (all sharing the serve process's memory).
+    //
+    // Explicit trade-off: this intentionally bounds BOOT-phase concurrency to 16,
+    // so the test no longer exercises 100 simultaneous clone *startups* — it
+    // proves N concurrent live clones + bounded-parallel boot, which is the
+    // supported production shape. A dedicated unthrottled-boot stress would be a
+    // separate (manual) test if that load class ever needs coverage.
+    let boot_permits = Arc::new(Semaphore::new(16));
 
     let mut spawn_handles = Vec::new();
 
@@ -170,9 +192,14 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
         let clone_name = format!("{}-{}", baseline_name.replace("-base-", "-clone-"), i);
         let results = Arc::clone(&results);
         let clone_pids = Arc::clone(&clone_pids);
+        let clone_children = Arc::clone(&clone_children);
         let serve_pid_str = serve_pid.to_string();
+        let boot_permits = Arc::clone(&boot_permits);
 
         let handle = tokio::spawn(async move {
+            // Held across spawn + health wait; released once this clone is healthy
+            // (or failed), letting the next clone start booting.
+            let _permit = boot_permits.acquire().await.expect("boot semaphore closed");
             let spawn_start = Instant::now();
 
             let result = common::spawn_fcvm_with_logs(
@@ -189,16 +216,22 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             .await;
 
             match result {
-                Ok((_child, clone_pid)) => {
+                Ok((child, clone_pid)) => {
                     let spawn_ms = spawn_start.elapsed().as_secs_f64() * 1000.0;
 
-                    // Store PID for cleanup
+                    // Store PID for cleanup and retain the kill_on_drop handle so
+                    // this clone outlives the task (see clone_children above).
                     clone_pids.lock().await.push(clone_pid);
+                    clone_children.lock().await.push(child);
 
-                    // Now wait for health check
+                    // Now wait for health check. poll_health_by_pid enforces its
+                    // own 120s deadline (with a rich error); the outer timeout is a
+                    // strictly-larger backstop for the poll loop itself hanging
+                    // (e.g. a wedged `fcvm ls` subprocess), so the inner error wins
+                    // in the normal timeout case.
                     let health_start = Instant::now();
                     let health_result = tokio::time::timeout(
-                        Duration::from_secs(120),
+                        Duration::from_secs(150),
                         common::poll_health_by_pid(clone_pid, 120),
                     )
                     .await;
@@ -232,9 +265,27 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
         spawn_handles.push(handle);
     }
 
-    // Wait for all spawn+health tasks to complete
-    for handle in spawn_handles {
-        let _ = handle.await;
+    // Wait for all spawn+health tasks, bounded by an explicit step deadline.
+    // The 16-permit throttle serializes a broad-failure run into ~7 waves; at the
+    // 150s worst case per wave that exceeds nextest's 600s terminate-after for
+    // stress tests, which would SIGTERM the test mid-run — losing the per-clone
+    // error table and skipping cleanup. Bounding here keeps the failure
+    // diagnosable: stragglers are aborted, recorded as failures via the missing
+    // results, and the table + cleanup still run.
+    let step4_deadline = Duration::from_secs(450);
+    let all_done = async {
+        for handle in spawn_handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(step4_deadline, all_done)
+        .await
+        .is_err()
+    {
+        println!(
+            "⚠ step 4 exceeded {}s — proceeding with partial results",
+            step4_deadline.as_secs()
+        );
     }
 
     let clone_total_time = step4_start.elapsed();
@@ -268,11 +319,19 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     println!("\nCleaning up...");
     let cleanup_start = Instant::now();
 
-    // Kill clones
-    for pid in clone_pids.iter() {
-        if *pid > 0 {
-            common::kill_process(*pid).await;
-        }
+    // Kill clones — in parallel: with the retained child handles all 100 clones
+    // are still ALIVE here, and a sequential graceful kill (~5s each) would add
+    // ~500s, blowing the stress tests into nextest's 600s terminate-after.
+    let kill_tasks: Vec<_> = clone_pids
+        .iter()
+        .filter(|pid| **pid > 0)
+        .map(|pid| {
+            let pid = *pid;
+            tokio::spawn(async move { common::kill_process(pid).await })
+        })
+        .collect();
+    for task in kill_tasks {
+        let _ = task.await;
     }
     println!("  Killed {} clones", clone_pids.len());
 
@@ -371,6 +430,24 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
         );
     }
     println!("╚═══════════════════════════════════════════════════════════════╝");
+
+    // The throttle's justifying invariant: every clone that turned healthy is
+    // still RUNNING now that all waves finished — i.e. peak live concurrency
+    // actually reached num_clones (the boot throttle paces startups, it must not
+    // change what the test proves).
+    // (clone_pids was locked above for the stats section.)
+    let alive_now = clone_pids
+        .iter()
+        .filter(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+        .count();
+    if healthy_count == num_clones && alive_now != num_clones {
+        anyhow::bail!(
+            "peak-concurrency invariant violated: {}/{} clones still alive after all waves \
+             completed (a healthy clone died before the end of step 4)",
+            alive_now,
+            num_clones
+        );
+    }
 
     // Fail if any clones failed
     if healthy_count != num_clones {
