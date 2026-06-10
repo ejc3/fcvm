@@ -88,6 +88,9 @@ pub async fn run_server(
                     }
                     Err(e) => {
                         eprintln!("[fc-agent] exec server accept error: {}", e);
+                        // Persistent errors (e.g. a broken listener fd) would
+                        // otherwise spin this select loop with no await point.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }

@@ -617,3 +617,128 @@ async fn test_snapshot_clone_inherits_no_health_check() -> Result<()> {
     println!("  (Previously would get auto-assigned http://127.x.y.z:8080/)");
     Ok(())
 }
+
+/// Resolve a VM's vm_id from its fcvm process pid via `fcvm ls --json --pid`.
+async fn vm_id_for_pid(pid: u32) -> Result<String> {
+    let fcvm_path = common::find_fcvm_binary()?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &pid.to_string()])
+        .output()
+        .await
+        .context("running fcvm ls")?;
+    anyhow::ensure!(output.status.success(), "fcvm ls failed");
+    let vms: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parsing fcvm ls json")?;
+    vms.get(0)
+        .and_then(|v| v.get("vm_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("no vm found for pid {pid}"))
+}
+
+/// #608 regression: restoring a snapshot must not depend on its ANCESTORS'
+/// vm-disks directories still existing.
+///
+/// The reported failure: a restore intermittently tried to open a cleaned-up
+/// sibling's `vm-disks/<id>/disks/rootfs.raw` (the path embedded in vmstate.bin),
+/// failing LoadSnapshot — or worse, silently opening a different live VM's disk.
+/// The deterministic shape exercises the divergence-suspect chain end-to-end:
+///
+/// 1. Baseline A → full snapshot T1 (vmstate embeds A's disk path).
+/// 2. Clone B restores T1 (drive patched to B's dir), then snapshot T2 FROM the
+///    restored clone — T2's metadata carries original_vsock_vm_id=A, vm_id=B,
+///    and its vmstate embeds B's patched path (the diff-chain case the #608
+///    analysis suspected).
+/// 3. Kill A and B — their vm-disks dirs are removed by normal cleanup (the
+///    "sibling cleaned up" condition).
+/// 4. Clone C restores T2: the #608 coverage guard must pass (vmstate's embedded
+///    path covered by the bind-mount derived from T2's metadata) and C must boot
+///    healthy with both ancestor dirs gone.
+#[tokio::test]
+async fn test_snapshot_restore_survives_ancestor_dir_cleanup() -> Result<()> {
+    let (name_a, name_b, tag1, _serve) = common::unique_names("sib608");
+    let tag2 = format!("{tag1}-t2");
+    let name_c = format!("{name_b}-c");
+
+    // 1. Baseline A.
+    let (mut child_a, pid_a) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &name_a, TEST_IMAGE],
+        "sib608-a",
+    )
+    .await?;
+    common::poll_health_by_pid(pid_a, 120).await?;
+    common::create_snapshot_by_pid(pid_a, &tag1)
+        .await
+        .context("creating T1 from baseline")?;
+
+    // 2. Clone B from T1, then snapshot T2 FROM the restored clone.
+    let (mut child_b, pid_b) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--snapshot", &tag1, "--name", &name_b],
+        "sib608-b",
+    )
+    .await?;
+    common::poll_health_by_pid(pid_b, 120).await?;
+    common::create_snapshot_by_pid(pid_b, &tag2)
+        .await
+        .context("creating T2 from restored clone")?;
+
+    // 3. Kill BOTH ancestors; their per-VM data dirs (vm-disks/<id>) are removed
+    //    by normal cleanup, reproducing the sibling-cleanup condition. The test
+    //    then ENFORCES the condition rather than trusting cleanup timing: it
+    //    waits for the dirs to disappear and force-removes any remnant, so clone
+    //    C provably restores with both ancestor dirs gone.
+    let vm_id_a = vm_id_for_pid(pid_a).await.context("vm_id for A")?;
+    let vm_id_b = vm_id_for_pid(pid_b).await.context("vm_id for B")?;
+    common::kill_process(pid_a).await;
+    let _ = child_a.kill().await;
+    common::kill_process(pid_b).await;
+    let _ = child_b.kill().await;
+
+    // Same base resolution as snapshot_dir(): FCVM_DATA_DIR, falling back to
+    // fcvm's config default (/mnt/fcvm-btrfs) — NOT the Makefile's per-suite
+    // override, which only exists when FCVM_DATA_DIR is exported anyway.
+    let vm_disks = std::env::var("FCVM_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs"))
+        .join("vm-disks");
+    for id in [&vm_id_a, &vm_id_b] {
+        let dir = vm_disks.join(id);
+        // Normal cleanup removes it within a few seconds of SIGTERM.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while dir.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if dir.exists() {
+            // Cleanup lagged (e.g. SIGKILL path) — force the condition the test
+            // is about: the ancestor's directory must NOT exist at restore time.
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("force-removing ancestor dir {}", dir.display()))?;
+        }
+        assert!(
+            !dir.exists(),
+            "ancestor vm-disks dir must be gone before the restore: {}",
+            dir.display()
+        );
+    }
+
+    // 4. Clone C from T2 must restore and become healthy with the ancestors gone.
+    let (mut child_c, pid_c) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--snapshot", &tag2, "--name", &name_c],
+        "sib608-c",
+    )
+    .await?;
+    common::poll_health_by_pid(pid_c, 120)
+        .await
+        .context("#608: restore failed after ancestor vm-disks cleanup")?;
+
+    // The restored clone must actually work (exec round-trip).
+    let out = common::exec_in_vm(pid_c, &["echo", "sib608-ok"]).await?;
+    assert!(out.contains("sib608-ok"), "exec into C failed: {out}");
+
+    // Cleanup.
+    common::kill_process(pid_c).await;
+    let _ = child_c.kill().await;
+    let _ = std::fs::remove_dir_all(snapshot_dir().join(&tag1));
+    let _ = std::fs::remove_dir_all(snapshot_dir().join(&tag2));
+    Ok(())
+}
