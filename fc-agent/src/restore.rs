@@ -92,6 +92,33 @@ pub async fn handle_clone_restore(
     network::flush_arp_cache().await;
     network::send_gratuitous_arp().await;
 
+    // Remount NFS shares: their kernel TCP connections to the host's NFS
+    // server died with the snapshot transport reset, and a hard NFS mount
+    // wedges every accessor until remounted. Lazy-unmount then mount fresh
+    // re-establishes the connection against the (still-exported) share.
+    match crate::mmds::fetch_plan().await {
+        Ok(plan) if !plan.nfs_mounts.is_empty() => {
+            eprintln!(
+                "[fc-agent] remounting {} NFS share(s) after restore",
+                plan.nfs_mounts.len()
+            );
+            for share in &plan.nfs_mounts {
+                let _ = tokio::process::Command::new("umount")
+                    .args(["-l", &share.mount_path])
+                    .output()
+                    .await;
+            }
+            if let Err(e) = crate::mounts::mount_nfs_shares(&plan.nfs_mounts) {
+                eprintln!("[fc-agent] WARNING: NFS remount after restore failed: {:?}", e);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "[fc-agent] WARNING: could not fetch plan for NFS remount after restore: {:?}",
+            e
+        ),
+    }
+
     // FIRST: Re-register exec server listener (AsyncFd epoll stale after transport reset).
     // Reset confirmation flag, then signal. Set flag BEFORE notify to prevent race
     // where select! drops the Notified future (see exec.rs doc comment).
