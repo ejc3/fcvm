@@ -489,6 +489,10 @@ setup-default: build setup-btrfs
 		exit 1; \
 	fi
 	@echo "==> Running fcvm setup (default kernel)..."
+	@# Tests run fcvm via sudo, which reads /root/.config/fcvm — sync BOTH the
+	@# user and root configs or a rootfs-config.toml change silently boots the
+	@# previous rootfs under sudo (root keeps the stale SHA).
+	sudo ./target/release/fcvm setup --generate-config --force
 	./target/release/fcvm setup
 
 setup-fcvm: setup-default
