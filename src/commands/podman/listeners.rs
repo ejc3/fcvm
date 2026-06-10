@@ -169,6 +169,16 @@ pub(crate) async fn run_status_listener(
                         // (the failure mode documented in fc-agent's read path).
                         let mut ack_rx = ack_rx;
                         let mut probe_line = String::new();
+                        // Pin the keepalive timer OUTSIDE the loop so it
+                        // survives across select iterations: the guest sends
+                        // probe bytes every ~500ms, and each probe-read
+                        // restarts the select — an inline sleep(5) would
+                        // reset on every probe and never fire while the guest
+                        // is running (the pre-pause semaphore-queue scenario
+                        // that #627 targets).
+                        let keepalive_interval =
+                            tokio::time::sleep(std::time::Duration::from_secs(5));
+                        tokio::pin!(keepalive_interval);
                         loop {
                             probe_line.clear();
                             tokio::select! {
@@ -193,12 +203,17 @@ pub(crate) async fn run_status_listener(
                                         }
                                     }
                                 }
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                                _ = &mut keepalive_interval => {
                                     if write_half.write_all(b"cache-wait\n").await.is_err() {
                                         let _ = (&mut ack_rx).await;
                                         break;
                                     }
                                     let _ = write_half.flush().await;
+                                    // Reset for the next keepalive interval.
+                                    keepalive_interval.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + std::time::Duration::from_secs(5),
+                                    );
                                 }
                             }
                         }
@@ -741,6 +756,107 @@ mod tests {
         assert!(
             wait_pos.is_some() && wait_pos.unwrap() < ack_pos,
             "expected at least one cache-wait keepalive before cache-ack; got: {received:?}"
+        );
+        listener_task.abort();
+    }
+
+    /// Same as above, but the guest continuously sends probe bytes ("\n") every
+    /// 500ms — matching production behaviour. Before the pinned-timer fix, the
+    /// inline `sleep(5)` was reset by each probe-read and would NEVER fire,
+    /// leaving the guest without keepalives during the pre-pause semaphore queue.
+    #[tokio::test]
+    async fn test_status_listener_keepalive_fires_despite_probe_traffic() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = temp_dir.path().to_path_buf();
+        let socket_path = runtime_dir.join("status.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let runtime_dir_for_task = runtime_dir.clone();
+
+        // cache handler that takes >5s (one keepalive interval) to ack.
+        let (cache_tx, mut cache_rx) = mpsc::channel::<CacheRequest>(1);
+        tokio::spawn(async move {
+            if let Some(req) = cache_rx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_millis(5600)).await;
+                let _ = req.ack_tx.send(());
+            }
+        });
+
+        let reboot_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener_task = tokio::spawn(async move {
+            run_status_listener(
+                &socket_path_string,
+                &runtime_dir_for_task,
+                "vm-test",
+                Some(cache_tx),
+                reboot_flag,
+                exit_flag,
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Split the stream so a background task can write probes while the
+        // main task reads the host's responses.
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+
+        write_half
+            .write_all(b"cache-ready:sha256:abc\n")
+            .await
+            .unwrap();
+
+        // Background task: send probe "\n" every 500ms (mimics fc-agent).
+        // Before the pinned-timer fix, these resets prevented the keepalive
+        // timer from ever firing.
+        let probe_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_done_clone = probe_done.clone();
+        let probe_task = tokio::spawn(async move {
+            while !probe_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if write_half.write_all(b"\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Collect everything the host writes until the ack arrives.
+        let mut received = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut buf = [0u8; 256];
+        let mut read_half = tokio::io::BufReader::new(read_half);
+        while !received.contains("cache-ack") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no cache-ack within deadline; got: {received:?}"
+            );
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                AsyncReadExt::read(&mut read_half, &mut buf),
+            )
+            .await
+            .expect("read timed out")
+            .unwrap();
+            assert!(n > 0, "connection closed before ack; got: {received:?}");
+            received.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+        }
+
+        probe_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = probe_task.await;
+
+        let wait_pos = received.find("cache-wait");
+        let ack_pos = received.find("cache-ack").unwrap();
+        assert!(
+            wait_pos.is_some() && wait_pos.unwrap() < ack_pos,
+            "expected cache-wait keepalive before cache-ack even with probe traffic; got: {received:?}"
         );
         listener_task.abort();
     }
