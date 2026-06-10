@@ -850,7 +850,7 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
 /// container startup to exceed the 10-minute test timeout.
 /// disk-dir and NFS may work better at L3.
 #[tokio::test]
-#[ignore]
+#[ignore = "nested L3 (FUSE-over-FUSE x2): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_fuse() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -863,7 +863,7 @@ async fn test_nested_l3_network_fuse() -> Result<()> {
 
 /// Test L3 network with NFS (may be faster than FUSE)
 #[tokio::test]
-#[ignore]
+#[ignore = "nested L3 (NFS): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_nfs() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -881,7 +881,7 @@ async fn test_nested_l3_network_nfs() -> Result<()> {
 /// initialization alone takes 10+ minutes. Need to implement request pipelining
 /// or async PassthroughFs before this test can complete in reasonable time.
 #[tokio::test]
-#[ignore]
+#[ignore = "nested L3: slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -896,7 +896,7 @@ async fn test_nested_l3() -> Result<()> {
 ///
 /// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
 #[tokio::test]
-#[ignore]
+#[ignore = "nested L4: very slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l4() -> Result<()> {
     run_nested_n_levels(
         4,
@@ -1718,7 +1718,7 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
 /// slower than L1). FUSE throughput itself is fine (181-224 MB/s on L1).
 /// The bottleneck is podman load's gzip decompression + overlay writes running
 /// under double Stage 2 translation with a single vCPU.
-#[ignore]
+#[ignore = "podman load over FUSE in nested VM: slow + NV2-flaky; run manually — tracked in #630-B"]
 #[tokio::test]
 async fn test_podman_load_over_fuse() -> Result<()> {
     println!("\nPodman Load Over FUSE Performance Test");
