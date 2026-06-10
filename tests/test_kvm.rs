@@ -1074,25 +1074,32 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     FUSE_DIR="/mnt/fcvm-btrfs/bench-large-${LEVEL}-$$"
     mkdir -p "$FUSE_DIR"
 
-    echo "--- Generating 100MB random data ---"
-    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
+    # 32MB: well past the ~10MB mark where the historical NV2 FUSE-over-vsock
+    # corruption appeared (fragmented max_write-sized writes), at a third of
+    # the old 100MB runtime.
+    echo "--- Generating 32MB random data ---"
+    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=32 2>/dev/null
 
-    echo "--- Copy TO FUSE (100MB) ---"
+    echo "--- Copy TO FUSE (32MB) ---"
     START=$(date +%s%N)
     cp /tmp/large.dat "${FUSE_DIR}/large.dat"
     sync
     END=$(date +%s%N)
     COPY_TO_MS=$(( (END - START) / 1000000 ))
-    COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
-    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
+    COPY_TO_MBS=$(( 32 * 1000 / (COPY_TO_MS + 1) ))
+    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (32MB, ${COPY_TO_MBS}MB/s)"
 
-    echo "--- Copy FROM FUSE (100MB) ---"
+    echo "--- Copy FROM FUSE (32MB) ---"
     START=$(date +%s%N)
     cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
     END=$(date +%s%N)
     COPY_FROM_MS=$(( (END - START) / 1000000 ))
-    COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
-    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
+    COPY_FROM_MBS=$(( 32 * 1000 / (COPY_FROM_MS + 1) ))
+    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (32MB, ${COPY_FROM_MBS}MB/s)"
+
+    # Round-trip integrity: the corruption class this test exists for shows
+    # up as zeroed/stale ranges in the data, not as I/O errors.
+    cmp /tmp/large.dat /tmp/large2.dat || { echo "FUSE_LARGE_L${LEVEL}=CORRUPTED"; exit 1; }
 
     rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
 else
@@ -1136,10 +1143,12 @@ if ! timeout 5 bash -c "echo > /dev/tcp/$SERVER/$PORT" 2>/dev/null; then
 fi
 echo "Server reachable"
 
-# Block sizes and parallelism
-BLOCK_SIZES="128K 1M"
-PARALLEL="1 4 8"
-DURATION=3
+# One block size, two parallelism levels, short duration: the test gates
+# "does networking work through the nested chain at sane throughput", not a
+# performance survey (run the manual benchmark test for that).
+BLOCK_SIZES="1M"
+PARALLEL="1 4"
+DURATION=2
 
 echo ""
 echo "--- Egress Throughput (VM -> Host) ---"
