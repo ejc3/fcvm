@@ -56,11 +56,12 @@ max-threads = 1
 [test-groups.snapshot-tests]
 max-threads = 3
 
-# Nested (NV2) tests run one at a time: each boots a 4GB L1 VM that itself
-# boots an L2 VM, and concurrent chains contend on CPU, the podman build lock,
-# and the shared image cache.
+# Nested (NV2) tests: each boots a 4GB L1 VM that itself boots an L2 VM.
+# Capped at 3 concurrent chains — fresh runners create one ~4GB pre-start
+# snapshot per distinct config (same rationale as snapshot-tests), and the
+# first run serializes on the podman image-build lock anyway.
 [test-groups.nested-tests]
-max-threads = 1
+max-threads = 3
 
 # VM tests run at full parallelism (num-cpus)
 [test-groups.vm-tests]
@@ -71,8 +72,8 @@ filter = "package(fcvm) & (test(/stress_100/) | test(/8000_concurrent/))"
 test-group = "stress-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
-# Nested (NV2) tests: serialized + 15-minute budget. An L1+L2 chain takes
-# ~6-8 minutes end to end (image build/export on first run, two VM boots,
+# Nested (NV2) tests: 3-concurrent + 15-minute budget. An L1+L2 chain takes
+# ~3-6 minutes end to end (image build/export on first run, two VM boots,
 # in-guest podman load). Must be listed BEFORE the snapshot/vm-tests overrides
 # so it wins for test names that also match those filters.
 [[profile.default.overrides]]
