@@ -64,6 +64,13 @@ pub struct VmContext {
     /// VM state snapshot for cache snapshot creation. Config fields (image, vcpu,
     /// memory_mib, network, original_vsock_vm_id, etc.) are immutable after setup.
     pub vm_state: crate::state::VmState,
+    /// Set by run_vm_loop right after the pre-start cache snapshot is created:
+    /// instead of resuming this VM, fcvm tears it down and relaunches by
+    /// restoring the snapshot it just produced, so the snapshot-miss path goes
+    /// through the exact same restore flow as a snapshot hit. (Resuming the
+    /// paused VM is the one lifecycle that intermittently starves Firecracker's
+    /// device event loop — see #630.)
+    pub restore_from_cache: Option<String>,
     /// Set by the status listener when the guest signals a reboot. run_vm_loop checks
     /// it when Firecracker exits and relaunches in place instead of terminating.
     pub reboot_requested: Arc<AtomicBool>,

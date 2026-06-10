@@ -137,6 +137,35 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
 }
 
 /// Best-effort removal of host state persisted during a failed `prepare_vm`.
+/// True when an error chain ends at Firecracker's `PUT /snapshot/load` step —
+/// i.e. the cached snapshot artifact itself is unusable (most commonly: it was
+/// created by an incompatible Firecracker version and no longer deserializes).
+///
+/// Firecracker prefixes every snapshot-load fault with "Load snapshot error",
+/// which fcvm's API client embeds verbatim in the error message.
+fn is_snapshot_load_failure(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("Load snapshot error")
+}
+
+/// Delete a cached snapshot that failed to load so the run can fall back to a
+/// fresh boot (which re-creates the snapshot with the current Firecracker).
+async fn invalidate_unusable_snapshot(snapshot_key: &str, err: &anyhow::Error) {
+    warn!(
+        snapshot_key = %snapshot_key,
+        error = %format!("{err:#}"),
+        "cached snapshot failed to load (incompatible Firecracker snapshot \
+         format?); invalidating it and falling back to a fresh boot"
+    );
+    let manager = crate::storage::SnapshotManager::new(paths::snapshot_dir());
+    if let Err(delete_err) = manager.delete_snapshot(snapshot_key).await {
+        warn!(
+            snapshot_key = %snapshot_key,
+            error = %delete_err,
+            "failed to delete unusable snapshot; the next run will hit it again"
+        );
+    }
+}
+
 ///
 /// `prepare_vm` creates the per-VM data directory and (for rootless and routed modes
 /// with published ports) persists the VM state file with an allocated loopback IP
@@ -390,8 +419,14 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 hugepages: Some(args.hugepages),
                 non_blocking_output: args.non_blocking_output,
             };
-            super::snapshot::cmd_snapshot_run(snapshot_args).await?;
-            return Ok(None);
+            match super::snapshot::cmd_snapshot_run(snapshot_args).await {
+                Ok(()) => return Ok(None),
+                Err(e) if is_snapshot_load_failure(&e) => {
+                    invalidate_unusable_snapshot(&startup_key, &e).await;
+                    // fall through to the pre-start check / fresh boot
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
@@ -421,8 +456,14 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 hugepages: Some(args.hugepages),
                 non_blocking_output: args.non_blocking_output,
             };
-            super::snapshot::cmd_snapshot_run(snapshot_args).await?;
-            return Ok(None);
+            match super::snapshot::cmd_snapshot_run(snapshot_args).await {
+                Ok(()) => return Ok(None),
+                Err(e) if is_snapshot_load_failure(&e) => {
+                    invalidate_unusable_snapshot(&key, &e).await;
+                    // fall through to a fresh boot (which re-creates the snapshot)
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         info!(
@@ -1018,6 +1059,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     let disk_path = data_dir.join("disks/rootfs.raw");
 
     Ok(Some(VmContext {
+        restore_from_cache: None,
         vm_id,
         vm_name,
         data_dir,
@@ -1301,22 +1343,25 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             return Ok(None);
                         }
                         SnapshotOutcome::Created => {
-                            info!(snapshot_key = %key, "Pre-start snapshot created successfully");
-                            ctx.vm_state.config.snapshot_name = Some(key.clone());
-                            // Locked read-modify-write: only update snapshot_name so the
-                            // health monitor's concurrent writes are not clobbered.
-                            let _ = ctx
-                                .state_manager
-                                .update_state(&ctx.vm_state.vm_id, |state| {
-                                    state.config.snapshot_name = Some(key.clone());
-                                })
-                                .await;
+                            info!(
+                                snapshot_key = %key,
+                                "Pre-start snapshot created; relaunching by restoring it \
+                                 (miss path converges on the hit path)"
+                            );
+                            // Do NOT ack fc-agent and do NOT resume into this VM: tear it
+                            // down and restore the snapshot we just produced, so the miss
+                            // path runs the exact same restore flow as a hit. Resuming the
+                            // paused VM is the one lifecycle that intermittently starves
+                            // Firecracker's device event loop (#630: NETDEV watchdog,
+                            // stalled FUSE, 100x guest slowdowns).
+                            ctx.restore_from_cache = Some(key.clone());
+                            return Ok(None);
                         }
                         SnapshotOutcome::Failed(e) => {
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
                         }
                     }
-                    // Send ack back regardless of success (fc-agent should continue)
+                    // Send ack back on failure/interruption (fc-agent should continue)
                     let _ = cache_request.ack_tx.send(());
                 } else {
                     // Should not happen if channel exists, but send ack anyway
@@ -1464,7 +1509,29 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Run the VM loop, then always clean up — even when the loop reports an error.
     let result = run_vm_loop(&mut ctx, cancel).await;
+    let restore_key = ctx.restore_from_cache.take();
+    let restore_args = restore_key.as_ref().map(|key| crate::cli::SnapshotRunArgs {
+        pid: None,
+        snapshot: Some(key.clone()),
+        name: Some(ctx.args.name.clone()),
+        exec: None,
+        no_dirty_tracking: false,
+        no_swap: false,
+        startup_snapshot_base_key: ctx.args.health_check.as_ref().map(|_| key.clone()),
+        cpu: Some(ctx.args.cpu),
+        mem: Some(ctx.args.mem),
+        firecracker_bin: None,
+        firecracker_args: None,
+        hugepages: Some(ctx.args.hugepages),
+        non_blocking_output: ctx.args.non_blocking_output,
+    });
     cleanup_vm_context(ctx).await;
+
+    // The run loop stopped on purpose right after producing the pre-start
+    // snapshot: relaunch through the restore path (identical to a cache hit).
+    if let Some(snapshot_args) = restore_args {
+        return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+    }
 
     // Propagate a missing exit code as an error and a non-zero exit code as a failure
     if let Some(code) = result? {
