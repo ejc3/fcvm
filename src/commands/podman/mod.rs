@@ -30,9 +30,10 @@ pub use snapshot::{
     CreateSnapshotParams,
 };
 pub(crate) use vm_config::{
-    build_launch_config, build_runtime_boot_args, configure_and_boot_firecracker,
+    build_launch_config, build_runtime_boot_args, cleanup_nfs_exports,
+    configure_and_boot_firecracker, setup_nfs_exports,
 };
-use vm_config::{cleanup_nfs_exports, run_vm_setup, VmSetupParams};
+use vm_config::{run_vm_setup, VmSetupParams};
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
@@ -1503,10 +1504,7 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
         handle.abort();
     }
 
-    // Cleanup NFS exports
-    cleanup_nfs_exports(&ctx.vm_id).await;
-
-    // Cleanup common resources
+    // Cleanup common resources (includes NFS export removal)
     super::common::cleanup_vm(
         super::common::CleanupContext {
             vm_id: ctx.vm_id,

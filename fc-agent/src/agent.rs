@@ -99,6 +99,7 @@ pub async fn run() -> Result<()> {
         exec_rebind_done: exec_rebind_done.clone(),
         exec_rebind_done_notify: exec_rebind_done_notify.clone(),
         egress_gen_rx: egress_gen_rx.clone(),
+        nfs_mounts: plan.nfs_mounts.clone(),
     };
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");

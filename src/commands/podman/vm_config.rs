@@ -627,10 +627,17 @@ pub(super) async fn build_and_send_mmds(
 
 /// Set up NFS exports for VM.
 /// Creates /etc/exports.d/fcvm-{vm_id}.exports and refreshes exportfs.
-pub(super) async fn setup_nfs_exports(
+///
+/// `client_spec` is the exports(5) client field — the source address the
+/// host's nfsd sees. Baseline VMs connect directly with their guest IP;
+/// clones behind in-namespace NAT arrive masqueraded as their veth IP.
+/// `insecure` allows non-privileged source ports (needed for clones:
+/// MASQUERADE may renumber the client's privileged port above 1023).
+pub(crate) async fn setup_nfs_exports(
     vm_id: &str,
     shares: &[crate::state::types::NfsShare],
-    network_config: &crate::network::NetworkConfig,
+    client_spec: &str,
+    insecure: bool,
 ) -> Result<()> {
     use std::io::Write;
 
@@ -684,21 +691,18 @@ pub(super) async fn setup_nfs_exports(
         }
     }
 
-    // Guest IP for access control (use /30 subnet for the VM)
-    let guest_ip = network_config
-        .guest_ip
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No guest IP configured for NFS"))?;
-
     // Build exports file content
     let mut exports = String::new();
     for share in shares {
-        let opts = if share.read_only {
-            "ro,sync,no_subtree_check,no_root_squash"
+        let mut opts = if share.read_only {
+            "ro,sync,no_subtree_check,no_root_squash".to_string()
         } else {
-            "rw,sync,no_subtree_check,no_root_squash"
+            "rw,sync,no_subtree_check,no_root_squash".to_string()
         };
-        exports.push_str(&format!("{} {}({})\n", share.host_path, guest_ip, opts));
+        if insecure {
+            opts.push_str(",insecure");
+        }
+        exports.push_str(&format!("{} {}({})\n", share.host_path, client_spec, opts));
     }
 
     // Write exports file
@@ -728,7 +732,7 @@ pub(super) async fn setup_nfs_exports(
 }
 
 /// Clean up NFS exports for VM
-pub(super) async fn cleanup_nfs_exports(vm_id: &str) {
+pub(crate) async fn cleanup_nfs_exports(vm_id: &str) {
     let exports_path = format!("/etc/exports.d/fcvm-{}.exports", vm_id);
     if std::path::Path::new(&exports_path).exists() {
         if let Err(e) = tokio::fs::remove_file(&exports_path).await {
@@ -996,7 +1000,11 @@ pub(crate) async fn configure_and_boot_firecracker(
             );
         }
         if !nfs_shares.is_empty() {
-            setup_nfs_exports(vm_id, &nfs_shares, network_config).await?;
+            let guest_ip = network_config
+                .guest_ip
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No guest IP configured for NFS"))?;
+            setup_nfs_exports(vm_id, &nfs_shares, guest_ip, false).await?;
         }
         vm_state.config.nfs_shares = nfs_shares;
 

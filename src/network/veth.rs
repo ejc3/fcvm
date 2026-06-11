@@ -677,6 +677,73 @@ pub async fn setup_in_namespace_nat(
         }
     }
 
+    // Step 9: Give the guest the same gateway-is-the-host contact surface a
+    // baseline VM has. In a baseline namespace the gateway IP lives on the
+    // host side of the veth (init netns), so guest→gateway:PORT reaches host
+    // services — NFS exports in particular. In a clone namespace br0 owns
+    // that IP, so such traffic would terminate here with nothing listening.
+    // DNAT it to the host's veth IP, and MASQUERADE those flows so replies
+    // route back over this clone's own /30. (Clones of one snapshot share
+    // the guest IP; without the masquerade, replies would depend on the
+    // shared guest-IP /32 host route, which only one clone can hold.)
+    for proto in ["tcp", "udp"] {
+        let output = exec_in_namespace(
+            ns_name,
+            &[
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "PREROUTING",
+                "-s",
+                &config.guest_ip,
+                "-d",
+                &config.gateway_ip,
+                "-p",
+                proto,
+                "-j",
+                "DNAT",
+                "--to-destination",
+                host_ip,
+            ],
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "failed to add {} gateway DNAT rule in namespace: {}",
+                proto,
+                stderr
+            );
+        }
+    }
+    let output = exec_in_namespace(
+        ns_name,
+        &[
+            "iptables",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            &config.guest_ip,
+            "-d",
+            host_ip,
+            "-o",
+            veth_name,
+            "-j",
+            "MASQUERADE",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "failed to add gateway MASQUERADE rule in namespace: {}",
+            stderr
+        );
+    }
+
     info!(
         namespace = %ns_name,
         bridge = %bridge_name,

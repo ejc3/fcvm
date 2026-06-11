@@ -18,6 +18,12 @@ pub struct RestoreSignals {
     pub exec_rebind_done: Arc<AtomicBool>,
     pub exec_rebind_done_notify: Arc<Notify>,
     pub egress_gen_rx: Option<watch::Receiver<u64>>,
+    /// NFS mounts from the boot-time plan, kept for post-restore remounting.
+    /// MMDS can't be re-fetched here: the host's restore-epoch PUT replaces the
+    /// whole MMDS store, so `container-plan` is gone by the time restore runs.
+    /// This cache lives in the snapshot's memory image, so a restored VM sees
+    /// exactly the mounts that were active when the snapshot was taken.
+    pub nfs_mounts: Vec<crate::types::NfsMount>,
 }
 
 /// Redirect stderr (fd 2) to /dev/console for direct serial console output.
@@ -95,28 +101,26 @@ pub async fn handle_clone_restore(
     // Remount NFS shares: their kernel TCP connections to the host's NFS
     // server died with the snapshot transport reset, and a hard NFS mount
     // wedges every accessor until remounted. Lazy-unmount then mount fresh
-    // re-establishes the connection against the (still-exported) share.
-    match crate::mmds::fetch_plan().await {
-        Ok(plan) if !plan.nfs_mounts.is_empty() => {
-            eprintln!(
-                "[fc-agent] remounting {} NFS share(s) after restore",
-                plan.nfs_mounts.len()
-            );
-            for share in &plan.nfs_mounts {
-                let _ = tokio::process::Command::new("umount")
-                    .args(["-l", &share.mount_path])
-                    .output()
-                    .await;
-            }
-            if let Err(e) = crate::mounts::mount_nfs_shares(&plan.nfs_mounts) {
-                eprintln!("[fc-agent] WARNING: NFS remount after restore failed: {:?}", e);
-            }
+    // re-establishes the connection against the host's re-created export.
+    // Uses the boot-time plan cached in RestoreSignals — see its doc comment
+    // for why MMDS can't be consulted here.
+    if !signals.nfs_mounts.is_empty() {
+        eprintln!(
+            "[fc-agent] remounting {} NFS share(s) after restore",
+            signals.nfs_mounts.len()
+        );
+        for share in &signals.nfs_mounts {
+            let _ = tokio::process::Command::new("umount")
+                .args(["-l", &share.mount_path])
+                .output()
+                .await;
         }
-        Ok(_) => {}
-        Err(e) => eprintln!(
-            "[fc-agent] WARNING: could not fetch plan for NFS remount after restore: {:?}",
-            e
-        ),
+        if let Err(e) = crate::mounts::mount_nfs_shares(&signals.nfs_mounts) {
+            eprintln!(
+                "[fc-agent] WARNING: NFS remount after restore failed: {:?}",
+                e
+            );
+        }
     }
 
     // FIRST: Re-register exec server listener (AsyncFd epoll stale after transport reset).

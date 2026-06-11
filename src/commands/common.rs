@@ -638,6 +638,12 @@ pub async fn cleanup_vm(
         warn!("failed to cleanup network: {}", e);
     }
 
+    // Remove this VM's NFS exports (no-op when the VM had none). Lives here so
+    // every exit path — podman run, converge teardown, restored clones — drops
+    // its /etc/exports.d entry; a leftover entry for a deleted directory makes
+    // every later `exportfs -ra` fail until the self-heal prunes it.
+    super::podman::cleanup_nfs_exports(&vm_id).await;
+
     // Delete state file
     if let Err(e) = state_manager.delete_state(&vm_id).await {
         warn!("failed to delete state file: {}", e);
@@ -1140,7 +1146,6 @@ pub async fn restore_from_snapshot(
     // boot), so the process must not be left running; its parent-death
     // signal only fires when fcvm itself exits.
     let post_start = async {
-
         // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
         let vm_pid = vm_manager.pid()?;
         let post_start_pid = holder_pid_for_post_start.unwrap_or(vm_pid);
@@ -1443,6 +1448,7 @@ pub fn build_snapshot_config(
             health_check_timeout: vm_state.config.health_check_timeout,
             hugepages: vm_state.config.hugepages,
             extra_disks,
+            nfs_shares: vm_state.config.nfs_shares.clone(),
             username: vm_state.config.username.clone(),
             user: vm_state.config.user.clone(),
             port_mappings: vm_state.config.port_mappings.clone(),

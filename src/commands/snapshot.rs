@@ -754,11 +754,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Generate VM ID and name
     let vm_id = generate_vm_id();
-    let runtime_config = snapshot_restore_runtime_config(
-        &args,
-        snapshot_config.metadata.kernel_profile.as_deref(),
-    )
-    .await;
+    let runtime_config =
+        snapshot_restore_runtime_config(&args, snapshot_config.metadata.kernel_profile.as_deref())
+            .await;
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -1078,6 +1076,42 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.ipv6_prefix = snapshot_config.metadata.ipv6_prefix.clone();
     vm_state.config.tty = tty_mode;
     vm_state.config.interactive = interactive;
+
+    // NFS shares recorded with the snapshot: re-export them for this VM. The
+    // baseline's /etc/exports.d entry died with the baseline, and fc-agent
+    // remounts the shares in the guest right after the restore signal — the
+    // export must be active before that. Bridged clones reach the host through
+    // the in-namespace gateway DNAT and arrive masqueraded as their veth IP
+    // (with a possibly non-privileged port → insecure); other modes connect
+    // with the guest IP like a baseline VM.
+    vm_state.config.nfs_shares = snapshot_config.metadata.nfs_shares.clone();
+    if !vm_state.config.nfs_shares.is_empty() {
+        let bridged_veth_ip = network
+            .as_any()
+            .downcast_ref::<BridgedNetwork>()
+            .and_then(|net| net.veth_inner_ip().map(str::to_string));
+        let (client_spec, insecure) = match bridged_veth_ip {
+            Some(ip) => (ip, true),
+            None => (network_config.guest_ip.clone().unwrap_or_default(), false),
+        };
+        if let Err(e) = crate::commands::podman::setup_nfs_exports(
+            &vm_id,
+            &vm_state.config.nfs_shares,
+            &client_spec,
+            insecure,
+        )
+        .await
+        .context("re-creating NFS exports for restored VM")
+        {
+            if let Err(cleanup_err) = network.cleanup().await {
+                warn!(
+                    "failed to cleanup network after NFS export error: {}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
+    }
 
     info!(
         tap = %network_config.tap_device,
@@ -2102,6 +2136,7 @@ mod tests {
             health_check_timeout: 5,
             hugepages: false,
             extra_disks: vec![],
+            nfs_shares: vec![],
             username: Some("ubuntu".to_string()),
             user: Some("1000:1000".to_string()),
             port_mappings: vec![],

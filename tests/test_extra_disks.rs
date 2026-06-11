@@ -329,3 +329,113 @@ async fn test_disk_dir_rw() -> Result<()> {
 async fn test_nfs_rw() -> Result<()> {
     test_dir_mount_rw(MountMethod::Nfs).await
 }
+
+/// Regression test: NFS shares must survive the snapshot→clone path.
+///
+/// Three independent breaks used to make this impossible (#630 follow-on):
+///   1. snapshot metadata didn't record NFS shares, so the restore path never
+///      re-created the host export (the baseline's /etc/exports.d entry dies
+///      with the baseline);
+///   2. a clone's namespace owns the gateway IP on its internal bridge, so the
+///      guest's NFS traffic to gateway:2049 terminated in-namespace instead of
+///      reaching the host's nfsd (fixed by the gateway DNAT + masquerade);
+///   3. fc-agent re-fetched the plan from MMDS after restore, but the
+///      restore-epoch PUT replaces the whole MMDS store — the fetch 404'd and
+///      the remount silently no-oped (fixed by caching the boot-time plan).
+///
+/// The nested kernel profile is required for CONFIG_NFS_FS, which also means
+/// the baseline itself converges through the restore path before we even
+/// snapshot it — so this exercises NFS across two restore generations.
+#[tokio::test]
+async fn test_nfs_clone_restore() -> Result<()> {
+    let (vm_name, clone_name, snap, _serve) = common::unique_names("nfs-clone");
+
+    // Shared directory with initial content.
+    let source_dir = TempDir::new()?;
+    tokio::fs::write(source_dir.path().join("original.txt"), "original content\n").await?;
+    let mount_spec = format!("{}:/mydata", source_dir.path().display());
+
+    // Baseline with an NFS share (nested profile: CONFIG_NFS_FS=y).
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--kernel-profile",
+        "nested",
+        "--nfs",
+        &mount_spec,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning NFS baseline")?;
+    common::poll_health_by_pid(pid, 180).await?;
+
+    // The baseline's NFS works (it already went through one restore via the
+    // NV2 snapshot-cache convergence) — and leave a marker for the clone.
+    let content = common::exec_in_container(pid, &["cat", "/mydata/original.txt"]).await?;
+    assert!(
+        content.contains("original content"),
+        "baseline NFS read failed: {}",
+        content
+    );
+    common::exec_in_container(pid, &["echo 'from baseline' > /mydata/baseline.txt"]).await?;
+
+    // Snapshot the baseline, then retire it (the clone reuses its guest IP).
+    common::create_snapshot_by_pid(pid, &snap)
+        .await
+        .context("creating snapshot of NFS baseline")?;
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    // Restore a clone from the snapshot files.
+    let (mut clone_child, clone_pid) = common::spawn_fcvm(&[
+        "snapshot",
+        "run",
+        "--snapshot",
+        &snap,
+        "--name",
+        &clone_name,
+    ])
+    .await
+    .context("restoring NFS clone")?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
+
+    // The clone sees the share: both pre-snapshot files are readable...
+    let content = common::exec_in_container(clone_pid, &["cat", "/mydata/original.txt"]).await?;
+    assert!(
+        content.contains("original content"),
+        "clone NFS read failed (export/remount missing after restore): {}",
+        content
+    );
+    let content = common::exec_in_container(clone_pid, &["cat", "/mydata/baseline.txt"]).await?;
+    assert!(
+        content.contains("from baseline"),
+        "clone missing baseline's NFS write: {}",
+        content
+    );
+
+    // ...and clone writes round-trip through the host's nfsd to the source dir.
+    common::exec_in_container(clone_pid, &["echo 'from clone' > /mydata/clone.txt"]).await?;
+    let host_side = tokio::fs::read_to_string(source_dir.path().join("clone.txt"))
+        .await
+        .context("clone NFS write did not reach the host directory")?;
+    assert!(
+        host_side.contains("from clone"),
+        "clone NFS write corrupted: {}",
+        host_side
+    );
+
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.kill().await;
+    let _ = std::fs::remove_dir_all(
+        std::env::var("FCVM_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs/root"))
+            .join("snapshots")
+            .join(&snap),
+    );
+    Ok(())
+}
