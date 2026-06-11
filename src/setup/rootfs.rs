@@ -39,10 +39,25 @@ pub struct Plan {
     /// Used when no kernel profile overrides it.
     #[serde(default)]
     pub firecracker: Option<FirecrackerConfig>,
+    /// Pinned pasta build (upstream commit + fcvm-carried patches).
+    /// When set, rootless networking REQUIRES the built binary — see
+    /// src/setup/pasta.rs for the why and the robustness rules.
+    #[serde(default)]
+    pub pasta: Option<PastaConfig>,
     /// Kernel profiles: kernel_profiles.{name}.{arch} = KernelProfile
     /// E.g., kernel_profiles.nested.arm64 = { kernel_version = "6.18", ... }
     #[serde(default)]
     pub kernel_profiles: HashMap<String, HashMap<String, KernelProfile>>,
+}
+
+/// Pinned pasta build configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PastaConfig {
+    /// Git URL of the passt repository (canonical: https://passt.top/passt)
+    pub repo: String,
+    /// Pinned upstream commit (full SHA). A commit — not a branch — so the
+    /// content-addressed binary path is computable offline.
+    pub commit: String,
 }
 
 /// Default Firecracker build configuration.

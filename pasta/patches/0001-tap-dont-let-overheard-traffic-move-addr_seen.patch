@@ -1,0 +1,132 @@
+From 6d0caa9684504b538ed856e269644f888e868d95 Mon Sep 17 00:00:00 2001
+From: EJ Campbell <ej.campbell@gmail.com>
+Date: Thu, 11 Jun 2026 04:06:09 +0000
+Subject: [PATCH] tap: don't let overheard traffic move addr_seen when address
+ is explicit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When pasta's tap interface shares an L2 segment with other endpoints
+(e.g. bridged in a namespace with a VM behind a second tap), frames
+from those endpoints flood to pasta and their source addresses
+overwrite addr_seen — inbound flows are then spliced or forwarded to
+whichever address spoke last instead of the configured guest.
+
+In such a setup the namespace kernel's own broadcasts (ARP probes,
+IGMP joins, sourced from the bridge address) race the guest's traffic
+for addr_seen, and inbound port-forwarded connections intermittently
+get RST after pasta dials the bridge address, where nothing listens:
+
+  Flow 0 (TCP connection (spliced)):
+    HOST [127.0.0.1]:57280 -> [127.0.0.2]:22844
+      => SPLICE [0.0.0.0]:0 -> [10.0.2.1]:80    <- bridge addr, not -a
+  Flow 0 (TCP connection (spliced)): Error event on socket: Connection refused
+
+When -a / --address is given, the user has explicitly said where the
+guest is: track that decision with a new addr_fixed flag (per address
+family) and skip the addr_seen updates in the tap handlers. Behaviour
+without -a is unchanged, and IPv6 link-local tracking (addr_ll_seen)
+is unaffected — a global -a says nothing about which link-local
+address the guest chose.
+
+With this change, a reproducer that previously failed one run in three
+(99 spliced connections per run) passed six consecutive runs.
+
+Signed-off-by: EJ Campbell <ej.campbell@gmail.com>
+---
+ conf.c  | 2 ++
+ passt.h | 6 ++++++
+ tap.c   | 9 ++++++---
+ 3 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/conf.c b/conf.c
+index cd05adf..4755a9f 100644
+--- a/conf.c
++++ b/conf.c
+@@ -1583,10 +1583,12 @@ void conf(struct ctx *c, int argc, char **argv)
+ 			if (inany_v4(&addr)) {
+ 				c->ip4.addr = *inany_v4(&addr);
+ 				c->ip4.prefix_len = prefix_len - 96;
++				c->ip4.addr_fixed = true;
+ 				if (c->mode == MODE_PASTA)
+ 					c->ip4.no_copy_addrs = true;
+ 			} else {
+ 				c->ip6.addr = addr.a6;
++				c->ip6.addr_fixed = true;
+ 				if (c->mode == MODE_PASTA)
+ 					c->ip6.no_copy_addrs = true;
+ 			}
+diff --git a/passt.h b/passt.h
+index c5f51d1..19d8c59 100644
+--- a/passt.h
++++ b/passt.h
+@@ -82,6 +82,8 @@ enum passt_modes {
+  * @ifname_out:		Optional interface name to bind outbound sockets to
+  * @no_copy_routes:	Don't copy all routes when configuring target namespace
+  * @no_copy_addrs:	Don't copy all addresses when configuring namespace
++ * @addr_fixed:		Address was given explicitly (-a): don't update
++ *			addr_seen from traffic observed on tap
+  */
+ struct ip4_ctx {
+ 	/* PIF_TAP addresses */
+@@ -103,6 +105,7 @@ struct ip4_ctx {
+ 
+ 	bool no_copy_routes;
+ 	bool no_copy_addrs;
++	bool addr_fixed;
+ };
+ 
+ /**
+@@ -123,6 +126,8 @@ struct ip4_ctx {
+  * @ifname_out:		Optional interface name to bind outbound sockets to
+  * @no_copy_routes:	Don't copy all routes when configuring target namespace
+  * @no_copy_addrs:	Don't copy all addresses when configuring namespace
++ * @addr_fixed:		Address was given explicitly (-a): don't update
++ *			addr_seen from traffic observed on tap
+  */
+ struct ip6_ctx {
+ 	/* PIF_TAP addresses */
+@@ -144,6 +149,7 @@ struct ip6_ctx {
+ 
+ 	bool no_copy_routes;
+ 	bool no_copy_addrs;
++	bool addr_fixed;
+ };
+ 
+ #include <netinet/if_ether.h>
+diff --git a/tap.c b/tap.c
+index 4cba4c7..2b1699a 100644
+--- a/tap.c
++++ b/tap.c
+@@ -770,7 +770,8 @@ resume:
+ 			continue;
+ 		}
+ 
+-		if (iph->saddr && c->ip4.addr_seen.s_addr != iph->saddr)
++		if (!c->ip4.addr_fixed &&
++		    iph->saddr && c->ip4.addr_seen.s_addr != iph->saddr)
+ 			c->ip4.addr_seen.s_addr = iph->saddr;
+ 
+ 		if (!iov_drop_header(&data, hlen))
+@@ -1003,13 +1004,15 @@ resume:
+ 		if (IN6_IS_ADDR_LINKLOCAL(saddr)) {
+ 			c->ip6.addr_ll_seen = *saddr;
+ 
+-			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_seen)) {
++			if (!c->ip6.addr_fixed &&
++			    IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_seen)) {
+ 				c->ip6.addr_seen = *saddr;
+ 			}
+ 
+ 			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr))
+ 				c->ip6.addr = *saddr;
+-		} else if (!IN6_IS_ADDR_UNSPECIFIED(saddr)){
++		} else if (!c->ip6.addr_fixed &&
++			   !IN6_IS_ADDR_UNSPECIFIED(saddr)) {
+ 			c->ip6.addr_seen = *saddr;
+ 		}
+ 
+-- 
+2.43.0
+

@@ -70,6 +70,15 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
 
+    // Build the pinned pasta if configured in [pasta] section (rootless
+    // networking requires it when configured — see src/setup/pasta.rs)
+    if let Some(path) = crate::setup::ensure_pasta(config.pasta.as_ref())
+        .await
+        .context("setting up pasta")?
+    {
+        println!("  ✓ Pasta ready: {}", path.display());
+    }
+
     // Build default Firecracker if configured in [firecracker] section
     // The [firecracker] config is injected into the "default" profile by synthesize_default_profile()
     if config.firecracker.is_some() {

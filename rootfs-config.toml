@@ -18,6 +18,20 @@ assets_dir = "/mnt/fcvm-btrfs"
 # Ignored if the host filesystem is already btrfs.
 btrfs_size = "60G"
 
+# Pinned pasta (passt) build
+# Rootless networking requires pasta behavior that upstream hasn't released:
+# the addr_seen fix (without it, pasta adopts the last source address it
+# overhears on its tap as "the guest", and the namespace bridge's broadcasts
+# intermittently poison inbound port forwarding — issue #661; patch submitted
+# upstream to passt-dev). `fcvm setup` builds this commit plus the patches
+# embedded in fcvm (pasta/patches/) into a content-addressed binary; rootless
+# VMs refuse to fall back to a distro pasta while this section is present.
+# When upstream ships the fix: bump the commit, drop the patch, then remove
+# this section once distros carry the release.
+[pasta]
+repo = "https://passt.top/passt"
+commit = "e1a6d9ef626aa6dbcfeef97dbbab3bd69c35b4b1"
+
 # Default Firecracker binary
 # Build from fork with diff snapshot fix for multi-slot VMs (>3GB RAM).
 # `fcvm setup` builds this automatically; `find_firecracker()` uses it.
