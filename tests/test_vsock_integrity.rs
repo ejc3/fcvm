@@ -75,12 +75,22 @@ async fn test_vsock_integrity_nested() -> Result<()> {
 
     println!("   L1 started (PID: {})", fcvm_pid);
 
-    // Wait for completion (with timeout)
-    // Output streams to console via Stdio::inherit()
-    let _status = tokio::time::timeout(std::time::Duration::from_secs(300), child.wait())
-        .await
-        .context("timeout waiting for test")?
-        .context("waiting for test")?;
+    // Wait for completion. Budget matches the other nested L1+L2 chains (840s
+    // in-test, under the nested group's 1200s nextest kill): the inner
+    // pipeline expands a 10GB rootfs through FUSE and cold-boots an L2 whose
+    // container pulls through two NAT layers — a healthy run takes minutes.
+    // On timeout the L1 MUST die here: an orphaned L1 keeps running into the
+    // retry and races it for the shared result file (a late "PASS" from the
+    // orphan would be read as the retry's verdict).
+    let wait = tokio::time::timeout(std::time::Duration::from_secs(840), child.wait()).await;
+    let _status = match wait {
+        Ok(status) => status.context("waiting for test")?,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            anyhow::bail!("timeout waiting for vsock integrity test (L1 killed)");
+        }
+    };
 
     // Check results via marker file on shared storage
     // run-test.sh writes PASS/CORRUPTION/INCOMPLETE to this file
