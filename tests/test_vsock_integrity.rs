@@ -9,7 +9,11 @@
 //! 3. L1 starts L2, which connects via vsock port 9999
 //! 4. L2 sends data, receives echo, verifies integrity
 
-#![cfg(feature = "privileged-tests")]
+// The corruption class this hunts (vsock data visibility under NV2's double
+// stage-2 translation) is ARM-specific, and the L2 leg needs a nested-KVM
+// L1 kernel that only the arm64 profile provides — on x86 runners the L2
+// InstanceStart times out before the test can do anything meaningful.
+#![cfg(all(feature = "privileged-tests", target_arch = "aarch64"))]
 
 mod common;
 
