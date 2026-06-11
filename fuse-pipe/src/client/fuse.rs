@@ -1281,9 +1281,7 @@ impl Filesystem for FuseClient {
             // cached inode size). The kernel patch derives the cloned length
             // from the request (host clones are all-or-nothing) and ignores
             // this value; saturate rather than wrap for anything that reads it.
-            VolumeResponse::Written { size } => {
-                reply.written(size.min(u64::from(u32::MAX)) as u32)
-            }
+            VolumeResponse::Written { size } => reply.written(size.min(u64::from(u32::MAX)) as u32),
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
         }
