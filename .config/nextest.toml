@@ -70,7 +70,7 @@ max-threads = "num-cpus"
 
 # The 8000-connection egress bench saturates the host (conntrack, ephemeral
 # ports, CPU for every pasta process); heavy clone tests sharing its window
-# flake on try 1 (rounds 5-6 of #630: extra_disk_ro_clone and a rotating
+# flake on try 1 (the #663 gate rounds: extra_disk_ro_clone and a rotating
 # stress_100 variant, each burning 100-150s before a clean retry). Give the
 # bench the entire runner: ~160s of exclusivity is cheaper in wall time than
 # the try-1 burns plus retries it causes.

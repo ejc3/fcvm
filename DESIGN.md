@@ -1536,10 +1536,10 @@ fcvm/
 │   │
 │   └── setup/              # Setup utilities
 │       ├── mod.rs
-│       ├── preflight.rs    # Pre-flight checks
-│       ├── kernel.rs       # Kernel setup
-│       ├── kernel_build.rs # Kernel build
-│       └── rootfs.rs       # Rootfs setup
+│       ├── kernel.rs       # Kernel + firecracker setup/build
+│       ├── pasta.rs        # Pinned pasta build (upstream commit + patches)
+│       ├── rootfs.rs       # Rootfs setup
+│       └── storage.rs      # btrfs storage setup
 │
 ├── fc-agent/               # Guest agent crate
 │   ├── Cargo.toml
