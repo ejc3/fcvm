@@ -1090,9 +1090,21 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             .as_any()
             .downcast_ref::<BridgedNetwork>()
             .and_then(|net| net.veth_inner_ip().map(str::to_string));
-        let (client_spec, insecure) = match bridged_veth_ip {
-            Some(ip) => (ip, true),
-            None => (network_config.guest_ip.clone().unwrap_or_default(), false),
+        let (client_spec, insecure) = match (bridged_veth_ip, network_config.guest_ip.clone()) {
+            (Some(ip), _) => (ip, true),
+            (None, Some(ip)) => (ip, false),
+            (None, None) => {
+                // A malformed exports entry would fail exportfs cryptically and
+                // hang the guest's hard mount — fail fast and clean like the
+                // other pre-restore error paths.
+                if let Err(cleanup_err) = network.cleanup().await {
+                    warn!(
+                        "failed to cleanup network after NFS client error: {}",
+                        cleanup_err
+                    );
+                }
+                anyhow::bail!("no client IP available for NFS exports of restored VM");
+            }
         };
         if let Err(e) = crate::commands::podman::setup_nfs_exports(
             &vm_id,
@@ -1185,6 +1197,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             cleanup_err
                         );
                     }
+                    crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
                     return Err(e);
                 }
             };
@@ -1207,6 +1220,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             cleanup_err
                         );
                     }
+                    crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
                     bail!("implicit UFFD server did not bind socket within 5s");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1323,6 +1337,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 cleanup_err
             );
         }
+
+        // Remove the NFS exports created for this VM (no-op without NFS)
+        crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
 
         // Cleanup data directory
         if data_dir.exists() {
@@ -1902,6 +1919,19 @@ fn run_args_from_snapshot_metadata(
             }
         })
         .collect();
+    // NFS shares re-enter through the normal fresh-boot flow (export + plan +
+    // guest mount) — a cold-boot clone of an NFS VM keeps its shares.
+    let nfs: Vec<String> = meta
+        .nfs_shares
+        .iter()
+        .map(|s| {
+            if s.read_only {
+                format!("{}:{}:ro", s.host_path, s.mount_path)
+            } else {
+                format!("{}:{}", s.host_path, s.mount_path)
+            }
+        })
+        .collect();
 
     RunArgs {
         name,
@@ -1911,7 +1941,7 @@ fn run_args_from_snapshot_metadata(
         map,
         disk: vec![],
         disk_dir: vec![],
-        nfs: vec![],
+        nfs,
         // fc-agent derives the rootless username from env USER; without it a --user
         // clone would set up "fcvm-user" and diverge from the captured passwd entry.
         env: match (&meta.user, &meta.username) {
@@ -2166,6 +2196,30 @@ mod tests {
         meta2.username = None;
         let args2 = run_args_from_snapshot_metadata(&meta2, "c".to_string(), 1, 512, false, None);
         assert!(args2.env.is_empty());
+
+        // Recorded NFS shares must survive into the cold-boot RunArgs (a
+        // disk-only clone of an NFS VM used to silently lose its shares).
+        let mut meta3 = meta.clone();
+        meta3.nfs_shares = vec![
+            crate::state::types::NfsShare {
+                host_path: "/srv/data".to_string(),
+                mount_path: "/mydata".to_string(),
+                read_only: true,
+            },
+            crate::state::types::NfsShare {
+                host_path: "/srv/rw".to_string(),
+                mount_path: "/rw".to_string(),
+                read_only: false,
+            },
+        ];
+        let args3 = run_args_from_snapshot_metadata(&meta3, "c".to_string(), 1, 512, false, None);
+        assert_eq!(
+            args3.nfs,
+            vec![
+                "/srv/data:/mydata:ro".to_string(),
+                "/srv/rw:/rw".to_string()
+            ]
+        );
     }
 
     #[test]
