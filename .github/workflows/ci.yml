@@ -236,7 +236,11 @@ jobs:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
         run: |
-          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm/target 2>/dev/null || true
+          # The whole checkout, not just target/: a run cancelled mid-test
+          # (e.g. superseded by a new push) leaves root-owned files — seen
+          # with artifacts/fc-agent et al. — and the next checkout fails
+          # with EACCES trying to remove them.
+          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm 2>/dev/null || true
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
@@ -438,7 +442,11 @@ jobs:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
         run: |
-          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm/target 2>/dev/null || true
+          # The whole checkout, not just target/: a run cancelled mid-test
+          # (e.g. superseded by a new push) leaves root-owned files — seen
+          # with artifacts/fc-agent et al. — and the next checkout fails
+          # with EACCES trying to remove them.
+          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm 2>/dev/null || true
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
@@ -620,7 +628,11 @@ jobs:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
         run: |
-          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm/target 2>/dev/null || true
+          # The whole checkout, not just target/: a run cancelled mid-test
+          # (e.g. superseded by a new push) leaves root-owned files — seen
+          # with artifacts/fc-agent et al. — and the next checkout fails
+          # with EACCES trying to remove them.
+          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm 2>/dev/null || true
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
