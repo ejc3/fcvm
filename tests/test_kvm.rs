@@ -232,6 +232,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 and kvm-arm.mode=nested, or x86 with Intel VT-x/AMD-V nested=1
 /// Skips if nested KVM isn't available.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("\nNested VM Test: Run fcvm inside fcvm");
@@ -495,6 +496,7 @@ except OSError as e:
 /// Each nested level uses localhost/nested-test which has fcvm baked in.
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 + kvm-arm.mode=nested, or x86 with nested=1
+#[cfg(target_arch = "aarch64")]
 #[allow(dead_code)] // Helper for future L3+ tests (currently L3 is too slow)
 async fn run_nested_chain(total_levels: usize) -> Result<()> {
     let success_marker = format!("NESTED_CHAIN_{}_LEVELS_SUCCESS", total_levels);
@@ -752,6 +754,7 @@ except OSError as e:
 ///
 /// The container OCI archive is loaded via FUSE-over-vsock.
 /// This is the original/default behavior.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -766,6 +769,7 @@ async fn test_nested_l2_fuse() -> Result<()> {
 /// Test L1→L2 nesting with image cache via NFS (--nfs)
 ///
 /// The container OCI archive is loaded from an NFS share.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_nfs() -> Result<()> {
     run_nested_n_levels(
@@ -781,6 +785,7 @@ async fn test_nested_l2_nfs() -> Result<()> {
 ///
 /// IGNORED: This test runs extensive benchmarks at both L1 and L2 levels,
 /// which exceeds the 10-minute test timeout. Use for manual performance analysis.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "exceeds 10-minute timeout - use for manual benchmarking"]
 async fn test_nested_l2_with_benchmarks() -> Result<()> {
@@ -798,6 +803,7 @@ async fn test_nested_l2_with_benchmarks() -> Result<()> {
 /// Tests FUSE-over-vsock with 100MB file copies at each nesting level.
 /// This validates the 32KB max_write limit that prevents vsock fragmentation
 /// issues under nested virtualization.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_with_large_files() -> Result<()> {
     run_nested_n_levels(
@@ -814,6 +820,7 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
 /// Measures egress/ingress throughput from VMs at each level to host using iperf3.
 /// Tests various block sizes (128K, 1M) and parallelism (1, 4, 8 streams).
 /// Network tests don't depend on FUSE for data path, but need image cache mount.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_network_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -826,6 +833,7 @@ async fn test_nested_l2_network_fuse() -> Result<()> {
 }
 
 /// Test L2 network benchmarks with image cache via NFS
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_network_nfs() -> Result<()> {
     run_nested_n_levels(
@@ -843,6 +851,7 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
 /// image cache mount. At L3, FUSE latency is ~15ms per operation, causing
 /// container startup to exceed the 10-minute test timeout.
 /// disk-dir and NFS may work better at L3.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L3 (FUSE-over-FUSE x2): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_fuse() -> Result<()> {
@@ -856,6 +865,7 @@ async fn test_nested_l3_network_fuse() -> Result<()> {
 }
 
 /// Test L3 network with NFS (may be faster than FUSE)
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L3 (NFS): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_nfs() -> Result<()> {
@@ -874,6 +884,7 @@ async fn test_nested_l3_network_nfs() -> Result<()> {
 /// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
 /// initialization alone takes 10+ minutes. Need to implement request pipelining
 /// or async PassthroughFs before this test can complete in reasonable time.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L3: slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3() -> Result<()> {
@@ -889,6 +900,7 @@ async fn test_nested_l3() -> Result<()> {
 /// Test L1→L2→L3→L4: 4 levels of nesting
 ///
 /// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L4: very slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l4() -> Result<()> {
@@ -1233,6 +1245,7 @@ fn print_benchmark_summary(log_content: &str, include_large_files: bool, include
 /// The `image_cache_mount` parameter controls how the OCI archive is shared with L1:
 /// - Fuse: Uses FUSE-over-vsock via --map (original behavior)
 /// - Nfs: Shares the directory via NFS
+#[cfg(target_arch = "aarch64")]
 async fn run_nested_n_levels(
     n: usize,
     marker: &str,

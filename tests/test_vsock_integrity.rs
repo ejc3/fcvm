@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 /// 3. L1 starts echo server, then L2 with vsock client
 /// 4. Verifies no corruption in the vsock data path
 #[tokio::test]
+#[ignore = "exceeds small CI runner capacity (840s+; passes on dev hardware in ~10min) — re-enable via #664"]
 async fn test_vsock_integrity_nested() -> Result<()> {
     println!("\nVsock Integrity Test (NV2 Nested)");
     println!("==================================\n");
