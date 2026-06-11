@@ -15,18 +15,23 @@
 
 FROM docker.io/library/rust:1.83-slim AS builder
 
-# Install musl target for static linking (L2 runs alpine)
-RUN rustup target add aarch64-unknown-linux-musl && \
+# Install the native musl target for static linking (L2 runs alpine).
+# Derived from the build arch — a hardcoded aarch64 target broke the
+# x86_64 CI runners the moment the test was re-enabled.
+RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" && \
+    rustup target add "$MUSL_TARGET" && \
     apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY tests/vsock-integrity/ .
-RUN cargo build --release --target aarch64-unknown-linux-musl
+RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" && \
+    cargo build --release --target "$MUSL_TARGET" && \
+    cp "target/$MUSL_TARGET/release/vsock-integrity" /build/vsock-integrity
 
 FROM localhost/nested-test
 
 # Add vsock-integrity binary (musl-linked for alpine)
-COPY --from=builder /build/target/aarch64-unknown-linux-musl/release/vsock-integrity /usr/local/bin/
+COPY --from=builder /build/vsock-integrity /usr/local/bin/
 
 # Add test script
 COPY tests/vsock-integrity/run-test.sh /usr/local/bin/
