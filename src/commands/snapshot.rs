@@ -39,7 +39,10 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
     }
 }
 
-async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
+async fn snapshot_restore_runtime_config(
+    args: &SnapshotRunArgs,
+    kernel_profile: Option<&str>,
+) -> RuntimeConfig {
     let mut config = RuntimeConfig {
         firecracker_bin: args.firecracker_bin.as_ref().map(PathBuf::from),
         firecracker_args: args.firecracker_args.clone(),
@@ -47,20 +50,35 @@ async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfi
         fuse_readers: None,
     };
 
-    // If no explicit firecracker_bin, check the default profile for custom Firecracker
-    // (matches podman run behavior — ensures snapshot restore uses same binary as create)
+    // If no explicit firecracker_bin, resolve the Firecracker (and its args) from
+    // the SNAPSHOT's kernel profile — the clone must run on the same binary the
+    // snapshot was created with. Resolving "default" for a nested-profile
+    // snapshot would restore a vEL2 (NV2) guest on a Firecracker without NV2
+    // support. Profiles that define no firecracker of their own (e.g. btrfs)
+    // were CREATED on the default profile's custom Firecracker (prepare_vm
+    // falls back to it), so the restore must fall back the same way — a plain
+    // PATH `firecracker` would be a different binary than created the snapshot.
     if config.firecracker_bin.is_none() {
-        if let Ok(Some(profile)) = crate::setup::get_kernel_profile("default") {
-            if profile.firecracker_repo.is_some() {
-                match crate::setup::get_firecracker_for_profile(&profile, "default").await {
-                    Ok(fc_path) => {
-                        config.firecracker_bin = Some(fc_path);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "custom Firecracker not found for snapshot restore, falling back to system binary");
-                    }
+        let profile_name = kernel_profile.unwrap_or("default");
+        for candidate in [profile_name, "default"] {
+            let Ok(Some(profile)) = crate::setup::get_kernel_profile(candidate) else {
+                continue;
+            };
+            if config.firecracker_args.is_none() {
+                config.firecracker_args = profile.firecracker_args.clone();
+            }
+            if profile.firecracker_repo.is_none() {
+                continue;
+            }
+            match crate::setup::get_firecracker_for_profile(&profile, candidate).await {
+                Ok(fc_path) => {
+                    config.firecracker_bin = Some(fc_path);
+                }
+                Err(e) => {
+                    warn!(error = %e, profile = candidate, "custom Firecracker not found for snapshot restore, falling back to system binary");
                 }
             }
+            break;
         }
     }
 
@@ -736,7 +754,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Generate VM ID and name
     let vm_id = generate_vm_id();
-    let runtime_config = snapshot_restore_runtime_config(&args).await;
+    let runtime_config =
+        snapshot_restore_runtime_config(&args, snapshot_config.metadata.kernel_profile.as_deref())
+            .await;
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -1057,6 +1077,54 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.tty = tty_mode;
     vm_state.config.interactive = interactive;
 
+    // NFS shares recorded with the snapshot: re-export them for this VM. The
+    // baseline's /etc/exports.d entry died with the baseline, and fc-agent
+    // remounts the shares in the guest right after the restore signal — the
+    // export must be active before that. Bridged clones reach the host through
+    // the in-namespace gateway DNAT and arrive masqueraded as their veth IP
+    // (with a possibly non-privileged port → insecure); other modes connect
+    // with the guest IP like a baseline VM.
+    vm_state.config.nfs_shares = snapshot_config.metadata.nfs_shares.clone();
+    if !vm_state.config.nfs_shares.is_empty() {
+        let bridged_veth_ip = network
+            .as_any()
+            .downcast_ref::<BridgedNetwork>()
+            .and_then(|net| net.veth_inner_ip().map(str::to_string));
+        let (client_spec, insecure) = match (bridged_veth_ip, network_config.guest_ip.clone()) {
+            (Some(ip), _) => (ip, true),
+            (None, Some(ip)) => (ip, false),
+            (None, None) => {
+                // A malformed exports entry would fail exportfs cryptically and
+                // hang the guest's hard mount — fail fast and clean like the
+                // other pre-restore error paths.
+                if let Err(cleanup_err) = network.cleanup().await {
+                    warn!(
+                        "failed to cleanup network after NFS client error: {}",
+                        cleanup_err
+                    );
+                }
+                anyhow::bail!("no client IP available for NFS exports of restored VM");
+            }
+        };
+        if let Err(e) = crate::commands::podman::setup_nfs_exports(
+            &vm_id,
+            &vm_state.config.nfs_shares,
+            &client_spec,
+            insecure,
+        )
+        .await
+        .context("re-creating NFS exports for restored VM")
+        {
+            if let Err(cleanup_err) = network.cleanup().await {
+                warn!(
+                    "failed to cleanup network after NFS export error: {}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
+    }
+
     info!(
         tap = %network_config.tap_device,
         mac = %network_config.guest_mac,
@@ -1129,6 +1197,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             cleanup_err
                         );
                     }
+                    crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
                     return Err(e);
                 }
             };
@@ -1151,6 +1220,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             cleanup_err
                         );
                     }
+                    crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
                     bail!("implicit UFFD server did not bind socket within 5s");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1267,6 +1337,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 cleanup_err
             );
         }
+
+        // Remove the NFS exports created for this VM (no-op without NFS)
+        crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
 
         // Cleanup data directory
         if data_dir.exists() {
@@ -1846,6 +1919,19 @@ fn run_args_from_snapshot_metadata(
             }
         })
         .collect();
+    // NFS shares re-enter through the normal fresh-boot flow (export + plan +
+    // guest mount) — a cold-boot clone of an NFS VM keeps its shares.
+    let nfs: Vec<String> = meta
+        .nfs_shares
+        .iter()
+        .map(|s| {
+            if s.read_only {
+                format!("{}:{}:ro", s.host_path, s.mount_path)
+            } else {
+                format!("{}:{}", s.host_path, s.mount_path)
+            }
+        })
+        .collect();
 
     RunArgs {
         name,
@@ -1855,7 +1941,7 @@ fn run_args_from_snapshot_metadata(
         map,
         disk: vec![],
         disk_dir: vec![],
-        nfs: vec![],
+        nfs,
         // fc-agent derives the rootless username from env USER; without it a --user
         // clone would set up "fcvm-user" and diverge from the captured passwd entry.
         env: match (&meta.user, &meta.username) {
@@ -2080,6 +2166,7 @@ mod tests {
             health_check_timeout: 5,
             hugepages: false,
             extra_disks: vec![],
+            nfs_shares: vec![],
             username: Some("ubuntu".to_string()),
             user: Some("1000:1000".to_string()),
             port_mappings: vec![],
@@ -2109,6 +2196,30 @@ mod tests {
         meta2.username = None;
         let args2 = run_args_from_snapshot_metadata(&meta2, "c".to_string(), 1, 512, false, None);
         assert!(args2.env.is_empty());
+
+        // Recorded NFS shares must survive into the cold-boot RunArgs (a
+        // disk-only clone of an NFS VM used to silently lose its shares).
+        let mut meta3 = meta.clone();
+        meta3.nfs_shares = vec![
+            crate::state::types::NfsShare {
+                host_path: "/srv/data".to_string(),
+                mount_path: "/mydata".to_string(),
+                read_only: true,
+            },
+            crate::state::types::NfsShare {
+                host_path: "/srv/rw".to_string(),
+                mount_path: "/rw".to_string(),
+                read_only: false,
+            },
+        ];
+        let args3 = run_args_from_snapshot_metadata(&meta3, "c".to_string(), 1, 512, false, None);
+        assert_eq!(
+            args3.nfs,
+            vec![
+                "/srv/data:/mydata:ro".to_string(),
+                "/srv/rw:/rw".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2183,7 +2294,7 @@ mod tests {
             no_swap: false,
         };
 
-        let runtime = snapshot_restore_runtime_config(&args).await;
+        let runtime = snapshot_restore_runtime_config(&args, Some("nested")).await;
         assert_eq!(
             runtime.firecracker_bin,
             Some(PathBuf::from("/opt/firecracker-profile"))

@@ -50,6 +50,7 @@ echo ""
 # Use ECR image to avoid Docker Hub rate limits
 # FCVM_FUSE_MAX_WRITE=32768 prevents vsock data loss in L2 FUSE-over-FUSE
 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
+    --no-snapshot \
     --name l2-vsock-test \
     --network bridged \
     --vsock-dir "$VSOCK_DIR" \

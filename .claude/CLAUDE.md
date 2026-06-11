@@ -384,28 +384,40 @@ because the double S2 translation creates a cross-domain cache coherency issue.
 **Test results**: With the DSB SY patch, 100MB file copies through FUSE-over-FUSE complete
 successfully with unbounded max_write (~1MB packets). Test: `make test-root FILTER=nested_l2_with_large`
 
-### L2 Single vCPU Requirement (2026-01)
+### NV2 Snapshot Lifecycle: Timer Coherence + One Restore Path (#630, 2026-06)
 
-**Problem**: L2 VMs with 2+ vCPUs hit `NETDEV WATCHDOG: CPU: 1: transmit queue 0 timed out`
-around 23-29 seconds after boot. The virtio-net TX queue stops being serviced.
+The "nested tests are too slow/flaky" disables (Jan 2026) traced to TWO snapshot-lifecycle
+bugs, both fixed. Neither was an inherent NV2 limitation:
 
-**Symptoms**:
-- fc-agent reaches "configuring DNS from kernel cmdline" then hangs
-- NETDEV WATCHDOG fires with 5600ms timeout
-- L2 network becomes unresponsive
+**1. Timer-domain skew on restore (firecracker fork fix).** Restore replayed CNTVCT/CNTPCT
+(KVM adjusts per-timer offsets, which for HAS_EL2 guests live in CNTVOFF_EL2 storage), then
+replayed CNTVOFF_EL2 — clobbering the adjustment. The guest's monotonic clock jumped forward
+by the host time elapsed since the snapshot, every armed timer CVAL landed in the past, and
+KVM's emulated EL1 timers (NV2 traps these) re-fired in a storm (~14k kvm_timer_emulate/s
+measured) that starved the vCPUs 25-300x. Fix: firecracker owns the VM-wide counter offset
+via `KVM_ARM_SET_COUNTER_OFFSET` — set at boot (zero-based counters), set coherently before
+the register replay on restore, and advanced by the pause duration on resume so the guest
+clock FREEZES while a VM is paused (fcvm's pre-start snapshot pauses VMs for many seconds).
 
-**Root cause**: Multi-vCPU nested VMs under NV2 have interrupt delivery issues between vCPUs.
-The virtio-net driver on one vCPU puts packets on the TX queue, but the notification/interrupt
-path to L1's Firecracker isn't processed correctly with multiple vCPUs.
+**2. Event-loop starvation after pause→save→resume (fcvm design fix).** Resuming the VM that
+just produced a snapshot intermittently left Firecracker's single device event-loop thread
+spinning (94 CPU-seconds measured), starving every virtio queue: `NETDEV WATCHDOG: transmit
+queue 0 timed out` in the guest, stalled FUSE-over-vsock, apparent 100x guest slowdowns that
+self-heal minutes later. Restored VMs never storm (fresh process, fresh event loop):
+create+resume stormed 3/3 under load; restore was clean 12/12. Fix: the snapshot-miss path
+CONVERGES on the restore path — create the pre-start snapshot, tear the throwaway VM down,
+and relaunch by restoring it. Snapshot hit and miss now run the exact same flow.
 
-**Solution**: Use single vCPU for L2+ VMs (`--cpu 1`). The test framework automatically
-applies this for nested VM launches.
+**Debugging these**: guest `dd if=/dev/zero of=/dev/null` per-CPU (healthy ≈ 19 GB/s on
+Graviton3; storms read 0.07-0.3 GB/s), host `ftrace` on `kvm:kvm_timer_emulate`, per-thread
+CPU of the firecracker process (`/proc/<fc>/task/*/stat` field 14+15), and the fork's
+env-gated `FC_DEBUG_REG_DUMP` / `FC_DEBUG_REG_DIFF` register instrumentation.
 
-**Why it works**: With a single vCPU, there's no cross-vCPU interrupt path to go wrong.
-All virtio notifications go through the same vCPU, avoiding the NV2 multi-vCPU issues.
-
-**Impact**: L2 VMs are limited to 1 vCPU. This is a performance tradeoff but enables
-reliable L2 operation until ARM/kernel developers fix the underlying NV2 issues.
+**Historical note — "L2 single vCPU requirement"**: multi-vCPU L2 VMs hitting NETDEV
+WATCHDOG (TX queue not serviced) was previously attributed to NV2 cross-vCPU interrupt
+issues. That symptom matches bug 2 (host event loop starvation, which always reports the
+watchdog on the queue's CPU). Nested launches still use `--cpu 1` as a conservative
+default; re-evaluating multi-vCPU L2 is tracked in #632.
 
 ## FUSE Performance Tracing
 

@@ -638,6 +638,12 @@ pub async fn cleanup_vm(
         warn!("failed to cleanup network: {}", e);
     }
 
+    // Remove this VM's NFS exports (no-op when the VM had none). Lives here so
+    // every exit path — podman run, converge teardown, restored clones — drops
+    // its /etc/exports.d entry; a leftover entry for a deleted directory makes
+    // every later `exportfs -ra` fail until the self-heal prunes it.
+    super::podman::cleanup_nfs_exports(&vm_id).await;
+
     // Delete state file
     if let Err(e) = state_manager.delete_state(&vm_id).await {
         warn!("failed to delete state file: {}", e);
@@ -1132,186 +1138,205 @@ pub async fn restore_from_snapshot(
         .await
         .context("starting Firecracker")?;
 
-    // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
-    let vm_pid = vm_manager.pid()?;
-    let post_start_pid = holder_pid_for_post_start.unwrap_or(vm_pid);
-    network
-        .post_start(post_start_pid)
-        .await
-        .context("post-start network setup")?;
+    // Everything after start() runs inside a fallible block so a failure
+    // (network post-start, snapshot load — e.g. an incompatible snapshot —
+    // drive patch, resume, crash check, state save) KILLS the Firecracker
+    // process before the error propagates. Callers may continue past a
+    // restore failure (snapshot-cache invalidation falls back to a fresh
+    // boot), so the process must not be left running; its parent-death
+    // signal only fires when fcvm itself exits.
+    let post_start = async {
+        // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
+        let vm_pid = vm_manager.pid()?;
+        let post_start_pid = holder_pid_for_post_start.unwrap_or(vm_pid);
+        network
+            .post_start(post_start_pid)
+            .await
+            .context("post-start network setup")?;
 
-    let client = vm_manager.client()?;
+        let client = vm_manager.client()?;
 
-    // Load snapshot with configured memory backend and network override
-    use crate::firecracker::api::{
-        DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
-    };
+        // Load snapshot with configured memory backend and network override
+        use crate::firecracker::api::{
+            DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
+        };
 
-    let mem_backend = match &restore_config.memory_backend {
-        MemoryBackend::File { memory_path } => {
-            info!(
-                memory = %memory_path.display(),
-                "loading snapshot with File backend"
-            );
-            MemBackend {
-                backend_type: "File".to_string(),
-                backend_path: memory_path.display().to_string(),
+        let mem_backend = match &restore_config.memory_backend {
+            MemoryBackend::File { memory_path } => {
+                info!(
+                    memory = %memory_path.display(),
+                    "loading snapshot with File backend"
+                );
+                MemBackend {
+                    backend_type: "File".to_string(),
+                    backend_path: memory_path.display().to_string(),
+                }
             }
-        }
-        MemoryBackend::Uffd { socket_path } => {
-            info!(
-                uffd_socket = %socket_path.display(),
-                "loading snapshot with UFFD backend"
-            );
-            MemBackend {
-                backend_type: "Uffd".to_string(),
-                backend_path: socket_path.display().to_string(),
+            MemoryBackend::Uffd { socket_path } => {
+                info!(
+                    uffd_socket = %socket_path.display(),
+                    "loading snapshot with UFFD backend"
+                );
+                MemBackend {
+                    backend_type: "Uffd".to_string(),
+                    backend_path: socket_path.display().to_string(),
+                }
             }
-        }
-    };
+        };
 
-    // Timing instrumentation: measure snapshot load operation
-    let load_start = std::time::Instant::now();
-    client
-        .load_snapshot(SnapshotLoad {
-            snapshot_path: restore_config.vmstate_path.display().to_string(),
-            mem_backend,
-            track_dirty_pages: Some(track_dirty_pages),
-            resume_vm: Some(false), // Update devices before resume
-            network_overrides: Some(vec![NetworkOverride {
-                iface_id: "eth0".to_string(),
-                host_dev_name: network_config.tap_device.clone(),
-            }]),
-        })
-        .await
-        .context("loading snapshot")?;
-    let load_duration = load_start.elapsed();
-    info!(
-        duration_ms = load_duration.as_millis(),
-        track_dirty_pages, "snapshot load completed"
-    );
-
-    // Timing instrumentation: measure disk patch operation
-    let patch_start = std::time::Instant::now();
-    client
-        .patch_drive(
-            "rootfs",
-            DrivePatch {
-                drive_id: "rootfs".to_string(),
-                path_on_host: Some(rootfs_path.display().to_string()),
-                rate_limiter: None,
-            },
-        )
-        .await
-        .context("retargeting rootfs drive")?;
-    let patch_duration = patch_start.elapsed();
-    info!(
-        duration_ms = patch_duration.as_millis(),
-        "disk patch completed"
-    );
-
-    // FCVM_KVM_TRACE: enable KVM ftrace around VM resume for debugging snapshot restore.
-    let kvm_trace = if std::env::var("FCVM_KVM_TRACE").is_ok() {
-        match crate::kvm_trace::KvmTrace::start(&vm_state.vm_id) {
-            Ok(t) => {
-                info!("KVM trace started for VM resume");
-                Some(t)
-            }
-            Err(e) => {
-                warn!("FCVM_KVM_TRACE: could not start KVM trace: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Timing instrumentation: measure VM resume operation
-    let resume_start = std::time::Instant::now();
-    client
-        .patch_vm_state(ApiVmState {
-            state: "Resumed".to_string(),
-        })
-        .await
-        .context("resuming VM after snapshot load")?;
-    let resume_duration = resume_start.elapsed();
-    info!(
-        duration_ms = resume_duration.as_millis(),
-        total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
-        "VM resume completed"
-    );
-
-    // Signal fc-agent to flush ARP cache and reconnect output vsock via MMDS.
-    // MUST be after VM resume — Firecracker accepts PUT /mmds while paused but
-    // the guest-visible MMDS data isn't updated until after resume.
-    let restore_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system time before Unix epoch")?
-        .as_secs();
-
-    let mut mmds_latest = serde_json::json!({
-        "host-time": chrono::Utc::now().timestamp().to_string(),
-        "restore-epoch": restore_epoch.to_string()
-    });
-    if let Some(ref ipv6) = clone_ipv6 {
-        mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
-    }
-    client
-        .put_mmds(serde_json::json!({ "latest": mmds_latest }))
-        .await
-        .context("updating MMDS with restore-epoch")?;
-    info!(
-        restore_epoch = restore_epoch,
-        clone_ipv6 = ?clone_ipv6,
-        "signaled fc-agent via MMDS"
-    );
-
-    // Stop KVM trace and dump results (captures resume + early VM execution)
-    if let Some(trace) = kvm_trace {
-        // Brief delay to capture initial KVM exits after resume
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        match trace.stop_and_dump() {
-            Ok(path) => info!("KVM trace saved to {}", path),
-            Err(e) => warn!("FCVM_KVM_TRACE: failed to save: {}", e),
-        }
-    }
-
-    // Store fcvm process PID (not Firecracker PID)
-    vm_state.pid = Some(std::process::id());
-
-    // Track original vsock vm_id for future snapshots
-    // When this VM is later snapshotted, clones need to use this original_vm_id
-    // for vsock redirect because vmstate.bin stores paths from this vm
-    vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
-
-    // Update extra_disks in clone state with clone-local paths
-    if !restore_config.extra_disks.is_empty() {
-        vm_state.config.extra_disks = restore_config
-            .extra_disks
-            .iter()
-            .map(|d| crate::state::types::ExtraDisk {
-                path: vm_dir.join(&d.filename).display().to_string(),
-                mount_path: d.mount_path.clone(),
-                read_only: d.read_only,
+        // Timing instrumentation: measure snapshot load operation
+        let load_start = std::time::Instant::now();
+        client
+            .load_snapshot(SnapshotLoad {
+                snapshot_path: restore_config.vmstate_path.display().to_string(),
+                mem_backend,
+                track_dirty_pages: Some(track_dirty_pages),
+                resume_vm: Some(false), // Update devices before resume
+                network_overrides: Some(vec![NetworkOverride {
+                    iface_id: "eth0".to_string(),
+                    host_dev_name: network_config.tap_device.clone(),
+                }]),
             })
-            .collect();
-    }
-
-    // Post-resume liveness check: verify VM didn't crash immediately.
-    // Under heavy I/O load, snapshot restore can corrupt guest memory (e.g., stack
-    // canary in do_idle), causing an immediate kernel panic + reboot. Detecting this
-    // early surfaces the error instead of silently serving a crashed VM.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if let Some(status) = vm_manager.try_wait()? {
-        bail!(
-            "VM crashed immediately after snapshot restore (exit status: {:?}). \
-             This can happen under heavy I/O load due to memory corruption during restore.",
-            status
+            .await
+            .context("loading snapshot")?;
+        let load_duration = load_start.elapsed();
+        info!(
+            duration_ms = load_duration.as_millis(),
+            track_dirty_pages, "snapshot load completed"
         );
-    }
 
-    // Save VM state with complete network configuration
-    save_vm_state_with_network(state_manager, vm_state, network_config).await?;
+        // Timing instrumentation: measure disk patch operation
+        let patch_start = std::time::Instant::now();
+        client
+            .patch_drive(
+                "rootfs",
+                DrivePatch {
+                    drive_id: "rootfs".to_string(),
+                    path_on_host: Some(rootfs_path.display().to_string()),
+                    rate_limiter: None,
+                },
+            )
+            .await
+            .context("retargeting rootfs drive")?;
+        let patch_duration = patch_start.elapsed();
+        info!(
+            duration_ms = patch_duration.as_millis(),
+            "disk patch completed"
+        );
+
+        // FCVM_KVM_TRACE: enable KVM ftrace around VM resume for debugging snapshot restore.
+        let kvm_trace = if std::env::var("FCVM_KVM_TRACE").is_ok() {
+            match crate::kvm_trace::KvmTrace::start(&vm_state.vm_id) {
+                Ok(t) => {
+                    info!("KVM trace started for VM resume");
+                    Some(t)
+                }
+                Err(e) => {
+                    warn!("FCVM_KVM_TRACE: could not start KVM trace: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Timing instrumentation: measure VM resume operation
+        let resume_start = std::time::Instant::now();
+        client
+            .patch_vm_state(ApiVmState {
+                state: "Resumed".to_string(),
+            })
+            .await
+            .context("resuming VM after snapshot load")?;
+        let resume_duration = resume_start.elapsed();
+        info!(
+            duration_ms = resume_duration.as_millis(),
+            total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
+            "VM resume completed"
+        );
+
+        // Signal fc-agent to flush ARP cache and reconnect output vsock via MMDS.
+        // MUST be after VM resume — Firecracker accepts PUT /mmds while paused but
+        // the guest-visible MMDS data isn't updated until after resume.
+        let restore_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system time before Unix epoch")?
+            .as_secs();
+
+        let mut mmds_latest = serde_json::json!({
+            "host-time": chrono::Utc::now().timestamp().to_string(),
+            "restore-epoch": restore_epoch.to_string()
+        });
+        if let Some(ref ipv6) = clone_ipv6 {
+            mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
+        }
+        client
+            .put_mmds(serde_json::json!({ "latest": mmds_latest }))
+            .await
+            .context("updating MMDS with restore-epoch")?;
+        info!(
+            restore_epoch = restore_epoch,
+            clone_ipv6 = ?clone_ipv6,
+            "signaled fc-agent via MMDS"
+        );
+
+        // Stop KVM trace and dump results (captures resume + early VM execution)
+        if let Some(trace) = kvm_trace {
+            // Brief delay to capture initial KVM exits after resume
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            match trace.stop_and_dump() {
+                Ok(path) => info!("KVM trace saved to {}", path),
+                Err(e) => warn!("FCVM_KVM_TRACE: failed to save: {}", e),
+            }
+        }
+
+        // Store fcvm process PID (not Firecracker PID)
+        vm_state.pid = Some(std::process::id());
+
+        // Track original vsock vm_id for future snapshots
+        // When this VM is later snapshotted, clones need to use this original_vm_id
+        // for vsock redirect because vmstate.bin stores paths from this vm
+        vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
+
+        // Update extra_disks in clone state with clone-local paths
+        if !restore_config.extra_disks.is_empty() {
+            vm_state.config.extra_disks = restore_config
+                .extra_disks
+                .iter()
+                .map(|d| crate::state::types::ExtraDisk {
+                    path: vm_dir.join(&d.filename).display().to_string(),
+                    mount_path: d.mount_path.clone(),
+                    read_only: d.read_only,
+                })
+                .collect();
+        }
+
+        // Post-resume liveness check: verify VM didn't crash immediately.
+        // Under heavy I/O load, snapshot restore can corrupt guest memory (e.g., stack
+        // canary in do_idle), causing an immediate kernel panic + reboot. Detecting this
+        // early surfaces the error instead of silently serving a crashed VM.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(status) = vm_manager.try_wait()? {
+            bail!(
+                "VM crashed immediately after snapshot restore (exit status: {:?}). \
+                 This can happen under heavy I/O load due to memory corruption during restore.",
+                status
+            );
+        }
+
+        // Save VM state with complete network configuration
+        save_vm_state_with_network(state_manager, vm_state, network_config).await?;
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = post_start {
+        warn!(error = %format!("{e:#}"), "restore failed after Firecracker start; killing the process");
+        if let Err(kill_err) = vm_manager.kill().await {
+            warn!(error = %kill_err, "failed to kill Firecracker after restore failure");
+        }
+        return Err(e);
+    }
 
     Ok((vm_manager, holder_child))
 }
@@ -1423,6 +1448,7 @@ pub fn build_snapshot_config(
             health_check_timeout: vm_state.config.health_check_timeout,
             hugepages: vm_state.config.hugepages,
             extra_disks,
+            nfs_shares: vm_state.config.nfs_shares.clone(),
             username: vm_state.config.username.clone(),
             user: vm_state.config.user.clone(),
             port_mappings: vm_state.config.port_mappings.clone(),

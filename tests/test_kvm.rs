@@ -232,7 +232,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 and kvm-arm.mode=nested, or x86 with Intel VT-x/AMD-V nested=1
 /// Skips if nested KVM isn't available.
-#[ignore = "nested tests disabled - too slow/flaky"]
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("\nNested VM Test: Run fcvm inside fcvm");
@@ -496,6 +496,7 @@ except OSError as e:
 /// Each nested level uses localhost/nested-test which has fcvm baked in.
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 + kvm-arm.mode=nested, or x86 with nested=1
+#[cfg(target_arch = "aarch64")]
 #[allow(dead_code)] // Helper for future L3+ tests (currently L3 is too slow)
 async fn run_nested_chain(total_levels: usize) -> Result<()> {
     let success_marker = format!("NESTED_CHAIN_{}_LEVELS_SUCCESS", total_levels);
@@ -753,7 +754,7 @@ except OSError as e:
 ///
 /// The container OCI archive is loaded via FUSE-over-vsock.
 /// This is the original/default behavior.
-#[ignore = "nested tests disabled - too slow/flaky"]
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -768,7 +769,7 @@ async fn test_nested_l2_fuse() -> Result<()> {
 /// Test L1→L2 nesting with image cache via NFS (--nfs)
 ///
 /// The container OCI archive is loaded from an NFS share.
-#[ignore = "nested tests disabled - too slow/flaky"]
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_nfs() -> Result<()> {
     run_nested_n_levels(
@@ -784,6 +785,7 @@ async fn test_nested_l2_nfs() -> Result<()> {
 ///
 /// IGNORED: This test runs extensive benchmarks at both L1 and L2 levels,
 /// which exceeds the 10-minute test timeout. Use for manual performance analysis.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "exceeds 10-minute timeout - use for manual benchmarking"]
 async fn test_nested_l2_with_benchmarks() -> Result<()> {
@@ -801,7 +803,7 @@ async fn test_nested_l2_with_benchmarks() -> Result<()> {
 /// Tests FUSE-over-vsock with 100MB file copies at each nesting level.
 /// This validates the 32KB max_write limit that prevents vsock fragmentation
 /// issues under nested virtualization.
-#[ignore = "nested tests disabled - too slow/flaky"]
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_with_large_files() -> Result<()> {
     run_nested_n_levels(
@@ -818,7 +820,7 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
 /// Measures egress/ingress throughput from VMs at each level to host using iperf3.
 /// Tests various block sizes (128K, 1M) and parallelism (1, 4, 8 streams).
 /// Network tests don't depend on FUSE for data path, but need image cache mount.
-#[ignore = "nested tests disabled - too slow/flaky"]
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_network_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -831,7 +833,7 @@ async fn test_nested_l2_network_fuse() -> Result<()> {
 }
 
 /// Test L2 network benchmarks with image cache via NFS
-#[ignore = "nested tests disabled - too slow/flaky"]
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_network_nfs() -> Result<()> {
     run_nested_n_levels(
@@ -849,6 +851,7 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
 /// image cache mount. At L3, FUSE latency is ~15ms per operation, causing
 /// container startup to exceed the 10-minute test timeout.
 /// disk-dir and NFS may work better at L3.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L3 (FUSE-over-FUSE x2): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_fuse() -> Result<()> {
@@ -862,6 +865,7 @@ async fn test_nested_l3_network_fuse() -> Result<()> {
 }
 
 /// Test L3 network with NFS (may be faster than FUSE)
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L3 (NFS): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_nfs() -> Result<()> {
@@ -880,6 +884,7 @@ async fn test_nested_l3_network_nfs() -> Result<()> {
 /// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
 /// initialization alone takes 10+ minutes. Need to implement request pipelining
 /// or async PassthroughFs before this test can complete in reasonable time.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L3: slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3() -> Result<()> {
@@ -895,6 +900,7 @@ async fn test_nested_l3() -> Result<()> {
 /// Test L1→L2→L3→L4: 4 levels of nesting
 ///
 /// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
+#[cfg(target_arch = "aarch64")]
 #[tokio::test]
 #[ignore = "nested L4: very slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l4() -> Result<()> {
@@ -1080,25 +1086,32 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     FUSE_DIR="/mnt/fcvm-btrfs/bench-large-${LEVEL}-$$"
     mkdir -p "$FUSE_DIR"
 
-    echo "--- Generating 100MB random data ---"
-    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
+    # 32MB: well past the ~10MB mark where the historical NV2 FUSE-over-vsock
+    # corruption appeared (fragmented max_write-sized writes), at a third of
+    # the old 100MB runtime.
+    echo "--- Generating 32MB random data ---"
+    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=32 2>/dev/null
 
-    echo "--- Copy TO FUSE (100MB) ---"
+    echo "--- Copy TO FUSE (32MB) ---"
     START=$(date +%s%N)
     cp /tmp/large.dat "${FUSE_DIR}/large.dat"
     sync
     END=$(date +%s%N)
     COPY_TO_MS=$(( (END - START) / 1000000 ))
-    COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
-    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
+    COPY_TO_MBS=$(( 32 * 1000 / (COPY_TO_MS + 1) ))
+    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (32MB, ${COPY_TO_MBS}MB/s)"
 
-    echo "--- Copy FROM FUSE (100MB) ---"
+    echo "--- Copy FROM FUSE (32MB) ---"
     START=$(date +%s%N)
     cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
     END=$(date +%s%N)
     COPY_FROM_MS=$(( (END - START) / 1000000 ))
-    COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
-    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
+    COPY_FROM_MBS=$(( 32 * 1000 / (COPY_FROM_MS + 1) ))
+    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (32MB, ${COPY_FROM_MBS}MB/s)"
+
+    # Round-trip integrity: the corruption class this test exists for shows
+    # up as zeroed/stale ranges in the data, not as I/O errors.
+    cmp /tmp/large.dat /tmp/large2.dat || { echo "FUSE_LARGE_L${LEVEL}=CORRUPTED"; exit 1; }
 
     rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
 else
@@ -1118,7 +1131,10 @@ fn network_script(server_ip: &str, port: u16) -> String {
 set -e
 LEVEL=${{1:-unknown}}
 SERVER="{server_ip}"
-PORT={port}
+# Per-level port: L1 and L2 hitting the same server port seconds apart through
+# stacked NAT intermittently hung the second connection (conntrack reuse);
+# the test spawns one iperf3 server per level.
+PORT=$(({port} + LEVEL))
 
 echo "=== NETWORK BENCHMARK L${{LEVEL}} ==="
 echo "Server: $SERVER:$PORT"
@@ -1139,16 +1155,18 @@ if ! timeout 5 bash -c "echo > /dev/tcp/$SERVER/$PORT" 2>/dev/null; then
 fi
 echo "Server reachable"
 
-# Block sizes and parallelism
-BLOCK_SIZES="128K 1M"
-PARALLEL="1 4 8"
-DURATION=3
+# One block size, two parallelism levels, short duration: the test gates
+# "does networking work through the nested chain at sane throughput", not a
+# performance survey (run the manual benchmark test for that).
+BLOCK_SIZES="1M"
+PARALLEL="1 4"
+DURATION=2
 
 echo ""
 echo "--- Egress Throughput (VM -> Host) ---"
 for bs in $BLOCK_SIZES; do
     for p in $PARALLEL; do
-        result=$(iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -J 2>/dev/null || echo '{{"error":"failed"}}')
+        result=$(timeout 60 iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -J 2>/dev/null || echo '{{"error":"failed"}}')
         throughput=$(echo "$result" | python3 -c "
 import sys, json
 try:
@@ -1170,7 +1188,7 @@ echo ""
 echo "--- Ingress Throughput (Host -> VM) ---"
 for bs in $BLOCK_SIZES; do
     for p in $PARALLEL; do
-        result=$(iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -R -J 2>/dev/null || echo '{{"error":"failed"}}')
+        result=$(timeout 60 iperf3 -c $SERVER -p $PORT -t $DURATION -l $bs -P $p -R -J 2>/dev/null || echo '{{"error":"failed"}}')
         throughput=$(echo "$result" | python3 -c "
 import sys, json
 try:
@@ -1227,6 +1245,7 @@ fn print_benchmark_summary(log_content: &str, include_large_files: bool, include
 /// The `image_cache_mount` parameter controls how the OCI archive is shared with L1:
 /// - Fuse: Uses FUSE-over-vsock via --map (original behavior)
 /// - Nfs: Shares the directory via NFS
+#[cfg(target_arch = "aarch64")]
 async fn run_nested_n_levels(
     n: usize,
     marker: &str,
@@ -1334,23 +1353,28 @@ async fn run_nested_n_levels(
         String::new()
     };
 
-    // Start iperf3 server for network benchmarks with unique port per test
-    let mut iperf_server: Option<tokio::process::Child> = None;
+    // Start one iperf3 server PER NESTING LEVEL (the guest script uses
+    // base_port + level) with a unique base port per test process. Sharing one
+    // server port across levels through stacked NAT intermittently hung the
+    // second level's connection for minutes (conntrack tuple reuse).
+    let mut iperf_servers: Vec<tokio::process::Child> = Vec::new();
     let iperf_port: u16 = if mode == BenchmarkMode::WithNetwork {
-        // Generate unique port based on process ID to avoid conflicts in parallel tests
-        let port = 5201 + (std::process::id() % 1000) as u16;
-        println!("Starting iperf3 server on host ({}:{})...", host_ip, port);
-        iperf_server = Some(
-            tokio::process::Command::new("iperf3")
-                .args(["-s", "-p", &port.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("starting iperf3 server")?,
-        );
-        // Give server time to start
+        let base_port = 5201 + (std::process::id() % 1000) as u16;
+        for level in 1..=n {
+            let port = base_port + level as u16;
+            println!("Starting iperf3 server on host ({}:{})...", host_ip, port);
+            iperf_servers.push(
+                tokio::process::Command::new("iperf3")
+                    .args(["-s", "-p", &port.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .context("starting iperf3 server")?,
+            );
+        }
+        // Give servers time to start
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        port
+        base_port
     } else {
         5201 // Default, unused
     };
@@ -1481,6 +1505,7 @@ echo "L{level}: Starting L{next_level} VM..."
 # Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
 mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
 FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+    --no-snapshot \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1519,6 +1544,7 @@ echo "L{level}: Starting L{next_level} VM..."
 # Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
 mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
 FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+    --no-snapshot \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1556,6 +1582,7 @@ echo "L{level}: Starting L{next_level} VM..."
 # Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
 mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
 FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+    --no-snapshot \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1604,16 +1631,32 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
         BenchmarkMode::WithLargeFiles => "large",
         BenchmarkMode::WithNetwork => "network",
     };
+    // Unique per attempt: a fixed VM name collides with the previous attempt's
+    // leftover VM/state when nextest retries after a timeout kill.
+    let attempt_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 100_000
+    );
     let log_file = format!(
-        "/tmp/nested-l{}-{}-{}.log",
+        "/tmp/nested-l{}-{}-{}-{}.log",
         n,
         mode_suffix,
-        image_cache_mount.name()
+        image_cache_mount.name(),
+        attempt_id
     );
     let image_cache_args = image_cache_mount_args.join(" ");
+    // `timeout` bounds the L1 VM's lifetime: when nextest kills a timed-out
+    // test, this spawned pipeline would otherwise survive as an orphan and
+    // collide with the retry. 840s < the 900s nextest budget so the VM dies
+    // (and cleans up) before the test harness gives up.
     let fcvm_cmd = format!(
-        "sudo ./target/release/fcvm podman run \
-         --name l1-nested-{}-{}-{} \
+        "timeout -k 10 840 sudo ./target/release/fcvm podman run \
+         --name l1-nested-{}-{}-{}-{} \
          --network bridged \
          --privileged \
          --mem {} \
@@ -1625,6 +1668,7 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
         n,
         mode_suffix,
         image_cache_mount.name(),
+        attempt_id,
         intermediate_mem,
         image_cache_args,
         l1_script,
@@ -1700,10 +1744,12 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
         );
     }
 
-    // Clean up iperf3 server if started
-    if let Some(mut server) = iperf_server {
-        println!("Stopping iperf3 server...");
-        server.kill().await.ok();
+    // Clean up iperf3 servers if started
+    if !iperf_servers.is_empty() {
+        println!("Stopping iperf3 servers...");
+        for mut server in iperf_servers {
+            server.kill().await.ok();
+        }
     }
 
     Ok(())

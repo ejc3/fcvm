@@ -137,6 +137,11 @@ pub(crate) async fn run_status_listener(
                 // fc-agent has loaded the image and is ready for caching
                 info!(vm_id = %vm_id, digest = %digest, "Cache-ready notification received");
 
+                // Whether to release fc-agent with "cache-ack". Stays true for
+                // created/failed/no-channel cases; flips false when the run loop
+                // drops the oneshot to signal "this VM is being replaced".
+                let mut should_ack = true;
+
                 if let Some(tx) = cache_tx.as_ref() {
                     // Create oneshot channel for ack
                     let (ack_tx, ack_rx) = oneshot::channel();
@@ -185,7 +190,17 @@ pub(crate) async fn run_status_listener(
                                 ack = &mut ack_rx => {
                                     match ack {
                                         Ok(()) => info!(vm_id = %vm_id, "Cache created, sending ack to fc-agent"),
-                                        Err(_) => warn!(vm_id = %vm_id, "Cache creation failed or was cancelled"),
+                                        Err(_) => {
+                                            // Sender dropped without a value: the run loop is
+                                            // replacing this VM with a restore of the snapshot
+                                            // it just created (or the process is going down).
+                                            // Do NOT ack — an ack would let fc-agent start the
+                                            // container in the doomed VM, racing teardown and
+                                            // double-running container startup against shared
+                                            // volumes. (Create FAILURES send Ok explicitly.)
+                                            warn!(vm_id = %vm_id, "cache oneshot dropped; suppressing cache-ack (VM being replaced)");
+                                            should_ack = false;
+                                        }
                                     }
                                     break;
                                 }
@@ -198,14 +213,14 @@ pub(crate) async fn run_status_listener(
                                         // the ack so the main task's oneshot isn't
                                         // dropped mid-snapshot.
                                         _ => {
-                                            let _ = (&mut ack_rx).await;
+                                            should_ack = (&mut ack_rx).await.is_ok();
                                             break;
                                         }
                                     }
                                 }
                                 _ = &mut keepalive_interval => {
                                     if write_half.write_all(b"cache-wait\n").await.is_err() {
-                                        let _ = (&mut ack_rx).await;
+                                        should_ack = (&mut ack_rx).await.is_ok();
                                         break;
                                     }
                                     let _ = write_half.flush().await;
@@ -222,11 +237,15 @@ pub(crate) async fn run_status_listener(
                     }
                 }
 
-                // Send ack back to fc-agent (even if cache creation failed)
-                if let Err(e) = write_half.write_all(b"cache-ack\n").await {
-                    warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
+                // Send ack back to fc-agent (even if cache creation failed) —
+                // unless the oneshot was dropped, which means this VM is being
+                // replaced by a restore and must not start its container.
+                if should_ack {
+                    if let Err(e) = write_half.write_all(b"cache-ack\n").await {
+                        warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
+                    }
+                    let _ = write_half.flush().await;
                 }
-                let _ = write_half.flush().await;
 
                 // Grace-drain before the connection drops at the `break` below:
                 // consume any last in-flight guest probe bytes so the close is

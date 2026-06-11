@@ -114,6 +114,13 @@ impl BridgedNetwork {
         self
     }
 
+    /// The clone's in-namespace veth IP (set by setup() for clones only).
+    /// Guest→host traffic leaves the namespace masqueraded as this address —
+    /// it's the client IP the host's NFS server sees for clone mounts.
+    pub fn veth_inner_ip(&self) -> Option<&str> {
+        self.veth_inner_ip.as_deref()
+    }
+
     /// Use a specific VM ID for network subnet calculation (for cache restore).
     /// This allows restored VMs to get the same subnet/IPs as the original
     /// while keeping fresh VM networking (not clone networking with NAT).

@@ -109,6 +109,11 @@ pub struct SnapshotMetadata {
     /// Extra disk images from the baseline VM (for clone disk-dir support)
     #[serde(default)]
     pub extra_disks: Vec<SnapshotExtraDisk>,
+    /// NFS shares from the baseline VM. The restore path re-exports these for
+    /// the new VM (the baseline's /etc/exports.d entry dies with the baseline)
+    /// and fc-agent remounts them in the guest after the transport reset.
+    #[serde(default)]
+    pub nfs_shares: Vec<crate::state::types::NfsShare>,
     /// Username for rootless container health checks (e.g., "ubuntu")
     #[serde(default)]
     pub username: Option<String>,
@@ -327,6 +332,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                nfs_shares: vec![],
                 username: None,
                 user: None,
                 port_mappings: vec![],
@@ -457,6 +463,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                nfs_shares: vec![],
                 username: None,
                 user: None,
                 port_mappings: vec![],
@@ -531,6 +538,7 @@ mod tests {
                     health_check_timeout: 5,
                     hugepages: false,
                     extra_disks: vec![],
+                    nfs_shares: vec![],
                     username: None,
                     user: None,
                     port_mappings: vec![],
@@ -592,6 +600,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                nfs_shares: vec![],
                 username: None,
                 user: None,
                 port_mappings: vec![],
@@ -706,6 +715,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                nfs_shares: vec![],
                 username: None,
                 user: None,
                 port_mappings: vec![],
@@ -796,6 +806,7 @@ mod tests {
             health_check_timeout: 5,
             hugepages: false,
             extra_disks: vec![],
+            nfs_shares: vec![],
             username: None,
             user: None,
             port_mappings: vec![],
