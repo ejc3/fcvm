@@ -723,7 +723,7 @@ pub(crate) async fn setup_nfs_exports(
         // hard NFS mount would hang until the test budget kills it. Fail
         // loudly instead.
         anyhow::bail!(
-            "exportfs -ra failed; NFS export for {} is not active (check              /etc/exports.d for stale entries)",
+            "exportfs -ra failed; NFS export for {} is not active (check /etc/exports.d for stale entries)",
             exports_path
         );
     }

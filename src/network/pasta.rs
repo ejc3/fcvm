@@ -328,7 +328,16 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             "starting pasta for rootless networking"
         );
 
-        let mut cmd = Command::new("pasta");
+        // Resolve the pasta binary through the pinned-build machinery: with a
+        // [pasta] config section the content-addressed patched build is
+        // required (a distro pasta would reintroduce the addr_seen inbound
+        // poisoning, #661); without one, PATH is used as before.
+        let (config, _, _) =
+            crate::setup::rootfs::load_config(None).context("loading config for pasta")?;
+        let pasta_bin = crate::setup::get_pasta_for_config(config.pasta.as_ref())?;
+        info!(pasta_bin = %pasta_bin.display(), "resolved pasta binary");
+
+        let mut cmd = Command::new(&pasta_bin);
         cmd.arg("--foreground")
             .arg("--quiet")
             .arg("-P")

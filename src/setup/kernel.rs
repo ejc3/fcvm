@@ -1330,7 +1330,7 @@ fn compute_profile_firecracker_sha_with_commit(
 
 /// Return a string identifying the C library (e.g. "glibc-2.39" or "musl-1.2.4").
 /// Used to namespace the firecracker binary cache per build environment.
-fn libc_version_tag() -> String {
+pub(crate) fn libc_version_tag() -> String {
     // Try GNU libc first (most common on host and Ubuntu containers)
     if let Ok(output) = std::process::Command::new("ldd").arg("--version").output() {
         // ldd --version prints to stdout on glibc, stderr on musl

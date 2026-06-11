@@ -1735,12 +1735,15 @@ pub async fn dump_clone_network_diagnostics(pid: u32) {
         run_nsenter_diagnostic(&hp_str, &["bridge", "link"], "bridge links").await;
     }
 
-    // Check what the VM sees (listening sockets)
+    // Check what the VM sees (listening sockets). `--vm` matters: the default
+    // execs into the container, where alpine images have no `ss` — the section
+    // then prints empty and reads as "nothing is listening" (it misled the
+    // #661 investigation exactly that way).
     let pid_str = pid.to_string();
     run_cmd_diagnostic(
         "VM listening sockets",
         &fcvm_path.to_string_lossy(),
-        &["exec", "--pid", &pid_str, "--", "ss", "-tnl"],
+        &["exec", "--pid", &pid_str, "--vm", "--", "ss", "-tnl"],
     )
     .await;
 }
