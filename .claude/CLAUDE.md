@@ -1213,7 +1213,8 @@ fuse-pipe/benches/
    - Clone memory load time: ~2.3ms
    - UFFD clones populate lazily (faulted pages are per-VM copies); File-backend
      clones share clean pages via the page cache (measured in #632)
-   - **Performance**: Original VM + 2 clones = ~512MB RAM total (not 1.5GB!)
+   - **Performance**: Original VM + 2 idle clones ≈ ~512MB RAM total (not 1.5GB) —
+     only each clone's faulted working set materializes
 
 3. **True Rootless Networking** (2025-11-25)
    - `--network rootless` (default): pasta, no root required

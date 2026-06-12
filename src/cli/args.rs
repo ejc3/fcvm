@@ -361,7 +361,7 @@ pub struct SnapshotServeArgs {
 
 #[derive(Args, Debug)]
 pub struct SnapshotRunArgs {
-    /// Serve process PID to clone from (UFFD mode - memory sharing)
+    /// Serve process PID to clone from (UFFD mode - lazy on-demand paging)
     #[arg(long, conflicts_with = "snapshot")]
     pub pid: Option<u32>,
 

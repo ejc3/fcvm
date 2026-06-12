@@ -18,10 +18,11 @@ the Firecracker path.
 
 ## Why this pair is a clean fit
 The research proved FC and CH are closely aligned:
-- **vsock is byte-for-byte identical** — both use the hybrid `CONNECT <port>` proxy over a
-  host Unix socket, guest→host via CID 2 with the host listening on `<socket>_<port>` (CH:
-  "based on the Firecracker implementation"). fcvm's exec/volume/status/tty layer ports
-  **unchanged** — and there's effectively **one `GuestChannel` impl**, not two.
+- **vsock uses the same hybrid design** — both use the `CONNECT <port>` proxy over a host
+  Unix socket, guest→host via CID 2 with the host listening on `<socket>_<port>` (CH:
+  "based on the Firecracker implementation"; naming doc-confirmed). fcvm's
+  exec/volume/status/tty layer should port with **one `GuestChannel` impl** — live
+  `CONNECT` parity is still unverified pending P0.5 (see open research items).
 - Both are **REST-over-UDS** control planes (FC `/actions`,`PATCH /vm`; CH `vm.boot`,
   `vm.pause`…), so the API client shape is shared.
 - Both support **direct kernel boot**, **UFFD lazy restore**, **static single binaries**,
@@ -38,7 +39,7 @@ Full table + citations in #632.
 | capability | Firecracker | Cloud Hypervisor | abstraction handling |
 |---|---|---|---|
 | lifecycle / boot / machine / block+net add / console / process model | ✅ | ✅ | trait covers directly |
-| vsock host↔guest (`CONNECT`) | ✅ | ✅ identical | single `GuestChannel` (UdsConnect) |
+| vsock host↔guest (`CONNECT`) | ✅ | ✅ same design (live parity unverified) | single `GuestChannel` (UdsConnect) expected |
 | full snapshot + restore-into-fresh-process | ✅ | ✅ | trait |
 | UFFD lazy restore | ✅ | ✅ (`memory_restore_mode=ondemand`, v52) | trait |
 | **cross-clone memory sharing** | ✅ **measured**: `File` backend mmaps `memory.bin` MAP_PRIVATE; 3× 1GiB clones ≈ 230MiB total PSS, with dirty tracking on OR off. UFFD path is **lazy population, not sharing** (UFFDIO_COPY makes per-VM copies) | ❓ blocked: CH v52 snapshot create fails on ARM64 (`GetAarchCoreRegister` EINVAL), so density unmeasured | split caps: `file_backed_cow_restore` / `external_uffd_lazy_restore` / `internal_uffd_lazy_restore` |
