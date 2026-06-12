@@ -661,7 +661,8 @@ fn volume_state_from_snapshot(
 /// Run clone from snapshot
 ///
 /// Two modes:
-/// - `--pid <serve_pid>`: Clone via UFFD memory sharing (for multiple concurrent clones)
+/// - `--pid <serve_pid>`: Clone via the UFFD serve process (lazy on-demand paging,
+///   for multiple concurrent clones)
 /// - `--snapshot <name>`: Clone directly from snapshot files (simpler, no serve process needed)
 ///
 /// This is public so podman.rs can call it directly for cache hits.
@@ -1409,7 +1410,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             vm_name, snapshot_name
         );
         if use_uffd {
-            println!("  Memory pages shared via UFFD serve process");
+            println!("  Memory pages served on-demand by UFFD serve process");
         } else {
             println!("  Memory pages served on-demand from snapshot file");
         }

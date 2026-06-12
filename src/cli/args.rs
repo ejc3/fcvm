@@ -361,7 +361,7 @@ pub struct SnapshotServeArgs {
 
 #[derive(Args, Debug)]
 pub struct SnapshotRunArgs {
-    /// Serve process PID to clone from (UFFD mode - memory sharing)
+    /// Serve process PID to clone from (UFFD mode - lazy on-demand paging)
     #[arg(long, conflicts_with = "snapshot")]
     pub pid: Option<u32>,
 
@@ -377,9 +377,10 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub exec: Option<String>,
 
-    /// Disable KVM dirty page tracking. File-backed pages stay shared through
-    /// the host page cache — multiple clones from the same snapshot share
-    /// physical memory pages. Tradeoff: diff snapshots from this VM won't work.
+    /// Disable KVM dirty page tracking, avoiding its logging overhead.
+    /// Tradeoff: diff snapshots from this VM won't work. Note: file-backed
+    /// clone memory is shared through the host page cache with tracking on
+    /// OR off (measured in #632) — this flag does not change sharing.
     #[arg(long)]
     pub no_dirty_tracking: bool,
 
