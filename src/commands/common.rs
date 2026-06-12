@@ -710,10 +710,12 @@ pub struct RestoreParams<'a> {
     /// For routed mode clones: the unique per-clone IPv6 that fc-agent should
     /// configure on eth0, replacing the snapshot's shared guest IPv6.
     pub clone_ipv6: Option<String>,
-    /// Enable KVM dirty page tracking. When true, KVM CoW-copies file-backed
-    /// pages for dirty tracking (needed for subsequent diff snapshots from this VM).
-    /// When false, pages stay shared through page cache — multiple clones from
-    /// the same snapshot share physical memory pages. Disabled for hugepage VMs
+    /// Enable KVM dirty page tracking (needed for subsequent diff snapshots
+    /// from this VM). File-backed restore memory is mmap'd MAP_PRIVATE either
+    /// way, so clones share clean pages through the host page cache in BOTH
+    /// modes — sharing is bounded by the guest's write footprint, and tracking
+    /// showed no material PSS erosion when measured (#632: 3x 1GiB clones
+    /// ≈ 230MiB total PSS, ON vs OFF within 1MiB). Disabled for hugepage VMs
     /// (KVM would split 2MB TLB entries to 4K).
     pub track_dirty_pages: bool,
 }

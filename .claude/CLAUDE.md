@@ -1211,7 +1211,8 @@ fuse-pipe/benches/
    - UFFD memory server serves pages on-demand via Unix socket
    - Clone disk uses btrfs reflink (~3ms instant CoW copy)
    - Clone memory load time: ~2.3ms
-   - Multiple VMs share same memory via kernel page cache
+   - UFFD clones populate lazily (faulted pages are per-VM copies); File-backend
+     clones share clean pages via the page cache (measured in #632)
    - **Performance**: Original VM + 2 clones = ~512MB RAM total (not 1.5GB!)
 
 3. **True Rootless Networking** (2025-11-25)
@@ -1424,8 +1425,9 @@ fcvm snapshot run --pid <serve_pid> --name clone1
 ```
 
 **How it works:**
-- Memory server mmaps snapshot file (MAP_SHARED)
-- Kernel shares physical pages via page cache
+- Memory server mmaps the snapshot file once; the page cache holds one copy
+- Guest RAM is MAP_ANONYMOUS; faults are filled with UFFDIO_COPY (a private
+  per-VM copy of each faulted page — lazy population, not cross-VM sharing)
 - Server uses tokio AsyncFd to handle UFFD events non-blocking
 - tokio::select! multiplexes: accept new VMs + monitor VM exits
 - Each VM gets dedicated async task (JoinSet) for page faults
@@ -1433,8 +1435,11 @@ fcvm snapshot run --pid <serve_pid> --name clone1
 - Server exits gracefully when last VM disconnects
 
 **Memory efficiency:**
-- 50 VMs with 512MB snapshot = ~512MB physical RAM (not 25.6GB)
-- Pages only copied on write (true CoW at page level)
+- UFFD path: density comes from laziness — only each clone's faulted working
+  set materializes (faulted pages are per-VM copies, #632)
+- File-backend restores (`snapshot run --snapshot`): clones genuinely share
+  clean pages via the page cache (MAP_PRIVATE) — measured 3x 1GiB clones
+  ≈ 230MiB total PSS, with or without dirty tracking (#632)
 
 ### FUSE Parallelism (fuse-pipe)
 
