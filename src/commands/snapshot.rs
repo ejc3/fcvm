@@ -2062,8 +2062,10 @@ fn run_args_from_snapshot_metadata(
         publish,
         balloon: None,
         network,
-        // Clones restore from Firecracker snapshots (CH clone/restore is P2).
-        hypervisor: crate::cli::args::Hypervisor::Firecracker,
+        // Cold-boot the clone/reboot under the SAME backend that created the snapshot —
+        // a CH disk-only/reboot clone must not be launched under Firecracker (and would
+        // fail outright on a CH-only host). meta.hypervisor is recorded at snapshot create.
+        hypervisor: meta.hypervisor.into(),
         health_check: meta.health_check_url.clone(),
         health_check_timeout: meta.health_check_timeout,
         privileged: false,
@@ -2332,6 +2334,50 @@ mod tests {
                 "/srv/data:/mydata:ro".to_string(),
                 "/srv/rw:/rw".to_string()
             ]
+        );
+    }
+
+    /// The synthesized cold-boot RunArgs must launch under the SAME backend that created
+    /// the snapshot — a CH disk-only/reboot clone launched under Firecracker would mis-boot
+    /// (and fail outright on a CH-only host). Regression for the hard-coded Firecracker.
+    #[test]
+    fn run_args_from_metadata_propagates_backend() {
+        let base = crate::storage::SnapshotMetadata {
+            image: "localhost/app:latest".to_string(),
+            vcpu: 1,
+            memory_mib: 512,
+            network_config: crate::network::NetworkConfig::default(),
+            volumes: vec![],
+            health_check_url: None,
+            health_check_timeout: 5,
+            hugepages: false,
+            extra_disks: vec![],
+            nfs_shares: vec![],
+            username: None,
+            user: None,
+            port_mappings: vec![],
+            forward_localhost: vec![],
+            network_mode: crate::firecracker::FcNetworkMode::Rootless,
+            ipv6_prefix: None,
+            tty: false,
+            interactive: false,
+            kernel_profile: None,
+            image_mode: None,
+            image_disk_path: None,
+            hypervisor: crate::hypervisor::Backend::CloudHypervisor,
+        };
+        let args = run_args_from_snapshot_metadata(&base, "c".to_string(), 1, 512, false, None);
+        assert_eq!(
+            args.hypervisor,
+            crate::cli::args::Hypervisor::CloudHypervisor
+        );
+
+        let mut fc = base.clone();
+        fc.hypervisor = crate::hypervisor::Backend::Firecracker;
+        let args_fc = run_args_from_snapshot_metadata(&fc, "c".to_string(), 1, 512, false, None);
+        assert_eq!(
+            args_fc.hypervisor,
+            crate::cli::args::Hypervisor::Firecracker
         );
     }
 

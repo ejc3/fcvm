@@ -544,6 +544,15 @@ impl From<Hypervisor> for crate::hypervisor::Backend {
     }
 }
 
+impl From<crate::hypervisor::Backend> for Hypervisor {
+    fn from(b: crate::hypervisor::Backend) -> Self {
+        match b {
+            crate::hypervisor::Backend::Firecracker => Hypervisor::Firecracker,
+            crate::hypervisor::Backend::CloudHypervisor => Hypervisor::CloudHypervisor,
+        }
+    }
+}
+
 /// Root filesystem type for the VM.
 ///
 /// Controls whether the rootfs is ext4 (default) or btrfs.

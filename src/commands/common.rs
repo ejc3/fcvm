@@ -893,6 +893,71 @@ fn assert_vmstate_rootfs_covered(
     )
 }
 
+/// #608 guard for the Cloud Hypervisor restore path — the CH analogue of
+/// [`assert_vmstate_rootfs_covered`].
+///
+/// CH has no `patch_drive`: it opens the disk paths embedded in the snapshot's
+/// `config.json` directly, and the mount-namespace redirect only retargets the baseline VM
+/// dirs (`vm_runtime_dir(original|snapshot)`). A WRITABLE disk path outside those dirs
+/// (sibling VM, or a different `data_dir` prefix between create and restore) would be
+/// opened read-write against another VM's real disk and corrupt it — the exact exposure the
+/// FC path guards against. Read-only disks (external `--disk`) may legitimately point
+/// elsewhere, so only writable disks are checked. Called before any holder/disk side
+/// effects so a violation aborts cleanly instead of corrupting silently.
+/// Pure check behind [`assert_ch_config_disks_covered`]: returns the first WRITABLE disk
+/// `path` in `cfg` that is not under any `covered_dirs` entry, or `None` if all are covered.
+/// Read-only disks (external `--disk`) may legitimately point anywhere and are skipped.
+/// Split out (like [`vmstate_rootfs_covered`]) so it is unit-testable without `paths` init.
+fn ch_config_uncovered_writable_disk<'a>(
+    cfg: &'a serde_json::Value,
+    covered_dirs: &[PathBuf],
+) -> Option<&'a str> {
+    let disks = cfg.get("disks").and_then(|v| v.as_array())?;
+    for disk in disks {
+        let readonly = disk
+            .get("readonly")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if readonly {
+            continue;
+        }
+        if let Some(path) = disk.get("path").and_then(|v| v.as_str()) {
+            if !covered_dirs.iter().any(|d| Path::new(path).starts_with(d)) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn assert_ch_config_disks_covered(
+    cfg: &serde_json::Value,
+    original_vm_id: &str,
+    snapshot_vm_id: Option<&str>,
+) -> Result<()> {
+    let mut covered_dirs = vec![paths::vm_runtime_dir(original_vm_id)];
+    if let Some(s) = snapshot_vm_id {
+        if s != original_vm_id {
+            covered_dirs.push(paths::vm_runtime_dir(s));
+        }
+    }
+    if let Some(path) = ch_config_uncovered_writable_disk(cfg, &covered_dirs) {
+        anyhow::bail!(
+            "#608 (CH): refusing to restore — snapshot config.json references writable disk \
+             {} outside any baseline bind-mount {:?} (data_dir prefix {}). Cloud Hypervisor \
+             opens disk paths directly, so this would open an uncovered/sibling VM's disk and \
+             corrupt it.",
+            path,
+            covered_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            paths::data_dir().display(),
+        );
+    }
+    Ok(())
+}
+
 /// Backend-neutral substrate for a snapshot restore: the per-clone CoW disk, the holder
 /// process (rootless), and the namespace/mount isolation to apply to the VMM process.
 ///
@@ -1483,6 +1548,22 @@ pub async fn restore_from_snapshot_ch(
         );
     }
 
+    // #608 guard (CH analogue of assert_vmstate_rootfs_covered): CH opens the disk paths
+    // embedded in config.json directly (no patch_drive), so validate they are covered by the
+    // mount redirect BEFORE prepare_clone_substrate's holder/disk side effects — an uncovered
+    // writable path would be opened read-write against a sibling VM's disk and corrupt it.
+    // Parsed once here and reused for the net-TAP rewrite below.
+    let cfg_bytes = tokio::fs::read(ch_dir.join("config.json"))
+        .await
+        .context("reading CH snapshot config.json")?;
+    let mut cfg: serde_json::Value =
+        serde_json::from_slice(&cfg_bytes).context("parsing CH snapshot config.json")?;
+    assert_ch_config_disks_covered(
+        &cfg,
+        &restore_config.original_vm_id,
+        restore_config.snapshot_vm_id.as_deref(),
+    )?;
+
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
     let substrate = prepare_clone_substrate(
         network,
@@ -1520,11 +1601,7 @@ pub async fn restore_from_snapshot_ch(
             .await
             .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
     }
-    let cfg_bytes = tokio::fs::read(ch_dir.join("config.json"))
-        .await
-        .context("reading CH snapshot config.json")?;
-    let mut cfg: serde_json::Value =
-        serde_json::from_slice(&cfg_bytes).context("parsing CH snapshot config.json")?;
+    // `cfg` was read, parsed, and #608-validated above (before the substrate side effects).
     if let Some(nets) = cfg.get_mut("net").and_then(|v| v.as_array_mut()) {
         for net in nets.iter_mut() {
             if let Some(obj) = net.as_object_mut() {
@@ -3047,5 +3124,54 @@ mod tests {
             b"x".as_slice(),
             Path::new("/long/path")
         ));
+    }
+
+    /// #608 guard for the CH restore path: a WRITABLE disk path outside the baseline
+    /// bind-mount dirs must be flagged (CH opens it directly and would corrupt a sibling
+    /// disk); a read-only external disk anywhere is fine.
+    #[test]
+    fn test_ch_config_disk_coverage() {
+        use serde_json::json;
+
+        let cfg = json!({
+            "disks": [
+                { "path": "/data/vm-disks/vm-AAA/disks/rootfs.raw", "readonly": false },
+                // a read-only external --disk pointing under ANOTHER vm -> must be ignored
+                { "path": "/data/vm-disks/vm-ext999/disks/data.raw", "readonly": true },
+            ]
+        });
+
+        // rootfs under the covered dir -> all writable disks covered.
+        assert!(
+            ch_config_uncovered_writable_disk(&cfg, &[PathBuf::from("/data/vm-disks/vm-AAA")])
+                .is_none()
+        );
+
+        // Same id, DIFFERENT data_dir prefix -> the writable rootfs is uncovered (#638 class).
+        assert_eq!(
+            ch_config_uncovered_writable_disk(&cfg, &[PathBuf::from("/other/vm-disks/vm-AAA")]),
+            Some("/data/vm-disks/vm-AAA/disks/rootfs.raw")
+        );
+
+        // A baseline for a sibling vm -> the writable rootfs is uncovered (the #608 corruption).
+        assert_eq!(
+            ch_config_uncovered_writable_disk(&cfg, &[PathBuf::from("/data/vm-disks/vm-BBB")]),
+            Some("/data/vm-disks/vm-AAA/disks/rootfs.raw")
+        );
+
+        // A WRITABLE second disk outside the covered dirs is flagged.
+        let cfg2 = json!({
+            "disks": [
+                { "path": "/data/vm-disks/vm-AAA/disks/rootfs.raw", "readonly": false },
+                { "path": "/data/vm-disks/vm-CCC/disks/data.raw", "readonly": false },
+            ]
+        });
+        assert_eq!(
+            ch_config_uncovered_writable_disk(&cfg2, &[PathBuf::from("/data/vm-disks/vm-AAA")]),
+            Some("/data/vm-disks/vm-CCC/disks/data.raw")
+        );
+
+        // No disks array -> nothing to open, nothing uncovered.
+        assert!(ch_config_uncovered_writable_disk(&json!({}), &[PathBuf::from("/data")]).is_none());
     }
 }
