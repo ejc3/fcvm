@@ -22,14 +22,16 @@
 //! performs the create+boot. The host-side work (NFS export, network `post_start`)
 //! stays in the orchestration between the calls — it never touches the VMM.
 //!
-//! ## What is NOT abstracted in P0
-//! Snapshot/restore/clone is Firecracker-specific (snapshot format, external UFFD,
-//! `patch_drive`, MMDS restore-epoch) and is **capability-gated**: a backend that
-//! returns `false` for the relevant capability never enters that path. The snapshot
-//! orchestration in `commands::common` therefore still operates on the concrete
-//! Firecracker backend (reached via [`Hypervisor::as_any`]). Abstracting snapshots is
-//! deferred to P2, which is blocked upstream for Cloud Hypervisor on ARM64 anyway
-//! (`GetAarchCoreRegister` EINVAL under nested/NV2 hosts).
+//! ## Snapshots (P2)
+//! Snapshot create/restore/clone is **capability-gated** (`Capabilities::snapshots`) and
+//! per-backend in `commands::common`: each backend has its own snapshot/restore (the memory
+//! image format and restore mechanism are VMM-specific — Firecracker `LoadSnapshot` + external
+//! UFFD + `patch_drive` + MMDS restore-epoch vs Cloud Hypervisor `--restore` + in-process
+//! UFFD + mount-redirect disk retarget + vsock restore-epoch). The network/namespace/CoW-disk
+//! prologue is shared (`prepare_clone_substrate`); the FC-specific snapshot-create path is
+//! still reached on the concrete backend via [`Hypervisor::as_any`]. (CH ARM64 snapshots
+//! needed a post-#8268 cloud-hypervisor build — the blocker was the SVE register-save bug,
+//! not nested/NV2.)
 
 pub mod cloud_hypervisor;
 pub mod firecracker;

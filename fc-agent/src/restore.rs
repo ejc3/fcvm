@@ -72,12 +72,15 @@ pub async fn handle_clone_restore(
     clone_ipv6: Option<&str>,
     egress_gen_before: Option<u64>,
     restore_epoch: &str,
+    transport: crate::bootplan::Transport,
 ) {
     eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
 
     // Sync clock FIRST — snapshot restore leaves the VM clock frozen at snapshot time.
     // Services that validate timestamps (auth, TLS, sessions) will fail with stale time.
-    if let Err(e) = crate::mmds::sync_clock_from_host().await {
+    // Use the active transport: Cloud Hypervisor has no MMDS, so an MMDS fetch would just
+    // wait out its timeout and leave the clock stuck at snapshot time.
+    if let Err(e) = crate::bootplan::sync_clock_from_host(transport).await {
         eprintln!("[fc-agent] WARNING: clock sync on restore failed: {:?}", e);
     }
 
