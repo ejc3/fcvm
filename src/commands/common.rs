@@ -522,37 +522,69 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
 /// CH #8268, post-v52.0) that CH snapshot/restore requires. Cold boot (P1) works with
 /// any v52+; the cached build is preferred so CI and dev hosts use the pinned fork.
 pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
-    let bin = if let Ok(path) = std::env::var("FCVM_CLOUD_HYPERVISOR_BIN") {
+    // Run `<bin> --version`; returns the trimmed version string on success.
+    fn version_of(bin: &std::path::Path) -> Option<String> {
+        let out = std::process::Command::new(bin)
+            .arg("--version")
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    // 1. Explicit override — must exist and run; no fallback (the user asked for THIS one).
+    if let Ok(path) = std::env::var("FCVM_CLOUD_HYPERVISOR_BIN") {
         let p = std::path::PathBuf::from(&path);
         if !p.exists() {
             anyhow::bail!("FCVM_CLOUD_HYPERVISOR_BIN={} does not exist", path);
         }
-        p
-    } else if let Some(cached) = crate::setup::newest_cached_cloud_hypervisor() {
-        cached
-    } else {
-        which::which("cloud-hypervisor").context(
-            "cloud-hypervisor not found: build it with `fcvm setup --cloud-hypervisor`, \
-             set FCVM_CLOUD_HYPERVISOR_BIN, or install it on PATH",
-        )?
-    };
-
-    let output = std::process::Command::new(&bin)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("failed to run {} --version", bin.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "cloud-hypervisor --version failed (binary: {})",
-            bin.display()
-        );
+        match version_of(&p) {
+            Some(v) => {
+                debug!(
+                    "Found Cloud Hypervisor via FCVM_CLOUD_HYPERVISOR_BIN {:?}: {}",
+                    p, v
+                );
+                return Ok(p);
+            }
+            None => anyhow::bail!("FCVM_CLOUD_HYPERVISOR_BIN={} failed `--version`", path),
+        }
     }
-    debug!(
-        "Found Cloud Hypervisor at {:?}: {}",
-        bin,
-        String::from_utf8_lossy(&output.stdout).trim()
-    );
-    Ok(bin)
+
+    // 2. Content-addressed build. A cached binary that can't run here (e.g. an assets_dir
+    //    shared across an incompatible arch/libc) must NOT mask a working PATH binary —
+    //    fall through to PATH instead of failing.
+    if let Some(cached) = crate::setup::newest_cached_cloud_hypervisor() {
+        match version_of(&cached) {
+            Some(v) => {
+                debug!(
+                    "Found Cloud Hypervisor (content-addressed build) {:?}: {}",
+                    cached, v
+                );
+                return Ok(cached);
+            }
+            None => warn!(
+                path = %cached.display(),
+                "cached cloud-hypervisor failed `--version`; falling back to PATH"
+            ),
+        }
+    }
+
+    // 3. PATH.
+    let bin = which::which("cloud-hypervisor").context(
+        "cloud-hypervisor not found: build it with `fcvm setup --cloud-hypervisor`, \
+         set FCVM_CLOUD_HYPERVISOR_BIN, or install it on PATH",
+    )?;
+    match version_of(&bin) {
+        Some(v) => {
+            debug!("Found Cloud Hypervisor on PATH {:?}: {}", bin, v);
+            Ok(bin)
+        }
+        None => anyhow::bail!(
+            "cloud-hypervisor on PATH ({}) failed `--version`",
+            bin.display()
+        ),
+    }
 }
 
 /// Parse Firecracker version from --version output

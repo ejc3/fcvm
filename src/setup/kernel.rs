@@ -1622,13 +1622,17 @@ pub async fn ensure_profile_firecracker(
 // `fcvm setup --cloud-hypervisor`, and resolved at launch by `find_cloud_hypervisor()`.
 
 /// Compute the content-addressed SHA for the cloud-hypervisor binary.
-/// Includes the libc version so host and container builds don't share a
-/// dynamically-linked binary built against an incompatible glibc.
+/// Includes the target architecture and libc version: the built binary is an
+/// arch-specific, dynamically-linked ELF, so an assets_dir copied or shared between
+/// an x86_64 and an aarch64 builder must NOT resolve the same content-addressed name
+/// (otherwise the second arch sees a false cache hit and runs an `Exec format error`
+/// binary). Arch + libc segregate the cache entries.
 fn compute_cloud_hypervisor_sha(repo: &str, branch: &str, commit_hash: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(repo.as_bytes());
     hasher.update(branch.as_bytes());
     hasher.update(commit_hash.as_bytes());
+    hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(libc_version_tag().as_bytes());
     let result = hasher.finalize();
     hex::encode(&result[..6]) // 12 hex chars
@@ -1664,14 +1668,16 @@ pub fn newest_cached_cloud_hypervisor() -> Option<PathBuf> {
 /// from repo + branch + commit_hash + libc. Automatically detects and rebuilds when
 /// new commits are pushed to the branch. Mirrors `ensure_profile_firecracker`.
 pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf> {
-    // Fetch latest commit hash to detect updates
+    // Fetch latest commit hash to detect updates. This drives the fast-path existence
+    // check; the binary's final name is re-derived from the actually-built HEAD below
+    // (the branch could move between this ls-remote and the clone).
     let commit_hash = fetch_remote_commit_hash(repo, branch).await?;
-    let sha = compute_cloud_hypervisor_sha(repo, branch, &commit_hash);
+    let mut sha = compute_cloud_hypervisor_sha(repo, branch, &commit_hash);
 
     // Content-addressed path in assets dir (alongside kernels and firecracker)
     let ch_dir = paths::assets_dir().join("cloud-hypervisor");
     let filename = format!("cloud-hypervisor-{}.bin", sha);
-    let bin_path = ch_dir.join(&filename);
+    let mut bin_path = ch_dir.join(&filename);
 
     // Already exists — use it
     if bin_path.exists() {
@@ -1715,9 +1721,16 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
     );
     println!("    This may take 5-10 minutes...");
 
-    // Build in a per-asset temp directory (flock is per filename; distinct SHAs
-    // must not share a build tree or one would delete the other's checkout).
-    let build_dir = PathBuf::from(format!("/tmp/cloud-hypervisor-build-{}", sha));
+    // Build in a UNIQUE temp directory. The flock above is per assets_dir/<filename>,
+    // so two setups with DIFFERENT assets_dirs (e.g. a custom --config) take different
+    // locks for the same commit; a build dir keyed only on the sha would let one delete
+    // the other's checkout mid-build. A per-invocation uuid removes that overlap (uuid,
+    // not pid — separate PID namespaces reuse numbers; see the cross-VM cache race lesson).
+    let build_dir = PathBuf::from(format!(
+        "/tmp/cloud-hypervisor-build-{}-{}",
+        sha,
+        uuid::Uuid::new_v4()
+    ));
     if build_dir.exists() {
         tokio::fs::remove_dir_all(&build_dir)
             .await
@@ -1740,8 +1753,42 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
         .context("cloning cloud-hypervisor repo")?;
 
     if !status.success() {
+        let _ = tokio::fs::remove_dir_all(&build_dir).await;
         flock.unlock().map_err(|(_, err)| err)?;
         bail!("Failed to clone cloud-hypervisor repo from {}", clone_url);
+    }
+
+    // The cache identity (sha/bin_path) was computed from the ls-remote commit, but the
+    // clone tracked the MUTABLE branch — if it moved in between, the binary would be built
+    // from a different commit than its content-addressed name claims. Re-derive the name
+    // from the actually-checked-out HEAD so the name always matches the bytes installed.
+    let head_out = Command::new("git")
+        .args(["-C", build_dir.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("reading cloned cloud-hypervisor HEAD")?;
+    if head_out.status.success() {
+        let head = String::from_utf8_lossy(&head_out.stdout);
+        let head = head.trim();
+        if let Some(built) = head.get(..12) {
+            if built != commit_hash {
+                let actual_sha = compute_cloud_hypervisor_sha(repo, branch, built);
+                warn!(
+                    resolved = %commit_hash,
+                    built = %built,
+                    sha = %actual_sha,
+                    "cloud-hypervisor branch moved during build; naming binary after the built commit"
+                );
+                sha = actual_sha;
+                bin_path = ch_dir.join(format!("cloud-hypervisor-{}.bin", sha));
+                // Another process may have already built this exact commit.
+                if bin_path.exists() {
+                    let _ = tokio::fs::remove_dir_all(&build_dir).await;
+                    flock.unlock().map_err(|(_, err)| err)?;
+                    return Ok(bin_path);
+                }
+            }
+        }
     }
 
     // Build cloud-hypervisor
