@@ -68,10 +68,11 @@ pub struct Capabilities {
     pub diff_snapshots: bool,             // FC: true,  CH: false
     pub file_backed_cow_restore: bool,    // FC: true (measured, #632); CH: unblocked post-#8268, density unmeasured (P2)
     pub external_uffd_lazy_restore: bool, // FC: true (fork handshake w/ page_size), CH: false
-    pub internal_uffd_lazy_restore: bool, // FC: n/a,   CH: ondemand (v52; unverified on ARM64)
+    pub internal_uffd_lazy_restore: bool, // FC: n/a,   CH: false (ondemand exists in v52 but unused; restore uses copy-mode)
     pub drive_retarget: bool,             // FC: true,  CH: false (bind-mount redirect)
     pub native_metadata_service: bool,    // FC: MMDS,  CH: false (vsock boot-plan)
     pub nested_arm64: bool,               // FC: true,  CH: false
+    pub snapshots: bool,                  // FC: true,  CH: true (P2, copy-mode via --restore)
 }
 
 #[async_trait]
