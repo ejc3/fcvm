@@ -1494,6 +1494,54 @@ pub async fn restore_from_snapshot_ch(
     )
     .await?;
 
+    // Cloud Hypervisor reads its restore config (disk/vsock/net) from the snapshot's `ch/`
+    // dir. Disk + vsock paths are the source VM's and are redirected to the clone's by the
+    // mount namespace, but a network TAP is a device NAME, not a path — the redirect can't
+    // fix it, and the source's TAP doesn't exist in the clone's namespace. So copy `ch/`
+    // into a clone-local dir (reflink: instant, shares blocks) and rewrite each net device
+    // to the clone's TAP before restoring (the FC path does the equivalent via
+    // LoadSnapshot's `network_overrides`). Copying also avoids mutating the shared snapshot,
+    // which concurrent clones restore from.
+    let clone_ch_dir = data_dir.join("ch-restore");
+    let _ = tokio::fs::remove_dir_all(&clone_ch_dir).await;
+    tokio::fs::create_dir_all(&clone_ch_dir)
+        .await
+        .context("creating CH restore directory")?;
+    let mut entries = tokio::fs::read_dir(&ch_dir)
+        .await
+        .with_context(|| format!("reading CH snapshot dir {}", ch_dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        // config.json is rewritten below; reflink the rest (state.json, memory ranges).
+        if name == std::ffi::OsStr::new("config.json") {
+            continue;
+        }
+        reflink_copy(&ch_dir.join(&name), &clone_ch_dir.join(&name))
+            .await
+            .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
+    }
+    let cfg_bytes = tokio::fs::read(ch_dir.join("config.json"))
+        .await
+        .context("reading CH snapshot config.json")?;
+    let mut cfg: serde_json::Value =
+        serde_json::from_slice(&cfg_bytes).context("parsing CH snapshot config.json")?;
+    if let Some(nets) = cfg.get_mut("net").and_then(|v| v.as_array_mut()) {
+        for net in nets.iter_mut() {
+            if let Some(obj) = net.as_object_mut() {
+                obj.insert(
+                    "tap".to_string(),
+                    serde_json::Value::String(network_config.tap_device.clone()),
+                );
+            }
+        }
+    }
+    tokio::fs::write(
+        clone_ch_dir.join("config.json"),
+        serde_json::to_vec_pretty(&cfg).context("serializing CH restore config.json")?,
+    )
+    .await
+    .context("writing CH restore config.json")?;
+
     let ch_bin = find_cloud_hypervisor()?;
     let log_path = data_dir.join("firecracker.log");
     let mut backend =
@@ -1502,7 +1550,7 @@ pub async fn restore_from_snapshot_ch(
     // Restore paused, then resume after network post-start (mirrors the FC load/resume split).
     let restore_args = format!(
         "--restore source_url=file://{},memory_restore_mode=copy,resume=false",
-        ch_dir.display()
+        clone_ch_dir.display()
     );
     let spec = ProcessSpec {
         binary: ch_bin,
@@ -2510,8 +2558,16 @@ pub async fn create_snapshot_ch(
     }
 
     // VM is paused — we MUST resume it before returning, regardless of outcome.
+    // Dumping all of guest RAM can take well over the default 30s API timeout for large
+    // `--mem` VMs or slow disks, so scale it like the Firecracker path: max(300s, mem_gib*10).
     let dest_url = format!("file://{}", ch_dir.display());
-    let snapshot_result = client.snapshot_vm(&dest_url).await;
+    let mem_gib = snapshot_config.metadata.memory_mib / 1024;
+    let snapshot_timeout =
+        std::time::Duration::from_secs(std::cmp::max(300, (mem_gib as u64) * 10));
+    let snapshot_result = client
+        .with_timeout(snapshot_timeout)
+        .snapshot_vm(&dest_url)
+        .await;
 
     // Reflink the disk(s) WHILE PAUSED so the disk image matches the captured memory
     // (a post-resume write would desync memory/disk and corrupt the clone's filesystem).

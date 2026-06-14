@@ -199,6 +199,7 @@ pub async fn watch_restore_epoch(
                         metadata.clone_ipv6.as_deref(),
                         egress_gen_at_last_stable,
                         current,
+                        transport,
                     )
                     .await;
                     // Update stable generation after successful restore handling
@@ -216,6 +217,7 @@ pub async fn watch_restore_epoch(
                         metadata.clone_ipv6.as_deref(),
                         egress_gen_at_last_stable,
                         current,
+                        transport,
                     )
                     .await;
                     // Update stable generation after successful restore handling
