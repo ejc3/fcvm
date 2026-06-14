@@ -243,7 +243,7 @@ Supported runtimes: `python`, `node`, `ruby`, `go`, or any custom image name.
 
 ### Rootless Architecture
 
-Uses [pasta](https://passt.top/) (from the passt project) with a Linux bridge for L2 forwarding between pasta and the VM. Pasta uses splice(2) zero-copy L4 translation. IPv6 supported with `--enable-ipv6`.
+Uses [pasta](https://passt.top/) (from the passt project) with a Linux bridge for L2 forwarding between pasta and the VM. Pasta uses splice(2) zero-copy L4 translation. IPv6 is enabled automatically when the host has a global IPv6 address (auto-detected; no flag needed).
 
 Host services are reachable from VMs via pasta gateways: `10.0.2.2` (IPv4) and `fd00::2` (IPv6).
 
@@ -374,7 +374,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
+| `FCVM_DATA_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
 | `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to disable FUSE writeback cache |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
