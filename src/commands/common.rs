@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use crate::{
     firecracker::VmManager,
+    hypervisor::{firecracker::FirecrackerBackend, Hypervisor},
     network::{BridgedNetwork, NetworkConfig, NetworkManager, PastaNetwork},
     paths,
     state::{StateManager, VmState, VmStatus},
@@ -580,7 +581,7 @@ pub struct CleanupContext {
 /// 7. Remove data directory
 pub async fn cleanup_vm(
     ctx: CleanupContext,
-    vm_manager: &mut VmManager,
+    vm_manager: &mut dyn Hypervisor,
     holder_child: &mut Option<tokio::process::Child>,
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
@@ -866,7 +867,7 @@ pub async fn restore_from_snapshot(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-) -> Result<(VmManager, Option<tokio::process::Child>)> {
+) -> Result<(FirecrackerBackend, Option<tokio::process::Child>)> {
     let RestoreParams {
         vm_id,
         vm_name,
@@ -1340,7 +1341,14 @@ pub async fn restore_from_snapshot(
         return Err(e);
     }
 
-    Ok((vm_manager, holder_child))
+    // Wrap the fully-restored, resumed VmManager as the Firecracker backend. The restore
+    // path is Firecracker-specific (snapshot format, external UFFD, patch_drive, MMDS
+    // restore-epoch) and operates on the raw VmManager above; the caller holds it through
+    // the hypervisor trait.
+    Ok((
+        FirecrackerBackend::from_vm_manager(vm_manager),
+        holder_child,
+    ))
 }
 
 /// Core snapshot creation logic with automatic diff snapshot support.

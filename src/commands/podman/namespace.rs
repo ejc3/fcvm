@@ -1,18 +1,19 @@
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::firecracker::VmManager;
+use crate::hypervisor::ProcessSpec;
 use crate::network::PastaNetwork;
 use crate::state::VmState;
 
 /// Set up rootless namespace for VM networking.
 ///
 /// Spawns a holder process with retry logic, runs network setup via nsenter,
-/// and verifies TAP device creation. Returns the holder child process and PID.
+/// and verifies TAP device creation. Records the namespace paths + holder PID into
+/// `process_spec` so the VMM is launched into them, and returns the holder child.
 pub(super) async fn setup_rootless_namespace(
     pasta_net: &PastaNetwork,
     network_config: &crate::network::NetworkConfig,
-    vm_manager: &mut VmManager,
+    process_spec: &mut ProcessSpec,
     vm_state: &mut VmState,
 ) -> Result<tokio::process::Child> {
     // Step 1: Spawn holder process (keeps namespace alive)
@@ -217,16 +218,16 @@ pub(super) async fn setup_rootless_namespace(
     // (kernel zeros task->pdeath_signal on credential changes). The pre_exec setns
     // path sets pdeathsig AFTER entering the user namespace, so Firecracker gets
     // SIGKILL when fcvm dies.
-    vm_manager.set_user_namespace_path(std::path::PathBuf::from(format!(
+    process_spec.user_namespace_path = Some(std::path::PathBuf::from(format!(
         "/proc/{}/ns/user",
         holder_pid
     )));
-    vm_manager.set_net_namespace_path(std::path::PathBuf::from(format!(
+    process_spec.net_namespace_path = Some(std::path::PathBuf::from(format!(
         "/proc/{}/ns/net",
         holder_pid
     )));
     // Still track holder_pid for health checks (nsenter curl) and cleanup
-    vm_manager.set_holder_pid(holder_pid);
+    process_spec.holder_pid = Some(holder_pid);
 
     // Store holder_pid in state for health checks and cleanup
     vm_state.holder_pid = Some(holder_pid);

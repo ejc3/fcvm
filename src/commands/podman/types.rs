@@ -7,7 +7,8 @@ use tokio_util::sync::CancellationToken;
 use std::sync::atomic::AtomicBool;
 
 use crate::cli::RunArgs;
-use crate::firecracker::{FirecrackerConfig, VmManager};
+use crate::firecracker::FirecrackerConfig;
+use crate::hypervisor::firecracker::FirecrackerBackend;
 use crate::network::{NetworkConfig, NetworkManager};
 use crate::state::{StateManager, VmState};
 use crate::volume::VolumeConfig;
@@ -35,7 +36,7 @@ pub struct VmContext {
     pub vm_id: String,
     pub vm_name: String,
     pub data_dir: PathBuf,
-    pub vm_manager: VmManager,
+    pub vm_manager: FirecrackerBackend,
     pub holder_child: Option<tokio::process::Child>,
     pub volume_servers: crate::volume::SpawnedVolumes,
     pub network: Box<dyn NetworkManager>,

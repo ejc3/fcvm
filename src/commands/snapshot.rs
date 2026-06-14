@@ -14,6 +14,7 @@ use crate::cli::{
     SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs, SnapshotServeArgs,
 };
 use crate::firecracker::FcNetworkMode;
+use crate::hypervisor::Hypervisor;
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, RoutedNetwork};
 use crate::paths;
 use crate::state::{
@@ -1628,11 +1629,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         if let Some((plan, synth_args, volume_mappings)) = reboot_plan.as_ref() {
                             info!("guest rebooted — relaunching restored clone in place (cold boot)");
                             let relaunch_result = async {
+                                // The backend's VmManager still holds the restore-time
+                                // namespace fields; a minimal spec reuses them.
+                                let relaunch_spec = crate::hypervisor::ProcessSpec {
+                                    binary: plan.firecracker_bin.clone(),
+                                    extra_args: plan.fc_args.clone(),
+                                    ..Default::default()
+                                };
                                 vm_manager
-                                    .start(&plan.firecracker_bin, None, plan.fc_args.as_deref())
+                                    .spawn(&relaunch_spec)
                                     .await
                                     .context("relaunching Firecracker after guest reboot")?;
-                                super::podman::configure_and_boot_firecracker(
+                                super::podman::configure_and_boot_vm(
                                     &mut vm_manager,
                                     plan,
                                     synth_args,

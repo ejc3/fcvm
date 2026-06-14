@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::cli::RunArgs;
-use crate::firecracker::VmManager;
+use crate::hypervisor::{firecracker::FirecrackerBackend, Hypervisor};
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork};
 use crate::state::{StateManager, VmState};
 use crate::storage::DiskManager;
@@ -325,7 +325,7 @@ pub(crate) fn build_runtime_boot_args(
 /// Returns the list of extra disks and optionally the image archive device path.
 pub(super) async fn attach_extra_disks(
     args: &RunArgs,
-    client: &crate::firecracker::FirecrackerClient,
+    hv: &mut dyn crate::hypervisor::Hypervisor,
     data_dir: &std::path::Path,
     image_disk_path: Option<&std::path::Path>,
     image_disk_read_only: bool,
@@ -386,19 +386,13 @@ pub(super) async fn attach_extra_disks(
             mount_path,
             if read_only { "ro" } else { "rw" }
         );
-        client
-            .add_drive(
-                &drive_id,
-                crate::firecracker::api::Drive {
-                    drive_id: drive_id.clone(),
-                    path_on_host: abs_path.display().to_string(),
-                    is_root_device: false,
-                    is_read_only: read_only,
-                    partuuid: None,
-                    rate_limiter: None,
-                },
-            )
-            .await?;
+        hv.add_drive(&crate::hypervisor::DriveSpec {
+            drive_id: drive_id.clone(),
+            path_on_host: abs_path.clone(),
+            is_root_device: false,
+            is_read_only: read_only,
+        })
+        .await?;
     }
 
     // Process --disk-dir: create disk images from directories
@@ -473,19 +467,13 @@ pub(super) async fn attach_extra_disks(
             mount_path,
             if read_only { "ro" } else { "rw" }
         );
-        client
-            .add_drive(
-                &drive_id,
-                crate::firecracker::api::Drive {
-                    drive_id: drive_id.clone(),
-                    path_on_host: image_path.display().to_string(),
-                    is_root_device: false,
-                    is_read_only: read_only,
-                    partuuid: None,
-                    rate_limiter: None,
-                },
-            )
-            .await?;
+        hv.add_drive(&crate::hypervisor::DriveSpec {
+            drive_id: drive_id.clone(),
+            path_on_host: image_path.clone(),
+            is_root_device: false,
+            is_read_only: read_only,
+        })
+        .await?;
     }
 
     // Attach image disk as a block device.
@@ -500,19 +488,13 @@ pub(super) async fn attach_extra_disks(
             device,
             image_disk_read_only,
         );
-        client
-            .add_drive(
-                &drive_id,
-                crate::firecracker::api::Drive {
-                    drive_id: drive_id.clone(),
-                    path_on_host: disk_path.display().to_string(),
-                    is_root_device: false,
-                    is_read_only: image_disk_read_only,
-                    partuuid: None,
-                    rate_limiter: None,
-                },
-            )
-            .await?;
+        hv.add_drive(&crate::hypervisor::DriveSpec {
+            drive_id: drive_id.clone(),
+            path_on_host: disk_path.to_path_buf(),
+            is_root_device: false,
+            is_read_only: image_disk_read_only,
+        })
+        .await?;
         Some(device)
     } else {
         None
@@ -527,7 +509,7 @@ pub(super) async fn attach_extra_disks(
 /// Runtime-only values (network, proxies, timestamps) are computed here.
 pub(super) async fn build_and_send_mmds(
     launch_config: &crate::firecracker::FirecrackerConfig,
-    client: &crate::firecracker::FirecrackerClient,
+    hv: &mut dyn crate::hypervisor::Hypervisor,
     network_config: &crate::network::NetworkConfig,
     vm_state: &VmState,
     volume_mappings: &[VolumeMapping],
@@ -621,7 +603,7 @@ pub(super) async fn build_and_send_mmds(
     };
 
     let mmds_data = launch_config.to_mmds_json(runtime);
-    client.put_mmds(mmds_data).await?;
+    hv.publish_boot_plan(mmds_data).await?;
     Ok(())
 }
 
@@ -779,7 +761,7 @@ pub(super) async fn run_vm_setup(
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<(
-    VmManager,
+    FirecrackerBackend,
     Option<tokio::process::Child>,
     super::types::RebootSpec,
 )> {
@@ -788,7 +770,7 @@ pub(super) async fn run_vm_setup(
     // The inner setup publishes the Firecracker manager and holder process into these
     // slots as soon as they are created, so the error path below can kill them even
     // when the failure happens partway through configuration.
-    let mut vm_manager_slot: Option<VmManager> = None;
+    let mut vm_manager_slot: Option<FirecrackerBackend> = None;
     let mut holder_slot: Option<tokio::process::Child> = None;
     // Inputs to replay the firecracker config on an in-place relaunch (guest reboot),
     // captured once the launch config is fully resolved.
@@ -917,8 +899,8 @@ pub(crate) fn build_launch_config(
 ///   * `None` (reboot relaunch): the host substrate (disk, namespace/holder, pasta,
 ///     NFS exports, listeners, persisted state) is already live and is reused untouched.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn configure_and_boot_firecracker(
-    vm_manager: &mut VmManager,
+pub(crate) async fn configure_and_boot_vm(
+    hv: &mut dyn crate::hypervisor::Hypervisor,
     plan: &super::types::RebootSpec,
     args: &RunArgs,
     network_config: &crate::network::NetworkConfig,
@@ -928,12 +910,10 @@ pub(crate) async fn configure_and_boot_firecracker(
     volume_mappings: &[VolumeMapping],
     network: Option<&mut dyn NetworkManager>,
 ) -> Result<()> {
-    let vm_pid = vm_manager.pid()?;
-    let client = vm_manager.client()?;
+    let vm_pid = hv.pid()?;
 
-    info!("configuring VM via Firecracker API");
-    plan.launch_config
-        .apply(client, &plan.boot_args, plan.track_dirty_pages)
+    info!("configuring VM via hypervisor API");
+    hv.apply_launch_config(&plan.launch_config, &plan.boot_args, plan.track_dirty_pages)
         .await?;
 
     // Attach extra disks and image disk (read-only for all image modes). disk-dir
@@ -942,7 +922,7 @@ pub(crate) async fn configure_and_boot_firecracker(
     let image_disk_read_only = true;
     let (extra_disks, image_device) = attach_extra_disks(
         args,
-        client,
+        hv,
         data_dir,
         plan.image_disk_path.as_deref(),
         image_disk_read_only,
@@ -1019,52 +999,34 @@ pub(crate) async fn configure_and_boot_firecracker(
     }
 
     // Network interface - required for MMDS V2 in all modes.
-    client
-        .add_network_interface(
-            "eth0",
-            crate::firecracker::api::NetworkInterface {
-                iface_id: "eth0".to_string(),
-                host_dev_name: network_config.tap_device.clone(),
-                guest_mac: Some(network_config.guest_mac.clone()),
-                rx_rate_limiter: None,
-                tx_rate_limiter: None,
-            },
-        )
-        .await?;
+    hv.add_network_interface(&crate::hypervisor::NetIfaceSpec {
+        iface_id: "eth0".to_string(),
+        host_dev_name: network_config.tap_device.clone(),
+        guest_mac: Some(network_config.guest_mac.clone()),
+    })
+    .await?;
 
-    // MMDS configuration - V2 works in rootless mode as long as the interface exists.
-    client
-        .set_mmds_config(crate::firecracker::api::MmdsConfig {
-            version: "V2".to_string(),
-            network_interfaces: Some(vec!["eth0".to_string()]),
-            ipv4_address: Some("169.254.169.254".to_string()),
-        })
-        .await?;
+    // Metadata service for boot-plan delivery (Firecracker: MMDS V2 on eth0).
+    hv.configure_metadata_service().await?;
 
     // Always configure vsock device for status channel (and optionally volumes).
+    // The backend removes any stale host-side uds_path socket before binding (a reboot
+    // relaunch reuses the same path); the per-port listener sockets are untouched.
     info!(
         "Configuring vsock device at {:?} (status + {} volume(s))",
         plan.vsock_socket_path,
         volume_mappings.len()
     );
-    // Remove any stale host-side vsock socket left by a prior Firecracker child so
-    // the new one can bind it. On a reboot relaunch the exited child's uds_path
-    // socket file persists, which otherwise fails set_vsock with EADDRINUSE. This
-    // removes ONLY the main uds_path socket — the per-port listener sockets
-    // (uds_path_4999 / _4997), owned by the long-lived status/output listeners,
-    // use their own paths and are untouched.
-    let _ = std::fs::remove_file(&plan.vsock_socket_path);
-    client
-        .set_vsock(crate::firecracker::api::Vsock {
-            guest_cid: 3, // Guest CID (host is always 2)
-            uds_path: plan.vsock_socket_path.display().to_string(),
-        })
-        .await?;
+    hv.set_vsock(
+        crate::hypervisor::firecracker::default_guest_cid(),
+        &plan.vsock_socket_path,
+    )
+    .await?;
 
-    // Build and send MMDS data (container plan).
+    // Build and send the container boot plan.
     build_and_send_mmds(
         &plan.launch_config,
-        client,
+        hv,
         network_config,
         vm_state,
         volume_mappings,
@@ -1073,25 +1035,15 @@ pub(crate) async fn configure_and_boot_firecracker(
     .await?;
 
     // Configure entropy device (virtio-rng) for better random number generation.
-    client
-        .set_entropy_device(crate::firecracker::api::EntropyDevice { rate_limiter: None })
-        .await?;
+    hv.add_entropy_device().await?;
 
     // Balloon (if specified).
     if let Some(balloon_mib) = args.balloon {
-        client
-            .set_balloon(crate::firecracker::api::Balloon {
-                amount_mib: balloon_mib,
-                deflate_on_oom: true,
-                stats_polling_interval_s: Some(1),
-            })
-            .await?;
+        hv.add_balloon(balloon_mib).await?;
     }
 
     // Start VM.
-    client
-        .put_action(crate::firecracker::api::InstanceAction::InstanceStart)
-        .await?;
+    hv.boot().await?;
 
     Ok(())
 }
@@ -1106,7 +1058,7 @@ async fn run_vm_setup_inner(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-    vm_manager_slot: &mut Option<VmManager>,
+    vm_manager_slot: &mut Option<FirecrackerBackend>,
     holder_slot: &mut Option<tokio::process::Child>,
     reboot_spec_slot: &mut Option<super::types::RebootSpec>,
 ) -> Result<()> {
@@ -1170,35 +1122,6 @@ async fn run_vm_setup_inner(
     // Enable Firecracker debug logging
     let fc_log_path = data_dir.join("firecracker.log");
     let _ = std::fs::File::create(&fc_log_path);
-    let vm_manager = vm_manager_slot.insert(VmManager::new(
-        vm_id.to_string(),
-        socket_path.to_path_buf(),
-        Some(fc_log_path),
-    ));
-
-    // Set VM name for logging
-    vm_manager.set_vm_name(vm_name);
-
-    // Configure namespace isolation based on network type
-    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
-        // Bridged mode: use pre-created network namespace
-        if let Some(ns_id) = bridged_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
-        }
-    } else if let Some(routed_net) = network
-        .as_any()
-        .downcast_ref::<crate::network::RoutedNetwork>()
-    {
-        // Routed mode: use pre-created network namespace (like bridged)
-        if let Some(ns_id) = routed_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
-        }
-    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
-        *holder_slot =
-            Some(setup_rootless_namespace(pasta_net, network_config, vm_manager, vm_state).await?);
-    }
 
     let firecracker_bin = crate::commands::common::find_firecracker(runtime_config)?;
 
@@ -1209,8 +1132,46 @@ async fn run_vm_setup_inner(
         .as_deref()
         .or(fc_args_env.as_deref());
 
+    // Build the process-spawn spec: binary, extra args, and namespace isolation. The
+    // namespace fields are VMM-neutral (any VMM child runs in the same namespaces).
+    let mut process_spec = crate::hypervisor::ProcessSpec {
+        binary: firecracker_bin.clone(),
+        extra_args: fc_args.map(|s| s.to_string()),
+        vm_name: Some(vm_name),
+        ..Default::default()
+    };
+
+    // Configure namespace isolation based on network type.
+    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
+        // Bridged mode: use pre-created network namespace
+        if let Some(ns_id) = bridged_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in network namespace");
+            process_spec.namespace_id = Some(ns_id.to_string());
+        }
+    } else if let Some(routed_net) = network
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
+    {
+        // Routed mode: use pre-created network namespace (like bridged)
+        if let Some(ns_id) = routed_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
+            process_spec.namespace_id = Some(ns_id.to_string());
+        }
+    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
+        *holder_slot = Some(
+            setup_rootless_namespace(pasta_net, network_config, &mut process_spec, vm_state)
+                .await?,
+        );
+    }
+
+    let vm_manager = vm_manager_slot.insert(FirecrackerBackend::new(
+        vm_id.to_string(),
+        socket_path.to_path_buf(),
+        Some(fc_log_path),
+    ));
+
     vm_manager
-        .start(&firecracker_bin, None, fc_args)
+        .spawn(&process_spec)
         .await
         .context("starting Firecracker")?;
 
@@ -1254,7 +1215,7 @@ async fn run_vm_setup_inner(
     // Apply the plan and bring the VM up via the shared primitive. `Some(network)`
     // runs the host-once-only steps (NFS exports + pasta post_start); an in-place
     // reboot relaunch passes `None` and reuses the already-live host substrate.
-    configure_and_boot_firecracker(
+    configure_and_boot_vm(
         vm_manager,
         &plan,
         args,
