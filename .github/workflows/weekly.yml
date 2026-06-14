@@ -1,8 +1,8 @@
-name: Nightly
+name: Weekly
 
 on:
   schedule:
-    - cron: '0 4 * * *'  # 4 AM UTC daily
+    - cron: '0 4 * * 1'  # 4 AM UTC every Monday (weekly)
   workflow_dispatch:  # Manual trigger
 
 env:
