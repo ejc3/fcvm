@@ -66,7 +66,7 @@ pub enum Backend { Firecracker, CloudHypervisor }
 
 pub struct Capabilities {
     pub diff_snapshots: bool,             // FC: true,  CH: false
-    pub file_backed_cow_restore: bool,    // FC: true (measured, #632), CH: unverified (snapshot blocked)
+    pub file_backed_cow_restore: bool,    // FC: true (measured, #632); CH: unblocked post-#8268, density unmeasured (P2)
     pub external_uffd_lazy_restore: bool, // FC: true (fork handshake w/ page_size), CH: false
     pub internal_uffd_lazy_restore: bool, // FC: n/a,   CH: ondemand (v52; unverified on ARM64)
     pub drive_retarget: bool,             // FC: true,  CH: false (bind-mount redirect)

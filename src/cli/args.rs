@@ -5,7 +5,7 @@ use clap_complete::Shell;
 #[command(
     name = "fcvm",
     version,
-    about = "Firecracker VM runner for Podman containers"
+    about = "Podman container runner with microVM isolation (Firecracker or Cloud Hypervisor)"
 )]
 pub struct Cli {
     /// Running as a subprocess (disables timestamp and level in logs)
@@ -108,7 +108,7 @@ pub struct PodmanArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum PodmanCommands {
-    /// Run a container in a Firecracker VM
+    /// Run a container in a microVM (Firecracker or Cloud Hypervisor)
     Run(RunArgs),
 }
 

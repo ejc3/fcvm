@@ -259,15 +259,17 @@ impl Capabilities {
         }
     }
 
-    /// Cloud Hypervisor's capabilities (#632). Cold boot works (P1); snapshot/restore is
-    /// P2 (needs a CH build with the SVE fix #8268) and is gated off here until then.
+    /// Cloud Hypervisor's capabilities (#632). Cold boot (P1) and snapshot/restore/clone (P2)
+    /// both work: the SVE register-save bug is fixed upstream (#8268), so `snapshots` is enabled
+    /// below (explicit `snapshot create` / `snapshot run` via `--restore`, copy-mode).
     pub fn cloud_hypervisor() -> Self {
         Self {
             diff_snapshots: false,
             file_backed_cow_restore: false,
             // CH's UFFD handler is in-process — no external page server can drive it.
             external_uffd_lazy_restore: false,
-            // memory_restore_mode=ondemand exists (v52) but restore is gated to P2.
+            // memory_restore_mode=ondemand exists (v52) but is unused — CH restore uses
+            // memory_restore_mode=copy; the in-process ondemand lazy-restore handler is a follow-on.
             internal_uffd_lazy_restore: false,
             // No PATCH /drives equivalent — uses the bind-mount redirect instead.
             drive_retarget: false,

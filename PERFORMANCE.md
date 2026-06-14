@@ -12,7 +12,7 @@ All benchmarks run on AWS c7g.metal (bare-metal ARM64):
 | Architecture | aarch64 |
 | Memory | 128GB |
 | Storage | btrfs on NVMe |
-| Kernel | 6.18+ with nested virtualization |
+| Kernel | 6.18+ (nested virtualization enabled for the nested L2 benchmarks; not required for general fcvm use) |
 | Instance | c7g.metal |
 
 ---

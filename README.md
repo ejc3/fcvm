@@ -1,10 +1,10 @@
 # fcvm
 
-fcvm runs Podman containers inside Firecracker microVMs. You use the same images and registries as plain Podman, and each container gets its own kernel, so isolation comes from a VM boundary rather than from namespaces sharing the host kernel.
+fcvm runs Podman containers inside microVMs, with a pluggable hypervisor backend — Firecracker (default) or Cloud Hypervisor, selected with `--hypervisor firecracker|cloud-hypervisor`. You use the same images and registries as plain Podman, and each container gets its own kernel, so isolation comes from a VM boundary rather than from namespaces sharing the host kernel.
 
 fcvm avoids paying the VM boot cost on every run: the first run of an image boots cold and saves a snapshot once the image is loaded, later runs restore from that snapshot, and a running VM can be cloned in milliseconds with copy-on-write memory and disk. `fcvm serve` exposes the same workflow over an HTTP API for programs that create sandboxes on demand.
 
-- Cached startup takes ~540ms via snapshot restore, compared to ~3s for a cold boot (see [Container Image Cache](#container-image-cache))
+- Cached startup takes ~540ms via snapshot restore, compared to ~3.1s for a cold boot (see [Container Image Cache](#container-image-cache))
 - Cloning a running VM takes ~10ms using UFFD memory sharing and btrfs reflinks
 - 50 clones of a 512MB VM share physical pages through the kernel page cache, using ~512MB total rather than 25GB
 - Three network modes: rootless (no root required), bridged, and routed (native IPv6 at kernel line rate)
@@ -124,7 +124,7 @@ same guest path (preserve storage, restart container, regenerate identity).
 
 ### In-Place Reboot
 
-A guest `reboot` does not terminate the VM. The host relaunches Firecracker
+A guest `reboot` does not terminate the VM. The host relaunches the configured hypervisor backend
 against the same disk, network, and listeners — the fcvm process and its PID stay
 stable — and the guest comes back exactly like a disk-only clone cold boot:
 storage preserved, container restarted, identity regenerated. A guest `poweroff`
@@ -175,7 +175,8 @@ sudo ./fcvm setup --kernel-profile nested --install-host-kernel && sudo reboot
 # Outer VM with nested kernel
 sudo ./fcvm podman run --name outer --network bridged \
     --kernel-profile nested --privileged \
-    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs nginx:alpine
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    --map "$(pwd)":/opt/fcvm nginx:alpine
 
 # Inner VM (inside outer)
 ./fcvm exec --pid <outer_pid> --vm -- \
@@ -242,7 +243,7 @@ Supported runtimes: `python`, `node`, `ruby`, `go`, or any custom image name.
 
 ### Rootless Architecture
 
-Uses [pasta](https://passt.top/) (from the passt project) with a Linux bridge for L2 forwarding between pasta and Firecracker. Pasta uses splice(2) zero-copy L4 translation. IPv6 supported with `--enable-ipv6`.
+Uses [pasta](https://passt.top/) (from the passt project) with a Linux bridge for L2 forwarding between pasta and the VM. Pasta uses splice(2) zero-copy L4 translation. IPv6 supported with `--enable-ipv6`.
 
 Host services are reachable from VMs via pasta gateways: `10.0.2.2` (IPv4) and `fd00::2` (IPv6).
 
@@ -258,7 +259,7 @@ veth-host ←──veth pair──→ veth-ns
   (proxy NDP)                 |
                            br0 (10.0.2.1/24, fd00::1/64)
                                |
-                           tap-vm → Firecracker VM (10.0.2.100, unique IPv6)
+                           tap-vm → microVM (10.0.2.100, unique IPv6)
 ```
 
 ### Egress Proxy
@@ -274,7 +275,7 @@ VMs can reach host services via gateway addresses (not `127.0.0.1`, which is the
 | `10.0.2.2` | `127.0.0.1` (IPv4) | Rootless |
 | `fd00::2` | `::1` (IPv6) | Rootless |
 
-fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
+fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM as part of the boot plan, delivered via the configured backend's metadata transport (Firecracker: MMDS; Cloud Hypervisor: the host-served vsock boot-plan on port 4995).
 
 ### Port Forwarding
 
@@ -292,8 +293,9 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
 - AWS: c6g.metal (ARM64) or c5.metal (x86_64)
 
 **Dependencies:**
-- Rust 1.83+ with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
-- Firecracker binary in PATH
+- Rust 1.75+ with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
+- Firecracker binary in PATH (default backend)
+- Cloud Hypervisor binary in PATH (only if using `--hypervisor cloud-hypervisor`; override location with `FCVM_CLOUD_HYPERVISOR_BIN`)
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
 - For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set)
@@ -337,7 +339,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | Command | Description |
 |---------|-------------|
 | `fcvm setup` | Download kernel and create rootfs (5-10 min first run, then cached) |
-| `fcvm podman run` | Run container in Firecracker VM |
+| `fcvm podman run` | Run container in a microVM (backend selected with `--hypervisor`, default `firecracker`) |
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm ls` | List running VMs (`--json` for JSON) |
 | `fcvm snapshot create` | Snapshot a running VM |
@@ -447,7 +449,7 @@ fcvm/
 
 **Tests hang?** Kill test VMs: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
 
-**KVM not available?** Firecracker requires bare-metal or nested virt. On AWS, use `.metal` instances.
+**KVM not available?** Both Firecracker and Cloud Hypervisor require bare-metal KVM or nested virtualization. On AWS, use `.metal` instances.
 
 **Network issues?** Test incrementally inside a VM:
 ```bash
