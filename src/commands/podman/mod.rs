@@ -1075,7 +1075,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         return Err(e);
     }
 
-    let (vm_manager, holder_child, reboot_spec) = setup_result.unwrap();
+    let (vm_manager, holder_child, reboot_spec, bootplan_handle) = setup_result.unwrap();
 
     info!(vm_id = %vm_id, "VM started successfully");
 
@@ -1100,6 +1100,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         data_dir,
         vm_manager,
         holder_child,
+        bootplan_handle,
         volume_servers,
         network,
         network_config,
@@ -1323,7 +1324,13 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         .map(|s| VolumeMapping::parse(s))
                         .collect::<Result<Vec<_>>>()
                         .context("parsing volume mappings for reboot relaunch")?;
-                    vm_config::configure_and_boot_vm(
+                    // Reuse the original boot-plan transport; the relaunched guest's
+                    // boot args still carry fcvm_bootplan=vsock when applicable.
+                    let bootplan_over_vsock = ctx.reboot_spec.bootplan_over_vsock;
+                    if let Some(old) = ctx.bootplan_handle.take() {
+                        old.abort();
+                    }
+                    ctx.bootplan_handle = vm_config::configure_and_boot_vm(
                         &mut ctx.vm_manager,
                         &ctx.reboot_spec,
                         &ctx.args,
@@ -1333,6 +1340,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         &ctx.vm_id,
                         &volume_mappings,
                         None,
+                        bootplan_over_vsock,
                     )
                     .await
                     .context("relaunching VM after guest reboot")?;
@@ -1505,6 +1513,11 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
 
     // Stop the egress proxy task (rootless mode only)
     if let Some(handle) = ctx.egress_proxy_handle.take() {
+        handle.abort();
+    }
+
+    // Stop the boot-plan vsock listener (vsock transport only)
+    if let Some(handle) = ctx.bootplan_handle.take() {
         handle.abort();
     }
 

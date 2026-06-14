@@ -29,6 +29,10 @@ pub struct RebootSpec {
     pub track_dirty_pages: bool,
     pub image_disk_path: Option<PathBuf>,
     pub vsock_socket_path: PathBuf,
+    /// Whether the boot plan is delivered over vsock (VMMs without a metadata service)
+    /// rather than MMDS. Baked into `boot_args` too (`fcvm_bootplan=vsock`), so an
+    /// in-place reboot relaunch must re-serve over the same transport.
+    pub bootplan_over_vsock: bool,
 }
 
 /// All state accumulated during VM setup, bundled for the event loop and cleanup.
@@ -38,6 +42,9 @@ pub struct VmContext {
     pub data_dir: PathBuf,
     pub vm_manager: FirecrackerBackend,
     pub holder_child: Option<tokio::process::Child>,
+    /// Boot-plan vsock listener task (Some only when the plan is served over vsock for
+    /// VMMs without a metadata service). Aborted during cleanup.
+    pub bootplan_handle: Option<tokio::task::JoinHandle<()>>,
     pub volume_servers: crate::volume::SpawnedVolumes,
     pub network: Box<dyn NetworkManager>,
     pub network_config: NetworkConfig,

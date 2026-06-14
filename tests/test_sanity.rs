@@ -280,6 +280,54 @@ async fn test_trailing_args_command() -> Result<()> {
     Ok(())
 }
 
+/// P0.5 (#632): fc-agent fetches its boot plan over vsock instead of MMDS.
+///
+/// `FCVM_BOOTPLAN=vsock` forces the vsock boot-plan transport on Firecracker (the
+/// transport Cloud Hypervisor requires, since it has no MMDS). This proves the path
+/// end-to-end: the host serves the plan on the boot-plan vsock port, fc-agent reads it
+/// and configures + runs the container. If vsock plan delivery were broken, fc-agent
+/// would never receive its plan and the container would never run, so a clean exit is
+/// definitive proof the vsock boot-plan works.
+#[tokio::test]
+async fn test_bootplan_over_vsock() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nTest boot plan over vsock (FCVM_BOOTPLAN=vsock)");
+    println!("================================================");
+
+    let (vm_name, _, _, _) = common::unique_names("bootplan-vsock");
+
+    let (mut child, fcvm_pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            common::TEST_IMAGE,
+            "echo",
+            "bootplan-vsock-ok",
+        ],
+        &[("FCVM_BOOTPLAN", "vsock")],
+    )
+    .await
+    .context("spawning fcvm with FCVM_BOOTPLAN=vsock")?;
+
+    println!("  fcvm PID: {} (FCVM_BOOTPLAN=vsock)", fcvm_pid);
+
+    let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
+        .await
+        .context("timeout waiting for vsock-boot-plan VM")?
+        .context("waiting for child")?;
+
+    println!("  Exit status: {}", status);
+    assert!(
+        status.success(),
+        "VM should boot via the vsock boot-plan (MMDS disabled) and run the container"
+    );
+    println!("✅ VSOCK BOOT-PLAN TEST PASSED!");
+    Ok(())
+}
+
 /// Test that container stdout streams to host after snapshot.
 ///
 /// Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
