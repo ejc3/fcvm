@@ -18,7 +18,7 @@ use crate::volume::VolumeConfig;
 /// host-side substrate (disk, network namespace/holder, vsock listeners) is reused
 /// untouched, so a relaunch only replays the per-firecracker-child config.
 ///
-/// Consumed by the shared `configure_and_boot_firecracker` primitive (vm_config.rs),
+/// Consumed by the shared `configure_and_boot_vm` primitive (vm_config.rs),
 /// which both the initial boot and the reboot relaunch call.
 pub struct RebootSpec {
     pub firecracker_bin: PathBuf,

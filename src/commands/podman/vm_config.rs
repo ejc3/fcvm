@@ -503,7 +503,7 @@ pub(super) async fn attach_extra_disks(
     Ok((extra_disks, image_device))
 }
 
-/// Build MMDS data (container plan) and send it to Firecracker.
+/// Build MMDS data (container boot plan) and deliver it to the hypervisor.
 ///
 /// User-input fields come from `launch_config` (part of snapshot cache key).
 /// Runtime-only values (network, proxies, timestamps) are computed here.
@@ -883,16 +883,16 @@ pub(crate) fn build_launch_config(
     }
 }
 
-/// Apply a launch plan to a freshly-started Firecracker child and boot the VM.
+/// Apply a launch plan to a freshly-spawned VMM child and boot the VM.
 ///
 /// This is the SHARED configure-and-boot primitive used by three flows:
 ///   * initial `fcvm podman run` (via run_vm_setup_inner)
 ///   * disk-only clone cold boot (via prepare_vm -> run_vm_setup_inner)
 ///   * in-place relaunch after a guest reboot (via run_vm_loop)
 ///
-/// The caller must have already started Firecracker (`vm_manager.start(...)`); this
+/// The caller must have already spawned the VMM (`hv.spawn(...)`); this
 /// replays the full per-child API configuration (apply -> attach disks -> add eth0 ->
-/// MMDS config -> vsock -> MMDS data -> entropy -> balloon -> InstanceStart).
+/// metadata service -> vsock -> boot plan -> entropy -> balloon -> boot).
 ///
 /// `network` gates the host-once-only steps:
 ///   * `Some(network)` (initial boot / clone): runs NFS exports + pasta `post_start`.
