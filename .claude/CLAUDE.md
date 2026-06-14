@@ -869,6 +869,35 @@ When a POSIX test fails:
 
 4. **The mantra:** What do timestamps show? What's different between failing and passing? The logs ALWAYS have the answer.
 
+5. **Real example (cross-VM cache race, #632):** De-serialized nested tests (max-threads>1)
+   failed. The lazy conclusion was "nested KVM can't take concurrency (#660)." It was not —
+   the smoking gun was in the per-VM logs (`/tmp/nested-l2-*.log`), and the technique that
+   caught it is reusable:
+
+   - **Read the per-VM debug logs, not the nextest summary.** Two concurrent chains showed,
+     at the same second: chain A `resize2fs: Inode checksum does not match inode` and chain B
+     `renaming storage image to final path: No such file or directory (os error 2)` — both on
+     the SAME content-addressed path `image-cache/<digest>.storage-v2.img.tmp`. Same file, two
+     writers = race, full stop.
+   - **`e2fsck -fn` the *cached artifact* to prove the race POISONED the cache.** The
+     already-cached `.storage-v2.img` failed checksum ("Filesystem still has errors"). A race
+     that persists a corrupt content-addressed file silently breaks every *later* run too
+     (including serialized ones) — so the symptom and the cause can be in different test runs.
+   - **Know when a single host CAN'T reproduce it.** The per-digest `flock` works fine within
+     one kernel, so host-only concurrent processes serialize and never collide. The race only
+     appears across VM boundaries: nested tests `--map` the host `/mnt/fcvm-btrfs` into every
+     L1, and `flock()` over a fuse-pipe mount that negotiates no `FUSE_FLOCK_LOCKS` is granted
+     LOCALLY per guest kernel — it never reaches the shared host backing store. Faithful repro =
+     clear the digest's cache entry (cold cache) + run two nested tests concurrently.
+   - **Fix at the right altitude:** don't try to make `flock` work over FUSE — make the writes
+     not need a lock. Unique-per-builder temp names (`uuid`, NOT pid — separate PID namespaces
+     reuse numbers) + atomic rename to the content-addressed final (identical bytes → the
+     rename race is idempotent). See `src/commands/podman/{image.rs,mod.rs}`.
+
+   **Generalizable rule:** any file under a `--map`'d / FUSE-shared directory written by more
+   than one VM must be made safe WITHOUT relying on `flock`/`fcntl` locks — those don't cross
+   the fuse-pipe boundary. Use content-addressing + unique temp + atomic rename.
+
 ### NO TEST HEDGES
 
 **Test assertions must be DEFINITIVE.** A test either PASSES or FAILS - no middle ground.
