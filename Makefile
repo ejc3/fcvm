@@ -70,6 +70,30 @@ else
 IPV6_FILTER :=
 endif
 
+# CI runs a representative SUBSET of the active nested (NV2) tests, not all of them.
+# Nested tests are the arm64 long pole and do NOT parallelize — they degrade ~3.7x under
+# mutual contention (system-wide dsb(sy) on every nested guest-exit + NV2 overhead; see the
+# [test-groups.nested-tests] comment in .config/nextest.toml), so concurrency can't shrink
+# them. Instead CI runs three that cover the distinct nested risks and skips the rest
+# (which still run locally with a normal `make test-root`):
+#   - test_nested_run_fcvm_inside_vm  : nesting works at all + /dev/kvm usable in the guest
+#   - test_nested_l2_with_large_files : FUSE-over-FUSE cache coherency (the #630 DSB regression guard)
+#   - test_nested_l2_nfs              : the NFS-share data path under nesting
+# Skipped in CI (still run locally): test_nested_l2_fuse (FUSE path is covered by large_files),
+# test_nested_l2_network_fuse / _network_nfs (iperf throughput — the slowest AND flakiest under
+# any contention), and test_utimensat_pjdfstest_nested_kernel. The L3/L4, benchmark, and
+# podman-load nested tests are already #[ignore]'d (run manually, tracked in #630-B).
+# Gated on CI=true (set by GitHub Actions). Override anytime with an explicit FILTER=...
+# Scoped to package(fcvm) so fuse-pipe's fast test_nested_file unit test is NOT excluded.
+# Mutually exclusive with IPV6_FILTER in practice — CI runners have an IPv4 route, so
+# IPV6_ONLY is never set there (two -E filtersets would be UNIONED, not intersected).
+CI ?=
+ifndef FILTER
+ifeq ($(CI),true)
+CI_NESTED_FILTER := -E 'not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs)'
+endif
+endif
+
 # Default log level: fcvm debug, suppress FUSE spam
 # Override with: RUST_LOG=debug make test-root
 TEST_LOG ?= fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn
@@ -348,7 +372,7 @@ _test-root:
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --features privileged-tests $(IPV6_FILTER) $(FILTER) || \
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --features privileged-tests $(IPV6_FILTER) $(CI_NESTED_FILTER) $(FILTER) || \
 	{ echo ""; \
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 	  echo "TEST FAILED - Check debug logs for root cause:"; \

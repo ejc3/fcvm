@@ -56,11 +56,34 @@ max-threads = 1
 [test-groups.snapshot-tests]
 max-threads = 3
 
-# Nested (NV2) tests run one at a time: each chain is an L1 (4GB) plus an L2
-# VM — the heaviest tests in the suite, and the L2 boots a 10GB disk copy
-# INSIDE the L1 where there is no reflink. A 3-concurrent experiment under
-# full-suite load produced an L2 in-guest failure; serialized is the proven
-# configuration. Revisit with #660.
+# Nested (NV2) tests are the heaviest in the suite: each chain is an L1 (4GB) plus an L2 VM,
+# and the L2 boots a 10GB disk copy INSIDE the L1 where there is no reflink. They run only on
+# arm64 (FEAT_NV2). Run as a whole and serialized they were the CI long pole (~21 min/run,
+# ~54% of the arm64 SnapshotEnabled job's wall time and the reason arm64 CI ≈ 2x x64) — which
+# is why CI now runs only a representative subset (see the CI_NESTED_FILTER block in the
+# Makefile). This group config still governs whatever nested tests DO run (CI subset or the
+# full set locally): they run one at a time.
+#
+# Serialized (max-threads=1) ON PURPOSE — and it must stay that way. TWO independent reasons,
+# both measured (PR #677), not assumed:
+#
+# 1. Cross-VM image-cache race (now FIXED, kept defensively): nested tests `--map` the host
+#    /mnt/fcvm-btrfs into every L1, so two L1s preparing the same content-addressed image
+#    collided on the shared "<digest>.storage-v2.img.tmp" — concurrent mkfs/resize2fs
+#    CORRUPTED the image (e2fsck on the cached file showed "Filesystem still has errors") and
+#    one builder's rename ENOENT'd the other's temp. The per-digest flock did not help: it is
+#    flock() over a fuse-pipe mount that negotiates no FUSE_FLOCK_LOCKS, so each guest kernel
+#    grants it locally and never forwards to the shared host backing store. Fixed by UUID-keyed
+#    temps + atomic rename in src/commands/podman/{image.rs,mod.rs}.
+#
+# 2. Nested VMs do NOT parallelize — concurrency makes them SLOWER, not faster. Measured: two
+#    nested tests cold-cache concurrent = 1085s wall AND a flake (test_nested_l2_network_nfs's
+#    L2 ingress iperf3 starved and blew its internal 840s budget, killed at 852s); the SAME
+#    test alone = 227s. A ~3.7x slowdown from 2-way contention alone (no other suite load).
+#    Mechanism: every nested guest-exit issues a system-wide dsb(sy) (the #630 cache-coherency
+#    patch) + raw NV2 overhead, so concurrent chains stall each other globally. De-serializing
+#    therefore widens the tail and adds retries — the long pole must be cut a different way
+#    (fewer/faster nested tests), not with concurrency.
 [test-groups.nested-tests]
 max-threads = 1
 

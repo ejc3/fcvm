@@ -597,15 +597,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         if needs_export {
             info!(image = %args.image, digest = %digest, "Exporting localhost image as Docker archive");
 
-            // Save to a temp file in the same directory, then rename.
-            // This avoids corrupt archives from interrupted exports (atomic rename).
-            // NOTE: Can't use with_extension("docker.tar.tmp") here because archive_path
-            // ends in .docker.tar — with_extension replaces after the last dot, producing
-            // .docker.docker.tar.tmp (double .docker). Use format! to just append .tmp.
-            let tmp_path = PathBuf::from(format!("{}.tmp", archive_path.display()));
-
-            // Remove stale tmp file if it exists (skopeo won't overwrite)
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+            // Export into a UUID-keyed temp, then atomically rename. This avoids corrupt
+            // archives from interrupted exports AND is safe under cross-VM concurrency: the
+            // image-cache dir is shared across VMs and the per-digest flock above does not
+            // coordinate cross-VM (see image::unique_cache_tmp). A shared "<digest>.tmp"
+            // would let one VM's rename ENOENT the other's in-flight export.
+            let tmp_path = image::unique_cache_tmp(&archive_path);
 
             // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
             // tag (#598). A parallel build can repoint the tag between the cache-key
@@ -623,9 +620,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             }
 
             // Atomic rename within the same filesystem
-            tokio::fs::rename(&tmp_path, &archive_path)
-                .await
-                .context("renaming exported archive to final path")?;
+            if let Err(e) = tokio::fs::rename(&tmp_path, &archive_path).await {
+                // Clean up the UUID-keyed temp — unlike the old fixed-name temp, a UUID
+                // orphan is never overwritten by the next run.
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(e).context("renaming exported archive to final path");
+            }
 
             info!(path = %archive_path.display(), "Image exported as Docker archive");
         }
