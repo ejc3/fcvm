@@ -330,7 +330,18 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
         println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
         println!("  Files:");
-        println!("    {}", snapshot_config.memory_path.display());
+        // Cloud Hypervisor writes its own snapshot (config.json/state.json/memory ranges)
+        // into the `ch/` subdir; Firecracker writes memory.bin alongside.
+        if vm_state.config.hypervisor == crate::hypervisor::Backend::CloudHypervisor {
+            println!(
+                "    {}/",
+                snapshot_dir
+                    .join(super::common::CH_SNAPSHOT_SUBDIR)
+                    .display()
+            );
+        } else {
+            println!("    {}", snapshot_config.memory_path.display());
+        }
         println!("    {}", snapshot_config.disk_path.display());
         println!(
             "\nOriginal VM '{}' has been resumed and is still running.",
