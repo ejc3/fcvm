@@ -78,12 +78,6 @@ sudo ./fcvm podman run --name web --network routed nginx:alpine
 ./fcvm ls --json
 ```
 
-> **`--map` in rootless mode:** mapped volumes are read/written by the container's
-> *root* user. A container process running as a **non-root** user (e.g. nginx's
-> worker) currently gets I/O errors reading a rootless-mapped volume — use
-> `--network bridged` for those, or run the container as root. (The nginx example
-> above therefore needs `--network bridged` in rootless environments.)
-
 ---
 
 ## Snapshot & Clone Workflow

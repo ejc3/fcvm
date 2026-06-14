@@ -719,3 +719,78 @@ async fn test_container_startup_failure_triggers_shutdown() -> Result<()> {
         }
     }
 }
+
+/// #683: a NON-root container process must be able to read a rootless `--map`'d volume.
+///
+/// The rootless volume server runs unprivileged (no CAP_SETUID), so the per-request
+/// fs-credential switch in fuse-backend-rs used to hard-fail with EIO for non-root readers
+/// (e.g. nginx's worker → HTTP 500), while root readers and bridged mode worked. The
+/// fuse-backend-rs cap-gate skips the switch when unprivileged (the guest mount's
+/// DefaultPermissions still enforces DAC). This test runs the VM ROOTLESS *as the
+/// unprivileged user* (no sudo) so it actually reproduces the failure — a privileged run
+/// would hold CAP_SETUID and mask the bug.
+#[tokio::test]
+async fn test_rootless_map_nonroot_reader() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    println!("\nTest rootless --map readable by a non-root container process (#683)");
+
+    let (vm_name, _, _, _) = common::unique_names("map-nonroot");
+    let host_dir = format!("/tmp/{}", vm_name);
+    tokio::fs::create_dir_all(&host_dir).await?;
+    let marker = "rootless-map-nonroot-ok";
+    let file = format!("{}/data.txt", host_dir);
+    tokio::fs::write(&file, marker).await?;
+    // 0644 so a non-root reader is allowed by DAC — the check exercises the credential
+    // mechanism, not a real permission denial.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))?;
+
+    let map_arg = format!("{}:/data:ro", host_dir);
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--map",
+        &map_arg,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning rootless fcvm with --map")?;
+    let _ = &mut child;
+
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
+        common::kill_process(fcvm_pid).await;
+        let _ = tokio::fs::remove_dir_all(&host_dir).await;
+        return Err(e.context("VM failed to become healthy"));
+    }
+
+    // Control: root reads the mapped file (this always worked).
+    let root_read = common::exec_in_container(fcvm_pid, &["cat", "/data/data.txt"]).await;
+    // Regression: a NON-root user reads it (returned EIO before the cap-gate fix).
+    // exec_in_container joins argv with spaces and runs it under `sh -c`, so the inner
+    // `su -c <CMD>` must be a single pre-quoted element — otherwise `su -c cat /data/...`
+    // parses only `cat` as the command and `cat` reads empty stdin (exit 0, no output).
+    let nonroot_read =
+        common::exec_in_container(fcvm_pid, &["su -s /bin/sh nobody -c 'cat /data/data.txt'"])
+            .await;
+
+    common::kill_process(fcvm_pid).await;
+    let _ = tokio::fs::remove_dir_all(&host_dir).await;
+
+    let root_out = root_read.context("root read of mapped file failed")?;
+    assert!(
+        root_out.contains(marker),
+        "root should read the mapped file; got: {root_out:?}"
+    );
+    let nonroot_out =
+        nonroot_read.context("non-root read of mapped file failed (#683 EIO regression)")?;
+    assert!(
+        nonroot_out.contains(marker),
+        "non-root container process must read the rootless --map'd file (#683); got: {nonroot_out:?}"
+    );
+    println!("✅ #683: non-root read of rootless --map'd volume works");
+    Ok(())
+}
