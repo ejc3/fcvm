@@ -362,6 +362,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --portable-volumes    Path-hash inodes for cross-machine snapshot/restore
 --rootfs-size <SIZE>  Minimum free space on rootfs (default: 10G)
 --no-snapshot         Disable automatic snapshot creation
+--hypervisor <VMM>    firecracker (default) or cloud-hypervisor (#632)
 --ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE)
 ```
 
@@ -375,6 +376,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to disable FUSE writeback cache |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
+| `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
 | `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |
 
 ### Image Delivery Modes
