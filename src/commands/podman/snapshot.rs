@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::cli::RunArgs;
-use crate::firecracker::VmManager;
+use crate::hypervisor::firecracker::FirecrackerBackend;
 use crate::paths;
 use crate::state::VmState;
 use crate::storage::{SnapshotConfig, SnapshotManager, SnapshotType};
@@ -33,7 +33,7 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
 /// Uses VmState as the single source of truth for snapshot metadata,
 /// ensuring fields like `original_vsock_vm_id` are always preserved correctly.
 pub struct CreateSnapshotParams<'a> {
-    pub vm_manager: &'a VmManager,
+    pub vm_manager: &'a FirecrackerBackend,
     pub snapshot_key: &'a str,
     pub vm_state: &'a VmState,
     pub disk_path: &'a Path,

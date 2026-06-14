@@ -458,6 +458,18 @@ mod tests {
         assert_eq!(config1.snapshot_key(), config2.snapshot_key());
     }
 
+    /// Byte-identity guard (#632 P0). `snapshot_key()` hashes the serialized JSON of
+    /// `FirecrackerConfig`, so ANY change to this struct's serialization — a renamed or
+    /// reordered field, or a new field that isn't `skip`/`skip_serializing_if` for its
+    /// default — changes the key and silently invalidates every cached snapshot. This
+    /// pins the key of a known config so such a change fails loudly. If you intend to
+    /// change the schema (e.g. add a backend dimension to the cache key), update this
+    /// hash deliberately and document the cache invalidation.
+    #[test]
+    fn test_snapshot_key_golden() {
+        assert_eq!(test_config().snapshot_key(), "65cbe74458e3");
+    }
+
     #[test]
     fn test_snapshot_key_changes_with_config() {
         let config1 = test_config();
