@@ -30,10 +30,12 @@ pub use snapshot::{
     CreateSnapshotParams,
 };
 pub(crate) use vm_config::{
-    build_launch_config, build_runtime_boot_args, cleanup_nfs_exports,
-    configure_and_boot_firecracker, setup_nfs_exports,
+    build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
+    setup_nfs_exports,
 };
 use vm_config::{run_vm_setup, VmSetupParams};
+
+use crate::hypervisor::Hypervisor;
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
@@ -1299,17 +1301,19 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             state.config.snapshot_name = None;
                         })
                         .await;
-                    // Fresh Firecracker child on the same api socket; start() removes
+                    // Fresh Firecracker child on the same api socket; spawn() removes
                     // the stale socket and re-enters the same network namespace via the
-                    // holder_pid/namespace fields VmManager still holds. Then the shared
+                    // holder_pid/namespace fields the backend's VmManager still holds (the
+                    // relaunch spec carries only the binary + args). Then the shared
                     // configure-and-boot primitive replays the per-child config; None
                     // skips the host-once-only steps (the live substrate is reused).
+                    let relaunch_spec = crate::hypervisor::ProcessSpec {
+                        binary: ctx.reboot_spec.firecracker_bin.clone(),
+                        extra_args: ctx.reboot_spec.fc_args.clone(),
+                        ..Default::default()
+                    };
                     ctx.vm_manager
-                        .start(
-                            &ctx.reboot_spec.firecracker_bin,
-                            None,
-                            ctx.reboot_spec.fc_args.as_deref(),
-                        )
+                        .spawn(&relaunch_spec)
                         .await
                         .context("relaunching Firecracker after guest reboot")?;
                     let volume_mappings: Vec<VolumeMapping> = ctx
@@ -1319,7 +1323,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         .map(|s| VolumeMapping::parse(s))
                         .collect::<Result<Vec<_>>>()
                         .context("parsing volume mappings for reboot relaunch")?;
-                    vm_config::configure_and_boot_firecracker(
+                    vm_config::configure_and_boot_vm(
                         &mut ctx.vm_manager,
                         &ctx.reboot_spec,
                         &ctx.args,

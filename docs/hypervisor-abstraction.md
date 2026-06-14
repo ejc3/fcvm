@@ -1,9 +1,14 @@
 # Design: hypervisor-agnostic abstraction (Firecracker + Cloud Hypervisor)
 
-Status: **proposal / RFC** (epic: #632). Canonical design doc; #632 holds the full proven
+Status: **in implementation** (epic: #632). Canonical design doc; #632 holds the full proven
 capability mapping with source citations, a code-verified seam audit (per-call-site routing
-table + P0 checklist), and **measured experiment results** (2026-06-12: CH v52 boots the full
-fcvm stack; FC File-backend sharing quantified; CH v52 snapshot creation fails on ARM64).
+table + P0 checklist), and **measured experiment results**. P0 (the `Hypervisor` trait around
+Firecracker, no behavior change) is implemented in `src/hypervisor/`. Measured 2026-06-13:
+CH v52 boots the full fcvm stack (console `hvc0`, PCI on, kernel already in ARM64 `Image`
+format); FC File-backend sharing quantified; the CH ARM64 snapshot failure was **root-caused
+to the SVE register-save bug (CH #8057, fixed by #8268)** — NOT nesting — and snapshot create
+is **verified working on this Graviton3** with a post-fix CH build, so CH snapshot/restore
+(P2) is unblocked.
 
 **Scope: the two microVMs — Firecracker and Cloud Hypervisor.** QEMU is explicitly out of
 scope (it was the outlier on every hard axis: no host vsock UDS proxy, QMP vs REST, a much
@@ -42,7 +47,7 @@ Full table + citations in #632.
 | vsock host↔guest (`CONNECT`) | ✅ | ✅ same design (live parity unverified) | single `GuestChannel` (UdsConnect) expected |
 | full snapshot + restore-into-fresh-process | ✅ | ✅ | trait |
 | UFFD lazy restore | ✅ | ✅ (`memory_restore_mode=ondemand`, v52) | trait |
-| **cross-clone memory sharing** | ✅ **measured**: `File` backend mmaps `memory.bin` MAP_PRIVATE; 3× 1GiB clones ≈ 230MiB total PSS, with dirty tracking on OR off. UFFD path is **lazy population, not sharing** (UFFDIO_COPY makes per-VM copies) | ❓ blocked: CH v52 snapshot create fails on ARM64 (`GetAarchCoreRegister` EINVAL), so density unmeasured | split caps: `file_backed_cow_restore` / `external_uffd_lazy_restore` / `internal_uffd_lazy_restore` |
+| **cross-clone memory sharing** | ✅ **measured**: `File` backend mmaps `memory.bin` MAP_PRIVATE; 3× 1GiB clones ≈ 230MiB total PSS, with dirty tracking on OR off. UFFD path is **lazy population, not sharing** (UFFDIO_COPY makes per-VM copies) | ⏳ unblocked, density unmeasured: CH `ondemand` is in-process UFFD (per-VM pages), so density must come from page-cache sharing of a `MAP_PRIVATE` snapshot file — measurable now that snapshot create works (post-#8268) | split caps: `file_backed_cow_restore` / `external_uffd_lazy_restore` / `internal_uffd_lazy_restore` |
 | diff / incremental snapshots | ✅ | ❌ | cap `diff_snapshots` (FC-only; CH takes full) |
 | drive retarget on restore (`patch_drive`) | ✅ | ❌ | use **bind-mount redirect** (already VMM-agnostic) everywhere |
 | metadata service (boot plan) | ✅ MMDS | ❌ no MMDS | **boot-plan over vsock** (portable; keep MMDS as FC fast path) |
@@ -94,15 +99,19 @@ pub trait GuestChannel { fn connect(&self, port: u32) -> Result<UnixStream>; fn 
    (also: vsock CID convention, the restore-reset event — CH also resets vsock on restore).
 2. **Drive retarget.** Make the **bind-mount namespace redirect** primary (VMM-agnostic);
    `patch_drive` becomes an FC optimization.
-3. **Memory-share clones — measured (#632, 2026-06-12).** FC's `File` backend mmaps the
+3. **Memory-share clones — measured (#632, 2026-06-13).** FC's `File` backend mmaps the
    snapshot MAP_PRIVATE: 3× 1GiB clones cost ~230MiB total PSS, and `track_dirty_pages`
    does NOT erode the sharing (ON vs OFF within 1MiB — the flag's costs are KVM logging
    overhead and the 2M→4K hugepage split). FC's UFFD path is **lazy population, not
    sharing**: guest RAM is MAP_ANONYMOUS and UFFDIO_COPY makes a private per-VM copy of
    each faulted page — density there comes from only working sets materializing. CH's
-   density is **unmeasured**: CH v52 snapshot creation fails on ARM64
-   (`GetAarchCoreRegister` EINVAL; FC snapshots work on the same host), blocking both the
-   `ondemand` and CoW-backing experiments.
+   `ondemand` restore is also in-process UFFD (per-VM pages), so CH clone density must
+   come from page-cache sharing of a `MAP_PRIVATE` snapshot file, the same mechanism as
+   FC's `File` backend. CH density is **unmeasured but now measurable**: the earlier ARM64
+   snapshot-create failure (`GetAarchCoreRegister` EINVAL) was misattributed to NV2/nesting
+   — it is the SVE register-save bug (CH #8057), which hits every SVE-capable aarch64 host
+   regardless of nesting, and is fixed by CH #8268. With a post-#8268 CH build, snapshot
+   create is verified working on this Graviton3.
 4. **Diff snapshots / ARM64 nesting / native metadata.** Capability-gated to Firecracker.
 5. **Snapshot format/version is per-VMM** — the cache key must encode
    `(backend, binary, version)` and refuse cross-backend/version restores.
@@ -124,23 +133,35 @@ optional future: evaluate embedding a VMM via rust-vmm/libkrun.
 - **P0.5** Boot-plan-over-vsock in fc-agent (removes the MMDS dependency for CH).
 - **P1** Cloud Hypervisor backend: cold boot + run a container via the vsock boot-plan (no
   snapshots). De-risked by experiment (#632): CH v52 boots fcvm's kernel+initrd+rootfs to
-  fc-agent today — needs `console=ttyAMA0` (custom profile kernels lack PL011: add
-  `CONFIG_SERIAL_AMBA_PL011=y` or use `hvc0`), `--cpus boot=`, `image_type=raw` on disks,
-  no `pci=off`. fc-agent starts ALL vsock channels only after the boot-plan fetch, so P0.5
-  is a hard prerequisite for any guest-channel function on CH.
+  fc-agent today — needs `console=hvc0` (CH's default console is virtio-pci `hvc0`, NOT the
+  PL011 `ttyAMA0`, which is the `--serial` device and off by default), `--cpus boot=N`,
+  `image_type=raw` on disks (auto-detect deprecated in v52, pass it explicitly), `--net`,
+  `--vsock cid=,socket=`, NO `pci=off` (CH puts virtio devices on PCI). fcvm's kernel asset
+  is already in ARM64 `Image` (PE/MZ) format, which CH loads directly — no conversion. The
+  host↔guest `CONNECT <port>` proxy reply is `OK <port>\n`, wire-compatible with Firecracker
+  (`exec.rs` parser needs no change). fc-agent starts ALL vsock channels only after the
+  boot-plan fetch, so P0.5 is a hard prerequisite for any guest-channel function on CH.
 - **P2** CH snapshot/restore + UFFD `ondemand`; capability-gate diff + memory-share; verify
-  CoW sharing. **Currently blocked**: CH v52 snapshot creation fails on ARM64
-  (`GetAarchCoreRegister` EINVAL) — isolate vs the `kvm-arm.mode=nested` host kernel, test
-  newer CH, file upstream. Until resolved, realistic CH scope is P1 only.
+  CoW sharing. **Unblocked** (the earlier ARM64 snapshot-create failure was the SVE
+  register-save bug CH #8057, fixed by #8268 — not nesting): build CH from a commit ≥ #8268
+  (or cherry-pick it onto v52, pinned like the FC fork). Snapshot create is verified on this
+  Graviton3 with a post-fix build. Note `memory_restore_mode=ondemand` is v52-min, strict
+  (no fallback to copy), page-aligned ranges, CLI `ondemand` vs HTTP enum `OnDemand`. CH's
+  aarch64 UFFD restore is one release old and unproven — test restore explicitly (cf. the
+  CNTVOFF_EL2 timer-on-restore history).
 - **P3** Parity polish: capability-driven degradation everywhere, `--hypervisor {firecracker,cloud-hypervisor}` in profiles/state/cache-key, docs, CI matrix dimension on both backends.
 Each phase: tests + `/code-review` + Codex review per repo convention.
 
 ## Open research items
-- Root-cause CH v52 ARM64 snapshot failure (`GetAarchCoreRegister` EINVAL): stock host
-  kernel? newer CH? upstream bug? Blocks all CH snapshot/restore work.
-- Verify CH cross-clone CoW sharing (`--memory file=` + restore path maps snapshot
-  MAP_PRIVATE as guest RAM) — blocked on the above.
-- CH vsock `CONNECT` parity with a live guest listener (testable only after P0.5 lands,
-  since fc-agent binds vsock channels only post-boot-plan; CH docs confirm the
-  `<socket>_<port>` naming).
+- ~~Root-cause CH ARM64 snapshot failure~~ **RESOLVED**: SVE register-save bug (CH #8057,
+  fixed #8268), not nesting. Hits every SVE aarch64 host. Snapshot create verified on this
+  Graviton3 with a post-#8268 CH build. Remaining: pin a CH build (commit ≥ #8268) and
+  content-address it like the FC fork.
+- Verify CH cross-clone CoW sharing (`--memory file=` / snapshot file mapped MAP_PRIVATE as
+  guest RAM) and `ondemand` restore on this NV2 host — now measurable; needs explicit
+  restore validation (aarch64 UFFD restore is one release old).
+- ~~CH vsock `CONNECT` parity~~ **RESOLVED from source**: CH replies `OK <port>\n`
+  (`virtio-devices/src/vsock/.../muxer.rs`), wire-compatible with Firecracker; on failure CH
+  closes the socket silently (no `-` reply), which fcvm's retry loop already tolerates. Still
+  worth an end-to-end check against a live guest listener once P0.5 lands.
 - Per-backend security/jailing model.

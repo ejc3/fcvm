@@ -430,7 +430,10 @@ mod tests {
             boot_source: BootSource {
                 kernel_image_path: "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
                 initrd_path: "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-                ..Default::default()
+                // Fixed boot args (not the arch-dependent static default, which uses
+                // reboot=t on x86 vs reboot=k on ARM64) so the golden snapshot_key below
+                // is identical on x86_64 and aarch64.
+                boot_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string(),
             },
             machine_config: MachineConfig {
                 vcpu_count: 2,
@@ -456,6 +459,18 @@ mod tests {
         let config1 = test_config();
         let config2 = test_config();
         assert_eq!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    /// Byte-identity guard (#632 P0). `snapshot_key()` hashes the serialized JSON of
+    /// `FirecrackerConfig`, so ANY change to this struct's serialization — a renamed or
+    /// reordered field, or a new field that isn't `skip`/`skip_serializing_if` for its
+    /// default — changes the key and silently invalidates every cached snapshot. This
+    /// pins the key of a known config so such a change fails loudly. If you intend to
+    /// change the schema (e.g. add a backend dimension to the cache key), update this
+    /// hash deliberately and document the cache invalidation.
+    #[test]
+    fn test_snapshot_key_golden() {
+        assert_eq!(test_config().snapshot_key(), "db30465bfbf5");
     }
 
     #[test]
