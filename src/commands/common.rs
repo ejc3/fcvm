@@ -53,6 +53,12 @@ pub const VSOCK_OUTPUT_PORT: u32 = 4997;
 /// Vsock port for TTY container I/O (binary exec_proto)
 pub const VSOCK_TTY_PORT: u32 = 4996;
 
+/// Vsock port the host serves the boot plan on, for VMMs without a metadata service
+/// (Cloud Hypervisor — #632 P0.5). fc-agent fetches its plan here when the kernel
+/// boot args contain `fcvm_bootplan=vsock`; Firecracker uses MMDS instead. Must match
+/// `fc-agent::bootplan::BOOTPLAN_VSOCK_PORT`.
+pub const VSOCK_BOOTPLAN_PORT: u32 = 4995;
+
 /// Minimum required Firecracker version for network_overrides support
 const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
 

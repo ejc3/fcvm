@@ -1650,8 +1650,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                                     &vm_id,
                                     volume_mappings,
                                     None,
+                                    plan.bootplan_over_vsock,
                                 )
                                 .await
+                                .map(|_bootplan_handle| ())
                             }
                             .await;
                             match relaunch_result {
@@ -1882,6 +1884,8 @@ async fn build_clone_reboot_plan(
         // overlay/archive-mode container's image layers survive the reboot.
         image_disk_path: meta.image_disk_path.clone(),
         vsock_socket_path: vsock_socket_path.to_path_buf(),
+        // Clones restore from Firecracker snapshots and use MMDS; CH clone/restore is P2.
+        bootplan_over_vsock: false,
     };
     Ok((plan, synth_args, volume_mappings))
 }

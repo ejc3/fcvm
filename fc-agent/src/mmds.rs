@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 use crate::types::{LatestMetadata, Plan};
@@ -108,6 +107,16 @@ pub async fn fetch_plan() -> Result<Plan> {
     };
 
     Ok(plan)
+}
+
+/// Fetch `/latest` metadata with a default client (used by the boot-plan transport).
+pub async fn fetch_latest_metadata_default() -> Result<LatestMetadata> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    fetch_latest_metadata(&client).await
 }
 
 async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadata> {
@@ -242,25 +251,5 @@ pub async fn sync_clock_from_host() -> Result<()> {
     let metadata: LatestMetadata =
         serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
-    eprintln!("[fc-agent] received host time: {}", metadata.host_time);
-
-    let output = Command::new("date")
-        .arg("-u")
-        .arg("-s")
-        .arg(format!("@{}", metadata.host_time))
-        .output()
-        .await
-        .context("setting system clock")?;
-
-    if !output.status.success() {
-        eprintln!(
-            "[fc-agent] WARNING: failed to set clock: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
-    } else {
-        eprintln!("[fc-agent] system clock synchronized from host");
-    }
-
-    Ok(())
+    crate::bootplan::set_system_clock(&metadata.host_time).await
 }

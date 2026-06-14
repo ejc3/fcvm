@@ -277,6 +277,54 @@ pub(crate) async fn run_status_listener(
     }
 }
 
+/// Bind the boot-plan vsock listener and spawn its serve loop (#632 P0.5).
+///
+/// For VMMs without a metadata service (Cloud Hypervisor), fc-agent fetches its plan
+/// from this listener instead of MMDS. Firecracker forwards a guest connection to vsock
+/// port N to the Unix socket `{uds_path}_{N}`, so we bind that path and write the plan
+/// JSON (the MMDS `latest` object: `{ "container-plan": {...}, "host-time": "..." }`) to
+/// each connecting guest, then close so the guest's `read_to_end` sees EOF.
+///
+/// Serialization and bind happen SYNCHRONOUSLY so a failure is surfaced to the caller
+/// (returns `Err`) instead of being swallowed in a detached task — otherwise the guest
+/// would loop forever waiting for a plan that is never served. The returned task runs for
+/// the VM's lifetime (the guest may reconnect for clock sync); the caller aborts it on
+/// cleanup or on any later boot-config failure.
+pub(crate) fn spawn_bootplan_listener(
+    socket_path: &str,
+    plan: &serde_json::Value,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use tokio::net::UnixListener;
+
+    let payload = serde_json::to_vec(plan).context("serializing boot plan")?;
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("binding boot-plan listener to {socket_path}"))?;
+    info!(socket = %socket_path, bytes = payload.len(), "Boot-plan listener started (vsock)");
+
+    Ok(tokio::spawn(serve_bootplan(listener, payload)))
+}
+
+/// Accept loop for the boot-plan listener: write the plan to each connecting guest and
+/// close the write side so the guest's `read_to_end` observes EOF.
+async fn serve_bootplan(listener: tokio::net::UnixListener, payload: Vec<u8>) {
+    use tokio::io::AsyncWriteExt;
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                if let Err(e) = stream.write_all(&payload).await {
+                    debug!(error = %e, "boot-plan listener: write failed");
+                    continue;
+                }
+                let _ = stream.shutdown().await;
+            }
+            Err(e) => {
+                warn!(error = %e, "boot-plan listener: accept error");
+            }
+        }
+    }
+}
+
 /// Bidirectional I/O listener for container stdin/stdout/stderr.
 ///
 /// Listens on port 4997 for raw output from fc-agent.

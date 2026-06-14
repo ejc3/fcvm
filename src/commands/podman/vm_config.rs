@@ -507,14 +507,13 @@ pub(super) async fn attach_extra_disks(
 ///
 /// User-input fields come from `launch_config` (part of snapshot cache key).
 /// Runtime-only values (network, proxies, timestamps) are computed here.
-pub(super) async fn build_and_send_mmds(
+pub(super) fn build_boot_plan_json(
     launch_config: &crate::firecracker::FirecrackerConfig,
-    hv: &mut dyn crate::hypervisor::Hypervisor,
     network_config: &crate::network::NetworkConfig,
     vm_state: &VmState,
     volume_mappings: &[VolumeMapping],
     image_device: Option<String>,
-) -> Result<()> {
+) -> serde_json::Value {
     // Build volume mount info for MMDS
     // Format: { guest_path, vsock_port, read_only }
     let volumes: Vec<serde_json::Value> = volume_mappings
@@ -602,9 +601,7 @@ pub(super) async fn build_and_send_mmds(
         host_time: chrono::Utc::now().timestamp().to_string(),
     };
 
-    let mmds_data = launch_config.to_mmds_json(runtime);
-    hv.publish_boot_plan(mmds_data).await?;
-    Ok(())
+    launch_config.to_mmds_json(runtime)
 }
 
 /// Set up NFS exports for VM.
@@ -764,6 +761,7 @@ pub(super) async fn run_vm_setup(
     FirecrackerBackend,
     Option<tokio::process::Child>,
     super::types::RebootSpec,
+    Option<tokio::task::JoinHandle<()>>,
 )> {
     let vm_id = params.vm_id.to_string();
 
@@ -775,6 +773,8 @@ pub(super) async fn run_vm_setup(
     // Inputs to replay the firecracker config on an in-place relaunch (guest reboot),
     // captured once the launch config is fully resolved.
     let mut reboot_spec_slot: Option<super::types::RebootSpec> = None;
+    // Boot-plan vsock listener handle (Some only when serving the plan over vsock).
+    let mut bootplan_handle_slot: Option<tokio::task::JoinHandle<()>> = None;
 
     let result = run_vm_setup_inner(
         params,
@@ -784,6 +784,7 @@ pub(super) async fn run_vm_setup(
         &mut vm_manager_slot,
         &mut holder_slot,
         &mut reboot_spec_slot,
+        &mut bootplan_handle_slot,
     )
     .await;
 
@@ -802,6 +803,10 @@ pub(super) async fn run_vm_setup(
             }
             let _ = holder.wait().await; // Clean up zombie
         }
+        // Abort the boot-plan listener task if it was started.
+        if let Some(handle) = bootplan_handle_slot.take() {
+            handle.abort();
+        }
         // NFS exports may have been written before the failing step; remove them
         // (no-op when the exports file was never created).
         cleanup_nfs_exports(&vm_id).await;
@@ -810,7 +815,7 @@ pub(super) async fn run_vm_setup(
 
     let vm_manager = vm_manager_slot.expect("run_vm_setup_inner sets vm_manager on success");
     let reboot_spec = reboot_spec_slot.expect("run_vm_setup_inner sets reboot_spec on success");
-    Ok((vm_manager, holder_slot, reboot_spec))
+    Ok((vm_manager, holder_slot, reboot_spec, bootplan_handle_slot))
 }
 
 /// Build the FirecrackerConfig used to cold-boot a VM from a disk.
@@ -898,6 +903,9 @@ pub(crate) fn build_launch_config(
 ///   * `Some(network)` (initial boot / clone): runs NFS exports + pasta `post_start`.
 ///   * `None` (reboot relaunch): the host substrate (disk, namespace/holder, pasta,
 ///     NFS exports, listeners, persisted state) is already live and is reused untouched.
+///
+/// Returns the boot-plan vsock listener's task handle when `bootplan_over_vsock` is set
+/// (the caller owns its lifetime and aborts it on cleanup); `None` for the MMDS path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn configure_and_boot_vm(
     hv: &mut dyn crate::hypervisor::Hypervisor,
@@ -909,7 +917,8 @@ pub(crate) async fn configure_and_boot_vm(
     vm_id: &str,
     volume_mappings: &[VolumeMapping],
     network: Option<&mut dyn NetworkManager>,
-) -> Result<()> {
+    bootplan_over_vsock: bool,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
     let vm_pid = hv.pid()?;
 
     info!("configuring VM via hypervisor API");
@@ -1023,16 +1032,41 @@ pub(crate) async fn configure_and_boot_vm(
     )
     .await?;
 
-    // Build and send the container boot plan.
-    build_and_send_mmds(
+    // Build the container boot plan and deliver it. For VMMs without a metadata service
+    // (Cloud Hypervisor), serve it over vsock and return the listener handle; otherwise
+    // publish it via MMDS (Firecracker).
+    let plan_json = build_boot_plan_json(
         &plan.launch_config,
-        hv,
         network_config,
         vm_state,
         volume_mappings,
         image_device,
-    )
-    .await?;
+    );
+    // Wrapped in an abort-on-drop guard: if a later boot-config step (entropy/balloon/
+    // boot) returns Err, the guard drops and aborts the listener task instead of leaking
+    // it. On success we disarm and hand the handle to the caller.
+    let bootplan_guard = AbortOnDrop(if bootplan_over_vsock {
+        // fc-agent reads the inner `latest` object; the host listens on
+        // `{vsock_socket}_{VSOCK_BOOTPLAN_PORT}` (Firecracker/CH vsock proxy naming).
+        // Bind happens synchronously here so a bind failure fails setup fast rather than
+        // leaving the guest looping forever waiting for a plan that is never served.
+        let inner = plan_json
+            .get("latest")
+            .cloned()
+            .unwrap_or_else(|| plan_json.clone());
+        let socket = format!(
+            "{}_{}",
+            plan.vsock_socket_path.display(),
+            crate::commands::common::VSOCK_BOOTPLAN_PORT
+        );
+        Some(
+            super::listeners::spawn_bootplan_listener(&socket, &inner)
+                .context("starting boot-plan vsock listener")?,
+        )
+    } else {
+        hv.publish_boot_plan(plan_json).await?;
+        None
+    });
 
     // Configure entropy device (virtio-rng) for better random number generation.
     hv.add_entropy_device().await?;
@@ -1045,7 +1079,26 @@ pub(crate) async fn configure_and_boot_vm(
     // Start VM.
     hv.boot().await?;
 
-    Ok(())
+    Ok(bootplan_guard.disarm())
+}
+
+/// Aborts the wrapped task on drop unless [`Self::disarm`]ed. Ensures the boot-plan vsock
+/// listener spawned mid-`configure_and_boot_vm` is not leaked if a later step fails.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    /// Take the handle out, defusing the abort-on-drop (the caller now owns it).
+    fn disarm(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Inner VM setup: creates the CoW disk, starts Firecracker, and configures the VM.
@@ -1053,6 +1106,7 @@ pub(crate) async fn configure_and_boot_vm(
 /// The Firecracker manager and (for rootless mode) the namespace-holder child are
 /// stored into the provided slots as soon as they exist so that `run_vm_setup` can
 /// kill them if a later step fails.
+#[allow(clippy::too_many_arguments)]
 async fn run_vm_setup_inner(
     params: VmSetupParams<'_>,
     network: &mut dyn NetworkManager,
@@ -1061,6 +1115,7 @@ async fn run_vm_setup_inner(
     vm_manager_slot: &mut Option<FirecrackerBackend>,
     holder_slot: &mut Option<tokio::process::Child>,
     reboot_spec_slot: &mut Option<super::types::RebootSpec>,
+    bootplan_handle_slot: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     let VmSetupParams {
         args,
@@ -1175,6 +1230,12 @@ async fn run_vm_setup_inner(
         .await
         .context("starting Firecracker")?;
 
+    // Boot-plan transport: VMMs without a native metadata service (Cloud Hypervisor)
+    // must receive the plan over vsock; Firecracker uses MMDS. FCVM_BOOTPLAN=vsock forces
+    // the vsock path on Firecracker too (exercised by the P0.5 regression test).
+    let bootplan_over_vsock = !vm_manager.capabilities().native_metadata_service
+        || std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock");
+
     // Build FirecrackerConfig for launch (single source of truth for VM config)
     // Use fc_config from cache check if available, otherwise build fresh.
     // IMPORTANT: fc_config uses content-addressed base_rootfs path for cache key,
@@ -1197,7 +1258,11 @@ async fn run_vm_setup_inner(
             )
         });
 
-    let runtime_boot_args = build_runtime_boot_args(args, network_config, runtime_config);
+    let mut runtime_boot_args = build_runtime_boot_args(args, network_config, runtime_config);
+    if bootplan_over_vsock {
+        // fc-agent reads this kernel arg to select the vsock boot-plan transport.
+        runtime_boot_args.push_str(" fcvm_bootplan=vsock");
+    }
 
     // The launch plan: everything needed to (re)boot this VM. Built UP FRONT so the
     // exact same descriptor boots the VM now and relaunches it on a guest reboot, and
@@ -1210,12 +1275,13 @@ async fn run_vm_setup_inner(
         track_dirty_pages,
         image_disk_path: image_disk_path.map(|p| p.to_path_buf()),
         vsock_socket_path: vsock_socket_path.to_path_buf(),
+        bootplan_over_vsock,
     };
 
     // Apply the plan and bring the VM up via the shared primitive. `Some(network)`
     // runs the host-once-only steps (NFS exports + pasta post_start); an in-place
     // reboot relaunch passes `None` and reuses the already-live host substrate.
-    configure_and_boot_vm(
+    *bootplan_handle_slot = configure_and_boot_vm(
         vm_manager,
         &plan,
         args,
@@ -1225,6 +1291,7 @@ async fn run_vm_setup_inner(
         vm_id,
         volume_mappings,
         Some(network),
+        bootplan_over_vsock,
     )
     .await?;
 
