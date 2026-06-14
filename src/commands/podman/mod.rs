@@ -620,9 +620,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             }
 
             // Atomic rename within the same filesystem
-            tokio::fs::rename(&tmp_path, &archive_path)
-                .await
-                .context("renaming exported archive to final path")?;
+            if let Err(e) = tokio::fs::rename(&tmp_path, &archive_path).await {
+                // Clean up the UUID-keyed temp — unlike the old fixed-name temp, a UUID
+                // orphan is never overwritten by the next run.
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(e).context("renaming exported archive to final path");
+            }
 
             info!(path = %archive_path.display(), "Image exported as Docker archive");
         }
