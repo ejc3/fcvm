@@ -869,7 +869,7 @@ When a POSIX test fails:
 
 4. **The mantra:** What do timestamps show? What's different between failing and passing? The logs ALWAYS have the answer.
 
-5. **Real example (cross-VM cache race, #632):** De-serialized nested tests (max-threads>1)
+5. **Real example (cross-VM cache race, #677):** De-serialized nested tests (max-threads>1)
    failed. The lazy conclusion was "nested KVM can't take concurrency (#660)." It was not —
    the smoking gun was in the per-VM logs (`/tmp/nested-l2-*.log`), and the technique that
    caught it is reusable:
