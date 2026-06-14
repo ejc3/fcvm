@@ -94,7 +94,23 @@ endif
 CI ?=
 ifndef FILTER
 ifeq ($(CI),true)
-CI_NESTED_FILTER := -E '(not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs)) & not test(=test_cloud_hypervisor_cold_boot)'
+# Base test-root CI filter: the nested subset (exclude all nested except the 3 kept) AND
+# always exclude the CH cold-boot test (#687).
+CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs)) & not test(=test_cloud_hypervisor_cold_boot)
+ifeq ($(FCVM_NO_SNAPSHOT),)
+# SnapshotEnabled mode (FCVM_NO_SNAPSHOT unset): ALSO drop test_nested_l2_with_large_files.
+# It guards FUSE-over-FUSE DATA INTEGRITY (the #630 DSB cache-coherency fix) — a live-traffic
+# property of the always-on kernel patch, independent of the snapshot feature — and it already
+# runs in the SnapshotDisabled job (~225s). Under SnapshotEnabled it runs TWICE (cold + restore)
+# and the warm run is a 4GB *nested* VM UFFD restore whose page faults go through double Stage-2
+# translation (~842s), ~18 min total for zero extra integrity coverage. Snapshot/restore
+# correctness is covered by test_startup_snapshot_* and the CH/clone roundtrips. This is the
+# single biggest lever on the arm64 SnapshotEnabled long pole (the file copy itself is only ~20s).
+CI_NESTED_FILTER := -E '$(CI_ROOT_BASE) & not test(=test_nested_l2_with_large_files)'
+else
+# SnapshotDisabled mode: keep test_nested_l2_with_large_files (the FUSE-integrity guard runs here).
+CI_NESTED_FILTER := -E '$(CI_ROOT_BASE)'
+endif
 endif
 endif
 
