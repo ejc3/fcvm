@@ -405,8 +405,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // into the snapshot-cache / UFFD restore path.
     let no_snapshot = args.no_snapshot
         || args.rootfs_override.is_some()
-        // Cloud Hypervisor snapshot/restore is P2 (needs a post-#8268 build); P1 is
-        // cold-boot only, so never enter the snapshot-cache / restore path for it.
+        // Cloud Hypervisor supports explicit `snapshot create`/`run` (P2), but the
+        // automatic pre-start snapshot cache for `podman run` is not wired up for CH yet
+        // (a follow-on) — so never enter the snapshot-cache / restore path for it here.
         || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
         || std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())

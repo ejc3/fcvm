@@ -273,8 +273,10 @@ impl Capabilities {
             native_metadata_service: false,
             // No aarch64 virtual-EL2 path.
             nested_arm64: false,
-            // Cold boot only in P1; flipped on in P2 with a post-#8268 CH build.
-            snapshots: false,
+            // P2: explicit `snapshot create` / `snapshot run` work for CH (pause→vm.snapshot
+            // →resume; `--restore source_url=…/ch,memory_restore_mode=copy`). The automatic
+            // pre-start cache integration for CH is a follow-on (still gated off in podman run).
+            snapshots: true,
         }
     }
 }
