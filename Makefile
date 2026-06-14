@@ -87,10 +87,14 @@ endif
 # Scoped to package(fcvm) so fuse-pipe's fast test_nested_file unit test is NOT excluded.
 # Mutually exclusive with IPV6_FILTER in practice — CI runners have an IPv4 route, so
 # IPV6_ONLY is never set there (two -E filtersets would be UNIONED, not intersected).
+# The CH cold-boot exclusion (see CI_FAST_FILTER, #687) is ANDed into the SAME filterset
+# here rather than added as a second -E: test-root uses default features (which include
+# integration-fast), so the CH integration tests also run under test-root, and a separate
+# -E would be UNIONED (re-including cold_boot) instead of intersected.
 CI ?=
 ifndef FILTER
 ifeq ($(CI),true)
-CI_NESTED_FILTER := -E 'not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs)'
+CI_NESTED_FILTER := -E '(not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs)) & not test(=test_cloud_hypervisor_cold_boot)'
 endif
 endif
 
