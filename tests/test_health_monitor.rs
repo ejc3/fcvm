@@ -94,6 +94,7 @@ async fn test_health_monitor_behaviors() {
             user: None,
             username: None,
             health_check_timeout: 5,
+            hypervisor: Default::default(),
         },
     };
 

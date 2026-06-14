@@ -163,9 +163,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
     }
 
-    // Create client directly for existing VM
-    use crate::firecracker::FirecrackerClient;
-    let client = FirecrackerClient::new(socket_path)?;
+    // The control client is created per-backend in the memory-snapshot branch below
+    // (FirecrackerClient vs ChClient on the same socket path). The disk-only path needs
+    // no control client (it quiesces the guest over vsock).
 
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
 
@@ -256,14 +256,28 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         )
         .await?;
     } else {
-        super::common::create_snapshot_core(
-            &client,
-            snapshot_config.clone(),
-            &vm_disk_path,
-            parent_dir.as_deref(),
-            None,
-        )
-        .await?;
+        // Memory snapshot: drive the VM's actual control plane. Both backends listen on
+        // the same `firecracker.sock` path; the client type + snapshot mechanism differ.
+        match vm_state.config.hypervisor {
+            crate::hypervisor::Backend::Firecracker => {
+                use crate::firecracker::FirecrackerClient;
+                let client = FirecrackerClient::new(socket_path.clone())?;
+                super::common::create_snapshot_core(
+                    &client,
+                    snapshot_config.clone(),
+                    &vm_disk_path,
+                    parent_dir.as_deref(),
+                    None,
+                )
+                .await?;
+            }
+            crate::hypervisor::Backend::CloudHypervisor => {
+                let client =
+                    crate::hypervisor::cloud_hypervisor::api::ChClient::new(socket_path.clone());
+                super::common::create_snapshot_ch(&client, snapshot_config.clone(), &vm_disk_path)
+                    .await?;
+            }
+        }
     }
 
     // Track this snapshot as the latest base for future diff snapshots.
@@ -2193,6 +2207,7 @@ mod tests {
             kernel_profile: Some("btrfs".to_string()),
             image_mode: Some("overlay".to_string()),
             image_disk_path: Some(std::path::PathBuf::from("/cache/img.storage-v2.img")),
+            hypervisor: Default::default(),
         };
         let args =
             run_args_from_snapshot_metadata(&meta, "clone".to_string(), 2, 1024, false, None);

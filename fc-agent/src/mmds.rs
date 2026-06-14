@@ -141,8 +141,16 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
     Ok(metadata)
 }
 
-/// Watch for restore-epoch changes in MMDS and handle clone restore.
-pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
+/// Watch for restore-epoch changes and handle clone restore, over either transport.
+///
+/// Firecracker polls MMDS; Cloud Hypervisor polls the host's boot-plan vsock port
+/// (#632 P2) — both via [`crate::bootplan::fetch_metadata`], so the restore handling is
+/// identical. MMDS polls at 50ms (a cheap local HTTP get); vsock polls slower because each
+/// poll reopens the boot-plan connection and re-reads the whole plan document.
+pub async fn watch_restore_epoch(
+    signals: crate::restore::RestoreSignals,
+    transport: crate::bootplan::Transport,
+) {
     let mut last_epoch: Option<String> = None;
 
     // Track the egress proxy generation at the last stable point.
@@ -150,25 +158,27 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
     let mut egress_gen_at_last_stable: Option<u64> =
         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
 
+    let poll_interval = match transport {
+        crate::bootplan::Transport::Mmds => Duration::from_millis(50),
+        crate::bootplan::Transport::Vsock => Duration::from_millis(250),
+    };
+
     loop {
-        sleep(Duration::from_millis(50)).await;
+        sleep(poll_interval).await;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
-        let metadata = match fetch_latest_metadata(&client).await {
+        let metadata = match crate::bootplan::fetch_metadata(transport).await {
             Ok(m) => m,
             Err(e) => {
-                // Log every 200th failure (~10s at 50ms poll interval) to avoid spam
-                // but still surface persistent errors after snapshot restore.
+                // Log the first few then every 200th failure to avoid spam while still
+                // surfacing persistent errors after snapshot restore.
                 static FAIL_COUNT: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let count = FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if count < 5 || count.is_multiple_of(200) {
-                    eprintln!("[fc-agent] MMDS fetch failed (count={}): {:?}", count, e);
+                    eprintln!(
+                        "[fc-agent] restore metadata fetch failed (count={}): {:?}",
+                        count, e
+                    );
                 }
                 continue;
             }

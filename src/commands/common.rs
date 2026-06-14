@@ -1510,6 +1510,7 @@ pub fn build_snapshot_config(
             kernel_profile: vm_state.config.kernel_profile.clone(),
             image_mode: vm_state.config.image_mode.clone(),
             image_disk_path: vm_state.config.image_disk_path.clone(),
+            hypervisor: vm_state.config.hypervisor,
         },
     }
 }
@@ -2241,6 +2242,168 @@ pub async fn create_snapshot_core(
         "snapshot created successfully"
     );
 
+    Ok(())
+}
+
+/// Subdirectory inside a snapshot directory holding Cloud Hypervisor's own snapshot files
+/// (its `config.json`, `state.json`, and memory ranges). Kept under a subdir so CH's
+/// `config.json` does not collide with fcvm's top-level `config.json` (the `SnapshotConfig`
+/// metadata). The CH restore path passes `file://{snapshot_dir}/{CH_SNAPSHOT_SUBDIR}` as the
+/// `--restore source_url`.
+pub const CH_SNAPSHOT_SUBDIR: &str = "ch";
+
+/// Cloud Hypervisor snapshot create. Full snapshots only — CH has no diff/dirty-page
+/// tracking in fcvm yet (#632 P2). Mirrors [`create_snapshot_core`]'s scaffolding (temp
+/// dir, paused-disk reflink for memory/disk consistency, atomic rename) but drives CH's
+/// `vm.pause` → `vm.snapshot` → `vm.resume` instead of Firecracker's snapshot API.
+///
+/// The VM is resumed regardless of success or failure, mirroring the Firecracker path.
+pub async fn create_snapshot_ch(
+    client: &crate::hypervisor::cloud_hypervisor::api::ChClient,
+    mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
+    disk_path: &Path,
+) -> Result<()> {
+    // CH snapshots are always self-contained (no diff base / parent chain).
+    snapshot_config.parent_snapshot = None;
+
+    // Acquire the same concurrency permit the Firecracker path uses, to bound simultaneous
+    // memory dumps (dirty_ratio throttling) across backends.
+    let _permit = snapshot_semaphore()
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("snapshot semaphore closed: {}", e))?;
+
+    // Owned so no borrow of `snapshot_config` is held across the later config write.
+    let snapshot_dir = snapshot_config
+        .memory_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?
+        .to_path_buf();
+    let snapshot_dir = snapshot_dir.as_path();
+    let temp_snapshot_dir = snapshot_sibling(snapshot_dir, "creating");
+
+    // Clean up a stale (incomplete) snapshot dir — one with no config.json.
+    if snapshot_dir.exists() && !snapshot_dir.join("config.json").exists() {
+        info!(snapshot = %snapshot_config.name, "cleaning up stale snapshot directory");
+        let _ = tokio::fs::remove_dir_all(snapshot_dir).await;
+    }
+
+    // Disk-space guard: a full memory dump needs ~memory_mib. Failing ENOSPC mid-dump
+    // would leave the VM in a bad state.
+    {
+        let required_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
+        let statvfs_path = if snapshot_dir.exists() {
+            snapshot_dir
+        } else {
+            snapshot_dir.parent().unwrap_or(snapshot_dir)
+        };
+        if let Ok(stat) = nix::sys::statvfs::statvfs(statvfs_path) {
+            let available_bytes = stat.blocks_available() * stat.fragment_size();
+            if available_bytes < required_bytes {
+                anyhow::bail!(
+                    "Not enough disk space for Cloud Hypervisor snapshot: need {} MiB, \
+                     have {} MiB free on {}.",
+                    required_bytes / (1024 * 1024),
+                    available_bytes / (1024 * 1024),
+                    snapshot_dir.display()
+                );
+            }
+        }
+    }
+
+    // Fresh temp dir + the CH sub-dir CH dumps its files into.
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    let ch_dir = temp_snapshot_dir.join(CH_SNAPSHOT_SUBDIR);
+    tokio::fs::create_dir_all(&ch_dir)
+        .await
+        .context("creating temp CH snapshot directory")?;
+
+    info!(snapshot = %snapshot_config.name, "pausing Cloud Hypervisor VM for snapshot");
+    // Pause first (CH requires a paused VM to snapshot). If pause fails the VM is NOT
+    // paused, so there is nothing to resume.
+    if let Err(e) = client.pause_vm().await {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("pausing Cloud Hypervisor VM for snapshot (VM still running)");
+    }
+
+    // VM is paused — we MUST resume it before returning, regardless of outcome.
+    let dest_url = format!("file://{}", ch_dir.display());
+    let snapshot_result = client.snapshot_vm(&dest_url).await;
+
+    // Reflink the disk(s) WHILE PAUSED so the disk image matches the captured memory
+    // (a post-resume write would desync memory/disk and corrupt the clone's filesystem).
+    let disk_copy_result = if snapshot_result.is_ok() {
+        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
+        info!(snapshot = %snapshot_config.name, "copying disk (CH VM paused)");
+        let mut r = reflink_copy(disk_path, &temp_disk_path).await;
+        if r.is_ok() {
+            for extra_disk in &snapshot_config.metadata.extra_disks {
+                let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
+                    .join("disks")
+                    .join(&extra_disk.filename);
+                let dest = temp_snapshot_dir.join(&extra_disk.filename);
+                if let Err(e) = reflink_copy(&source, &dest).await {
+                    r = Err(e).context("copying CH extra disk");
+                    break;
+                }
+            }
+        }
+        r
+    } else {
+        Ok(())
+    };
+
+    // Resume ALWAYS, even if the snapshot or disk copy failed.
+    let resume_result = client.resume_vm().await;
+    if let Err(e) = &resume_result {
+        error!(snapshot = %snapshot_config.name, error = %e,
+            "CRITICAL: failed to resume Cloud Hypervisor VM after snapshot — VM may be paused!");
+    }
+
+    if let Err(e) = snapshot_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("creating Cloud Hypervisor snapshot");
+    }
+    if let Err(e) = disk_copy_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("copying disk during Cloud Hypervisor snapshot");
+    }
+    if let Err(e) = resume_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("resuming Cloud Hypervisor VM after snapshot");
+    }
+
+    info!(snapshot = %snapshot_config.name, "CH VM resumed, finalizing snapshot");
+
+    // Write fcvm's metadata config.json, then atomically swap the dir into place.
+    let temp_config_path = temp_snapshot_dir.join("config.json");
+    let config_json =
+        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
+    tokio::fs::write(&temp_config_path, &config_json)
+        .await
+        .context("writing snapshot config")?;
+
+    if snapshot_dir.exists() {
+        let old_snapshot_dir = snapshot_sibling(snapshot_dir, "old");
+        let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
+        tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
+            .await
+            .context("moving old snapshot out of the way")?;
+        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
+        let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
+    } else {
+        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
+    }
+
+    info!(
+        snapshot = %snapshot_config.name,
+        disk = %snapshot_config.disk_path.display(),
+        "Cloud Hypervisor snapshot created successfully"
+    );
     Ok(())
 }
 

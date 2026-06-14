@@ -41,8 +41,14 @@ use std::process::ExitStatus;
 use tokio::sync::mpsc;
 
 /// Which VMM a backend drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Default` is `Firecracker` so a state/snapshot file written before the backend was
+/// recorded (no `hypervisor` field) deserializes as Firecracker — the only backend that
+/// existed then. Serialized in `VmConfig` / `SnapshotConfig` so `snapshot create`/`run`
+/// know which VMM to drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Backend {
+    #[default]
     Firecracker,
     CloudHypervisor,
 }
