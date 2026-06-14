@@ -747,7 +747,14 @@ async fn test_rootless_map_nonroot_reader() -> Result<()> {
 
     let map_arg = format!("{}:/data:ro", host_dir);
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run", "--name", &vm_name, "--network", "rootless", "--map", &map_arg,
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--map",
+        &map_arg,
         common::TEST_IMAGE,
     ])
     .await
@@ -763,11 +770,12 @@ async fn test_rootless_map_nonroot_reader() -> Result<()> {
     // Control: root reads the mapped file (this always worked).
     let root_read = common::exec_in_container(fcvm_pid, &["cat", "/data/data.txt"]).await;
     // Regression: a NON-root user reads it (returned EIO before the cap-gate fix).
-    let nonroot_read = common::exec_in_container(
-        fcvm_pid,
-        &["su", "-s", "/bin/sh", "nobody", "-c", "cat /data/data.txt"],
-    )
-    .await;
+    // exec_in_container joins argv with spaces and runs it under `sh -c`, so the inner
+    // `su -c <CMD>` must be a single pre-quoted element — otherwise `su -c cat /data/...`
+    // parses only `cat` as the command and `cat` reads empty stdin (exit 0, no output).
+    let nonroot_read =
+        common::exec_in_container(fcvm_pid, &["su -s /bin/sh nobody -c 'cat /data/data.txt'"])
+            .await;
 
     common::kill_process(fcvm_pid).await;
     let _ = tokio::fs::remove_dir_all(&host_dir).await;
