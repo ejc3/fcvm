@@ -503,10 +503,12 @@ pub(super) async fn attach_extra_disks(
     Ok((extra_disks, image_device))
 }
 
-/// Build MMDS data (container boot plan) and deliver it to the hypervisor.
+/// Build the boot-plan JSON (the `latest` object served to fc-agent).
 ///
-/// User-input fields come from `launch_config` (part of snapshot cache key).
-/// Runtime-only values (network, proxies, timestamps) are computed here.
+/// Used by both transports: MMDS (`hv.publish_boot_plan`) and vsock
+/// (`spawn_bootplan_listener`). User-input fields come from `launch_config`
+/// (part of snapshot cache key); runtime-only values (network, proxies,
+/// timestamps) are computed here.
 pub(super) fn build_boot_plan_json(
     launch_config: &crate::firecracker::FirecrackerConfig,
     network_config: &crate::network::NetworkConfig,
