@@ -31,6 +31,7 @@ fn test_run_args(name: &str) -> RunArgs {
         publish: vec![],
         balloon: None,
         network: NetworkMode::Rootless,
+        hypervisor: fcvm::cli::args::Hypervisor::Firecracker,
         health_check: None,
         privileged: false,
         interactive: false,

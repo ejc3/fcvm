@@ -31,6 +31,7 @@
 //! deferred to P2 (now unblocked: the earlier CH ARM64 snapshot-create failure was the
 //! SVE register-save bug CH #8057, fixed by #8268 — not nesting).
 
+pub mod cloud_hypervisor;
 pub mod firecracker;
 
 use anyhow::Result;
@@ -247,6 +248,27 @@ impl Capabilities {
             native_metadata_service: true,
             nested_arm64: true,
             snapshots: true,
+        }
+    }
+
+    /// Cloud Hypervisor's capabilities (#632). Cold boot works (P1); snapshot/restore is
+    /// P2 (needs a CH build with the SVE fix #8268) and is gated off here until then.
+    pub fn cloud_hypervisor() -> Self {
+        Self {
+            diff_snapshots: false,
+            file_backed_cow_restore: false,
+            // CH's UFFD handler is in-process — no external page server can drive it.
+            external_uffd_lazy_restore: false,
+            // memory_restore_mode=ondemand exists (v52) but restore is gated to P2.
+            internal_uffd_lazy_restore: false,
+            // No PATCH /drives equivalent — uses the bind-mount redirect instead.
+            drive_retarget: false,
+            // No MMDS — the boot plan is delivered over vsock (P0.5).
+            native_metadata_service: false,
+            // No aarch64 virtual-EL2 path.
+            nested_arm64: false,
+            // Cold boot only in P1; flipped on in P2 with a post-#8268 CH build.
+            snapshots: false,
         }
     }
 }
