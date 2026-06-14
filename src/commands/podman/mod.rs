@@ -22,7 +22,7 @@ pub(crate) use types::{RebootSpec, VolumeMapping};
 // ID even when the tag is rebuilt mid-export).
 pub use image::export_image_archive;
 
-pub(crate) use listeners::{run_output_listener, run_status_listener};
+pub(crate) use listeners::{run_output_listener, run_status_listener, spawn_bootplan_listener};
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
