@@ -35,7 +35,7 @@ pub(crate) use vm_config::{
 };
 use vm_config::{run_vm_setup, VmSetupParams};
 
-use crate::hypervisor::Hypervisor;
+use crate::hypervisor::firecracker::FirecrackerBackend;
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
@@ -405,6 +405,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // into the snapshot-cache / UFFD restore path.
     let no_snapshot = args.no_snapshot
         || args.rootfs_override.is_some()
+        // Cloud Hypervisor snapshot/restore is P2 (needs a post-#8268 build); P1 is
+        // cold-boot only, so never enter the snapshot-cache / restore path for it.
+        || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
         || std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
             .unwrap_or(false);
@@ -1331,7 +1334,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         old.abort();
                     }
                     ctx.bootplan_handle = vm_config::configure_and_boot_vm(
-                        &mut ctx.vm_manager,
+                        ctx.vm_manager.as_mut(),
                         &ctx.reboot_spec,
                         &ctx.args,
                         &ctx.network_config,
@@ -1375,8 +1378,13 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
+                    let fc_backend = ctx
+                        .vm_manager
+                        .as_any()
+                        .downcast_ref::<FirecrackerBackend>()
+                        .context("snapshot creation requires the Firecracker backend")?;
                     let snap = CreateSnapshotParams {
-                        vm_manager: &ctx.vm_manager,
+                        vm_manager: fc_backend,
                         snapshot_key: key,
                         vm_state: &ctx.vm_state,
                         disk_path: &ctx.disk_path,
@@ -1461,8 +1469,13 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         // The diff parent is resolved inside create_podman_snapshot under
                         // the per-VM snapshot lock (re-read from the state file), so a
                         // concurrent `fcvm snapshot create` cannot leave us with a stale base.
+                        let fc_backend = ctx
+                            .vm_manager
+                            .as_any()
+                            .downcast_ref::<FirecrackerBackend>()
+                            .context("snapshot creation requires the Firecracker backend")?;
                         let snap = CreateSnapshotParams {
-                            vm_manager: &ctx.vm_manager,
+                            vm_manager: fc_backend,
                             snapshot_key: &startup_key,
                             vm_state: &ctx.vm_state,
                             disk_path: &ctx.disk_path,
@@ -1532,7 +1545,7 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
             health_monitor_handle: Some(ctx.health_monitor_handle),
             output_listener_handle: ctx.output_handle,
         },
-        &mut ctx.vm_manager,
+        ctx.vm_manager.as_mut(),
         &mut ctx.holder_child,
         ctx.network.as_mut(),
         &ctx.state_manager,
@@ -1639,6 +1652,7 @@ mod tests {
             publish: vec![],
             balloon: None,
             network: NetworkMode::Rootless,
+            hypervisor: crate::cli::args::Hypervisor::Firecracker,
             health_check: None,
             health_check_timeout: 5,
             privileged: false,

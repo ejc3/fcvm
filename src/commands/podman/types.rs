@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::cli::RunArgs;
 use crate::firecracker::FirecrackerConfig;
-use crate::hypervisor::firecracker::FirecrackerBackend;
+use crate::hypervisor::Hypervisor;
 use crate::network::{NetworkConfig, NetworkManager};
 use crate::state::{StateManager, VmState};
 use crate::volume::VolumeConfig;
@@ -40,7 +40,7 @@ pub struct VmContext {
     pub vm_id: String,
     pub vm_name: String,
     pub data_dir: PathBuf,
-    pub vm_manager: FirecrackerBackend,
+    pub vm_manager: Box<dyn Hypervisor>,
     pub holder_child: Option<tokio::process::Child>,
     /// Boot-plan vsock listener task (Some only when the plan is served over vsock for
     /// VMMs without a metadata service). Aborted during cleanup.

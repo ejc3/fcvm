@@ -198,6 +198,10 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
     pub network: NetworkMode,
 
+    /// VMM backend: firecracker (default) or cloud-hypervisor (#632).
+    #[arg(long, value_enum, default_value_t = Hypervisor::Firecracker)]
+    pub hypervisor: Hypervisor,
+
     /// Routable IPv6 /64 prefix for routed mode VM addressing.
     /// Each VM gets a unique address in this prefix via NDP proxy.
     /// When set, MASQUERADE is skipped (the prefix is directly routable).
@@ -519,6 +523,25 @@ pub enum NetworkMode {
     Rootless,
     /// Routed networking using veth + IPv6 routing (requires sudo, no NAT needed)
     Routed,
+}
+
+/// VMM backend selection (#632). Maps to [`crate::hypervisor::Backend`].
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, ValueEnum)]
+pub enum Hypervisor {
+    /// Firecracker (default).
+    #[default]
+    Firecracker,
+    /// Cloud Hypervisor.
+    CloudHypervisor,
+}
+
+impl From<Hypervisor> for crate::hypervisor::Backend {
+    fn from(h: Hypervisor) -> Self {
+        match h {
+            Hypervisor::Firecracker => crate::hypervisor::Backend::Firecracker,
+            Hypervisor::CloudHypervisor => crate::hypervisor::Backend::CloudHypervisor,
+        }
+    }
 }
 
 /// Root filesystem type for the VM.

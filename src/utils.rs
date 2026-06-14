@@ -334,6 +334,209 @@ pub async fn wait_for_namespace_ready(
     }
 }
 
+/// Network/user/mount-namespace isolation to apply to a spawned VMM process before exec.
+///
+/// VMM-neutral: both Firecracker and Cloud Hypervisor run as a child process inside the
+/// same namespaces with the same parent-death signal. See [`install_namespace_pre_exec`].
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceParams {
+    /// VM id, for log context only.
+    pub vm_id: String,
+    /// Bridged/routed network namespace name (`/var/run/netns/<id>`).
+    pub namespace_id: Option<String>,
+    /// User namespace path for rootless clones (`/proc/<pid>/ns/user`), entered first to
+    /// gain CAP_SYS_ADMIN for the mount-redirect operations.
+    pub user_namespace_path: Option<std::path::PathBuf>,
+    /// Net namespace path for rootless clones (`/proc/<pid>/ns/net`).
+    pub net_namespace_path: Option<std::path::PathBuf>,
+    /// Mount-namespace redirects `(baseline_dirs, clone_dir)` for clone isolation.
+    pub mount_redirects: Option<(Vec<std::path::PathBuf>, std::path::PathBuf)>,
+}
+
+/// Install `pre_exec` hooks on a VMM command that (1) enter the configured user/mount/network
+/// namespaces and apply the clone mount redirects, and (2) set `PR_SET_PDEATHSIG=SIGKILL` so
+/// the VMM dies with fcvm. Shared by the Firecracker and Cloud Hypervisor backends so both
+/// get identical isolation + parent-death behavior. Call once on the command before spawn.
+///
+/// The pdeathsig hook is installed LAST so it runs AFTER `setns(CLONE_NEWUSER)` — a credential
+/// change zeros `task->pdeath_signal`, so setting it earlier would be lost.
+pub fn install_namespace_pre_exec(
+    cmd: &mut tokio::process::Command,
+    ns: &NamespaceParams,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let ns_id_clone = ns.namespace_id.clone();
+    let mount_redirects_clone = ns.mount_redirects.clone();
+    let user_ns_path_clone = ns.user_namespace_path.clone();
+    let net_ns_path_clone = ns.net_namespace_path.clone();
+
+    // Ensure baseline directories exist for bind mount targets. The baseline VMs may have
+    // been cleaned up, but we need the directories present as mount targets.
+    if let Some((ref baseline_dirs, _)) = mount_redirects_clone {
+        for baseline_dir in baseline_dirs {
+            if !baseline_dir.exists() {
+                std::fs::create_dir_all(baseline_dir)
+                    .context("creating baseline directory for mount redirect")?;
+            }
+        }
+    }
+
+    if ns_id_clone.is_some()
+        || mount_redirects_clone.is_some()
+        || user_ns_path_clone.is_some()
+        || net_ns_path_clone.is_some()
+    {
+        use std::ffi::CString;
+        let vm_id = ns.vm_id.clone();
+
+        // Prepare CStrings outside the closure (async-signal-safe requirement).
+        let ns_path_cstr = if let Some(ref ns_id) = ns_id_clone {
+            info!(target: "vm", vm_id = %vm_id, namespace = %ns_id, "entering network namespace");
+            Some(
+                CString::new(format!("/var/run/netns/{}", ns_id))
+                    .context("namespace ID contains invalid characters (null bytes)")?,
+            )
+        } else {
+            None
+        };
+
+        let user_ns_cstr = if let Some(ref path) = user_ns_path_clone {
+            info!(target: "vm", vm_id = %vm_id, path = %path.display(), "will enter user namespace in pre_exec");
+            Some(
+                CString::new(path.to_string_lossy().as_bytes())
+                    .context("user namespace path contains invalid characters")?,
+            )
+        } else {
+            None
+        };
+
+        let net_ns_cstr = if let Some(ref path) = net_ns_path_clone {
+            info!(target: "vm", vm_id = %vm_id, path = %path.display(), "will enter net namespace in pre_exec");
+            Some(
+                CString::new(path.to_string_lossy().as_bytes())
+                    .context("net namespace path contains invalid characters")?,
+            )
+        } else {
+            None
+        };
+
+        let mount_paths = if let Some((ref baseline_dirs, ref clone_dir)) = mount_redirects_clone {
+            info!(target: "vm", vm_id = %vm_id,
+                baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                clone = %clone_dir.display(),
+                "setting up mount namespace for mount redirects");
+            let clone_cstr = CString::new(clone_dir.to_string_lossy().as_bytes())
+                .context("clone path contains invalid characters")?;
+            let baseline_cstrs: Vec<CString> = baseline_dirs
+                .iter()
+                .map(|p| {
+                    CString::new(p.to_string_lossy().as_bytes())
+                        .context("baseline path contains invalid characters")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Some((baseline_cstrs, clone_cstr))
+        } else {
+            None
+        };
+
+        // SAFETY: pre_exec runs after fork() but before exec().
+        // 1. Only async-signal-safe functions are called (open, setns, unshare, mount).
+        // 2. No heap allocations after fork (CStrings created before fork).
+        // 3. File descriptors are properly owned via OwnedFd.
+        // 4. The closure captures only CStrings and Option types.
+        unsafe {
+            cmd.pre_exec(move || {
+                use nix::fcntl::{open, OFlag};
+                use nix::mount::{mount, MsFlags};
+                use nix::sched::{setns, unshare, CloneFlags};
+                use nix::sys::stat::Mode;
+                use std::os::unix::io::{FromRawFd, OwnedFd};
+
+                // Step 0: Enter user namespace if specified (rootless clones). MUST be first
+                // to get CAP_SYS_ADMIN for mount operations. The user namespace was created
+                // by the holder (unshare --user --net) with external UID/GID mappings, so
+                // entering it gives UID 0 with full capabilities inside the namespace.
+                if let Some(ref user_ns_path) = user_ns_cstr {
+                    let ns_fd_raw = open(user_ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
+                        .map_err(|e| {
+                        std::io::Error::other(format!("failed to open user namespace: {}", e))
+                    })?;
+                    let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
+                    setns(&ns_fd, CloneFlags::CLONE_NEWUSER).map_err(|e| {
+                        std::io::Error::other(format!("failed to enter user namespace: {}", e))
+                    })?;
+                }
+
+                // Step 1: Mount namespace for path redirects (before entering network ns).
+                if let Some((ref baseline_cstrs, ref clone_cstr)) = mount_paths {
+                    unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
+                        std::io::Error::other(format!("failed to unshare mount namespace: {}", e))
+                    })?;
+                    // Make our mount namespace private so mounts don't propagate.
+                    mount::<str, str, str, str>(
+                        None,
+                        "/",
+                        None,
+                        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                        None,
+                    )
+                    .map_err(|e| {
+                        std::io::Error::other(format!("failed to make mount private: {}", e))
+                    })?;
+                    // Bind mount clone_dir over each baseline_dir so the VMM sees the clone's
+                    // files when accessing any baseline's path.
+                    for baseline_cstr in baseline_cstrs {
+                        mount(
+                            Some(clone_cstr.as_c_str()),
+                            baseline_cstr.as_c_str(),
+                            None::<&str>,
+                            MsFlags::MS_BIND,
+                            None::<&str>,
+                        )
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "failed to bind mount {:?} over {:?}: {}",
+                                clone_cstr, baseline_cstr, e
+                            ))
+                        })?;
+                    }
+                }
+
+                // Step 2: Enter network namespace if specified — net_ns_cstr
+                // (/proc/PID/ns/net, rootless clones, preferred) or ns_path_cstr
+                // (/var/run/netns/NAME, bridged mode).
+                let net_ns_to_enter = net_ns_cstr.as_ref().or(ns_path_cstr.as_ref());
+                if let Some(ns_path) = net_ns_to_enter {
+                    let ns_fd_raw = open(ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
+                        .map_err(|e| {
+                            std::io::Error::other(format!("failed to open net namespace: {}", e))
+                        })?;
+                    let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
+                    setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
+                        std::io::Error::other(format!("failed to enter net namespace: {}", e))
+                    })?;
+                }
+
+                Ok(())
+            });
+        }
+    }
+
+    // Kill the VMM if the parent (fcvm) dies, even from SIGKILL. Unconditional; must be the
+    // LAST pre_exec so it runs AFTER setns(CLONE_NEWUSER), which clears pdeath_signal.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

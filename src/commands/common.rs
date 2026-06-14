@@ -510,6 +510,40 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
     Ok(firecracker_bin)
 }
 
+/// Locate the Cloud Hypervisor binary (#632). Honors `FCVM_CLOUD_HYPERVISOR_BIN`, then PATH.
+///
+/// Note: CH snapshot/restore on aarch64 SVE hosts requires a build with the SVE register
+/// fix (CH #8268, post-v52.0); cold boot (P1) works with any v52+. Version pinning lands
+/// with P2.
+pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
+    let bin = if let Ok(path) = std::env::var("FCVM_CLOUD_HYPERVISOR_BIN") {
+        let p = std::path::PathBuf::from(&path);
+        if !p.exists() {
+            anyhow::bail!("FCVM_CLOUD_HYPERVISOR_BIN={} does not exist", path);
+        }
+        p
+    } else {
+        which::which("cloud-hypervisor").context("cloud-hypervisor not found in PATH")?
+    };
+
+    let output = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to run {} --version", bin.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cloud-hypervisor --version failed (binary: {})",
+            bin.display()
+        );
+    }
+    debug!(
+        "Found Cloud Hypervisor at {:?}: {}",
+        bin,
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    Ok(bin)
+}
+
 /// Parse Firecracker version from --version output
 ///
 /// Expected format: "Firecracker v1.14.0" or similar

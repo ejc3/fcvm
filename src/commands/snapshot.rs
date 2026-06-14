@@ -1965,6 +1965,8 @@ fn run_args_from_snapshot_metadata(
         publish,
         balloon: None,
         network,
+        // Clones restore from Firecracker snapshots (CH clone/restore is P2).
+        hypervisor: crate::cli::args::Hypervisor::Firecracker,
         health_check: meta.health_check_url.clone(),
         health_check_timeout: meta.health_check_timeout,
         privileged: false,
