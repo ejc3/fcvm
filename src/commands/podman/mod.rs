@@ -22,7 +22,7 @@ pub(crate) use types::{RebootSpec, VolumeMapping};
 // ID even when the tag is rebuilt mid-export).
 pub use image::export_image_archive;
 
-pub(crate) use listeners::{run_output_listener, run_status_listener};
+pub(crate) use listeners::{run_output_listener, run_status_listener, spawn_bootplan_listener};
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
@@ -405,8 +405,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // into the snapshot-cache / UFFD restore path.
     let no_snapshot = args.no_snapshot
         || args.rootfs_override.is_some()
-        // Cloud Hypervisor snapshot/restore is P2 (needs a post-#8268 build); P1 is
-        // cold-boot only, so never enter the snapshot-cache / restore path for it.
+        // Cloud Hypervisor supports explicit `snapshot create`/`run` (P2), but the
+        // automatic pre-start snapshot cache for `podman run` is not wired up for CH yet
+        // (a follow-on) — so never enter the snapshot-cache / restore path for it here.
         || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
         || std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
@@ -734,6 +735,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.forward_localhost = args.forward_localhost.clone();
     vm_state.config.network_mode = args.network.into();
+    vm_state.config.hypervisor = args.hypervisor.into();
     vm_state.config.ipv6_prefix = args.ipv6_prefix.clone();
     vm_state.config.tty = args.tty;
     vm_state.config.interactive = args.interactive;

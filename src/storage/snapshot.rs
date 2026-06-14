@@ -154,6 +154,11 @@ pub struct SnapshotMetadata {
     /// stay reachable.
     #[serde(default)]
     pub image_disk_path: Option<PathBuf>,
+    /// Which VMM backend created this snapshot. Restore must use the same backend
+    /// (the memory image format is VMM-specific). Defaults to Firecracker for snapshots
+    /// written before this field existed (#632 P2).
+    #[serde(default)]
+    pub hypervisor: crate::hypervisor::Backend,
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -344,6 +349,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                hypervisor: Default::default(),
             },
         };
 
@@ -475,6 +481,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                hypervisor: Default::default(),
             },
         };
 
@@ -550,6 +557,7 @@ mod tests {
                     kernel_profile: None,
                     image_mode: None,
                     image_disk_path: None,
+                    hypervisor: Default::default(),
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -612,6 +620,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                hypervisor: Default::default(),
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -727,6 +736,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                hypervisor: Default::default(),
             },
         };
 
@@ -818,6 +828,7 @@ mod tests {
             kernel_profile: None,
             image_mode: None,
             image_disk_path: None,
+            hypervisor: Default::default(),
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

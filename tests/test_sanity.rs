@@ -435,6 +435,116 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
     Ok(())
 }
 
+/// Cloud Hypervisor snapshot create → restore (clone) roundtrip (#632 P2).
+///
+/// Proves the full CH snapshot lifecycle: a running CH VM is snapshotted (pause →
+/// `vm.snapshot` → resume), then a clone is restored from it (`cloud-hypervisor --restore`,
+/// disk via mount-redirect) and the restored guest reconnects its vsock channels via the
+/// vsock restore-epoch watcher (`handle_clone_restore`) so it becomes healthy and its
+/// container still runs. Gated on a `cloud-hypervisor` binary being present (see #61).
+#[tokio::test]
+async fn test_cloud_hypervisor_snapshot_roundtrip() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nTest Cloud Hypervisor snapshot create + restore roundtrip");
+    println!("==========================================================");
+
+    if std::process::Command::new("cloud-hypervisor")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "SKIP: cloud-hypervisor not found on PATH — skipping CH snapshot roundtrip \
+             (install it to /usr/local/bin to run this; see #632/#61)"
+        );
+        return Ok(());
+    }
+
+    let (vm_name, clone_name, snap, _) = common::unique_names("ch-roundtrip");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // 1. Boot a long-running CH VM (nginx daemon stays up to be snapshotted).
+    let (mut baseline, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await
+    .context("spawning CH baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 300)
+        .await
+        .context("CH baseline VM should become healthy")?;
+    println!("  ✓ CH baseline healthy (PID {baseline_pid})");
+
+    // 2. Snapshot the running VM (CH pause → vm.snapshot → resume + disk reflink).
+    let out = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snap,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    assert!(
+        out.status.success(),
+        "CH snapshot create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    println!("  ✓ CH snapshot '{snap}' created");
+
+    // 3. Restore a clone from the snapshot (file-backed CH --restore copy mode).
+    let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snap,
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning CH clone from snapshot")?;
+
+    // 4. The clone must become healthy — this proves the restored guest reconnected its
+    //    output + exec vsock channels via the vsock restore-epoch → handle_clone_restore.
+    common::poll_health_by_pid(clone_pid, 300)
+        .await
+        .context("CH clone should become healthy after restore")?;
+    println!("  ✓ CH clone healthy (PID {clone_pid})");
+
+    // 5. Exec in the clone's container to prove it actually runs post-restore.
+    let exec_out = common::exec_in_container(clone_pid, &["echo", "ch-clone-ok"])
+        .await
+        .context("exec in CH clone container")?;
+    assert!(
+        exec_out.contains("ch-clone-ok"),
+        "clone container exec output should contain 'ch-clone-ok', got: {exec_out:?}"
+    );
+    println!("✅ CLOUD HYPERVISOR SNAPSHOT ROUNDTRIP PASSED!");
+
+    // Cleanup: stop clone and baseline.
+    common::kill_process(clone_pid).await;
+    common::kill_process(baseline_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), clone.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), baseline.wait()).await;
+    Ok(())
+}
+
 /// Test that container stdout streams to host after snapshot.
 ///
 /// Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).

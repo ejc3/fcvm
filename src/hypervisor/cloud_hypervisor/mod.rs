@@ -7,10 +7,11 @@
 //! (so the process PID + control socket exist before configuration), reusing the shared
 //! [`crate::utils::install_namespace_pre_exec`] namespace isolation.
 //!
-//! Cold boot only in P1 (no MMDS → boot plan over vsock, handled by the orchestration).
-//! Snapshot/restore is P2 (gated off via [`Capabilities`]). ARM64 boot specifics: the
-//! kernel must be the `Image` (PE) format (fcvm's asset already is), the console is
-//! virtio `hvc0` (not the PL011 `ttyAMA0`), and `pci=off` must be removed.
+//! Cold boot (no MMDS → boot plan over vsock, handled by the orchestration) plus explicit
+//! snapshot create / restore-clone (P2): the snapshot path drives `vm.snapshot` /
+//! `--restore` and is reached from `commands::common`. ARM64 boot specifics: the kernel must
+//! be the `Image` (PE) format (fcvm's asset already is), the console is virtio `hvc0` (not
+//! the PL011 `ttyAMA0`), and `pci=off` must be removed.
 
 pub mod api;
 

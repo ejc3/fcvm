@@ -84,7 +84,8 @@ pub async fn fetch_plan(transport: Transport) -> Result<Plan> {
 }
 
 /// Fetch host metadata (host-time, restore-epoch, clone-ipv6) via the selected transport.
-#[allow(dead_code)] // used by the vsock restore watcher in P2
+/// Polled by the restore-epoch watcher ([`crate::mmds::watch_restore_epoch`]) on both
+/// transports, and used for one-shot clock sync.
 pub async fn fetch_metadata(transport: Transport) -> Result<LatestMetadata> {
     match transport {
         Transport::Mmds => crate::mmds::fetch_latest_metadata_default().await,

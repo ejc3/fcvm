@@ -14,7 +14,6 @@ use crate::cli::{
     SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs, SnapshotServeArgs,
 };
 use crate::firecracker::FcNetworkMode;
-use crate::hypervisor::Hypervisor;
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, RoutedNetwork};
 use crate::paths;
 use crate::state::{
@@ -163,9 +162,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
     }
 
-    // Create client directly for existing VM
-    use crate::firecracker::FirecrackerClient;
-    let client = FirecrackerClient::new(socket_path)?;
+    // The control client is created per-backend in the memory-snapshot branch below
+    // (FirecrackerClient vs ChClient on the same socket path). The disk-only path needs
+    // no control client (it quiesces the guest over vsock).
 
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
 
@@ -256,14 +255,28 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         )
         .await?;
     } else {
-        super::common::create_snapshot_core(
-            &client,
-            snapshot_config.clone(),
-            &vm_disk_path,
-            parent_dir.as_deref(),
-            None,
-        )
-        .await?;
+        // Memory snapshot: drive the VM's actual control plane. Both backends listen on
+        // the same `firecracker.sock` path; the client type + snapshot mechanism differ.
+        match vm_state.config.hypervisor {
+            crate::hypervisor::Backend::Firecracker => {
+                use crate::firecracker::FirecrackerClient;
+                let client = FirecrackerClient::new(socket_path.clone())?;
+                super::common::create_snapshot_core(
+                    &client,
+                    snapshot_config.clone(),
+                    &vm_disk_path,
+                    parent_dir.as_deref(),
+                    None,
+                )
+                .await?;
+            }
+            crate::hypervisor::Backend::CloudHypervisor => {
+                let client =
+                    crate::hypervisor::cloud_hypervisor::api::ChClient::new(socket_path.clone());
+                super::common::create_snapshot_ch(&client, snapshot_config.clone(), &vm_disk_path)
+                    .await?;
+            }
+        }
     }
 
     // Track this snapshot as the latest base for future diff snapshots.
@@ -317,7 +330,18 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
         println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
         println!("  Files:");
-        println!("    {}", snapshot_config.memory_path.display());
+        // Cloud Hypervisor writes its own snapshot (config.json/state.json/memory ranges)
+        // into the `ch/` subdir; Firecracker writes memory.bin alongside.
+        if vm_state.config.hypervisor == crate::hypervisor::Backend::CloudHypervisor {
+            println!(
+                "    {}/",
+                snapshot_dir
+                    .join(super::common::CH_SNAPSHOT_SUBDIR)
+                    .display()
+            );
+        } else {
+            println!("    {}", snapshot_config.memory_path.display());
+        }
         println!("    {}", snapshot_config.disk_path.display());
         println!(
             "\nOriginal VM '{}' has been resumed and is still running.",
@@ -793,6 +817,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.kernel_profile = snapshot_config.metadata.kernel_profile.clone();
     vm_state.config.image_mode = snapshot_config.metadata.image_mode.clone();
     vm_state.config.image_disk_path = snapshot_config.metadata.image_disk_path.clone();
+    // The clone runs the same VMM that created the snapshot (the memory image format is
+    // VMM-specific). Recorded so `fcvm ls` and any later snapshot of the clone are correct.
+    vm_state.config.hypervisor = snapshot_config.metadata.hypervisor;
 
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
@@ -1161,7 +1188,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     let implicit_uffd_cancel = tokio_util::sync::CancellationToken::new();
 
-    let memory_backend = if let Some(ref uffd_socket_path) = uffd_socket {
+    // Which VMM created this snapshot — restore must use the same backend (the memory image
+    // format is VMM-specific). Cloud Hypervisor restores from its own `ch/` subdir via
+    // `--restore`, so the Firecracker MemoryBackend below is unused for it.
+    let is_ch = snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::CloudHypervisor;
+
+    let memory_backend = if is_ch {
+        // Unused by the CH restore path (it reads ch/memory-ranges via --restore); a
+        // placeholder so the shared RestoreParams shape is satisfied.
+        MemoryBackend::File {
+            memory_path: snapshot_config.memory_path.clone(),
+        }
+    } else if let Some(ref uffd_socket_path) = uffd_socket {
         // Explicit UFFD mode (--pid): connect to existing serve process
         MemoryBackend::Uffd {
             socket_path: uffd_socket_path.clone(),
@@ -1307,13 +1345,58 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
         track_dirty_pages: needs_dirty_tracking,
     };
-    let setup_result = super::common::restore_from_snapshot(
-        restore_params,
-        network.as_mut(),
-        &state_manager,
-        &mut vm_state,
-    )
-    .await;
+    // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
+    // so the downstream health/exit/cleanup handling is backend-agnostic.
+    let setup_result: Result<(
+        Box<dyn crate::hypervisor::Hypervisor>,
+        Option<tokio::process::Child>,
+    )> = if is_ch {
+        async {
+            // Serve the restore-epoch over the boot-plan vsock port BEFORE the restore
+            // resumes the VM, so the restored guest's watcher can run handle_clone_restore
+            // (reconnect output/exec vsock + clock sync) as soon as it resumes. The
+            // listener task runs detached for the clone's (process) lifetime.
+            let restore_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut latest = serde_json::json!({
+                "host-time": chrono::Utc::now().timestamp().to_string(),
+                "restore-epoch": restore_epoch.to_string(),
+            });
+            if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
+                latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
+            }
+            let bootplan_socket = format!(
+                "{}_{}",
+                clone_vsock_base.display(),
+                super::common::VSOCK_BOOTPLAN_PORT
+            );
+            super::podman::spawn_bootplan_listener(&bootplan_socket, &latest)
+                .context("spawning CH restore boot-plan listener")?;
+            let (backend, holder) = super::common::restore_from_snapshot_ch(
+                restore_params,
+                network.as_mut(),
+                &state_manager,
+                &mut vm_state,
+            )
+            .await?;
+            Ok((
+                Box::new(backend) as Box<dyn crate::hypervisor::Hypervisor>,
+                holder,
+            ))
+        }
+        .await
+    } else {
+        super::common::restore_from_snapshot(
+            restore_params,
+            network.as_mut(),
+            &state_manager,
+            &mut vm_state,
+        )
+        .await
+        .map(|(b, h)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h))
+    };
 
     // The restore has opened/reflinked everything it needs from the snapshot directory;
     // release the shared per-snapshot lock so creators are not blocked for the lifetime
@@ -1365,26 +1448,33 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Build the cold-boot relaunch plan up front (consumed if the guest reboots).
     let clone_disk_path = data_dir.join("disks/rootfs.raw");
-    let reboot_plan = match build_clone_reboot_plan(
-        &snapshot_config.metadata,
-        &vm_name,
-        args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
-        args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
-        args.non_blocking_output,
-        &network_config,
-        &runtime_config,
-        &clone_disk_path,
-        &clone_vsock_base,
-    )
-    .await
-    {
-        Ok(plan) => Some(plan),
-        Err(e) => {
-            warn!(
-                error = %e,
-                "reboot-in-place unavailable for this clone — a guest reboot will terminate it"
-            );
-            None
+    // Reboot-in-place relaunches via the Firecracker cold-boot plan (build_clone_reboot_plan
+    // is FC-specific). Cloud Hypervisor clones don't support it yet — a guest reboot
+    // terminates the clone (same as TTY clones). Tracked for a future increment.
+    let reboot_plan = if is_ch {
+        None
+    } else {
+        match build_clone_reboot_plan(
+            &snapshot_config.metadata,
+            &vm_name,
+            args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
+            args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
+            args.non_blocking_output,
+            &network_config,
+            &runtime_config,
+            &clone_disk_path,
+            &clone_vsock_base,
+        )
+        .await
+        {
+            Ok(plan) => Some(plan),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "reboot-in-place unavailable for this clone — a guest reboot will terminate it"
+                );
+                None
+            }
         }
     };
 
@@ -1485,7 +1575,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 health_monitor_handle: None,
                 output_listener_handle: output_handle, // abort output listener task
             },
-            &mut vm_manager,
+            vm_manager.as_mut(),
             &mut holder_child,
             network.as_mut(),
             &state_manager,
@@ -1641,7 +1731,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                                     .await
                                     .context("relaunching Firecracker after guest reboot")?;
                                 super::podman::configure_and_boot_vm(
-                                    &mut vm_manager,
+                                    vm_manager.as_mut(),
                                     plan,
                                     synth_args,
                                     &network_config,
@@ -1707,10 +1797,17 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     if let Some(ref base_key) = args.startup_snapshot_base_key {
                         let startup_key = startup_snapshot_key(base_key);
 
-                        // Skip if startup snapshot already exists
+                        // Skip if startup snapshot already exists. The startup-snapshot cache
+                        // path is Firecracker-specific (diff snapshots via create_snapshot_core)
+                        // and only runs for the podman-cache restore (FC); a Cloud Hypervisor
+                        // clone forces no_snapshot, so the downcast never fails for it in
+                        // practice — and if a non-FC backend ever reaches here, skip gracefully.
                         if check_podman_snapshot(&startup_key).await.is_some() {
                             info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
-                        } else {
+                        } else if let Some(fc_backend) = vm_manager
+                            .as_any()
+                            .downcast_ref::<crate::hypervisor::firecracker::FirecrackerBackend>()
+                        {
                             info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
                             // Use select! so SIGTERM can abort startup snapshot immediately.
@@ -1720,7 +1817,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             // the per-VM snapshot lock (re-read from the state file), so a
                             // concurrent `fcvm snapshot create` cannot leave us with a stale base.
                             let snap = CreateSnapshotParams {
-                                vm_manager: &vm_manager,
+                                vm_manager: fc_backend,
                                 snapshot_key: &startup_key,
                                 vm_state: &vm_state,
                                 disk_path: &disk_path,
@@ -1780,7 +1877,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             health_monitor_handle,
             output_listener_handle: output_handle, // abort output listener task
         },
-        &mut vm_manager,
+        vm_manager.as_mut(),
         &mut holder_child,
         network.as_mut(),
         &state_manager,
@@ -1965,8 +2062,10 @@ fn run_args_from_snapshot_metadata(
         publish,
         balloon: None,
         network,
-        // Clones restore from Firecracker snapshots (CH clone/restore is P2).
-        hypervisor: crate::cli::args::Hypervisor::Firecracker,
+        // Cold-boot the clone/reboot under the SAME backend that created the snapshot —
+        // a CH disk-only/reboot clone must not be launched under Firecracker (and would
+        // fail outright on a CH-only host). meta.hypervisor is recorded at snapshot create.
+        hypervisor: meta.hypervisor.into(),
         health_check: meta.health_check_url.clone(),
         health_check_timeout: meta.health_check_timeout,
         privileged: false,
@@ -2193,6 +2292,7 @@ mod tests {
             kernel_profile: Some("btrfs".to_string()),
             image_mode: Some("overlay".to_string()),
             image_disk_path: Some(std::path::PathBuf::from("/cache/img.storage-v2.img")),
+            hypervisor: Default::default(),
         };
         let args =
             run_args_from_snapshot_metadata(&meta, "clone".to_string(), 2, 1024, false, None);
@@ -2234,6 +2334,50 @@ mod tests {
                 "/srv/data:/mydata:ro".to_string(),
                 "/srv/rw:/rw".to_string()
             ]
+        );
+    }
+
+    /// The synthesized cold-boot RunArgs must launch under the SAME backend that created
+    /// the snapshot — a CH disk-only/reboot clone launched under Firecracker would mis-boot
+    /// (and fail outright on a CH-only host). Regression for the hard-coded Firecracker.
+    #[test]
+    fn run_args_from_metadata_propagates_backend() {
+        let base = crate::storage::SnapshotMetadata {
+            image: "localhost/app:latest".to_string(),
+            vcpu: 1,
+            memory_mib: 512,
+            network_config: crate::network::NetworkConfig::default(),
+            volumes: vec![],
+            health_check_url: None,
+            health_check_timeout: 5,
+            hugepages: false,
+            extra_disks: vec![],
+            nfs_shares: vec![],
+            username: None,
+            user: None,
+            port_mappings: vec![],
+            forward_localhost: vec![],
+            network_mode: crate::firecracker::FcNetworkMode::Rootless,
+            ipv6_prefix: None,
+            tty: false,
+            interactive: false,
+            kernel_profile: None,
+            image_mode: None,
+            image_disk_path: None,
+            hypervisor: crate::hypervisor::Backend::CloudHypervisor,
+        };
+        let args = run_args_from_snapshot_metadata(&base, "c".to_string(), 1, 512, false, None);
+        assert_eq!(
+            args.hypervisor,
+            crate::cli::args::Hypervisor::CloudHypervisor
+        );
+
+        let mut fc = base.clone();
+        fc.hypervisor = crate::hypervisor::Backend::Firecracker;
+        let args_fc = run_args_from_snapshot_metadata(&fc, "c".to_string(), 1, 512, false, None);
+        assert_eq!(
+            args_fc.hypervisor,
+            crate::cli::args::Hypervisor::Firecracker
         );
     }
 

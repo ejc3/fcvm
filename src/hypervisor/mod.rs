@@ -22,14 +22,16 @@
 //! performs the create+boot. The host-side work (NFS export, network `post_start`)
 //! stays in the orchestration between the calls — it never touches the VMM.
 //!
-//! ## What is NOT abstracted in P0
-//! Snapshot/restore/clone is Firecracker-specific (snapshot format, external UFFD,
-//! `patch_drive`, MMDS restore-epoch) and is **capability-gated**: a backend that
-//! returns `false` for the relevant capability never enters that path. The snapshot
-//! orchestration in `commands::common` therefore still operates on the concrete
-//! Firecracker backend (reached via [`Hypervisor::as_any`]). Abstracting snapshots is
-//! deferred to P2 (now unblocked: the earlier CH ARM64 snapshot-create failure was the
-//! SVE register-save bug CH #8057, fixed by #8268 — not nesting).
+//! ## Snapshots (P2)
+//! Snapshot create/restore/clone is **capability-gated** (`Capabilities::snapshots`) and
+//! per-backend in `commands::common`: each backend has its own snapshot/restore (the memory
+//! image format and restore mechanism are VMM-specific — Firecracker `LoadSnapshot` + external
+//! UFFD + `patch_drive` + MMDS restore-epoch vs Cloud Hypervisor `--restore` + in-process
+//! UFFD + mount-redirect disk retarget + vsock restore-epoch). The network/namespace/CoW-disk
+//! prologue is shared (`prepare_clone_substrate`); the FC-specific snapshot-create path is
+//! still reached on the concrete backend via [`Hypervisor::as_any`]. (CH ARM64 snapshots
+//! needed a post-#8268 cloud-hypervisor build — the blocker was the SVE register-save bug,
+//! not nested/NV2.)
 
 pub mod cloud_hypervisor;
 pub mod firecracker;
@@ -41,8 +43,14 @@ use std::process::ExitStatus;
 use tokio::sync::mpsc;
 
 /// Which VMM a backend drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Default` is `Firecracker` so a state/snapshot file written before the backend was
+/// recorded (no `hypervisor` field) deserializes as Firecracker — the only backend that
+/// existed then. Serialized in `VmConfig` / `SnapshotConfig` so `snapshot create`/`run`
+/// know which VMM to drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Backend {
+    #[default]
     Firecracker,
     CloudHypervisor,
 }
@@ -267,8 +275,10 @@ impl Capabilities {
             native_metadata_service: false,
             // No aarch64 virtual-EL2 path.
             nested_arm64: false,
-            // Cold boot only in P1; flipped on in P2 with a post-#8268 CH build.
-            snapshots: false,
+            // P2: explicit `snapshot create` / `snapshot run` work for CH (pause→vm.snapshot
+            // →resume; `--restore source_url=…/ch,memory_restore_mode=copy`). The automatic
+            // pre-start cache integration for CH is a follow-on (still gated off in podman run).
+            snapshots: true,
         }
     }
 }
