@@ -94,6 +94,19 @@ CI_NESTED_FILTER := -E 'not (package(fcvm) & (test(/nested/) | test(/podman_load
 endif
 endif
 
+# test-fast CI exclusions. test_cloud_hypervisor_cold_boot (a CH cold boot of an
+# instant-exit container, snapshots disabled) storms on x86_64 under full CI parallel
+# load: the host↔guest output-vsock/shutdown handshake loops and the VM never powers
+# off (180s timeout). Passes on arm64 and in isolation locally; same class as the #630
+# cold-boot event-loop storm. The snapshot-roundtrip test still cold-boots a CH VM
+# (nginx baseline) and exercises snapshot/restore, so CH cold boot keeps CI coverage.
+# Tracked in #687. Gated on CI=true; runs locally and with an explicit FILTER=.
+ifndef FILTER
+ifeq ($(CI),true)
+CI_FAST_FILTER := -E 'not test(=test_cloud_hypervisor_cold_boot)'
+endif
+endif
+
 # Default log level: fcvm debug, suppress FUSE spam
 # Override with: RUST_LOG=debug make test-root
 TEST_LOG ?= fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn
@@ -357,7 +370,7 @@ _test-unit:
 
 _test-fast:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(CI_FAST_FILTER) $(FILTER)
 
 _test-all:
 	RUST_LOG="$(TEST_LOG)" \
