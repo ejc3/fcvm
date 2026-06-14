@@ -1660,6 +1660,49 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reflink the rootfs + any extra disks into the temp snapshot dir (instant btrfs CoW).
+/// Shared by the Firecracker and Cloud Hypervisor snapshot-create paths; the caller must
+/// have the VM paused so the disk image matches the captured memory.
+async fn reflink_disks_to_snapshot(
+    disk_path: &Path,
+    snapshot_config: &crate::storage::snapshot::SnapshotConfig,
+    temp_snapshot_dir: &Path,
+) -> Result<()> {
+    reflink_copy(disk_path, &temp_snapshot_dir.join("disk.raw")).await?;
+    for extra_disk in &snapshot_config.metadata.extra_disks {
+        let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
+            .join("disks")
+            .join(&extra_disk.filename);
+        let dest = temp_snapshot_dir.join(&extra_disk.filename);
+        reflink_copy(&source, &dest)
+            .await
+            .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
+    }
+    Ok(())
+}
+
+/// Atomically replace `final_dir` with `temp_dir`: move any existing dir aside, rename the
+/// temp dir into place, then remove the old. Shared by the snapshot-create paths so a
+/// finalized snapshot directory always appears atomically.
+async fn atomic_replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
+    if final_dir.exists() {
+        let old = snapshot_sibling(final_dir, "old");
+        let _ = tokio::fs::remove_dir_all(&old).await;
+        tokio::fs::rename(final_dir, &old)
+            .await
+            .context("moving old snapshot out of the way")?;
+        tokio::fs::rename(temp_dir, final_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
+        let _ = tokio::fs::remove_dir_all(&old).await;
+    } else {
+        tokio::fs::rename(temp_dir, final_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
+    }
+    Ok(())
+}
+
 /// Limit concurrent snapshot creation to prevent dirty_ratio writeback throttling.
 ///
 /// Each full snapshot writes the VM's entire configured memory (default 1GB) to page cache.
@@ -2305,38 +2348,13 @@ pub async fn create_snapshot_core(
         }
     }
 
-    // Copy disk while VM is still paused to maintain memory/disk consistency.
-    // If we copy after resume, the disk may have post-resume writes that don't
-    // match the snapshot's memory state. This causes filesystem corruption on
-    // restore (e.g., btrfs detects inconsistent transaction log and goes read-only).
-    // Reflink copy is instant (O(1) metadata operation), so pause time is not affected.
+    // Copy disk while VM is still paused to maintain memory/disk consistency. If we copy
+    // after resume, the disk may have post-resume writes that don't match the snapshot's
+    // memory state, corrupting the filesystem on restore. Reflink is O(1), so pause time is
+    // unaffected.
     let disk_copy_result = if snapshot_result.is_ok() {
-        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
         info!(snapshot = %snapshot_config.name, "copying disk (VM paused)");
-        let r = reflink_copy(disk_path, &temp_disk_path).await;
-
-        // Also copy extra disks while paused
-        if r.is_ok() {
-            let mut extra_ok = true;
-            for extra_disk in &snapshot_config.metadata.extra_disks {
-                let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-                    .join("disks")
-                    .join(&extra_disk.filename);
-                let dest = temp_snapshot_dir.join(&extra_disk.filename);
-                if let Err(e) = reflink_copy(&source, &dest).await {
-                    error!(error = %e, disk = %extra_disk.filename, "failed to copy extra disk");
-                    extra_ok = false;
-                    break;
-                }
-            }
-            if extra_ok {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("extra disk copy failed"))
-            }
-        } else {
-            r
-        }
+        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir).await
     } else {
         Ok(()) // Skip disk copy if snapshot failed
     };
@@ -2447,23 +2465,7 @@ pub async fn create_snapshot_core(
         .await
         .context("writing snapshot config")?;
 
-    // Atomic replace: rename old out of the way, then rename new into place.
-    // Handles both cases: snapshot_dir exists (re-creating) or doesn't (first creation).
-    if snapshot_dir.exists() {
-        let old_snapshot_dir = snapshot_sibling(snapshot_dir, "old");
-        let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-        tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
-            .await
-            .context("moving old snapshot out of the way")?;
-        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-            .await
-            .context("renaming temp snapshot to final location")?;
-        let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-    } else {
-        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-            .await
-            .context("renaming temp snapshot to final location")?;
-    }
+    atomic_replace_dir(&temp_snapshot_dir, snapshot_dir).await?;
 
     let actual_type = if use_diff { "Diff" } else { "Full" };
     info!(
@@ -2572,22 +2574,8 @@ pub async fn create_snapshot_ch(
     // Reflink the disk(s) WHILE PAUSED so the disk image matches the captured memory
     // (a post-resume write would desync memory/disk and corrupt the clone's filesystem).
     let disk_copy_result = if snapshot_result.is_ok() {
-        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
         info!(snapshot = %snapshot_config.name, "copying disk (CH VM paused)");
-        let mut r = reflink_copy(disk_path, &temp_disk_path).await;
-        if r.is_ok() {
-            for extra_disk in &snapshot_config.metadata.extra_disks {
-                let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-                    .join("disks")
-                    .join(&extra_disk.filename);
-                let dest = temp_snapshot_dir.join(&extra_disk.filename);
-                if let Err(e) = reflink_copy(&source, &dest).await {
-                    r = Err(e).context("copying CH extra disk");
-                    break;
-                }
-            }
-        }
-        r
+        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir).await
     } else {
         Ok(())
     };
@@ -2622,21 +2610,7 @@ pub async fn create_snapshot_ch(
         .await
         .context("writing snapshot config")?;
 
-    if snapshot_dir.exists() {
-        let old_snapshot_dir = snapshot_sibling(snapshot_dir, "old");
-        let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-        tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
-            .await
-            .context("moving old snapshot out of the way")?;
-        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-            .await
-            .context("renaming temp snapshot to final location")?;
-        let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-    } else {
-        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-            .await
-            .context("renaming temp snapshot to final location")?;
-    }
+    atomic_replace_dir(&temp_snapshot_dir, snapshot_dir).await?;
 
     info!(
         snapshot = %snapshot_config.name,
