@@ -510,11 +510,17 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
     Ok(firecracker_bin)
 }
 
-/// Locate the Cloud Hypervisor binary (#632). Honors `FCVM_CLOUD_HYPERVISOR_BIN`, then PATH.
+/// Locate the Cloud Hypervisor binary (#632).
 ///
-/// Note: CH snapshot/restore on aarch64 SVE hosts requires a build with the SVE register
-/// fix (CH #8268, post-v52.0); cold boot (P1) works with any v52+. Version pinning lands
-/// with P2.
+/// Resolution order:
+///   1. `FCVM_CLOUD_HYPERVISOR_BIN` (explicit override)
+///   2. newest content-addressed binary built by `fcvm setup --cloud-hypervisor`
+///      (assets_dir/cloud-hypervisor/cloud-hypervisor-<sha>.bin) — offline, no git ls-remote
+///   3. `cloud-hypervisor` on PATH
+///
+/// The content-addressed lookup carries the fork build (aarch64 SVE register fix,
+/// CH #8268, post-v52.0) that CH snapshot/restore requires. Cold boot (P1) works with
+/// any v52+; the cached build is preferred so CI and dev hosts use the pinned fork.
 pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
     let bin = if let Ok(path) = std::env::var("FCVM_CLOUD_HYPERVISOR_BIN") {
         let p = std::path::PathBuf::from(&path);
@@ -522,8 +528,13 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
             anyhow::bail!("FCVM_CLOUD_HYPERVISOR_BIN={} does not exist", path);
         }
         p
+    } else if let Some(cached) = crate::setup::newest_cached_cloud_hypervisor() {
+        cached
     } else {
-        which::which("cloud-hypervisor").context("cloud-hypervisor not found in PATH")?
+        which::which("cloud-hypervisor").context(
+            "cloud-hypervisor not found: build it with `fcvm setup --cloud-hypervisor`, \
+             set FCVM_CLOUD_HYPERVISOR_BIN, or install it on PATH",
+        )?
     };
 
     let output = std::process::Command::new(&bin)

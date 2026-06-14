@@ -62,6 +62,23 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     let (config, _, _) = load_config(args.config.as_deref())?;
     paths::init_with_paths(&config.paths.data_dir, &config.paths.assets_dir);
 
+    // Build the optional Cloud Hypervisor backend binary (#632) and exit. CH is an
+    // optional VMM backend, so it is built on demand via `--cloud-hypervisor` rather
+    // than on every setup (a CH build is as slow as a firecracker build).
+    if args.cloud_hypervisor {
+        let ch = config.cloud_hypervisor.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--cloud-hypervisor requires a [cloud_hypervisor] section (repo + branch) in the config"
+            )
+        })?;
+        println!("Building Cloud Hypervisor backend...");
+        let path = crate::setup::ensure_cloud_hypervisor(&ch.repo, &ch.branch)
+            .await
+            .context("setting up cloud-hypervisor")?;
+        println!("  ✓ Cloud Hypervisor ready: {}", path.display());
+        return Ok(());
+    }
+
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
 
     // Ensure default kernel exists (downloads from [kernel] section if missing)
