@@ -893,6 +893,248 @@ fn assert_vmstate_rootfs_covered(
     )
 }
 
+/// Backend-neutral substrate for a snapshot restore: the per-clone CoW disk, the holder
+/// process (rootless), and the namespace/mount isolation to apply to the VMM process.
+///
+/// The work that produces it — create the network namespace (bridged/routed) or holder
+/// (rootless), reflink the CoW rootfs + extra disks, and compute the mount-namespace
+/// redirect — is identical for Firecracker and Cloud Hypervisor. Only the subsequent
+/// VMM-specific load differs (FC `LoadSnapshot`+`patch_drive` vs CH `--restore`), so both
+/// restore paths call [`prepare_clone_substrate`] and then apply this to their backend.
+pub struct CloneSubstrate {
+    pub rootfs_path: PathBuf,
+    pub holder_child: Option<tokio::process::Child>,
+    /// PID to hand `network.post_start` — the rootless holder, or (None) the VMM pid the
+    /// caller fills in after spawn.
+    pub holder_pid_for_post_start: Option<u32>,
+    /// Namespace/mount isolation to apply to the VMM spawn. `mount_redirects` is already
+    /// set to `(baseline_dirs, clone_dir)` so the VMM opens the clone's CoW disk where the
+    /// snapshot embedded the baseline's path.
+    pub namespace: crate::utils::NamespaceParams,
+}
+
+/// Prepare the [`CloneSubstrate`]: per-network-mode namespace setup + CoW disk + extra-disk
+/// copy + mount-redirect. Shared by the Firecracker and Cloud Hypervisor restore paths.
+///
+/// Mirrors the original inline prologue of [`restore_from_snapshot`] exactly (no behavior
+/// change for Firecracker); the only difference is it records the namespace isolation into a
+/// [`NamespaceParams`](crate::utils::NamespaceParams) instead of mutating a `VmManager`, so a
+/// Cloud Hypervisor backend can apply the same isolation to its `ProcessSpec`.
+async fn prepare_clone_substrate(
+    network: &mut dyn NetworkManager,
+    restore_config: &SnapshotRestoreConfig,
+    network_config: &NetworkConfig,
+    vm_id: &str,
+    data_dir: &Path,
+    vm_state: &mut VmState,
+) -> Result<CloneSubstrate> {
+    let vm_dir = data_dir.join("disks");
+    let mut holder_child: Option<tokio::process::Child> = None;
+    let mut holder_pid_for_post_start: Option<u32> = None;
+    let mut namespace = crate::utils::NamespaceParams {
+        vm_id: vm_id.to_string(),
+        ..Default::default()
+    };
+
+    // rootfs_path is set by either the bridged, rootless, or routed branch.
+    let rootfs_path: PathBuf;
+
+    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
+        if let Some(ns_id) = bridged_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in network namespace");
+            namespace.namespace_id = Some(ns_id.to_string());
+        }
+
+        let disk_manager = DiskManager::new(
+            vm_id.to_string(),
+            restore_config.source_disk_path.clone(),
+            vm_dir.clone(),
+        );
+        rootfs_path = disk_manager
+            .create_cow_disk()
+            .await
+            .context("creating CoW disk from snapshot")?;
+        info!(
+            rootfs = %rootfs_path.display(),
+            source_disk = %restore_config.source_disk_path.display(),
+            "CoW disk prepared from snapshot"
+        );
+    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
+        // Rootless mode: spawn holder process, then run disk creation and network setup
+        // in parallel via nsenter.
+        let holder_cmd = pasta_net.build_holder_command();
+        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
+        let (mut child, holder_pid) = spawn_namespace_holder(&holder_cmd).await?;
+
+        let setup_script = pasta_net.build_setup_script();
+        let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
+        let tap_device = network_config.tap_device.clone();
+
+        let source_disk = restore_config.source_disk_path.clone();
+        let disk_task = async {
+            let disk_manager =
+                DiskManager::new(vm_id.to_string(), source_disk.clone(), vm_dir.clone());
+            let rootfs_path = disk_manager
+                .create_cow_disk()
+                .await
+                .context("creating CoW disk from snapshot")?;
+            info!(
+                rootfs = %rootfs_path.display(),
+                source_disk = %source_disk.display(),
+                "CoW disk prepared from snapshot"
+            );
+            Ok::<_, anyhow::Error>(rootfs_path)
+        };
+
+        let network_task = async {
+            let ns_poll_start = std::time::Instant::now();
+            info!(holder_pid = holder_pid, "running network setup via nsenter");
+            loop {
+                if !crate::utils::is_process_alive(holder_pid) {
+                    anyhow::bail!(
+                        "holder process (PID {}) died before network setup could run",
+                        holder_pid
+                    );
+                }
+                let output = tokio::process::Command::new(&nsenter_prefix[0])
+                    .args(&nsenter_prefix[1..])
+                    .arg("bash")
+                    .arg("-c")
+                    .arg(&setup_script)
+                    .output()
+                    .await
+                    .context("running network setup via nsenter")?;
+                if output.status.success() {
+                    debug!("namespace ready after {:?}", ns_poll_start.elapsed());
+                    break;
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("Invalid argument") || stderr.contains("No such process") {
+                    if ns_poll_start.elapsed() > NSENTER_MAX_WAIT {
+                        anyhow::bail!(
+                            "namespace not ready after {:?}: {}",
+                            ns_poll_start.elapsed(),
+                            stderr
+                        );
+                    }
+                    tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
+                    continue;
+                }
+                anyhow::bail!("network setup failed: {}", stderr);
+            }
+
+            let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
+                .args(&nsenter_prefix[1..])
+                .arg("ip")
+                .arg("link")
+                .arg("show")
+                .arg(&tap_device)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .context("verifying TAP device")?;
+            if !verify_output.success() {
+                anyhow::bail!(
+                    "TAP device '{}' not found after network setup - setup may have failed silently",
+                    tap_device
+                );
+            }
+            debug!(tap_device = %tap_device, "TAP device verified");
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let (disk_result, network_result) = tokio::join!(disk_task, network_task);
+        if let Err(e) = &disk_result {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!("disk creation failed: {}", e));
+        }
+        if let Err(e) = &network_result {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!("network setup failed: {}", e));
+        }
+        rootfs_path = disk_result?;
+        network_result?;
+        info!(
+            holder_pid = holder_pid,
+            "parallel disk + network setup complete"
+        );
+
+        namespace.user_namespace_path =
+            Some(PathBuf::from(format!("/proc/{}/ns/user", holder_pid)));
+        namespace.net_namespace_path = Some(PathBuf::from(format!("/proc/{}/ns/net", holder_pid)));
+        vm_state.holder_pid = Some(holder_pid);
+        holder_pid_for_post_start = Some(holder_pid);
+        holder_child = Some(child);
+    } else if let Some(routed_net) = network
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
+    {
+        if let Some(ns_id) = routed_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
+            namespace.namespace_id = Some(ns_id.to_string());
+        }
+        let disk_manager = DiskManager::new(
+            vm_id.to_string(),
+            restore_config.source_disk_path.clone(),
+            vm_dir.clone(),
+        );
+        rootfs_path = disk_manager
+            .create_cow_disk()
+            .await
+            .context("creating CoW disk from snapshot")?;
+        info!(
+            rootfs = %rootfs_path.display(),
+            source_disk = %restore_config.source_disk_path.display(),
+            "CoW disk prepared from snapshot (routed)"
+        );
+    } else {
+        anyhow::bail!("Unknown network type");
+    }
+
+    // Mount-namespace redirect: the snapshot embeds the baseline VM's paths (vsock under
+    // original_vm_id; disk under snapshot_vm_id if different). Bind-mounting those baseline
+    // dirs over the clone's dir makes the VMM open the clone's CoW disk / bind its vsock.
+    let mut baseline_dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
+    if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
+        if snapshot_vm_id != &restore_config.original_vm_id {
+            baseline_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
+        }
+    }
+    info!(
+        baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        clone_dir = %data_dir.display(),
+        "enabling mount namespace for path isolation"
+    );
+    namespace.mount_redirects = Some((baseline_dirs, data_dir.to_path_buf()));
+
+    // Copy extra disk images (disk-dir) from snapshot to the clone's disk directory so the
+    // redirected baseline paths resolve to real files.
+    if !restore_config.extra_disks.is_empty() {
+        if let Some(ref snap_dir) = restore_config.snapshot_dir {
+            for extra_disk in &restore_config.extra_disks {
+                let source = snap_dir.join(&extra_disk.filename);
+                let dest = vm_dir.join(&extra_disk.filename);
+                reflink_copy(&source, &dest)
+                    .await
+                    .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
+            }
+            info!(
+                num_disks = restore_config.extra_disks.len(),
+                "copied {} extra disk image(s) to clone",
+                restore_config.extra_disks.len()
+            );
+        }
+    }
+
+    Ok(CloneSubstrate {
+        rootfs_path,
+        holder_child,
+        holder_pid_for_post_start,
+        namespace,
+    })
+}
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -929,9 +1171,21 @@ pub async fn restore_from_snapshot(
         restore_config.snapshot_vm_id.as_deref(),
     )?;
 
-    // Configure namespace isolation if network provides one
-    let mut holder_child: Option<tokio::process::Child> = None;
-    let mut holder_pid_for_post_start: Option<u32> = None;
+    // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
+    // mount redirect — all shared with the Cloud Hypervisor restore path.
+    let substrate = prepare_clone_substrate(
+        network,
+        restore_config,
+        network_config,
+        vm_id,
+        data_dir,
+        vm_state,
+    )
+    .await?;
+    let rootfs_path = substrate.rootfs_path;
+    let holder_child = substrate.holder_child;
+    let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
+
     let fc_log_path = data_dir.join("firecracker.log");
     let mut vm_manager = VmManager::new(
         vm_id.to_string(),
@@ -939,235 +1193,20 @@ pub async fn restore_from_snapshot(
         Some(fc_log_path),
     );
     vm_manager.set_vm_name(vm_name.to_string());
-
-    // rootfs_path is set by either the bridged or rootless branch
-    let rootfs_path: PathBuf;
-
-    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
-        if let Some(ns_id) = bridged_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
-        }
-
-        // For bridged mode, create disk
-        let disk_manager = DiskManager::new(
-            vm_id.to_string(),
-            restore_config.source_disk_path.clone(),
-            vm_dir.clone(),
-        );
-
-        rootfs_path = disk_manager
-            .create_cow_disk()
-            .await
-            .context("creating CoW disk from snapshot")?;
-
-        info!(
-            rootfs = %rootfs_path.display(),
-            source_disk = %restore_config.source_disk_path.display(),
-            "CoW disk prepared from snapshot"
-        );
-    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
-        // Rootless mode: spawn holder process and set up namespace via nsenter
-        // OPTIMIZATION: Parallelize disk creation with network setup
-
-        // Step 1: Spawn holder process (keeps namespace alive)
-        let holder_cmd = pasta_net.build_holder_command();
-        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
-
-        let (mut child, holder_pid) = spawn_namespace_holder(&holder_cmd).await?;
-
-        // Step 2: Run disk creation and network setup IN PARALLEL
-        let setup_script = pasta_net.build_setup_script();
-        let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
-        let tap_device = network_config.tap_device.clone();
-
-        // Disk creation task
-        let source_disk = restore_config.source_disk_path.clone();
-        let disk_task = async {
-            let disk_manager =
-                DiskManager::new(vm_id.to_string(), source_disk.clone(), vm_dir.clone());
-
-            let rootfs_path = disk_manager
-                .create_cow_disk()
-                .await
-                .context("creating CoW disk from snapshot")?;
-
-            info!(
-                rootfs = %rootfs_path.display(),
-                source_disk = %source_disk.display(),
-                "CoW disk prepared from snapshot"
-            );
-
-            Ok::<_, anyhow::Error>(rootfs_path)
-        };
-
-        // Network setup task
-        let network_task = async {
-            let ns_poll_start = std::time::Instant::now();
-
-            info!(holder_pid = holder_pid, "running network setup via nsenter");
-            loop {
-                // Verify holder is still alive before attempting nsenter
-                if !crate::utils::is_process_alive(holder_pid) {
-                    anyhow::bail!(
-                        "holder process (PID {}) died before network setup could run",
-                        holder_pid
-                    );
-                }
-
-                let output = tokio::process::Command::new(&nsenter_prefix[0])
-                    .args(&nsenter_prefix[1..])
-                    .arg("bash")
-                    .arg("-c")
-                    .arg(&setup_script)
-                    .output()
-                    .await
-                    .context("running network setup via nsenter")?;
-
-                if output.status.success() {
-                    debug!("namespace ready after {:?}", ns_poll_start.elapsed());
-                    break;
-                }
-
-                // Check if it's a namespace-not-ready error (retry) vs permanent error (fail)
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-                    if ns_poll_start.elapsed() > NSENTER_MAX_WAIT {
-                        anyhow::bail!(
-                            "namespace not ready after {:?}: {}",
-                            ns_poll_start.elapsed(),
-                            stderr
-                        );
-                    }
-                    tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
-                    continue;
-                }
-
-                // Permanent error
-                anyhow::bail!("network setup failed: {}", stderr);
-            }
-
-            // Verify TAP device was created successfully
-            let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-                .args(&nsenter_prefix[1..])
-                .arg("ip")
-                .arg("link")
-                .arg("show")
-                .arg(&tap_device)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .context("verifying TAP device")?;
-
-            if !verify_output.success() {
-                anyhow::bail!(
-                    "TAP device '{}' not found after network setup - setup may have failed silently",
-                    tap_device
-                );
-            }
-            debug!(tap_device = %tap_device, "TAP device verified");
-
-            Ok::<_, anyhow::Error>(())
-        };
-
-        // Run both tasks in parallel
-        let (disk_result, network_result) = tokio::join!(disk_task, network_task);
-
-        // Handle errors - kill holder child if either fails
-        if let Err(e) = &disk_result {
-            let _ = child.kill().await;
-            return Err(anyhow::anyhow!("disk creation failed: {}", e));
-        }
-        if let Err(e) = &network_result {
-            let _ = child.kill().await;
-            return Err(anyhow::anyhow!("network setup failed: {}", e));
-        }
-
-        rootfs_path = disk_result?;
-        network_result?;
-
-        info!(
-            holder_pid = holder_pid,
-            "parallel disk + network setup complete"
-        );
-
-        // Step 3: Set namespace paths for pre_exec setns
-        vm_manager.set_user_namespace_path(PathBuf::from(format!("/proc/{}/ns/user", holder_pid)));
-        vm_manager.set_net_namespace_path(PathBuf::from(format!("/proc/{}/ns/net", holder_pid)));
-
-        // Store holder_pid in state for health checks
-        vm_state.holder_pid = Some(holder_pid);
-        holder_pid_for_post_start = Some(holder_pid);
-
-        holder_child = Some(child);
-    } else if let Some(routed_net) = network
-        .as_any()
-        .downcast_ref::<crate::network::RoutedNetwork>()
-    {
-        // Routed mode: like bridged but with veth+IPv6 routing instead of iptables NAT
-        if let Some(ns_id) = routed_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
-        }
-
-        let disk_manager = DiskManager::new(
-            vm_id.to_string(),
-            restore_config.source_disk_path.clone(),
-            vm_dir.clone(),
-        );
-
-        rootfs_path = disk_manager
-            .create_cow_disk()
-            .await
-            .context("creating CoW disk from snapshot")?;
-
-        info!(
-            rootfs = %rootfs_path.display(),
-            source_disk = %restore_config.source_disk_path.display(),
-            "CoW disk prepared from snapshot (routed)"
-        );
-    } else {
-        anyhow::bail!("Unknown network type");
+    // Apply the substrate's namespace/mount isolation to the Firecracker VmManager (the
+    // #608 coverage check ran at the top of this function, before any side effects).
+    let ns = &substrate.namespace;
+    if let Some(id) = &ns.namespace_id {
+        vm_manager.set_namespace(id.clone());
     }
-
-    // Configure mount namespace isolation for path redirects
-    // We need to redirect BOTH:
-    // 1. original_vm_id - for vsock paths in vmstate.bin (original cache VM)
-    // 2. snapshot_vm_id - for disk paths in vmstate.bin (snapshotted VM, if different)
-    let mut baseline_dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
-    if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
-        if snapshot_vm_id != &restore_config.original_vm_id {
-            baseline_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
-        }
+    if let Some(p) = &ns.user_namespace_path {
+        vm_manager.set_user_namespace_path(p.clone());
     }
-    info!(
-        baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-        clone_dir = %data_dir.display(),
-        "enabling mount namespace for path isolation"
-    );
-
-    // (#608 coverage is asserted at the top of this function, before any side effects.)
-    vm_manager.set_mount_redirects(baseline_dirs, data_dir.to_path_buf());
-
-    // Copy extra disk images (disk-dir) from snapshot to clone's disk directory.
-    // The mount namespace will redirect Firecracker's baseline paths to clone paths,
-    // so these files need to exist at {vm_dir}/{filename}.
-    if !restore_config.extra_disks.is_empty() {
-        if let Some(ref snap_dir) = restore_config.snapshot_dir {
-            for extra_disk in &restore_config.extra_disks {
-                let source = snap_dir.join(&extra_disk.filename);
-                let dest = vm_dir.join(&extra_disk.filename);
-                reflink_copy(&source, &dest)
-                    .await
-                    .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
-            }
-            info!(
-                num_disks = restore_config.extra_disks.len(),
-                "copied {} extra disk image(s) to clone",
-                restore_config.extra_disks.len()
-            );
-        }
+    if let Some(p) = &ns.net_namespace_path {
+        vm_manager.set_net_namespace_path(p.clone());
+    }
+    if let Some((baseline_dirs, clone_dir)) = &ns.mount_redirects {
+        vm_manager.set_mount_redirects(baseline_dirs.clone(), clone_dir.clone());
     }
 
     let firecracker_bin = find_firecracker(runtime_config)?;
@@ -1389,6 +1428,150 @@ pub async fn restore_from_snapshot(
         FirecrackerBackend::from_vm_manager(vm_manager),
         holder_child,
     ))
+}
+
+/// Restore a Cloud Hypervisor VM from a snapshot (#632 P2).
+///
+/// The Cloud Hypervisor analogue of [`restore_from_snapshot`]. It reuses the shared clone
+/// substrate (network/namespace/CoW disk/mount-redirect via [`prepare_clone_substrate`]),
+/// then — instead of Firecracker's `LoadSnapshot` + `patch_drive` — launches
+/// `cloud-hypervisor --restore source_url=file://{snapshot}/ch,memory_restore_mode=copy`.
+/// CH reads its own `config.json`/`state.json`/memory ranges from that subdir; the disk
+/// paths it embeds are redirected to the clone's CoW disk by the mount namespace (CH has no
+/// `patch_drive`). The VM restores PAUSED (`resume=false`) so the network post-start runs
+/// before [`Hypervisor::resume`], mirroring Firecracker.
+///
+/// `copy` mode is eager read-copy (simplest, proven); in-process on-demand UFFD
+/// (`memory_restore_mode=ondemand`) is a follow-on (P2.5). The restored guest reconnects its
+/// vsock channels and syncs its clock when the CALLER serves a restore-epoch over the
+/// boot-plan vsock port (its restore-epoch watcher triggers `handle_clone_restore`).
+pub async fn restore_from_snapshot_ch(
+    params: RestoreParams<'_>,
+    network: &mut dyn NetworkManager,
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+) -> Result<(
+    crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend,
+    Option<tokio::process::Child>,
+)> {
+    use crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend;
+    use crate::hypervisor::{Hypervisor, ProcessSpec};
+
+    let RestoreParams {
+        vm_id,
+        vm_name,
+        data_dir,
+        socket_path,
+        runtime_config: _, // CH binary is resolved via find_cloud_hypervisor (env/PATH)
+        restore_config,
+        network_config,
+        clone_ipv6: _, // delivered to the guest via the boot-plan restore-epoch (caller)
+        track_dirty_pages: _, // CH has no dirty-page tracking
+    } = params;
+    let vm_dir = data_dir.join("disks");
+
+    // CH's own snapshot files live in the `ch/` subdir (written by create_snapshot_ch).
+    let snapshot_dir = restore_config
+        .snapshot_dir
+        .as_ref()
+        .context("Cloud Hypervisor restore requires the snapshot directory")?;
+    let ch_dir = snapshot_dir.join(CH_SNAPSHOT_SUBDIR);
+    if !ch_dir.join("config.json").exists() {
+        bail!(
+            "Cloud Hypervisor snapshot incomplete: {} has no config.json",
+            ch_dir.display()
+        );
+    }
+
+    // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
+    let substrate = prepare_clone_substrate(
+        network,
+        restore_config,
+        network_config,
+        vm_id,
+        data_dir,
+        vm_state,
+    )
+    .await?;
+
+    let ch_bin = find_cloud_hypervisor()?;
+    let log_path = data_dir.join("firecracker.log");
+    let mut backend =
+        CloudHypervisorBackend::new(vm_id.to_string(), socket_path.to_path_buf(), Some(log_path));
+
+    // Restore paused, then resume after network post-start (mirrors the FC load/resume split).
+    let restore_args = format!(
+        "--restore source_url=file://{},memory_restore_mode=copy,resume=false",
+        ch_dir.display()
+    );
+    let spec = ProcessSpec {
+        binary: ch_bin,
+        extra_args: Some(restore_args),
+        vm_name: Some(vm_name.to_string()),
+        namespace_id: substrate.namespace.namespace_id.clone(),
+        holder_pid: substrate.holder_pid_for_post_start,
+        user_namespace_path: substrate.namespace.user_namespace_path.clone(),
+        net_namespace_path: substrate.namespace.net_namespace_path.clone(),
+        mount_redirects: substrate.namespace.mount_redirects.clone(),
+    };
+    backend
+        .spawn(&spec)
+        .await
+        .context("launching Cloud Hypervisor --restore")?;
+
+    let holder_child = substrate.holder_child;
+    // Everything after spawn runs in a fallible block so a failure kills the CH process
+    // (callers may fall back to a fresh boot, so a half-restored process must not leak).
+    let post_start = async {
+        let vm_pid = backend.pid()?;
+        let post_start_pid = substrate.holder_pid_for_post_start.unwrap_or(vm_pid);
+        network
+            .post_start(post_start_pid)
+            .await
+            .context("post-start network setup")?;
+
+        backend
+            .resume()
+            .await
+            .context("resuming Cloud Hypervisor after restore")?;
+
+        vm_state.pid = Some(std::process::id());
+        // Future snapshots of this clone must redirect using the original vsock vm_id.
+        vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
+        if !restore_config.extra_disks.is_empty() {
+            vm_state.config.extra_disks = restore_config
+                .extra_disks
+                .iter()
+                .map(|d| crate::state::types::ExtraDisk {
+                    path: vm_dir.join(&d.filename).display().to_string(),
+                    mount_path: d.mount_path.clone(),
+                    read_only: d.read_only,
+                })
+                .collect();
+        }
+
+        // Liveness: ensure the VM didn't crash immediately after restore.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(status) = backend.try_wait()? {
+            bail!(
+                "Cloud Hypervisor crashed immediately after snapshot restore (exit status: {:?})",
+                status
+            );
+        }
+
+        save_vm_state_with_network(state_manager, vm_state, network_config).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = post_start {
+        warn!(error = %format!("{e:#}"), "CH restore failed after launch; killing the process");
+        if let Err(kill_err) = backend.kill().await {
+            warn!(error = %kill_err, "failed to kill Cloud Hypervisor after restore failure");
+        }
+        return Err(e);
+    }
+
+    Ok((backend, holder_child))
 }
 
 /// Core snapshot creation logic with automatic diff snapshot support.
