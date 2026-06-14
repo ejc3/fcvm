@@ -1,4 +1,4 @@
-# FCVM - Firecracker VM Manager Design Specification
+# FCVM - MicroVM Manager Design Specification (Pluggable Hypervisor Backends: Firecracker + Cloud Hypervisor)
 
 ## Table of Contents
 1. [Overview](#overview)
@@ -16,7 +16,7 @@
 
 ## Overview
 
-**fcvm** is a Firecracker VM manager designed to run Podman containers inside lightweight microVMs with lightning-fast cloning capabilities. It provides a simple CLI interface for spinning up isolated container environments with:
+**fcvm** is a microVM manager designed to run Podman containers inside lightweight microVMs with lightning-fast cloning capabilities. It runs VMs behind a pluggable `Hypervisor` trait (`src/hypervisor/`) supporting two backends — **Firecracker** (default) and **Cloud Hypervisor** — selected with `--hypervisor firecracker|cloud-hypervisor` on `fcvm podman run`. It provides a simple CLI interface for spinning up isolated container environments with:
 
 - **Full-featured VMs**: Filesystem access, outbound networking, port forwarding
 - **Fast cloning**: Clone running VMs in <1s using snapshots and CoW disks
@@ -34,7 +34,7 @@
 
 1. **`fcvm podman run` Command**
    - Takes a Docker/Podman container image
-   - Spins up a Firecracker VM running the container
+   - Spins up a microVM (Firecracker or Cloud Hypervisor, via `--hypervisor`) running the container
    - Supports volume mounts via FUSE passthrough (host → guest)
    - Supports port forwarding (host → guest)
    - Process blocks until VM exits (hanging/foreground mode)
@@ -80,7 +80,7 @@
 ### Non-Functional Requirements
 
 - **Performance**: Clone startup <1s
-- **Isolation**: Full VM isolation via Firecracker
+- **Isolation**: Full VM isolation via KVM (Firecracker or Cloud Hypervisor backends)
 - **Compatibility**: Works with rootless Podman in guest
 - **Portability**: Runs on bare metal or nested VMs (VM-in-VM)
 - **Reliability**: Clean shutdown, resource cleanup
@@ -95,8 +95,8 @@
 ┌──────────────────────────────────────────────────────┐
 │                  fcvm CLI (Host)                      │
 │  ┌────────────┐  ┌──────────────┐  ┌─────────────┐  │
-│  │ Networking │  │  Firecracker │  │  Storage &  │  │
-│  │  Manager   │  │  API Client  │  │  Snapshots  │  │
+│  │ Networking │  │  Hypervisor  │  │  Storage &  │  │
+│  │  Manager   │  │  Abstraction │  │  Snapshots  │  │
 │  └────────────┘  └──────────────┘  └─────────────┘  │
 │         │                │                 │          │
 │         └────────────────┴─────────────────┘          │
@@ -105,7 +105,8 @@
                            │
                            ▼
               ┌────────────────────────┐
-              │  Firecracker Process   │
+              │   Hypervisor Process   │
+              │ (Firecracker / CH)     │
               │  (microVM)             │
               │  ┌──────────────────┐  │
               │  │   Linux Kernel   │  │
@@ -128,10 +129,11 @@
    - Manages networking, storage, snapshots
    - Streams logs and handles signals
 
-2. **Firecracker** (External binary)
-   - Runs the microVM
-   - Provides REST API over Unix socket
-   - Manages VM resources (vCPU, memory, drives, network)
+2. **Hypervisor backend** (External binary, pluggable via `--hypervisor`)
+   - Runs the microVM and manages VM resources (vCPU, memory, drives, network)
+   - **Firecracker** (default): REST API over a Unix socket; boot metadata via MMDS
+   - **Cloud Hypervisor**: REST API over the `--api-socket` Unix socket (`/api/v1/vm.create` + `vm.boot`); boot metadata served over vsock (boot-plan port 4995, no MMDS)
+   - Selected behind the `Hypervisor` trait (`src/hypervisor/`); see Core Components for backend-specific details
 
 3. **fc-agent** (Rust, runs in guest)
    - Fetches container configuration from MMDS
@@ -385,6 +387,7 @@ Each VM has:
 │       ├── disk.snap          # Disk snapshot
 │       └── config.json        # VM configuration
 ├── state/                     # VM state JSON files
+├── image-cache/               # Container image layers (sha256:{digest}/)
 └── cache/                     # Downloaded cloud images
 ```
 
@@ -1320,13 +1323,13 @@ match fork() {
 | Command | Purpose |
 |---------|---------|
 | `fcvm setup` | Download kernel, create rootfs (first-time setup, ~5-10 min) |
-| `fcvm podman run` | Launch container in Firecracker VM |
+| `fcvm podman run` | Launch container in a microVM (Firecracker by default, or Cloud Hypervisor via `--hypervisor cloud-hypervisor`) |
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm ls` | List running VMs |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
-| `fcvm snapshots` | List available snapshots |
+| `fcvm snapshots ls` | List stored snapshots (also: `delete <NAME>`, `prune`) |
 
 ### Key CLI Design Decisions
 
@@ -1402,11 +1405,14 @@ fcvm snapshot serve my-snapshot
 **Usage**:
 ```bash
 fcvm snapshot run --pid <SERVE_PID> [OPTIONS]
+fcvm snapshot run --snapshot <NAME> [OPTIONS]
 ```
 
 **Options**:
 ```
---pid <SERVE_PID>         Memory server PID (required)
+--pid <SERVE_PID>         Memory server PID (UFFD lazy-restore mode)
+--snapshot <NAME>         Snapshot name (direct file mode, no server needed)
+                          (Either --pid or --snapshot is required; mutually exclusive)
 --name <NAME>             Clone VM name (auto-generated if not provided)
 --exec <CMD>              Execute command in container after clone is healthy
 ```
@@ -1458,10 +1464,38 @@ clone-1        12350   running   healthy   rootless  (clone)
 
 #### `fcvm snapshots`
 
-**Purpose**: List available snapshots.
+**Purpose**: Manage stored snapshots. A subcommand is required (`ls`, `delete`, or `prune`).
 
+**List snapshots**:
 ```bash
-fcvm snapshots
+fcvm snapshots ls [--json] [--filter <user|system>] [--image <NAME>] [--shared]
+```
+
+**Delete a specific snapshot**:
+```bash
+fcvm snapshots delete <NAME> [--force]
+```
+
+**Prune snapshots** (deletes system/auto-generated snapshots by default):
+```bash
+fcvm snapshots prune [--force] [--all] [--image <NAME>]
+```
+
+**Options**:
+```
+ls:
+  --json                  Output in JSON format
+  --filter <user|system>  Filter by snapshot type
+  --image <NAME>          Filter by container image name
+  --shared                Show accurate disk usage accounting for btrfs shared extents (slower)
+
+delete:
+  --force, -f             Force deletion without confirmation
+
+prune:
+  --force, -f             Force deletion without confirmation
+  --all                   Delete ALL snapshots (including user-created ones)
+  --image <NAME>          Only delete snapshots matching this container image name
 ```
 
 ---
@@ -1626,7 +1660,7 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
 ### Build System (Makefile)
 
-All builds are done via the root Makefile. See [CLAUDE.md](/.claude/CLAUDE.md#makefile-targets) for the complete target list.
+All builds are done via the root Makefile. Run `make help` for the complete target list (see also [CLAUDE.md](.claude/CLAUDE.md#always-use-the-makefile)).
 
 ```bash
 make build      # Build fcvm + fc-agent
