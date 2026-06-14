@@ -28,8 +28,8 @@
 //! returns `false` for the relevant capability never enters that path. The snapshot
 //! orchestration in `commands::common` therefore still operates on the concrete
 //! Firecracker backend (reached via [`Hypervisor::as_any`]). Abstracting snapshots is
-//! deferred to P2, which is blocked upstream for Cloud Hypervisor on ARM64 anyway
-//! (`GetAarchCoreRegister` EINVAL under nested/NV2 hosts).
+//! deferred to P2 (now unblocked: the earlier CH ARM64 snapshot-create failure was the
+//! SVE register-save bug CH #8057, fixed by #8268 — not nesting).
 
 pub mod firecracker;
 
