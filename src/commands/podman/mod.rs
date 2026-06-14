@@ -407,7 +407,16 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         || args.rootfs_override.is_some()
         || std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(false)
+        // A FORCED boot-plan transport override (FCVM_BOOTPLAN=vsock on Firecracker, which
+        // natively uses MMDS) produces a guest whose fc-agent took the vsock path and never
+        // spawned the MMDS restore-epoch watcher. The snapshot cache key is a hash of
+        // FirecrackerConfig, which does NOT encode the boot-plan transport, so a cached
+        // vsock-built snapshot would be restored by a later NORMAL (MMDS) run under the same
+        // key — the host then signals restore over MMDS that nobody polls, wedging the
+        // restored VM (no exec rebind / output reconnect). Forcing the transport is a
+        // test/debug path with no need to populate the shared cache, so skip caching for it.
+        || std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock");
     let (fc_config, snapshot_key): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
