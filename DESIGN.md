@@ -136,7 +136,7 @@
    - Selected behind the `Hypervisor` trait (`src/hypervisor/`); see Core Components for backend-specific details
 
 3. **fc-agent** (Rust, runs in guest)
-   - Fetches container configuration from MMDS
+   - Fetches container configuration (boot plan) via MMDS (Firecracker) or vsock (Cloud Hypervisor)
    - Launches Podman with correct parameters
    - Streams container logs to host via vsock
    - Signals readiness to host
@@ -1042,10 +1042,10 @@ async fn main() -> Result<()> {
 
 **Location**: `fc-agent/src/main.rs`
 
-Runs inside the Firecracker VM as a systemd service.
+Runs inside the microVM as a systemd service (both Firecracker and Cloud Hypervisor).
 
 **Responsibilities**:
-1. Fetch container plan from MMDS (Metadata Service)
+1. Fetch container plan (boot plan) via MMDS (Firecracker) or vsock port 4995 (Cloud Hypervisor)
 2. Launch Podman with correct configuration
 3. Stream container logs to serial console
 4. Signal readiness to host (via vsock)
@@ -1091,8 +1091,8 @@ Firecracker provides a metadata service accessible at `http://169.254.169.254/`.
 ```rust
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Fetch plan from MMDS
-    let plan = fetch_mmds_plan().await?;
+    // 1. Fetch plan via MMDS (Firecracker) or vsock (Cloud Hypervisor)
+    let plan = fetch_plan().await?;
 
     // 2. Build Podman command
     let mut cmd = Command::new("podman");
@@ -1148,12 +1148,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn fetch_mmds_plan() -> Result<Plan> {
-    loop {
-        match reqwest::get("http://169.254.169.254/").await {
-            Ok(resp) => return resp.json().await.context("parsing MMDS"),
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+// Actual implementation auto-detects transport via /proc/cmdline
+// (fcvm_bootplan=vsock → vsock port 4995; otherwise → MMDS at 169.254.169.254)
+async fn fetch_plan() -> Result<Plan> {
+    match detect_transport() {
+        Transport::Vsock => read_vsock_plan().await,
+        Transport::Mmds => {
+            loop {
+                match reqwest::get("http://169.254.169.254/").await {
+                    Ok(resp) => return resp.json().await.context("parsing MMDS"),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
             }
         }
     }
