@@ -456,8 +456,8 @@ plumbing — the disk itself carries the signal.
 
 Every VM is configured "reboot possible" **up front**: each lifecycle path builds a
 launch plan (`RebootSpec`: firecracker binary/args, fully-resolved launch config,
-boot args, vsock path) before the VM runs, and all paths boot through one shared
-primitive, `configure_and_boot_firecracker`:
+boot args, vsock path, boot-plan transport) before the VM runs, and all paths boot
+through one shared primitive, `configure_and_boot_vm`:
 
 - initial `fcvm podman run` boot
 - disk-only clone cold boot (via `prepare_vm` with `rootfs_override`)
