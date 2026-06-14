@@ -734,6 +734,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.forward_localhost = args.forward_localhost.clone();
     vm_state.config.network_mode = args.network.into();
+    vm_state.config.hypervisor = args.hypervisor.into();
     vm_state.config.ipv6_prefix = args.ipv6_prefix.clone();
     vm_state.config.tty = args.tty;
     vm_state.config.interactive = args.interactive;

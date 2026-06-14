@@ -188,6 +188,11 @@ pub struct VmConfig {
     /// Used by health checks to run `runuser -u <username> -- podman inspect`.
     #[serde(default)]
     pub username: Option<String>,
+    /// Which VMM backend runs this VM (Firecracker or Cloud Hypervisor). Recorded so
+    /// `snapshot create`/`run` drive the right control plane. Defaults to Firecracker for
+    /// state files written before this field existed (#632 P2).
+    #[serde(default)]
+    pub hypervisor: crate::hypervisor::Backend,
 }
 
 impl VmState {
@@ -233,6 +238,7 @@ impl VmState {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                hypervisor: crate::hypervisor::Backend::default(),
             },
         }
     }

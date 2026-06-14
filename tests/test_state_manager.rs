@@ -67,6 +67,7 @@ async fn test_state_persistence() {
             user: None,
             username: None,
             health_check_timeout: 5,
+            hypervisor: Default::default(),
         },
     };
 
@@ -149,6 +150,7 @@ async fn test_list_vms() {
                 user: None,
                 username: None,
                 health_check_timeout: 5,
+                hypervisor: Default::default(),
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -215,6 +217,7 @@ async fn test_load_state_by_name_duplicate_detection() {
                 user: None,
                 username: None,
                 health_check_timeout: 5,
+                hypervisor: Default::default(),
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -275,6 +278,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             user: None,
             username: None,
             health_check_timeout: 5,
+            hypervisor: Default::default(),
         },
     };
     manager.save_state(&state).await.unwrap();
@@ -324,6 +328,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
             user: None,
             username: None,
             health_check_timeout: 5,
+            hypervisor: Default::default(),
         },
     }
 }

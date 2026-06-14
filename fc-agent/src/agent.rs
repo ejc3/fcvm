@@ -94,10 +94,10 @@ pub async fn run() -> Result<()> {
     let exec_rebind_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
-    // Start restore-epoch watcher (Firecracker/MMDS only). Vsock restore-epoch delivery
-    // for Cloud Hypervisor clone/restore is P2; under the vsock transport the MMDS
-    // watcher would only spam failed 169.254.169.254 polls, so skip it.
-    if transport == bootplan::Transport::Mmds {
+    // Start the restore-epoch watcher for the active transport: Firecracker polls MMDS,
+    // Cloud Hypervisor polls the host's boot-plan vsock port (#632 P2). Both call
+    // handle_clone_restore identically when a restore-epoch appears.
+    {
         let restore_signals = crate::restore::RestoreSignals {
             output: output.clone(),
             restore_flag: restore_flag.clone(),
@@ -109,8 +109,8 @@ pub async fn run() -> Result<()> {
             nfs_mounts: plan.nfs_mounts.clone(),
         };
         tokio::spawn(async move {
-            eprintln!("[fc-agent] starting restore-epoch watcher");
-            mmds::watch_restore_epoch(restore_signals).await;
+            eprintln!("[fc-agent] starting restore-epoch watcher ({transport:?})");
+            mmds::watch_restore_epoch(restore_signals, transport).await;
         });
     }
 
