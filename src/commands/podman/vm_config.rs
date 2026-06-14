@@ -5,7 +5,9 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::cli::RunArgs;
-use crate::hypervisor::{firecracker::FirecrackerBackend, Hypervisor};
+use crate::hypervisor::{
+    cloud_hypervisor::CloudHypervisorBackend, firecracker::FirecrackerBackend, Backend, Hypervisor,
+};
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork};
 use crate::state::{StateManager, VmState};
 use crate::storage::DiskManager;
@@ -760,7 +762,7 @@ pub(super) async fn run_vm_setup(
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<(
-    FirecrackerBackend,
+    Box<dyn Hypervisor>,
     Option<tokio::process::Child>,
     super::types::RebootSpec,
     Option<tokio::task::JoinHandle<()>>,
@@ -770,7 +772,7 @@ pub(super) async fn run_vm_setup(
     // The inner setup publishes the Firecracker manager and holder process into these
     // slots as soon as they are created, so the error path below can kill them even
     // when the failure happens partway through configuration.
-    let mut vm_manager_slot: Option<FirecrackerBackend> = None;
+    let mut vm_manager_slot: Option<Box<dyn Hypervisor>> = None;
     let mut holder_slot: Option<tokio::process::Child> = None;
     // Inputs to replay the firecracker config on an in-place relaunch (guest reboot),
     // captured once the launch config is fully resolved.
@@ -1114,7 +1116,7 @@ async fn run_vm_setup_inner(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-    vm_manager_slot: &mut Option<FirecrackerBackend>,
+    vm_manager_slot: &mut Option<Box<dyn Hypervisor>>,
     holder_slot: &mut Option<tokio::process::Child>,
     reboot_spec_slot: &mut Option<super::types::RebootSpec>,
     bootplan_handle_slot: &mut Option<tokio::task::JoinHandle<()>>,
@@ -1176,24 +1178,32 @@ async fn run_vm_setup_inner(
 
     let vm_name = args.name.clone();
     info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
-    // Enable Firecracker debug logging
-    let fc_log_path = data_dir.join("firecracker.log");
-    let _ = std::fs::File::create(&fc_log_path);
+    // VMM debug log (named firecracker.log for both backends for tooling compatibility).
+    let vmm_log_path = data_dir.join("firecracker.log");
+    let _ = std::fs::File::create(&vmm_log_path);
 
-    let firecracker_bin = crate::commands::common::find_firecracker(runtime_config)?;
+    // Select the VMM backend (#632) and its binary.
+    let backend: Backend = args.hypervisor.into();
+    let vmm_bin = match backend {
+        Backend::Firecracker => crate::commands::common::find_firecracker(runtime_config)?,
+        Backend::CloudHypervisor => crate::commands::common::find_cloud_hypervisor()?,
+    };
 
-    // Use RuntimeConfig firecracker_args (from --kernel-profile), falling back to env var
-    let fc_args_env = std::env::var("FCVM_FIRECRACKER_ARGS").ok();
-    let fc_args = runtime_config
-        .firecracker_args
-        .as_deref()
-        .or(fc_args_env.as_deref());
+    // Firecracker extra args (e.g. --enable-nv2 from the kernel profile, or
+    // FCVM_FIRECRACKER_ARGS) are Firecracker-specific; Cloud Hypervisor ignores them.
+    let vmm_extra_args: Option<String> = match backend {
+        Backend::Firecracker => runtime_config
+            .firecracker_args
+            .clone()
+            .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok()),
+        Backend::CloudHypervisor => None,
+    };
 
     // Build the process-spawn spec: binary, extra args, and namespace isolation. The
     // namespace fields are VMM-neutral (any VMM child runs in the same namespaces).
     let mut process_spec = crate::hypervisor::ProcessSpec {
-        binary: firecracker_bin.clone(),
-        extra_args: fc_args.map(|s| s.to_string()),
+        binary: vmm_bin.clone(),
+        extra_args: vmm_extra_args.clone(),
         vm_name: Some(vm_name),
         ..Default::default()
     };
@@ -1221,11 +1231,18 @@ async fn run_vm_setup_inner(
         );
     }
 
-    let vm_manager = vm_manager_slot.insert(FirecrackerBackend::new(
-        vm_id.to_string(),
-        socket_path.to_path_buf(),
-        Some(fc_log_path),
-    ));
+    let vm_manager = vm_manager_slot.insert(match backend {
+        Backend::Firecracker => Box::new(FirecrackerBackend::new(
+            vm_id.to_string(),
+            socket_path.to_path_buf(),
+            Some(vmm_log_path),
+        )) as Box<dyn Hypervisor>,
+        Backend::CloudHypervisor => Box::new(CloudHypervisorBackend::new(
+            vm_id.to_string(),
+            socket_path.to_path_buf(),
+            Some(vmm_log_path),
+        )) as Box<dyn Hypervisor>,
+    });
 
     vm_manager
         .spawn(&process_spec)
@@ -1270,8 +1287,8 @@ async fn run_vm_setup_inner(
     // exact same descriptor boots the VM now and relaunches it on a guest reboot, and
     // is shared with the disk-only clone path (which boots via prepare_vm -> here).
     let plan = super::types::RebootSpec {
-        firecracker_bin,
-        fc_args: fc_args.map(|s| s.to_string()),
+        firecracker_bin: vmm_bin,
+        fc_args: vmm_extra_args,
         launch_config,
         boot_args: runtime_boot_args,
         track_dirty_pages,
@@ -1284,7 +1301,7 @@ async fn run_vm_setup_inner(
     // runs the host-once-only steps (NFS exports + pasta post_start); an in-place
     // reboot relaunch passes `None` and reuses the already-live host substrate.
     *bootplan_handle_slot = configure_and_boot_vm(
-        vm_manager,
+        vm_manager.as_mut(),
         &plan,
         args,
         network_config,

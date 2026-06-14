@@ -370,6 +370,71 @@ async fn test_bootplan_over_vsock() -> Result<()> {
     Ok(())
 }
 
+/// P1 (#632): Cloud Hypervisor cold-boots and runs a container.
+///
+/// End-to-end proof of the `CloudHypervisorBackend`: cloud-hypervisor spawns, the VM is
+/// created + booted via the REST API, fc-agent fetches its plan over vsock (CH has no
+/// MMDS), and the container runs to completion. Rootless (no sudo). Requires a
+/// cloud-hypervisor binary on PATH (or `FCVM_CLOUD_HYPERVISOR_BIN`); on aarch64 SVE hosts a
+/// post-#8268 build is only needed for snapshots (P2), not for this cold boot.
+#[tokio::test]
+async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nTest Cloud Hypervisor cold boot (--hypervisor cloud-hypervisor)");
+    println!("================================================================");
+
+    // Cloud Hypervisor is an optional external VMM (CI provisions only the Firecracker
+    // fork). Gate on its presence the same way other tests gate on a device/privilege:
+    // when present (local dev, or CI once it provisions CH) the test runs and its
+    // assertion is definitive; when absent, skip rather than fail. The binary must be on
+    // a namespace-accessible path (e.g. /usr/local/bin), NOT a 0700 home dir, since the
+    // rootless user namespace cannot exec a file owned by an unmapped uid.
+    if std::process::Command::new("cloud-hypervisor")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "SKIP: cloud-hypervisor not found on PATH — skipping CH backend test \
+             (install it to /usr/local/bin to run this; see #632)"
+        );
+        return Ok(());
+    }
+
+    let (vm_name, _, _, _) = common::unique_names("ch-coldboot");
+
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--hypervisor",
+        "cloud-hypervisor",
+        common::TEST_IMAGE,
+        "echo",
+        "ch-cold-boot-ok",
+    ])
+    .await
+    .context("spawning fcvm --hypervisor cloud-hypervisor")?;
+
+    println!("  fcvm PID: {} (cloud-hypervisor)", fcvm_pid);
+
+    let status = tokio::time::timeout(Duration::from_secs(180), child.wait())
+        .await
+        .context("timeout waiting for Cloud Hypervisor VM")?
+        .context("waiting for child")?;
+
+    println!("  Exit status: {}", status);
+    assert!(
+        status.success(),
+        "Cloud Hypervisor should cold-boot and run the container to completion"
+    );
+    println!("✅ CLOUD HYPERVISOR COLD-BOOT TEST PASSED!");
+    Ok(())
+}
+
 /// Test that container stdout streams to host after snapshot.
 ///
 /// Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
