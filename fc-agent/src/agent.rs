@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tokio::time::{sleep, Duration};
 
-use crate::{container, exec, lock_test, mmds, mounts, network, output, proxy, system};
+use crate::{bootplan, container, exec, lock_test, mmds, mounts, network, output, proxy, system};
 
 /// Main agent logic — fetches plan, runs container, triggers shutdown.
 pub async fn run() -> Result<()> {
@@ -19,15 +19,19 @@ pub async fn run() -> Result<()> {
     network::configure_dns_from_cmdline();
     network::configure_ipv6_from_cmdline();
 
-    // Fetch plan from MMDS with retry
+    // Select the boot-plan transport (MMDS for Firecracker, vsock for VMMs without a
+    // metadata service like Cloud Hypervisor) from the kernel command line.
+    let transport = bootplan::detect_transport();
+
+    // Fetch the container plan with retry.
     let plan = loop {
-        match mmds::fetch_plan().await {
+        match bootplan::fetch_plan(transport).await {
             Ok(p) => {
                 eprintln!("[fc-agent] received container plan successfully");
                 break p;
             }
             Err(e) => {
-                eprintln!("[fc-agent] MMDS not ready: {:?}", e);
+                eprintln!("[fc-agent] boot plan not ready: {:?}", e);
                 eprintln!("[fc-agent] retrying in 500ms...");
                 sleep(Duration::from_millis(500)).await;
             }
@@ -63,7 +67,7 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    if let Err(e) = mmds::sync_clock_from_host().await {
+    if let Err(e) = bootplan::sync_clock_from_host(transport).await {
         eprintln!("[fc-agent] WARNING: clock sync failed: {:?}", e);
         eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
     }
@@ -90,21 +94,25 @@ pub async fn run() -> Result<()> {
     let exec_rebind_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
-    // Start restore-epoch watcher
-    let restore_signals = crate::restore::RestoreSignals {
-        output: output.clone(),
-        restore_flag: restore_flag.clone(),
-        exec_rebind: exec_rebind.clone(),
-        exec_rebind_needed: exec_rebind_needed.clone(),
-        exec_rebind_done: exec_rebind_done.clone(),
-        exec_rebind_done_notify: exec_rebind_done_notify.clone(),
-        egress_gen_rx: egress_gen_rx.clone(),
-        nfs_mounts: plan.nfs_mounts.clone(),
-    };
-    tokio::spawn(async move {
-        eprintln!("[fc-agent] starting restore-epoch watcher");
-        mmds::watch_restore_epoch(restore_signals).await;
-    });
+    // Start restore-epoch watcher (Firecracker/MMDS only). Vsock restore-epoch delivery
+    // for Cloud Hypervisor clone/restore is P2; under the vsock transport the MMDS
+    // watcher would only spam failed 169.254.169.254 polls, so skip it.
+    if transport == bootplan::Transport::Mmds {
+        let restore_signals = crate::restore::RestoreSignals {
+            output: output.clone(),
+            restore_flag: restore_flag.clone(),
+            exec_rebind: exec_rebind.clone(),
+            exec_rebind_needed: exec_rebind_needed.clone(),
+            exec_rebind_done: exec_rebind_done.clone(),
+            exec_rebind_done_notify: exec_rebind_done_notify.clone(),
+            egress_gen_rx: egress_gen_rx.clone(),
+            nfs_mounts: plan.nfs_mounts.clone(),
+        };
+        tokio::spawn(async move {
+            eprintln!("[fc-agent] starting restore-epoch watcher");
+            mmds::watch_restore_epoch(restore_signals).await;
+        });
+    }
 
     // Write storage.conf with driver = "overlay" before starting the exec server.
     // The health monitor runs `podman inspect` as soon as exec accepts connections.

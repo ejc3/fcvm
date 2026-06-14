@@ -280,6 +280,96 @@ async fn test_trailing_args_command() -> Result<()> {
     Ok(())
 }
 
+/// P0.5 (#632): fc-agent fetches its boot plan over vsock instead of MMDS.
+///
+/// `FCVM_BOOTPLAN=vsock` forces the vsock boot-plan transport on Firecracker (the
+/// transport Cloud Hypervisor requires, since it has no MMDS). This proves the path
+/// end-to-end: the host serves the plan on the boot-plan vsock port, fc-agent reads it
+/// and configures + runs the container. If vsock plan delivery were broken, fc-agent
+/// would never receive its plan and the container would never run, so a clean exit is
+/// definitive proof the vsock boot-plan works.
+///
+/// It ALSO guards against the #670 cache-poisoning regression: the snapshot cache key is
+/// a hash of FirecrackerConfig and does NOT encode the boot-plan transport. If a
+/// forced-vsock run cached a (watcher-less) snapshot under the shared key, a later NORMAL
+/// MMDS run with the same config would restore it and wedge (host signals restore over
+/// MMDS that nobody polls). So we run the SAME command twice — once forced-vsock, then
+/// normal — sharing a unique echo token (hence a unique, collision-free snapshot key).
+/// Without the fix the second run restores the poisoned snapshot and hangs (timeout);
+/// with the fix the forced-vsock run caches nothing, so the second run boots cleanly.
+#[tokio::test]
+async fn test_bootplan_over_vsock() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nTest boot plan over vsock (FCVM_BOOTPLAN=vsock)");
+    println!("================================================");
+
+    // vm_vsock / vm_mmds: distinct VM names. `token`: a unique marker echoed by BOTH runs
+    // so they share one snapshot cache key that no other test/run can have populated.
+    let (vm_vsock, vm_mmds, token, _) = common::unique_names("bootplan-vsock");
+
+    // Run 1 — forced vsock boot plan.
+    let (mut child, fcvm_pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_vsock,
+            common::TEST_IMAGE,
+            "echo",
+            &token,
+        ],
+        &[("FCVM_BOOTPLAN", "vsock")],
+    )
+    .await
+    .context("spawning fcvm with FCVM_BOOTPLAN=vsock")?;
+
+    println!("  fcvm PID: {} (FCVM_BOOTPLAN=vsock)", fcvm_pid);
+
+    let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
+        .await
+        .context("timeout waiting for vsock-boot-plan VM")?
+        .context("waiting for child")?;
+
+    println!("  Run 1 (vsock) exit status: {}", status);
+    assert!(
+        status.success(),
+        "VM should boot via the vsock boot-plan (MMDS disabled) and run the container"
+    );
+
+    // Run 2 — same command, NORMAL (MMDS) transport, no FCVM_BOOTPLAN. Shares run 1's
+    // snapshot key (same image + `echo <token>` + config). Regression guard for #670: if
+    // run 1 had cached its vsock-built snapshot, this run would restore the watcher-less
+    // guest and wedge; the timeout below would then fire and fail the test.
+    let (mut child2, fcvm_pid2) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_mmds,
+        common::TEST_IMAGE,
+        "echo",
+        &token,
+    ])
+    .await
+    .context("spawning normal-MMDS fcvm for the same command")?;
+
+    println!("  fcvm PID: {} (normal MMDS, same key)", fcvm_pid2);
+
+    let status2 = tokio::time::timeout(Duration::from_secs(120), child2.wait())
+        .await
+        .context("timeout waiting for normal-MMDS VM (would indicate #670 cache poisoning)")?
+        .context("waiting for child2")?;
+
+    println!("  Run 2 (MMDS) exit status: {}", status2);
+    assert!(
+        status2.success(),
+        "Normal MMDS run of the same command must boot cleanly (not restore a vsock-built \
+         snapshot under the shared cache key — #670)"
+    );
+    println!("✅ VSOCK BOOT-PLAN + #670 NON-POISONING TEST PASSED!");
+    Ok(())
+}
+
 /// Test that container stdout streams to host after snapshot.
 ///
 /// Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).

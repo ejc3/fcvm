@@ -1,4 +1,5 @@
 mod agent;
+mod bootplan;
 mod container;
 mod exec;
 mod fuse;
