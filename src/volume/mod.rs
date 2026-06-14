@@ -1,6 +1,7 @@
 //! FUSE-over-vsock volume mounting using fuse-pipe.
 //!
-//! This module provides host directory mounting inside Firecracker VMs
+//! This module provides host directory mounting inside VMs via vsock,
+//! which works with both hypervisor backends (Firecracker and Cloud Hypervisor),
 //! using FUSE over vsock, powered by the high-performance fuse-pipe library.
 //!
 //! # Architecture
@@ -80,12 +81,14 @@ impl VolumeServer {
         Ok(Self { config, host_path })
     }
 
-    /// Serve volumes over Firecracker's vsock Unix socket.
+    /// Serve volumes over the VMM's vsock Unix socket.
     ///
-    /// For guest-initiated connections, Firecracker's vsock expects the host to listen on:
+    /// For guest-initiated connections, the VMM's vsock expects the host to listen on:
     ///   `{uds_path}_{port}` (e.g., `/path/to/v.sock_5000`)
     ///
-    /// When guest connects to CID 2, port 5000, Firecracker forwards to host's v.sock_5000.
+    /// When the guest connects to the host (CID 2) on port 5000, the VMM forwards to the
+    /// host's `v.sock_5000`. This `{uds_path}_{port}` scheme is identical for both Firecracker
+    /// and Cloud Hypervisor.
     pub async fn serve_vsock(&self, vsock_socket_path: &Path) -> Result<()> {
         self.serve_vsock_with_ready_signal(vsock_socket_path, None)
             .await

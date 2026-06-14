@@ -5,7 +5,7 @@ Welcome! We're excited you're interested in contributing to fcvm. Whether you're
 ## Getting Started
 
 1. **Fork and clone** the repo
-2. **Set up dependencies** - see the [Required Forks](README.md#required-forks) section in the README
+2. **Set up dependencies** - see the [Prerequisites](README.md#prerequisites) section in the README
 3. **Build** with `make build`
 4. **Run tests** with `make test`
 

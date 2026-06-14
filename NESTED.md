@@ -9,7 +9,7 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2. Host → L1 → L2 ne
 | **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal, c7gn.metal, r7g.metal) |
 | **Host kernel** | 6.18+ with `kvm-arm.mode=nested` boot parameter |
 | **Nested kernel** | Pre-built from releases or `fcvm setup --kernel-profile nested --build-kernels` |
-| **Firecracker** | Fork with NV2 support (configured via kernel profile) |
+| **Hypervisor** | Firecracker fork with NV2 support, configured via kernel profile (Cloud Hypervisor does not support nested ARM64) |
 
 ## Setting Up an EC2 Instance
 
@@ -89,7 +89,8 @@ sudo ./fcvm podman run \
     --kernel-profile nested \
     --privileged \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    --map /path/to/fcvm/binary:/opt/fcvm \
+    # Map the directory containing the fcvm binary so the inner VM can run /opt/fcvm/fcvm
+    --map "$(dirname "$(command -v fcvm)")":/opt/fcvm \
     nginx:alpine
 
 # Verify nested KVM works

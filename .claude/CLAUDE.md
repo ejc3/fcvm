@@ -208,7 +208,7 @@ ps aux | grep -E "fcvm|script|cat"
 **The process list tells you EXACTLY what's happening.** Read it.
 
 ## Overview
-fcvm is a Firecracker VM manager for running Podman containers in lightweight microVMs. This document tracks implementation findings and decisions.
+fcvm is a hypervisor-agnostic VM manager for running Podman containers in lightweight microVMs. It drives two backends behind a pluggable `Hypervisor` trait — Firecracker (default) and Cloud Hypervisor — selected via `--hypervisor firecracker|cloud-hypervisor`. This document tracks implementation findings and decisions.
 
 ## Nested Virtualization
 
@@ -1151,11 +1151,14 @@ src/
 ├── main.rs           # CLI dispatcher
 ├── paths.rs          # Path utilities for btrfs layout
 ├── health.rs         # Health monitoring
+├── kvm_trace.rs      # KVM ftrace helper for debugging snapshot restore
+├── utils.rs          # Process/system utility functions
 ├── cli/              # Command-line parsing
 │   └── args.rs       # Clap structures
 ├── commands/         # Command implementations
 ├── state/            # VM state management
-├── firecracker/      # Firecracker API client
+├── hypervisor/       # Pluggable hypervisor (VMM) abstraction (Firecracker + Cloud Hypervisor)
+├── firecracker/      # Low-level Firecracker API client (Firecracker backend impl)
 ├── network/          # Networking layer (bridged + pasta + routed + egress proxy)
 ├── storage/          # Disk/snapshot management
 ├── uffd/             # UFFD memory sharing
@@ -1200,11 +1203,13 @@ fuse-pipe/benches/
 ### ✅ Completed
 
 1. **Core Implementation** (2025-11-09)
-   - Firecracker API client using hyper + hyperlocal (Unix sockets)
+   - Pluggable `Hypervisor` trait (`src/hypervisor/mod.rs`) selecting the VMM behind the same orchestration, with two backends: **Firecracker (default)** and **Cloud Hypervisor**, chosen via `--hypervisor firecracker|cloud-hypervisor` (#632)
+   - Firecracker backend: API client using hyper + hyperlocal (Unix sockets); boot plan via MMDS
+   - Cloud Hypervisor backend: cold boot + container run, snapshot/restore/clone via `--restore` + in-process UFFD; boot plan via vsock (no MMDS)
    - Dual networking modes: bridged (iptables) + rootless (pasta)
    - Storage layer with btrfs CoW disk management
    - VM state persistence
-   - Guest agent (fc-agent) with MMDS integration
+   - Guest agent (fc-agent) receives its boot plan via MMDS (Firecracker) or over vsock (Cloud Hypervisor)
 
 2. **Snapshot/Clone Workflow** (2025-11-11, verified 2025-11-12)
    - Pause VM → Create Firecracker snapshot → Resume VM
@@ -1248,9 +1253,17 @@ fuse-pipe/benches/
 
 ## Technical Reference
 
-### Firecracker Requirements
+### Backend Requirements
+
+fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hypervisor/`), selected with `--hypervisor firecracker|cloud-hypervisor` (default: firecracker). Both cold-boot fcvm's kernel + initrd + rootfs and run a Podman container; fc-agent is injected at boot via initrd in both cases. Rootfs is Ubuntu 24.04 with systemd, Podman, and iproute2 for both.
+
+**Firecracker** (default)
 - **Kernel**: vmlinux or bzImage, boot args: `console=ttyS0 reboot=k panic=1 pci=off`
-- **Rootfs**: ext4 or btrfs (via `--rootfs-type`) with Ubuntu 24.04, systemd, Podman, iproute2, fc-agent injected at boot via initrd
+- **Rootfs**: ext4 or btrfs (via `--rootfs-type`)
+
+**Cloud Hypervisor** (ARM64)
+- **Kernel**: ARM64 `Image` (PE) format (not vmlinux/bzImage), boot args: `console=hvc0 reboot=k panic=1` (virtio console, no `pci=off`)
+- **Rootfs**: declared with `image_type=Raw` (CH does not take an ext4/btrfs filesystem-type flag)
 
 ### Network Modes
 
@@ -1299,7 +1312,7 @@ fuse-pipe/benches/
 - Sparse files: only written blocks use real disk space (50G file with 2G content uses ~2G)
 - Included in `FirecrackerConfig.rootfs_size` → affects snapshot cache key (different sizes = different snapshots)
 - Clones inherit parent's disk size naturally (reflink copies the already-resized file)
-- Implementation: `src/storage/disk.rs::ensure_free_space()`, called from `src/commands/podman.rs`
+- Implementation: `src/storage/disk.rs::ensure_free_space()`, called from `src/commands/podman/vm_config.rs`
 
 **Layer System:**
 The rootfs is named after the SHA of a combined script that includes:
