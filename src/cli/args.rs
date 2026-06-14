@@ -72,6 +72,13 @@ pub struct SetupArgs {
     /// Requires --kernel-profile flag. After setup, reboot to activate.
     #[arg(long, requires = "kernel_profile")]
     pub install_host_kernel: bool,
+
+    /// Build the Cloud Hypervisor backend binary from the [cloud_hypervisor]
+    /// config (repo + branch), content-addressed under assets_dir/cloud-hypervisor/.
+    /// CH is an optional VMM backend (`--hypervisor cloud-hypervisor`), so it is
+    /// built on demand rather than on every setup.
+    #[arg(long)]
+    pub cloud_hypervisor: bool,
 }
 
 // ============================================================================

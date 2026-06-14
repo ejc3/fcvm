@@ -384,21 +384,18 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
     println!("\nTest Cloud Hypervisor cold boot (--hypervisor cloud-hypervisor)");
     println!("================================================================");
 
-    // Cloud Hypervisor is an optional external VMM (CI provisions only the Firecracker
-    // fork). Gate on its presence the same way other tests gate on a device/privilege:
-    // when present (local dev, or CI once it provisions CH) the test runs and its
-    // assertion is definitive; when absent, skip rather than fail. The binary must be on
-    // a namespace-accessible path (e.g. /usr/local/bin), NOT a 0700 home dir, since the
-    // rootless user namespace cannot exec a file owned by an unmapped uid.
-    if std::process::Command::new("cloud-hypervisor")
-        .arg("--version")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
+    // Cloud Hypervisor is an optional VMM backend. Gate on the SAME resolution fcvm uses
+    // (FCVM_CLOUD_HYPERVISOR_BIN → content-addressed build under assets_dir → PATH): when
+    // resolvable (local dev, or CI after `fcvm setup --cloud-hypervisor`) the test runs and
+    // its assertion is definitive; when absent, skip rather than fail. The binary must live
+    // on a namespace-accessible path (the content-addressed assets_dir works, like the
+    // firecracker fork binary), NOT a 0700 home dir, since the rootless user namespace
+    // cannot exec a file owned by an unmapped uid.
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
         eprintln!(
-            "SKIP: cloud-hypervisor not found on PATH — skipping CH backend test \
-             (install it to /usr/local/bin to run this; see #632)"
+            "SKIP: cloud-hypervisor not found — skipping CH backend test (build it with \
+             `fcvm setup --cloud-hypervisor`, set FCVM_CLOUD_HYPERVISOR_BIN, or install on \
+             PATH; see #632/#61)"
         );
         return Ok(());
     }
@@ -449,15 +446,11 @@ async fn test_cloud_hypervisor_snapshot_roundtrip() -> Result<()> {
     println!("\nTest Cloud Hypervisor snapshot create + restore roundtrip");
     println!("==========================================================");
 
-    if std::process::Command::new("cloud-hypervisor")
-        .arg("--version")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
         eprintln!(
-            "SKIP: cloud-hypervisor not found on PATH — skipping CH snapshot roundtrip \
-             (install it to /usr/local/bin to run this; see #632/#61)"
+            "SKIP: cloud-hypervisor not found — skipping CH snapshot roundtrip (build it with \
+             `fcvm setup --cloud-hypervisor`, set FCVM_CLOUD_HYPERVISOR_BIN, or install on \
+             PATH; see #632/#61)"
         );
         return Ok(());
     }

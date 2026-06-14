@@ -41,6 +41,15 @@ commit = "e1a6d9ef626aa6dbcfeef97dbbab3bd69c35b4b1"
 repo = "ejc3/firecracker"
 branch = "bump-vsock-max-connections"
 
+# Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
+# Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
+# Pinned to a fork branch carrying the aarch64 SVE register save/restore fix
+# (upstream CH PR #8268), which landed after the v52.0 release and is in no tagged
+# release yet. Required for CH snapshot/restore on SVE-capable hosts (Graviton3+).
+[cloud_hypervisor]
+repo = "ejc3/cloud-hypervisor"
+branch = "fcvm-v52-sve-fix"
+
 # Rootfs Modification Plan
 #
 # The SHA256 of the generated setup script determines the image name: layer2-{sha}.raw

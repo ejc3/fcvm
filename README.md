@@ -295,7 +295,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM as part of the boo
 **Dependencies:**
 - Rust 1.75+ with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH (default backend)
-- Cloud Hypervisor binary in PATH (only if using `--hypervisor cloud-hypervisor`; override location with `FCVM_CLOUD_HYPERVISOR_BIN`)
+- Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): build the pinned fork with `fcvm setup --cloud-hypervisor`, or set `FCVM_CLOUD_HYPERVISOR_BIN`, or put `cloud-hypervisor` in PATH (resolved in that order)
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
 - For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set)
@@ -339,6 +339,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | Command | Description |
 |---------|-------------|
 | `fcvm setup` | Download kernel and create rootfs (5-10 min first run, then cached) |
+| `fcvm setup --cloud-hypervisor` | Build the Cloud Hypervisor backend binary (content-addressed, on demand) |
 | `fcvm podman run` | Run container in a microVM (backend selected with `--hypervisor`, default `firecracker`) |
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm ls` | List running VMs (`--json` for JSON) |

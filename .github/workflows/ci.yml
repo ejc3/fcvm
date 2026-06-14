@@ -384,6 +384,16 @@ jobs:
           sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
       - name: Refresh KVM permissions
         run: sudo chmod 666 /dev/kvm
+      # #61: provision the optional Cloud Hypervisor backend so the
+      # --hypervisor cloud-hypervisor sanity tests run (instead of skipping).
+      # Built from the [cloud_hypervisor] fork (SVE register fix, CH #8268) and
+      # content-addressed under assets_dir, exactly like the firecracker fork.
+      # The assets dir (/mnt/fcvm-btrfs) persists across runs, so this rebuilds
+      # only when the fork commit moves (a new content-addressed filename);
+      # otherwise it is an instant no-op, like the kernel/rootfs/firecracker setup.
+      - name: Build Cloud Hypervisor backend
+        working-directory: fcvm
+        run: ./target/release/fcvm setup --cloud-hypervisor
       - name: test-packaging-e2e
         working-directory: fcvm
         run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
