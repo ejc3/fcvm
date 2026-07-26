@@ -199,7 +199,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-setup-fcvm container-shell container-clean container-bench \
 	setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import \
-	lint fmt ssh test-serve-sdk
+	lint fmt update-dependency ssh test-serve-sdk
 
 all: build
 
@@ -209,6 +209,7 @@ help:
 	@echo "Build:"
 	@echo "  build              Build fcvm + fc-agent"
 	@echo "  build-fc-mock      Build fc-mock (Firecracker mock for container mode)"
+	@echo "  update-dependency  Update one Cargo.lock package (PACKAGE=..., optional VERSION=...)"
 	@echo "  clean              Remove target directory"
 	@echo ""
 	@echo "Test (host):"
@@ -668,6 +669,10 @@ lint: setup-lint-tools
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CARGO) audit
 	$(CARGO) deny check
+
+update-dependency:
+	@test -n "$(PACKAGE)" || (echo "ERROR: PACKAGE required"; exit 1)
+	$(CARGO) update -p "$(PACKAGE)" $(if $(VERSION),--precise "$(VERSION)")
 
 fmt:
 	$(CARGO) fmt
