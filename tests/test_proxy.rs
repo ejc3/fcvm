@@ -42,26 +42,25 @@ async fn get_host_ipv6() -> Option<String> {
 
 /// Helper to test proxy functionality for a given address family.
 ///
-/// 1. Target server binds to `host_bind` on host
-/// 2. Proxy server binds to `host_bind` on host
-/// 3. VM uses curl with http_proxy env var pointing to `vm_gateway`
+/// 1. Target server binds to `target_bind` on host
+/// 2. Proxy server binds to `proxy_bind` on host
+/// 3. VM uses curl with `-x` pointing to `vm_gateway`
 /// 4. VM requests target URL via the proxy
 /// 5. Proxy forwards to target and returns response
-async fn test_proxy_to_addr(host_bind: &str, vm_gateway: &str, addr_type: &str) -> Result<()> {
-    let is_ipv6 = host_bind.contains(':');
-
+async fn test_proxy_to_addr(
+    target_bind: &str,
+    proxy_bind: &str,
+    vm_gateway: &str,
+    addr_type: &str,
+) -> Result<()> {
     // Start target server
-    let target_server = common::LocalTestServer::start_on_available_port(host_bind)
+    let target_server = common::LocalTestServer::start_on_available_port(target_bind)
         .await
         .context("start target server")?;
-    let target_url = if is_ipv6 {
-        format!("http://[{}]:{}/", host_bind, target_server.port)
-    } else {
-        format!("http://{}:{}/", host_bind, target_server.port)
-    };
+    let target_url = target_server.url.clone();
 
     // Start proxy server
-    let proxy_server = common::LocalProxyServer::start_on_available_port(host_bind)
+    let proxy_server = common::LocalProxyServer::start_on_available_port(proxy_bind)
         .await
         .context("start proxy server")?;
     let vm_proxy_url = if vm_gateway.contains(':') {
@@ -72,15 +71,15 @@ async fn test_proxy_to_addr(host_bind: &str, vm_gateway: &str, addr_type: &str) 
 
     println!(
         "[{}] Target: {} (host's {})",
-        addr_type, target_url, host_bind
+        addr_type, target_url, target_bind
     );
     println!(
         "[{}] Proxy:  {} (host's {})",
-        addr_type, proxy_server.url, host_bind
+        addr_type, proxy_server.url, proxy_bind
     );
     println!(
         "[{}] VM proxy: {} ({} → {})",
-        addr_type, vm_proxy_url, vm_gateway, host_bind
+        addr_type, vm_proxy_url, vm_gateway, proxy_bind
     );
 
     let (vm_name, _, _, _) = common::unique_names(&format!("proxy-{}", addr_type));
@@ -132,7 +131,7 @@ async fn test_proxy_to_addr(host_bind: &str, vm_gateway: &str, addr_type: &str) 
         pid,
         &[
             "curl",
-            "-s",
+            "-sS",
             "--max-time",
             "10",
             "-x",
@@ -168,7 +167,7 @@ async fn test_proxy_to_addr(host_bind: &str, vm_gateway: &str, addr_type: &str) 
             );
             println!(
                 "[{}] ✓ VM used proxy ({}) to reach target ({})",
-                addr_type, vm_gateway, host_bind
+                addr_type, vm_gateway, target_bind
             );
             Ok(())
         }
@@ -185,15 +184,16 @@ async fn test_proxy_ipv6() -> Result<()> {
         );
         return Ok(());
     }
-    // Note: We use :: (all interfaces) instead of ::1 because pasta IPv6
-    // doesn't have host loopback translation like IPv4's 10.0.2.2 → 127.0.0.1
-    test_proxy_to_addr("::", "fd00::2", "ipv6").await
+    // The proxy listens on :: so the VM must reach it over IPv6 through
+    // pasta's fd00::2 gateway. The proxy-to-target hop is host-local and
+    // independent of the client-to-proxy address family under test.
+    test_proxy_to_addr("127.0.0.1", "::", "fd00::2", "ipv6").await
 }
 
 /// Test IPv4 proxy: VM uses 10.0.2.2 to reach proxy on 127.0.0.1
 #[tokio::test]
 async fn test_proxy_ipv4() -> Result<()> {
-    test_proxy_to_addr("127.0.0.1", "10.0.2.2", "ipv4").await
+    test_proxy_to_addr("127.0.0.1", "127.0.0.1", "10.0.2.2", "ipv4").await
 }
 
 /// Helper to test VM egress to a specific bind address.

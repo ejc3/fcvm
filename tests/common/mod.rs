@@ -2223,9 +2223,8 @@ impl LocalProxyServer {
             "[proxy] Got {} bytes from target, forwarding to client",
             response.len()
         );
-        writer.write_all(&response).await?;
-
         request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        writer.write_all(&response).await?;
         eprintln!("[proxy] Request complete");
         Ok(())
     }
