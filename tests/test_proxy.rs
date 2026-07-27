@@ -134,6 +134,10 @@ async fn test_proxy_to_addr(
             "-sS",
             "--max-time",
             "10",
+            // Force proxy use even if inherited NO_PROXY contains the target.
+            "--noproxy",
+            // exec_in_container joins command words into a shell script.
+            "\"\"",
             "-x",
             &vm_proxy_url,
             &target_url,
