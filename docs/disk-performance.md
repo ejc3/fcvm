@@ -99,12 +99,13 @@ the same failure guarantees: the local NVMe device belongs to one host, while EB
 Archil are remote durable storage services. This test did not inject failures or
 independently verify provider durability.
 
-The very high read results on all three fcvm-loop layouts came from the sparse backing
-file's page cache. Each 2 GiB test file had just been written and fit in the host's
-16 GiB of memory. These are warm-cache results, not storage-provider read rates. The
-buffered random results also include that cache. The cache can improve a running
-workload's latency, but it is finite and is lost when a workload moves to another
-host.
+The very high read results on all three fcvm-loop layouts are consistent with the
+sparse backing file's page cache dominating the measurements. Each 2 GiB test file had
+just been written and fit in the host's 16 GiB of memory. Other cache layers may also
+have contributed, particularly on the Archil path. These are warm-cache results, not
+storage-provider read rates. The buffered random results include the same cache
+layers. Those caches can improve a running workload's latency, but host-local caches
+are finite and are lost when a workload moves to another host.
 
 Direct EBS and the EBS direct-I/O-loop image both clustered around baseline gp3's
 provisioned 3,000 IOPS and 125 MiB/s. The fcvm-loop EBS image buffered QD1 writes in
@@ -194,9 +195,10 @@ their own latency and capacity tests.
 
 ## Summary
 
-- fcvm's non-Btrfs-host loop path used the host page cache for the sparse backing file.
-  That made warm reads and some buffered writes much faster, but the results do not
-  represent cold storage-provider performance or durability.
+- fcvm's non-Btrfs-host loop path made the sparse backing file eligible for the host
+  page cache. The high warm-read results are consistent with that cache, although other
+  cache layers may have contributed. They do not represent cold storage-provider
+  performance or durability.
 - Median `fsync` through the fcvm-loop EBS image was 2.04 ms, close to direct EBS at
   1.94 ms, but its p99 was 6.32 ms rather than 2.24 ms and its maximum was 82.3 ms
   rather than 18.0 ms. The direct-I/O-loop EBS image measured a 5.67 ms median.
