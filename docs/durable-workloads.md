@@ -248,12 +248,19 @@ checkpoint and any backing used for lazy memory restore, together with the
 immutable restore-runtime bundle, are authoritative workload storage. They are
 never artifact-cache entries.
 
-If checkpoint creation fails before termination begins, the system discards the
-staged generation, checkpoint, bundle, and unpublished manifest, then safely
-resumes the same exclusively leased writer. If termination has begun or writer
-ownership is uncertain, the workload enters `Fencing` and remains non-runnable
-until that writer is fenced. A VM checkpoint is never published without its
-restore runtime or paired with a different workspace generation.
+Failure before the workspace generation commits can discard every uncommitted
+staging object and safely resume the same exclusively leased writer. Once a
+generation commits, checkpoint rollback never deletes it. A later failure before
+manifest publication discards only the incomplete checkpoint, bundle, and
+manifest, retains the committed generation until `Running` is durably
+re-established, and then leaves it to normal generation garbage collection. If
+the manifest has published, the operation is committed to stopping: recovery
+finishes termination and fencing instead of resuming the old VM. If termination
+has begun or writer ownership is uncertain, the workload enters `Fencing` and
+retains the committed generation until recovery has durably selected its source.
+A VM checkpoint is never published without its restore runtime or paired with a
+different workspace generation. Recovery never deletes the last known-good
+durable disk state.
 
 The initial idle rule is no active command or exec session, no live log session, no
 active forwarded connection, and no client keep-awake lease for the configured
@@ -271,17 +278,86 @@ snapshot format, and restore-runtime bundle digest. The scheduler restores it on
 on a compatible host, with that retained runtime, and against its exact workspace
 generation. The cell database anchors the bundle digest and trusted signer. Before
 execution, the worker verifies the complete bundle against the cell's release
-allowlist and revocation policy. A missing compatible host, damaged bundle, invalid
-signature, or revoked runtime leaves the workload stopped with a restore error;
-wake-up never silently substitutes a cold boot or executes a revoked runtime. An
-explicit cold restart discards the checkpoint and restore-runtime bundle, then
-boots the same workspace with the current runtime.
+allowlist and revocation policy. A missing compatible host, damaged bundle, or
+invalid signature leaves the workload stopped with a restore error. Wake-up never
+silently substitutes a cold boot. An explicit cold restart discards the checkpoint
+and restore-runtime bundle, then boots the same workspace with the current
+runtime.
 
-Restore consumes a checkpoint. It remains retryable while the new VMM is loading
-and paused. Immediately before the first vCPU resumes, the cell durably marks the
-checkpoint consumed so it cannot launch a second execution. A failure after that
-point uses the unexpected-compute-loss path. Physical checkpoint and bundle
-cleanup waits until no restore operation or VMM can reference them.
+Before attachment or compute side effects, `Starting` creates one durable restore
+attempt bound to the operation ID, checkpoint, workload revision, new writer epoch,
+start-intent revision, worker, VMM, and owner-lease generation. Its durable state is
+`Loading`, `ResumeAuthorized`, `Running`, `Fencing`, or terminal failure. Lease
+expiry permits takeover of this same attempt only; it never permits a second
+attempt or writer.
+
+Every restore-side worker, compute, storage, and authoritative-resource mutation
+carries the attempt ID, owner-lease generation, writer epoch, and exact resource
+ID. The recipient accepts it only under a current durable command claim. Takeover
+atomically increments the owner generation, so a delayed attach, resume,
+terminate, detach, or hold-release command from an older generation is rejected or
+becomes a no-op. Before dispatch, the controller durably records each command and
+its idempotency token.
+
+Some provider APIs cannot cancel an RPC that was already accepted. In that case,
+takeover reconciles the recorded in-flight command to its terminal result before
+adopting, resuming, or replacing the affected resource; it never assumes the old
+RPC was canceled. Cleanup and hold release also conditionally update the current
+attempt phase and owner generation, so an old owner cannot free resources already
+transferred to an authorized execution.
+
+The restore attempt acquires durable holds on the checkpoint, lazy-memory backing,
+and restore-runtime bundle before loading. Loading is read-only with respect to the
+authoritative workspace and leaves it at the checkpoint's exact generation. A
+provider that cannot enforce this does not advertise checkpoint restore. A
+pre-authorization abort makes the checkpoint retryable only after the attempted
+writer is fenced and the provider proves that the generation did not change.
+
+Resume authorization is the checkpoint-consumption and execution linearization
+point. Immediately before resume, one serializable cell transaction verifies the
+attempt owner and writer epoch, the exact checkpoint and workspace generation, and
+the bundle digest, signer, allowlist entry, and current runtime-policy epoch. It
+also verifies that the workload is still `Starting` under the same start-intent
+revision. It then atomically marks the checkpoint consumed and the attempt
+`ResumeAuthorized`. The worker can resume vCPUs only with the resulting one-shot
+authorization, which is bound to that attempt, worker, writer epoch, checkpoint,
+and runtime digest.
+
+Runtime revocation increments the same durable policy epoch and serializes against
+authorization. If revocation commits first, authorization fails, the VMM remains
+paused, the checkpoint remains unconsumed, and the attempt enters `Fencing`. Only
+after terminating the paused VMM, tearing down its writable attachment, and
+proving the writer fenced does the workload return to `Stopped` with a restore
+error. If authorization commits first, the attempt is treated as potentially
+executed for recovery and fencing, but the workload remains `Starting` until guest
+health permits publishing `Running`. A later revocation uses the running-instance
+fencing policy and is not complete until that VMM and writer are fenced. No
+restore authorized after revocation can execute that runtime.
+
+`stop`, `delete`, and explicit cold restart increment the same durable intent
+revision and serialize against resume authorization. If the intent change commits
+first, authorization fails and the attempted writer is fenced. If authorization
+commits first, the command treats the attempt as potentially executed and fences
+it before carrying out the new intent.
+
+After a controller restart, recovery resolves the durable restore attempt before
+creating another. Before `ResumeAuthorized`, it either adopts that exact paused VMM
+or terminates and fences its worker before making the checkpoint retryable. At or
+after `ResumeAuthorized`, recovery queries that exact VMM. If it proves the VMM is
+still paused and no later revocation or intent requires fencing, recovery
+idempotently completes the one authorized resume; if it proves the VMM is running,
+recovery adopts it. Otherwise the checkpoint stays consumed and recovery enters
+`Fencing`. After proving the old writer unable to write, it completes the winning
+durable cause or intent: revocation returns `Stopped` with a restore error, `stop`
+returns `Stopped`, `delete` commits its tombstone and cleanup, and explicit cold
+restart cold-boots. Only an intent-free ambiguous execution loss uses the
+unexpected-compute-loss cold-boot path. Recovery never replays that checkpoint.
+
+At authorization, the restore attempt's resource holds transfer to the execution.
+Cleanup releases them only after lazy memory is fully materialized or detached, or
+after compute termination and fencing prove that the VMM cannot fault again. These
+are correctness holds on authoritative checkpoint resources, not artifact-cache
+pins or cache reference counts.
 
 Delete first stops and fences the workload, then atomically commits an irreversible
 tombstone before physical cleanup. A failure before the tombstone leaves the intact
@@ -382,8 +458,15 @@ system uses the unexpected-compute-loss path.
 
 The service starts with two cells to force the architecture to respect cell
 boundaries from the beginning. Client registration permanently selects one cell.
-The registration credential and every workload ID contain a routable cell
-component, so the front door forwards requests without a global workload lookup.
+Every workload ID contains a routable cell component, but the ID is a locator, not
+authorization. The front door authenticates the registration credential, derives
+its assigned cell, compares that cell with the workload ID, and rejects a mismatch
+before forwarding. For a match, it routes without a global workload lookup. The
+target cell validates both credential and workload-ID authenticity, then requires
+the credential cell, ID cell, stored workload cell, and authenticated registration
+owner to match. A mismatch is rejected without cross-cell fallback or
+workload-existence disclosure. Credential rotation does not change the permanent
+cell assignment.
 
 Each cell owns its workload database, scheduler, provider credentials, workspaces,
 retained generations, VM checkpoints and restore-runtime bundles, backups,
@@ -451,12 +534,33 @@ The required tests are:
   that no partial workspace is published;
 - fail every step of preparation, checkpoint, fork, and relocation and verify that
   exactly one authoritative source-workload workspace remains;
+- fail immediately after workspace-generation commit, resume the same writer, and
+  verify all data flushed before the commit remains available while the generation
+  is retained until normal garbage collection;
 - checkpoint with one VMM version, remove that version from worker images and
   artifact caches, roll out an incompatible version, and verify wake-up restores
   with the retained runtime rather than silently cold-booting;
 - tamper with and revoke retained runtime bundles and verify restore rejects them,
-  then verify a pre-resume failure is retryable and a resumed checkpoint cannot
-  start a second execution;
+  then pause after preliminary verification, commit revocation before resume
+  authorization, and prove no vCPU resumes and the writer is fenced before
+  `Stopped` is published;
+- restart the controller before resume authorization and after authorization but
+  before its acknowledgement; verify the first case adopts or fences the paused
+  attempt before retry, while the second resumes or adopts the exact authorized
+  VMM when its state is provable and otherwise fences before completing the
+  winning cause or intent; neither case replays a consumed checkpoint;
+- fail a paused load before authorization and prove the authoritative workspace
+  generation did not change before the checkpoint becomes retryable;
+- pause an old controller before each attach, resume, terminate, detach, and
+  hold-release command, transfer attempt ownership, then release the old command;
+  verify it is rejected or reconciled before adoption and cannot kill an adopted
+  VMM or reclaim backing that it can still fault;
+- race `stop`, `delete`, and cold restart against resume authorization and verify
+  the winning intent revision determines the post-restart outcome without two
+  executions or an unintended cold boot;
+- hold a lazy-memory fault open during cleanup and verify the checkpoint backing
+  and runtime bundle remain available until materialization, detachment, or proven
+  compute fencing;
 - fail every step of deletion and verify that a pre-tombstone failure leaves the
   intact workload while a post-tombstone failure converges to zero authoritative
   workspaces and never resurrects the workload;
@@ -466,8 +570,9 @@ The required tests are:
   successful `fsync` or generation commit;
 - interrupt spot compute before and after checkpoint commit;
 - reconnect through the same port endpoint after stop and relocation;
-- assign clients to two cells and prove state, credentials, routing, and caches do
-  not cross the boundary;
+- assign clients to two cells, submit a mismatched workload-ID cell, and prove the
+  front door rejects it before either cell observes the request; also prove state,
+  credentials, routing, and caches do not cross the boundary;
 - fuzz lifecycle command sequences, duplicate delivery, controller restarts, and
   provider error timing; and
 - run the existing fcvm filesystem, snapshot, clone, and container tests once a
