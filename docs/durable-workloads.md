@@ -37,9 +37,10 @@ request to the cell that owns the workload.
 1. Every workload has exactly one authoritative logical workspace.
 2. A workload enters `Running` only after its storage provider has committed an
    exclusive, self-sufficient workspace.
-3. Every workload block device visible to the guest is workspace-owned. Every boot
-   or checkpoint input required to start it is an authoritative workload resource.
-   Cache paths are never attached as runtime drives.
+3. Every workload block device visible to the guest is workspace-owned. Every
+   workload-specific guest boot input and every exact checkpoint-restore input is
+   an authoritative workload resource. The compute provider's current cold-boot
+   runtime is not workload data. Cache paths are never attached as runtime drives.
 4. Deleting every host and cell artifact-cache entry after preparation cannot
    affect start, run, stop, restart, or fork from the workload.
 5. At most one VM can write a workspace. A new writer starts only after the old
@@ -65,15 +66,21 @@ subvolume, a block volume, or a remote workspace, but the control plane always s
 one workspace per workload.
 
 A **workspace generation** is an immutable, committed point-in-time view of that
-workspace. A **VM checkpoint** is the VMM, device, and memory state paired with
-exactly one workspace generation. A new or cold-booted workload has no VM
-checkpoint. An idle-suspended workload has one. The checkpoint file and every
-backing object needed for lazy memory restore are part of the workspace's
-authoritative storage namespace.
+workspace. A **VM checkpoint** is the VMM device state and guest memory state
+paired with exactly one workspace generation. A new or cold-booted workload has no
+VM checkpoint. An idle-suspended workload has one. The checkpoint file, every
+backing object needed for lazy memory restore, and an immutable restore-runtime
+bundle containing a compatible VMM executable and its runtime dependencies are
+part of the workspace's authoritative storage namespace. The bundle is hermetic
+and stored in a guest-inaccessible, control-plane-owned part of that namespace.
+Its digest and trusted release signature cover the complete bundle.
 
 Preparation also places the exact kernel, initrd, and other boot inputs needed by
-the workload in that authoritative namespace. The VMM executable, runtime sockets,
-and worker diagnostics belong to ephemeral compute and are not workload data.
+the workload in that authoritative namespace. The active VMM process, runtime
+sockets, worker diagnostics, and any current-worker copy of the VMM executable
+belong to ephemeral compute and are not workload data. The restore-runtime bundle
+retained with a checkpoint remains authoritative until that checkpoint is
+discarded.
 
 The client-visible durability boundary follows normal filesystem rules. A
 successful `stop` or idle suspension returns only after guest filesystems are
@@ -100,7 +107,8 @@ The storage provider owns these operations:
 - detach and fence a writer;
 - relocate or reattach a stopped workspace;
 - grow capacity; and
-- delete the workspace and its retained generations.
+- delete the workspace and its retained generations, checkpoints, and
+  restore-runtime bundles.
 
 `prepare` is a transaction. It creates a staging workspace, establishes every
 logical path, validates the result, commits its initial generation, and atomically
@@ -228,19 +236,24 @@ or failed workload. Only an idle-suspended workload wakes without an explicit
 `start` or `restart`.
 
 Idle shutdown uses the `Checkpointing` transition. The system quiesces and pauses
-the guest, flushes the workspace, commits a workspace generation, captures a VM
-checkpoint paired with that generation, then terminates and fences the writer. The
-guest remains quiesced from the snapshot boundary through fence confirmation, so
-the workspace cannot advance beyond the paired generation. Only then does the
-control plane publish `Stopped`. The VM checkpoint and any backing used for lazy
-memory restore are authoritative workload storage. They are never artifact-cache
-entries.
+the guest after it has materialized and verified the current VMM's immutable
+restore-runtime bundle. It then flushes the workspace, commits a workspace
+generation, captures a VM checkpoint, and durably stores the bundle. One atomic
+control-plane manifest binds the workspace generation, checkpoint digest, and
+restore-runtime bundle digest. The guest remains quiesced from the snapshot
+boundary through manifest publication and fence confirmation, so the workspace
+cannot advance beyond the paired generation. Only after the complete manifest is
+durable and the writer is fenced does the control plane publish `Stopped`. The VM
+checkpoint and any backing used for lazy memory restore, together with the
+immutable restore-runtime bundle, are authoritative workload storage. They are
+never artifact-cache entries.
 
 If checkpoint creation fails before termination begins, the system discards the
-staged generation and checkpoint and safely resumes the same exclusively leased
-writer. If termination has begun or writer ownership is uncertain, the workload
-enters `Fencing` and remains non-runnable until that writer is fenced. A VM
-checkpoint is never paired with a different workspace generation.
+staged generation, checkpoint, bundle, and unpublished manifest, then safely
+resumes the same exclusively leased writer. If termination has begun or writer
+ownership is uncertain, the workload enters `Fencing` and remains non-runnable
+until that writer is fenced. A VM checkpoint is never published without its
+restore runtime or paired with a different workspace generation.
 
 The initial idle rule is no active command or exec session, no live log session, no
 active forwarded connection, and no client keep-awake lease for the configured
@@ -253,10 +266,22 @@ uncommitted VM memory does not. After fencing the failed host, the system
 cold-boots the authoritative workspace. It never restores a VM checkpoint against
 a workspace that has advanced beyond the checkpoint's paired generation.
 
-A VM checkpoint records its architecture, CPU requirements, kernel, hypervisor, and
-snapshot format. The scheduler restores it only on a compatible host and against
-its exact workspace generation. An explicit cold restart discards incompatible VM
-state and boots the same workspace.
+A VM checkpoint records its architecture, CPU requirements, kernel, hypervisor,
+snapshot format, and restore-runtime bundle digest. The scheduler restores it only
+on a compatible host, with that retained runtime, and against its exact workspace
+generation. The cell database anchors the bundle digest and trusted signer. Before
+execution, the worker verifies the complete bundle against the cell's release
+allowlist and revocation policy. A missing compatible host, damaged bundle, invalid
+signature, or revoked runtime leaves the workload stopped with a restore error;
+wake-up never silently substitutes a cold boot or executes a revoked runtime. An
+explicit cold restart discards the checkpoint and restore-runtime bundle, then
+boots the same workspace with the current runtime.
+
+Restore consumes a checkpoint. It remains retryable while the new VMM is loading
+and paused. Immediately before the first vCPU resumes, the cell durably marks the
+checkpoint consumed so it cannot launch a second execution. A failure after that
+point uses the unexpected-compute-loss path. Physical checkpoint and bundle
+cleanup waits until no restore operation or VMM can reference them.
 
 Delete first stops and fences the workload, then atomically commits an irreversible
 tombstone before physical cleanup. A failure before the tombstone leaves the intact
@@ -361,10 +386,11 @@ The registration credential and every workload ID contain a routable cell
 component, so the front door forwards requests without a global workload lookup.
 
 Each cell owns its workload database, scheduler, provider credentials, workspaces,
-retained generations, VM checkpoints, backups, artifact caches, and network
-endpoints. Workload state, authoritative storage, and cached content do not leak
-across cells. The first version does not fail a workload over to another cell; cell
-disaster recovery restores that cell's control-plane data and storage in place.
+retained generations, VM checkpoints and restore-runtime bundles, backups,
+artifact caches, and network endpoints. Workload state, authoritative storage, and
+cached content do not leak across cells. The first version does not fail a workload
+over to another cell; cell disaster recovery restores that cell's control-plane
+data and storage in place.
 
 ## Networking
 
@@ -425,6 +451,12 @@ The required tests are:
   that no partial workspace is published;
 - fail every step of preparation, checkpoint, fork, and relocation and verify that
   exactly one authoritative source-workload workspace remains;
+- checkpoint with one VMM version, remove that version from worker images and
+  artifact caches, roll out an incompatible version, and verify wake-up restores
+  with the retained runtime rather than silently cold-booting;
+- tamper with and revoke retained runtime bundles and verify restore rejects them,
+  then verify a pre-resume failure is retryable and a resumed checkpoint cannot
+  start a second execution;
 - fail every step of deletion and verify that a pre-tombstone failure leaves the
   intact workload while a post-tombstone failure converges to zero authoritative
   workspaces and never resurrects the workload;
