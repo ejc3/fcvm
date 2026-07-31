@@ -159,16 +159,31 @@ enough to authorize a second writer: the storage provider must prove that every
 previous writer can no longer issue writes.
 
 Examples of proof are confirmation that the old EBS compute instance has reached a
-terminal state and its non-Multi-Attach volume is detached, an exclusive filesystem
-lock in the local provider, or a provider-enforced lease that rejects stale epochs.
-Submitting a termination or detach request is not proof. If the provider cannot
-prove fencing, the workload stays in `Fencing` and cannot start, relocate, or be
-reported as stopped.
+terminal state and its non-Multi-Attach volume is detached, or a provider-enforced
+access mechanism that revokes old credentials and rejects stale epochs. Submitting
+a termination or detach request is not proof.
 
-Every lifecycle request has an idempotency key. State changes use conditional
-updates against the expected workload revision and writer epoch. Duplicate
-requests, controller restarts, and network partitions cannot create, attach, or
-publish two physical writers.
+An advisory filesystem lock can serialize cooperating local starts, but it is not
+writer fencing: it cannot revoke an old process's ability to write through an open
+file descriptor. Before activating a higher epoch, the local provider must either
+terminate the old worker, confirm process exit, and tear down its writable mount,
+or use a mandatory, revocable access layer that rejects the old epoch. If any
+provider cannot prove fencing, the workload stays in `Fencing` and cannot start,
+relocate, or be reported as stopped.
+
+Every mutating request has an idempotency key scoped to the client registration
+inside its cell. Before side effects, the cell durably records the key, operation
+kind, canonical request-parameter digest, progress, and eventual result. The first
+version never expires or reuses an accepted key.
+
+A retry with the same key and parameters joins the in-progress operation or
+replays its exact terminal result, including the original workload ID, relocation
+result, or deletion tombstone. A retry with different parameters is rejected.
+These rules apply to `run`, relocation, deletion, and every other mutating
+operation across controller restarts and network retries. State changes also use
+conditional updates against the expected workload revision and writer epoch.
+Duplicate requests, controller restarts, and network partitions cannot create,
+attach, or publish two physical writers.
 
 ## Lifecycle
 
@@ -195,6 +210,7 @@ Preparing -> Absent
 Starting -> Fencing -> Stopped
 Running -> Checkpointing -> Stopped
 Checkpointing -> Running
+Checkpointing -> Fencing -> Stopped
 Running -> Stopping -> Stopped
 Running -> Fencing -> Stopped
 Running -> Stopping -> Deleting -> Deleted
@@ -214,7 +230,7 @@ or failed workload. Only an idle-suspended workload wakes without an explicit
 Idle shutdown uses the `Checkpointing` transition. The system quiesces and pauses
 the guest, flushes the workspace, commits a workspace generation, captures a VM
 checkpoint paired with that generation, then terminates and fences the writer. The
-guest remains quiesced from the disk-and-memory cut through fence confirmation, so
+guest remains quiesced from the snapshot boundary through fence confirmation, so
 the workspace cannot advance beyond the paired generation. Only then does the
 control plane publish `Stopped`. The VM checkpoint and any backing used for lazy
 memory restore are authoritative workload storage. They are never artifact-cache
@@ -277,6 +293,14 @@ published by atomic rename after digest validation. Host caches use capacity-bas
 LRU eviction. Cell caches use the same rule with their own capacity. Neither cache
 uses running-workload pins or correctness reference counts.
 
+Preparation acquires a short-lived read handle for each cache input. Eviction marks
+an entry unavailable to new readers and removes it only after existing read handles
+close. This handle ends before `prepare` commits and is not a workload pin. If a
+backend cannot preserve an active read, preparation treats disappearance as a read
+failure, discards the incomplete staging data for that digest, and retries from
+another source. It validates every digest before publication, so eviction can
+delay or fail preparation but cannot publish a partial workspace.
+
 Btrfs maintains the physical extent reference counts created by reflinks and
 subvolume snapshots. Storage providers maintain the resources that back
 authoritative workspaces and checkpoints. Those are separate from artifact-cache
@@ -297,12 +321,22 @@ Deleting the source workload or any artifact-cache entry cannot break the child.
 
 ## Stopped relocation and capacity
 
-The scheduler never moves a running workload. Each provider reports capacity and
-maintains reserved headroom. The scheduler grows storage, stops admission, and
-idles eligible workloads at configured high-water marks before the active
-filesystem can reach `ENOSPC`. It relocates only workloads that are already
-stopped; it never treats relocation as recovery from an exhausted running
-filesystem. Relocation then:
+The scheduler never moves a running workload. Each storage provider enforces a
+per-workspace allocation and a physical-pool reserve that workloads cannot consume.
+Local Btrfs can use qgroups and reserved pool capacity; block and remote providers
+use equivalent quotas or write admission. High-water marks trigger growth, stop
+new workload admission, and idle eligible workloads while protected capacity still
+remains.
+
+If growth cannot complete before a workload reaches its enforced allocation, the
+provider backpressures its writes for a bounded interval and then returns the
+provider's documented `ENOSPC` or quota error. It never reports a write as
+successful if capacity prevented allocation or caused any of that write to be
+discarded. Durability across a provider failure follows the `fsync` and generation
+commit boundary defined above. Workload data cannot consume the protected pool
+reserve, and one workload cannot exhaust storage needed by another workload or the
+control plane. Relocation uses only workloads that are already stopped; it is not
+recovery from an exhausted running filesystem. Relocation then:
 
 1. verifies that the workload is stopped;
 2. fences and detaches the old writer;
@@ -379,19 +413,25 @@ The required tests are:
   restart, and fork it;
 - concurrently issue duplicate starts and prove that only one writer reaches the
   workspace;
+- retry `run`, relocation, and deletion across controller restarts, verify exact
+  result replay, and reject key reuse with different parameters;
 - inject failures before and after epoch allocation, storage attachment, VMM launch,
   VMM termination, storage detachment, and fence confirmation;
 - kill the controller or worker after every durable transition, restart it, and
   verify idempotent recovery;
-- partition a stale worker, fence it, and prove it cannot write after a new epoch
-  starts;
+- partition a stale worker that retains an open writable file descriptor, fence it,
+  and prove its writes fail before a new epoch attaches;
+- evict a cache input during preparation, verify retry or clean failure, and prove
+  that no partial workspace is published;
 - fail every step of preparation, checkpoint, fork, and relocation and verify that
   exactly one authoritative source-workload workspace remains;
 - fail every step of deletion and verify that a pre-tombstone failure leaves the
   intact workload while a post-tombstone failure converges to zero authoritative
   workspaces and never resurrects the workload;
-- drive a host disk to its admission high-water mark, verify that no running
-  filesystem reaches `ENOSPC`, and relocate only stopped workloads;
+- drive a host disk to its admission high-water mark, inject growth failure, and
+  verify bounded backpressure or an isolated quota error without physical-pool
+  exhaustion, silently discarded capacity-constrained writes, or loss after a
+  successful `fsync` or generation commit;
 - interrupt spot compute before and after checkpoint commit;
 - reconnect through the same port endpoint after stop and relocation;
 - assign clients to two cells and prove state, credentials, routing, and caches do
