@@ -2143,19 +2143,16 @@ Snapshot metadata records the source's `kernel_profile`, `image_mode`, and
    - chroot, cgroups, seccomp
 
 7. **Multi-host support**:
-   - Distribute VMs across multiple hosts
-   - Remote snapshots
+   - Durable workloads across pluggable compute and storage providers
+   - Stopped-only relocation between hosts
+   - See [the durable remote workload design](docs/durable-workloads.md)
 
 ### Phase 3 (Advanced Features)
 
-1. **Live migration**:
-   - Migrate running VMs between hosts
-   - Zero-downtime updates
-
-2. **GPU passthrough**:
+1. **GPU passthrough**:
    - vGPU support for ML workloads
 
-3. **Kubernetes integration**:
+2. **Kubernetes integration**:
    - Run as CRI runtime
    - Pod → Firecracker VM
 

@@ -439,6 +439,7 @@ fcvm/
 | Document | Content |
 |----------|---------|
 | [DESIGN.md](DESIGN.md) | Architecture, internals, configuration reference |
+| [Durable remote workloads](docs/durable-workloads.md) | Proposed persistent, cell-based remote execution architecture |
 | [PERFORMANCE.md](PERFORMANCE.md) | Benchmarks, tuning, tracing |
 | [NESTED.md](NESTED.md) | Nested virtualization setup |
 
