@@ -925,6 +925,26 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     Ok((config, config_sha, config_sha_short))
 }
 
+/// Resolve the Firecracker binary for the rootfs setup VM.
+///
+/// FCVM_FIRECRACKER_BIN first, then PATH. Without this the setup VM shelled out
+/// to a bare "firecracker", so a host that has never installed one system-wide
+/// failed with a plain "No such file or directory" even though fcvm had just
+/// built a Firecracker of its own under the assets directory.
+fn setup_vm_firecracker_bin() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
+        let p = PathBuf::from(&path);
+        if !p.exists() {
+            bail!("FCVM_FIRECRACKER_BIN={} does not exist", path);
+        }
+        return Ok(p);
+    }
+    which::which("firecracker").context(
+        "firecracker not found in PATH; set FCVM_FIRECRACKER_BIN to the binary \
+         fcvm built under <assets_dir>/firecracker/",
+    )
+}
+
 /// Create a synthetic "default" kernel profile from the [kernel] config section.
 ///
 /// This allows all kernel code to work with profiles uniformly. The [kernel]
@@ -2285,7 +2305,8 @@ async fn boot_vm_for_setup(
         "starting Firecracker for Layer 2 setup (serial output: {})",
         serial_path.display()
     );
-    let mut fc_process = Command::new("firecracker")
+    let firecracker_bin = setup_vm_firecracker_bin()?;
+    let mut fc_process = Command::new(&firecracker_bin)
         .args([
             "--api-sock",
             path_to_str(&api_socket)?,
@@ -2462,4 +2483,30 @@ async fn boot_vm_for_setup(
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FCVM_FIRECRACKER_BIN is a process-global, so these run in one test.
+    #[test]
+    fn setup_vm_firecracker_bin_honors_env_var() {
+        let real = std::env::current_exe().expect("test binary path");
+
+        // Set and existing: returned as-is, rather than searching PATH.
+        std::env::set_var("FCVM_FIRECRACKER_BIN", &real);
+        assert_eq!(setup_vm_firecracker_bin().unwrap(), real);
+
+        // Set and missing: the error names the variable, so the reader knows
+        // which knob is wrong instead of getting a bare ENOENT.
+        std::env::set_var("FCVM_FIRECRACKER_BIN", "/nonexistent/firecracker");
+        let err = setup_vm_firecracker_bin().unwrap_err().to_string();
+        assert!(
+            err.contains("FCVM_FIRECRACKER_BIN"),
+            "error should name the variable, got: {err}"
+        );
+
+        std::env::remove_var("FCVM_FIRECRACKER_BIN");
+    }
 }
