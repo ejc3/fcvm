@@ -18,6 +18,13 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Record --config early so every load_config(None) in this process
+    // resolves to the same file — including the --install-host-kernel path
+    // that calls get_kernel_profile() before the main setup block.
+    if let Some(path) = args.config.as_deref() {
+        crate::setup::rootfs::set_config_path(path);
+    }
+
     // For host kernel install only, use temp paths (no btrfs needed)
     if args.install_host_kernel {
         if args.kernel_profile.is_none() {
@@ -56,9 +63,6 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     // Ensure btrfs storage is ready (creates loopback if needed)
     // This must be done before accessing any paths under the configured assets_dir
-    if let Some(path) = args.config.as_deref() {
-        crate::setup::rootfs::set_config_path(path);
-    }
     crate::setup::ensure_storage(args.config.as_deref()).context("initializing storage")?;
 
     // Load config and initialize paths (with helpful error if config missing)
