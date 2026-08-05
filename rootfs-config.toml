@@ -331,12 +331,13 @@ kernel_version = "6.16.1"
 kernel_repo = "ejc3/fcvm"
 build_inputs = [
     "kernel/mountinfo.conf",
-    "kernel/patches/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
-# Stated rather than left to the default, so the pair is explicit about
-# applying the same baseline patches.
-patches_dir = "kernel/patches"
+# Empty means apply no patches. The repo's default FUSE patches target a newer
+# kernel and do not apply to 6.16.1, and this comparison only times reads of
+# /proc/self/mountinfo, so the pair carries none and differs by exactly the
+# patch under test.
+patches_dir = ""
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
 [kernel_profiles.mountinfo-fix.amd64]
@@ -346,10 +347,9 @@ kernel_repo = "ejc3/fcvm"
 build_inputs = [
     "kernel/mountinfo.conf",
     "kernel/patches-mountinfo/*.patch",
-    "kernel/patches/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
-# Holds symlinks to every kernel/patches entry plus the one patch under test,
-# so this profile is the control plus exactly one patch and cannot drift from it.
+# Holds exactly one patch, the one under test. The control applies none, so the
+# pair differs by that patch alone.
 patches_dir = "kernel/patches-mountinfo"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
