@@ -328,6 +328,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 [kernel_profiles.mountinfo-base.amd64]
 description = "6.16.1 guest kernel, unpatched control for the mountinfo A/B"
 kernel_version = "6.16.1"
+kernel_repo = "ejc3/fcvm"
 build_inputs = [
     "kernel/mountinfo.conf",
 ]
@@ -337,6 +338,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 [kernel_profiles.mountinfo-fix.amd64]
 description = "6.16.1 guest kernel caching the dominating-id ring scan per peer group"
 kernel_version = "6.16.1"
+kernel_repo = "ejc3/fcvm"
 build_inputs = [
     "kernel/mountinfo.conf",
     "kernel/patches-mountinfo/*.patch",
