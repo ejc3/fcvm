@@ -326,21 +326,30 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # 6.16.1 is chosen because that is where the behaviour was first measured.
 
 [kernel_profiles.mountinfo-base.amd64]
-description = "6.16.1 guest kernel, unpatched control for the mountinfo A/B"
+description = "6.16.1 guest kernel, control for the mountinfo A/B"
 kernel_version = "6.16.1"
+kernel_repo = "ejc3/fcvm"
 build_inputs = [
     "kernel/mountinfo.conf",
+    "kernel/patches/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
+# Stated rather than left to the default, so the pair is explicit about
+# applying the same baseline patches.
+patches_dir = "kernel/patches"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
 [kernel_profiles.mountinfo-fix.amd64]
 description = "6.16.1 guest kernel caching the dominating-id ring scan per peer group"
 kernel_version = "6.16.1"
+kernel_repo = "ejc3/fcvm"
 build_inputs = [
     "kernel/mountinfo.conf",
     "kernel/patches-mountinfo/*.patch",
+    "kernel/patches/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
+# Holds symlinks to every kernel/patches entry plus the one patch under test,
+# so this profile is the control plus exactly one patch and cannot drift from it.
 patches_dir = "kernel/patches-mountinfo"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
