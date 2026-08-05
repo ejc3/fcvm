@@ -808,9 +808,10 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
 
     // 1b. A --config recorded earlier in this process
     if let Some(p) = EXPLICIT_CONFIG.get() {
-        if p.exists() {
-            return Ok(p.clone());
+        if !p.exists() {
+            bail!("Config file not found: {}", p.display());
         }
+        return Ok(p.clone());
     }
 
     // 2. SUDO_USER's config (when running with sudo)
