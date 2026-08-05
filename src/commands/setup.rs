@@ -56,6 +56,9 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     // Ensure btrfs storage is ready (creates loopback if needed)
     // This must be done before accessing any paths under the configured assets_dir
+    if let Some(path) = args.config.as_deref() {
+        crate::setup::rootfs::set_config_path(path);
+    }
     crate::setup::ensure_storage(args.config.as_deref()).context("initializing storage")?;
 
     // Load config and initialize paths (with helpful error if config missing)

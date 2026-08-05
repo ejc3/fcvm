@@ -52,6 +52,28 @@ get_kernel_version() {
 # Get patches directory for profile
 get_patches_dir() {
     local profile="$1"
+    local config_file="$REPO_ROOT/rootfs-config.toml"
+
+    # A profile may name its own patches_dir, and the Rust build reads it
+    # (src/setup/kernel.rs). This helper has to agree, or it edits and validates
+    # a different set of patches than the one that actually gets built.
+    #
+    # Profile tables are arch-suffixed ([kernel_profiles.<name>.amd64]), so match
+    # the name followed by either "]" or ".".
+    # Scope to the current arch's table: grep -A20 on a bare profile name spans
+    # both the .amd64 and .arm64 blocks and would read the wrong one.
+    local carch="amd64"
+    [[ "$(uname -m)" == "aarch64" ]] && carch="arm64"
+    local block
+    block=$(sed -n "/^\\[kernel_profiles\\.$profile\\.$carch\\]/,/^\\[/p" "$config_file" 2>/dev/null || true)
+    if grep -q '^patches_dir' <<< "$block"; then
+        local declared
+        declared=$(grep -m1 '^patches_dir' <<< "$block" | sed 's/.*=.*"\([^"]*\)".*/\1/')
+        # An empty string means the profile deliberately applies no patches.
+        [[ -z "$declared" ]] && return
+        echo "$REPO_ROOT/$declared"
+        return
+    fi
 
     # Check for arch-specific patches first
     local arch=$(uname -m)

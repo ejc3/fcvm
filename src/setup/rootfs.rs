@@ -5,6 +5,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -12,6 +13,19 @@ use crate::paths;
 
 /// Config file name
 const CONFIG_FILE: &str = "rootfs-config.toml";
+
+/// A --config path recorded once, so every later load_config(None) resolves to
+/// the same file. Without this, --config reaches only the call sites that thread
+/// it explicitly, and lookups that go through load_plan() (kernel profiles, for
+/// one) silently read the user config instead. The failure is confusing rather
+/// than loud: fcvm reports a profile "not found in config" while naming a config
+/// that defines it.
+static EXPLICIT_CONFIG: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the config file chosen on the command line. First call wins.
+pub fn set_config_path(path: &str) {
+    let _ = EXPLICIT_CONFIG.set(PathBuf::from(path));
+}
 
 /// Embedded default config (used by --generate-config)
 const EMBEDDED_CONFIG: &str = include_str!("../../rootfs-config.toml");
@@ -790,6 +804,13 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
             bail!("Config file not found: {}", path);
         }
         return Ok(p);
+    }
+
+    // 1b. A --config recorded earlier in this process
+    if let Some(p) = EXPLICIT_CONFIG.get() {
+        if p.exists() {
+            return Ok(p.clone());
+        }
     }
 
     // 2. SUDO_USER's config (when running with sudo)
