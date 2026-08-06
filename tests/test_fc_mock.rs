@@ -407,6 +407,25 @@ async fn test_fc_mock_exec_connect_protocol() -> Result<()> {
         .await?;
     println!("  Sent exec request: {}", request_json);
 
+    // Three-phase handshake: the server ACKs the consumed request and executes
+    // only after our GO line (see exec_proto::HANDSHAKE_ACK).
+    let mut ack_line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack_line))
+        .await
+        .context("timeout reading ACK")?
+        .context("reading ACK line")?;
+    assert_eq!(
+        ack_line.trim(),
+        exec_proto::HANDSHAKE_ACK,
+        "should get ACK before any exec response, got: {:?}",
+        ack_line
+    );
+    println!("  Received: ACK");
+    write_half
+        .write_all(format!("{}\n", exec_proto::HANDSHAKE_GO).as_bytes())
+        .await?;
+    println!("  Sent: GO");
+
     // Read responses (stdout, then exit)
     let mut got_stdout = false;
     let mut got_exit = false;

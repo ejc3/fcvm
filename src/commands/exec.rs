@@ -4,6 +4,14 @@
 //! The guest (fc-agent) listens on vsock port 4998.
 //! The host connects via the vsock.sock Unix socket using the CONNECT protocol.
 //!
+//! Every exec session starts with a three-phase handshake (request → ACK → GO,
+//! see `exec_proto::HANDSHAKE_ACK`): a VM snapshot pause (startup snapshot or
+//! `fcvm snapshot create --pid`) resets the vsock transport and silently orphans
+//! in-flight connections with no error on either side. A request that never
+//! receives ACK provably never executed, so it is resent on a fresh connection
+//! (bounded retries); once GO is sent, resending is forbidden — execution may
+//! have started — and any connection death is a loud error instead of a hang.
+//!
 //! TTY mode uses a length-prefixed binary protocol (see exec_proto.rs) to cleanly
 //! separate control messages from raw terminal data. Non-TTY mode continues to use
 //! JSON line protocol.
@@ -27,13 +35,29 @@ const MAX_EXEC_CONNECT_ATTEMPTS: u32 = 30;
 /// Initial retry delay when connecting to exec server (doubles each attempt)
 const INITIAL_RETRY_DELAY_MS: u64 = 100;
 
+/// Per-attempt bounded wait for the agent's ACK line. A live agent ACKs in
+/// sub-millisecond time; only an orphaned/paused connection stalls this long.
+const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Attempts to send an exec request that was never acknowledged. Resends are
+/// safe (fc-agent never executes before consuming GO). 5 × 3s of ACK waiting
+/// (plus reconnect time) spans realistic snapshot pause durations (~15s).
+const MAX_ACK_ATTEMPTS: u32 = 5;
+
+/// Post-handshake read timeout — commands like phps cookie gen can take
+/// >10 min of silence. A safety net against permanent hangs (not None/infinite).
+const EXEC_READ_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Post-handshake / handshake write timeout.
+const EXEC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Connect to the exec server via vsock with retry logic.
 ///
 /// The guest VM takes several seconds to boot and start fc-agent with the exec server.
 /// This function retries the connection with exponential backoff to handle this startup delay.
 ///
 /// Returns a connected UnixStream on success.
-pub fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> {
+fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> {
     let mut attempt = 0;
     let mut delay_ms = INITIAL_RETRY_DELAY_MS;
 
@@ -134,6 +158,158 @@ pub fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStre
     }
 }
 
+/// Outcome of waiting for the agent's ACK line after sending a request.
+#[derive(Debug)]
+enum AckOutcome {
+    /// ACK consumed — the agent has the full request and awaits GO.
+    Acked,
+    /// No ACK arrived (timeout, EOF, or read error). The request provably
+    /// never reached execution, so resending on a fresh connection is safe.
+    NotAcked(String),
+    /// The agent rejected the request before ACK (invalid JSON, empty
+    /// command). Deterministic — resending cannot help.
+    Rejected(String),
+}
+
+/// Wait for the agent's ACK line, bounded by the stream's read timeout.
+///
+/// Reads byte-by-byte so no bytes past the ACK newline are ever consumed —
+/// everything after ACK belongs to the post-GO exec protocol (JSON lines or
+/// TTY frames), which the mode loops read from the raw stream.
+fn read_ack_line(stream: &mut UnixStream) -> AckOutcome {
+    // An ACK line is 4 bytes; a pre-ACK Error line carries a message. Anything
+    // bigger is a protocol violation.
+    const MAX_ACK_LINE_LENGTH: usize = 65_536;
+    let mut line: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return AckOutcome::NotAcked("connection closed before ACK".to_string()),
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if line.len() >= MAX_ACK_LINE_LENGTH {
+                    return AckOutcome::Rejected(format!(
+                        "protocol violation: pre-ACK line exceeds {} bytes",
+                        MAX_ACK_LINE_LENGTH
+                    ));
+                }
+                line.push(byte[0]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return AckOutcome::NotAcked(format!(
+                    "timed out after {:?} waiting for ACK",
+                    ACK_TIMEOUT
+                ));
+            }
+            Err(e) => return AckOutcome::NotAcked(format!("read error waiting for ACK: {}", e)),
+        }
+    }
+
+    if line == exec_proto::HANDSHAKE_ACK.as_bytes() {
+        return AckOutcome::Acked;
+    }
+
+    // Not ACK: the agent rejects invalid requests with an Error response line
+    // before ever ACKing. Surface its message rather than a raw protocol dump.
+    if let Ok(ExecResponse::Error(msg)) = serde_json::from_slice::<ExecResponse>(&line) {
+        return AckOutcome::Rejected(msg);
+    }
+    AckOutcome::Rejected(format!(
+        "protocol violation: expected ACK, got {:?}",
+        String::from_utf8_lossy(&line)
+    ))
+}
+
+/// Connect, send the exec request, and complete the three-phase handshake
+/// (request → ACK → GO). Returns a stream on which execution has just been
+/// authorized: the next bytes from the agent are exec responses.
+///
+/// A request that never gets ACKed (its connection was orphaned by a snapshot
+/// pause's vsock reset — silent, no error on either side) provably never
+/// executed, so it is resent on a fresh connection, bounded by
+/// `MAX_ACK_ATTEMPTS`. After GO is sent, no resend ever happens — fc-agent may
+/// have started executing — so a subsequent connection death surfaces as a
+/// loud error from the mode loops instead (see `ExecConnectionClosed`).
+pub fn connect_and_start_exec(vsock_socket: &Path, request: &ExecRequest) -> Result<UnixStream> {
+    let request_json = serde_json::to_string(request)?;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut stream = connect_to_exec_server_with_retry(vsock_socket)?;
+        stream.set_read_timeout(Some(ACK_TIMEOUT))?;
+        stream.set_write_timeout(Some(EXEC_WRITE_TIMEOUT))?;
+
+        // Phase 1: send the request line.
+        if let Err(e) = writeln!(stream, "{}", request_json).and_then(|()| stream.flush()) {
+            if attempt < MAX_ACK_ATTEMPTS {
+                debug!(attempt, error = %e, "exec request send failed; reconnecting to resend");
+                continue;
+            }
+            bail!(
+                "failed to send exec request after {} attempts: {}",
+                attempt,
+                e
+            );
+        }
+
+        // Phase 2: wait (bounded) for ACK.
+        match read_ack_line(&mut stream) {
+            AckOutcome::Acked => {
+                debug!(attempt, "exec handshake: ACK received, sending GO");
+                // Phase 3: authorize execution. From here on the request must
+                // NEVER be resent: fc-agent executes as soon as it consumes GO,
+                // and a local write result cannot prove whether GO was delivered.
+                if let Err(e) =
+                    writeln!(stream, "{}", exec_proto::HANDSHAKE_GO).and_then(|()| stream.flush())
+                {
+                    bail!(
+                        "exec connection died while sending GO (after the request was \
+                         acknowledged): {}. Not resending — the command could run twice. \
+                         If a VM snapshot was being created (startup snapshot or \
+                         `fcvm snapshot create`), the pause resets vsock and kills \
+                         in-flight execs; retry the exec.",
+                        e
+                    );
+                }
+                debug!("exec handshake: GO sent, command starting");
+                stream.set_read_timeout(Some(EXEC_READ_TIMEOUT))?;
+                stream.set_write_timeout(Some(EXEC_WRITE_TIMEOUT))?;
+                return Ok(stream);
+            }
+            AckOutcome::NotAcked(reason) => {
+                if attempt < MAX_ACK_ATTEMPTS {
+                    // Safe by construction: fc-agent never executes before GO,
+                    // and this request never even got ACKed.
+                    debug!(
+                        attempt,
+                        reason,
+                        "exec request never acknowledged (connection likely orphaned by a \
+                         snapshot pause); reconnecting to resend"
+                    );
+                    continue;
+                }
+                bail!(
+                    "exec request was never acknowledged after {} attempts (last: {}). \
+                     A VM snapshot pause (startup snapshot or `fcvm snapshot create`) \
+                     resets vsock and orphans in-flight connections; resends are safe \
+                     but retries are exhausted — is the VM healthy?",
+                    attempt,
+                    reason
+                );
+            }
+            AckOutcome::Rejected(msg) => {
+                bail!("fc-agent rejected the exec request: {}", msg);
+            }
+        }
+    }
+}
+
 /// Execute a command in a VM or its container (programmatic API)
 ///
 /// This is a simpler API for programmatic use (e.g., from snapshot run --exec).
@@ -159,16 +335,6 @@ pub async fn run_exec_in_vm(
     let command = command.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        // Connect to the exec server with retry logic
-        let mut stream = connect_to_exec_server_with_retry(&vsock_socket)?;
-
-        // Long timeout — commands like phps cookie gen can take >10 min.
-        // Use 1 hour as a safety net against permanent hangs (not None/infinite).
-        stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-        debug!("connected to guest exec server");
-
         // Build the exec request (non-interactive, no TTY)
         let request = ExecRequest {
             command,
@@ -177,10 +343,9 @@ pub async fn run_exec_in_vm(
             tty: false,
         };
 
-        // Send request as JSON followed by newline
-        let request_json = serde_json::to_string(&request)?;
-        writeln!(stream, "{}", request_json)?;
-        stream.flush()?;
+        // Connect, send the request, and complete the ACK/GO handshake
+        let stream = connect_and_start_exec(&vsock_socket, &request)?;
+        debug!("exec handshake complete");
 
         // Run in line mode and capture exit code
         run_line_mode_with_exit_code(stream)
@@ -223,19 +388,6 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
             port = EXEC_VSOCK_PORT,
             "connecting to VM exec server via vsock"
         );
-    }
-
-    // Connect to the exec server with retry logic
-    let mut stream = connect_to_exec_server_with_retry(&vsock_socket)?;
-
-    // Long timeout — commands like phps cookie gen can take >10 min.
-    // Use 1 hour as a safety net against permanent hangs (not None/infinite).
-    // TTY mode uses select/poll for multiplexing but still benefits from a timeout.
-    stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-    if !quiet {
-        info!("connected to guest exec server");
     }
 
     // Check if stdin is a TTY
@@ -282,10 +434,8 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         tty,
     };
 
-    // Send request as JSON followed by newline
-    let request_json = serde_json::to_string(&request)?;
-    writeln!(stream, "{}", request_json)?;
-    stream.flush()?;
+    // Connect, send the request, and complete the ACK/GO handshake
+    let stream = connect_and_start_exec(&vsock_socket, &request)?;
 
     if !quiet {
         info!(
@@ -293,7 +443,7 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
             in_container = !args.vm,
             interactive,
             tty,
-            "sent exec request"
+            "exec request acknowledged, command starting"
         );
     }
 
@@ -376,7 +526,9 @@ impl std::fmt::Display for ExecConnectionClosed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "exec connection closed before an exit status was received"
+            "exec connection closed before an exit status was received \
+             (the VM or agent may have exited, or a VM snapshot pause reset \
+             vsock and killed the exec mid-flight)"
         )
     }
 }
@@ -473,12 +625,6 @@ pub async fn run_exec_in_vm_captured(
     let command = command.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        let mut stream = connect_to_exec_server_with_retry(&vsock_socket)?;
-
-        // Long timeout as safety net (not None/infinite)
-        stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
         let request = ExecRequest {
             command,
             in_container,
@@ -486,9 +632,8 @@ pub async fn run_exec_in_vm_captured(
             tty: false,
         };
 
-        let request_json = serde_json::to_string(&request)?;
-        writeln!(stream, "{}", request_json)?;
-        stream.flush()?;
+        // Connect, send the request, and complete the ACK/GO handshake
+        let stream = connect_and_start_exec(&vsock_socket, &request)?;
 
         // Read lines and capture into strings instead of printing
         let reader = BufReader::new(stream);
@@ -510,16 +655,21 @@ pub async fn run_exec_in_vm_captured(
     .context("exec task panicked")?
 }
 
-/// Connect to the exec server and return a tokio async UnixStream.
+/// Connect, complete the exec handshake for `request`, and return a tokio
+/// async UnixStream on which execution has just been authorized (the next
+/// bytes from the agent are exec responses / TTY frames).
 ///
 /// Useful for building WebSocket↔vsock bridges (terminal sessions).
 ///
-/// The blocking connection/retry logic is offloaded to a blocking thread pool
+/// The blocking connect/handshake logic is offloaded to a blocking thread pool
 /// so this function is safe to call from async contexts.
-pub async fn connect_to_exec_server_async(vsock_socket: &Path) -> Result<tokio::net::UnixStream> {
+pub async fn start_exec_session_async(
+    vsock_socket: &Path,
+    request: ExecRequest,
+) -> Result<tokio::net::UnixStream> {
     let vsock_socket = vsock_socket.to_path_buf();
     let std_stream =
-        tokio::task::spawn_blocking(move || connect_to_exec_server_with_retry(&vsock_socket))
+        tokio::task::spawn_blocking(move || connect_and_start_exec(&vsock_socket, &request))
             .await
             .context("connect task panicked")??;
     std_stream.set_nonblocking(true)?;
@@ -590,6 +740,71 @@ mod tests {
             err.to_string().contains("before an exit status"),
             "unexpected error: {err}"
         );
+    }
+
+    /// ACK arrives → Acked, and NOTHING past the ACK newline is consumed —
+    /// bytes after ACK belong to the post-GO exec protocol.
+    #[test]
+    fn read_ack_line_acked_consumes_nothing_past_newline() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server
+            .write_all(
+                format!(
+                    "{}\n{{\"type\":\"exit\",\"data\":0}}\n",
+                    exec_proto::HANDSHAKE_ACK
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        assert!(matches!(read_ack_line(&mut client), AckOutcome::Acked));
+
+        // The exec response following ACK must still be readable in full.
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "{\"type\":\"exit\",\"data\":0}\n");
+    }
+
+    /// Peer closes without ACK → NotAcked (safe to resend).
+    #[test]
+    fn read_ack_line_eof_is_not_acked() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        drop(server);
+        match read_ack_line(&mut client) {
+            AckOutcome::NotAcked(reason) => assert!(reason.contains("closed"), "{reason}"),
+            other => panic!("expected NotAcked, got {:?}", other),
+        }
+    }
+
+    /// Silence (the snapshot-pause orphan shape) → bounded NotAcked timeout,
+    /// not a hang.
+    #[test]
+    fn read_ack_line_timeout_is_not_acked() {
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let start = std::time::Instant::now();
+        match read_ack_line(&mut client) {
+            AckOutcome::NotAcked(reason) => assert!(reason.contains("timed out"), "{reason}"),
+            other => panic!("expected NotAcked, got {:?}", other),
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A pre-ACK Error response (invalid/empty request) → Rejected with the
+    /// agent's message; deterministic, so the client must not resend.
+    #[test]
+    fn read_ack_line_error_response_is_rejected() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let error_line = response_line(&ExecResponse::Error("Empty command".into()));
+        server.write_all(error_line.as_bytes()).unwrap();
+
+        match read_ack_line(&mut client) {
+            AckOutcome::Rejected(msg) => assert_eq!(msg, "Empty command"),
+            other => panic!("expected Rejected, got {:?}", other),
+        }
     }
 
     /// #607 regression (Codex P2): the log downgrade for the benign "stream closed

@@ -18,6 +18,30 @@ use std::io::{self, Read, Write};
 /// This prevents DoS via large length values.
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
+/// Three-phase exec handshake tokens, shared by the host client
+/// (`fcvm exec`, src/commands/exec.rs), the guest server (fc-agent/src/exec.rs),
+/// and the mock server (fc-mock/src/vsock_exec.rs).
+///
+/// Every exec connection starts with three newline-terminated lines:
+///
+/// 1. client → server: `ExecRequest` JSON
+/// 2. server → client: `ACK` — the request line was fully consumed; nothing
+///    has executed yet
+/// 3. client → server: `GO` — the server may start executing ONLY after
+///    consuming this line
+///
+/// Why: a VM snapshot pause (pre-start, startup, or a user-initiated
+/// `fcvm snapshot create --pid`) resets the vsock transport and silently
+/// orphans in-flight connections with no error on either side. Before ACK the
+/// client can prove its request never reached execution, so it safely
+/// reconnects and resends; once it has sent GO it must never resend (execution
+/// may have started), and a dead connection is a loud bounded error instead of
+/// a silent hang. The server closes any connection whose handshake stalls, so
+/// orphaned connections can never execute and never leak a thread.
+pub const HANDSHAKE_ACK: &str = "ACK";
+/// See [`HANDSHAKE_ACK`].
+pub const HANDSHAKE_GO: &str = "GO";
+
 /// Message types for the TTY exec protocol
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
