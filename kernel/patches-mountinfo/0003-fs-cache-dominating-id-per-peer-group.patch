@@ -1,0 +1,177 @@
+From: EJ Cyr <ejc3@meta.com>
+Subject: [PATCH] fs: cache the peer search per group in mountinfo
+
+Generating /proc/<pid>/mountinfo calls get_dominating_id() for every
+slave mount. That walks the mount's master chain and, for each master,
+scans that master's entire peer ring for a member reachable under the
+caller's root. Nothing memoises the scan, so listing N slaves of one
+shared tree of P mounts costs O(N * P).
+
+That shape is what a service mount namespace produces. systemd turns the
+mounts it inherits into slaves, so on a host whose mounts largely
+descend from one shared "/" every line rescans the same large ring.
+
+Measured on a host with 994 mounts, inside a slave namespace holding 985
+slave lines across 462 distinct master peer groups. Weighting each line
+by the size of the ring it scans gives 258,589 ring steps per listing,
+and one group of 508 members accounts for 258,064 of them, or 99.8
+percent:
+
+  read /proc/self/mountinfo, root namespace   0.0016 s
+  read /proc/self/mountinfo, slave namespace  0.5128 s
+
+Ordinary tools pay it too: df(1) went from 0.0122 s to 0.5414 s between
+those namespaces, and mount(8) from 0.0089 s to 0.4919 s.
+
+get_peer_under_root() reads only the ring it is given, plus the
+namespace and the root, and both of those are fixed for the duration of
+one listing. A ring is identified by the peer group id its members
+share, so that id is a valid cache key. Replaying the measured sequence
+of master group ids through an 8-entry cache leaves 2,049 of the 258,589
+ring steps, a factor of 126; 16 entries gain nothing further.
+
+The key has to be the group id rather than the master pointer. Turning a
+shared tree into slaves gives every slave its own master, so the same
+run presents 1,859 distinct master pointers naming only 462 rings, and a
+pointer-keyed cache would miss almost every time.
+
+Only the first level is cached. Its answer is a property of one ring.
+Deeper levels follow each master's own chain, where two mounts sharing a
+ring can diverge, so those are walked as before.
+
+The cache cannot go stale: m_start() takes namespace_sem for read and
+m_stop() drops it, so the tree is fixed while records are emitted, and
+m_start() clears the cache each time it takes the lock.
+
+Signed-off-by: EJ Cyr <ejc3@meta.com>
+---
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -138,10 +138,33 @@
+ 
+ extern seqlock_t mount_lock;
+ 
++/*
++ * Memoises the first-level peer search of get_dominating_id() across one
++ * listing of mountinfo.
++ *
++ * get_peer_under_root() scans the whole peer ring of a mount's master. The
++ * outcome depends only on that ring, the namespace, and the root; the latter
++ * two are fixed for a listing, and a ring is identified by the peer group id
++ * its members share. So the group id is a valid key, and every slave of the
++ * same shared tree answers out of one entry instead of rescanning the ring.
++ *
++ * Keying on the master pointer instead would not work: making a shared tree
++ * into slaves gives each slave its own master, so a tree of N mounts presents
++ * N distinct master pointers that all name the same ring.
++ */
++#define MNT_DOM_CACHE_SIZE 8
++
++struct mnt_dom_cache {
++	int gid[MNT_DOM_CACHE_SIZE];	/* master's peer group id; 0 = unused */
++	bool found[MNT_DOM_CACHE_SIZE];	/* did that ring hold a peer under root */
++	unsigned int victim;		/* next slot to replace */
++};
++
+ struct proc_mounts {
+ 	struct mnt_namespace *ns;
+ 	struct path root;
+ 	int (*show)(struct seq_file *, struct vfsmount *);
++	struct mnt_dom_cache dom_cache;
+ };
+ 
+ extern const struct seq_operations mounts_op;
+--- a/fs/pnode.h
++++ b/fs/pnode.h
+@@ -42,6 +42,8 @@
+ void propagate_mount_unlock(struct mount *);
+ void mnt_release_group_id(struct mount *);
+ int get_dominating_id(struct mount *mnt, const struct path *root);
++int get_dominating_id_cached(struct mount *mnt, const struct path *root,
++			     struct mnt_dom_cache *cache);
+ int mnt_get_count(struct mount *mnt);
+ void mnt_set_mountpoint(struct mount *, struct mountpoint *,
+ 			struct mount *);
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@ -70,6 +70,55 @@
+ 	return 0;
+ }
+ 
++/*
++ * As get_dominating_id(), but memoises the first master's ring scan in cache.
++ *
++ * Only the first level is cached. Its answer is a property of that one ring,
++ * which the group id names. Deeper levels follow each master's own chain, so
++ * two mounts sharing a ring can diverge there, and those levels are walked
++ * uncached. A hit that recorded a peer returns the group id directly: the peer
++ * found is a member of that same ring, so it carries the same id.
++ */
++int get_dominating_id_cached(struct mount *mnt, const struct path *root,
++			     struct mnt_dom_cache *cache)
++{
++	struct mount *first = mnt->mnt_master;
++	struct mount *m, *d;
++	int gid, i;
++
++	if (!first)
++		return 0;
++
++	gid = first->mnt_group_id;
++	if (gid) {
++		for (i = 0; i < MNT_DOM_CACHE_SIZE; i++) {
++			if (cache->gid[i] != gid)
++				continue;
++			if (cache->found[i])
++				return gid;
++			goto deeper;
++		}
++	}
++
++	d = get_peer_under_root(first, mnt->mnt_ns, root);
++	if (gid) {
++		i = cache->victim++ % MNT_DOM_CACHE_SIZE;
++		cache->gid[i] = gid;
++		cache->found[i] = d != NULL;
++	}
++	if (d)
++		return d->mnt_group_id;
++
++deeper:
++	for (m = first->mnt_master; m != NULL; m = m->mnt_master) {
++		d = get_peer_under_root(m, mnt->mnt_ns, root);
++		if (d)
++			return d->mnt_group_id;
++	}
++
++	return 0;
++}
++
+ static int do_make_slave(struct mount *mnt)
+ {
+ 	struct mount *master, *slave_mnt;
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1630,6 +1630,11 @@
+ 	struct proc_mounts *p = m->private;
+ 
+ 	down_read(&namespace_sem);
++	/*
++	 * The mount tree cannot change until m_stop() drops this, so anything
++	 * cached below is valid for exactly this window.
++	 */
++	memset(&p->dom_cache, 0, sizeof(p->dom_cache));
+ 
+ 	return mnt_find_id_at(p->ns, *pos);
+ }
+--- a/fs/proc_namespace.c
++++ b/fs/proc_namespace.c
+@@ -160,7 +160,7 @@
+ 		seq_printf(m, " shared:%i", r->mnt_group_id);
+ 	if (IS_MNT_SLAVE(r)) {
+ 		int master = r->mnt_master->mnt_group_id;
+-		int dom = get_dominating_id(r, &p->root);
++		int dom = get_dominating_id_cached(r, &p->root, &p->dom_cache);
+ 		seq_printf(m, " master:%i", master);
+ 		if (dom && dom != master)
+ 			seq_printf(m, " propagate_from:%i", dom);

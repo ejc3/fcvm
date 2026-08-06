@@ -318,3 +318,38 @@ kernel_config = "kernel/btrfs-x86.conf"
 # No patches_dir — no FUSE patches needed for btrfs profile
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+
+# --- mountinfo scaling experiment -------------------------------------------
+# Two identical 6.16.1 guest kernels that differ only by a patch to
+# caching get_dominating_id()'s ring scan per peer group, so the pair can be A/B'd for
+# the cost of generating /proc/self/mountinfo in a slave mount namespace.
+# 6.16.1 is chosen because that is where the behaviour was first measured.
+
+[kernel_profiles.mountinfo-base.amd64]
+description = "6.16.1 guest kernel, control for the mountinfo A/B"
+kernel_version = "6.16.1"
+kernel_repo = "ejc3/fcvm"
+build_inputs = [
+    "kernel/mountinfo.conf",
+]
+kernel_config = "kernel/mountinfo.conf"
+# Empty means apply no patches. The repo's default FUSE patches target a newer
+# kernel and do not apply to 6.16.1, and this comparison only times reads of
+# /proc/self/mountinfo, so the pair carries none and differs by exactly the
+# patch under test.
+patches_dir = ""
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+
+[kernel_profiles.mountinfo-fix.amd64]
+description = "6.16.1 guest kernel caching the dominating-id ring scan per peer group"
+kernel_version = "6.16.1"
+kernel_repo = "ejc3/fcvm"
+build_inputs = [
+    "kernel/mountinfo.conf",
+    "kernel/patches-mountinfo/*.patch",
+]
+kernel_config = "kernel/mountinfo.conf"
+# Holds exactly one patch, the one under test. The control applies none, so the
+# pair differs by that patch alone.
+patches_dir = "kernel/patches-mountinfo"
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
