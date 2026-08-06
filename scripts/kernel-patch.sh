@@ -43,8 +43,12 @@ get_kernel_version() {
 
     # Extract kernel version for the profile
     # This is a simple grep - for complex configs, use a proper TOML parser
-    grep -A20 "\[kernel_profiles\.$profile\]" "$config_file" | \
-        grep -m1 'kernel_version' | \
+    # Same arch scoping as get_patches_dir: profile tables are arch-suffixed, and
+    # a bare -A20 spans both the .amd64 and .arm64 blocks.
+    local carch="amd64"
+    [[ "$(uname -m)" == "aarch64" ]] && carch="arm64"
+    sed -n "/^\\[kernel_profiles\\.$profile\\.$carch\\]/,/^\\[/p" "$config_file" | \
+        grep -m1 '^kernel_version' | \
         sed 's/.*=.*"\([^"]*\)".*/\1/' || \
         error "Could not find kernel_version for profile '$profile'"
 }

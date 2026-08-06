@@ -806,11 +806,14 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         return Ok(p);
     }
 
-    // 1b. A --config recorded earlier in this process
+    // 1b. A --config recorded earlier in this process. Missing is an error, not a
+    // reason to fall back: silently reading a different file is the failure this
+    // whole path exists to remove.
     if let Some(p) = EXPLICIT_CONFIG.get() {
-        if p.exists() {
-            return Ok(p.clone());
+        if !p.exists() {
+            bail!("Config file not found: {}", p.display());
         }
+        return Ok(p.clone());
     }
 
     // 2. SUDO_USER's config (when running with sudo)
@@ -2508,5 +2511,18 @@ mod tests {
         );
 
         std::env::remove_var("FCVM_FIRECRACKER_BIN");
+    }
+
+    /// A --config path that does not exist must fail, not quietly fall back to
+    /// the discovered config, which is the bug this whole path removes.
+    #[test]
+    fn find_config_file_rejects_a_missing_explicit_path() {
+        let err = find_config_file(Some("/nonexistent/rootfs-config.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Config file not found"),
+            "should refuse a missing --config, got: {err}"
+        );
     }
 }
