@@ -404,10 +404,16 @@ async fn test_fcvm_ls_bridged() -> Result<()> {
 /// ```
 /// sudo fcvm podman run --name web1 --cmd "nginx -g 'daemon off;'" nginx:alpine
 /// ```
-// Re-enabled after the #617 fix: VsockListener::accept() now has a periodic
-// optimistic-accept fallback, so a connection whose readiness edge is lost across
-// the startup-snapshot create's pause/resume is served within ~2s instead of
-// hanging the exec forever.
+// Two fixes cover execs racing the startup-snapshot create's pause/resume:
+// - #617 (VsockListener::accept() periodic optimistic-accept fallback) covers the
+//   LISTENER-QUEUE phase: a connection whose readiness edge is lost across the
+//   pause is still accepted within ~2s.
+// - The three-phase exec handshake (request → ACK → GO, see
+//   exec_proto::HANDSHAKE_ACK) covers the IN-FLIGHT phase #617 could not: a
+//   connection already accepted by fc-agent but orphaned by the snapshot's vsock
+//   reset before execution started is closed by the agent's handshake deadline,
+//   and the host — whose request was never ACKed and so provably never ran —
+//   resends it on a fresh connection instead of hanging forever.
 #[tokio::test]
 async fn test_custom_command_bridged() -> Result<()> {
     println!("\ntest_custom_command_bridged");

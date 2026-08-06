@@ -94,6 +94,41 @@ async fn handle_connection(stream: tokio::net::UnixStream) -> Result<()> {
         "exec request received"
     );
 
+    // Pre-ACK validation, matching fc-agent: an empty command is rejected with
+    // an Error line BEFORE the ACK, so the client sees a deterministic
+    // rejection instead of a mid-handshake close.
+    if request.command.is_empty() {
+        let resp = ExecResponse::Error("Empty command".to_string());
+        let json = serde_json::to_string(&resp)?;
+        write_half.write_all(json.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        return Ok(());
+    }
+
+    // Three-phase handshake (matches fc-agent, see exec_proto::HANDSHAKE_ACK):
+    // ACK that the request was fully consumed, then execute only after the
+    // client's GO line. Bounded so a stalled client can't leak this task.
+    write_half
+        .write_all(format!("{}\n", exec_proto::HANDSHAKE_ACK).as_bytes())
+        .await
+        .context("writing ACK")?;
+    let mut go_line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut go_line),
+    )
+    .await
+    .context("timed out waiting for GO; closing without executing")?
+    .context("reading GO line")?;
+    // Exact-byte compare (one trailing newline stripped), matching fc-agent.
+    if go_line.strip_suffix('\n').unwrap_or(&go_line) != exec_proto::HANDSHAKE_GO {
+        anyhow::bail!(
+            "expected GO, got {:?}; closing without executing",
+            go_line.trim_end_matches('\n')
+        );
+    }
+    debug!("exec handshake complete (ACK/GO)");
+
     // Execute the command
     if request.tty || request.interactive {
         // TTY mode - not supported yet, send error

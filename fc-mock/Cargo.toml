@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+exec-proto = { path = "../exec-proto" }
 hyper = { version = "0.14", features = ["server", "client", "http1"] }
 hyperlocal = "0.8"
 serde = { version = "1", features = ["derive"] }

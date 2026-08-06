@@ -938,11 +938,21 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
     use axum::extract::ws::{CloseFrame, Message as WsMessage};
     use tokio::io::AsyncWriteExt;
 
-    // Connect to exec server
-    let stream = match crate::commands::exec::connect_to_exec_server_async(&vsock_path).await {
+    // Exec request for interactive bash
+    let exec_req = crate::commands::exec::ExecRequest {
+        command: vec!["/bin/bash".into()],
+        in_container: true,
+        interactive: true,
+        tty: true,
+    };
+
+    // Connect and complete the exec handshake (request → ACK → GO); the
+    // returned stream carries only post-GO TTY frames.
+    let stream = match crate::commands::exec::start_exec_session_async(&vsock_path, exec_req).await
+    {
         Ok(s) => s,
         Err(e) => {
-            error!(error = %e, "Failed to connect to exec server for terminal");
+            error!(error = %e, "Failed to start exec session for terminal");
             let _ = ws
                 .send(WsMessage::Close(Some(CloseFrame {
                     code: 1011,
@@ -953,30 +963,7 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
         }
     };
 
-    // Send exec request for interactive bash
-    let exec_req = crate::commands::exec::ExecRequest {
-        command: vec!["/bin/bash".into()],
-        in_container: true,
-        interactive: true,
-        tty: true,
-    };
     let (mut vsock_read, mut vsock_write) = stream.into_split();
-
-    // Write the exec request as JSON line
-    let req_json = match serde_json::to_string(&exec_req) {
-        Ok(j) => j,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize exec request");
-            return;
-        }
-    };
-    if let Err(e) = vsock_write
-        .write_all(format!("{}\n", req_json).as_bytes())
-        .await
-    {
-        error!(error = %e, "Failed to send exec request");
-        return;
-    }
 
     // Bridge WS ↔ vsock
     // Use a channel for vsock→WS since we can't hold &mut to both ws and vsock in select!

@@ -139,9 +139,12 @@ async fn test_library_api_exec_captured() -> Result<()> {
     Ok(())
 }
 
-/// Test: connect_to_exec_server_async returns a usable tokio stream
+/// Test: start_exec_session_async completes the ACK/GO handshake and returns a
+/// usable tokio stream carrying post-GO exec responses (the WS bridge use case)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_library_api_async_connection() -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
     let (vm_name, _, _, _) = common::unique_names("api-conn");
     let args = test_run_args(&vm_name);
 
@@ -153,10 +156,29 @@ async fn test_library_api_async_connection() -> Result<()> {
 
     let vsock = handle.vsock_socket_path();
 
-    // Get async stream (for WS bridge use case)
-    let stream = exec::connect_to_exec_server_async(&vsock).await?;
-    // If we got here without error, the async connection works
-    drop(stream);
+    // Start an async exec session (for WS bridge use case). The handshake
+    // (request → ACK → GO) happens inside; the returned stream carries only
+    // the exec responses.
+    let request = exec::ExecRequest {
+        command: vec!["echo".into(), "async-session".into()],
+        in_container: true,
+        interactive: false,
+        tty: false,
+    };
+    let mut stream = exec::start_exec_session_async(&vsock, request).await?;
+
+    // Non-TTY responses are JSON lines; the agent closes after Exit, so read
+    // to EOF and check both the output and the exit message arrived.
+    let mut responses = String::new();
+    stream.read_to_string(&mut responses).await?;
+    assert!(
+        responses.contains("async-session"),
+        "responses should contain the echoed output, got: {responses:?}"
+    );
+    assert!(
+        responses.contains("\"exit\""),
+        "responses should contain an exit message, got: {responses:?}"
+    );
 
     handle.stop().await?;
     Ok(())
