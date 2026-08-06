@@ -5,6 +5,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -12,6 +13,19 @@ use crate::paths;
 
 /// Config file name
 const CONFIG_FILE: &str = "rootfs-config.toml";
+
+/// A --config path recorded once, so every later load_config(None) resolves to
+/// the same file. Without this, --config reaches only the call sites that thread
+/// it explicitly, and lookups that go through load_plan() (kernel profiles, for
+/// one) silently read the user config instead. The failure is confusing rather
+/// than loud: fcvm reports a profile "not found in config" while naming a config
+/// that defines it.
+static EXPLICIT_CONFIG: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the config file chosen on the command line. First call wins.
+pub fn set_config_path(path: &str) {
+    let _ = EXPLICIT_CONFIG.set(PathBuf::from(path));
+}
 
 /// Embedded default config (used by --generate-config)
 const EMBEDDED_CONFIG: &str = include_str!("../../rootfs-config.toml");
@@ -792,6 +806,16 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         return Ok(p);
     }
 
+    // 1b. A --config recorded earlier in this process. Missing is an error, not a
+    // reason to fall back: silently reading a different file is the failure this
+    // whole path exists to remove.
+    if let Some(p) = EXPLICIT_CONFIG.get() {
+        if !p.exists() {
+            bail!("Config file not found: {}", p.display());
+        }
+        return Ok(p.clone());
+    }
+
     // 2. SUDO_USER's config (when running with sudo)
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         // Get the invoking user's home directory
@@ -902,6 +926,26 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     );
 
     Ok((config, config_sha, config_sha_short))
+}
+
+/// Resolve the Firecracker binary for the rootfs setup VM.
+///
+/// FCVM_FIRECRACKER_BIN first, then PATH. Without this the setup VM shelled out
+/// to a bare "firecracker", so a host that has never installed one system-wide
+/// failed with a plain "No such file or directory" even though fcvm had just
+/// built a Firecracker of its own under the assets directory.
+fn setup_vm_firecracker_bin() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
+        let p = PathBuf::from(&path);
+        if !p.exists() {
+            bail!("FCVM_FIRECRACKER_BIN={} does not exist", path);
+        }
+        return Ok(p);
+    }
+    which::which("firecracker").context(
+        "firecracker not found in PATH; set FCVM_FIRECRACKER_BIN to the binary \
+         fcvm built under <assets_dir>/firecracker/",
+    )
 }
 
 /// Create a synthetic "default" kernel profile from the [kernel] config section.
@@ -2264,7 +2308,8 @@ async fn boot_vm_for_setup(
         "starting Firecracker for Layer 2 setup (serial output: {})",
         serial_path.display()
     );
-    let mut fc_process = Command::new("firecracker")
+    let firecracker_bin = setup_vm_firecracker_bin()?;
+    let mut fc_process = Command::new(&firecracker_bin)
         .args([
             "--api-sock",
             path_to_str(&api_socket)?,
@@ -2441,4 +2486,43 @@ async fn boot_vm_for_setup(
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FCVM_FIRECRACKER_BIN is a process-global, so these run in one test.
+    #[test]
+    fn setup_vm_firecracker_bin_honors_env_var() {
+        let real = std::env::current_exe().expect("test binary path");
+
+        // Set and existing: returned as-is, rather than searching PATH.
+        std::env::set_var("FCVM_FIRECRACKER_BIN", &real);
+        assert_eq!(setup_vm_firecracker_bin().unwrap(), real);
+
+        // Set and missing: the error names the variable, so the reader knows
+        // which knob is wrong instead of getting a bare ENOENT.
+        std::env::set_var("FCVM_FIRECRACKER_BIN", "/nonexistent/firecracker");
+        let err = setup_vm_firecracker_bin().unwrap_err().to_string();
+        assert!(
+            err.contains("FCVM_FIRECRACKER_BIN"),
+            "error should name the variable, got: {err}"
+        );
+
+        std::env::remove_var("FCVM_FIRECRACKER_BIN");
+    }
+
+    /// A --config path that does not exist must fail, not quietly fall back to
+    /// the discovered config, which is the bug this whole path removes.
+    #[test]
+    fn find_config_file_rejects_a_missing_explicit_path() {
+        let err = find_config_file(Some("/nonexistent/rootfs-config.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Config file not found"),
+            "should refuse a missing --config, got: {err}"
+        );
+    }
 }

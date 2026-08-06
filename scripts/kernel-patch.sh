@@ -43,8 +43,12 @@ get_kernel_version() {
 
     # Extract kernel version for the profile
     # This is a simple grep - for complex configs, use a proper TOML parser
-    grep -A20 "\[kernel_profiles\.$profile\]" "$config_file" | \
-        grep -m1 'kernel_version' | \
+    # Same arch scoping as get_patches_dir: profile tables are arch-suffixed, and
+    # a bare -A20 spans both the .amd64 and .arm64 blocks.
+    local carch="amd64"
+    [[ "$(uname -m)" == "aarch64" ]] && carch="arm64"
+    sed -n "/^\\[kernel_profiles\\.$profile\\.$carch\\]/,/^\\[/p" "$config_file" | \
+        grep -m1 '^kernel_version' | \
         sed 's/.*=.*"\([^"]*\)".*/\1/' || \
         error "Could not find kernel_version for profile '$profile'"
 }
@@ -52,6 +56,28 @@ get_kernel_version() {
 # Get patches directory for profile
 get_patches_dir() {
     local profile="$1"
+    local config_file="$REPO_ROOT/rootfs-config.toml"
+
+    # A profile may name its own patches_dir, and the Rust build reads it
+    # (src/setup/kernel.rs). This helper has to agree, or it edits and validates
+    # a different set of patches than the one that actually gets built.
+    #
+    # Profile tables are arch-suffixed ([kernel_profiles.<name>.amd64]), so match
+    # the name followed by either "]" or ".".
+    # Scope to the current arch's table: grep -A20 on a bare profile name spans
+    # both the .amd64 and .arm64 blocks and would read the wrong one.
+    local carch="amd64"
+    [[ "$(uname -m)" == "aarch64" ]] && carch="arm64"
+    local block
+    block=$(sed -n "/^\\[kernel_profiles\\.$profile\\.$carch\\]/,/^\\[/p" "$config_file" 2>/dev/null || true)
+    if grep -q '^patches_dir' <<< "$block"; then
+        local declared
+        declared=$(grep -m1 '^patches_dir' <<< "$block" | sed 's/.*=.*"\([^"]*\)".*/\1/')
+        # An empty string means the profile deliberately applies no patches.
+        [[ -z "$declared" ]] && return
+        echo "$REPO_ROOT/$declared"
+        return
+    fi
 
     # Check for arch-specific patches first
     local arch=$(uname -m)
@@ -194,6 +220,9 @@ cmd_create() {
     local patches_dir=$(get_patches_dir "$profile")
     local workdir="/tmp/kernel-patch-$$"
 
+    # An empty patches_dir means the profile deliberately applies no patches.
+    [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot create a patch"
+
     info "Creating patch for kernel $version (profile: $profile)"
 
     # Setup kernel source
@@ -237,6 +266,9 @@ cmd_finish() {
     local patches_dir=$(get_patches_dir "$profile")
     local kernel_dir="$workdir/linux-${version}"
 
+    # An empty patches_dir means the profile deliberately applies no patches.
+    [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot finish a patch"
+
     [[ -d "$kernel_dir" ]] || error "Kernel dir not found: $kernel_dir"
 
     # Ensure patch name has .patch extension
@@ -267,6 +299,9 @@ cmd_edit() {
     local version=$(get_kernel_version "$profile")
     local patches_dir=$(get_patches_dir "$profile")
     local workdir="/tmp/kernel-patch-$$"
+
+    # An empty patches_dir means the profile deliberately applies no patches.
+    [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot edit a patch"
 
     # Find the patch file
     local patch_file=$(ls "$patches_dir"/${patch_num}*.patch 2>/dev/null | head -1)
@@ -311,6 +346,12 @@ cmd_validate() {
     local version=$(get_kernel_version "$profile")
     local patches_dir=$(get_patches_dir "$profile")
     local workdir="/tmp/kernel-validate-$$"
+
+    # An empty patches_dir means the profile deliberately applies no patches.
+    if [[ -z "$patches_dir" ]]; then
+        info "Profile '$profile' has patches disabled (patches_dir is empty); nothing to validate"
+        return
+    fi
 
     info "Validating patches for kernel $version (profile: $profile)"
 

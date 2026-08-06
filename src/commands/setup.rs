@@ -9,6 +9,13 @@ use crate::setup::rootfs::{generate_config, get_kernel_profile, load_config};
 /// This downloads the Kata kernel (~15MB) and creates the Layer 2 rootfs (~10GB).
 /// The rootfs creation downloads Ubuntu cloud image and installs podman, taking 5-10 minutes.
 pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
+    // Record --config before anything reads config. The --install-host-kernel
+    // branch below returns early, so a later placement leaves that path reading
+    // the discovered config instead of the requested one.
+    if let Some(path) = args.config.as_deref() {
+        crate::setup::rootfs::set_config_path(path);
+    }
+
     // Handle --generate-config: write default config and exit
     if args.generate_config {
         let config_path = generate_config(args.force)?;
