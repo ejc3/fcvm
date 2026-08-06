@@ -5,11 +5,12 @@ use crate::{bootplan, container, exec, lock_test, mmds, mounts, network, output,
 
 /// Main agent logic — fetches plan, runs container, triggers shutdown.
 pub async fn run() -> Result<()> {
-    // Redirect stderr to /dev/console for direct serial output, bypassing journald.
-    // After snapshot restore, journald crashes (journal corrupted mid-write), which
-    // kills the journal+console output path. Direct /dev/console writes use polled
-    // I/O and work even with stale UART IER register after restore.
-    crate::restore::redirect_stderr_to_console();
+    // Route fd 1/2 through the wedge-proof console pipe (writer thread →
+    // /dev/console). Bypasses journald, which crashes after snapshot restore
+    // (journal corrupted mid-write) and would take the console output path
+    // with it — and guarantees a dead console can only LOSE log lines, never
+    // block a thread on a full tty buffer. See fc-agent/src/console.rs.
+    crate::console::init();
 
     eprintln!("[fc-agent] run_agent starting");
 
@@ -324,10 +325,11 @@ pub async fn run() -> Result<()> {
     // we check, wait_for returns immediately because watch retains the latest value.
     let egress_gen_before = egress_gen_rx.as_ref().map(|rx| *rx.borrow());
 
-    // Notify host for cache snapshot
+    // Notify host for cache snapshot. notify_cache_ready_and_wait logs the
+    // digest itself, then quiesces the console BEFORE the notification so the
+    // host's pre-start snapshot pause can never capture the UART mid-transmit.
     match container::get_image_digest(&image_ref, &cmd_prefix).await {
         Ok(digest) => {
-            eprintln!("[fc-agent] image digest: {}", digest);
             let cache_result = container::notify_cache_ready_and_wait(&digest, &restore_flag);
             match cache_result {
                 container::CacheResult::ColdStart => {

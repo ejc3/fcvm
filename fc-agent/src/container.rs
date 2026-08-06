@@ -914,6 +914,22 @@ pub fn notify_cache_ready_and_wait(
     use nix::unistd::{read, write};
     use std::os::fd::{AsFd, AsRawFd};
 
+    // Receiving "cache-ready" makes the host PAUSE this VM for the pre-start
+    // snapshot. A snapshot that captures the UART mid-transmit is poisoned:
+    // EVERY restore of it has a dead serial console (the guest 8250 driver
+    // waits forever for a TX interrupt the re-created serial device never
+    // delivers). So: announce FIRST, then make the console provably quiet
+    // (flush + gate + TIOCOUTQ drain — structural, not probabilistic), and
+    // only THEN let the host know we are ready to be paused. The gate holds
+    // until this function returns (every path: ack, restore, failure), so no
+    // concurrent task can put a byte in UART TX while the pause can happen —
+    // lines logged meanwhile are buffered and flushed when the guard drops.
+    eprintln!(
+        "[fc-agent] image digest {} loaded; quiescing console before cache-ready notification",
+        digest
+    );
+    let _console_quiesce = crate::console::quiesce_for_snapshot();
+
     let sock = match socket(
         AddressFamily::Vsock,
         SockType::Stream,

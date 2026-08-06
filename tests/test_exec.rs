@@ -963,8 +963,12 @@ async fn run_exec_with_pty(
             // Wrap master fd in File for I/O (File takes ownership, will close on drop)
             let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
 
-            // Delay to let child start - container exec via podman needs more time
-            std::thread::sleep(Duration::from_millis(500));
+            // Delay to let child start - container exec via podman needs more time.
+            // Async, not std::thread::sleep: these helpers run on tokio's
+            // current-thread test runtime, and a blocking sleep freezes every
+            // other task — including the spawn_fcvm log consumers, which is
+            // exactly what truncated the debug logs of wedged VMs.
+            tokio::time::sleep(Duration::from_millis(500)).await;
 
             // Write stdin input only if provided
             if let Some(input) = stdin_input {
@@ -1006,7 +1010,9 @@ async fn run_exec_with_pty(
                             Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
                             Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                             _ => {
-                                std::thread::sleep(Duration::from_millis(50));
+                                // Async sleep: keeps the current-thread runtime's
+                                // log-consumer tasks draining while we poll.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                         }
                     }
@@ -1141,7 +1147,8 @@ async fn run_exec_with_pty_interrupt(
                             let output_str = String::from_utf8_lossy(&output);
                             if output_str.contains(wait_for) {
                                 // Small delay to ensure command is in expected state
-                                std::thread::sleep(Duration::from_millis(100));
+                                // (async so log-consumer tasks keep draining).
+                                tokio::time::sleep(Duration::from_millis(100)).await;
 
                                 // Send the control character through PTY
                                 use std::io::Write;
@@ -1159,7 +1166,9 @@ async fn run_exec_with_pty_interrupt(
                         ) {
                             Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
                             Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
-                            _ => std::thread::sleep(Duration::from_millis(50)),
+                            // Async sleep: keeps the current-thread runtime's
+                            // log-consumer tasks draining while we poll.
+                            _ => tokio::time::sleep(Duration::from_millis(50)).await,
                         }
                     }
                     Err(_) => break,

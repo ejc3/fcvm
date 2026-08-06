@@ -26,32 +26,6 @@ pub struct RestoreSignals {
     pub nfs_mounts: Vec<crate::types::NfsMount>,
 }
 
-/// Redirect stderr (fd 2) to /dev/console for direct serial console output.
-///
-/// systemd's `journal+console` routes output through journald, which writes to
-/// /dev/console. After snapshot restore, journald crashes because its journal file
-/// was mid-write during the snapshot ("corrupted or uncleanly shut down"). With
-/// journald dead, stderr goes nowhere and serial output stops.
-///
-/// Fix: open /dev/console directly and dup2 it to stderr. This bypasses journald
-/// entirely — eprintln!() writes go straight to /dev/console → ttyS0 → Firecracker
-/// serial → host stdout. The console write path uses polled I/O (busy-wait on THRE),
-/// so it works even after snapshot restore when the UART IER register is stale.
-pub fn redirect_stderr_to_console() {
-    use std::os::unix::io::AsRawFd;
-
-    let console = match std::fs::OpenOptions::new().write(true).open("/dev/console") {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-
-    unsafe {
-        libc::dup2(console.as_raw_fd(), 2);
-        libc::dup2(console.as_raw_fd(), 1);
-    }
-    // console fd is closed when dropped, but fd 1 and 2 remain open (dup'd)
-}
-
 /// Handle clone restore: kill stale sockets, flush ARP, re-register exec, reconnect output.
 ///
 /// CRITICAL ordering: exec re-register and egress reconnect MUST complete before output reconnect.

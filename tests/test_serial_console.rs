@@ -1,18 +1,20 @@
 //! Test that the guest serial console works after snapshot restore.
 //!
-//! After snapshot restore, systemd-journald crashes because its journal file was
-//! mid-write during the snapshot. Since fc-agent.service uses journal+console,
-//! stderr goes to a journal socket — with journald dead, that socket goes nowhere
-//! and serial output stops flowing.
-//!
-//! Fix: fc-agent calls redirect_stderr_to_console() at startup, which opens
-//! /dev/console directly and dup2's it to fd 1 and fd 2. This bypasses journald
-//! entirely — eprintln!() writes go straight to /dev/console → ttyS0 → Firecracker
-//! serial → host stdout. The console write path uses polled I/O (busy-wait on THRE),
-//! so it works even with stale UART IER register after restore.
+//! Two ways the restored console used to die:
+//! - systemd-journald crashes after restore (journal mid-write during the
+//!   snapshot); fc-agent.service's journal+console stderr then went nowhere.
+//!   Fix: fc-agent owns its console output directly (console::init() at startup
+//!   routes fd 1/2 through a pipe drained by a dedicated writer thread that
+//!   writes /dev/console non-blocking — see fc-agent/src/console.rs).
+//! - The pre-start snapshot was captured with UART TX bytes in flight; the
+//!   restored 8250 driver waits forever for a TX interrupt the re-created
+//!   serial device never delivers, killing ALL restored serial output.
+//!   Fix: fc-agent quiesces the console (flush + gate + TIOCOUTQ drain) BEFORE
+//!   sending cache-ready, so the host's snapshot pause always captures an idle
+//!   UART (container::notify_cache_ready_and_wait).
 //!
 //! Architecture:
-//!   Guest eprintln!() → fd 2 (dup2'd to /dev/console) → kernel console driver
+//!   Guest eprintln!() → fd 2 (pipe) → console-writer thread → /dev/console
 //!   → /dev/ttyS0 → Firecracker UART emulation → host stdout → tracing → log file
 
 #![cfg(feature = "integration-fast")]
