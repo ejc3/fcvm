@@ -78,6 +78,19 @@ async fn main() {
 
     eprintln!("[fc-agent] starting");
 
+    // Arm guest failpoints from the kernel cmdline: fcvm forwards the host env
+    // FCVM_GUEST_FAILPOINT as `fcvm_failpoint=<spec>` (the fuse_trace_rate
+    // pattern) because fc-agent cannot read host env. Sleep actions only in the
+    // guest — block_until_file is host-only, rejected by fcvm before boot.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        if let Some(spec) = cmdline
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("fcvm_failpoint="))
+        {
+            failpoint::arm_from_str(spec);
+        }
+    }
+
     if let Err(e) = agent::run().await {
         eprintln!("[fc-agent] ==========================================");
         eprintln!("[fc-agent] FATAL ERROR: Container failed to start");

@@ -657,6 +657,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "failpoint"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -669,6 +676,7 @@ dependencies = [
  "anyhow",
  "dashmap 6.1.0",
  "exec-proto",
+ "failpoint",
  "fs2",
  "fuse-pipe",
  "libc",
@@ -712,6 +720,7 @@ dependencies = [
  "criterion",
  "directories",
  "exec-proto",
+ "failpoint",
  "fs2",
  "fuse-pipe",
  "glob",

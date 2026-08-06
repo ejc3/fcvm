@@ -30,6 +30,10 @@ async fn main() -> Result<()> {
     // Raise resource limits early for fuse-pipe server
     raise_resource_limits();
 
+    // Arm deterministic lifecycle failpoints from FCVM_FAILPOINT (test-only
+    // instrumentation; no-op when unset). Once, before any command runs.
+    failpoint::arm_from_env();
+
     // Parse CLI arguments
     let cli = cli::Cli::parse();
 

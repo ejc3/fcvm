@@ -1351,6 +1351,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
+    // failpoint: hold right before the restore resumes/unblocks the VM (the resume
+    // happens inside restore_from_snapshot{,_ch} below) — clone infra (state file,
+    // status listener, network) is already live, so "client arrives before the
+    // restored guest ever runs" becomes deterministic.
+    failpoint::hit_async("restore.pre_resume").await;
     let setup_result: Result<(
         Box<dyn crate::hypervisor::Hypervisor>,
         Option<tokio::process::Child>,

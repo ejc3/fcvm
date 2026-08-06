@@ -175,7 +175,7 @@ CONTAINER_RUN_BASE := podman run --rm --privileged \
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
 .PHONY: all help build clean clean-test-data check-disk \
-	test test-unit test-fast test-all test-root test-packaging \
+	test test-unit test-fast test-all test-root test-packaging fuzz \
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
@@ -200,6 +200,7 @@ help:
 	@echo "  test-all           + slow VM tests (rootless, no sudo)"
 	@echo "  test-root, test    + privileged tests (bridged, pjdfstest, sudo)"
 	@echo "  test-fc-mock       Run tests with fc-mock (no KVM required)"
+	@echo "  fuzz               Seeded lifecycle chaos fuzz (SEEDS=N|list OPS=M, defaults 1/10)"
 	@echo ""
 	@echo "Test (container):"
 	@echo "  container-test-unit    Unit tests in container"
@@ -403,6 +404,17 @@ test-fast: show-notes check-disk setup-fcvm _test-fast
 test-all: show-notes check-disk setup-fcvm _test-all
 test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages _test-root
 test: test-root
+
+# Seeded lifecycle chaos fuzz (tests/test_fuzz_chaos.rs): one rootless VM per
+# seed, randomized-but-seeded op schedule, end-state oracles. Runs through the
+# same _test-root machinery as the rest of the suite.
+# Usage: make fuzz SEEDS=25 OPS=30   (defaults: SEEDS=1 OPS=10)
+# SEEDS is a count N (runs seeds 1..=N) or a comma list of literal seeds
+# ("3,17,42"; a trailing comma like "7," replays exactly seed 7).
+SEEDS ?= 1
+OPS ?= 10
+fuzz: show-notes check-disk setup-fcvm
+	FCVM_FUZZ_SEEDS=$(SEEDS) FCVM_FUZZ_OPS=$(OPS) $(MAKE) _test-root FILTER=fuzz_lifecycle_chaos
 
 # fc-mock: container-mode tests (no KVM required)
 # Uses fc-mock binary instead of Firecracker.
@@ -647,7 +659,7 @@ setup-lint-tools:
 	@which cargo-deny > /dev/null || (echo "Installing cargo-deny..." && cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked)
 
 lint: setup-lint-tools
-	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent --check
+	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint --check
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CARGO) audit
 	$(CARGO) deny check

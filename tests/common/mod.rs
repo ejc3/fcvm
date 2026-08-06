@@ -35,17 +35,25 @@ pub struct TestLogger {
 }
 
 impl TestLogger {
-    /// Create a new test logger. Logs are written to /tmp/fcvm-test-logs/{test_name}-{timestamp}-{pid}.log
+    /// Create a new test logger. Logs are written to
+    /// /tmp/fcvm-test-logs/{test_name}-{timestamp}-{pid}-{seq}.log. The seq
+    /// counter disambiguates spawns that share a name (e.g. two name-less
+    /// `snapshot create` children) within the same second and process, which
+    /// would otherwise interleave into one file.
     pub fn new(test_name: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LOG_SEQ: AtomicU64 = AtomicU64::new(0);
+
         // Create log directory if needed
         std::fs::create_dir_all(TEST_LOG_DIR).ok();
 
         // Include PID to avoid conflicts between host and container tests
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let pid = std::process::id();
+        let seq = LOG_SEQ.fetch_add(1, Ordering::Relaxed);
         let log_path = PathBuf::from(format!(
-            "{}/{}-{}-{}.log",
-            TEST_LOG_DIR, test_name, timestamp, pid
+            "{}/{}-{}-{}-{}.log",
+            TEST_LOG_DIR, test_name, timestamp, pid, seq
         ));
 
         // Create the file — panic immediately if directory isn't writable.
@@ -470,6 +478,19 @@ pub async fn spawn_fcvm_with_env(
     args: &[&str],
     env_vars: &[(&str, &str)],
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
+    let (child, pid, _log_path) = spawn_fcvm_with_env_and_log_path(args, env_vars).await?;
+    Ok((child, pid))
+}
+
+/// Same as `spawn_fcvm_with_env` but also returns the debug log file path.
+///
+/// Use this when a test needs BOTH environment variables (e.g. `FCVM_FAILPOINT` /
+/// `FCVM_GUEST_FAILPOINT`) AND the log path, to sequence on marker lines like
+/// `FAILPOINT <name> reached` (see the failpoint crate's marker contract).
+pub async fn spawn_fcvm_with_env_and_log_path(
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
     // Ensure config exists (runs once per test process)
     ensure_config_exists();
 
@@ -484,6 +505,7 @@ pub async fn spawn_fcvm_with_env(
         .unwrap_or("fcvm");
 
     let logger = TestLogger::new(name);
+    let log_path = logger.path().clone();
 
     let mut cmd = tokio::process::Command::new(&fcvm_path);
     cmd.args(&final_args)
@@ -513,7 +535,7 @@ pub async fn spawn_fcvm_with_env(
     spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
     spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
 
-    Ok((child, pid))
+    Ok((child, pid, log_path))
 }
 
 /// Spawn fcvm with piped IO and automatic log consumers.
@@ -1016,6 +1038,10 @@ pub async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> anyhow::Re
             "--tag",
             snapshot_name,
         ])
+        // Callers race this future against a timeout; without kill_on_drop a
+        // timed-out create would survive as an orphan mid pause/save and could
+        // leave the target VM paused while the caller tears it down.
+        .kill_on_drop(true)
         .output()
         .await?;
 
