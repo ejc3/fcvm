@@ -60,7 +60,9 @@ pub struct VmContext {
     /// Egress proxy task (rootless mode only); aborted during cleanup.
     pub egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
     pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,
-    pub startup_rx: Option<oneshot::Receiver<()>>,
+    /// Startup-snapshot trigger from the health monitor. Carries the ack the
+    /// snapshot path must send (or drop) before the monitor publishes Healthy.
+    pub startup_rx: Option<oneshot::Receiver<crate::health::StartupSnapshotAck>>,
     pub snapshot_key: Option<String>,
     pub volume_configs: Vec<VolumeConfig>,
     pub args: RunArgs,

@@ -45,6 +45,11 @@ pub fn spawn_health_monitor_with_cancel(
     spawn_health_monitor_full(vm_id, pid, state_dir, cancel_token, None)
 }
 
+/// Ack sent by the startup-snapshot path once its pause/resume cycle is over
+/// (snapshot created, skipped, or failed). Dropping it unblocks the monitor
+/// too, so an aborted snapshot path can never wedge health reporting.
+pub type StartupSnapshotAck = oneshot::Sender<()>;
+
 /// Spawn a health monitor with full configuration options.
 ///
 /// Parameters:
@@ -52,15 +57,18 @@ pub fn spawn_health_monitor_with_cancel(
 /// - `pid`: Optional process ID for the VM
 /// - `state_dir`: Directory for state files
 /// - `cancel_token`: Optional token for graceful shutdown
-/// - `startup_healthy_tx`: Optional oneshot channel to signal when health first becomes Healthy.
-///   This is used to trigger startup snapshot creation. Only fires once, when transitioning
-///   from non-healthy to healthy state.
+/// - `startup_healthy_tx`: Optional channel to signal when health first becomes Healthy.
+///   This triggers startup snapshot creation, which PAUSES the VM (the memory dump can
+///   take tens of seconds under I/O load). A paused VM cannot answer forwarded ports or
+///   execs, so the monitor sends an ack channel along with the signal and defers
+///   publishing Healthy to the state file until the snapshot path acks (or drops the
+///   ack): once Healthy is externally visible, the data plane is actually live.
 pub fn spawn_health_monitor_full(
     vm_id: String,
     pid: Option<u32>,
     state_dir: PathBuf,
     cancel_token: Option<CancellationToken>,
-    startup_healthy_tx: Option<oneshot::Sender<()>>,
+    startup_healthy_tx: Option<oneshot::Sender<StartupSnapshotAck>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let state_manager = StateManager::new(state_dir);
@@ -124,22 +132,59 @@ pub fn spawn_health_monitor_full(
             }
 
             let check_start = Instant::now();
-            let health_status = match update_health_status_once(
+            let checked = check_health_once(
                 &state_manager,
                 &vm_id,
                 pid,
                 &mut last_failure_log,
                 &mut skip_podman_healthcheck,
             )
-            .await
-            {
-                Ok((status, _exit_code)) => status,
+            .await;
+            let check_duration = check_start.elapsed();
+            let (health_status, exit_code, check_ok) = match checked {
+                Ok((status, exit_code)) => (status, exit_code, true),
                 Err(e) => {
                     warn!(target: "health-monitor", error = %e, "health check iteration failed");
-                    HealthStatus::Unknown
+                    (HealthStatus::Unknown, None, false)
                 }
             };
-            let check_duration = check_start.elapsed();
+
+            // First healthy transition: the healthy signal triggers startup-snapshot
+            // creation, which pauses the VM. Run that pause/resume cycle to completion
+            // BEFORE persisting Healthy, so no client (port-forward curl, exec, `fcvm
+            // ls` poller) can observe Healthy while the vCPUs are paused. The snapshot
+            // path acks when done; a dropped ack (abort/shutdown) unblocks us too.
+            if health_status == HealthStatus::Healthy && !is_healthy {
+                if let Some(tx) = startup_tx.take() {
+                    let (ack_tx, ack_rx) = oneshot::channel::<()>();
+                    if tx.send(ack_tx).is_ok() {
+                        info!(target: "health-monitor",
+                            "signaling startup snapshot trigger; deferring Healthy until its pause is over");
+                        if let Some(ref token) = cancel_token {
+                            tokio::select! {
+                                _ = ack_rx => {}
+                                _ = token.cancelled() => {
+                                    info!(target: "health-monitor", "cancellation requested during startup snapshot, stopping");
+                                    break;
+                                }
+                            }
+                        } else {
+                            let _ = ack_rx.await;
+                        }
+                    }
+                }
+            }
+
+            // Persist after the gate above. A failed check persists nothing (same as
+            // before the check/persist split): the next iteration retries.
+            if check_ok {
+                if let Err(e) = state_manager
+                    .update_health_status(&vm_id, health_status, exit_code)
+                    .await
+                {
+                    warn!(target: "health-monitor", error = %e, "persisting health status failed");
+                }
+            }
 
             // Track consecutive failures for escalated logging
             if health_status == HealthStatus::Healthy {
@@ -172,12 +217,6 @@ pub fn spawn_health_monitor_full(
                     is_healthy = true;
                     poll_interval = HEALTH_POLL_HEALTHY_INTERVAL;
                     info!(target: "health-monitor", "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
-
-                    // Signal startup snapshot trigger (fires only once)
-                    if let Some(tx) = startup_tx.take() {
-                        info!(target: "health-monitor", "signaling startup snapshot trigger");
-                        let _ = tx.send(()); // Ignore error if receiver dropped
-                    }
                 }
             } else if is_healthy {
                 // VM was healthy but is no longer — revert to adaptive polling
@@ -506,8 +545,11 @@ async fn run_podman_healthcheck(pid: u32, username: Option<&str>, user_spec: Opt
     }
 }
 
-/// Perform a single health check iteration and persist the result.
-async fn update_health_status_once(
+/// Perform a single health check iteration WITHOUT persisting the result.
+///
+/// The monitor loop persists separately so the first Healthy can be gated on
+/// the startup-snapshot pause finishing (see `spawn_health_monitor_full`).
+async fn check_health_once(
     state_manager: &StateManager,
     vm_id: &str,
     pid: Option<u32>,
@@ -790,16 +832,10 @@ async fn update_health_status_once(
         (HealthStatus::Unknown, None)
     };
 
-    // Update state file atomically (lock held across read-modify-write)
-    state_manager
-        .update_health_status(vm_id, health_status, exit_code)
-        .await
-        .context("updating health state atomically")?;
-
     Ok((health_status, exit_code))
 }
 
-/// Run a single health check iteration (exposed for tests).
+/// Run a single health check iteration and persist the result (exposed for tests).
 pub async fn run_health_check_once(
     vm_id: &str,
     pid: Option<u32>,
@@ -808,7 +844,7 @@ pub async fn run_health_check_once(
     let state_manager = StateManager::new(state_dir);
     let mut last_failure_log = None;
     let mut skip_podman_healthcheck = false;
-    let (status, _exit_code) = update_health_status_once(
+    let (status, exit_code) = check_health_once(
         &state_manager,
         vm_id,
         pid,
@@ -816,6 +852,11 @@ pub async fn run_health_check_once(
         &mut skip_podman_healthcheck,
     )
     .await?;
+    // Update state file atomically (lock held across read-modify-write)
+    state_manager
+        .update_health_status(vm_id, status, exit_code)
+        .await
+        .context("updating health state atomically")?;
     Ok(status)
 }
 
