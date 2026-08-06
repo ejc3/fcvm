@@ -220,6 +220,9 @@ cmd_create() {
     local patches_dir=$(get_patches_dir "$profile")
     local workdir="/tmp/kernel-patch-$$"
 
+    # An empty patches_dir means the profile deliberately applies no patches.
+    [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot create a patch"
+
     info "Creating patch for kernel $version (profile: $profile)"
 
     # Setup kernel source
@@ -263,6 +266,9 @@ cmd_finish() {
     local patches_dir=$(get_patches_dir "$profile")
     local kernel_dir="$workdir/linux-${version}"
 
+    # An empty patches_dir means the profile deliberately applies no patches.
+    [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot finish a patch"
+
     [[ -d "$kernel_dir" ]] || error "Kernel dir not found: $kernel_dir"
 
     # Ensure patch name has .patch extension
@@ -293,6 +299,9 @@ cmd_edit() {
     local version=$(get_kernel_version "$profile")
     local patches_dir=$(get_patches_dir "$profile")
     local workdir="/tmp/kernel-patch-$$"
+
+    # An empty patches_dir means the profile deliberately applies no patches.
+    [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot edit a patch"
 
     # Find the patch file
     local patch_file=$(ls "$patches_dir"/${patch_num}*.patch 2>/dev/null | head -1)
@@ -337,6 +346,12 @@ cmd_validate() {
     local version=$(get_kernel_version "$profile")
     local patches_dir=$(get_patches_dir "$profile")
     local workdir="/tmp/kernel-validate-$$"
+
+    # An empty patches_dir means the profile deliberately applies no patches.
+    if [[ -z "$patches_dir" ]]; then
+        info "Profile '$profile' has patches disabled (patches_dir is empty); nothing to validate"
+        return
+    fi
 
     info "Validating patches for kernel $version (profile: $profile)"
 
