@@ -474,11 +474,127 @@ async fn test_fc_mock_exec_connect_protocol() -> Result<()> {
     assert!(got_exit, "should have received exit response");
     assert_eq!(exit_code, Some(0), "exit code should be 0");
 
+    // --- TIER 0 parity: drop-after-ACK against the real fc-mock server ---
+    // Abandon a handshake between ACK and GO (the snapshot-pause orphan shape).
+    // The command would create a marker file if it ever executed; fc-mock must
+    // close the connection without executing and stay fully serviceable.
+    let marker = format!("/tmp/fc-mock-exec-orphan-marker-{}", std::process::id());
+    let _ = std::fs::remove_file(&marker);
+    {
+        let stream = tokio::net::UnixStream::connect(&vsock_path)
+            .await
+            .context("connecting orphan handshake")?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half.write_all(b"CONNECT 4998\n").await?;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .context("timeout reading orphan OK")?
+            .context("reading orphan OK line")?;
+        assert_eq!(line.trim(), "OK 4998");
+
+        let orphan_request = serde_json::json!({
+            "command": ["touch", marker],
+            "in_container": false,
+            "interactive": false,
+            "tty": false
+        });
+        write_half
+            .write_all(format!("{}\n", serde_json::to_string(&orphan_request)?).as_bytes())
+            .await?;
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .context("timeout reading orphan ACK")?
+            .context("reading orphan ACK line")?;
+        assert_eq!(
+            line.trim(),
+            exec_proto::HANDSHAKE_ACK,
+            "orphan connection should be ACKed before being dropped"
+        );
+        // Drop both halves WITHOUT sending GO.
+    }
+    println!("  Orphaned a handshake after ACK (no GO sent)");
+
+    // The server must survive the orphan: a fresh connection completes a full
+    // exec (this also strictly orders the runtime past the orphan's EOF handling).
+    {
+        let stream = tokio::net::UnixStream::connect(&vsock_path)
+            .await
+            .context("connecting post-orphan exec")?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half.write_all(b"CONNECT 4998\n").await?;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .context("timeout reading post-orphan OK")?
+            .context("reading post-orphan OK line")?;
+        assert_eq!(line.trim(), "OK 4998");
+
+        let request = serde_json::json!({
+            "command": ["echo", "alive-after-orphan"],
+            "in_container": false,
+            "interactive": false,
+            "tty": false
+        });
+        write_half
+            .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
+            .await?;
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .context("timeout reading post-orphan ACK")?
+            .context("reading post-orphan ACK line")?;
+        assert_eq!(line.trim(), exec_proto::HANDSHAKE_ACK);
+        write_half
+            .write_all(format!("{}\n", exec_proto::HANDSHAKE_GO).as_bytes())
+            .await?;
+
+        let mut post_stdout = String::new();
+        let mut post_exit: Option<i32> = None;
+        loop {
+            line.clear();
+            let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .context("timeout reading post-orphan responses")?
+                .context("reading post-orphan response line")?;
+            if n == 0 {
+                break;
+            }
+            let resp: serde_json::Value =
+                serde_json::from_str(line.trim()).context("parsing post-orphan response")?;
+            match resp["type"].as_str() {
+                Some("stdout") => post_stdout.push_str(resp["data"].as_str().unwrap_or("")),
+                Some("exit") => {
+                    post_exit = resp["data"].as_i64().map(|v| v as i32);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            post_stdout.contains("alive-after-orphan"),
+            "exec after an orphaned handshake should work, got stdout: {:?}",
+            post_stdout
+        );
+        assert_eq!(post_exit, Some(0), "post-orphan exec should exit 0");
+    }
+    println!("  Server fully serviceable after the orphaned handshake");
+
     // Cleanup
     common::kill_process(mock_pid).await;
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&vsock_path);
     let _ = std::fs::remove_file(&status_socket);
+
+    // With fc-mock dead, the marker verdict is final: the ACKed-but-never-GOed
+    // command must not have executed.
+    assert!(
+        !std::path::Path::new(&marker).exists(),
+        "fc-mock executed a command whose handshake never received GO"
+    );
 
     println!("✅ FC-MOCK EXEC CONNECT PROTOCOL TEST PASSED!");
     Ok(())

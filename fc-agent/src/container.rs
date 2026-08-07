@@ -970,6 +970,14 @@ pub fn notify_cache_ready_and_wait(
         return CacheResult::Failed;
     }
 
+    // failpoint: hold AFTER the console quiesce completed and immediately BEFORE
+    // announcing cache-ready (which triggers the host's pre-start snapshot pause) —
+    // proves the quiesce gate keeps the UART idle across an arbitrarily long
+    // pre-pause window. Sync context (this fn is blocking). Note: the marker line
+    // is buffered by the quiesced console and reaches the host log only after the
+    // guard drops — a hold, not a host-visible sync point.
+    failpoint::hit("cache_ready.pre_send");
+
     let msg = format!("cache-ready:{}\n", digest);
     match write(&sock, msg.as_bytes()) {
         Ok(n) if n == msg.len() => {}

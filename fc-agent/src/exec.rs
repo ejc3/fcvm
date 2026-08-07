@@ -356,6 +356,11 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
     /// GO is 2 bytes; anything longer is a protocol violation.
     const MAX_GO_LINE_LENGTH: usize = 16;
 
+    // failpoint: hold after accept, before consuming the request line — forces the
+    // client's 3s ACK timeout and exercises reconnect+resend against a REAL agent
+    // (not a mock). Sync hit(): this fn runs inside spawn_blocking.
+    failpoint::hit("exec.post_accept_pre_read");
+
     let deadline = Instant::now() + timeout;
 
     // Phase 1: request line.
@@ -409,6 +414,11 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
         unsafe { libc::close(fd) };
         return None;
     }
+
+    // failpoint: hold after the ACK write and BEFORE go_deadline is computed, so a
+    // hold delays the GO read without eating its 2s floor (Instant::now() below is
+    // taken after the hold) — makes "GO races a snapshot pause after ACK" testable.
+    failpoint::hit("exec.post_ack_pre_go");
 
     // Phase 3: GO — only after consuming this may execution start. A request
     // that arrived slowly can leave the shared deadline nearly exhausted here;
@@ -712,6 +722,12 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
     // fd closed by OwnedFd drop (inside AsyncFd, inside Mutex, inside Arc)
 }
+
+// TIER 0 protocol-interleaving fuzz: systematic peer-death enumeration for the
+// ACK/GO handshake (kept in its own file — see exec_fuzz_tests.rs).
+#[cfg(test)]
+#[path = "exec_fuzz_tests.rs"]
+mod exec_fuzz_tests;
 
 #[cfg(test)]
 mod tests {

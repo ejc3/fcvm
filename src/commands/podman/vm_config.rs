@@ -303,6 +303,20 @@ pub(crate) fn build_runtime_boot_args(
         boot_args.push_str(&format!("fuse_trace_rate={}", rate));
     }
 
+    // Pass guest failpoints to fc-agent via kernel command line (test-only
+    // deterministic-interleaving instrumentation — see the failpoint crate).
+    // Validated up front: guest specs are sleep-only and whitespace-free, and a
+    // bad spec must fail the run before a VM boots, not silently un-arm a test.
+    if let Ok(spec) = std::env::var("FCVM_GUEST_FAILPOINT") {
+        if let Err(e) = failpoint::validate_guest_spec(&spec) {
+            panic!("invalid FCVM_GUEST_FAILPOINT: {e}");
+        }
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
+        }
+        boot_args.push_str(&format!("fcvm_failpoint={}", spec));
+    }
+
     // Pass FUSE max_write to fc-agent via kernel command line.
     if let Ok(max_write) = std::env::var("FCVM_FUSE_MAX_WRITE") {
         if !boot_args.is_empty() {
@@ -889,6 +903,9 @@ pub(crate) fn build_launch_config(
         rootfs_type: super::resolve_rootfs_type(args),
         port_mappings,
         firecracker_bin: runtime_config.firecracker_bin.clone(),
+        // Cache-key isolation for guest failpoints (see field docs): the spec is
+        // forwarded to the guest by build_runtime_boot_args from the same env var.
+        guest_failpoint: std::env::var("FCVM_GUEST_FAILPOINT").ok(),
     }
 }
 

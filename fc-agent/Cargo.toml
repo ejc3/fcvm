@@ -15,6 +15,7 @@ fs2 = "0.4"
 dashmap = "6"
 fuse-pipe = { path = "../fuse-pipe", default-features = false }
 exec-proto = { path = "../exec-proto" }
+failpoint = { path = "../failpoint" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
