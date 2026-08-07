@@ -359,6 +359,12 @@ cmd_land() {
 
     for number in $landable; do
         note "landing PR #$number"
+        # Look up the validated head SHA from the manifest so we can bind
+        # the merge to exactly the commit CI tested (closes the TOCTOU
+        # window between the preflight check and the actual merge).
+        local match_sha
+        match_sha=$(jq -r --argjson n "$number" '.prs[] | select(.number == $n) | .headSha' "$MANIFEST")
+
         gh pr comment "$number" --body "Landed by the CI merge train (\`scripts/ci-train.sh\`).
 
 Validation for this PR came from one full CI matrix run on the **combined tree of the whole batch** (branch \`$BRANCH\` @ \`$run_sha\`), not from a per-PR run:
@@ -374,7 +380,7 @@ Landing merges each batch PR in the same order, so \`main\` converges on the tre
         local attempt=0 merged=""
         while [ "$attempt" -lt 5 ]; do
             attempt=$((attempt + 1))
-            if gh pr merge "$number" --merge --delete-branch --admin; then
+            if gh pr merge "$number" --merge --delete-branch --admin --match-head-commit "$match_sha"; then
                 merged=1
                 break
             fi
@@ -420,9 +426,18 @@ cmd_bisect() {
     status=$(jq -r '.status' <<<"$run")
     conclusion=$(jq -r '.conclusion' <<<"$run")
     [ "$status" = "completed" ] || die "train run is still $status - wait for it before bisecting"
-    if [ "$conclusion" = "success" ]; then
-        die "train run is green - nothing to bisect; run 'land'"
-    fi
+    case "$conclusion" in
+        success)
+            die "train run is green - nothing to bisect; run 'land'"
+            ;;
+        failure|timed_out)
+            # Genuine test failure (or timeout, which may be a bad PR) -
+            # proceed to bisect.
+            ;;
+        *)
+            die "train run concluded '$conclusion' - this is not a test failure; re-dispatch instead of bisecting: $(jq -r '.url' <<<"$run")"
+            ;;
+    esac
 
     local count
     count=$(jq '.prs | length' "$MANIFEST")
