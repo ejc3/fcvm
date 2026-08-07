@@ -56,7 +56,7 @@ jobs:
     outputs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check if tree SHA already passed CI
         id: check
         env:
@@ -100,7 +100,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -145,7 +145,7 @@ jobs:
     name: Packaging
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -176,7 +176,7 @@ jobs:
     name: fc-mock
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -244,7 +244,7 @@ jobs:
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -460,7 +460,7 @@ jobs:
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -646,7 +646,7 @@ jobs:
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -732,7 +732,7 @@ jobs:
         run: echo "::notice::Skipped self-hosted tests — tree SHA already passed CI on a PR branch"
       # When the test matrix was skipped, no artifacts exist and there is
       # nothing to analyze; downloading would fail on the missing directory.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: needs.skip-check.outputs.skip != 'true'
       - name: Download all artifacts
         if: needs.skip-check.outputs.skip != 'true'

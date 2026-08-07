@@ -13,7 +13,7 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -45,7 +45,7 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
