@@ -31,7 +31,7 @@ pub(super) async fn setup_rootless_namespace(
     // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
     // This is also inside retry logic - if holder dies during nsenter, retry everything
     let setup_script = pasta_net.build_setup_script();
-    let mut nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
+    let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
 
     // Debug: Check if holder is still alive and namespace files exist
     let proc_dir = format!("/proc/{}", holder_pid);
@@ -61,15 +61,18 @@ pub(super) async fn setup_rootless_namespace(
     // Log the setup script for debugging
     debug!(
         holder_pid = holder_pid,
-        script = %setup_script.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).collect::<Vec<_>>().join("; "),
+        script = %setup_script.summary(),
         "network setup script"
     );
 
+    // One nsenter+bash+ip for the whole phase: the script batches every `ip`
+    // command (TAP creation, link up, loopback, and the TAP existence check)
+    // into a single `ip -batch` process.
     let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
         .args(&nsenter_prefix[1..])
         .arg("bash")
         .arg("-c")
-        .arg(&setup_script)
+        .arg(setup_script.script())
         .output()
         .await
         .context("running network setup via nsenter")?;
@@ -104,7 +107,7 @@ pub(super) async fn setup_rootless_namespace(
                 .args(&retry_nsenter_prefix[1..])
                 .arg("bash")
                 .arg("-c")
-                .arg(&setup_script)
+                .arg(setup_script.script())
                 .output()
                 .await
                 .context("running network setup via nsenter (retry)")?;
@@ -115,13 +118,15 @@ pub(super) async fn setup_rootless_namespace(
                     nix::unistd::Pid::from_raw(retry_holder_pid as i32),
                     nix::sys::signal::Signal::SIGKILL,
                 );
-                bail!("network setup failed on retry: {}", retry_stderr.trim(),);
+                bail!(
+                    "network setup failed on retry: {}",
+                    setup_script.describe_failure(&retry_stderr)
+                );
             }
 
             // Success on retry - update variables for rest of function
             child = retry_child;
             holder_pid = retry_holder_pid;
-            nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
             info!(
                 holder_pid = holder_pid,
                 "network setup succeeded after retry"
@@ -169,7 +174,7 @@ pub(super) async fn setup_rootless_namespace(
                     "network setup failed: holder died during nsenter. \
                      nsenter_stderr='{}', holder_stderr='{}', \
                      (tun={}, ns_user={}, ns_net={})",
-                    stderr.trim(),
+                    setup_script.describe_failure(&stderr),
                     holder_stderr_content.trim(),
                     tun_exists,
                     ns_user_exists,
@@ -178,7 +183,7 @@ pub(super) async fn setup_rootless_namespace(
             } else {
                 bail!(
                     "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
-                    stderr.trim(),
+                    setup_script.describe_failure(&stderr),
                     tun_exists,
                     holder_alive,
                     ns_user_exists,
@@ -188,30 +193,10 @@ pub(super) async fn setup_rootless_namespace(
         }
     }
 
+    // The TAP existence check is the last step of the batched setup script, so a
+    // successful run already proves the device is there — no second nsenter+ip.
+    debug!(tap_device = %network_config.tap_device, "TAP device verified");
     info!(holder_pid = holder_pid, "network setup complete");
-
-    // Verify TAP device was created successfully
-    let tap_device = &network_config.tap_device;
-    let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-        .args(&nsenter_prefix[1..])
-        .arg("ip")
-        .arg("link")
-        .arg("show")
-        .arg(tap_device)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .context("verifying TAP device")?;
-
-    if !verify_output.success() {
-        let _ = child.kill().await;
-        bail!(
-            "TAP device '{}' not found after network setup - setup may have failed silently",
-            tap_device
-        );
-    }
-    debug!(tap_device = %tap_device, "TAP device verified");
 
     // Use pre_exec setns path (not nsenter) for rootless baselines.
     // nsenter enters the user namespace internally, which clears PR_SET_PDEATHSIG

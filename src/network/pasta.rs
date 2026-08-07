@@ -40,6 +40,103 @@ const PASTA_STDERR_TAIL_LINES: usize = 20;
 /// so the failure error can include what it actually printed.
 const PASTA_STDERR_DRAIN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Heredoc delimiter separating the batched `ip` commands from the shell script.
+const IP_BATCH_DELIMITER: &str = "FCVM_IP_BATCH";
+
+/// A list of `ip` commands rendered as a single shell script.
+///
+/// Configuring one VM's namespace takes ~10 `ip` invocations, and each one is a
+/// fork+exec. `ip -batch` reads commands from a stream and applies them all in
+/// ONE process, so a whole phase costs `nsenter` + `bash` + `ip` instead of a
+/// process per command.
+///
+/// Semantics are unchanged: `ip -batch` runs the commands in order and, without
+/// `-force`, **aborts at the first failure** — nothing after it is applied, just
+/// as `set -e` did for the one-command-per-line form. On failure it prints
+/// `Command failed -:<line>`, and [`IpBatchScript::describe_failure`] maps that
+/// line back to the step's description so an error still names the step that
+/// failed.
+#[derive(Debug, Clone)]
+pub struct IpBatchScript {
+    /// (human description, `ip` arguments) — one entry per batch line, in order.
+    steps: Vec<(String, String)>,
+    script: String,
+}
+
+impl IpBatchScript {
+    /// Render `steps` as one `ip -batch` invocation, followed by `trailing_shell`
+    /// lines (for things `ip` cannot do, e.g. writing a sysctl — those are shell
+    /// builtins and cost no extra process).
+    fn new(steps: Vec<(String, String)>, trailing_shell: &[&str]) -> Self {
+        // One step per physical line, no blanks or comments inside the heredoc:
+        // `ip -batch` reports the physical line number, so line N is step N.
+        let batch: String = steps
+            .iter()
+            .map(|(_, args)| format!("{}\n", args))
+            .collect();
+        let mut script = format!(
+            "set -e\nip -batch - <<'{delim}'\n{batch}{delim}\n",
+            delim = IP_BATCH_DELIMITER,
+            batch = batch,
+        );
+        for line in trailing_shell {
+            script.push_str(line);
+            script.push('\n');
+        }
+        Self { steps, script }
+    }
+
+    /// The shell script to run under `bash -c` inside the namespace.
+    pub fn script(&self) -> &str {
+        &self.script
+    }
+
+    /// One-line summary of the steps, for debug logging.
+    pub fn summary(&self) -> String {
+        self.steps
+            .iter()
+            .map(|(_, args)| format!("ip {}", args))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Turn a failed run's stderr into a message naming the step that failed.
+    ///
+    /// `ip -batch` prints `Command failed -:<line>` for the aborting command;
+    /// anything else (nsenter/bash failures, or an `ip` too old to report a
+    /// line) falls back to the raw stderr so no diagnostic is ever swallowed.
+    pub fn describe_failure(&self, stderr: &str) -> String {
+        let stderr = stderr.trim();
+        for token in stderr.split_whitespace() {
+            let Some(line_no) = token.strip_prefix("-:") else {
+                continue;
+            };
+            let Ok(line_no) = line_no.trim_end_matches(':').parse::<usize>() else {
+                continue;
+            };
+            if let Some((desc, args)) = line_no.checked_sub(1).and_then(|i| self.steps.get(i)) {
+                return format!(
+                    "step {}/{} ({}) failed running `ip {}`: {}",
+                    line_no,
+                    self.steps.len(),
+                    desc,
+                    args,
+                    if stderr.is_empty() {
+                        "(no stderr)"
+                    } else {
+                        stderr
+                    }
+                );
+            }
+        }
+        if stderr.is_empty() {
+            "(no stderr)".to_string()
+        } else {
+            stderr.to_string()
+        }
+    }
+}
+
 /// Rootless networking using pasta with bridge architecture
 ///
 /// This mode uses user namespaces and pasta (from passt project) for true
@@ -160,24 +257,38 @@ impl PastaNetwork {
         ]
     }
 
-    /// Build the pre-pasta setup script to run inside the namespace via nsenter
+    /// Build the pre-pasta setup script to run inside the namespace via nsenter.
     ///
-    /// Creates only the Firecracker TAP device. The bridge and pasta0 TAP
-    /// are set up after pasta starts (pasta creates its own TAP).
-    /// Run via: nsenter -t HOLDER_PID -U -n -- bash -c '<this script>'
-    pub fn build_setup_script(&self) -> String {
-        format!(
-            r#"
-set -e
-
-# Create TAP device for Firecracker (pasta creates its own TAP separately)
-ip tuntap add {fc_tap} mode tap
-ip link set {fc_tap} up
-
-# Set up loopback
-ip link set lo up
-"#,
-            fc_tap = self.tap_device,
+    /// Creates the Firecracker TAP device, brings loopback up, and verifies the
+    /// TAP exists — every `ip` command in ONE `ip -batch` process (see
+    /// [`IpBatchScript`]). The bridge and pasta0 TAP are set up after pasta
+    /// starts (pasta creates its own TAP).
+    ///
+    /// Run via: nsenter -t HOLDER_PID -U -n -- bash -c '<script()>'
+    pub fn build_setup_script(&self) -> IpBatchScript {
+        IpBatchScript::new(
+            vec![
+                (
+                    format!("create TAP device {} for Firecracker", self.tap_device),
+                    format!("tuntap add {} mode tap", self.tap_device),
+                ),
+                (
+                    format!("bring TAP device {} up", self.tap_device),
+                    format!("link set {} up", self.tap_device),
+                ),
+                (
+                    "bring loopback up".to_string(),
+                    "link set lo up".to_string(),
+                ),
+                // Verification is the last batch step rather than a second
+                // nsenter+ip process: `ip -batch` already stops at the first
+                // failure, so reaching this line means every step above applied.
+                (
+                    format!("verify TAP device {} exists", self.tap_device),
+                    format!("link show {}", self.tap_device),
+                ),
+            ],
+            &[],
         )
     }
 
@@ -190,37 +301,50 @@ ip link set lo up
     ///
     /// The caller (post_start) waits for pasta's TAP device to exist via
     /// wait_for_pasta_device() before running this script.
-    pub fn build_bridge_script(&self) -> String {
-        let script = format!(
-            r#"
-set -e
-
-# Bring pasta0 up (pasta creates it but doesn't bring it up without --config-net)
-ip link set {pasta_dev} up
-
-# Create L2 bridge — connects pasta0 and Firecracker TAP
-ip link add {bridge} type bridge
-ip link set {bridge} up
-
-# Add pasta's TAP to bridge (pasta created this device)
-ip link set {pasta_dev} master {bridge}
-
-# Add Firecracker's TAP to bridge
-ip link set {fc_tap} master {bridge}
-
-# Add IP to bridge for health checks (namespace needs route to reach guest)
-ip addr add {namespace_ip}/24 dev {bridge}
-
-# Enable IP forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
-"#,
-            bridge = BRIDGE_DEVICE,
-            pasta_dev = self.pasta_device,
-            fc_tap = self.tap_device,
-            namespace_ip = NAMESPACE_IP,
-        );
-
-        script
+    ///
+    /// All six `ip` commands run in ONE `ip -batch` process; enabling IP
+    /// forwarding is a shell redirect (no extra process).
+    pub fn build_bridge_script(&self) -> IpBatchScript {
+        let bridge = BRIDGE_DEVICE;
+        IpBatchScript::new(
+            vec![
+                (
+                    format!(
+                        "bring {} up (pasta creates it but leaves it down without --config-net)",
+                        self.pasta_device
+                    ),
+                    format!("link set {} up", self.pasta_device),
+                ),
+                (
+                    format!("create L2 bridge {}", bridge),
+                    format!("link add {} type bridge", bridge),
+                ),
+                (
+                    format!("bring bridge {} up", bridge),
+                    format!("link set {} up", bridge),
+                ),
+                (
+                    format!("add pasta TAP {} to bridge {}", self.pasta_device, bridge),
+                    format!("link set {} master {}", self.pasta_device, bridge),
+                ),
+                (
+                    format!(
+                        "add Firecracker TAP {} to bridge {}",
+                        self.tap_device, bridge
+                    ),
+                    format!("link set {} master {}", self.tap_device, bridge),
+                ),
+                (
+                    format!(
+                        "add health-check IP {}/24 to bridge {}",
+                        NAMESPACE_IP, bridge
+                    ),
+                    format!("addr add {}/24 dev {}", NAMESPACE_IP, bridge),
+                ),
+            ],
+            // Enable IP forwarding — a bash redirect, not another process.
+            &["echo 1 > /proc/sys/net/ipv4/ip_forward"],
+        )
     }
 
     /// Build the nsenter prefix command for running processes in the namespace
@@ -245,8 +369,17 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
         "holder(unshare --user --net) + nsenter for setup/firecracker".to_string()
     }
 
-    /// Detect host's global IPv6 address for pasta outbound traffic
+    /// Detect host's global IPv6 address for pasta outbound traffic.
+    ///
+    /// Memoised for the process lifetime: `setup()` and `start_pasta()` both need
+    /// it, so without this every VM launch pays two `ip -6 addr show` execs for
+    /// an answer that cannot change during one launch.
     fn detect_host_ipv6() -> Option<String> {
+        static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        HOST_IPV6.get_or_init(Self::probe_host_ipv6).clone()
+    }
+
+    fn probe_host_ipv6() -> Option<String> {
         let output = std::process::Command::new("ip")
             .args(["-6", "addr", "show", "scope", "global"])
             .output()
@@ -755,7 +888,7 @@ impl NetworkManager for PastaNetwork {
 
         debug!(
             holder_pid = holder_pid,
-            script = %bridge_script.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).collect::<Vec<_>>().join("; "),
+            script = %bridge_script.summary(),
             "running bridge setup script"
         );
 
@@ -763,14 +896,17 @@ impl NetworkManager for PastaNetwork {
             .args(&nsenter_prefix[1..])
             .arg("bash")
             .arg("-c")
-            .arg(&bridge_script)
+            .arg(bridge_script.script())
             .output()
             .await
             .context("running bridge setup via nsenter")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("bridge setup failed: {}", stderr.trim());
+            anyhow::bail!(
+                "bridge setup failed: {}",
+                bridge_script.describe_failure(&stderr)
+            );
         }
 
         // Phase 4: Verify port forwarding is actually working
@@ -895,5 +1031,173 @@ mod tests {
         assert_eq!(net.pasta_device, "pasta0");
         assert_eq!(net.guest_ip, "10.0.2.100");
         assert_eq!(net.gateway_ip(), "10.0.2.2");
+    }
+
+    /// Batch lines are exactly the heredoc body, in order, one per line.
+    fn batch_lines(script: &str) -> Vec<&str> {
+        let open = format!("<<'{}'\n", IP_BATCH_DELIMITER);
+        let body = script
+            .split_once(&open)
+            .expect("script must open a batch heredoc")
+            .1;
+        let body = body
+            .split_once(&format!("\n{}\n", IP_BATCH_DELIMITER))
+            .expect("script must close the batch heredoc")
+            .0;
+        body.lines().collect()
+    }
+
+    #[test]
+    fn setup_script_batches_every_ip_command_into_one_process() {
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
+        let script = net.build_setup_script();
+
+        // Exactly one `ip` process for the whole phase: the only shell line that
+        // invokes `ip` is the batch itself.
+        let ip_lines: Vec<&str> = script
+            .script()
+            .lines()
+            .filter(|l| l.trim_start().starts_with("ip "))
+            .collect();
+        assert_eq!(
+            ip_lines,
+            vec![format!("ip -batch - <<'{}'", IP_BATCH_DELIMITER)],
+            "no per-command `ip` invocations should remain outside the batch"
+        );
+
+        assert_eq!(
+            batch_lines(script.script()),
+            vec![
+                "tuntap add tap-fc mode tap",
+                "link set tap-fc up",
+                "link set lo up",
+                "link show tap-fc",
+            ],
+            "TAP verification must be the last batch step, not a second exec"
+        );
+    }
+
+    #[test]
+    fn bridge_script_batches_every_ip_command_and_keeps_ip_forward() {
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
+        let script = net.build_bridge_script();
+
+        assert_eq!(script.script().matches("ip -batch -").count(), 1);
+        assert_eq!(
+            batch_lines(script.script()),
+            vec![
+                "link set pasta0 up",
+                "link add br0 type bridge",
+                "link set br0 up",
+                "link set pasta0 master br0",
+                "link set tap-fc master br0",
+                "addr add 10.0.2.1/24 dev br0",
+            ]
+        );
+        assert!(
+            script
+                .script()
+                .contains("echo 1 > /proc/sys/net/ipv4/ip_forward"),
+            "ip_forward must still be enabled (as a shell redirect, not a process)"
+        );
+        assert!(script.script().starts_with("set -e\n"));
+    }
+
+    #[test]
+    fn batch_failure_names_the_failing_step() {
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
+        let script = net.build_bridge_script();
+
+        // `ip -batch` aborts at the first failing line and reports `-:<line>`.
+        let msg = script.describe_failure("RTNETLINK answers: File exists\nCommand failed -:2\n");
+        assert!(msg.contains("step 2/6"), "missing step index: {msg}");
+        assert!(
+            msg.contains("create L2 bridge br0"),
+            "missing step name: {msg}"
+        );
+        assert!(
+            msg.contains("ip link add br0 type bridge"),
+            "missing command: {msg}"
+        );
+        assert!(
+            msg.contains("RTNETLINK answers: File exists"),
+            "lost stderr: {msg}"
+        );
+    }
+
+    #[test]
+    fn batch_failure_falls_back_to_raw_stderr() {
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
+        let script = net.build_setup_script();
+
+        // nsenter-level failure: no `-:<line>` marker, so nothing may be swallowed.
+        let msg = script.describe_failure("nsenter: cannot open /proc/123/ns/net: No such process");
+        assert_eq!(
+            msg,
+            "nsenter: cannot open /proc/123/ns/net: No such process"
+        );
+
+        // Out-of-range line numbers must not panic or invent a step.
+        assert_eq!(
+            script.describe_failure("Command failed -:99"),
+            "Command failed -:99"
+        );
+        assert_eq!(script.describe_failure("   "), "(no stderr)");
+    }
+
+    /// The batch really does run under `bash -c` and really does abort at the
+    /// first failure — verified against the host's actual `ip` binary, in the
+    /// current namespace, using read-only `link show` commands.
+    #[test]
+    fn ip_batch_script_runs_and_aborts_on_first_failure() {
+        let ok = IpBatchScript::new(
+            vec![
+                ("show loopback".to_string(), "link show lo".to_string()),
+                (
+                    "show loopback again".to_string(),
+                    "link show lo".to_string(),
+                ),
+            ],
+            &["echo TRAILING_RAN"],
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(ok.script())
+            .output()
+            .expect("running batch script");
+        assert!(
+            out.status.success(),
+            "batch failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("TRAILING_RAN"));
+
+        let bad = IpBatchScript::new(
+            vec![
+                ("show loopback".to_string(), "link show lo".to_string()),
+                (
+                    "show a device that cannot exist".to_string(),
+                    "link show fcvm-no-such-dev".to_string(),
+                ),
+                ("never reached".to_string(), "link show lo".to_string()),
+            ],
+            &["echo TRAILING_RAN"],
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(bad.script())
+            .output()
+            .expect("running batch script");
+        assert!(!out.status.success(), "batch should have failed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let msg = bad.describe_failure(&stderr);
+        assert!(
+            msg.contains("step 2/3") && msg.contains("show a device that cannot exist"),
+            "failure not attributed to step 2: stderr={stderr:?} msg={msg}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("TRAILING_RAN"),
+            "set -e must stop the script when the batch aborts"
+        );
     }
 }

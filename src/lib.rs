@@ -11,6 +11,7 @@ pub mod state;
 pub mod storage;
 pub mod uffd;
 pub mod utils;
+pub mod version_cache;
 pub mod volume;
 
 /// Get total host memory in MiB from /proc/meminfo.

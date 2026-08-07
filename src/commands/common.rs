@@ -463,34 +463,21 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
         which::which("firecracker").context("firecracker not found in PATH")?
     };
 
-    // Check version
-    let output = std::process::Command::new(&firecracker_bin)
-        .arg("--version")
-        .output()
-        .with_context(|| {
+    // Check version. Cached per binary identity (path + mtime + size): this runs
+    // on every VM launch and clone, and the answer only changes when the binary
+    // does — a rebuilt or swapped firecracker is re-probed. See version_cache.
+    let version_str =
+        crate::version_cache::version_output(&firecracker_bin).with_context(|| {
             format!(
-                "failed to run firecracker --version (binary: {})",
+                "checking firecracker version at {}",
                 firecracker_bin.display()
             )
         })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "firecracker --version failed (exit {}, binary: {}): {}",
-            output.status,
-            firecracker_bin.display(),
-            stderr.trim()
-        );
-    }
-
-    let version_str = String::from_utf8_lossy(&output.stdout);
     let version = parse_firecracker_version(&version_str).with_context(|| {
         format!(
-            "binary: {}, stdout: {:?}, stderr: {:?}",
+            "binary: {}, stdout: {:?}",
             firecracker_bin.display(),
             version_str.trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
         )
     })?;
 
@@ -523,14 +510,12 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
 /// any v52+; the cached build is preferred so CI and dev hosts use the pinned fork.
 pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
     // Run `<bin> --version`; returns the trimmed version string on success.
+    // Cached per binary identity (only successful probes are cached), so a
+    // binary that cannot run here keeps failing and keeps falling through.
     fn version_of(bin: &std::path::Path) -> Option<String> {
-        let out = std::process::Command::new(bin)
-            .arg("--version")
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        crate::version_cache::version_output(bin)
+            .ok()
+            .map(|s| s.trim().to_string())
     }
 
     // 1. Explicit override — must exist and run; no fallback (the user asked for THIS one).
@@ -1031,7 +1016,6 @@ pub struct CloneSubstrate {
 async fn prepare_clone_substrate(
     network: &mut dyn NetworkManager,
     restore_config: &SnapshotRestoreConfig,
-    network_config: &NetworkConfig,
     vm_id: &str,
     data_dir: &Path,
     vm_state: &mut VmState,
@@ -1076,7 +1060,6 @@ async fn prepare_clone_substrate(
 
         let setup_script = pasta_net.build_setup_script();
         let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
-        let tap_device = network_config.tap_device.clone();
 
         let source_disk = restore_config.source_disk_path.clone();
         let disk_task = async {
@@ -1097,6 +1080,9 @@ async fn prepare_clone_substrate(
         let network_task = async {
             let ns_poll_start = std::time::Instant::now();
             info!(holder_pid = holder_pid, "running network setup via nsenter");
+            // One nsenter+bash+ip for the whole phase, TAP verification included
+            // as the last batch step (ip -batch aborts at the first failure, so
+            // reaching it proves every step above applied).
             loop {
                 if !crate::utils::is_process_alive(holder_pid) {
                     anyhow::bail!(
@@ -1108,7 +1094,7 @@ async fn prepare_clone_substrate(
                     .args(&nsenter_prefix[1..])
                     .arg("bash")
                     .arg("-c")
-                    .arg(&setup_script)
+                    .arg(setup_script.script())
                     .output()
                     .await
                     .context("running network setup via nsenter")?;
@@ -1128,27 +1114,11 @@ async fn prepare_clone_substrate(
                     tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
                     continue;
                 }
-                anyhow::bail!("network setup failed: {}", stderr);
-            }
-
-            let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-                .args(&nsenter_prefix[1..])
-                .arg("ip")
-                .arg("link")
-                .arg("show")
-                .arg(&tap_device)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .context("verifying TAP device")?;
-            if !verify_output.success() {
                 anyhow::bail!(
-                    "TAP device '{}' not found after network setup - setup may have failed silently",
-                    tap_device
+                    "network setup failed: {}",
+                    setup_script.describe_failure(&stderr)
                 );
             }
-            debug!(tap_device = %tap_device, "TAP device verified");
             Ok::<_, anyhow::Error>(())
         };
 
@@ -1281,15 +1251,8 @@ pub async fn restore_from_snapshot(
 
     // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
     // mount redirect — all shared with the Cloud Hypervisor restore path.
-    let substrate = prepare_clone_substrate(
-        network,
-        restore_config,
-        network_config,
-        vm_id,
-        data_dir,
-        vm_state,
-    )
-    .await?;
+    let substrate =
+        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
     let rootfs_path = substrate.rootfs_path;
     let holder_child = substrate.holder_child;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
@@ -1608,15 +1571,8 @@ pub async fn restore_from_snapshot_ch(
     )?;
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
-    let substrate = prepare_clone_substrate(
-        network,
-        restore_config,
-        network_config,
-        vm_id,
-        data_dir,
-        vm_state,
-    )
-    .await?;
+    let substrate =
+        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
 
     // Cloud Hypervisor reads its restore config (disk/vsock/net) from the snapshot's `ch/`
     // dir. Disk + vsock paths are the source VM's and are redirected to the clone's by the
