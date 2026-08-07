@@ -446,6 +446,24 @@ impl PastaNetwork {
     pub async fn start_pasta(&mut self, namespace_pid: u32) -> Result<()> {
         let pid_file = paths::data_dir().join(format!("pasta-{}.pid", truncate_id(&self.vm_id, 8)));
 
+        // Register the inotify watch BEFORE the stale-file cleanup and spawn:
+        // pasta's PID-file write after this point always produces an event, so
+        // readiness can never be missed (zero-race: watch → check → wait).
+        // Init failure (e.g. fs.inotify.max_user_instances exhausted by many
+        // concurrent clone starts as one user) must not fail start_pasta — the
+        // old poll never had that failure mode. Degrade to the 250ms safety
+        // tick below, same as the vm.rs API-socket watch.
+        let mut pid_file_watch = match crate::utils::DirWatch::new(&paths::data_dir()) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "inotify unavailable for pasta PID-file wait; degrading to 250ms polling"
+                );
+                None
+            }
+        };
+
         if pid_file.exists() {
             tokio::fs::remove_file(&pid_file).await?;
         }
@@ -605,40 +623,53 @@ impl PastaNetwork {
             });
         }
 
-        // Wait for PID file to appear (signals pasta is ready)
-        let deadline = std::time::Instant::now() + PASTA_READY_TIMEOUT;
+        // Wait for the PID file to appear (pasta writes it once ready).
+        // Event-driven: the inotify watch registered before spawn wakes us the
+        // instant the file lands (the old 50ms poll noticed a +2.3ms file at
+        // +52.8ms on every rootless clone). pasta death interrupts the wait via
+        // child.wait(); the deadline still bounds everything, and a coarse
+        // safety tick re-checks the file so even a lost/overflowed inotify
+        // event can only add latency, never hang.
+        let deadline = tokio::time::Instant::now() + PASTA_READY_TIMEOUT;
         loop {
             if pid_file.exists() {
                 info!("pasta ready (PID file created)");
                 break;
             }
 
-            // Check if pasta died during startup
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Give the stderr reader a moment to drain the pipe so the
-                    // error includes what pasta actually printed.
+            tokio::select! {
+                status = child.wait() => {
+                    // pasta died during startup. Give the stderr reader a moment
+                    // to drain the pipe so the error includes what pasta printed.
                     tokio::time::sleep(PASTA_STDERR_DRAIN_DELAY).await;
+                    match status {
+                        Ok(status) => anyhow::bail!(
+                            "pasta exited before becoming ready (status: {}){}",
+                            status,
+                            self.stderr_tail_message()
+                        ),
+                        Err(e) => anyhow::bail!("failed to check pasta status: {}", e),
+                    }
+                }
+                event = crate::utils::DirWatch::next_event_opt(&mut pid_file_watch) => {
+                    // Filesystem activity in the data dir — loop re-checks the
+                    // PID file. A watch error degrades to the safety tick.
+                    if event.is_err() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = child.kill().await;
                     anyhow::bail!(
-                        "pasta exited before becoming ready (status: {}){}",
-                        status,
+                        "pasta did not become ready within {:?}{}",
+                        PASTA_READY_TIMEOUT,
                         self.stderr_tail_message()
                     );
                 }
-                Ok(None) => {} // Still running
-                Err(e) => anyhow::bail!("failed to check pasta status: {}", e),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    // Safety tick: re-check the condition even without events.
+                }
             }
-
-            if std::time::Instant::now() > deadline {
-                let _ = child.kill().await;
-                anyhow::bail!(
-                    "pasta did not become ready within {:?}{}",
-                    PASTA_READY_TIMEOUT,
-                    self.stderr_tail_message()
-                );
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         self.pasta_process = Some(child);
@@ -672,6 +703,15 @@ impl PastaNetwork {
     async fn wait_for_pasta_device(&mut self, holder_pid: u32) -> Result<()> {
         let deadline = std::time::Instant::now() + PASTA_DEVICE_TIMEOUT;
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
+
+        // Fine-grained backoff, not a fixed 100ms: pasta creates the TAP within
+        // a few ms of writing its PID file, and now that the PID file is
+        // noticed event-driven (+2ms instead of +52ms) this probe regularly
+        // arrives BEFORE the device exists — a fixed 100ms retry put a +100ms
+        // mode on 4/10 benched clones. Each probe is a full nsenter+ip exec
+        // (~1-3ms), so short gaps just keep probing continuously through the
+        // handful of ms until the device appears; the deadline still bounds it.
+        let mut retry_delay = std::time::Duration::from_millis(1);
 
         loop {
             let output = Command::new(&nsenter_prefix[0])
@@ -718,7 +758,8 @@ impl PastaNetwork {
                 );
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(std::time::Duration::from_millis(50));
         }
     }
 

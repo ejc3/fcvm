@@ -18,6 +18,13 @@ pub struct RestoreSignals {
     pub exec_rebind_done: Arc<AtomicBool>,
     pub exec_rebind_done_notify: Arc<Notify>,
     pub egress_gen_rx: Option<watch::Receiver<u64>>,
+    /// Incremented by the output writer when it observes EPOLLERR on its
+    /// established vsock connection — the guest-visible edge of the device's
+    /// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET at snapshot restore. The epoch
+    /// watcher uses it as a wakeup to fast-poll for the new restore-epoch
+    /// instead of finishing a frozen 50ms sleep. Accelerator only: the normal
+    /// poll cadence remains the correctness path.
+    pub vsock_reset_rx: watch::Receiver<u64>,
     /// NFS mounts from the boot-time plan, kept for post-restore remounting.
     /// MMDS can't be re-fetched here: the host's restore-epoch PUT replaces the
     /// whole MMDS store, so `container-plan` is gone by the time restore runs.

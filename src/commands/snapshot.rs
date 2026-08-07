@@ -1455,38 +1455,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    // Build the cold-boot relaunch plan up front (consumed if the guest reboots).
-    let clone_disk_path = data_dir.join("disks/rootfs.raw");
-    // Reboot-in-place relaunches via the Firecracker cold-boot plan (build_clone_reboot_plan
-    // is FC-specific). Cloud Hypervisor clones don't support it yet — a guest reboot
-    // terminates the clone (same as TTY clones). Tracked for a future increment.
-    let reboot_plan = if is_ch {
-        None
-    } else {
-        match build_clone_reboot_plan(
-            &snapshot_config.metadata,
-            &vm_name,
-            args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
-            args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
-            args.non_blocking_output,
-            &network_config,
-            &runtime_config,
-            &clone_disk_path,
-            &clone_vsock_base,
-        )
-        .await
-        {
-            Ok(plan) => Some(plan),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "reboot-in-place unavailable for this clone — a guest reboot will terminate it"
-                );
-                None
-            }
-        }
-    };
-
     // Disable swap for Firecracker if requested via --no-swap
     if args.no_swap {
         if let Ok(pid) = vm_manager.pid() {
@@ -1537,12 +1505,16 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             let cmd_args: Vec<String> = shell_words::split(exec_cmd)
                 .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
 
-            // Wait for vsock socket to be ready (poll instead of blind sleep)
+            // Wait for the vsock socket to be connectable. After a restore the
+            // socket virtually always exists already (Firecracker binds it during
+            // load_snapshot), so probe immediately and back off from 1ms — the old
+            // fixed 10ms interval burned most of an interval per clone --exec.
             let vsock_socket = data_dir.join("vsock.sock");
             let poll_start = std::time::Instant::now();
             const MAX_VSOCK_WAIT: Duration = Duration::from_millis(5000);
-            const VSOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+            const VSOCK_POLL_MAX_INTERVAL: Duration = Duration::from_millis(10);
 
+            let mut vsock_poll_interval = Duration::from_millis(1);
             loop {
                 if poll_start.elapsed() > MAX_VSOCK_WAIT {
                     bail!("vsock socket not ready after {:?}", poll_start.elapsed());
@@ -1556,7 +1528,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     }
                 }
 
-                tokio::time::sleep(VSOCK_POLL_INTERVAL).await;
+                tokio::time::sleep(vsock_poll_interval).await;
+                vsock_poll_interval = (vsock_poll_interval * 2).min(VSOCK_POLL_MAX_INTERVAL);
             }
             crate::commands::exec::run_exec_in_vm(
                 &vsock_socket,
@@ -1629,8 +1602,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // can take minutes. Proceeding early causes exec failures; waiting is correct.
     // But poll VM liveness to avoid hanging forever if Firecracker crashes.
     if !tty_mode {
-        let mut liveness_interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        liveness_interval.tick().await; // consume immediate first tick
+        // First liveness check at 250ms, then every 5s: restore_from_snapshot no
+        // longer sleeps post-resume (its old 200ms crash-window moved here, off
+        // the hot path), so a VM that dies right after resume is still diagnosed
+        // quickly — while a healthy clone's output connection wins this select
+        // in a few ms and never waits on any tick.
+        let mut liveness_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(5),
+        );
         let mut output_connected = false;
         loop {
             tokio::select! {
@@ -1788,6 +1768,42 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         container_exit_seen.store(false, std::sync::atomic::Ordering::Release);
                         let _ = std::fs::remove_file(data_dir.join("container-exit"));
                         let _ = std::fs::remove_file(data_dir.join("container-ready"));
+                        // Build the cold-boot relaunch plan ON DEMAND: only a rebooting
+                        // clone needs it, and assembling it (kernel/initrd resolution,
+                        // launch config) cost ~19ms up front on EVERY clone — waste for
+                        // one-shot clones that never reboot. A guest reboot already pays
+                        // a full cold boot, so plan assembly here is noise; a build
+                        // failure has the same outcome as the old eager path (the reboot
+                        // terminates the clone), just diagnosed at reboot time.
+                        // build_clone_reboot_plan is FC-specific; Cloud Hypervisor clones
+                        // don't support reboot-in-place yet — a guest reboot terminates
+                        // them (same as TTY clones). Tracked for a future increment.
+                        let reboot_plan = if is_ch {
+                            None
+                        } else {
+                            match build_clone_reboot_plan(
+                                &snapshot_config.metadata,
+                                &vm_name,
+                                args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
+                                args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
+                                args.non_blocking_output,
+                                &network_config,
+                                &runtime_config,
+                                &data_dir.join("disks/rootfs.raw"),
+                                &clone_vsock_base,
+                            )
+                            .await
+                            {
+                                Ok(plan) => Some(plan),
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "reboot-in-place unavailable for this clone — treating reboot as VM exit"
+                                    );
+                                    None
+                                }
+                            }
+                        };
                         if let Some((plan, synth_args, volume_mappings)) = reboot_plan.as_ref() {
                             info!("guest rebooted — relaunching restored clone in place (cold boot)");
                             let relaunch_result = async {

@@ -1478,11 +1478,18 @@ pub async fn restore_from_snapshot(
                 .collect();
         }
 
-        // Post-resume liveness check: verify VM didn't crash immediately.
-        // Under heavy I/O load, snapshot restore can corrupt guest memory (e.g., stack
-        // canary in do_idle), causing an immediate kernel panic + reboot. Detecting this
-        // early surfaces the error instead of silently serving a crashed VM.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Post-resume liveness check (non-blocking): catch a Firecracker process that
+        // already died during load/patch/resume. This used to be `sleep(200ms)` +
+        // try_wait (fe4376b0) to detect restores of corrupt diff snapshots, but the
+        // sleep could never catch what it aimed for: a panicking guest reboots (and
+        // Firecracker exits) only ~1s after resume (`panic=1` boot arg), outside any
+        // 200ms window — and since #630 narrowed cached-snapshot fallback to
+        // Firecracker "Load snapshot error"s, this error is a hard failure anyway
+        // (corrupt diffs are caught at CREATE time by the diff-size validation).
+        // Delayed guest crashes are detected event-driven by every caller's positive
+        // readiness gate: the output-connect wait (with its try_wait liveness poll)
+        // in cmd_snapshot_run, --exec's vsock connect probe, and
+        // verify_port_forwarding. Sleeping here bought nothing but 200ms per clone.
         if let Some(status) = vm_manager.try_wait()? {
             bail!(
                 "VM crashed immediately after snapshot restore (exit status: {:?}). \
@@ -1688,8 +1695,10 @@ pub async fn restore_from_snapshot_ch(
                 .collect();
         }
 
-        // Liveness: ensure the VM didn't crash immediately after restore.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Liveness (non-blocking): catch a CH process that already died during
+        // restore/resume. Same rationale as the Firecracker path above — delayed
+        // guest crashes are detected event-driven by the caller's readiness gates,
+        // so there is nothing a fixed post-resume sleep can catch that they don't.
         if let Some(status) = backend.try_wait()? {
             bail!(
                 "Cloud Hypervisor crashed immediately after snapshot restore (exit status: {:?})",

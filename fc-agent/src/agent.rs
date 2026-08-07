@@ -73,8 +73,10 @@ pub async fn run() -> Result<()> {
         eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
     }
 
-    // Create output channel — the writer task handles all vsock writes
-    let (output, output_writer) = output::create();
+    // Create output channel — the writer task handles all vsock writes. The
+    // reset watch surfaces EPOLLERR on the output connection (vsock transport
+    // reset = snapshot restore) to the restore-epoch watcher.
+    let (output, output_writer, vsock_reset_rx) = output::create();
     tokio::spawn(output_writer);
 
     // Shared flag: set by restore-epoch watcher, checked by notify_cache_ready_and_wait.
@@ -107,6 +109,7 @@ pub async fn run() -> Result<()> {
             exec_rebind_done: exec_rebind_done.clone(),
             exec_rebind_done_notify: exec_rebind_done_notify.clone(),
             egress_gen_rx: egress_gen_rx.clone(),
+            vsock_reset_rx,
             nfs_mounts: plan.nfs_mounts.clone(),
         };
         tokio::spawn(async move {
