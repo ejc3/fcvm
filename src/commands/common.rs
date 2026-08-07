@@ -754,10 +754,19 @@ pub async fn cleanup_vm(
 
 /// Memory backend configuration for snapshot restore
 pub enum MemoryBackend {
-    /// Load memory directly from file (used by podman cache restore)
+    /// Load memory directly from file (used by podman cache restore).
+    /// Firecracker maps the snapshot file MAP_PRIVATE, so clean pages are shared through
+    /// the host page cache and guest writes CoW.
     File { memory_path: PathBuf },
-    /// Use UFFD server for on-demand page loading (used by snapshot clones)
+    /// Use UFFD server for on-demand page loading (used by snapshot clones).
+    /// MISSING faults on anonymous memory, resolved with UFFDIO_COPY: lazy, but every
+    /// faulted page becomes a private per-clone copy.
     Uffd { socket_path: PathBuf },
+    /// Use the UFFD server in MINOR mode: Firecracker receives a shared memfd from the
+    /// server, maps it MAP_PRIVATE, and the server resolves minor faults with
+    /// UFFDIO_CONTINUE. Lazy *and* shared — clean pages have exactly one physical copy
+    /// across all clones, writes CoW into private memory.
+    UffdMinor { socket_path: PathBuf },
 }
 
 /// Configuration for restoring a VM from a snapshot
@@ -1369,6 +1378,16 @@ pub async fn restore_from_snapshot(
                 );
                 MemBackend {
                     backend_type: "Uffd".to_string(),
+                    backend_path: socket_path.display().to_string(),
+                }
+            }
+            MemoryBackend::UffdMinor { socket_path } => {
+                info!(
+                    uffd_socket = %socket_path.display(),
+                    "loading snapshot with UFFD MINOR backend (shared memfd + UFFDIO_CONTINUE)"
+                );
+                MemBackend {
+                    backend_type: "UffdMinor".to_string(),
                     backend_path: socket_path.display().to_string(),
                 }
             }

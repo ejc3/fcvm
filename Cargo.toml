@@ -60,7 +60,7 @@ async-trait = "0.1"
 hyper = { version = "0.14", features = ["client", "http1"] }
 hyperlocal = "0.8"
 shellexpand = "3"
-userfaultfd = "0.8"
+userfaultfd = { version = "0.9", features = ["linux5_13"] }
 memmap2 = "0.9"
 vmm-sys-util = "0.12"
 shell-words = "1"

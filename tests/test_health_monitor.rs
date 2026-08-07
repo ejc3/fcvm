@@ -79,6 +79,7 @@ async fn test_health_monitor_behaviors() {
             snapshot_name: None,
             process_type: Some(ProcessType::Vm),
             serve_pid: None,
+            uffd_mode: None,
             original_vsock_vm_id: None,
             port_mappings: vec![],
             forward_localhost: vec![],

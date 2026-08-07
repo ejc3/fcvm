@@ -2298,91 +2298,175 @@ A large container VM may have 131 GB of guest memory, but most of it is identica
 (kernel, application code, page cache). Only pages each clone writes to should be unique
 (Private_Dirty).
 
-### Current State (2026-02-28)
+### The three memory backends (measured 2026-08-07, matched accounting)
 
-Three memory backends were tested. Results for two 131 GB clones:
+An earlier (2026-02-28) version of this table ranked the backends by per-clone RSS of the
+firecracker process alone on a 131 GB guest, and called the File backend "Broken — KVM
+CoW-copies pages into Private_Clean even for reads". Recomputing on a **matched accounting
+basis** — PSS/RSS summed over *every* process belonging to a clone (fcvm + firecracker +
+pasta + the `unshare` namespace holder), plus each backend's costs *outside* the clones —
+showed that ranking was inverted: the File backend's big RSS is the same reclaimable page
+cache counted once per clone, not per-clone private waste, and on whole-machine cost it is
+the *cheapest* 4 KiB option, not a broken one. Measured, N=4 concurrent 1 GiB alpine/nginx
+clones (aarch64, details in the next section):
 
-| Backend | Per-clone RSS | Shared | Private_Clean | Pressure | Status |
-|---------|--------------|--------|---------------|----------|--------|
-| **File** (`MAP_PRIVATE` on memory.bin) | 44 GB | 1.8 MB | 33.6 GB | 40% | Broken — KVM CoW-copies pages into Private_Clean even for reads |
-| **UFFD MISSING+COPY** | 21 GB | 0 | 0 | 11% | Works but no sharing — each fault copies data to fresh anon page |
-| **UFFD MINOR+CONTINUE** (not implemented) | ~5 GB (est.) | ~80 GB (est.) | 0 | ~2% (est.) | True sharing via shared memfd |
+| Backend | Σ clone PSS | Σ clone RSS | Unreclaimable footprint at N=4 (clones + server + backing) | Status |
+|---------|------------|------------|------------------------------------------|--------|
+| **File** (`MAP_PRIVATE` on memory.bin) | 306 MiB | 743 MiB (double-counts page cache shared BETWEEN clones) | **≈ 160 MiB** (only Private_Dirty; everything else is reclaimable page cache) | Works; clean pages shared via page cache; rejected by Firecracker for hugetlbfs snapshots |
+| **UFFD MISSING+COPY** | 296 MiB | 344 MiB | ≈ 500 MiB (296 clone anon + the serve process's own faulted copy, 205 PSS) | Works; zero sharing between clones |
+| **UFFD MINOR+CONTINUE** (`--uffd-mode minor`) | **204 MiB** | 355 MiB | ≈ 590 MiB (204 clone + **383 unevictable shmem memfd** + 3.5 serve) | Works; true sharing via a sealed memfd mapped `MAP_PRIVATE` |
 
 **File backend**: Firecracker maps memory.bin with `MAP_PRIVATE | PROT_READ | PROT_WRITE`.
-When KVM handles a guest page fault, even for a read, the page becomes Private_Clean in the
-process's address space. This happens because the kernel creates a private copy of the
-file-backed page when setting up writable EPT mappings. The `track_dirty_pages` flag
-(`--no-dirty-tracking` CLI) controls KVM's dirty bitmap tracking but does NOT prevent
-the Private_Clean CoW behavior — that's inherent to MAP_PRIVATE with writable mappings.
+Faulted-but-clean pages stay page-cache-backed: they show up as Shared_Clean/Private_Clean
+in each mapping process (which is what the old measurement misread as per-clone cost), but
+there is ONE physical, *reclaimable* copy regardless of clone count. Only written pages
+(`Private_Dirty`, ~40 MiB/clone measured) are truly per-clone.
 
 **UFFD MISSING+COPY**: Firecracker creates anonymous memory (`MAP_PRIVATE | MAP_ANONYMOUS`)
-and registers it with UFFD in MISSING mode. On each page fault, the UFFD server reads from
-memory.bin and calls `UFFDIO_COPY` to fill the page. Each clone gets its own physical copy.
-No Private_Clean bloat (no file-backed mapping), but no sharing either.
-RSS is lower than File mode because only faulted pages are populated (lazy loading).
+and registers it with UFFD in MISSING mode. On each fault the server `UFFDIO_COPY`s out of
+memory.bin — every faulted page becomes unswappable private anon in that clone (~76
+MiB/clone at idle), and the serve process itself faults the whole snapshot mmap in as it
+copies (205 MiB PSS measured after serving 4 clones).
 
 **KSM**: Disabled (`/sys/kernel/mm/ksm/run=0`). Firecracker doesn't mark guest memory
 with `MADV_MERGEABLE`. Even if enabled, KSM is after-the-fact dedup with scanning overhead.
 
-### Proposed: UFFD MINOR Mode with Shared Memfd
+### Implemented: UFFD MINOR mode with a shared memfd (`--uffd-mode minor`)
 
-The kernel (6.13+) supports `UFFD_FEATURE_MINOR_SHMEM` — verified on our host.
-The `userfaultfd` crate (0.9.0) supports `register_with_mode()` with raw bits.
-
-**Architecture:**
+**The mechanism is NOT `MAP_SHARED`.** An earlier sketch in this document proposed mapping the
+memfd `MAP_SHARED`; that is wrong and would let every clone's guest writes land in the golden
+snapshot and in each other. The correct recipe, proven on kernel 6.18.3-fcvm and then
+implemented, is:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  fcvm snapshot serve                                │
-│                                                     │
-│  1. memfd_create("snapshot", 131 GB)                │
-│  2. Populate memfd from memory.bin                  │
-│  3. Accept clone connections via UDS                 │
-│  4. Send memfd fd + UFFD fd to each clone           │
-│                                                     │
-│  On MINOR fault from clone:                         │
-│    UFFDIO_CONTINUE → maps existing memfd page       │
-│    (zero-copy, page shared across all clones)       │
-└─────────────────────────────────────────────────────┘
-         │ memfd fd shared via UDS
-         ▼
-┌──────────────────────┐  ┌──────────────────────┐
-│  Clone 1 (Firecracker) │  │  Clone 2 (Firecracker) │
-│                        │  │                        │
-│  Guest memory:         │  │  Guest memory:         │
-│  MAP_SHARED on memfd   │  │  MAP_SHARED on memfd   │
-│  + UFFD MINOR mode     │  │  + UFFD MINOR mode     │
-│                        │  │                        │
-│  Read → shared page    │  │  Read → shared page    │
-│  Write → kernel CoW    │  │  Write → kernel CoW    │
-└──────────────────────┘  └──────────────────────┘
+snapshot serve --uffd-mode minor
+  memfd_create(MFD_CLOEXEC|MFD_ALLOW_SEALING [| MFD_HUGETLB|MFD_HUGE_2MB])  # one per snapshot
+  populate it once from memory.bin (all-zero pages left as holes on shmem)
+  fcntl(F_ADD_SEALS, F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE)
+  reopen O_RDONLY via /proc/self/fd — the ONLY fd clones ever see
+  on each clone connection: SCM_RIGHTS that sealed read-only fd to Firecracker
+
+Firecracker (mem_backend.backend_type = "UffdMinor")
+  recv the memfd, mmap every guest region MAP_PRIVATE over it
+    (MAP_NORESERVE for shmem; hugetlbfs RESERVES the full range -> ENOMEM at
+     restore instead of SIGBUS at CoW when the pool is short)
+  create a userfaultfd via /dev/userfaultfd, register MODE_MINOR
+  send the usual mappings JSON + the uffd back
+
+fcvm handler
+  minor fault -> UFFDIO_CONTINUE(addr, page_size, wake)
+    EEXIST        -> page already mapped by a racing fault: success
+    EAGAIN        -> mmap_changing is set: park the fault, drain the event
+                     queue, retry (bounded); NEVER drop it — the faulting vCPU
+                     sleeps until a CONTINUE wakes it
+    short mapped  -> advance by the reported byte count, continue the rest
 ```
 
-**Changes required:**
+The seal + read-only reopen exist because kernel CoW only covers *mapped* writes: an
+unsealed fd received over SCM_RIGHTS could `pwrite(2)`/`ftruncate(2)` the backing file — or
+be reopened O_RDWR via `/proc/self/fd` — and corrupt the golden snapshot for every clone,
+the same catastrophe the MAP_SHARED experiment demonstrated through a different door.
+Sealing is verified to work for `MFD_HUGETLB` on this kernel; enforcement is tested by
+`uffd::server::tests::test_backing_memfd_is_sealed_*` (pwrite EBADF on the handed-out fd,
+EPERM via an O_RDWR reopen, ftruncate EPERM, `mmap(MAP_SHARED, PROT_WRITE)` EPERM — while
+MAP_PRIVATE + MINOR + CONTINUE keep working off the sealed fd).
 
-1. **Firecracker** (`persist.rs`):
-   - `guest_memory_from_uffd()`: Use `memfd_backed()` instead of `anonymous()` for guest memory
-   - Pass memfd fd from the UFFD server (received via UDS alongside the UFFD fd)
-   - `uffd.register_with_mode(ptr, size, RegisterMode::from_bits_truncate(4))` for MINOR mode
+`UFFDIO_CONTINUE` into a **non-shared** VMA installs a READ-ONLY PTE onto the shared
+page-cache folio (`mm/userfaultfd.c`: `if (page_in_cache && !vm_shared) writable = false`;
+`mm/hugetlb.c` `hugetlb_mfill_atomic_pte` does the same for hugetlb). Reads across all clones
+therefore hit one physical page and the first guest write takes an ordinary copy-on-write
+fault into private memory. The snapshot stays pristine and reusable — enforced by
+`test_snapshot_clone_isolation_uffd_minor`.
 
-2. **fcvm UFFD server** (`src/uffd/server.rs`):
-   - Create memfd, populate from memory.bin (one-time cost at serve start)
-   - Send memfd fd to each clone via UDS handshake
-   - On MINOR fault: `UFFDIO_CONTINUE` (maps existing page) instead of `UFFDIO_COPY` (copies data)
+Two kernel facts shape the implementation:
 
-3. **fcvm serve** (`src/commands/snapshot.rs`):
-   - `snapshot serve` creates and populates the memfd once
-   - Each clone receives the same memfd fd
+* MINOR registration requires a **hugetlb or shmem** VMA (`vma_can_userfault()`), so the
+  backing file must be a memfd; a plain on-disk `memory.bin` cannot be registered MINOR.
+* All-zero pages are left as **holes on shmem only**. `shmem_fault` allocates a hole's folio
+  in the *inode's* page cache regardless of `VM_SHARED`, so the first clone to touch it
+  populates the shared copy and every later clone faults MINOR onto it. `hugetlb_no_page()`
+  only adds to the page cache when `VM_MAYSHARE`, so a hugetlb hole would become a private
+  anon huge page per clone — hugetlb backings are therefore populated in full.
 
-**Why this works:** With `MAP_SHARED` on the memfd, all clones' page tables can point to the
-same physical pages. `UFFDIO_CONTINUE` resolves a MINOR fault by installing a PTE pointing to
-the already-populated memfd page — no data copy. Writes trigger kernel-level CoW (the page gets
-copied to anonymous memory for that process only). This is the same mechanism used by CRIU for
-lazy migration and by cloud providers for VM density.
+### Measured (2026-08-07, N=4 concurrent alpine/nginx clones, 1 GiB guest, aarch64)
 
-**Kernel support:** Verified `UFFD_FEATURE_MINOR_SHMEM` (bit 10) is available on our
-kernel 6.13. The `userfaultfd` crate 0.9.0 doesn't export a `MINOR` constant but
-`RegisterMode::from_bits_truncate(4)` works since it's a bitflags struct.
+Matched accounting basis: **PSS/RSS summed over every process belonging to a clone** — the
+`fcvm` clone process, its `firecracker` child, the `unshare --user --net` holder, and `pasta`
+(4 processes per clone) — plus the serve process measured *after* it had served all 4 clones.
+
+| Config | Σ clone PSS | Σ clone RSS | 1-clone PSS | Serve-process PSS after N | Unevictable shmem | Marginal PSS per extra clone |
+|--------|------------|------------|-------------|---------------------------|-------------------|------------------|
+| UFFD MISSING+COPY | 296 MiB | 344 MiB | 76 MiB | 205 MiB | 0 | ~74 MiB |
+| File `MAP_PRIVATE` | 306 MiB | 743 MiB | 175 MiB | n/a | 0 | ~44 MiB (concave: page cache PSS spreads over clones) |
+| UFFD MINOR+CONTINUE | **204 MiB** | 355 MiB | 74 MiB | **3.5 MiB** | **383 MiB** | **~43 MiB** |
+
+Restore latency was identical across all three (0.91 s from `snapshot run` exec to healthy
+for the first clone; 3 more concurrently in another 0.93 s).
+
+Reading the table:
+
+* MINOR cuts the clones' own PSS by ~31% versus both existing backends and all but eliminates
+  the serve process (3.5 vs 205 MiB PSS — COPY's server faults in every page it ever copied).
+* It pays a fixed **383 MiB of unevictable shmem** for the memfd (63% of this snapshot's pages
+  were all-zero and became holes, so 1024 MiB of guest memory cost 383 MiB resident). On a host
+  with no swap that memory cannot be reclaimed, unlike the page cache the other two backends use.
+* Against UFFD COPY the total-unreclaimable crossover is ≈7 clones (fixed 386 vs 205 MiB,
+  marginal ~43 vs ~74 MiB).
+* Against the **file backend** MINOR never pays off for 4 KiB guests on this metric: File's
+  unreclaimable footprint is only its Private_Dirty (~40 MiB/clone, no fixed cost) because it
+  shares clean pages through *reclaimable* page cache for free. Use MINOR when you need
+  hugepages, lazy/remote page fetch, or per-page interception — not as a blanket replacement.
+
+### Hugepages: the case MINOR actually unlocks
+
+Firecracker **rejects the File backend for hugetlbfs snapshots**, so a `--hugepages` clone must
+use UFFD, and hugetlb pages are neither swappable nor reclaimable — exhaustion is not "slow",
+it is `ENOMEM` or `SIGBUS`. Two facts (both measured on this host) shape the design:
+
+* 2 MiB CoW granularity privatises most of an active guest fast: a restored
+  Ubuntu+systemd+podman guest wrote into ~70% of its 2 MiB regions within seconds of restore.
+  Overcommitting the pool against "clones won't write much" is therefore a mirage.
+* With `MAP_NORESERVE` (the first implementation), pool exhaustion surfaced as a **SIGBUS on a
+  copy-on-write fault of a running guest**: 4 concurrent 512 MiB MINOR clones on a 512-page
+  pool all died mid-boot before fcvm even recorded their PIDs. Reproduced deterministically in
+  a C harness (`MAP_NORESERVE` mapping + exhausted pool → child killed by SIGBUS).
+
+The fix is kernel-enforced admission, not hope: hugetlb MINOR mappings now **reserve their
+full guest size at restore** (the fork's `UffdMinor` backend maps the memfd `MAP_PRIVATE`
+without `MAP_NORESERVE`; `HugePages_Rsvd` jumps by guest_size/2MiB per clone). An unservable
+clone fails its `mmap` with a clean `ENOMEM` — surfaced as a restore error — and an admitted
+clone's CoW always draws from its own reservation and can never SIGBUS. fcvm additionally
+preflights the pool before spawning any hugepage UFFD clone (`preflight_clone_hugepages`) so
+the operator sees "raise vm.nr_hugepages" instead of a dead process; that check is advisory
+(concurrent spawns race), the kernel reservation is the authoritative gate.
+
+The capacity contract is therefore explicit: a pool of P pages serves
+`floor((P - guest_pages) / guest_pages)` MINOR clones (one guest_size for the fully-populated
+memfd, one reserved per clone). What MINOR buys over COPY within that contract is *not* a
+bigger N — COPY needs the same N × guest_size worst case, just unenforced — but:
+
+Measured 2026-08-07, 4 concurrent 512 MiB alpine/nginx clones (aarch64, both runs restore
+to healthy in 0.93 s):
+
+| Pool | Mode | Outcome | HugePages actually allocated | Reserved (admission contract) | Serve RSS |
+|------|------|---------|------------------------------|-------------------------------|-----------|
+| 512 (1 GiB) | copy | **all 4 clones dead**: pool 512→0 free mid-boot, `UFFDIO_COPY` ENOMEM, never healthy | 512 (everything) | none — unenforced | 398 MiB |
+| 512 (1 GiB) | minor | clone 0 **healthy and stays healthy** (its CoW draws on its own reservation); clones 1-3 fail *before the guest exists* — kernel `ENOMEM` at restore mmap when racing spawns, or fcvm's preflight error ("hugepage pool too small … Raise vm.nr_hugepages") when the shortfall is visible at spawn | 256 memfd + survivor's CoW | 256/clone | 10 MiB |
+| 1536 (3 GiB) | copy | 4/4 healthy, isolation OK | 766 (~383 MiB/clone touched: reads AND writes privatise) | none | 398 MiB |
+| 1536 (3 GiB) | minor | 4/4 healthy, isolation OK | 946 (256 memfd + ~345 MiB/clone written; ~28 MiB/clone visibly `Shared_Hugetlb`) | 1280 (memfd + 4×256) | 10 MiB |
+
+Reading it honestly: at N=4 with a mostly-written idle guest, MINOR's *allocated* draw (946)
+is not lower than COPY's (766) — the fully-populated memfd outweighs the small read-shared
+set, and 2 MiB CoW granularity privatises ~70% of the guest either way. What MINOR buys is:
+
+* **no SIGBUS, ever, and deterministic admission**: COPY-mode admission is unenforceable
+  (anonymous `MAP_NORESERVE` memory); when the pool runs out, `UFFDIO_COPY` fails and running
+  guests die (the pool-512 row). MINOR clones that start are guaranteed to finish, and clones
+  that cannot be served fail up front with an explanation.
+* **reads are shared**: COPY privatises every page a guest *touches*; MINOR only what it
+  *writes*. The gap grows with read-heavy guests; it is ~150 MiB of the pool here.
+* **the serve process costs almost nothing** (10 vs 398 MiB RSS: it drops its populate
+  mapping; the memfd pages are page cache of the hugetlbfs inode).
 
 ## References
 
