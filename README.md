@@ -380,7 +380,17 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to disable FUSE writeback cache |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
+| `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
 | `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |
+
+**Firecracker fork resolution.** When a kernel profile builds firecracker from a
+fork branch, the branch head is resolved with `git ls-remote` — a network round
+trip that used to run on *every* VM launch and snapshot clone. The result is now
+cached in `assets_dir/firecracker/<profile>.resolved.json` and reused for
+`FCVM_FIRECRACKER_RESOLVE_TTL_SECS`. `fcvm setup` always re-queries and rewrites
+that file, so rebuilding the fork takes effect for launches immediately rather
+than after the TTL. `<binary> --version` probes are cached the same way, keyed by
+the binary's path + mtime + size, so a rebuilt binary is always re-checked.
 
 ### Image Delivery Modes
 

@@ -180,7 +180,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-chromium \
+	bench-container-import bench-chromium bench-clone-latency \
 	lint fmt update-dependency ssh test-serve-sdk
 
 all: build
@@ -235,6 +235,7 @@ help:
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
+	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
 	@echo "  train-create PRS=\"689 690\"  Build the ci-train branch from a batch of PRs"
@@ -653,6 +654,15 @@ bench-hugepages-test: build setup-default
 bench-container-import: build setup-default
 	@echo "==> Running container import benchmark..."
 	$(CARGO) bench --bench container_import
+
+# Clone hot-path latency: `fcvm snapshot run` spawn -> exec-server-ready, N times.
+# Event-driven readiness (waits on the debug log's marker), plus a stage breakdown
+# parsed from the RUST_LOG=fcvm=debug timeline.
+# Results in /tmp/fcvm-clone-latency-$(LABEL)/ (never committed).
+#   make bench-clone-latency LABEL=before N=10
+bench-clone-latency: build setup-default
+	@echo "==> Running clone latency benchmark..."
+	bench/clone-latency.sh $(or $(LABEL),run) $(or $(N),10)
 
 # Container benchmark target (used by nightly CI)
 # Uses CONTAINER_RUN_BASE (no --ulimit nproc) to avoid EPERM on GHA ubuntu-latest

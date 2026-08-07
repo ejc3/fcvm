@@ -463,34 +463,21 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
         which::which("firecracker").context("firecracker not found in PATH")?
     };
 
-    // Check version
-    let output = std::process::Command::new(&firecracker_bin)
-        .arg("--version")
-        .output()
-        .with_context(|| {
+    // Check version. Cached per binary identity (path + mtime + size): this runs
+    // on every VM launch and clone, and the answer only changes when the binary
+    // does — a rebuilt or swapped firecracker is re-probed. See version_cache.
+    let version_str =
+        crate::version_cache::version_output(&firecracker_bin).with_context(|| {
             format!(
-                "failed to run firecracker --version (binary: {})",
+                "checking firecracker version at {}",
                 firecracker_bin.display()
             )
         })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "firecracker --version failed (exit {}, binary: {}): {}",
-            output.status,
-            firecracker_bin.display(),
-            stderr.trim()
-        );
-    }
-
-    let version_str = String::from_utf8_lossy(&output.stdout);
     let version = parse_firecracker_version(&version_str).with_context(|| {
         format!(
-            "binary: {}, stdout: {:?}, stderr: {:?}",
+            "binary: {}, stdout: {:?}",
             firecracker_bin.display(),
             version_str.trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
         )
     })?;
 
@@ -523,14 +510,12 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
 /// any v52+; the cached build is preferred so CI and dev hosts use the pinned fork.
 pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
     // Run `<bin> --version`; returns the trimmed version string on success.
+    // Cached per binary identity (only successful probes are cached), so a
+    // binary that cannot run here keeps failing and keeps falling through.
     fn version_of(bin: &std::path::Path) -> Option<String> {
-        let out = std::process::Command::new(bin)
-            .arg("--version")
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        crate::version_cache::version_output(bin)
+            .ok()
+            .map(|s| s.trim().to_string())
     }
 
     // 1. Explicit override — must exist and run; no fallback (the user asked for THIS one).
@@ -1031,7 +1016,6 @@ pub struct CloneSubstrate {
 async fn prepare_clone_substrate(
     network: &mut dyn NetworkManager,
     restore_config: &SnapshotRestoreConfig,
-    network_config: &NetworkConfig,
     vm_id: &str,
     data_dir: &Path,
     vm_state: &mut VmState,
@@ -1076,7 +1060,6 @@ async fn prepare_clone_substrate(
 
         let setup_script = pasta_net.build_setup_script();
         let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
-        let tap_device = network_config.tap_device.clone();
 
         let source_disk = restore_config.source_disk_path.clone();
         let disk_task = async {
@@ -1097,6 +1080,9 @@ async fn prepare_clone_substrate(
         let network_task = async {
             let ns_poll_start = std::time::Instant::now();
             info!(holder_pid = holder_pid, "running network setup via nsenter");
+            // One nsenter+bash+ip for the whole phase, TAP verification included
+            // as the last batch step (ip -batch aborts at the first failure, so
+            // reaching it proves every step above applied).
             loop {
                 if !crate::utils::is_process_alive(holder_pid) {
                     anyhow::bail!(
@@ -1108,7 +1094,7 @@ async fn prepare_clone_substrate(
                     .args(&nsenter_prefix[1..])
                     .arg("bash")
                     .arg("-c")
-                    .arg(&setup_script)
+                    .arg(setup_script.script())
                     .output()
                     .await
                     .context("running network setup via nsenter")?;
@@ -1128,27 +1114,11 @@ async fn prepare_clone_substrate(
                     tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
                     continue;
                 }
-                anyhow::bail!("network setup failed: {}", stderr);
-            }
-
-            let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-                .args(&nsenter_prefix[1..])
-                .arg("ip")
-                .arg("link")
-                .arg("show")
-                .arg(&tap_device)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .context("verifying TAP device")?;
-            if !verify_output.success() {
                 anyhow::bail!(
-                    "TAP device '{}' not found after network setup - setup may have failed silently",
-                    tap_device
+                    "network setup failed: {}",
+                    setup_script.describe_failure(&stderr)
                 );
             }
-            debug!(tap_device = %tap_device, "TAP device verified");
             Ok::<_, anyhow::Error>(())
         };
 
@@ -1243,6 +1213,23 @@ async fn prepare_clone_substrate(
     })
 }
 
+/// Mint the restore-epoch value that tells a restored guest's fc-agent "you have
+/// just been restored — reconnect your vsock channels".
+///
+/// MUST be unique per restore, never wall-clock derived. fc-agent's watcher
+/// ([`fc-agent`]'s `watch_restore_epoch`) compares epochs only for (in)equality,
+/// and a snapshot taken FROM a restored VM captures the watcher's last-seen
+/// epoch inside guest memory. With the old second-granularity epochs
+/// (`SystemTime::now().as_secs()`), restoring such a snapshot within the same
+/// wall-clock second as its ancestor's restore handed the guest an IDENTICAL
+/// epoch: the watcher treated the restore as already handled, never reconnected
+/// exec/egress/output vsocks, and the clone never became healthy (120s health
+/// timeouts across the snapshot-hit suite once the clone hot path went
+/// sub-second). A fresh UUID makes every restore observably distinct.
+pub(crate) fn new_restore_epoch() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -1281,15 +1268,8 @@ pub async fn restore_from_snapshot(
 
     // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
     // mount redirect — all shared with the Cloud Hypervisor restore path.
-    let substrate = prepare_clone_substrate(
-        network,
-        restore_config,
-        network_config,
-        vm_id,
-        data_dir,
-        vm_state,
-    )
-    .await?;
+    let substrate =
+        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
     let rootfs_path = substrate.rootfs_path;
     let holder_child = substrate.holder_child;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
@@ -1448,14 +1428,11 @@ pub async fn restore_from_snapshot(
         // Signal fc-agent to flush ARP cache and reconnect output vsock via MMDS.
         // MUST be after VM resume — Firecracker accepts PUT /mmds while paused but
         // the guest-visible MMDS data isn't updated until after resume.
-        let restore_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("system time before Unix epoch")?
-            .as_secs();
+        let restore_epoch = new_restore_epoch();
 
         let mut mmds_latest = serde_json::json!({
             "host-time": chrono::Utc::now().timestamp().to_string(),
-            "restore-epoch": restore_epoch.to_string()
+            "restore-epoch": restore_epoch.clone()
         });
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
@@ -1465,7 +1442,7 @@ pub async fn restore_from_snapshot(
             .await
             .context("updating MMDS with restore-epoch")?;
         info!(
-            restore_epoch = restore_epoch,
+            restore_epoch = %restore_epoch,
             clone_ipv6 = ?clone_ipv6,
             "signaled fc-agent via MMDS"
         );
@@ -1608,15 +1585,8 @@ pub async fn restore_from_snapshot_ch(
     )?;
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
-    let substrate = prepare_clone_substrate(
-        network,
-        restore_config,
-        network_config,
-        vm_id,
-        data_dir,
-        vm_state,
-    )
-    .await?;
+    let substrate =
+        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
 
     // Cloud Hypervisor reads its restore config (disk/vsock/net) from the snapshot's `ch/`
     // dir. Disk + vsock paths are the source VM's and are redirected to the clone's by the
@@ -2820,6 +2790,22 @@ mod tests {
     use crate::state::VmState;
     use crate::storage::SnapshotType;
     use std::path::Path;
+
+    /// Regression guard for the deaf-clone bug: a snapshot taken from a restored
+    /// VM embeds the ancestor's restore epoch in guest memory, so two restores in
+    /// the same wall-clock second MUST still produce different epochs — otherwise
+    /// fc-agent sees an unchanged epoch, skips handle_clone_restore, and the clone
+    /// never becomes healthy. Wall-clock-second epochs fail this; unique-per-call
+    /// epochs pass.
+    #[test]
+    fn restore_epochs_differ_for_back_to_back_restores() {
+        let a = new_restore_epoch();
+        let b = new_restore_epoch();
+        assert_ne!(
+            a, b,
+            "restore epochs minted back-to-back (same wall-clock second) must differ"
+        );
+    }
 
     /// `with_extension` would map "app.v1" onto "app.creating", colliding with an
     /// unrelated tag's files — snapshot_sibling must APPEND instead.

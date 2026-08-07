@@ -248,6 +248,49 @@ All 10 clones launched simultaneously:
 
 Core restore is ~10ms regardless of sequential or parallel. Single memory server handles 10 concurrent clones. Bottleneck is network teardown and state cleanup under contention.
 
+### Clone Spawn → Exec-Ready Latency
+
+`bench/clone-latency.sh <label> <N>` boots a minimal alpine VM, snapshots it,
+serves it, and times N `fcvm snapshot run` cycles from process spawn until
+fc-agent's exec server is reachable (event-driven: it waits on the debug log's
+readiness marker, no polling). It prints p50/min/max plus a stage breakdown
+parsed from the `RUST_LOG=fcvm=debug` timeline; results land in
+`/tmp/fcvm-clone-latency-<label>/` and are not committed.
+
+```bash
+make build
+bench/clone-latency.sh mylabel 10
+```
+
+Measured on Graviton3, alpine, rootless networking, 2 rounds × 10 clones:
+
+| Stage | Before | After |
+|-------|--------|-------|
+| firecracker resolution (`git ls-remote`) | 337 ms | 0.4 ms |
+| netns + pasta setup | 101 ms | 95 ms |
+| snapshot load + resume | 6 ms | 6 ms |
+| resume → exec-server-ready | 222 ms | 221 ms |
+| **total (p50)** | **673 ms** | **331 ms** |
+| `execve()` per clone | 35 | 19 |
+
+Three hot-path costs were removed, all of them work that does not belong in a
+per-launch path:
+
+1. **`git ls-remote` to GitHub on every launch** (~337 ms, half the total). The
+   fork-branch resolution is now cached under `assets_dir/firecracker/` with a
+   TTL (`FCVM_FIRECRACKER_RESOLVE_TTL_SECS`, default 1h); `fcvm setup` always
+   re-queries and rewrites it, so a rebuilt fork is picked up immediately.
+2. **Repeated `--version` / `ldd --version` probes.** Cached per binary identity
+   (path + mtime + size), in-process and on disk, so a changed binary still
+   re-checks. Removes 3 execs per clone.
+3. **Per-command `ip` execs in the rootless namespace.** Each setup phase now
+   pipes all its `ip` commands through one `ip -batch` process, and the TAP
+   verification is the batch's last step instead of a second `nsenter`. Removes
+   10 execs per clone.
+
+The remaining `resume → exec-server-ready` (~221 ms) is guest-side work (fc-agent
+restore handshake) and is the next target.
+
 ---
 
 ## Memory Efficiency

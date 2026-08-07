@@ -1330,7 +1330,17 @@ fn compute_profile_firecracker_sha_with_commit(
 
 /// Return a string identifying the C library (e.g. "glibc-2.39" or "musl-1.2.4").
 /// Used to namespace the firecracker binary cache per build environment.
+///
+/// Memoised for the lifetime of the process: the host's libc cannot change while
+/// fcvm runs, and several content-addressed SHAs (firecracker, pasta,
+/// cloud-hypervisor) mix it in, which otherwise costs one `ldd --version` exec
+/// each on the VM-launch path.
 pub(crate) fn libc_version_tag() -> String {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(probe_libc_version_tag).clone()
+}
+
+fn probe_libc_version_tag() -> String {
     // Try GNU libc first (most common on host and Ubuntu containers)
     if let Ok(output) = std::process::Command::new("ldd").arg("--version").output() {
         // ldd --version prints to stdout on glibc, stderr on musl
@@ -1353,14 +1363,253 @@ pub(crate) fn libc_version_tag() -> String {
     "libc-unknown".to_string()
 }
 
+// ============================================================================
+// Profile Firecracker resolution cache
+// ============================================================================
+
+/// Default freshness window for a cached firecracker resolution.
+const FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS: u64 = 3600;
+
+/// Env var overriding the resolution TTL, in seconds. `0` forces a remote refresh.
+const FIRECRACKER_RESOLVE_TTL_ENV: &str = "FCVM_FIRECRACKER_RESOLVE_TTL_SECS";
+
+/// A previously completed remote resolution of a profile's firecracker binary.
+///
+/// Persisted at `assets_dir/firecracker/<profile>.resolved.json` so VM launches
+/// can reuse it instead of paying a `git ls-remote` round trip to GitHub.
+///
+/// Concurrency: written with a unique temp file + atomic rename, never a lock —
+/// `assets_dir` can be shared across nesting levels over fuse-pipe, where
+/// `flock` does not cross the VM boundary (see the cross-VM cache race notes in
+/// AGENTS.md). Readers therefore always see a whole file. Two writers racing
+/// resolve the *same* repo/branch, so the loser's entry is equally valid; if the
+/// branch moved between them the older commit simply expires at the next TTL,
+/// and `fcvm setup` rewrites the entry unconditionally.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FirecrackerResolution {
+    repo: String,
+    branch: String,
+    commit_hash: String,
+    resolved_path: PathBuf,
+    /// Unix seconds at which the `git ls-remote` that produced `commit_hash` ran.
+    resolved_at_secs: u64,
+}
+
+/// Directory holding the profile firecracker binaries and their resolution cache.
+fn firecracker_cache_dir() -> PathBuf {
+    paths::assets_dir().join("firecracker")
+}
+
+fn firecracker_resolution_path(dir: &Path, profile_name: &str) -> PathBuf {
+    dir.join(format!("{}.resolved.json", profile_name))
+}
+
+/// How long a cached resolution stays usable before the remote is re-queried.
+fn firecracker_resolve_ttl_secs() -> u64 {
+    parse_resolve_ttl(std::env::var(FIRECRACKER_RESOLVE_TTL_ENV).ok().as_deref())
+}
+
+/// Parse `FCVM_FIRECRACKER_RESOLVE_TTL_SECS`. Unset or unparsable falls back to
+/// the default; `0` means "always re-query the remote".
+fn parse_resolve_ttl(raw: Option<&str>) -> u64 {
+    let Some(raw) = raw else {
+        return FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS;
+    };
+    raw.trim().parse::<u64>().unwrap_or_else(|_| {
+        warn!(
+            var = FIRECRACKER_RESOLVE_TTL_ENV,
+            value = %raw,
+            default = FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS,
+            "invalid firecracker resolve TTL, using default"
+        );
+        FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS
+    })
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Return the cached resolution for `profile_name` if it is usable right now:
+/// same repo/branch, within the TTL, and pointing at a binary that still exists.
+///
+/// Any parse/IO problem is a miss (the caller re-resolves), never an error —
+/// a corrupt cache must not be able to block a VM launch.
+fn fresh_cached_firecracker_resolution_in(
+    dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    ttl_secs: u64,
+) -> Option<PathBuf> {
+    if ttl_secs == 0 {
+        return None;
+    }
+    let path = firecracker_resolution_path(dir, profile_name);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let entry: FirecrackerResolution = match serde_json::from_str(&raw) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "ignoring unreadable firecracker resolution cache");
+            return None;
+        }
+    };
+    if entry.repo != repo || entry.branch != branch {
+        return None;
+    }
+    // A resolution stamped in the future (clock moved backwards) is treated as
+    // stale rather than as infinitely fresh.
+    let age = unix_now_secs().checked_sub(entry.resolved_at_secs)?;
+    if age >= ttl_secs {
+        return None;
+    }
+    if !entry.resolved_path.exists() {
+        return None;
+    }
+    debug!(
+        profile = %profile_name,
+        path = %entry.resolved_path.display(),
+        commit = %entry.commit_hash,
+        age_secs = age,
+        ttl_secs,
+        "using cached firecracker resolution (no git ls-remote)"
+    );
+    Some(entry.resolved_path)
+}
+
+/// Persist a completed remote resolution so later launches can skip the network.
+///
+/// Written atomically (unique temp + rename) because several fcvm processes may
+/// resolve the same profile concurrently; readers then always see a whole file.
+/// Only called with a `resolved_path` that exists, so the cache never advertises
+/// a binary that was never built.
+fn record_firecracker_resolution_in(
+    dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    commit_hash: &str,
+    resolved_path: &Path,
+) {
+    let entry = FirecrackerResolution {
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        commit_hash: commit_hash.to_string(),
+        resolved_path: resolved_path.to_path_buf(),
+        resolved_at_secs: unix_now_secs(),
+    };
+    let final_path = firecracker_resolution_path(dir, profile_name);
+    if let Err(e) = write_json_atomic(&final_path, &entry) {
+        // Non-fatal: the next launch just pays the ls-remote again.
+        warn!(
+            path = %final_path.display(),
+            error = %e,
+            "could not persist firecracker resolution cache"
+        );
+        return;
+    }
+    debug!(
+        profile = %profile_name,
+        path = %resolved_path.display(),
+        commit = %commit_hash,
+        "recorded firecracker resolution"
+    );
+}
+
+/// [`fresh_cached_firecracker_resolution_in`] against the real assets dir.
+fn fresh_cached_firecracker_resolution(
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    ttl_secs: u64,
+) -> Option<PathBuf> {
+    fresh_cached_firecracker_resolution_in(
+        &firecracker_cache_dir(),
+        profile_name,
+        repo,
+        branch,
+        ttl_secs,
+    )
+}
+
+/// [`record_firecracker_resolution_in`] against the real assets dir.
+fn record_firecracker_resolution(
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    commit_hash: &str,
+    resolved_path: &Path,
+) {
+    record_firecracker_resolution_in(
+        &firecracker_cache_dir(),
+        profile_name,
+        repo,
+        branch,
+        commit_hash,
+        resolved_path,
+    );
+}
+
+/// Serialize `value` as JSON to `final_path` via a unique temp file + rename.
+///
+/// The temp name carries a uuid (not a pid — separate PID namespaces reuse
+/// numbers) so concurrent writers never share a temp file, and the rename makes
+/// the swap atomic for readers.
+fn write_json_atomic<T: serde::Serialize>(final_path: &Path, value: &T) -> Result<()> {
+    let dir = final_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent directory for {}", final_path.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "cache".to_string()),
+        uuid::Uuid::new_v4()
+    ));
+    let json = serde_json::to_vec_pretty(value).context("serializing cache entry")?;
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, final_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("renaming into {}", final_path.display()));
+    }
+    Ok(())
+}
+
 /// Get the content-addressed path for profile firecracker binary.
 /// Uses assets_dir/firecracker/ alongside kernels and other assets.
-/// Fetches latest commit hash to ensure we detect updates.
 ///
 /// Returns `Ok(None)` when the profile does not configure a custom firecracker.
-/// When the remote commit cannot be queried (offline, GitHub outage), falls back
-/// to the most recently installed cached binary for the profile instead of
-/// pretending no custom firecracker is configured; errors if none is cached.
+///
+/// # Resolution contract
+///
+/// This runs on the **VM launch / snapshot clone hot path**, so it does NOT
+/// contact the network on every call. Resolution order:
+///
+/// 1. `assets_dir/firecracker/<profile>.resolved.json` — the result of the last
+///    remote resolution. Used when it names the same repo/branch, is younger
+///    than the TTL, and still points at an existing binary.
+/// 2. `git ls-remote` against the configured repo/branch, which then rewrites
+///    the cache (only when the resolved binary exists).
+/// 3. Offline fallback: the newest cached `firecracker-<profile>-*.bin`. Errors
+///    if the remote is unreachable and nothing is cached.
+///
+/// The TTL is `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` seconds (default 3600);
+/// setting it to `0` forces a remote refresh on every call.
+///
+/// **A rebuild must never leave a launcher on a stale binary.**
+/// [`ensure_profile_firecracker`] — the `fcvm setup` path, including
+/// `--build-kernels` / an explicit `--kernel-profile` — always performs the
+/// remote resolution and rewrites this cache with the binary it just
+/// installed. So `fcvm setup` is what makes an updated fork visible, and it
+/// takes effect immediately rather than after the TTL expires.
 pub async fn get_profile_firecracker_path(
     profile: &KernelProfile,
     profile_name: &str,
@@ -1372,12 +1621,26 @@ pub async fn get_profile_firecracker_path(
     };
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
+    // Fast path: reuse the last remote resolution and skip the network entirely.
+    let ttl_secs = firecracker_resolve_ttl_secs();
+    if let Some(cached) = fresh_cached_firecracker_resolution(profile_name, repo, branch, ttl_secs)
+    {
+        return Ok(Some(cached));
+    }
+
     // Fetch latest commit hash to detect updates
     match fetch_remote_commit_hash(repo, branch).await {
         Ok(commit_hash) => {
             let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
             let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
-            Ok(Some(paths::assets_dir().join("firecracker").join(filename)))
+            let resolved = paths::assets_dir().join("firecracker").join(filename);
+            // Only cache resolutions that name a binary that actually exists, so
+            // a not-yet-built profile keeps re-resolving (and keeps failing loudly
+            // in get_firecracker_for_profile) instead of caching a dead path.
+            if resolved.exists() {
+                record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &resolved);
+            }
+            Ok(Some(resolved))
         }
         Err(e) => match newest_cached_profile_firecracker(profile_name)? {
             Some(cached) => {
@@ -1452,6 +1715,12 @@ pub async fn get_firecracker_for_profile(
 /// Uses content-addressed naming: firecracker-{profile}-{sha}.bin
 /// where SHA is computed from firecracker_repo + firecracker_branch + commit_hash.
 /// Automatically detects and rebuilds when new commits are pushed.
+///
+/// This is the `fcvm setup` path and it **always** performs the remote
+/// resolution (`git ls-remote`), then rewrites the launch-time resolution cache
+/// read by [`get_profile_firecracker_path`]. That is what makes an updated fork
+/// take effect for VM launches immediately rather than after the cache TTL —
+/// `fcvm setup` is the sanctioned way to pick up a new firecracker build.
 pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
     profile_name: &str,
@@ -1481,6 +1750,7 @@ pub async fn ensure_profile_firecracker(
             sha = %sha,
             "firecracker binary exists"
         );
+        record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
         return Ok(Some(bin_path));
     }
 
@@ -1508,6 +1778,7 @@ pub async fn ensure_profile_firecracker(
     if bin_path.exists() {
         debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
         flock.unlock().map_err(|(_, err)| err)?;
+        record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
         return Ok(Some(bin_path));
     }
 
@@ -1607,6 +1878,8 @@ pub async fn ensure_profile_firecracker(
         "firecracker binary installed"
     );
     println!("  ✓ Firecracker ready: {}", bin_path.display());
+
+    record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
 
     Ok(Some(bin_path))
 }
@@ -1949,6 +2222,166 @@ mod tests {
         assert_eq!(
             compute_profile_kernel_sha(&profile).unwrap(),
             "000000000000"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Firecracker resolution cache (kills the git ls-remote on the hot path)
+    // ---------------------------------------------------------------------
+
+    const REPO: &str = "ejc3/firecracker";
+    const BRANCH: &str = "bump-vsock-max-connections";
+    const TTL: u64 = 3600;
+
+    /// Create the cache dir plus a stand-in firecracker binary inside it.
+    fn resolution_fixture(dir: &Path, sha: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join(format!("firecracker-default-{}.bin", sha));
+        std::fs::write(&bin, b"fake firecracker").unwrap();
+        bin
+    }
+
+    #[test]
+    fn resolution_cache_hit_returns_recorded_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bin = resolution_fixture(dir, "aaaaaaaaaaaa");
+
+        // Nothing recorded yet -> miss (caller pays the ls-remote).
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL).is_none()
+        );
+
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+        assert_eq!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL),
+            Some(bin)
+        );
+    }
+
+    #[test]
+    fn resolution_cache_expires_with_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bin = resolution_fixture(dir, "bbbbbbbbbbbb");
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+
+        // Age the entry past any plausible TTL by rewriting its timestamp.
+        let path = firecracker_resolution_path(dir, "default");
+        let mut entry: FirecrackerResolution =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        entry.resolved_at_secs -= 7200;
+        std::fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL).is_none(),
+            "an entry older than the TTL must not be reused"
+        );
+        // A longer TTL still accepts it.
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, 86_400).is_some()
+        );
+    }
+
+    #[test]
+    fn resolution_cache_ttl_zero_forces_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bin = resolution_fixture(dir, "cccccccccccc");
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, 0).is_none(),
+            "FCVM_FIRECRACKER_RESOLVE_TTL_SECS=0 must always re-query the remote"
+        );
+    }
+
+    #[test]
+    fn resolution_cache_invalidated_by_repo_or_branch_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bin = resolution_fixture(dir, "dddddddddddd");
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", "other/fork", BRANCH, TTL)
+                .is_none()
+        );
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, "main", TTL).is_none()
+        );
+        // Different profile name = different cache file.
+        assert!(fresh_cached_firecracker_resolution_in(dir, "nested", REPO, BRANCH, TTL).is_none());
+    }
+
+    #[test]
+    fn resolution_cache_ignores_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bin = resolution_fixture(dir, "eeeeeeeeeeee");
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+
+        std::fs::remove_file(&bin).unwrap();
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL).is_none(),
+            "a resolution pointing at a deleted binary must not be reused"
+        );
+    }
+
+    #[test]
+    fn resolution_cache_ignores_corrupt_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(firecracker_resolution_path(dir, "default"), b"{not json").unwrap();
+
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL).is_none(),
+            "a corrupt cache must degrade to a remote resolution, not fail the launch"
+        );
+    }
+
+    #[test]
+    fn setup_style_rebuild_overwrites_the_resolution() {
+        // Models `fcvm setup` after a fork rebuild: ensure_profile_firecracker
+        // always re-resolves and rewrites the cache, so a launcher picks up the
+        // NEW binary immediately instead of waiting out the TTL.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let old = resolution_fixture(dir, "111111111111");
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "old000000000", &old);
+        assert_eq!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL),
+            Some(old.clone())
+        );
+
+        let new = resolution_fixture(dir, "222222222222");
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "new000000000", &new);
+        assert_eq!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL),
+            Some(new),
+            "setup must not leave launches pinned to the pre-rebuild binary"
+        );
+    }
+
+    #[test]
+    fn resolve_ttl_env_parsing() {
+        // Pure parser (no std::env mutation — that would race the other tests in
+        // this process, and env writes are not thread-safe).
+        assert_eq!(
+            parse_resolve_ttl(None),
+            FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS
+        );
+        assert_eq!(parse_resolve_ttl(Some("0")), 0);
+        assert_eq!(parse_resolve_ttl(Some("42")), 42);
+        assert_eq!(parse_resolve_ttl(Some(" 90 ")), 90);
+        assert_eq!(
+            parse_resolve_ttl(Some("not-a-number")),
+            FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_resolve_ttl(Some("")),
+            FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS
         );
     }
 }

@@ -77,6 +77,15 @@ pub fn assets_dir() -> PathBuf {
         .clone()
 }
 
+/// Assets directory *only if* it has already been initialised.
+///
+/// Unlike [`assets_dir`] this never loads the config (and so never panics when
+/// no config exists). Used by best-effort on-disk caches that must degrade to a
+/// process-local cache rather than take down a caller that never needed paths.
+pub fn assets_dir_if_initialized() -> Option<PathBuf> {
+    ASSETS_DIR.get().cloned()
+}
+
 // === Content-addressed assets (use assets_dir) ===
 
 /// Directory for kernel images (vmlinux-*.bin files).
