@@ -35,6 +35,15 @@ use std::time::{Duration, Instant};
 // Local helpers (marker sequencing, process tracking, oracles)
 // ---------------------------------------------------------------------------
 
+/// Check if snapshot is disabled via FCVM_NO_SNAPSHOT environment variable.
+/// Tests that rely on automatic pre-start or startup snapshot creation must
+/// skip when this is set (the SnapshotDisabled CI matrix entry sets it to "1").
+fn snapshot_disabled_by_env() -> bool {
+    std::env::var("FCVM_NO_SNAPSHOT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Search a log file for `needle` at/after byte offset `from`.
 /// Returns the byte offset just past the match (a monotone cursor for
 /// "this marker, then that marker" sequencing), or None if absent.
@@ -575,6 +584,12 @@ async fn test_lifecycle_interleave_go_floor_across_ack_stall() -> Result<()> {
 /// 2s curl deterministically times out.
 #[tokio::test]
 async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> {
+    // This test requires automatic startup snapshot creation (the gate defers
+    // Healthy until the startup-snapshot pause/resume completes).
+    if snapshot_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
     let (vm_name, _, _, _) = common::unique_names("ilv-healthy");
     // Unique env → unique base AND startup snapshot keys → the startup
     // snapshot is CREATED this run (a warm start would skip the pause and
@@ -721,6 +736,12 @@ async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> 
 /// fires, the run reaches healthy, and SIGTERM produces an orderly exit.
 #[tokio::test]
 async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()> {
+    // This test creates a pre-start snapshot (run 1) and restores from it
+    // (run 2) to verify serial console quiesce across snapshot boundaries.
+    if snapshot_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
     let (run1_name, run2_name, _, _) = common::unique_names("ilv-quiesce");
     let canary = format!("serial-canary-{}", run1_name);
     // Unique canary in the cmd → unique snapshot key → run 1 always cold.
@@ -862,6 +883,12 @@ async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()
 /// state file is deleted.
 #[tokio::test]
 async fn test_lifecycle_interleave_no_leaks_after_interleaved_teardown() -> Result<()> {
+    // This test relies on automatic pre-start snapshot creation to exercise
+    // the snapshot.pre_pause failpoint during teardown.
+    if snapshot_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
     let (vm_name, _, _, _) = common::unique_names("ilv-teardown");
     // Unique cmd → unique snapshot key → the pre-start snapshot is created
     // (and therefore snapshot.pre_pause is hit) on THIS run.
