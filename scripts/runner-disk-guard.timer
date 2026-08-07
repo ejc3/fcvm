@@ -1,0 +1,15 @@
+# Hourly trigger for runner-disk-guard.service (see that unit for why).
+# Installed by scripts/build-ami.sh (runner AMI) and scripts/setup-runner.sh.
+
+[Unit]
+Description=Hourly disk capacity guard for the fcvm CI runner
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+# Spread runners out so a fleet doesn't hammer shared infra in lockstep.
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

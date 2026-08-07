@@ -17,6 +17,15 @@ compute_hash() {
     # Include the passt build inputs so a pin or patch change rebuilds the AMI
     # instead of reusing one whose baked-in pasta no longer matches CI.
     cat "$SCRIPT_DIR/build-passt.sh" "$SCRIPT_DIR"/passt-*.patch 2>/dev/null
+    # Include the disk guard's script and units: they are baked into the AMI,
+    # so a change to them must produce a new AMI rather than silently reusing
+    # one without the fix.
+    cat "$SCRIPT_DIR/runner-disk-preflight.sh" \
+      "$SCRIPT_DIR/runner-disk-guard.service" "$SCRIPT_DIR/runner-disk-guard.timer" 2>/dev/null
+    # Include the provisioning script itself. Without this, editing the AMI's
+    # user-data changes nothing the hash can see, so the cached AMI is reused
+    # and the edit never reaches a runner.
+    create_user_data
   } | sha256sum | cut -c1-12
 }
 
@@ -157,6 +166,16 @@ curl -o /tmp/actions-runner.tar.gz -L \
 tar xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner
 chown -R ubuntu:ubuntu /opt/actions-runner
 /opt/actions-runner/bin/installdependencies.sh
+
+# Disk-capacity guard (hourly timer). A runner that fills its disk fails every
+# job it picks up at "Set up job", before any job step can run, so the CI
+# preflight step cannot rescue it — this cleans caches out-of-band and, if the
+# hard floor still cannot be met, stops the runner service so the box goes
+# offline and gets replaced instead of poisoning jobs.
+install -m 755 /tmp/fcvm/scripts/runner-disk-preflight.sh /usr/local/bin/runner-disk-preflight.sh
+install -m 644 /tmp/fcvm/scripts/runner-disk-guard.service /etc/systemd/system/runner-disk-guard.service
+install -m 644 /tmp/fcvm/scripts/runner-disk-guard.timer /etc/systemd/system/runner-disk-guard.timer
+systemctl enable runner-disk-guard.timer
 
 # Clean up
 apt-get clean
