@@ -85,6 +85,7 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
         cmd.env("SUDO_USER", sudo_user);
     }
 
+    common::set_test_pdeathsig(&mut cmd);
     let mut child = cmd.spawn().context("spawning VM")?;
     let vm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no VM PID"))?;
     logger.info(&format!("Spawned VM PID={}", vm_pid));
@@ -235,6 +236,7 @@ async fn test_libfuse_remap_container() {
         cmd.env("SUDO_USER", sudo_user);
     }
 
+    common::set_test_pdeathsig(&mut cmd);
     let mut child = cmd.spawn().expect("spawning VM");
     let vm_pid = child.id().expect("VM PID");
     logger.info(&format!("Spawned VM PID={}", vm_pid));

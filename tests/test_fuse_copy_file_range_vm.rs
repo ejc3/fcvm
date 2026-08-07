@@ -132,6 +132,7 @@ echo "SUCCESS: copy_file_range works through FUSE!"
         cmd.env("SUDO_USER", sudo_user);
     }
 
+    common::set_test_pdeathsig(&mut cmd);
     let mut child = cmd.spawn().context("spawning VM")?;
     let vm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no VM PID"))?;
     println!("  VM started (PID: {})", vm_pid);

@@ -125,6 +125,7 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
         cmd.env("FCVM_NO_WRITEBACK_CACHE", "1");
     }
 
+    common::set_test_pdeathsig(&mut cmd);
     let mut child = cmd.spawn().context("spawning VM")?;
     let vm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no VM PID"))?;
 

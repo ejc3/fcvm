@@ -981,6 +981,38 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 Do not run `sudo cargo`. Use Makefile targets so cargo runs as your user and test binaries run via `CARGO_TARGET_*_RUNNER='sudo -E'`; otherwise `target/` becomes root-owned and breaks builds.
 
+### PROCESS TEARDOWN IS PER-HOP. EVERY HOP.
+
+**`PR_SET_PDEATHSIG` only kills a child whose OWN pdeathsig is set. One unprotected hop
+orphans the entire subtree below it.** The chain that must hold, end to end:
+
+```
+cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm → firecracker
+                           ^ setpriv --pdeathsig  ^ set_test_pdeathsig  ^ install_namespace_pre_exec
+```
+
+- `scripts/root-test-runner.sh` (`ROOT_TEST_RUNNER` in the Makefile) covers the **sudo hop**.
+  Never reduce the privileged runner back to a bare `sudo -E env PATH=...`.
+- `tests/common/mod.rs::set_test_pdeathsig{,_std}` covers **every long-lived fcvm spawn** in
+  tests. `spawn_fcvm*` applies it; a hand-rolled `Command::new(&fcvm_path)…spawn()` must too.
+- `src/utils.rs::install_namespace_pre_exec` covers **every VMM spawn** (Firecracker, Cloud
+  Hypervisor, and the Layer-2 setup VM in `src/setup/rootfs.rs`). It must stay the LAST
+  `pre_exec` — `setns(CLONE_NEWUSER)` zeroes `pdeath_signal`, so setting it earlier is lost.
+
+**Why a privilege boundary is special:** the kernel refuses a signal from uid 1000 to a uid-0
+process, and `killpg` still returns success when it managed to signal *any* member — so
+nextest's slow-timeout kill fails **silently** against a `sudo`'d test binary. SIGKILL cannot
+be caught, so `sudo` never forwards it either. On 2026-08-06 that left ~498 `firecracker`
+processes alive on two ARM runners (load average 523, 103 tasks in D-state, 420 zombies) for
+21 hours, and the AWS lease logic kept renewing the dead runners because GitHub still reported
+them busy. Regression test: `test_root_test_runner_reaps_vm_when_sudo_is_killed`
+(`tests/test_signal_cleanup.rs`). Defense in depth (NOT a substitute): `timeout-minutes` on
+every self-hosted job plus the `scripts/ci-stray-vm-guard.sh` pre/post steps in `ci.yml`.
+
+**Prefer kernel-enforced reaping over cleanup code.** A `Drop` impl, a signal handler, or an
+`always()` cleanup step does not run when the process is SIGKILLed — which is exactly the case
+that leaked. If teardown matters, it must survive SIGKILL.
+
 ### Container Build Rules
 
 **Container builds work naturally with layer caching.** No workarounds needed.

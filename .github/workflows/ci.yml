@@ -228,6 +228,11 @@ jobs:
     needs: [skip-check]
     if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
+    # Longest of the last 6 successful runs: 12 min. GitHub's default is SIX HOURS, which is
+    # how a wedged runner held a job all day on 2026-08-06 (one job stuck >5h) while the
+    # AWS-side lease logic kept renewing its lease because GitHub still reported it busy.
+    # 5x headroom covers a cold runner (kernel/rootfs rebuilds) and is nowhere near 6h.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -259,6 +264,13 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
+      # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
+      # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
+      # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
+      # nothing in any job log had ever mentioned them.
+      - name: Stray microVM guard (pre)
+        working-directory: fcvm
+        run: ./scripts/ci-stray-vm-guard.sh pre
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
@@ -412,6 +424,12 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
+      # And what THIS job left behind. A non-zero count here means the run leaked microVMs:
+      # it is annotated on the run page, not just buried in the step log.
+      - name: Stray microVM guard (post)
+        if: always()
+        working-directory: fcvm
+        run: ./scripts/ci-stray-vm-guard.sh post
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
@@ -446,6 +464,10 @@ jobs:
     needs: [skip-check]
     if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
+    # Longest of the last 6 successful runs: 43 min (arm64 SnapshotEnabled, which runs the
+    # whole suite twice, plus the nested + btrfs kernel builds). ~3x headroom.
+    # See the Host job comment for why the 6h default is not acceptable here.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -487,6 +509,13 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
+      # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
+      # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
+      # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
+      # nothing in any job log had ever mentioned them.
+      - name: Stray microVM guard (pre)
+        working-directory: fcvm
+        run: ./scripts/ci-stray-vm-guard.sh pre
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
@@ -623,6 +652,12 @@ jobs:
         run: |
           make clean-test-data || true
           make bench-vm
+      # And what THIS job left behind. A non-zero count here means the run leaked microVMs:
+      # it is annotated on the run page, not just buried in the step log.
+      - name: Stray microVM guard (post)
+        if: always()
+        working-directory: fcvm
+        run: ./scripts/ci-stray-vm-guard.sh post
       - name: Capture kernel logs
         if: always()
         run: |
@@ -650,6 +685,9 @@ jobs:
     needs: [skip-check]
     if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.skip != 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
+    # Longest of the last 6 successful runs: 21 min. ~3x headroom.
+    # See the Host job comment for why the 6h default is not acceptable here.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -685,6 +723,13 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
+      # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
+      # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
+      # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
+      # nothing in any job log had ever mentioned them.
+      - name: Stray microVM guard (pre)
+        working-directory: fcvm
+        run: ./scripts/ci-stray-vm-guard.sh pre
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Setup KVM and rootless podman
         run: |
@@ -742,6 +787,12 @@ jobs:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
         working-directory: fcvm
         run: make container-test
+      # And what THIS job left behind. A non-zero count here means the run leaked microVMs:
+      # it is annotated on the run page, not just buried in the step log.
+      - name: Stray microVM guard (post)
+        if: always()
+        working-directory: fcvm
+        run: ./scripts/ci-stray-vm-guard.sh post
       - name: Capture kernel logs
         if: always()
         run: |

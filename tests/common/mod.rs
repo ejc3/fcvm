@@ -271,26 +271,51 @@ fn ensure_config_exists() {
 /// This only governs process teardown: during the test fcvm runs normally, and the usual
 /// `kill_process` cleanup still does the graceful shutdown on the success path. Zero blast
 /// radius — it does not change what any test must hold or do.
-fn set_test_pdeathsig(cmd: &mut tokio::process::Command) {
-    let parent = std::process::id() as i32;
-    // SAFETY: pre_exec runs in the forked child before exec; prctl/getppid are
-    // async-signal-safe and we allocate nothing here.
+///
+/// **Every long-lived fcvm spawn must go through this** (`spawn_fcvm*` does it for you; tests
+/// that build their own command call it directly). The reaping chain is per-hop: the kernel
+/// only kills a child whose OWN pdeathsig is set, so one unprotected hop orphans everything
+/// below it — an fcvm spawned without it survives its dead test process and keeps its
+/// firecracker alive, which is how a CI runner accumulated ~490 live microVMs.
+pub fn set_test_pdeathsig(cmd: &mut tokio::process::Command) {
+    // SAFETY: pre_exec runs in the forked child before exec; see `pdeathsig_hook`.
     unsafe {
-        cmd.pre_exec(move || {
-            // Full varargs form (the kernel ignores args 3-5 for PR_SET_PDEATHSIG, but pass
-            // them explicitly for the C varargs ABI).
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Close the fork-vs-prctl race: if the parent (test process) already exited
-            // between fork and here, getppid() no longer matches — abort the spawn rather
-            // than launch an unsupervised fcvm. Use a raw OS error (no allocation in the
-            // forked child); ESRCH ("no such process") fits "parent gone".
-            if libc::getppid() != parent {
-                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-            }
-            Ok(())
-        });
+        cmd.pre_exec(pdeathsig_hook());
+    }
+}
+
+/// `std::process::Command` flavour of [`set_test_pdeathsig`], for the tests that build their
+/// fcvm command with the blocking API. Same guarantee, same hook.
+pub fn set_test_pdeathsig_std(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: pre_exec runs in the forked child before exec; see `pdeathsig_hook`.
+    unsafe {
+        cmd.pre_exec(pdeathsig_hook());
+    }
+}
+
+/// The `pre_exec` body shared by both flavours: set `PR_SET_PDEATHSIG(SIGKILL)`, then close
+/// the fork-vs-prctl race.
+///
+/// Async-signal-safe: `prctl`/`getppid` only, and the parent pid is captured BEFORE the fork
+/// so the closure allocates nothing.
+fn pdeathsig_hook() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    let parent = std::process::id() as i32;
+    move || {
+        // Full varargs form (the kernel ignores args 3-5 for PR_SET_PDEATHSIG, but pass
+        // them explicitly for the C varargs ABI).
+        // SAFETY: prctl with a constant option and no memory effects.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // If the parent (test process) already exited between fork and here, getppid() no
+        // longer matches — abort the spawn rather than launch an unsupervised fcvm. Use a raw
+        // OS error (no allocation in the forked child); ESRCH ("no such process") fits.
+        // SAFETY: getppid has no arguments and no memory effects.
+        if unsafe { libc::getppid() } != parent {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(())
     }
 }
 

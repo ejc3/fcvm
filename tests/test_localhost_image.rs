@@ -87,12 +87,12 @@ async fn run_localhost_test_with_kernel(
     }
     args.push(&image_name);
 
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    cmd.args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning fcvm podman run")?;
+        .stderr(Stdio::piped());
+    common::set_test_pdeathsig(&mut cmd);
+    let mut child = cmd.spawn().context("spawning fcvm podman run")?;
 
     let fcvm_pid = child
         .id()
