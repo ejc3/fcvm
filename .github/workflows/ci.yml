@@ -118,7 +118,7 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Cache cargo tools
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_LINT }}-${{ runner.os }}-${{ runner.arch }}
@@ -199,7 +199,7 @@ jobs:
           # (needed for rootless podman on Ubuntu 24.04+)
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
       - name: Cache cargo tools
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin
           key: cargo-nextest-0.9.115-${{ runner.os }}-${{ runner.arch }}
@@ -288,7 +288,7 @@ jobs:
           sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
       - name: Restore cargo tools cache
         id: cache-cargo-tools
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
@@ -410,7 +410,7 @@ jobs:
           retention-days: 14
       - name: Save cargo tools cache
         if: always() && steps.cache-cargo-tools.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
@@ -504,7 +504,7 @@ jobs:
           sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
       - name: Restore cargo tools cache
         id: cache-cargo-tools
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
@@ -613,7 +613,7 @@ jobs:
           retention-days: 14
       - name: Save cargo tools cache
         if: always() && steps.cache-cargo-tools.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
@@ -681,7 +681,7 @@ jobs:
       - name: Login to ghcr.io
         run: echo "${{ github.token }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Cache container cargo
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/cargo-cache
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
