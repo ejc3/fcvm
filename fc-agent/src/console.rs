@@ -26,7 +26,10 @@
 //!    been written to the console (`pipe empty && enqueued == disposed`);
 //! 2. gate — the writer thread stops writing to the console (bytes accumulate in its
 //!    pending buffer instead; `eprintln!` keeps working and never blocks);
-//! 3. drain — poll `TIOCOUTQ` on the console fd until 0.
+//! 3. drain — poll `TIOCOUTQ` on the console fd until 0. If it never reaches 0
+//!    within the bounded window (or its state is unknowable), quiesce releases the
+//!    gate and FAILS: the caller must abort the handshake — no `cache-ready`, no
+//!    snapshot — rather than let the host pause a VM whose UART may be mid-transmit.
 //!
 //! Why `TIOCOUTQ == 0` proves the UART is idle: the 8250 driver drains its circular
 //! buffer to THR only inside its IRQ handler under the port lock, and the same
@@ -59,10 +62,17 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{read, write};
 
 /// Upper bound on bytes buffered while the console is gated or stalled.
-/// Beyond this, new bytes are dropped (and counted). The guest produces no
-/// output while paused for a snapshot, so this only needs to absorb the
-/// pre-pause and post-restore-pre-resolution log traffic.
-const PENDING_CAP: usize = 256 * 1024;
+/// Beyond this, new bytes are dropped (and counted; one summary line is
+/// emitted when the console recovers). Sized for the WORST-CASE gate hold:
+/// the quiesce gate is held for the entire cache-ready→ack handshake, which
+/// host `cache-wait` keepalives can extend to the absolute 600s cap
+/// (`notify_cache_ready_and_wait` in container.rs) — not just a short
+/// pre-pause window. 1 MiB absorbs ~1.7 KiB/s of gated log traffic for that
+/// full window, well above fc-agent's log rate while idling in the handshake
+/// (a few short lines per poll cycle). Dropping on overflow stays deliberate:
+/// bounded memory against a wedged console beats unbounded growth, and drops
+/// are counted and summarized rather than silent.
+const PENDING_CAP: usize = 1024 * 1024;
 
 /// Writer thread poll tick. Bounds how quickly the writer notices a gate
 /// transition; pipe data wakes it immediately via POLLIN.
@@ -111,6 +121,21 @@ impl Drop for QuiesceGuard {
     }
 }
 
+/// The UART could not be proven idle within the drain window. The gate has
+/// already been released — the caller MUST abort the cache-ready handshake
+/// (send nothing, take no snapshot): pausing the VM in this state can capture
+/// the 8250 mid-transmit and poison the snapshot for every restore.
+#[derive(Debug)]
+pub struct QuiesceError;
+
+impl std::fmt::Display for QuiesceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "console UART did not drain within the quiesce window")
+    }
+}
+
+impl std::error::Error for QuiesceError {}
+
 /// Redirect fd 1/2 to the console pipe and start the writer thread.
 ///
 /// Replaces the old direct dup2-to-/dev/console: systemd's `journal+console`
@@ -156,6 +181,12 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
     // Write end stays BLOCKING: eprintln! panics on write errors, and a
     // transiently full pipe must block the producer momentarily (the writer
     // thread always drains it), never return EAGAIN into eprintln!.
+    //
+    // nix 0.29 API split: `fcntl` and `read` still take `RawFd`, while `write`
+    // and `poll` already take `AsFd` — the `as_raw_fd()` calls here and at the
+    // writer-loop `read` are required by those signatures, not an opt-out from
+    // the safe wrappers. (Raw `libc::ioctl` below is different: nix has no
+    // TIOCOUTQ/FIONREAD wrapper.)
     let (pipe_rd, pipe_wr) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
     let flags = fcntl(pipe_rd.as_raw_fd(), FcntlArg::F_GETFL)?;
     fcntl(
@@ -313,14 +344,22 @@ impl ConsoleShared {
     }
 
     /// Bytes still queued in the tty/UART output buffer.
+    ///
+    /// Returns -1 when the state is UNKNOWN (unexpected `TIOCOUTQ` failure).
+    /// Callers must treat unknown as "not drained": converting "cannot verify
+    /// the UART" into "the UART is idle" would let quiesce vouch for a drain
+    /// it never observed.
     fn uart_backlog(&self) -> i64 {
         let mut n: libc::c_int = 0;
         let rc = unsafe { libc::ioctl(self.console_fd.as_raw_fd(), libc::TIOCOUTQ, &mut n) };
         if rc == 0 {
             n as i64
-        } else {
-            // Not a tty (tests use pipes/files): nothing can be queued in a UART.
+        } else if Errno::last() == Errno::ENOTTY {
+            // Not a tty (tests use pipes/files): there is no 8250 UART, so
+            // nothing can be queued in one.
             0
+        } else {
+            -1
         }
     }
 
@@ -338,11 +377,20 @@ impl ConsoleShared {
     }
 
     /// See [`quiesce_for_snapshot`].
-    fn quiesce(self: &Arc<Self>) -> QuiesceGuard {
+    fn quiesce(self: &Arc<Self>) -> Result<QuiesceGuard, QuiesceError> {
+        self.quiesce_with_timeout(QUIESCE_PHASE_TIMEOUT)
+    }
+
+    /// [`Self::quiesce`] with an explicit per-phase bound. Tests shrink it so
+    /// the no-drain abort path doesn't cost real seconds.
+    fn quiesce_with_timeout(
+        self: &Arc<Self>,
+        phase_timeout: Duration,
+    ) -> Result<QuiesceGuard, QuiesceError> {
         // Phase 1 (politeness): let already-logged lines reach the console so
         // the quiesce announcement lands before the host pauses the VM. Purely
         // cosmetic for safety — phases 2+3 provide the guarantee.
-        let deadline = Instant::now() + QUIESCE_PHASE_TIMEOUT;
+        let deadline = Instant::now() + phase_timeout;
         while !self.flushed() {
             if Instant::now() >= deadline {
                 break;
@@ -357,12 +405,15 @@ impl ConsoleShared {
         // logs concurrently — logs accumulate in the writer's pending buffer.
         self.gate.store(true, Ordering::SeqCst);
         drop(self.write_lock.lock().unwrap_or_else(|e| e.into_inner()));
+        let guard = QuiesceGuard {
+            state: Some(self.clone()),
+        };
 
         // Phase 3 (drain): wait for the UART to go fully idle (TIOCOUTQ == 0
         // also proves THRI is disarmed — see module docs). Monotone: the gate
         // stops all refills. Terminates because the console works pre-snapshot;
         // the cap only prevents an unexpected wedge from stalling startup.
-        let deadline = Instant::now() + QUIESCE_PHASE_TIMEOUT;
+        let deadline = Instant::now() + phase_timeout;
         let mut drained = false;
         while Instant::now() < deadline {
             if self.uart_backlog() == 0 {
@@ -372,33 +423,43 @@ impl ConsoleShared {
             std::thread::sleep(Duration::from_millis(1));
         }
         if !drained {
-            // Held in the pending buffer until the guard drops (console-safe).
+            // The UART cannot be proven idle: a snapshot taken now could
+            // capture the 8250 mid-transmit and every restore of it would have
+            // a dead serial console. Release the gate (dropping the guard —
+            // the VM is staying live and cold, so logging must keep flowing)
+            // and surface the failure so the caller aborts the handshake
+            // instead of inviting the host to pause us.
+            drop(guard);
             eprintln!(
                 "[fc-agent] WARNING: console did not drain before snapshot quiesce; \
-                 a snapshot taken now may capture the UART mid-transmit"
+                 aborting the cache-ready handshake so no snapshot can capture the \
+                 UART mid-transmit"
             );
+            return Err(QuiesceError);
         }
 
-        QuiesceGuard {
-            state: Some(self.clone()),
-        }
+        Ok(guard)
     }
 }
 
 /// Make the serial console provably quiet for a host-side VM pause.
 ///
 /// Called before sending `cache-ready` (which triggers the host's pre-start
-/// snapshot pause). Until the returned guard drops, no byte reaches the UART:
-/// the snapshot cannot capture the 8250 mid-transmit, so its restores keep a
-/// working serial console. `eprintln!` stays usable throughout — lines are
-/// held in the writer's pending buffer and flushed when the guard drops
-/// (ack received, restore detected, or failure).
+/// snapshot pause). On success, until the returned guard drops, no byte
+/// reaches the UART: the snapshot cannot capture the 8250 mid-transmit, so
+/// its restores keep a working serial console. `eprintln!` stays usable
+/// throughout — lines are held in the writer's pending buffer and flushed
+/// when the guard drops (ack received, restore detected, or failure).
 ///
-/// No-op guard if [`init`] didn't run (no /dev/console).
-pub fn quiesce_for_snapshot() -> QuiesceGuard {
+/// `Err` means the UART could not be proven idle: the gate is NOT held, and
+/// the caller must NOT send `cache-ready` — the only safe outcome is to
+/// continue cold with no snapshot artifact.
+///
+/// No-op `Ok` guard if [`init`] didn't run (no /dev/console).
+pub fn quiesce_for_snapshot() -> Result<QuiesceGuard, QuiesceError> {
     match CONSOLE.get() {
         Some(state) => state.quiesce(),
-        None => QuiesceGuard { state: None },
+        None => Ok(QuiesceGuard { state: None }),
     }
 }
 
@@ -437,31 +498,79 @@ mod tests {
         cond()
     }
 
+    /// Append whatever the fake console currently holds to `sink` WITHOUT
+    /// blocking (FIONREAD probe, read only what is there). Blocking reads are
+    /// forbidden in these tests: `flushed()` can be transiently true before
+    /// bytes reach the console, and once the gate closes a blocking read can
+    /// only return after the guard drops — which the test does after the read.
+    /// A lost race must fail an assert, never hang the suite.
+    fn drain_console(console_rd: &mut std::fs::File, sink: &mut Vec<u8>) {
+        let mut out = [0u8; 65536];
+        loop {
+            let mut avail: libc::c_int = 0;
+            let rc = unsafe { libc::ioctl(console_rd.as_raw_fd(), libc::FIONREAD, &mut avail) };
+            if rc != 0 || avail == 0 {
+                return;
+            }
+            match console_rd.read(&mut out) {
+                Ok(0) => return,
+                Ok(n) => sink.extend_from_slice(&out[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("fake console read failed: {}", e),
+            }
+        }
+    }
+
     #[test]
     fn test_console_relay_and_flush() {
         let (console_wr, mut console_rd) = fake_console();
         let state = setup(console_wr).unwrap();
+        let mut seen: Vec<u8> = Vec::new();
 
         write_pipe(&state, b"hello console\n");
         assert!(
-            wait_until(|| state.flushed(), Duration::from_secs(5)),
-            "writer must relay and dispose all bytes"
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen.as_slice() == b"hello console\n"
+                },
+                Duration::from_secs(5)
+            ),
+            "writer must relay all bytes to the console, got {:?}",
+            String::from_utf8_lossy(&seen)
         );
-
-        let mut out = [0u8; 64];
-        let n = console_rd.read(&mut out).unwrap();
-        assert_eq!(&out[..n], b"hello console\n");
+        assert!(
+            wait_until(|| state.flushed(), Duration::from_secs(5)),
+            "writer must account every relayed byte as disposed"
+        );
     }
 
     #[test]
     fn test_console_gate_holds_bytes_then_releases() {
         let (console_wr, mut console_rd) = fake_console();
         let state = setup(console_wr).unwrap();
+        let mut seen: Vec<u8> = Vec::new();
 
+        // Wait for the bytes to actually REACH the console, not merely for
+        // `flushed()`: that check can be transiently true while the bytes sit
+        // in the writer thread's local buffer, and gating in that window would
+        // hold "before-gate" back until the guard drops.
         write_pipe(&state, b"before-gate\n");
-        assert!(wait_until(|| state.flushed(), Duration::from_secs(5)));
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen.as_slice() == b"before-gate\n"
+                },
+                Duration::from_secs(5)
+            ),
+            "pre-gate bytes must reach the console, got {:?}",
+            String::from_utf8_lossy(&seen)
+        );
 
-        let guard = state.quiesce();
+        let guard = state
+            .quiesce()
+            .expect("quiesce on a pipe-backed console must report drained");
 
         // Logged while gated: consumed from the pipe but NOT written to the console.
         write_pipe(&state, b"held-line\n");
@@ -475,19 +584,67 @@ mod tests {
             "gated bytes must move to the pending buffer, not the console"
         );
 
-        // Nothing new on the fake console while gated.
-        let mut out = [0u8; 64];
-        let n = console_rd.read(&mut out).unwrap();
-        assert_eq!(&out[..n], b"before-gate\n");
+        // Nothing new may arrive on the fake console while gated: the held
+        // bytes are accounted in the pending buffer and the gate was closed
+        // (write lock cycled) before they were written.
+        drain_console(&mut console_rd, &mut seen);
+        assert_eq!(
+            seen.as_slice(),
+            b"before-gate\n",
+            "console must not receive bytes while gated"
+        );
 
         drop(guard);
 
         assert!(
-            wait_until(|| state.flushed(), Duration::from_secs(5)),
-            "dropping the guard must flush held bytes"
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen.as_slice() == b"before-gate\nheld-line\n"
+                },
+                Duration::from_secs(5)
+            ),
+            "dropping the guard must flush held bytes, got {:?}",
+            String::from_utf8_lossy(&seen)
         );
-        let n = console_rd.read(&mut out).unwrap();
-        assert_eq!(&out[..n], b"held-line\n");
+    }
+
+    #[test]
+    fn test_console_quiesce_aborts_when_uart_never_drains() {
+        use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+
+        // A socketpair "console": on sockets, `TIOCOUTQ` (== `SIOCOUTQ`)
+        // genuinely reports bytes the peer has not consumed — a never-read
+        // peer models a UART whose TX queue never drains.
+        let (console_fd, peer) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let state = setup(console_fd).unwrap();
+
+        write_pipe(&state, b"stuck-in-uart\n");
+        assert!(
+            wait_until(|| state.uart_backlog() > 0, Duration::from_secs(5)),
+            "socket console must report an undrained TX backlog"
+        );
+
+        let result = state.quiesce_with_timeout(Duration::from_millis(200));
+        assert!(
+            result.is_err(),
+            "quiesce must ABORT when the UART cannot be proven idle — returning a \
+             guard here would let the host snapshot the VM mid-transmit"
+        );
+        // The failed quiesce must not leave the console gated: the handshake
+        // is aborted, the VM continues cold, and logging must keep flowing.
+        assert!(
+            !state.gate.load(Ordering::SeqCst),
+            "failed quiesce must release the gate before returning"
+        );
+
+        drop(peer);
     }
 
     #[test]
@@ -500,8 +657,8 @@ mod tests {
         let state = setup(console_wr).unwrap();
 
         // Stall the console (nobody reads it) and overwhelm pending: the fake
-        // console absorbs ~4KB, PENDING_CAP holds 256KB, the rest must be
-        // DROPPED — and no producer may ever block.
+        // console absorbs ~4KB, the pending buffer holds PENDING_CAP bytes,
+        // the rest must be DROPPED — and no producer may ever block.
         let chunk = vec![b'x'; 8192];
         let total = 4096 + PENDING_CAP + 64 * 1024;
         let mut written = 0;
@@ -520,21 +677,10 @@ mod tests {
         // Recover the console: drain everything. The writer must flush its
         // pending bytes and append ONE summary line about the dropped bytes.
         let mut sunk: Vec<u8> = Vec::new();
-        let mut out = [0u8; 65536];
         assert!(wait_until(
             || {
                 // Keep draining until the writer reports fully flushed.
-                loop {
-                    // Non-blocking read via FIONREAD probe.
-                    let mut avail: libc::c_int = 0;
-                    let rc =
-                        unsafe { libc::ioctl(console_rd.as_raw_fd(), libc::FIONREAD, &mut avail) };
-                    if rc != 0 || avail == 0 {
-                        break;
-                    }
-                    let n = console_rd.read(&mut out).unwrap();
-                    sunk.extend_from_slice(&out[..n]);
-                }
+                drain_console(&mut console_rd, &mut sunk);
                 state.flushed() && state.dropped.load(Ordering::SeqCst) == 0
             },
             Duration::from_secs(10)

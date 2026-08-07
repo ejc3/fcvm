@@ -871,7 +871,9 @@ pub enum CacheResult {
     /// POLLHUP, write-probe, or restore-epoch detected — warm start,
     /// vsock connections are dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
     WarmStart,
-    /// Handshake failed (connect error, send error, timeout, etc.).
+    /// Handshake failed (console quiesce failure — cache-ready deliberately
+    /// not sent so the host cannot snapshot a mid-transmit UART — or connect
+    /// error, send error, timeout, etc.). The VM continues cold.
     Failed,
 }
 
@@ -920,15 +922,28 @@ pub fn notify_cache_ready_and_wait(
     // waits forever for a TX interrupt the re-created serial device never
     // delivers). So: announce FIRST, then make the console provably quiet
     // (flush + gate + TIOCOUTQ drain — structural, not probabilistic), and
-    // only THEN let the host know we are ready to be paused. The gate holds
-    // until this function returns (every path: ack, restore, failure), so no
-    // concurrent task can put a byte in UART TX while the pause can happen —
-    // lines logged meanwhile are buffered and flushed when the guard drops.
+    // only THEN let the host know we are ready to be paused. On success the
+    // gate holds until this function returns (every path: ack, restore,
+    // failure), so no concurrent task can put a byte in UART TX while the
+    // pause can happen — lines logged meanwhile are buffered and flushed when
+    // the guard drops. If the console CANNOT be proven quiet, the handshake
+    // is aborted BEFORE cache-ready is sent: the host never pauses us, no
+    // poisoned snapshot artifact can be created, and the VM continues cold.
     eprintln!(
         "[fc-agent] image digest {} loaded; quiescing console before cache-ready notification",
         digest
     );
-    let _console_quiesce = crate::console::quiesce_for_snapshot();
+    let _console_quiesce = match crate::console::quiesce_for_snapshot() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: {}; not sending cache-ready — continuing cold \
+                 without a pre-start snapshot",
+                e
+            );
+            return CacheResult::Failed;
+        }
+    };
 
     let sock = match socket(
         AddressFamily::Vsock,

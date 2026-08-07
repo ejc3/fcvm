@@ -1658,9 +1658,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // always prints restore-progress lines BEFORE reconnecting output, so
         // zero console lines shortly after this point is proof of a poisoned
         // snapshot. One loud error naming the snapshot instead of a trail of
-        // mystery test failures.
+        // mystery test failures. The mid-TX-UART diagnosis is Firecracker-only
+        // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
+        // console, so they get a backend-neutral missing-console error.
         if output_connected {
             let console_lines = vm_manager.console_line_counter();
+            let backend = vm_manager.backend();
             let snapshot_name = snapshot_name.clone();
             let vm_id = vm_id.clone();
             // 30s, not a few seconds: a freshly restored VM can be CPU-starved for a
@@ -1683,15 +1686,25 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         _ = watchdog_cancel.cancelled() => return,
                     }
                 }
-                tracing::error!(
-                    vm_id = %vm_id,
-                    snapshot = %snapshot_name,
-                    "fc-agent's output vsock reconnected after restore but NO serial \
-                     console line arrived within 30s — snapshot '{}' almost certainly \
-                     captured the guest UART mid-transmit and every restore of it will \
-                     have a dead serial console. Recreate the snapshot.",
-                    snapshot_name
-                );
+                match backend {
+                    crate::hypervisor::Backend::Firecracker => tracing::error!(
+                        vm_id = %vm_id,
+                        snapshot = %snapshot_name,
+                        "fc-agent's output vsock reconnected after restore but NO serial \
+                         console line arrived within 30s — snapshot '{}' almost certainly \
+                         captured the guest UART mid-transmit and every restore of it will \
+                         have a dead serial console. Recreate the snapshot.",
+                        snapshot_name
+                    ),
+                    crate::hypervisor::Backend::CloudHypervisor => tracing::error!(
+                        vm_id = %vm_id,
+                        snapshot = %snapshot_name,
+                        "fc-agent's output vsock reconnected after restore but NO console \
+                         output arrived within 30s — restores of snapshot '{}' come up with \
+                         a dead guest console. Recreate the snapshot.",
+                        snapshot_name
+                    ),
+                }
             });
         }
     }

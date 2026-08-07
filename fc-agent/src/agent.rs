@@ -328,6 +328,8 @@ pub async fn run() -> Result<()> {
     // Notify host for cache snapshot. notify_cache_ready_and_wait logs the
     // digest itself, then quiesces the console BEFORE the notification so the
     // host's pre-start snapshot pause can never capture the UART mid-transmit.
+    // If the console cannot be proven quiet it returns Failed WITHOUT sending
+    // cache-ready — the host never pauses us and the VM continues cold.
     match container::get_image_digest(&image_ref, &cmd_prefix).await {
         Ok(digest) => {
             let cache_result = container::notify_cache_ready_and_wait(&digest, &restore_flag);
