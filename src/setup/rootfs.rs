@@ -1502,15 +1502,34 @@ exec switch_root /newroot /sbin/init
 pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     // Find fc-agent binary
     let fc_agent_path = find_fc_agent_binary()?;
-    let fc_agent_bytes = std::fs::read(&fc_agent_path)
-        .with_context(|| format!("reading fc-agent binary at {}", fc_agent_path.display()))?;
 
-    // Compute combined hash of all initrd contents
-    let mut combined = fc_agent_bytes.clone();
-    combined.extend_from_slice(INITRD_INIT_SCRIPT.as_bytes());
-    combined.extend_from_slice(FC_AGENT_SERVICE.as_bytes());
-    combined.extend_from_slice(FC_AGENT_SERVICE_STRACE.as_bytes());
-    let initrd_sha = compute_sha256(&combined);
+    // Combined hash of all initrd contents: sha256(fc-agent bytes ++ init script
+    // ++ service files). Reading + hashing the ~4.4MB fc-agent binary costs
+    // ~17ms and sits on every VM-launch / clone hot path, so the result is
+    // memoised per binary identity (path+mtime+size — the version-cache
+    // pattern). The embedded scripts are compile-time constants; their hash
+    // goes into the cache namespace so an fcvm rebuild that changes only the
+    // scripts can never reuse a stale combined SHA.
+    let scripts_sha = {
+        let mut scripts = Vec::new();
+        scripts.extend_from_slice(INITRD_INIT_SCRIPT.as_bytes());
+        scripts.extend_from_slice(FC_AGENT_SERVICE.as_bytes());
+        scripts.extend_from_slice(FC_AGENT_SERVICE_STRACE.as_bytes());
+        compute_sha256(&scripts)
+    };
+    let initrd_sha = crate::version_cache::derived(
+        &fc_agent_path,
+        &format!("initrd-sha:{}", scripts_sha),
+        || {
+            let mut combined = std::fs::read(&fc_agent_path).with_context(|| {
+                format!("reading fc-agent binary at {}", fc_agent_path.display())
+            })?;
+            combined.extend_from_slice(INITRD_INIT_SCRIPT.as_bytes());
+            combined.extend_from_slice(FC_AGENT_SERVICE.as_bytes());
+            combined.extend_from_slice(FC_AGENT_SERVICE_STRACE.as_bytes());
+            Ok(compute_sha256(&combined))
+        },
+    )?;
     let initrd_sha_short = &initrd_sha[..12];
 
     // Check if initrd already exists for this version (fast path, no lock)

@@ -53,18 +53,33 @@ impl OutputHandle {
     }
 }
 
-/// Create an (OutputHandle, writer future) pair. Spawn the future as a tokio task.
-pub fn create() -> (OutputHandle, impl Future<Output = ()>) {
+/// Create an (OutputHandle, writer future, transport-reset watch) triple. Spawn
+/// the future as a tokio task.
+///
+/// The `watch::Receiver<u64>` increments whenever the writer observes EPOLLERR
+/// on its established vsock connection — the kernel's reaction to
+/// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, which the device raises at snapshot
+/// restore. It is the guest's earliest "you were just restored" signal: the
+/// restore-epoch watcher uses it to poll for the new epoch immediately instead
+/// of finishing a frozen 50ms sleep first. It is an ACCELERATOR only — every
+/// consumer must keep working (just slower) if it never fires (e.g. TTY-mode
+/// VMs, where no output connection exists).
+pub fn create() -> (
+    OutputHandle,
+    impl Future<Output = ()>,
+    tokio::sync::watch::Receiver<u64>,
+) {
     let (tx, rx) = mpsc::channel(4096);
     let reconnect = Arc::new(Notify::new());
     let reconnect_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
     let handle = OutputHandle {
         tx,
         reconnect: reconnect.clone(),
         reconnect_flag: reconnect_flag.clone(),
     };
-    let writer = output_writer(rx, reconnect, reconnect_flag);
-    (handle, writer)
+    let writer = output_writer(rx, reconnect, reconnect_flag, reset_tx);
+    (handle, writer, reset_rx)
 }
 
 /// Try to reconnect the vsock stream, retrying up to 30 times.
@@ -119,6 +134,7 @@ async fn output_writer(
     mut rx: mpsc::Receiver<OutputMessage>,
     reconnect_signal: Arc<Notify>,
     reconnect_flag: Arc<std::sync::atomic::AtomicBool>,
+    reset_tx: tokio::sync::watch::Sender<u64>,
 ) {
     let mut stream: Option<VsockStream> =
         match VsockStream::connect(vsock::HOST_CID, vsock::OUTPUT_PORT) {
@@ -188,7 +204,7 @@ async fn output_writer(
                 }
             }
 
-            // Wait for next message (or reconnect signal).
+            // Wait for next message (or reconnect signal, or transport reset).
             let msg = tokio::select! {
                 msg = rx.recv() => msg,
                 _ = reconnect_signal.notified() => {
@@ -197,6 +213,23 @@ async fn output_writer(
                     // the top of the loop. Re-storing would create a stored-permit
                     // cascade: the next select! would fire immediately, dropping
                     // the freshly-reconnected stream before any data is written.
+                    stream = None;
+                    continue;
+                }
+                _ = s.wait_for_error() => {
+                    // EPOLLERR on the idle connection: the vsock transport was
+                    // reset — for an fc-agent-held connection that means a
+                    // snapshot restore just happened. Publish the earliest
+                    // restore hint (the epoch watcher fast-polls on it), drop
+                    // the dead stream, and wait for the explicit reconnect from
+                    // handle_clone_restore exactly like the write-failure path.
+                    // The snapshot is virtually always taken with output idle,
+                    // so this arm is where a restored writer wakes up; a reset
+                    // mid-write lands in the write-error path instead, which
+                    // doesn't bump the hint — the watcher's normal poll covers
+                    // that case.
+                    eprintln!("[fc-agent] output vsock EPOLLERR (transport reset)");
+                    reset_tx.send_modify(|gen| *gen += 1);
                     stream = None;
                     continue;
                 }

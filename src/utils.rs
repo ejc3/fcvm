@@ -1,11 +1,89 @@
 //! Utility functions for process management and system operations.
 
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{info, warn};
+
+/// Event-driven watch on a directory for "a file appeared / changed" conditions.
+///
+/// Wraps an inotify fd in tokio's `AsyncFd` so readiness waits are epoll-driven
+/// — no fixed-interval polling. The zero-race usage pattern is:
+///
+/// 1. `DirWatch::new(dir)` — register the watch FIRST;
+/// 2. check the real condition (file exists / socket connects);
+/// 3. if not met, `next_event().await`, then re-check — a file that appears
+///    between (2) and (3) produced an event that (3) consumes, so it can never
+///    be missed. Callers keep their own deadline/child-exit select arms.
+///
+/// Events are only wakeups: callers ALWAYS re-check the real condition, so
+/// coalesced events, queue overflow, or unrelated files in the directory are
+/// all safe (just extra re-checks).
+pub struct DirWatch {
+    async_fd: tokio::io::unix::AsyncFd<std::os::fd::RawFd>,
+    // Keeps the inotify fd open; declared after async_fd so the AsyncFd is
+    // dropped (deregistered from the reactor) before the fd is closed.
+    inotify: nix::sys::inotify::Inotify,
+}
+
+impl DirWatch {
+    /// Register an inotify watch on `dir` for file-appearance events
+    /// (create, rename-in, close-after-write, attribute change).
+    pub fn new(dir: &Path) -> anyhow::Result<Self> {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC)
+            .map_err(|e| anyhow::anyhow!("inotify_init1: {e}"))?;
+        inotify
+            .add_watch(
+                dir,
+                AddWatchFlags::IN_CREATE
+                    | AddWatchFlags::IN_MOVED_TO
+                    | AddWatchFlags::IN_CLOSE_WRITE
+                    | AddWatchFlags::IN_ATTRIB,
+            )
+            .map_err(|e| anyhow::anyhow!("inotify_add_watch {}: {e}", dir.display()))?;
+        let raw = std::os::fd::AsFd::as_fd(&inotify).as_raw_fd();
+        let async_fd = tokio::io::unix::AsyncFd::new(raw)
+            .map_err(|e| anyhow::anyhow!("registering inotify fd with tokio: {e}"))?;
+        Ok(Self { async_fd, inotify })
+    }
+
+    /// [`next_event`](Self::next_event) over an optional watch: a `None` watch
+    /// (inotify init failed — e.g. `fs.inotify.max_user_instances` exhausted by
+    /// many concurrent fcvm processes) never completes, so a `select!` caller
+    /// degrades to its safety-tick/deadline arms instead of failing hard.
+    pub async fn next_event_opt(watch: &mut Option<Self>) -> anyhow::Result<()> {
+        match watch {
+            Some(w) => w.next_event().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Wait until at least one filesystem event has been consumed.
+    ///
+    /// Drains everything currently queued (the event batch is only a wakeup —
+    /// the caller re-checks its condition afterwards).
+    pub async fn next_event(&mut self) -> anyhow::Result<()> {
+        loop {
+            let mut guard = self
+                .async_fd
+                .readable()
+                .await
+                .map_err(|e| anyhow::anyhow!("waiting for inotify readability: {e}"))?;
+            match self.inotify.read_events() {
+                Ok(_events) => return Ok(()),
+                Err(nix::errno::Errno::EAGAIN) => {
+                    guard.clear_ready();
+                    continue;
+                }
+                Err(e) => return Err(anyhow::anyhow!("reading inotify events: {e}")),
+            }
+        }
+    }
+}
 
 /// Check if a process is alive by checking /proc/{pid} existence.
 ///

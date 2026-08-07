@@ -36,11 +36,23 @@ use tracing::{debug, info};
 /// Vsock port for exec commands (fc-agent listens on this)
 pub const EXEC_VSOCK_PORT: u32 = 4998;
 
-/// Maximum number of connection attempts to the exec server
-const MAX_EXEC_CONNECT_ATTEMPTS: u32 = 30;
+/// Maximum number of connection attempts to the exec server. With the 5ms
+/// initial delay, 1.5x growth, and 2s cap this spans ~54s of total waiting —
+/// the same boot-tolerance window as the previous 30 × (100ms, 2x) ladder.
+const MAX_EXEC_CONNECT_ATTEMPTS: u32 = 41;
 
-/// Initial retry delay when connecting to exec server (doubles each attempt)
-const INITIAL_RETRY_DELAY_MS: u64 = 100;
+/// Initial retry delay when connecting to exec server (grows 1.5x per attempt,
+/// capped at 2s). 5ms, not 100ms: a freshly restored clone's exec server
+/// re-registers within single-digit milliseconds, and the adversarial review of
+/// the clone-latency benchmarks showed the old 100ms quantum was
+/// indistinguishable from real guest latency (UFFD arms sat in the empty
+/// 100-139ms band purely from this ladder).
+const INITIAL_RETRY_DELAY_MS: u64 = 5;
+
+/// Multiply the retry delay by 3/2 (integer) each attempt, capped at 2s.
+fn next_retry_delay(delay_ms: u64) -> u64 {
+    std::cmp::min(delay_ms + delay_ms / 2 + 1, 2000)
+}
 
 /// Per-attempt bounded wait for the agent's ACK line. A live agent ACKs in
 /// sub-millisecond time; only an orphaned/paused connection stalls this long.
@@ -71,6 +83,7 @@ const EXEC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> {
     let mut attempt = 0;
     let mut delay_ms = INITIAL_RETRY_DELAY_MS;
+    let mut waited_ms: u64 = 0;
 
     loop {
         attempt += 1;
@@ -81,7 +94,8 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
             Err(e) if attempt < MAX_EXEC_CONNECT_ATTEMPTS => {
                 debug!(attempt, delay_ms, "vsock socket not ready, retrying");
                 std::thread::sleep(Duration::from_millis(delay_ms));
-                delay_ms = std::cmp::min(delay_ms * 2, 2000); // Cap at 2 seconds
+                waited_ms += delay_ms;
+                delay_ms = next_retry_delay(delay_ms);
                 continue;
             }
             Err(e) => {
@@ -105,7 +119,8 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
             if attempt < MAX_EXEC_CONNECT_ATTEMPTS {
                 debug!(attempt, delay_ms, error = %e, "failed to send CONNECT, retrying");
                 std::thread::sleep(Duration::from_millis(delay_ms));
-                delay_ms = std::cmp::min(delay_ms * 2, 2000);
+                waited_ms += delay_ms;
+                delay_ms = next_retry_delay(delay_ms);
                 continue;
             }
             bail!(
@@ -123,7 +138,8 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
                 if attempt < MAX_EXEC_CONNECT_ATTEMPTS {
                     debug!(attempt, delay_ms, error = %e, "failed to read CONNECT response, retrying");
                     std::thread::sleep(Duration::from_millis(delay_ms));
-                    delay_ms = std::cmp::min(delay_ms * 2, 2000);
+                    waited_ms += delay_ms;
+                    delay_ms = next_retry_delay(delay_ms);
                     continue;
                 }
                 bail!(
@@ -149,7 +165,8 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
                     );
                 }
                 std::thread::sleep(Duration::from_millis(delay_ms));
-                delay_ms = std::cmp::min(delay_ms * 2, 2000);
+                waited_ms += delay_ms;
+                delay_ms = next_retry_delay(delay_ms);
                 continue;
             }
 
@@ -161,9 +178,15 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
             );
         }
 
-        // Success!
+        // Success! Attempt count + cumulative retry sleep are logged so
+        // benchmark timelines can attribute connect-retry waiting (the ladder's
+        // quantum) separately from real guest latency.
         if attempt > 1 {
-            debug!(attempt, "successfully connected to exec server");
+            debug!(
+                attempts = attempt,
+                retry_wait_ms = waited_ms,
+                "connected to exec server after retries"
+            );
         }
         return Ok(stream);
     }

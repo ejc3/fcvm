@@ -15,6 +15,9 @@ use super::FirecrackerClient;
 /// Socket/device wait timeout (total wait time = RETRY_COUNT * RETRY_DELAY)
 const SOCKET_WAIT_RETRY_COUNT: u32 = 500;
 const SOCKET_WAIT_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// Total budget for the API socket to accept connections (matches the old
+/// 500 × 10ms retry ladder).
+const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of recent Firecracker stderr lines kept for error reporting.
 const STDERR_TAIL_LINES: usize = 10;
@@ -334,27 +337,60 @@ impl VmManager {
     ///
     /// The socket file becoming visible is not enough: there is a window between
     /// Firecracker's bind() (file exists) and listen() where connect() fails with
-    /// ECONNREFUSED. Poll by actually connecting so the first real API request
+    /// ECONNREFUSED. Probe by actually connecting so the first real API request
     /// never races that window.
     ///
-    /// Also polls the Firecracker child process: if it exits before the API
-    /// server accepts connections, fail immediately with its exit status and
-    /// recent stderr output instead of timing out with a generic socket error.
+    /// Event-driven: an inotify watch on the socket's parent directory (registered
+    /// BEFORE the first probe, so a file appearing mid-check always produces an
+    /// event) wakes the probe the instant Firecracker binds — the old fixed 10ms
+    /// poll cost most of that interval on every launch/clone. The bind→listen
+    /// window has no filesystem event, so ECONNREFUSED retries at 1ms. A coarse
+    /// safety tick re-checks even without events, and the deadline bounds all
+    /// paths, so a lost event can only add latency, never hang.
+    ///
+    /// Also watches the Firecracker child process on every iteration (including
+    /// the 1ms ECONNREFUSED path): if it exits before the API server accepts
+    /// connections, fail with its exit status and recent stderr output instead
+    /// of timing out with a generic socket error.
     async fn wait_for_socket(&mut self) -> Result<()> {
         use tokio::time::sleep;
 
-        for _ in 0..SOCKET_WAIT_RETRY_COUNT {
+        let mut watch =
+            self.socket_path
+                .parent()
+                .and_then(|dir| match crate::utils::DirWatch::new(dir) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "inotify unavailable for API-socket wait; degrading to 10ms polling"
+                        );
+                        None
+                    }
+                });
+
+        let deadline = tokio::time::Instant::now() + SOCKET_WAIT_TIMEOUT;
+        loop {
+            // ECONNREFUSED retries on a tight 1ms cadence (set below) instead of
+            // waiting for a directory event — but still falls through to the
+            // child-liveness check first: if Firecracker binds the socket and
+            // then dies, the socket FILE persists and refuses connections
+            // forever, and skipping try_wait would spin out the whole deadline
+            // and report a generic timeout instead of the exit status + stderr.
+            let mut refused = false;
             match tokio::net::UnixStream::connect(&self.socket_path).await {
                 Ok(stream) => {
                     // Only probing readiness — drop the connection immediately.
                     drop(stream);
                     return Ok(());
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        || e.kind() == std::io::ErrorKind::ConnectionRefused =>
-                {
-                    // Socket file not created yet, or created but not listening yet.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Socket file not created yet — wait for a directory event below.
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // bind() done, listen() imminent (sub-millisecond window
+                    // with no fs event).
+                    refused = true;
                 }
                 Err(e) => bail!(
                     "unexpected error connecting to Firecracker API socket {}: {}",
@@ -373,15 +409,41 @@ impl VmManager {
                     self.stderr_tail_message()
                 );
             }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
 
-            sleep(SOCKET_WAIT_RETRY_DELAY).await;
+            if refused {
+                // Liveness verified above — retry the connect at 1ms.
+                sleep(Duration::from_millis(1)).await;
+                continue;
+            }
+
+            match watch.as_mut() {
+                Some(w) => {
+                    tokio::select! {
+                        event = w.next_event() => {
+                            // Directory activity — loop re-probes the socket.
+                            // A (persistent) watch error degrades to the old
+                            // fixed cadence via this sleep, bounded by deadline.
+                            if event.is_err() {
+                                sleep(SOCKET_WAIT_RETRY_DELAY).await;
+                            }
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {}
+                        _ = sleep(Duration::from_millis(100)) => {
+                            // Safety tick: re-check child liveness + socket
+                            // even if no event arrives.
+                        }
+                    }
+                }
+                None => sleep(SOCKET_WAIT_RETRY_DELAY).await,
+            }
         }
 
-        let timeout_secs =
-            SOCKET_WAIT_RETRY_COUNT as u64 * SOCKET_WAIT_RETRY_DELAY.as_millis() as u64 / 1000;
         bail!(
             "Firecracker socket not ready after {} seconds",
-            timeout_secs
+            SOCKET_WAIT_TIMEOUT.as_secs()
         )
     }
 

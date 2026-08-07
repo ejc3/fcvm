@@ -147,6 +147,16 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
 /// (#632 P2) — both via [`crate::bootplan::fetch_metadata`], so the restore handling is
 /// identical. MMDS polls at 50ms (a cheap local HTTP get); vsock polls slower because each
 /// poll reopens the boot-plan connection and re-reads the whole plan document.
+///
+/// The steady poll is only the fallback. The actual restore EVENT is the vsock
+/// transport reset the device raises at resume (surfaced by the output writer
+/// as `vsock_reset_rx`): a snapshot freezes this loop mid-`sleep`, so with the
+/// poll alone a restored clone waits out the frozen sleep's remainder (avg
+/// ~25ms of the measured clone floor) before even looking for its epoch. On a
+/// reset event the loop fetches immediately and polls at a tight cadence for a
+/// bounded window — the host PUTs the epoch right after resume, so this races
+/// only a few ms ahead of it. If the event never fires (TTY VMs, non-restore
+/// connection errors) behavior degrades to exactly the old poll.
 pub async fn watch_restore_epoch(
     signals: crate::restore::RestoreSignals,
     transport: crate::bootplan::Transport,
@@ -162,9 +172,43 @@ pub async fn watch_restore_epoch(
         crate::bootplan::Transport::Mmds => Duration::from_millis(50),
         crate::bootplan::Transport::Vsock => Duration::from_millis(250),
     };
+    // Post-reset fast cadence: MMDS gets are cheap local HTTP; vsock polls
+    // reopen the boot-plan connection, so keep them a bit gentler.
+    let fast_interval = match transport {
+        crate::bootplan::Transport::Mmds => Duration::from_millis(2),
+        crate::bootplan::Transport::Vsock => Duration::from_millis(10),
+    };
+    const FAST_WINDOW: Duration = Duration::from_secs(1);
+
+    let mut reset_rx = signals.vsock_reset_rx.clone();
+    // Once the watch sender is gone (writer task ended — shutdown), stop
+    // selecting on it so a closed channel can't busy-loop the watcher.
+    let mut reset_armed = true;
+    let mut fast_until: Option<tokio::time::Instant> = None;
 
     loop {
-        sleep(poll_interval).await;
+        let interval = match fast_until {
+            Some(t) if tokio::time::Instant::now() < t => fast_interval,
+            _ => {
+                fast_until = None;
+                poll_interval
+            }
+        };
+        tokio::select! {
+            _ = sleep(interval) => {}
+            changed = reset_rx.changed(), if reset_armed => {
+                match changed {
+                    Ok(()) => {
+                        eprintln!(
+                            "[fc-agent] vsock transport reset observed; fast-polling restore-epoch"
+                        );
+                        fast_until = Some(tokio::time::Instant::now() + FAST_WINDOW);
+                        // Fall through to an immediate fetch.
+                    }
+                    Err(_) => reset_armed = false,
+                }
+            }
+        }
 
         let metadata = match crate::bootplan::fetch_metadata(transport).await {
             Ok(m) => m,
@@ -206,6 +250,8 @@ pub async fn watch_restore_epoch(
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
                     last_epoch = metadata.restore_epoch;
+                    // Epoch found and handled — the fast window did its job.
+                    fast_until = None;
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
@@ -224,6 +270,8 @@ pub async fn watch_restore_epoch(
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
                     last_epoch = metadata.restore_epoch;
+                    // Epoch found and handled — the fast window did its job.
+                    fast_until = None;
                 }
                 _ => {}
             }

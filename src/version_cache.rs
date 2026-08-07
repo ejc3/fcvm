@@ -1,31 +1,36 @@
-//! Cached `<binary> --version` probes.
+//! Cached per-binary derivations: `<binary> --version` probes and other strings
+//! that are a pure function of a binary's bytes (e.g. the fc-agent initrd SHA).
 //!
 //! `firecracker --version` runs on the VM-launch / snapshot-clone hot path —
 //! `find_firecracker()` probes it and is called more than once per launch — and
-//! each probe is a fork+exec of a multi-megabyte binary. The answer only changes
-//! when the binary itself changes, so it is memoised per binary *identity*
-//! (path + mtime + size) in two layers:
+//! each probe is a fork+exec of a multi-megabyte binary. Likewise the fc-agent
+//! initrd SHA re-reads and SHA-256s a ~4.4MB binary per launch. The answer only
+//! changes when the binary itself changes, so it is memoised per binary
+//! *identity* (path + mtime + size) in two layers:
 //!
 //! * a process-local map, so repeat probes inside one fcvm process are free;
 //! * `assets_dir/version-cache/<key>.json`, so a *freshly spawned* fcvm (the
-//!   clone case: one short-lived process per VM) skips the exec too.
+//!   clone case: one short-lived process per VM) skips the exec/hash too.
 //!
-//! **Version gating still holds.** Rebuilding or replacing the binary changes
-//! its mtime and usually its size, which changes the key, so a changed binary is
-//! re-probed instead of inheriting the old version. A different path is a
-//! different key for the same reason.
+//! **Gating still holds.** Rebuilding or replacing the binary changes its mtime
+//! and usually its size, which changes the key, so a changed binary is
+//! re-derived instead of inheriting the old value. A different path is a
+//! different key for the same reason. Distinct derivations of the same binary
+//! are separated by a `namespace` string that is hashed into the key AND
+//! re-verified on read (`""` is the `--version` namespace, so pre-existing
+//! cache entries stay valid).
 //!
-//! Only *successful* probes are cached. A binary that fails to run (wrong arch,
-//! missing loader) re-runs every time and keeps producing its real error, which
-//! is what the fallback logic in `find_cloud_hypervisor()` depends on.
+//! Only *successful* derivations are cached. A binary that fails to run (wrong
+//! arch, missing loader) re-runs every time and keeps producing its real error,
+//! which is what the fallback logic in `find_cloud_hypervisor()` depends on.
 //!
-//! Cache IO never fails a probe: an unreadable or unwritable cache degrades to
-//! running the binary (so a root-created cache dir does not break unprivileged
+//! Cache IO never fails a derivation: an unreadable or unwritable cache degrades
+//! to recomputing (so a root-created cache dir does not break unprivileged
 //! runs, and vice versa — they just fall back to the in-process layer).
 //!
 //! Entries are ~250 bytes and one is added per distinct binary build ever
-//! probed, so the directory is bounded by how many firecracker /
-//! cloud-hypervisor builds a host has seen; no eviction is needed.
+//! probed, so the directory is bounded by how many binary builds a host has
+//! seen; no eviction is needed.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -34,14 +39,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tracing::debug;
 
-/// Persisted probe result. `path`/`mtime_ns`/`len` are re-verified on read so a
-/// hash collision or a hand-edited file can never hand back another binary's
-/// version string.
+/// Persisted derivation result. `path`/`mtime_ns`/`len`/`namespace` are
+/// re-verified on read so a hash collision or a hand-edited file can never hand
+/// back another binary's (or another derivation's) value.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CachedVersion {
     path: PathBuf,
     mtime_ns: i128,
     len: u64,
+    /// Which derivation this entry stores (`""` = `--version` stdout). Absent in
+    /// entries written before namespaces existed, which were all `--version`.
+    #[serde(default)]
+    namespace: String,
     stdout: String,
 }
 
@@ -69,18 +78,24 @@ impl BinaryIdentity {
         })
     }
 
-    /// Stable file name for this identity's on-disk cache entry.
-    fn key(&self) -> String {
+    /// Stable file name for this identity's on-disk cache entry. The namespace
+    /// is appended, so `""` (the `--version` namespace) produces byte-identical
+    /// keys to the pre-namespace scheme and existing cache entries stay valid.
+    fn key(&self, namespace: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.path.as_os_str().as_encoded_bytes());
         hasher.update(b"\0");
         hasher.update(self.mtime_ns.to_le_bytes());
         hasher.update(self.len.to_le_bytes());
+        hasher.update(namespace.as_bytes());
         hex::encode(&hasher.finalize()[..16])
     }
 
-    fn matches(&self, entry: &CachedVersion) -> bool {
-        entry.path == self.path && entry.mtime_ns == self.mtime_ns && entry.len == self.len
+    fn matches(&self, entry: &CachedVersion, namespace: &str) -> bool {
+        entry.path == self.path
+            && entry.mtime_ns == self.mtime_ns
+            && entry.len == self.len
+            && entry.namespace == namespace
     }
 }
 
@@ -105,18 +120,52 @@ pub fn version_output(bin: &Path) -> Result<String> {
 /// on-disk layer). Split out so tests can exercise the cache without touching
 /// the process-global asset paths.
 fn version_output_in(bin: &Path, cache_dir: Option<&Path>) -> Result<String> {
+    derived_in(bin, "", cache_dir, || {
+        let output = std::process::Command::new(bin)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("failed to run `{} --version`", bin.display()))?;
+        if !output.status.success() {
+            bail!(
+                "`{} --version` failed (exit {}): {}",
+                bin.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    })
+}
+
+/// Memoise an arbitrary string derived purely from a binary's bytes (plus
+/// whatever the caller folds into `namespace`), keyed by binary identity.
+/// `compute` runs on a miss; its value is cached only on success.
+pub fn derived(
+    bin: &Path,
+    namespace: &str,
+    compute: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    derived_in(bin, namespace, disk_cache_dir().as_deref(), compute)
+}
+
+fn derived_in(
+    bin: &Path,
+    namespace: &str,
+    cache_dir: Option<&Path>,
+    compute: impl FnOnce() -> Result<String>,
+) -> Result<String> {
     let identity = BinaryIdentity::of(bin);
 
     if let Some(id) = &identity {
-        let key = id.key();
+        let key = id.key(namespace);
         if let Ok(map) = memo().lock() {
             if let Some(hit) = map.get(&key) {
                 return Ok(hit.clone());
             }
         }
         if let Some(dir) = cache_dir {
-            if let Some(hit) = read_disk_entry(dir, &key, id) {
-                debug!(bin = %bin.display(), "version cache hit (disk)");
+            if let Some(hit) = read_disk_entry(dir, &key, id, namespace) {
+                debug!(bin = %bin.display(), namespace, "binary derivation cache hit (disk)");
                 if let Ok(mut map) = memo().lock() {
                     map.insert(key, hit.clone());
                 }
@@ -125,46 +174,35 @@ fn version_output_in(bin: &Path, cache_dir: Option<&Path>) -> Result<String> {
         }
     }
 
-    let output = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("failed to run `{} --version`", bin.display()))?;
-    if !output.status.success() {
-        bail!(
-            "`{} --version` failed (exit {}): {}",
-            bin.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let value = compute()?;
 
     if let Some(id) = &identity {
-        let key = id.key();
+        let key = id.key(namespace);
         if let Ok(mut map) = memo().lock() {
-            map.insert(key.clone(), stdout.clone());
+            map.insert(key.clone(), value.clone());
         }
         if let Some(dir) = cache_dir {
-            write_disk_entry(dir, &key, id, &stdout);
+            write_disk_entry(dir, &key, id, namespace, &value);
         }
     }
 
-    Ok(stdout)
+    Ok(value)
 }
 
-fn read_disk_entry(dir: &Path, key: &str, id: &BinaryIdentity) -> Option<String> {
+fn read_disk_entry(dir: &Path, key: &str, id: &BinaryIdentity, namespace: &str) -> Option<String> {
     let raw = std::fs::read_to_string(dir.join(format!("{}.json", key))).ok()?;
     let entry: CachedVersion = serde_json::from_str(&raw).ok()?;
-    id.matches(&entry).then_some(entry.stdout)
+    id.matches(&entry, namespace).then_some(entry.stdout)
 }
 
 /// Write the entry atomically (unique temp + rename): several fcvm processes can
 /// probe the same binary at once, and a reader must never see a partial file.
-fn write_disk_entry(dir: &Path, key: &str, id: &BinaryIdentity, stdout: &str) {
+fn write_disk_entry(dir: &Path, key: &str, id: &BinaryIdentity, namespace: &str, stdout: &str) {
     let entry = CachedVersion {
         path: id.path.clone(),
         mtime_ns: id.mtime_ns,
         len: id.len,
+        namespace: namespace.to_string(),
         stdout: stdout.to_string(),
     };
     if std::fs::create_dir_all(dir).is_err() {
@@ -351,5 +389,57 @@ mod tests {
             version_output_in(&bin, None).unwrap().trim(),
             "Firecracker v1.15.0"
         );
+    }
+
+    /// Different namespaces of the same binary are independent entries, and a
+    /// disk hit for one namespace can never satisfy the other (both the key and
+    /// the stored `namespace` field separate them).
+    #[test]
+    fn namespaces_are_isolated_per_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        std::fs::write(tmp.path().join("bin"), b"payload").unwrap();
+        let bin = tmp.path().join("bin");
+
+        let mut version_runs = 0;
+        let mut sha_runs = 0;
+        let v = derived_in(&bin, "", Some(&cache), || {
+            version_runs += 1;
+            Ok("v1".into())
+        })
+        .unwrap();
+        let s = derived_in(&bin, "initrd-sha:abc", Some(&cache), || {
+            sha_runs += 1;
+            Ok("sha-value".into())
+        })
+        .unwrap();
+        assert_eq!((v.as_str(), s.as_str()), ("v1", "sha-value"));
+        assert_eq!((version_runs, sha_runs), (1, 1));
+
+        // Fresh process simulation: disk layer must hit per-namespace.
+        memo().lock().unwrap().clear();
+        let v2 = derived_in(&bin, "", Some(&cache), || {
+            version_runs += 1;
+            Ok("WRONG".into())
+        })
+        .unwrap();
+        let s2 = derived_in(&bin, "initrd-sha:abc", Some(&cache), || {
+            sha_runs += 1;
+            Ok("WRONG".into())
+        })
+        .unwrap();
+        assert_eq!((v2.as_str(), s2.as_str()), ("v1", "sha-value"));
+        assert_eq!(
+            (version_runs, sha_runs),
+            (1, 1),
+            "disk hits must not recompute"
+        );
+
+        // A different namespace suffix (changed embedded scripts) recomputes.
+        let s3 = derived_in(&bin, "initrd-sha:def", Some(&cache), || {
+            Ok("new-scripts".into())
+        })
+        .unwrap();
+        assert_eq!(s3, "new-scripts");
     }
 }
