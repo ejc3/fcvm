@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>heavy fixture</title>
+<link rel="icon" href="data:,">
+<style>
+  body { font-family: "DejaVu Sans", sans-serif; margin: 1rem; }
+  table { border-collapse: collapse; font-size: 11px; }
+  td { border: 1px solid #cbd5e0; padding: 1px 4px; }
+  tr:nth-child(even) { background: #edf2f7; }
+  canvas { border: 1px solid #2b6cb0; display: block; margin: 1rem 0; }
+  #done { font-weight: bold; color: #276749; }
+</style>
+</head>
+<body>
+<h1>heavy fixture</h1>
+<p>Synchronous script below builds a 1200-row table with forced layout reads,
+then draws gradients, arcs, and text to a canvas and reads the pixels back —
+all before the load event fires, so navigation timing includes the work.</p>
+<div id="tbl"></div>
+<canvas id="cv" width="800" height="600"></canvas>
+<p id="done">not-done</p>
+<p id="marker">fixture=heavy</p>
+<script>
+(function () {
+  var t0 = performance.now();
+
+  // --- Layout: 1200-row x 6-col table, forcing synchronous layout every 100 rows.
+  var container = document.getElementById("tbl");
+  var table = document.createElement("table");
+  var layoutReads = 0;
+  for (var r = 0; r < 1200; r++) {
+    var tr = document.createElement("tr");
+    for (var c = 0; c < 6; c++) {
+      var td = document.createElement("td");
+      td.textContent = "r" + r + "c" + c + ":" + ((r * 31 + c * 7) % 997);
+      tr.appendChild(td);
+    }
+    table.appendChild(tr);
+    if (r % 100 === 99) {
+      container.appendChild(table);
+      layoutReads += table.offsetHeight > 0 ? 1 : 0; // force layout
+    }
+  }
+  container.appendChild(table);
+  var tableHeight = table.offsetHeight; // final forced layout
+  var tLayout = performance.now();
+
+  // --- Canvas: gradients, arcs, text, then a pixel readback to force raster.
+  var cv = document.getElementById("cv");
+  var ctx = cv.getContext("2d");
+  var grad = ctx.createLinearGradient(0, 0, 800, 600);
+  grad.addColorStop(0, "#2b6cb0");
+  grad.addColorStop(0.5, "#4fd1c5");
+  grad.addColorStop(1, "#ed8936");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 800, 600);
+  var seed = 42;
+  function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+  for (var i = 0; i < 3000; i++) {
+    ctx.beginPath();
+    ctx.arc(rnd() * 800, rnd() * 600, 2 + rnd() * 18, 0, 2 * Math.PI);
+    ctx.fillStyle = "rgba(" + ((i * 37) % 256) + "," + ((i * 91) % 256) + "," + ((i * 53) % 256) + ",0.35)";
+    ctx.fill();
+  }
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "14px sans-serif";
+  for (var j = 0; j < 200; j++) {
+    ctx.fillText("bench text row " + j, 10 + (j % 4) * 190, 14 + Math.floor(j / 4) * 11.5);
+  }
+  var pixels = ctx.getImageData(0, 0, 800, 600).data; // force software raster + readback
+  var checksum = 0;
+  for (var p = 0; p < pixels.length; p += 4096) { checksum = (checksum + pixels[p]) & 0xffffffff; }
+  var tCanvas = performance.now();
+
+  window.__benchStats = {
+    layout_ms: tLayout - t0,
+    canvas_ms: tCanvas - tLayout,
+    total_ms: tCanvas - t0,
+    table_height: tableHeight,
+    layout_reads: layoutReads,
+    canvas_checksum: checksum
+  };
+  document.getElementById("done").textContent =
+    "done layout_ms=" + (tLayout - t0).toFixed(1) +
+    " canvas_ms=" + (tCanvas - tLayout).toFixed(1) +
+    " checksum=" + checksum;
+})();
+</script>
+</body>
+</html>

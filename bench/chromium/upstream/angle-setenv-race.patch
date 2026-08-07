@@ -1,0 +1,187 @@
+From: <fill in your name/email>
+Date: Fri, 07 Aug 2026 08:10:57 +0000
+Subject: [PATCH] Vulkan: Don't mutate environ when VK_ICD_FILENAMES already matches
+
+ScopedVkLoaderEnvironment::setICDEnvironment() calls setenv() on
+VK_ICD_FILENAMES every time a Vulkan instance is probed or created, and
+the destructor calls setenv()/unsetenv() again to restore the old value.
+setenv() and unsetenv() are MT-Unsafe -- the glibc manual annotates both
+"MT-Unsafe const:env" and states plainly that "Modifications of
+environment variables are not allowed in multi-threaded programs".
+getenv() is only "MT-Safe env", i.e. safe against other readers, not
+against a concurrent writer: glibc's setenv() takes a lock that getenv()
+does not.
+
+ANGLE reaches this code from three production paths (vk_renderer.cpp,
+gpu_info_util/SystemInfo_vulkan.cpp, DeviceVk.cpp), all of which run
+long after the embedding application has started threads, so each
+set/restore pair is a race window against every getenv() in the process
+-- including getenv() calls made from inside other libraries.
+
+Observed as a startup SIGSEGV in Chromium 151.0.7922.71 on Debian
+bookworm arm64 with --single-process, at a rate of ~7% under launch
+concurrency (100% with a race amplifier). --single-process puts the GPU
+thread in the browser process, so the ANGLE ICD probe on
+Chrome_InProcGpuThread runs concurrently with Chromium's async fontconfig
+init, which is inside FcInitLoadConfigAndFonts -> FcConfigGetFilename ->
+getenv() on a thread-pool worker. The faulting instruction is the glibc
+environ walk "ldr x19, [x20, #8]!" with x19 holding recycled-allocator
+garbage rather than a char *.
+
+On glibc <= 2.40 the failure is a use-after-free rather than a torn read.
+__add_to_environ() takes the "name not present" path, which does
+realloc(last_environ, (size + 2) * sizeof (char *)) and republishes the
+result as __environ. When realloc moves the block the old array is freed
+while another thread is walking it, and that thread dereferences freed
+memory. glibc 2.41 (commit 7a61e7f557a9, "stdlib: Make getenv
+thread-safe in more cases") stopped deallocating old environ arrays, so
+the use-after-free is confined to glibc <= 2.40 -- but the call remains
+MT-Unsafe by contract and must not depend on the libc version.
+
+Whether the realloc moves the block depends on the size class of the
+current environ array, i.e. on how many variables the parent process
+exported. Measured, with the move/no-move observed directly via a setenv
+interposer: an sh parent (16 vars) grew in place and never crashed
+(0/6); a python3 parent (17 vars, CPython adds LC_CTYPE per PEP 538)
+moved the array and always crashed (6/6). One extra exported variable
+flips the outcome, which is why this looks like an unreproducible flake.
+
+A lock inside ANGLE cannot fix this, because the racing reader is
+usually not ANGLE code. That approach was already tried and rejected in
+Chromium (crrev.com/c/7725326, abandoned: "There's no reasonable way to
+make these functions thread-safe. The pointer returned from getenv() can
+easily be invalidated."). Renaming the variable to VK_DRIVER_FILES would
+not help either -- it is still a setenv() -- and was reverted once
+already for breaking the Fuchsia loader (crrev.com/c/3522821, reverted
+by crrev.com/c/3580980).
+
+ANGLE is a library and cannot choose when its embedder creates threads,
+so the environment has to be correct before ANGLE is reached. Chromium
+adopted exactly this pattern for its own env writes in
+crrev.com/c/7725187 ("set env FC_FONTATIONS and EGL_PLATFORM early ...
+avoids race conditions issues of setenv/getenv"), which moved a setenv()
+out of GlobalFontConfig construction -- but it did not cover ANGLE's
+VK_ICD_FILENAMES write, which is the writer that remains.
+
+This CL makes that contract usable: when VK_ICD_FILENAMES already holds
+exactly the value setICDEnvironment() would write, skip the mutation and
+report success. mChangedICDEnv stays false, which also suppresses the
+paired restore in the destructor, so a process that pre-set the variable
+before creating threads performs zero environ mutations on this path.
+Behaviour is unchanged when the variable is unset or holds a different
+value.
+
+This is intentionally minimal and does not remove the setenv() for
+embedders that do not pre-seed. The longer-term fix is to stop selecting
+an ICD through the environment at all: VK_LUNARG_direct_driver_loading
+passes the driver to vkCreateInstance via VkDirectDriverLoadingInfoLUNARG
+with no environ involvement. That needs Vulkan loader >= 1.3.234 and
+ANGLE loading the ICD itself, so it is not a drop-in given the loader
+versions ANGLE still supports.
+
+Bug: angleproject:TODO-file-me
+Test: Chromium 151.0.7922.71, Debian bookworm arm64, --single-process,
+    launched under concurrency from a 17-variable parent environment.
+    Baseline ~7% SIGSEGV in getenv() under FcConfigGetFilename; 100%
+    with an LD_PRELOAD getenv() that sleeps 20ms mid-walk for
+    FONTCONFIG*/XDG_*/HOME/FC_* names. With VK_ICD_FILENAMES pre-set to
+    the bundled SwiftShader ICD path before exec, a setenv interposer
+    shows this call site performing no environ mutation at all and the
+    crash does not occur: 0/15 and 0/60 amplified, 0/936 natural.
+    Also clean: --disable-software-rasterizer (0/15) and --use-gl=disabled
+    (0/15), both of which skip the ICD probe entirely. NOT a fix, for the
+    record: --no-zygote looks clean naturally (0/936) but is 15/15 under
+    the amplifier -- it only narrows the window.
+    NOT COMPILE-TESTED -- see the notes below the diff.
+
+---
+Generated against angle/angle main @ 7368784df4242e2a98b3820c95a99bd09f6f2fda
+(https://chromium.googlesource.com/angle/angle, fetched 2026-08-07)
+Apply with:  git am angle-setenv-race.patch     (or: git apply)
+
+diff --git a/src/common/vulkan/vulkan_icd.cpp b/src/common/vulkan/vulkan_icd.cpp
+index 9606208..c2076b1 100644
+--- a/src/common/vulkan/vulkan_icd.cpp
++++ b/src/common/vulkan/vulkan_icd.cpp
+@@ -212,7 +212,30 @@ bool ScopedVkLoaderEnvironment::setICDEnvironment(const char *icd)
+     // Override environment variable to use built Mock ICD
+     // ANGLE_VK_ICD_JSON gets set to the built mock ICD in BUILD.gn
+     mPreviousICDEnv = angle::GetEnvironmentVar(kLoaderICDFilenamesEnv);
+-    mChangedICDEnv  = angle::SetEnvironmentVar(kLoaderICDFilenamesEnv, icd);
++
++    // setenv()/unsetenv() are MT-Unsafe ("MT-Unsafe const:env" in the glibc manual): they
++    // mutate the process-wide environ array, which races against any concurrent getenv().
++    // The racing reader does not have to be ANGLE code - it can live in the Vulkan loader,
++    // in fontconfig, or in libc itself, so a lock inside ANGLE cannot make this safe.  On
++    // glibc < 2.41, adding a name that is not already present reallocates the environ array
++    // and frees the old one, so a concurrent getenv() walking that array dereferences freed
++    // memory and crashes.
++    //
++    // ANGLE is a library and cannot control when its embedder creates threads, so the
++    // environment must already be correct by the time we get here.  Embedders that
++    // initialize ANGLE after threads exist (for example Chromium with --single-process or
++    // --in-process-gpu, where the GPU thread runs in the browser process) are expected to
++    // set VK_ICD_FILENAMES before creating any thread.  When the variable already holds the
++    // value we would write, skip the mutation entirely: the loader will do what we want and
++    // no race window is opened.  Leaving mChangedICDEnv false also suppresses the paired
++    // restore in the destructor, which is a second mutation of the same array.
++    if (mPreviousICDEnv.valid() && mPreviousICDEnv.value() == icd)
++    {
++        mChangedICDEnv = false;
++        return true;
++    }
++
++    mChangedICDEnv = angle::SetEnvironmentVar(kLoaderICDFilenamesEnv, icd);
+ 
+     if (!mChangedICDEnv)
+     {
+-- 
+
+================================================================================
+REVIEWER NOTES -- what was and was NOT verified
+================================================================================
+
+NOT VERIFIED (no ANGLE build in the environment that produced this patch):
+
+  * Not compile-tested. ANGLE was not built. A reviewer must confirm the
+    change builds on every platform that compiles vulkan_icd.cpp, including
+    the !ANGLE_PLATFORM_ANDROID / ANGLE_PLATFORM_MACOS / ANGLE_PLATFORM_FUCHSIA
+    permutations, since setICDEnvironment() sits under those guards.
+  * No ANGLE test was run (angle_end2end_tests, angle_unittests, or the
+    VulkanHelper path in src/tests/test_utils/VulkanHelper.cpp:219).
+  * Behaviour with ICD::Mock was reasoned about but not exercised; the Mock
+    path uses the same setICDEnvironment() and should benefit identically,
+    but confirm the mock-ICD tests still select the mock driver.
+
+VERIFIED:
+
+  * The diff applies cleanly to angle/angle main at the SHA above
+    (git apply --check).
+  * The changed logic was extracted into a standalone translation unit built
+    against ANGLE's real src/common/Optional.h and compiled with
+    g++ -std=c++17 -Wall -Wextra. It type-checks, and all three cases behave
+    as intended:
+      - VK_ICD_FILENAMES unset          -> setenv() called, mChangedICDEnv=1
+                                           (destructor restores, as today)
+      - set to the SAME value           -> NO setenv(), mChangedICDEnv=0
+                                           (destructor does not restore),
+                                           returns true, mICD unchanged
+      - set to a DIFFERENT value        -> setenv() called, as today
+  * Optional<std::string>::valid()/value() semantics were read from
+    src/common/Optional.h; note GetEnvironmentVar() returns an empty string
+    for an unset variable, so the comparison cannot spuriously match (the ICD
+    path passed in is never empty -- it is a concatenated module path).
+
+POINTS A REVIEWER SHOULD PUSH ON:
+
+  * This narrows the race to the not-pre-seeded case rather than eliminating
+    setenv() from the path. If ANGLE wants the stronger guarantee, the two
+    other environ writers in this file (VK_LAYER_PATH via
+    PrependPathToEnvironmentVar under mEnableDebugLayers, and NODEVICE_SELECT
+    under MSan/ASan) deserve the same treatment; they were left alone here
+    to keep the change minimal and because neither is on the default
+    production path.
+  * crrev.com/c/7699542 (open) proposes unsetting VK_INSTANCE_LAYERS inside
+    ScopedVkLoaderEnvironment for an unrelated MangoHud crash. That would add
+    two more environ mutations to this exact hot path and would make this race
+    worse; the two changes should be looked at together.
