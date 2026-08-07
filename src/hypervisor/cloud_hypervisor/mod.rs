@@ -135,8 +135,11 @@ impl CloudHypervisorBackend {
     }
 
     /// Translate Firecracker-style boot args to a Cloud Hypervisor cmdline: CH's default
-    /// console is virtio `hvc0` (not the PL011 `ttyS0`/`ttyAMA0`) and it puts virtio
-    /// devices on PCI, so `pci=off` must be dropped.
+    /// console is virtio `hvc0` (not the PL011 `ttyS0`/`ttyAMA0`), it puts virtio
+    /// devices on PCI (so `pci=off` must be dropped), and it supports ACPI power-off
+    /// natively (so the Firecracker-specific `reboot=t`/`reboot=k` triple-fault hack
+    /// must be removed — otherwise `reboot -f` causes CH to *restart* the VM instead
+    /// of terminating the VMM process, creating an infinite reboot loop).
     fn ch_cmdline(fc_boot_args: &str, runtime_boot_args: &str) -> String {
         let combined = if runtime_boot_args.is_empty() {
             fc_boot_args.to_string()
@@ -144,12 +147,14 @@ impl CloudHypervisorBackend {
             format!("{fc_boot_args} {runtime_boot_args}")
         };
         // Token-based (not substring) so we only rewrite/drop whole kernel args, never an
-        // embedded value: map the serial console to virtio hvc0 and drop pci=off (CH puts
-        // virtio devices on PCI).
+        // embedded value: map the serial console to virtio hvc0, drop pci=off (CH puts
+        // virtio devices on PCI), and drop reboot=t/reboot=k (Firecracker-specific
+        // triple-fault/keyboard-controller shutdown that CH interprets as a reboot, not
+        // a termination; without it the kernel defaults to ACPI which CH handles correctly).
         combined
             .split_whitespace()
             .filter_map(|tok| match tok {
-                "pci=off" => None,
+                "pci=off" | "reboot=t" | "reboot=k" => None,
                 "console=ttyS0" | "console=ttyAMA0" => Some("console=hvc0"),
                 other => Some(other),
             })
@@ -639,11 +644,28 @@ mod tests {
         );
         assert!(!toks.contains(&"console=ttyS0"));
         assert!(!toks.contains(&"pci=off"), "pci=off dropped: {out}");
+        assert!(
+            !toks.contains(&"reboot=k"),
+            "reboot=k dropped (FC-specific): {out}"
+        );
         assert!(toks.contains(&"root=/dev/vda"));
         assert!(
             toks.contains(&"fcvm_bootplan=vsock"),
             "runtime args appended"
         );
+    }
+
+    /// reboot=t (x86 triple-fault) is dropped — it would cause CH to restart the VM
+    /// in an infinite loop instead of terminating the VMM process.
+    #[test]
+    fn ch_cmdline_drops_reboot_t() {
+        let out = CloudHypervisorBackend::ch_cmdline(
+            "console=ttyS0 reboot=t panic=1 pci=off root=/dev/vda rw",
+            "",
+        );
+        let toks: Vec<&str> = out.split_whitespace().collect();
+        assert!(!toks.contains(&"reboot=t"), "reboot=t dropped: {out}");
+        assert!(toks.contains(&"panic=1"), "other args preserved: {out}");
     }
 
     #[test]

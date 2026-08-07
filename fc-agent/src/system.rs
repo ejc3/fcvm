@@ -230,8 +230,25 @@ pub async fn shutdown_vm(exit_code: i32) -> ! {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        eprintln!("[fc-agent] calling reboot -f (triple-fault via reboot=t)...");
-        let _ = Command::new("reboot").args(["-f"]).spawn();
+        // Firecracker passes `reboot=t` (triple-fault reboot) on the kernel cmdline
+        // because it has no ACPI support — `reboot -f` triggers a triple-fault that
+        // Firecracker treats as VM termination (process exits).
+        //
+        // Cloud Hypervisor does NOT pass `reboot=t` (ch_cmdline filters it out) because
+        // CH supports ACPI natively. Without `reboot=t`, the kernel defaults to ACPI
+        // reboot, and `reboot -f` would cause CH to *restart* the VM in an infinite
+        // loop instead of terminating. Use `poweroff -f` (ACPI power-off) which CH
+        // handles by exiting the VMM process.
+        let use_triple_fault = std::fs::read_to_string("/proc/cmdline")
+            .map(|c| c.split_whitespace().any(|tok| tok == "reboot=t"))
+            .unwrap_or(true);
+        if use_triple_fault {
+            eprintln!("[fc-agent] calling reboot -f (triple-fault via reboot=t)...");
+            let _ = Command::new("reboot").args(["-f"]).spawn();
+        } else {
+            eprintln!("[fc-agent] calling poweroff -f (ACPI power-off)...");
+            let _ = Command::new("poweroff").args(["-f"]).spawn();
+        }
     }
 
     sleep(Duration::from_secs(2)).await;
@@ -243,7 +260,17 @@ pub async fn shutdown_vm(exit_code: i32) -> ! {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        eprintln!("[fc-agent] reboot didn't complete after 2s, trying sysrq");
+        eprintln!("[fc-agent] primary shutdown didn't complete after 2s, trying fallback");
+        // Try the opposite method as fallback.
+        let use_triple_fault = std::fs::read_to_string("/proc/cmdline")
+            .map(|c| c.split_whitespace().any(|tok| tok == "reboot=t"))
+            .unwrap_or(true);
+        if use_triple_fault {
+            eprintln!("[fc-agent] trying sysrq");
+        } else {
+            eprintln!("[fc-agent] trying reboot -f as fallback...");
+            let _ = Command::new("reboot").args(["-f"]).spawn();
+        }
     }
 
     sleep(Duration::from_secs(2)).await;
