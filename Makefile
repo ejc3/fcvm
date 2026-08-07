@@ -87,16 +87,11 @@ endif
 # Scoped to package(fcvm) so fuse-pipe's fast test_nested_file unit test is NOT excluded.
 # Mutually exclusive with IPV6_FILTER in practice — CI runners have an IPv4 route, so
 # IPV6_ONLY is never set there (two -E filtersets would be UNIONED, not intersected).
-# The CH cold-boot exclusion (see CI_FAST_FILTER, #687) is ANDed into the SAME filterset
-# here rather than added as a second -E: test-root uses default features (which include
-# integration-fast), so the CH integration tests also run under test-root, and a separate
-# -E would be UNIONED (re-including cold_boot) instead of intersected.
 CI ?=
 ifndef FILTER
 ifeq ($(CI),true)
-# Base test-root CI filter: the nested subset (exclude all nested except the 3 kept) AND
-# always exclude the CH cold-boot test (#687).
-CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs)) & not test(=test_cloud_hypervisor_cold_boot)
+# Base test-root CI filter: the nested subset (exclude all nested except the 3 kept).
+CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs))
 ifeq ($(FCVM_NO_SNAPSHOT),)
 # SnapshotEnabled mode (FCVM_NO_SNAPSHOT unset): ALSO drop test_nested_l2_with_large_files.
 # It guards FUSE-over-FUSE DATA INTEGRITY (the #630 DSB cache-coherency fix) — a live-traffic
@@ -111,19 +106,6 @@ else
 # SnapshotDisabled mode: keep test_nested_l2_with_large_files (the FUSE-integrity guard runs here).
 CI_NESTED_FILTER := -E '$(CI_ROOT_BASE)'
 endif
-endif
-endif
-
-# test-fast CI exclusions. test_cloud_hypervisor_cold_boot (a CH cold boot of an
-# instant-exit container, snapshots disabled) storms on x86_64 under full CI parallel
-# load: the host↔guest output-vsock/shutdown handshake loops and the VM never powers
-# off (180s timeout). Passes on arm64 and in isolation locally; same class as the #630
-# cold-boot event-loop storm. The snapshot-roundtrip test still cold-boots a CH VM
-# (nginx baseline) and exercises snapshot/restore, so CH cold boot keeps CI coverage.
-# Tracked in #687. Gated on CI=true; runs locally and with an explicit FILTER=.
-ifndef FILTER
-ifeq ($(CI),true)
-CI_FAST_FILTER := -E 'not test(=test_cloud_hypervisor_cold_boot)'
 endif
 endif
 
@@ -391,7 +373,7 @@ _test-unit:
 
 _test-fast:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(CI_FAST_FILTER) $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
 
 _test-all:
 	RUST_LOG="$(TEST_LOG)" \

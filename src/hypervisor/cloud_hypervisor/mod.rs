@@ -137,6 +137,13 @@ impl CloudHypervisorBackend {
     /// Translate Firecracker-style boot args to a Cloud Hypervisor cmdline: CH's default
     /// console is virtio `hvc0` (not the PL011 `ttyS0`/`ttyAMA0`) and it puts virtio
     /// devices on PCI, so `pci=off` must be dropped.
+    ///
+    /// Also appends `fcvm_shutdown=acpi`: on x86_64 fc-agent's only way to make
+    /// Firecracker exit is a triple fault (`reboot -f` under `reboot=t`), but Cloud
+    /// Hypervisor treats a triple fault as a guest-initiated RESET and reboots the VM
+    /// in-process — the guest boot-loops and fcvm's `vm_manager.wait()` never returns.
+    /// The token tells fc-agent this VMM honors ACPI/PSCI power-off (CH exits its
+    /// process on either), so it must power off instead of triple-faulting.
     fn ch_cmdline(fc_boot_args: &str, runtime_boot_args: &str) -> String {
         let combined = if runtime_boot_args.is_empty() {
             fc_boot_args.to_string()
@@ -146,15 +153,16 @@ impl CloudHypervisorBackend {
         // Token-based (not substring) so we only rewrite/drop whole kernel args, never an
         // embedded value: map the serial console to virtio hvc0 and drop pci=off (CH puts
         // virtio devices on PCI).
-        combined
+        let mut tokens: Vec<&str> = combined
             .split_whitespace()
             .filter_map(|tok| match tok {
                 "pci=off" => None,
                 "console=ttyS0" | "console=ttyAMA0" => Some("console=hvc0"),
                 other => Some(other),
             })
-            .collect::<Vec<_>>()
-            .join(" ")
+            .collect();
+        tokens.push("fcvm_shutdown=acpi");
+        tokens.join(" ")
     }
 
     /// Wait for the api-socket to accept connections and answer a ping, failing fast if
@@ -644,6 +652,10 @@ mod tests {
             toks.contains(&"fcvm_bootplan=vsock"),
             "runtime args appended"
         );
+        assert!(
+            toks.contains(&"fcvm_shutdown=acpi"),
+            "shutdown contract appended: {out}"
+        );
     }
 
     #[test]
@@ -652,12 +664,15 @@ mod tests {
         // left untouched (the substring `.replace()` would have corrupted these).
         let out = CloudHypervisorBackend::ch_cmdline("console=ttyS0extra fcpci=offx", "");
         let toks: Vec<&str> = out.split_whitespace().collect();
-        assert_eq!(toks, vec!["console=ttyS0extra", "fcpci=offx"]);
+        assert_eq!(
+            toks,
+            vec!["console=ttyS0extra", "fcpci=offx", "fcvm_shutdown=acpi"]
+        );
     }
 
     #[test]
     fn ch_cmdline_handles_empty_runtime_args() {
         let out = CloudHypervisorBackend::ch_cmdline("console=ttyAMA0 root=/dev/vda", "");
-        assert_eq!(out, "console=hvc0 root=/dev/vda");
+        assert_eq!(out, "console=hvc0 root=/dev/vda fcvm_shutdown=acpi");
     }
 }

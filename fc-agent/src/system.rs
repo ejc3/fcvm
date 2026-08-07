@@ -184,6 +184,20 @@ pub fn raise_resource_limits() {
     }
 }
 
+/// Whether the VMM wants an ACPI/PSCI power-off (`fcvm_shutdown=acpi` on the cmdline).
+///
+/// Firecracker's ACPI-less microVM on x86_64 only exits on a triple fault, so fc-agent
+/// defaults to `reboot -f` under `reboot=t` there. Cloud Hypervisor treats a triple
+/// fault as a guest-initiated RESET and reboots the VM in-process — the guest would
+/// boot-loop forever while fcvm waits for the VMM process to exit. fcvm therefore puts
+/// `fcvm_shutdown=acpi` on the Cloud Hypervisor cmdline: power off instead (CH exits
+/// its process on ACPI S5 on x86_64 exactly as it does for PSCI SYSTEM_OFF on aarch64).
+fn vmm_wants_acpi_shutdown() -> bool {
+    std::fs::read_to_string("/proc/cmdline")
+        .map(|c| c.split_whitespace().any(|tok| tok == "fcvm_shutdown=acpi"))
+        .unwrap_or(false)
+}
+
 /// Shutdown the VM. This function never returns.
 pub async fn shutdown_vm(exit_code: i32) -> ! {
     eprintln!("[fc-agent] shutting down VM (exit_code={})", exit_code);
@@ -223,32 +237,53 @@ pub async fn shutdown_vm(exit_code: i32) -> ! {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        eprintln!("[fc-agent] calling poweroff -f (PSCI SYSTEM_OFF)...");
+    let acpi = vmm_wants_acpi_shutdown();
+
+    if acpi {
+        eprintln!(
+            "[fc-agent] calling poweroff -f (fcvm_shutdown=acpi: ACPI S5 / PSCI SYSTEM_OFF)..."
+        );
         let _ = Command::new("poweroff").args(["-f"]).spawn();
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        eprintln!("[fc-agent] calling reboot -f (triple-fault via reboot=t)...");
-        let _ = Command::new("reboot").args(["-f"]).spawn();
-    }
-
-    sleep(Duration::from_secs(2)).await;
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        eprintln!("[fc-agent] poweroff didn't complete after 2s, trying reboot -f");
-        let _ = Command::new("reboot").args(["-f"]).spawn();
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        eprintln!("[fc-agent] reboot didn't complete after 2s, trying sysrq");
+    } else {
+        #[cfg(target_arch = "aarch64")]
+        {
+            eprintln!("[fc-agent] calling poweroff -f (PSCI SYSTEM_OFF)...");
+            let _ = Command::new("poweroff").args(["-f"]).spawn();
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            eprintln!("[fc-agent] calling reboot -f (triple-fault via reboot=t)...");
+            let _ = Command::new("reboot").args(["-f"]).spawn();
+        }
     }
 
     sleep(Duration::from_secs(2)).await;
-    eprintln!("[fc-agent] shutdown didn't complete, trying sysrq reboot");
-    let _ = std::fs::write("/proc/sysrq-trigger", "b");
+
+    if acpi {
+        eprintln!("[fc-agent] poweroff didn't complete after 2s, retrying poweroff -f");
+        let _ = Command::new("poweroff").args(["-f"]).spawn();
+    } else {
+        #[cfg(target_arch = "aarch64")]
+        {
+            eprintln!("[fc-agent] poweroff didn't complete after 2s, trying reboot -f");
+            let _ = Command::new("reboot").args(["-f"]).spawn();
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            eprintln!("[fc-agent] reboot didn't complete after 2s, trying sysrq");
+        }
+    }
+
+    sleep(Duration::from_secs(2)).await;
+    if acpi {
+        // sysrq "b" reboots — under a VMM that reboots in-process that would boot-loop,
+        // so the last resort must stay a power-off ("o").
+        eprintln!("[fc-agent] shutdown didn't complete, trying sysrq poweroff");
+        let _ = std::fs::write("/proc/sysrq-trigger", "o");
+    } else {
+        eprintln!("[fc-agent] shutdown didn't complete, trying sysrq reboot");
+        let _ = std::fs::write("/proc/sysrq-trigger", "b");
+    }
 
     sleep(Duration::from_secs(1)).await;
     eprintln!("[fc-agent] VM shutdown completely failed!");
