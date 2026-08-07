@@ -27,11 +27,11 @@ versus exactly 1 run per PR without pooling. For low-risk batches:
 | 5 | 0.01 | ~0.25         | ~4x    |
 | 5 | 0.05 | ~0.43         | ~2.3x  |
 | 8 | 0.01 | ~0.19         | ~5x    |
-| 5 | 0.35 | ~1.0          | none   |
+| 5 | 0.17 | ~1.0          | none   |
 
-Break-even is around p ≈ (1 − 1/k) / (2·log2 k) — about 0.35 for k = 5. So
-pooling pays off unless the PRs you batch fail CI more than a third of the
-time, in which case they were not low-risk PRs and should not have been
+Break-even is around p ≈ (1 − 1/k) / (2·log2 k) — about 0.17 for k = 5. So
+pooling pays off unless the PRs you batch fail CI more than about a sixth of
+the time, in which case they were not low-risk PRs and should not have been
 pooled.
 
 ## When to pool
