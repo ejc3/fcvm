@@ -1213,6 +1213,23 @@ async fn prepare_clone_substrate(
     })
 }
 
+/// Mint the restore-epoch value that tells a restored guest's fc-agent "you have
+/// just been restored — reconnect your vsock channels".
+///
+/// MUST be unique per restore, never wall-clock derived. fc-agent's watcher
+/// ([`fc-agent`]'s `watch_restore_epoch`) compares epochs only for (in)equality,
+/// and a snapshot taken FROM a restored VM captures the watcher's last-seen
+/// epoch inside guest memory. With the old second-granularity epochs
+/// (`SystemTime::now().as_secs()`), restoring such a snapshot within the same
+/// wall-clock second as its ancestor's restore handed the guest an IDENTICAL
+/// epoch: the watcher treated the restore as already handled, never reconnected
+/// exec/egress/output vsocks, and the clone never became healthy (120s health
+/// timeouts across the snapshot-hit suite once the clone hot path went
+/// sub-second). A fresh UUID makes every restore observably distinct.
+pub(crate) fn new_restore_epoch() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -1411,14 +1428,11 @@ pub async fn restore_from_snapshot(
         // Signal fc-agent to flush ARP cache and reconnect output vsock via MMDS.
         // MUST be after VM resume — Firecracker accepts PUT /mmds while paused but
         // the guest-visible MMDS data isn't updated until after resume.
-        let restore_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("system time before Unix epoch")?
-            .as_secs();
+        let restore_epoch = new_restore_epoch();
 
         let mut mmds_latest = serde_json::json!({
             "host-time": chrono::Utc::now().timestamp().to_string(),
-            "restore-epoch": restore_epoch.to_string()
+            "restore-epoch": restore_epoch.clone()
         });
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
@@ -1428,7 +1442,7 @@ pub async fn restore_from_snapshot(
             .await
             .context("updating MMDS with restore-epoch")?;
         info!(
-            restore_epoch = restore_epoch,
+            restore_epoch = %restore_epoch,
             clone_ipv6 = ?clone_ipv6,
             "signaled fc-agent via MMDS"
         );
@@ -2769,6 +2783,22 @@ mod tests {
     use crate::state::VmState;
     use crate::storage::SnapshotType;
     use std::path::Path;
+
+    /// Regression guard for the deaf-clone bug: a snapshot taken from a restored
+    /// VM embeds the ancestor's restore epoch in guest memory, so two restores in
+    /// the same wall-clock second MUST still produce different epochs — otherwise
+    /// fc-agent sees an unchanged epoch, skips handle_clone_restore, and the clone
+    /// never becomes healthy. Wall-clock-second epochs fail this; unique-per-call
+    /// epochs pass.
+    #[test]
+    fn restore_epochs_differ_for_back_to_back_restores() {
+        let a = new_restore_epoch();
+        let b = new_restore_epoch();
+        assert_ne!(
+            a, b,
+            "restore epochs minted back-to-back (same wall-clock second) must differ"
+        );
+    }
 
     /// `with_extension` would map "app.v1" onto "app.creating", colliding with an
     /// unrelated tag's files — snapshot_sibling must APPEND instead.

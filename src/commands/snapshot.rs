@@ -1360,13 +1360,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             // resumes the VM, so the restored guest's watcher can run handle_clone_restore
             // (reconnect output/exec vsock + clock sync) as soon as it resumes. The
             // listener task runs detached for the clone's (process) lifetime.
-            let restore_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            // Unique per restore (see new_restore_epoch): a wall-clock epoch
+            // repeats when a snapshot of a restored VM is itself restored within
+            // the same second, leaving the guest's watcher deaf to the restore.
+            let restore_epoch = super::common::new_restore_epoch();
             let mut latest = serde_json::json!({
                 "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch.to_string(),
+                "restore-epoch": restore_epoch,
             });
             if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
                 latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
