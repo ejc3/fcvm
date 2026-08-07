@@ -1,0 +1,62 @@
+# Chromium CDP benchmark container: warm headless browser + in-guest fixture server.
+#
+# The shared-nothing bench snapshots this container AFTER warmup (renderer, JIT,
+# network service, raster/encode all hot — the READY marker / the pageserver's
+# /ready endpoint flag the warm point), then fans out file-backed clones that
+# each drive one CDP render via bench/chromium/render.py.
+#
+# Build (repo root context; .dockerignore excludes target/):
+#   podman build -t localhost/chromium-bench -f Containerfile.chromium-bench .
+#
+# Host smoke test (fast loop, no VM):
+#   podman run -d --name cb localhost/chromium-bench
+#   podman logs -f cb          # wait for CHROMIUM_BENCH_READY
+#   podman exec cb python3 /opt/bench/render.py http://127.0.0.1:8000/medium.html \
+#       --out-prefix /tmp/medium
+#
+# Run with fcvm (rootless):
+#   fcvm podman run --name chromium-bench localhost/chromium-bench
+#   fcvm exec --pid <PID> -c -- python3 /opt/bench/render.py \
+#       http://127.0.0.1:8000/medium.html --out-prefix /tmp/medium
+#
+# Golden-snapshot warm point: /ready returns 200 only after warmup, so
+#   --health-check http://127.0.0.1:8000/ready
+# makes the auto startup snapshot capture a WARM browser.
+#
+# Fixtures live in bench/chromium/pages/ and are COPY'd in; the host-side
+# fixture server (bench harness) serves the SAME directory so in-guest and
+# host-served arms render identical bytes.
+
+FROM docker.io/library/debian:bookworm-slim
+
+# chromium: the browser under test (Debian ships arm64 builds)
+# python3: CDP driver (render.py) + fixture pageserver — no node/puppeteer bloat
+# fonts-dejavu-core: deterministic text rendering (slim base has no fonts -> tofu)
+# The trailing rm also drops /var/cache/apt/archives/partial (_apt-owned, mode
+# 0700): rootless fcvm packs the image store with an unprivileged mkfs.ext4 -d
+# outside the user namespace, and any non-root-owned dir without world rx makes
+# that fail with "__populate_fs: Permission denied".
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    python3 \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial
+
+# Belt-and-braces half of the getenv/setenv workaround documented at length in
+# bench/chromium/entry.sh. entry.sh exports this too, but the bench also drives
+# this image with `--entrypoint python3 <driver>`, which never runs entry.sh --
+# putting the name in the image environment means no entrypoint can lose it.
+# Any value would defuse the race (glibc only reallocs the environ array for a
+# name it has never seen); this is the exact string ANGLE composes, so nothing
+# observes a different ICD path than it would have anyway. To reproduce the
+# original crash for a regression test, run a non-entry.sh entrypoint with
+# `--unsetenv VK_ICD_FILENAMES` (entry.sh deliberately re-exports it, and
+# `-e VK_ICD_FILENAMES=` does NOT work -- an empty value still counts as
+# present, so glibc still slot-replaces; measured 0/12 under the amplifier).
+ENV VK_ICD_FILENAMES=/usr/lib/chromium/./vk_swiftshader_icd.json
+
+COPY bench/chromium/pages/ /opt/bench/pages/
+COPY bench/chromium/pageserver.py bench/chromium/render.py bench/chromium/entry.sh /opt/bench/
+RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py
+
+CMD ["/opt/bench/entry.sh"]

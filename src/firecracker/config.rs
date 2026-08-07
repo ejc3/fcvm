@@ -116,6 +116,14 @@ pub struct FirecrackerConfig {
     /// created by one FC version cannot be restored by another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firecracker_bin: Option<PathBuf>,
+    /// Guest failpoint spec (FCVM_GUEST_FAILPOINT), forwarded to fc-agent on the
+    /// kernel cmdline as `fcvm_failpoint=`. The runtime boot-args string is
+    /// excluded from the cache key, so this dedicated field puts the spec in the
+    /// key: a snapshot whose guest booted with failpoints armed must never be
+    /// restored by a normal run (and vice versa) — fuzz VMs get their own cache
+    /// entries. None (the default) is skip-serialized so existing keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_failpoint: Option<String>,
 }
 
 impl Default for FirecrackerConfig {
@@ -146,6 +154,7 @@ impl Default for FirecrackerConfig {
             ipv6_prefix: None,
             portable_volumes: false,
             firecracker_bin: None,
+            guest_failpoint: None,
         }
     }
 }
@@ -518,6 +527,17 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.privileged = true;
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    /// Guest failpoints ride the kernel cmdline and are baked into the snapshot,
+    /// so a run with FCVM_GUEST_FAILPOINT set must compute a different key —
+    /// fuzz VMs never pollute (or reuse) normal snapshot caches.
+    #[test]
+    fn test_snapshot_key_changes_with_guest_failpoint() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.guest_failpoint = Some("exec.post_accept_pre_read:sleep:100".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 

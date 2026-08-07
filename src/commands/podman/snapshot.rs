@@ -276,6 +276,9 @@ pub(super) fn build_firecracker_config(
         ipv6_prefix: args.ipv6_prefix.clone(),
         portable_volumes: args.portable_volumes,
         firecracker_bin: firecracker_bin.map(|p| p.to_path_buf()),
+        // Cache-key isolation for guest failpoints (see field docs): the spec is
+        // forwarded to the guest by build_runtime_boot_args from the same env var.
+        guest_failpoint: std::env::var("FCVM_GUEST_FAILPOINT").ok(),
     }
 }
 

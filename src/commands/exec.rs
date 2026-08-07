@@ -878,6 +878,13 @@ pub async fn start_exec_session_async(
     Ok((stream, guard))
 }
 
+// TIER 0 protocol-interleaving fuzz: scripted fake agents enumerating connection
+// death at every handshake stage, plus the exactly-once execution property
+// (kept in its own file — see exec_fuzz_tests.rs).
+#[cfg(test)]
+#[path = "exec_fuzz_tests.rs"]
+mod exec_fuzz_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

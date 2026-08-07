@@ -190,6 +190,13 @@ pub fn spawn_health_monitor_full(
                 }
             }
 
+            // failpoint: hold between the first-healthy ack gate above and the
+            // state-file persist — makes "client races the externally-visible
+            // Healthy transition" (exec/curl just before Healthy lands) deterministic.
+            if check_ok && health_status == HealthStatus::Healthy {
+                failpoint::hit_async("health.pre_persist_healthy").await;
+            }
+
             // Persist after the gate above. A failed check persists nothing (same as
             // before the check/persist split): the next iteration retries.
             let mut persisted = false;

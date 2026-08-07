@@ -2428,6 +2428,9 @@ pub async fn create_snapshot_core(
 
     // Pause VM before snapshotting (required by Firecracker).
     // If Pause fails/times out, the VM is NOT paused — no resume needed.
+    // failpoint: widen the window just before the pause — makes "in-flight
+    // exec/curl/serial write collides with the VM pause" deterministic.
+    failpoint::hit_async("snapshot.pre_pause").await;
     info!(snapshot = %snapshot_config.name, "pausing VM for snapshot");
     if let Err(e) = pause_client
         .patch_vm_state(ApiVmState {
@@ -2539,6 +2542,10 @@ pub async fn create_snapshot_core(
 
     // Resume VM (ALWAYS, regardless of snapshot/disk copy result).
     // Memory merge happens after resume since it operates on snapshot files, not live disk.
+    // failpoint: hold after the snapshot save (VM still paused) and before resume —
+    // makes "client observes a saved-but-still-paused VM" (stalled exec/curl/vsock
+    // across an arbitrarily long pause) deterministic.
+    failpoint::hit_async("snapshot.post_save_pre_resume").await;
     let resume_result = snapshot_client
         .patch_vm_state(ApiVmState {
             state: "Resumed".to_string(),

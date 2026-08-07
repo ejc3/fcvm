@@ -97,6 +97,21 @@ max-threads = "num-cpus"
 # stress_100 variant, each burning 100-150s before a clean retry). Give the
 # bench the entire runner: ~160s of exclusivity is cheaper in wall time than
 # the try-1 burns plus retries it causes.
+# Seeded lifecycle chaos fuzz (make fuzz, tests/test_fuzz_chaos.rs): ONE test
+# loops over every requested seed, each booting a VM and running a full op
+# schedule (~2-4 min/seed). The weekly CI run uses 20 seeds x 25 ops, so the
+# single test needs a multi-hour ceiling; the default run (1 seed, 10 ops)
+# finishes in ~2-3 min. Listed before the vm-tests override so it wins.
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(=test_fuzz_lifecycle_chaos)"
+test-group = "vm-tests"
+slow-timeout = { period = "7200s", terminate-after = 1 }
+# NEVER retry the chaos fuzzer: its interleavings are seed-scheduled but not
+# cycle-deterministic, so a wholesale retry would almost always pass and turn a
+# caught race into a green job with only a "flaky" footnote — exactly the hedge
+# this suite exists to eliminate. A chaos failure must fail the run.
+retries = 0
+
 [[profile.default.overrides]]
 filter = "package(fcvm) & test(/8000_concurrent/)"
 test-group = "stress-tests"
