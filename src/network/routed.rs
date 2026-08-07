@@ -393,9 +393,78 @@ impl NetworkManager for RoutedNetwork {
         namespace::create_namespace(&ns_name).await?;
         self.namespace_id = Some(ns_name.clone());
 
+        // 1b. Turn Duplicate Address Detection off inside the namespace, before any
+        //     interface exists there. Every link in here is a private point-to-point
+        //     segment we built ourselves, so there is nothing to detect a duplicate
+        //     against — but DAD still costs a random 0..router_solicitation_delay (1s)
+        //     kick plus dad_transmits(1) x retrans_time_ms(1000), during which br0's
+        //     link-local is `tentative`.
+        //
+        //     That is not merely cosmetic: the namespace routes guest traffic out via
+        //     the host veth's link-local, and to resolve that nexthop it must send a
+        //     Neighbor Solicitation sourced from a VALID link-local of its own. While
+        //     br0's is tentative there is no such source, so the NS is not sent and the
+        //     guest has no egress for 1-2s after restore.
+        //
+        //     `all` and `default` are both namespace-local here (unlike on the host,
+        //     where they are global), so this is scoped entirely to this VM: the kernel
+        //     skips DAD only when net.ipv6.conf.all.accept_dad AND the per-device value
+        //     are both < 1, and `default` supplies the per-device value for interfaces
+        //     created in — or moved into — the namespace after this point.
+        namespace::exec_in_namespace_checked(
+            &ns_name,
+            &[
+                "sysctl",
+                "-w",
+                "net.ipv6.conf.all.accept_dad=0",
+                "net.ipv6.conf.default.accept_dad=0",
+            ],
+        )
+        .await
+        .context("disabling IPv6 DAD in the VM namespace")?;
+
         // 2. Create veth pair and move guest side to namespace
         veth::create_veth_pair(&host_veth, &guest_veth, &ns_name).await?;
         self.host_veth = Some(host_veth.clone());
+
+        // 2b. Stop the kernel from autogenerating the host veth's link-local BEFORE
+        //     the link comes up (step 6). `create_veth_pair` leaves both ends down, so
+        //     this window is race-free.
+        //
+        //     Without this, the moment both ends go up the kernel installs the EUI-64
+        //     link-local itself, in `tentative` state, and runs Duplicate Address
+        //     Detection on it: a random 0..router_solicitation_delay (1s) kick delay
+        //     plus dad_transmits(1) x retrans_time_ms(1000) = 1-2s before the address
+        //     is usable. A tentative address does not answer Neighbor Solicitations,
+        //     so for that whole window the namespace cannot resolve its IPv6
+        //     default-route nexthop (this veth's link-local) and the guest has no
+        //     egress. Step 8's `nodad` add cannot rescue it either — the address is
+        //     already there, so the add fails EEXIST ("address already assigned") and
+        //     the NODAD flag never lands. `ip addr replace/change ... nodad` sets the
+        //     flag but does NOT cancel the in-flight DAD.
+        //
+        //     addr_gen_mode=1 (none) means the kernel installs nothing, so step 8's
+        //     explicit `nodad` add is the one that takes effect and is instantly valid.
+        //
+        //     keep_addr_on_down=1 compensates for the self-healing addr_gen_mode=1
+        //     gives up: by default the kernel flushes addresses on link-down and,
+        //     with autogeneration off, would never regenerate the link-local on
+        //     link-up — a veth bounce would leave the nexthop address gone for good.
+        //     With it, the manually-installed address survives down/up cycles.
+        //
+        //     Fresh boots hid this: DAD ran in the shadow of the multi-second guest
+        //     boot. Restored clones are ready in ~700ms, so it landed on the critical
+        //     path and cost every routed clone ~1s of egress downtime.
+        run_host_command(
+            "disabling kernel IPv6 address autogeneration on host veth",
+            "sysctl",
+            &[
+                "-w",
+                &format!("net.ipv6.conf.{}.addr_gen_mode=1", host_veth),
+                &format!("net.ipv6.conf.{}.keep_addr_on_down=1", host_veth),
+            ],
+        )
+        .await;
 
         // 3. Create TAP in namespace
         veth::create_tap_in_ns(&ns_name, &self.tap_device).await?;
@@ -504,31 +573,23 @@ impl NetworkManager for RoutedNetwork {
             }
         }
 
-        // 8. Assign link-local to host veth manually (auto-assignment fails when
-        //    all.forwarding=1 from a previous run). Use EUI-64 from MAC + nodad.
+        // 8. Assign the host veth's link-local (EUI-64 from MAC) with nodad. This is
+        //    the namespace's IPv6 default-route nexthop, so it must be usable — not
+        //    `tentative` — the instant the VM starts sending. Step 2b keeps the kernel
+        //    from claiming it first; assign_link_local_nodad repairs the address if
+        //    anything did claim it anyway (see its doc comment).
         let host_ll = generate_link_local_from_mac(&host_veth)
             .await
             .context("failed to generate link-local for host veth")?;
-        let host_ll_cidr = format!("{}/64", host_ll);
-        if run_host_command(
-            "assigning link-local to host veth",
-            "ip",
-            &[
-                "-6",
-                "addr",
-                "add",
-                &host_ll_cidr,
-                "dev",
-                &host_veth,
-                "scope",
-                "link",
-                "nodad",
-            ],
-        )
-        .await
-        {
-            info!(host_ll = %host_ll, "assigned link-local to host veth");
-        }
+        assign_link_local_nodad(&host_veth, &host_ll)
+            .await
+            .with_context(|| {
+                format!(
+                    "assigning link-local {} to host veth {}",
+                    host_ll, host_veth
+                )
+            })?;
+        info!(host_ll = %host_ll, "assigned link-local to host veth");
 
         // 9. In namespace: default IPv6 route goes through bridge → veth → host.
         //     The bridge forwards L2 frames from br0 to veth (bridge member).
@@ -873,8 +934,112 @@ async fn run_host_command(what: &str, program: &str, args: &[&str]) -> bool {
     }
 }
 
-/// Generate EUI-64 link-local address from interface MAC address.
-/// Needed because IPv6 link-local auto-assignment fails when forwarding=1.
+/// Assign `link_local` to `iface` as a scope-link address that is usable immediately.
+///
+/// "Immediately" is the whole point: this address is the VM namespace's IPv6
+/// default-route nexthop. While an IPv6 address is `tentative` the kernel does not
+/// answer Neighbor Solicitations for it, so the namespace cannot resolve the nexthop
+/// and the guest has no egress at all.
+///
+/// The plain `add ... nodad` path is what normally runs (step 2b disables kernel
+/// autogeneration, so nothing else has claimed the address). If something did claim it
+/// — an older kernel that rejects `addr_gen_mode`, or a leftover from a previous VM on
+/// a recycled interface name — the add fails EEXIST and the pre-existing address is
+/// mid-DAD. `ip addr replace`/`change` cannot fix that: they set the NODAD flag but
+/// leave the in-flight DAD running, so the address stays tentative for its full 1-2s.
+/// Deleting and re-adding is the only sequence that yields a non-tentative address, so
+/// that is the repair — and it runs ONLY when the interface really does hold the
+/// address already. Any other add failure (wrong device, permissions, ENOBUFS)
+/// propagates as an error without deleting anything: a blind `addr del` on such a
+/// failure could remove a valid in-use address.
+async fn assign_link_local_nodad(iface: &str, link_local: &str) -> Result<()> {
+    let cidr = format!("{}/64", link_local);
+    let add = || async {
+        tokio::process::Command::new("ip")
+            .args([
+                "-6", "addr", "add", &cidr, "dev", iface, "scope", "link", "nodad",
+            ])
+            .output()
+            .await
+            .context("running `ip -6 addr add` for host veth link-local")
+    };
+
+    let first = add().await?;
+    if first.status.success() {
+        return Ok(());
+    }
+
+    // Decide from the interface's actual state, not iproute2's error text (which
+    // varies across versions/locales), whether this is the already-assigned case.
+    if !iface_holds_ipv6_address(iface, link_local).await? {
+        anyhow::bail!(
+            "`ip -6 addr add {} dev {}` failed and the address is not present: {}",
+            cidr,
+            iface,
+            String::from_utf8_lossy(&first.stderr).trim()
+        );
+    }
+
+    warn!(
+        iface = %iface,
+        link_local = %link_local,
+        "link-local already present — deleting and re-adding so nodad takes effect"
+    );
+    run_host_command(
+        "removing pre-existing link-local from host veth",
+        "ip",
+        &["-6", "addr", "del", &cidr, "dev", iface],
+    )
+    .await;
+
+    let second = add().await?;
+    if second.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "could not assign a non-tentative link-local {} to {}: the guest's IPv6 \
+         default-route nexthop would be unreachable: {}",
+        link_local,
+        iface,
+        String::from_utf8_lossy(&second.stderr).trim()
+    );
+}
+
+/// Whether `iface` currently holds the IPv6 address `address`.
+///
+/// Addresses are compared parsed (`Ipv6Addr`), so a textual-form difference between
+/// what fcvm computed and what the kernel prints can never cause a false negative.
+async fn iface_holds_ipv6_address(iface: &str, address: &str) -> Result<bool> {
+    let want: std::net::Ipv6Addr = address
+        .parse()
+        .with_context(|| format!("parsing IPv6 address {}", address))?;
+    let output = tokio::process::Command::new("ip")
+        .args(["-j", "-6", "addr", "show", "dev", iface])
+        .output()
+        .await
+        .context("running `ip -j -6 addr show`")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`ip -j -6 addr show dev {}` failed: {}",
+            iface,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let links: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).context("parsing `ip -j -6 addr show` JSON")?;
+    Ok(links
+        .iter()
+        .flat_map(|link| link["addr_info"].as_array().into_iter().flatten())
+        .filter_map(|addr| addr["local"].as_str())
+        .filter_map(|s| s.parse::<std::net::Ipv6Addr>().ok())
+        .any(|a| a == want))
+}
+
+/// Generate the EUI-64 link-local address for an interface from its MAC.
+///
+/// This is the same address the kernel would autogenerate. Setup suppresses that
+/// autogeneration (step 2b) precisely so it can install this address itself with
+/// `nodad`, so fcvm has to compute it rather than read it back.
 async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
     let output = tokio::process::Command::new("ip")
         .args(["link", "show", iface])
