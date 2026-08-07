@@ -79,7 +79,7 @@ with no environ involvement. That needs Vulkan loader >= 1.3.234 and
 ANGLE loading the ICD itself, so it is not a drop-in given the loader
 versions ANGLE still supports.
 
-Bug: angleproject:TODO-file-me
+Bug: angleproject:543664586
 Test: Chromium 151.0.7922.71, Debian bookworm arm64, --single-process,
     launched under concurrency from a 17-variable parent environment.
     Baseline ~7% SIGSEGV in getenv() under FcConfigGetFilename; 100%

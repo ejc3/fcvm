@@ -84,7 +84,7 @@ echo "chromium-bench: launching chromium"
 #   unfixed  25/336 = 7.4% [5.1%, 10.8%] Wilson 95%
 #   this fix  0/336 = 0.0% [0.0%,  1.1%] Wilson 95%
 #
-# Upstream: https://issues.chromium.org/issues/TODO-FILE-ME (ANGLE
+# Upstream: https://issues.angleproject.org/issues/543664586 (ANGLE
 # ScopedVkLoaderEnvironment setenv vs gfx::InitializeGlobalFontConfigAsync).
 # Remove this only once that bug is fixed AND the fixed Chromium is in the image.
 #
