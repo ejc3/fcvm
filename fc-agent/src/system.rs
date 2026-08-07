@@ -240,7 +240,9 @@ pub async fn shutdown_vm(exit_code: i32) -> ! {
     let acpi = vmm_wants_acpi_shutdown();
 
     if acpi {
-        eprintln!("[fc-agent] calling poweroff -f (fcvm_shutdown=acpi: ACPI S5 / PSCI SYSTEM_OFF)...");
+        eprintln!(
+            "[fc-agent] calling poweroff -f (fcvm_shutdown=acpi: ACPI S5 / PSCI SYSTEM_OFF)..."
+        );
         let _ = Command::new("poweroff").args(["-f"]).spawn();
     } else {
         #[cfg(target_arch = "aarch64")]
