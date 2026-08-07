@@ -1598,8 +1598,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // - startup_snapshot_base_key is set (passed from podman run on cache hit)
     // - snapshot has a health check URL (needed to know when VM is fully initialized)
     let (startup_tx, mut startup_rx): (
-        Option<tokio::sync::oneshot::Sender<()>>,
-        Option<tokio::sync::oneshot::Receiver<()>>,
+        Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
+        Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
     ) = if args.startup_snapshot_base_key.is_some()
         && snapshot_config.metadata.health_check_url.is_some()
     {
@@ -1784,8 +1784,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     }
                     break;
                 }
-                // Handle startup snapshot creation when health becomes healthy
-                Ok(()) = async {
+                // Handle startup snapshot creation when health becomes healthy. The
+                // health monitor defers publishing Healthy until `startup_ack` is sent
+                // (or dropped by the abort paths below), so no client can observe
+                // Healthy while the snapshot pause has the vCPUs stopped.
+                Ok(startup_ack) = async {
                     match startup_rx.as_mut() {
                         Some(rx) => rx.await,
                         None => std::future::pending().await,
@@ -1855,6 +1858,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             }
                         }
                     }
+                    // Snapshot attempt over (created, skipped, or failed) and the VM is
+                    // resumed — let the health monitor publish Healthy. The break/abort
+                    // paths above drop `startup_ack`, which unblocks it the same way.
+                    let _ = startup_ack.send(());
                     // Continue waiting for VM exit or signals
                 }
             }

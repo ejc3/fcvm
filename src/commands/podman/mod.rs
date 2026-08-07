@@ -924,8 +924,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // - Have a snapshot key
     // - Have a health_check URL configured (HTTP health check, not just container-ready)
     let (startup_tx, startup_rx): (
-        Option<tokio::sync::oneshot::Sender<()>>,
-        Option<tokio::sync::oneshot::Receiver<()>>,
+        Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
+        Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
     ) = if !skip_snapshot_creation && snapshot_key.is_some() && args.health_check.is_some() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
@@ -1454,8 +1454,11 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 }
                 // Continue waiting for VM exit or cancellation
             }
-            // Handle startup snapshot creation when health becomes healthy
-            Ok(()) = async {
+            // Handle startup snapshot creation when health becomes healthy. The health
+            // monitor defers publishing Healthy until `startup_ack` is sent (or dropped
+            // by the abort paths below), so no client can observe Healthy while the
+            // snapshot pause has the vCPUs stopped.
+            Ok(startup_ack) = async {
                 match ctx.startup_rx.as_mut() {
                     Some(rx) => rx.await,
                     None => std::future::pending().await,
@@ -1524,6 +1527,10 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         }
                     }
                 }
+                // Snapshot attempt over (created, skipped, or failed) and the VM is
+                // resumed — let the health monitor publish Healthy. The early-return
+                // abort paths above drop `startup_ack`, which unblocks it the same way.
+                let _ = startup_ack.send(());
                 // Continue waiting for VM exit or cancellation
             }
         }
