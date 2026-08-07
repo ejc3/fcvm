@@ -1,0 +1,20 @@
+# Disk-capacity guard for fcvm CI runners. Installed to /etc/systemd/system by
+# scripts/build-ami.sh (baked into the runner AMI) and scripts/setup-runner.sh,
+# triggered hourly by runner-disk-guard.timer.
+#
+# A job-level preflight step cannot rescue a runner so full that GitHub's
+# "Set up job" phase fails (no step ever runs), so this guard cleans caches
+# before that point and — if the hard floor cannot be met — stops the
+# actions-runner service so the box goes offline and gets replaced instead of
+# poisoning every job it picks up. Same script as the ci.yml preflight step.
+
+[Unit]
+Description=Disk capacity guard: clean caches, quarantine runner if disk stays full
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/runner-disk-preflight.sh --quarantine
+# Pruning large btrfs trees can take a while; don't let the default 90s
+# start timeout kill the cleanup half-way.
+TimeoutStartSec=30min
+Nice=10

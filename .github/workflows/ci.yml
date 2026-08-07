@@ -247,6 +247,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+      # Free space before the dependency clones and builds that need it, and
+      # fail loudly (naming the runner) if the disk can't be recovered — a
+      # full runner otherwise produces mystery ENOSPC failures downstream.
+      # Runs as early as the repo's own script is available; it cannot rescue
+      # a runner already too full for "Set up job" itself (2026-08-06:
+      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # it picked up, including two on the dependabot merge train). That case
+      # is covered on the runner by scripts/runner-disk-guard.timer, which
+      # runs this same script hourly with --quarantine. Needs no secrets.
+      - name: Disk preflight
+        working-directory: fcvm
+        run: ./scripts/runner-disk-preflight.sh
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
@@ -463,6 +475,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+      # Free space before the dependency clones and builds that need it, and
+      # fail loudly (naming the runner) if the disk can't be recovered — a
+      # full runner otherwise produces mystery ENOSPC failures downstream.
+      # Runs as early as the repo's own script is available; it cannot rescue
+      # a runner already too full for "Set up job" itself (2026-08-06:
+      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # it picked up, including two on the dependabot merge train). That case
+      # is covered on the runner by scripts/runner-disk-guard.timer, which
+      # runs this same script hourly with --quarantine. Needs no secrets.
+      - name: Disk preflight
+        working-directory: fcvm
+        run: ./scripts/runner-disk-preflight.sh
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
@@ -649,6 +673,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+      # Free space before the dependency clones and builds that need it, and
+      # fail loudly (naming the runner) if the disk can't be recovered — a
+      # full runner otherwise produces mystery ENOSPC failures downstream.
+      # Runs as early as the repo's own script is available; it cannot rescue
+      # a runner already too full for "Set up job" itself (2026-08-06:
+      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # it picked up, including two on the dependabot merge train). That case
+      # is covered on the runner by scripts/runner-disk-guard.timer, which
+      # runs this same script hourly with --quarantine. Needs no secrets.
+      - name: Disk preflight
+        working-directory: fcvm
+        run: ./scripts/runner-disk-preflight.sh
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Setup KVM and rootless podman
         run: |

@@ -87,6 +87,19 @@ ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 # (scripts/build-passt.sh owns the pin and the local patches).
 git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm-passt
 /tmp/fcvm-passt/scripts/build-passt.sh
+
+# Disk-capacity guard (hourly timer), installed from the same clone. A runner
+# that fills its disk fails every job it picks up at "Set up job", before any
+# job step can run, so the CI preflight step cannot rescue it — this cleans
+# caches out-of-band and, if the hard floor still cannot be met, stops the
+# runner service so the box goes offline and gets replaced instead of
+# poisoning jobs.
+install -m 755 /tmp/fcvm-passt/scripts/runner-disk-preflight.sh /usr/local/bin/runner-disk-preflight.sh
+install -m 644 /tmp/fcvm-passt/scripts/runner-disk-guard.service /etc/systemd/system/runner-disk-guard.service
+install -m 644 /tmp/fcvm-passt/scripts/runner-disk-guard.timer /etc/systemd/system/runner-disk-guard.timer
+systemctl daemon-reload
+systemctl enable --now runner-disk-guard.timer
+
 rm -rf /tmp/fcvm-passt /tmp/passt-build-*
 cd /
 
