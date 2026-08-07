@@ -160,16 +160,31 @@ pub fn spawn_health_monitor_full(
                     if tx.send(ack_tx).is_ok() {
                         info!(target: "health-monitor",
                             "signaling startup snapshot trigger; deferring Healthy until its pause is over");
-                        if let Some(ref token) = cancel_token {
+                        let acked = if let Some(ref token) = cancel_token {
                             tokio::select! {
-                                _ = ack_rx => {}
+                                res = ack_rx => res.is_ok(),
                                 _ = token.cancelled() => {
                                     info!(target: "health-monitor", "cancellation requested during startup snapshot, stopping");
                                     break;
                                 }
                             }
                         } else {
-                            let _ = ack_rx.await;
+                            ack_rx.await.is_ok()
+                        };
+                        if !acked {
+                            // The ack sender was dropped without completing: the
+                            // startup-snapshot path was abandoned (guest-reboot
+                            // relaunch clears startup_rx; shutdown paths return
+                            // early). This Healthy observation predates that pause
+                            // or reboot — persisting it would publish Healthy for
+                            // a VM that is mid-reboot. Discard the observation and
+                            // re-check real state next tick. The spent trigger is
+                            // intentionally not re-armed: the relaunched VM takes
+                            // no startup snapshot, so from now on Healthy
+                            // observations persist ungated.
+                            warn!(target: "health-monitor",
+                                "startup snapshot ack dropped; discarding pre-pause Healthy observation and re-checking");
+                            continue;
                         }
                     }
                 }
@@ -177,12 +192,16 @@ pub fn spawn_health_monitor_full(
 
             // Persist after the gate above. A failed check persists nothing (same as
             // before the check/persist split): the next iteration retries.
+            let mut persisted = false;
             if check_ok {
-                if let Err(e) = state_manager
+                match state_manager
                     .update_health_status(&vm_id, health_status, exit_code)
                     .await
                 {
-                    warn!(target: "health-monitor", error = %e, "persisting health status failed");
+                    Ok(_) => persisted = true,
+                    Err(e) => {
+                        warn!(target: "health-monitor", error = %e, "persisting health status failed");
+                    }
                 }
             }
 
@@ -230,10 +249,19 @@ pub fn spawn_health_monitor_full(
                     check_duration.clamp(HEALTH_POLL_MIN_INTERVAL, HEALTH_POLL_MAX_INTERVAL);
             }
 
-            // Stop monitoring if container has stopped
+            // Stop monitoring if container has stopped — but only once the Stopped
+            // status actually reached the state file. If the persist failed, exiting
+            // here would leave the state file stale (possibly Healthy) forever; keep
+            // looping so the next tick retries the check and the write (mirrors the
+            // pre-split behavior where a persist error yielded Unknown and the
+            // monitor stayed alive).
             if health_status == HealthStatus::Stopped {
-                info!(target: "health-monitor", "container stopped, ending health monitor");
-                break;
+                if persisted {
+                    info!(target: "health-monitor", "container stopped, ending health monitor");
+                    break;
+                }
+                warn!(target: "health-monitor",
+                    "container stopped but persisting Stopped failed; retrying next tick");
             }
         }
     })
