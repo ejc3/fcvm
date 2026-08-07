@@ -1621,11 +1621,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if !tty_mode {
         let mut liveness_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         liveness_interval.tick().await; // consume immediate first tick
+        let mut output_connected = false;
         loop {
             tokio::select! {
                 result = &mut output_connected_rx => {
                     match result {
-                        Ok(()) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
+                        Ok(()) => {
+                            info!(vm_id = %vm_id, "fc-agent output connected, exec server ready");
+                            output_connected = true;
+                        }
                         Err(_) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
                     }
                     break;
@@ -1644,6 +1648,64 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     }
                 }
             }
+        }
+        // Dead-serial detection: the output vsock reconnecting proves the guest
+        // and its virtio transport are alive, but the serial console can still
+        // be dead if the snapshot was captured with UART TX bytes in flight —
+        // the restored guest's 8250 driver then waits forever for a TX
+        // interrupt the re-created serial device never delivers, and every log
+        // line from the VM silently disappears. A healthy restored fc-agent
+        // always prints restore-progress lines BEFORE reconnecting output, so
+        // zero console lines shortly after this point is proof of a poisoned
+        // snapshot. One loud error naming the snapshot instead of a trail of
+        // mystery test failures. The mid-TX-UART diagnosis is Firecracker-only
+        // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
+        // console, so they get a backend-neutral missing-console error.
+        if output_connected {
+            let console_lines = vm_manager.console_line_counter();
+            let backend = vm_manager.backend();
+            let snapshot_name = snapshot_name.clone();
+            let vm_id = vm_id.clone();
+            // 30s, not a few seconds: a freshly restored VM can be CPU-starved for a
+            // while (see the untimed output-connect wait above), and fc-agent's
+            // console gate releases up to ~500ms after WarmStart. A poisoned
+            // snapshot's serial is dead FOREVER, so a generous window costs nothing.
+            // Cancel-aware so it can't fire after the VM is torn down.
+            let watchdog_cancel = health_cancel_token.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    if console_lines.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                        _ = watchdog_cancel.cancelled() => return,
+                    }
+                }
+                match backend {
+                    crate::hypervisor::Backend::Firecracker => tracing::error!(
+                        vm_id = %vm_id,
+                        snapshot = %snapshot_name,
+                        "fc-agent's output vsock reconnected after restore but NO serial \
+                         console line arrived within 30s — snapshot '{}' almost certainly \
+                         captured the guest UART mid-transmit and every restore of it will \
+                         have a dead serial console. Recreate the snapshot.",
+                        snapshot_name
+                    ),
+                    crate::hypervisor::Backend::CloudHypervisor => tracing::error!(
+                        vm_id = %vm_id,
+                        snapshot = %snapshot_name,
+                        "fc-agent's output vsock reconnected after restore but NO console \
+                         output arrived within 30s — restores of snapshot '{}' come up with \
+                         a dead guest console. Recreate the snapshot.",
+                        snapshot_name
+                    ),
+                }
+            });
         }
     }
 

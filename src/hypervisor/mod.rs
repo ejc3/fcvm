@@ -177,6 +177,14 @@ pub trait Hypervisor: Send {
     /// Stream the guest serial/virtio console line-by-line.
     async fn stream_console(&self, console_path: &Path) -> Result<mpsc::Receiver<String>>;
 
+    /// Counter of guest console lines observed on this VMM process's console
+    /// stream since it spawned (serial → stdout for Firecracker, hvc0 file
+    /// tail for Cloud Hypervisor). The restore path watches it to detect a
+    /// restored VM whose serial console is dead — a snapshot that captured
+    /// the UART mid-transmit restores with the guest driver waiting on a TX
+    /// interrupt that never arrives, so no console line ever surfaces.
+    fn console_line_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64>;
+
     // --- cold-boot configuration (called in order; see trait docs) ---
 
     /// Apply the launch config (boot source, machine config, root drives) and the

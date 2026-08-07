@@ -119,6 +119,10 @@ impl Hypervisor for FirecrackerBackend {
         self.vm.stream_console(console_path).await
     }
 
+    fn console_line_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.vm.console_line_counter()
+    }
+
     async fn apply_launch_config(
         &mut self,
         config: &FirecrackerConfig,

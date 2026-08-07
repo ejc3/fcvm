@@ -50,6 +50,10 @@ pub struct VmManager {
     mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
+    /// Guest serial console lines observed on the Firecracker child's stdout
+    /// since spawn. Watched by the restore path to detect a dead serial
+    /// console (snapshot captured the UART mid-transmit).
+    console_lines: Arc<std::sync::atomic::AtomicU64>,
     client: Option<FirecrackerClient>,
 }
 
@@ -67,8 +71,15 @@ impl VmManager {
             mount_redirects: None,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: None,
         }
+    }
+
+    /// Counter of guest serial console lines seen since the Firecracker child
+    /// spawned (see [`crate::hypervisor::Hypervisor::console_line_counter`]).
+    pub fn console_line_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.console_lines)
     }
 
     /// Set the VM name for logging purposes
@@ -274,10 +285,17 @@ impl VmManager {
 
         // Spawn process with streaming output
         let stderr_tail = Arc::clone(&self.stderr_tail);
+        let console_lines = Arc::clone(&self.console_lines);
         let child = spawn_streaming(cmd, move |line, is_stderr| {
             let clean = strip_firecracker_prefix(line);
             // fc-agent and container output at INFO/WARN, everything else at DEBUG
             let is_important = clean.contains("fc-agent") || clean.contains("[ctr:");
+            if !is_stderr {
+                // Firecracker writes the guest serial console to its stdout
+                // (its own logs go to --log-path), so every stdout line is
+                // guest console output.
+                console_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if is_stderr {
                 // Keep the last few stderr lines so launch failures can report
                 // what Firecracker actually printed (its errors only appear at

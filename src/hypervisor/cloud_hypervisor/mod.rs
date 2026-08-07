@@ -79,6 +79,9 @@ pub struct CloudHypervisorBackend {
     /// The relaunch reuses the VM dir and keeps `ch-console.log`, so an orphaned tail
     /// would not self-exit — it must be aborted explicitly.
     console_tail: Option<JoinHandle<()>>,
+    /// Guest console (hvc0) lines observed by the console tail since spawn
+    /// (see [`Hypervisor::console_line_counter`]).
+    console_lines: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CloudHypervisorBackend {
@@ -100,6 +103,7 @@ impl CloudHypervisorBackend {
             pending: PendingConfig::default(),
             vsock_path: None,
             console_tail: None,
+            console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -354,7 +358,10 @@ impl Hypervisor for CloudHypervisorBackend {
             old.abort();
         }
         if let Some(cpath) = self.console_path() {
-            self.console_tail = Some(tokio::spawn(tail_console_to_tracing(cpath)));
+            self.console_tail = Some(tokio::spawn(tail_console_to_tracing(
+                cpath,
+                Arc::clone(&self.console_lines),
+            )));
         }
         Ok(())
     }
@@ -407,6 +414,10 @@ impl Hypervisor for CloudHypervisorBackend {
         // spawn_streaming, not via a separate console device file. Return an empty stream.
         let (_tx, rx) = mpsc::channel(1);
         Ok(rx)
+    }
+
+    fn console_line_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.console_lines)
     }
 
     async fn apply_launch_config(
@@ -518,8 +529,9 @@ pub const fn default_guest_cid() -> u32 {
 /// tracing logs (the portable equivalent of Firecracker streaming its serial to stdout).
 /// fc-agent / container lines go at INFO, kernel/boot noise at DEBUG. The loop exits once
 /// the file has been gone for a few seconds (the VM dir was cleaned up), so it never
-/// outlives its VM.
-async fn tail_console_to_tracing(path: PathBuf) {
+/// outlives its VM. Each line also bumps `console_lines` (dead-console detection
+/// after restore — see [`Hypervisor::console_line_counter`]).
+async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::atomic::AtomicU64>) {
     use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 
     // Wait for Cloud Hypervisor to create the console file at boot.
@@ -545,6 +557,7 @@ async fn tail_console_to_tracing(path: PathBuf) {
                             Ok(0) => break, // caught up; poll again after a short sleep
                             Ok(n) => {
                                 pos += n as u64;
+                                console_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let clean = line.trim_end();
                                 if clean.contains("fc-agent") || clean.contains("[ctr:") {
                                     info!(target: "cloud-hypervisor", "{}", clean);
