@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 
 use self::api::{
     BalloonConfig, ChClient, ConsoleConfig, CpusConfig, DiskConfig, MemoryConfig, NetConfig,
-    PayloadConfig, RngConfig, VmConfig, VsockConfig,
+    PayloadConfig, PlatformConfig, RngConfig, VmConfig, VsockConfig,
 };
 use super::{Backend, Capabilities, DriveSpec, Hypervisor, NetIfaceSpec, ProcessSpec};
 use crate::utils::{install_namespace_pre_exec, spawn_streaming, NamespaceParams};
@@ -262,6 +262,14 @@ impl CloudHypervisorBackend {
             balloon: self.pending.balloon_mib.map(|mib| BalloonConfig {
                 size: mib as u64 * 1024 * 1024,
                 deflate_on_oom: true,
+            }),
+            // Make the VMM process exit on guest reboot (matching Firecracker behavior).
+            // Without this, Cloud Hypervisor reboots the VM in place and the process never
+            // exits, so `run_vm_loop` never sees the child exit and the fc-agent's
+            // `shutdown_vm()` (which calls `reboot -f`) causes an infinite reboot loop
+            // instead of a clean shutdown.
+            platform: Some(PlatformConfig {
+                on_reboot: "shutdown".to_string(),
             }),
         })
     }

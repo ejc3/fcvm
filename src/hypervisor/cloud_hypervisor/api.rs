@@ -159,6 +159,8 @@ pub struct VmConfig {
     pub rng: Option<RngConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balloon: Option<BalloonConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<PlatformConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,6 +229,17 @@ pub struct BalloonConfig {
     pub size: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub deflate_on_oom: bool,
+}
+
+/// Platform-level configuration (x86 IOAPIC, ACPI, reboot behavior, etc.).
+/// Cloud Hypervisor defaults `on_reboot` to in-place reboot; fcvm needs it set to
+/// `"shutdown"` so the VMM process exits on guest reboot (matching Firecracker behavior)
+/// and `run_vm_loop` can detect the exit and decide whether to relaunch.
+#[derive(Debug, Serialize)]
+pub struct PlatformConfig {
+    /// What happens when the guest triggers a reboot: `"shutdown"` makes the VMM exit
+    /// (like Firecracker), `"reboot"` (the CH default) reboots in place.
+    pub on_reboot: String,
 }
 
 #[derive(Debug, Serialize)]
