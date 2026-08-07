@@ -91,8 +91,16 @@ pub fn run_tty_session(socket_path: &str, tty: bool, interactive: bool) -> Resul
 
     debug!("TTY connection established");
 
-    // Run the session with the connected stream
-    let result = run_tty_session_connected(stream, tty, interactive);
+    // Run the session with the connected stream. This is the `podman run -it`
+    // console (host-bound listener socket, not an exec vsock session), so the
+    // snapshot-orphan guard does not apply — and the socket carries no read
+    // timeout, so the disabled guard is never even consulted.
+    let result = run_tty_session_connected(
+        stream,
+        tty,
+        interactive,
+        crate::commands::exec::SnapshotOrphanGuard::disabled(),
+    );
 
     // Clean up socket
     let _ = std::fs::remove_file(socket_path);
@@ -108,7 +116,18 @@ pub fn run_tty_session(socket_path: &str, tty: bool, interactive: bool) -> Resul
 /// 2. Spawns reader thread (socket -> stdout)
 /// 3. Spawns writer thread if `interactive=true` (stdin -> socket)
 /// 4. Returns exit code from remote command
-pub fn run_tty_session_connected(stream: UnixStream, tty: bool, interactive: bool) -> Result<i32> {
+///
+/// `guard` is the exec session's snapshot-orphan guard: reads that sit idle
+/// past the epoch poll interval check it, so a session silently killed by a
+/// VM snapshot pause aborts loudly instead of hanging (an idle shell with an
+/// unchanged epoch waits forever, which is correct). The `podman run -it`
+/// console path passes `SnapshotOrphanGuard::disabled()`.
+pub fn run_tty_session_connected(
+    stream: UnixStream,
+    tty: bool,
+    interactive: bool,
+    guard: crate::commands::exec::SnapshotOrphanGuard,
+) -> Result<i32> {
     // Set up raw terminal mode if TTY requested
     let stdin_fd = std::io::stdin().as_raw_fd();
 
@@ -132,9 +151,15 @@ pub fn run_tty_session_connected(stream: UnixStream, tty: bool, interactive: boo
     let read_stream = stream.try_clone().context("cloning stream for reader")?;
     let mut write_stream = stream;
 
-    // Spawn reader thread: socket -> stdout
+    // Spawn reader thread: socket -> stdout. The epoch-guarded reader turns
+    // idle-read timeouts into snapshot-orphan checks (see exec.rs).
     let reader_done = done.clone();
-    let reader_thread = std::thread::spawn(move || reader_loop(read_stream, reader_done));
+    let reader_thread = std::thread::spawn(move || {
+        reader_loop(
+            crate::commands::exec::EpochGuardedReader::new(read_stream, guard),
+            reader_done,
+        )
+    });
 
     // Spawn writer thread if interactive: stdin -> socket
     let writer_thread = if interactive {
@@ -227,7 +252,7 @@ fn restore_terminal(stdin_fd: i32, orig_termios: Termios) {
 }
 
 /// Reader loop: read framed messages from socket, write to stdout
-fn reader_loop(mut stream: std::os::unix::net::UnixStream, done: Arc<AtomicBool>) -> Option<i32> {
+fn reader_loop<R: std::io::Read>(mut stream: R, done: Arc<AtomicBool>) -> Option<i32> {
     let mut stdout = std::io::stdout().lock();
     let mut total_read: usize = 0;
 
@@ -275,6 +300,16 @@ fn reader_loop(mut stream: std::os::unix::net::UnixStream, done: Arc<AtomicBool>
                         "\r\nfcvm: exec connection closed before the command's exit status \
                          was received (the VM or agent may have exited)\r"
                     );
+                    done.store(true, Ordering::Relaxed);
+                    return Some(1);
+                }
+                // Snapshot-pause orphan (epoch guard fired): the session's vsock
+                // transport was silently reset — name the failure mode loudly.
+                if let Some(orphan) = e.get_ref().filter(|inner| {
+                    inner.is::<crate::commands::exec::ExecOrphanedBySnapshotPause>()
+                }) {
+                    debug!("reader_loop: snapshot-pause orphan: {}", orphan);
+                    eprintln!("\r\nfcvm: {}\r", orphan);
                     done.store(true, Ordering::Relaxed);
                     return Some(1);
                 }

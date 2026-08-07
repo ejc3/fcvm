@@ -34,6 +34,15 @@ pub struct VmState {
     /// Namespace holder PID for rootless networking (used for nsenter health checks)
     #[serde(default)]
     pub holder_pid: Option<u32>,
+    /// Monotonically increasing count of host-side vsock transport resets.
+    /// Bumped (locked read-modify-write via `StateManager::bump_vsock_epoch`)
+    /// after every snapshot pause/save of this VM and BEFORE the VM resumes:
+    /// the pause silently orphans in-flight vsock connections (no error on
+    /// either side), so a changed epoch tells a blocked exec client its
+    /// session is dead (see `commands::exec::SnapshotOrphanGuard`). Defaults
+    /// to 0 so state files written before this field existed still load.
+    #[serde(default)]
+    pub vsock_epoch: u64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_updated: chrono::DateTime<chrono::Utc>,
     pub config: VmConfig,
@@ -208,6 +217,7 @@ impl VmState {
             pid: None,
             pid_start_time: None,
             holder_pid: None,
+            vsock_epoch: 0,
             created_at: now,
             last_updated: now,
             config: VmConfig {
@@ -291,6 +301,24 @@ mod tests {
         assert_eq!(vm_from_str, ProcessType::Vm);
         assert_eq!(serve_from_str, ProcessType::Serve);
         assert_eq!(clone_from_str, ProcessType::Clone);
+    }
+
+    #[test]
+    fn test_vsock_epoch_defaults_to_zero_for_old_state_files() {
+        // State files written before vsock_epoch existed must load as epoch 0,
+        // and a bumped epoch must round-trip.
+        let mut state = VmState::new("vm-old".to_string(), "alpine:latest".to_string(), 1, 128);
+        assert_eq!(state.vsock_epoch, 0);
+
+        let mut json: serde_json::Value = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("vsock_epoch");
+        let loaded: VmState = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.vsock_epoch, 0, "missing field must default to 0");
+
+        state.vsock_epoch = 7;
+        let roundtrip: VmState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(roundtrip.vsock_epoch, 7);
     }
 
     #[test]

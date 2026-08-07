@@ -110,6 +110,7 @@ async fn test_library_api_exec_captured() -> Result<()> {
         &vsock,
         &["echo".into(), "hello-api".into()],
         true, // in_container
+        &handle.vm_id,
     )
     .await?;
 
@@ -125,6 +126,7 @@ async fn test_library_api_exec_captured() -> Result<()> {
         &vsock,
         &["sh".into(), "-c".into(), "echo errmsg >&2; exit 42".into()],
         true,
+        &handle.vm_id,
     )
     .await?;
 
@@ -165,7 +167,8 @@ async fn test_library_api_async_connection() -> Result<()> {
         interactive: false,
         tty: false,
     };
-    let mut stream = exec::start_exec_session_async(&vsock, request).await?;
+    let (mut stream, _guard) =
+        exec::start_exec_session_async(&vsock, request, &handle.vm_id).await?;
 
     // Non-TTY responses are JSON lines; the agent closes after Exit, so read
     // to EOF and check both the output and the exit message arrived.

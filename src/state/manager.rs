@@ -636,6 +636,29 @@ impl StateManager {
         Ok(previous_status)
     }
 
+    /// Record a host-side vsock transport reset for this VM by bumping the
+    /// persisted `vsock_epoch` (locked read-modify-write via `update_state`).
+    ///
+    /// Ordering contract: call this AFTER a snapshot pause/save and BEFORE the
+    /// VM is resumed. Exec clients capture the epoch right after their vsock
+    /// connection is established — which is only possible against a running
+    /// guest — so bumping while the VM is still paused guarantees that every
+    /// connection from before the pause observes the change (loud orphan abort
+    /// instead of an indefinite hang) and every post-resume connection reads
+    /// the already-bumped value (no false abort).
+    ///
+    /// Returns the new epoch, or `None` if the state file no longer exists
+    /// (VM mid-teardown — its exec sessions get a socket error when the
+    /// hypervisor exits, so no epoch signal is needed).
+    pub async fn bump_vsock_epoch(&self, vm_id: &str) -> Result<Option<u64>> {
+        let updated = self
+            .update_state(vm_id, |state| {
+                state.vsock_epoch += 1;
+            })
+            .await?;
+        Ok(updated.map(|state| state.vsock_epoch))
+    }
+
     /// Allocate a unique loopback IP for rootless networking and persist it atomically
     ///
     /// Uses a global lock file to ensure atomic allocation across concurrent VM starts.

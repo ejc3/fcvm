@@ -233,18 +233,21 @@ fn ensure_exec_succeeded(operation: &str, output: &ExecOutput) -> std::result::R
 }
 
 // ============================================================================
-// Helper: get sandbox + vsock path
+// Helper: get sandbox exec target (vsock path + vm_id)
 // ============================================================================
 
-async fn get_vsock_path(
+/// Resolve a sandbox id to its exec target: the vsock socket path plus the
+/// vm_id whose persisted `vsock_epoch` guards exec sessions against the
+/// snapshot-pause orphan mode (see `commands::exec::SnapshotOrphanGuard`).
+async fn get_exec_target(
     state: &SharedState,
     id: &str,
-) -> std::result::Result<std::path::PathBuf, Response> {
+) -> std::result::Result<(std::path::PathBuf, String), Response> {
     let sandboxes = state.sandboxes.read().await;
     let entry = sandboxes
         .get(id)
         .ok_or_else(|| gateway_error(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id)))?;
-    Ok(entry.handle.vsock_socket_path())
+    Ok((entry.handle.vsock_socket_path(), entry.handle.vm_id.clone()))
 }
 
 fn sandbox_url(port: u16, id: &str) -> String {
@@ -501,7 +504,7 @@ async fn run_code(
     Path(id): Path<String>,
     Json(req): Json<RunCodeRequest>,
 ) -> Response {
-    let (vsock_path, language) = {
+    let (vsock_path, vm_id, language) = {
         let sandboxes = state.sandboxes.read().await;
         let entry = match sandboxes.get(&id) {
             Some(e) => e,
@@ -517,12 +520,16 @@ async fn run_code(
                 .unwrap_or("python")
                 .to_string()
         });
-        (entry.handle.vsock_socket_path(), lang)
+        (
+            entry.handle.vsock_socket_path(),
+            entry.handle.vm_id.clone(),
+            lang,
+        )
     };
 
     let cmd = language_to_run_command(&language, &req.code);
 
-    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
+    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true, &vm_id).await {
         Ok(o) => o,
         Err(e) => {
             return gateway_error(
@@ -555,8 +562,8 @@ async fn run_command(
     Path(id): Path<String>,
     Json(req): Json<RunCommandRequest>,
 ) -> Response {
-    let vsock_path = match get_vsock_path(&state, &id).await {
-        Ok(p) => p,
+    let (vsock_path, vm_id) = match get_exec_target(&state, &id).await {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -566,7 +573,7 @@ async fn run_command(
     };
     let start = std::time::Instant::now();
 
-    let output = match run_exec_in_vm_captured(&vsock_path, &shell_cmd, true).await {
+    let output = match run_exec_in_vm_captured(&vsock_path, &shell_cmd, true, &vm_id).await {
         Ok(o) => o,
         Err(e) => {
             return gateway_error(
@@ -636,8 +643,8 @@ async fn list_files(
     Path(id): Path<String>,
     Query(query): Query<FilesQuery>,
 ) -> Response {
-    let vsock_path = match get_vsock_path(&state, &id).await {
-        Ok(p) => p,
+    let (vsock_path, vm_id) = match get_exec_target(&state, &id).await {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -654,7 +661,7 @@ async fn list_files(
         ),
     ];
 
-    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
+    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true, &vm_id).await {
         Ok(o) => o,
         Err(e) => {
             return gateway_error(
@@ -710,8 +717,8 @@ async fn create_file(
     Path(id): Path<String>,
     Json(req): Json<CreateFileRequest>,
 ) -> Response {
-    let vsock_path = match get_vsock_path(&state, &id).await {
-        Ok(p) => p,
+    let (vsock_path, vm_id) = match get_exec_target(&state, &id).await {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -745,7 +752,7 @@ async fn create_file(
 
     let cmd = vec!["sh".into(), "-c".into(), write_cmd];
 
-    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
+    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true, &vm_id).await {
         Ok(o) => o,
         Err(e) => {
             return gateway_error(
@@ -777,8 +784,8 @@ async fn read_file(
     State(state): State<SharedState>,
     Path((id, file_path)): Path<(String, String)>,
 ) -> Response {
-    let vsock_path = match get_vsock_path(&state, &id).await {
-        Ok(p) => p,
+    let (vsock_path, vm_id) = match get_exec_target(&state, &id).await {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -795,7 +802,7 @@ async fn read_file(
         format!("cat '{}'", abs_path.replace('\'', "'\\''")),
     ];
 
-    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
+    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true, &vm_id).await {
         Ok(o) => o,
         Err(e) => {
             return gateway_error(
@@ -827,8 +834,8 @@ async fn file_exists(
     State(state): State<SharedState>,
     Path((id, file_path)): Path<(String, String)>,
 ) -> Response {
-    let vsock_path = match get_vsock_path(&state, &id).await {
-        Ok(p) => p,
+    let (vsock_path, vm_id) = match get_exec_target(&state, &id).await {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -845,7 +852,7 @@ async fn file_exists(
         format!("test -e '{}'", abs_path.replace('\'', "'\\''")),
     ];
 
-    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
+    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true, &vm_id).await {
         Ok(o) => o,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -861,8 +868,8 @@ async fn delete_file(
     State(state): State<SharedState>,
     Path((id, file_path)): Path<(String, String)>,
 ) -> Response {
-    let vsock_path = match get_vsock_path(&state, &id).await {
-        Ok(p) => p,
+    let (vsock_path, vm_id) = match get_exec_target(&state, &id).await {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -879,7 +886,7 @@ async fn delete_file(
         format!("rm -rf '{}'", abs_path.replace('\'', "'\\''")),
     ];
 
-    if let Err(e) = run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
+    if let Err(e) = run_exec_in_vm_captured(&vsock_path, &cmd, true, &vm_id).await {
         return gateway_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to delete file: {}", e),
@@ -921,20 +928,24 @@ async fn ws_terminal(
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let vsock_path = {
+    let (vsock_path, vm_id) = {
         let sandboxes = state.sandboxes.read().await;
         match sandboxes.get(&id) {
-            Some(entry) => entry.handle.vsock_socket_path(),
+            Some(entry) => (entry.handle.vsock_socket_path(), entry.handle.vm_id.clone()),
             None => {
                 return gateway_error(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id));
             }
         }
     };
 
-    ws.on_upgrade(move |socket| ws_terminal_handler(socket, vsock_path))
+    ws.on_upgrade(move |socket| ws_terminal_handler(socket, vsock_path, vm_id))
 }
 
-async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: std::path::PathBuf) {
+async fn ws_terminal_handler(
+    mut ws: axum::extract::ws::WebSocket,
+    vsock_path: std::path::PathBuf,
+    vm_id: String,
+) {
     use axum::extract::ws::{CloseFrame, Message as WsMessage};
     use tokio::io::AsyncWriteExt;
 
@@ -948,9 +959,14 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
 
     // Connect and complete the exec handshake (request → ACK → GO); the
     // returned stream carries only post-GO TTY frames.
-    let stream = match crate::commands::exec::start_exec_session_async(&vsock_path, exec_req).await
+    let (stream, guard) = match crate::commands::exec::start_exec_session_async(
+        &vsock_path,
+        exec_req,
+        &vm_id,
+    )
+    .await
     {
-        Ok(s) => s,
+        Ok(session) => session,
         Err(e) => {
             error!(error = %e, "Failed to start exec session for terminal");
             let _ = ws
@@ -974,10 +990,40 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
     // so frame headers and control messages never reach the terminal stream.
     let (vsock_tx, mut vsock_rx) = tokio::sync::mpsc::channel::<exec_proto::Message>(32);
 
-    // Spawn task to decode exec-proto frames from the vsock and send them to the channel
+    // Spawn task to decode exec-proto frames from the vsock and send them to the
+    // channel. The terminal deliberately has NO overall inactivity timeout — an
+    // idle shell stays open for hours. The only bounded case is the
+    // snapshot-pause orphan: whenever the vsock has been idle for the epoch
+    // poll interval, the session's SnapshotOrphanGuard is consulted, and an
+    // epoch change ends the session loudly (same watcher as the blocking exec
+    // paths, adapted to async).
     let reader_task = tokio::spawn(async move {
         loop {
-            match exec_proto::Message::read_from_async(&mut vsock_read).await {
+            // select! on the PINNED read future: a poll tick does NOT cancel
+            // the in-progress frame read, so partial frame bytes are never
+            // lost (Message::read_from_async is not cancel-safe mid-frame).
+            let result = {
+                let read_fut = exec_proto::Message::read_from_async(&mut vsock_read);
+                tokio::pin!(read_fut);
+                loop {
+                    tokio::select! {
+                        res = &mut read_fut => break res,
+                        // Fresh sleep each iteration: ticks only while the read
+                        // stays pending, i.e. while the vsock is idle.
+                        () = tokio::time::sleep(
+                            crate::commands::exec::EXEC_EPOCH_POLL_INTERVAL
+                        ) => {
+                            // One tiny synchronous state-file read every ~2s of
+                            // idle time (see SnapshotOrphanGuard::check) — not
+                            // worth a spawn_blocking round-trip.
+                            if let Err(orphan) = guard.check() {
+                                break Err(std::io::Error::other(orphan));
+                            }
+                        }
+                    }
+                }
+            };
+            match result {
                 Ok(msg) => {
                     let session_ended = matches!(
                         msg,
@@ -988,7 +1034,19 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
                     }
                 }
                 Err(e) => {
-                    if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    let is_orphan = e.get_ref().is_some_and(|inner| {
+                        inner.is::<crate::commands::exec::ExecOrphanedBySnapshotPause>()
+                    });
+                    if is_orphan {
+                        // Forward the orphan as a terminal Error frame so the
+                        // main loop closes the WebSocket with the loud,
+                        // snapshot-pause-naming reason instead of a generic
+                        // "closed before exit status".
+                        error!(error = %e, "terminal session orphaned by a VM snapshot pause");
+                        let _ = vsock_tx
+                            .send(exec_proto::Message::Error(e.to_string()))
+                            .await;
+                    } else if e.kind() != std::io::ErrorKind::UnexpectedEof {
                         warn!(error = %e, "terminal vsock protocol error");
                     }
                     break;
