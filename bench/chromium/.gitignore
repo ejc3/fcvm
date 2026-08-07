@@ -1,0 +1,3 @@
+# Raw run output (requests/, samples/, logs/, raw.json, report.md per run).
+# Publishable runs get a curated summary.md + charts/*.svg committed separately.
+results/

@@ -180,7 +180,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import \
+	bench-container-import bench-chromium \
 	lint fmt update-dependency ssh test-serve-sdk
 
 all: build
@@ -233,6 +233,7 @@ help:
 	@echo "  bench-hugepages    Run hugepages benchmark (32GB VM, 16GB dirty)"
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
+	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
 	@echo ""
 	@echo "Other:"
 	@echo "  lint               Run linting (auto-installs tools if needed)"
@@ -575,6 +576,14 @@ test-serve-sdk: build
 	fi
 	cd tests && npm install --silent
 	npx tsx tests/test_serve_sdk.ts
+
+# Chromium shared-nothing benchmark: per-request clone latency + memory density
+# across every egress path, vs host-native baselines. Results land in
+# bench/chromium/results/<timestamp>/report.md. Knobs: R, REBUILD, PHASES —
+# see bench/chromium/bench.sh header.
+bench-chromium: build
+	@echo "==> Running Chromium shared-nothing benchmark..."
+	@bash bench/chromium/bench.sh run
 
 bench: build
 	@echo "==> Running benchmarks..."

@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>warmup fixture</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header><h1>warmup fixture</h1></header>
+<main>
+  <p>Touches every path the bench fixtures use so the golden snapshot carries a
+  warm renderer: network fetch (this page + stylesheet + one image), CSS parse,
+  PNG decode, text shaping, canvas raster, and a little JS.</p>
+  <figure class="card" style="max-width: 280px">
+    <img src="img1.png" alt="warmup image" width="256" height="256">
+    <figcaption>warmup image</figcaption>
+  </figure>
+  <canvas id="cv" width="320" height="200"></canvas>
+  <p id="marker">fixture=warmup</p>
+</main>
+<script>
+  var ctx = document.getElementById("cv").getContext("2d");
+  var g = ctx.createLinearGradient(0, 0, 320, 200);
+  g.addColorStop(0, "#2b6cb0");
+  g.addColorStop(1, "#ed8936");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 320, 200);
+  ctx.fillStyle = "#fff";
+  ctx.font = "16px sans-serif";
+  ctx.fillText("warmup canvas", 20, 100);
+  window.__warmupChecksum = ctx.getImageData(0, 0, 320, 200).data[0];
+</script>
+</body>
+</html>

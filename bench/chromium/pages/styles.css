@@ -1,0 +1,90 @@
+/* Medium-fixture stylesheet: enough rules to exercise CSS parse + cascade + grid layout. */
+:root {
+  --accent: #2b6cb0;
+  --bg: #f7fafc;
+  --card: #ffffff;
+}
+
+body {
+  margin: 0;
+  font-family: "DejaVu Sans", sans-serif;
+  background: var(--bg);
+  color: #1a202c;
+  line-height: 1.5;
+}
+
+header {
+  background: linear-gradient(90deg, var(--accent), #4fd1c5);
+  color: white;
+  padding: 1.5rem 2rem;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.8rem;
+  letter-spacing: 0.02em;
+}
+
+main {
+  max-width: 960px;
+  margin: 1rem auto;
+  padding: 0 1rem;
+}
+
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.75rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.card img {
+  width: 100%;
+  height: auto;
+  border-radius: 4px;
+  display: block;
+}
+
+.card figcaption {
+  font-size: 0.85rem;
+  color: #4a5568;
+  margin-top: 0.5rem;
+  text-align: center;
+}
+
+.card:nth-child(odd) {
+  border-left: 3px solid var(--accent);
+}
+
+.prose p::first-letter {
+  font-size: 1.3em;
+  font-weight: bold;
+  color: var(--accent);
+}
+
+#js-status {
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  background: #fed7d7;
+  display: inline-block;
+}
+
+#js-status.ran {
+  background: #c6f6d5;
+}
+
+footer {
+  border-top: 1px solid #e2e8f0;
+  margin-top: 2rem;
+  padding: 1rem 2rem;
+  font-size: 0.8rem;
+  color: #718096;
+}
