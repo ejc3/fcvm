@@ -1674,14 +1674,16 @@ pub fn find_available_high_port() -> anyhow::Result<u16> {
     find_available_port(10000 + offset, 50000 - offset)
 }
 
-/// Get the loopback IP for a VM by PID (from `fcvm ls --json`).
-pub async fn get_loopback_ip(pid: u32) -> anyhow::Result<String> {
+/// Read a string field out of a VM's `config.network` (from `fcvm ls --json`).
+///
+/// e.g. `loopback_ip` (rootless), `host_veth` / `namespace_name` (routed).
+pub async fn get_network_field(pid: u32, field: &str) -> anyhow::Result<String> {
     let fcvm_path = find_fcvm_binary()?;
     let output = tokio::process::Command::new(&fcvm_path)
         .args(["ls", "--json", "--pid", &pid.to_string()])
         .output()
         .await
-        .context("getting VM state for loopback IP")?;
+        .with_context(|| format!("getting VM state for network.{}", field))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
@@ -1690,11 +1692,16 @@ pub async fn get_loopback_ip(pid: u32) -> anyhow::Result<String> {
         .and_then(|v| {
             v.get("config")?
                 .get("network")?
-                .get("loopback_ip")?
+                .get(field)?
                 .as_str()
                 .map(|s| s.to_string())
         })
-        .ok_or_else(|| anyhow::anyhow!("loopback_ip not found for VM PID {}", pid))
+        .ok_or_else(|| anyhow::anyhow!("network.{} not found for VM PID {}", field, pid))
+}
+
+/// Get the loopback IP for a VM by PID (from `fcvm ls --json`).
+pub async fn get_loopback_ip(pid: u32) -> anyhow::Result<String> {
+    get_network_field(pid, "loopback_ip").await
 }
 
 /// Result of a single HTTP check via curl.
