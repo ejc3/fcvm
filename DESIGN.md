@@ -319,11 +319,13 @@ async fn setup() -> Result<NetworkConfig> {
     detect_host_ipv6()                 // find /64 subnet (or /128 with on-link /64); skipped if --ipv6-prefix
     generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash
     create_namespace(ns_name)
+    // Disable DAD inside namespace (accept_dad=0 on all + default)
     create_veth_pair(host_veth, guest_veth)
+    // Suppress host veth link-local autogeneration (addr_gen_mode=1, keep_addr_on_down=1)
     create_tap_in_ns(ns_name, tap)
     connect_tap_to_veth(ns_name, tap, guest_veth)  // bridge for L2
     // Assign bridge IPs: 10.0.2.1/24 + fd00::1/64
-    // Host veth: enable forwarding, assign link-local
+    // Host veth: enable forwarding, assign link-local with nodad (hard error on failure)
     // Namespace: default IPv6 route via host veth link-local
     // Host: /128 route to VM IPv6 via host veth
     // Proxy NDP on default interface
@@ -747,21 +749,23 @@ curl http://172.30.x.1:8080
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Setup Sequence** (14 steps):
+**Setup Sequence** (16 steps):
 1. Preflight: verify root, global IPv6, ip6tables
 2. Detect host IPv6 /64 subnet (supports direct /64 or AWS-style /128 with on-link /64 route)
 3. Generate deterministic VM IPv6 from host prefix + hash of vm_id (with collision detection)
 4. Create network namespace (`ip netns add fcvm-XXXX`)
-5. Create veth pair, move guest side to namespace
-6. Create TAP device in namespace, connect to bridge (br0) with veth
-7. Assign bridge IPs: `10.0.2.1/24` (IPv4 gateway) + `fd00::1/64` (IPv6 gateway, nodad)
-8. Bring up host veth, enable per-interface IPv6 forwarding
-9. Assign EUI-64 link-local to host veth (auto-assignment fails when `all.forwarding=1`)
-10. Namespace default IPv6 route: via host veth link-local through bridge
-11. Host: route `vm_ipv6/128` via host veth
-12. Proxy NDP for vm_ipv6 on default interface (so network fabric routes to this host)
-13. ip6tables MASQUERADE on outbound interface (required for AWS source/dest check)
-14. TCP proxy port forwarding on unique loopback IP (127.x.y.z)
+5. Disable IPv6 DAD inside namespace (`accept_dad=0` on all + default, before any interface exists)
+6. Create veth pair, move guest side to namespace
+7. Suppress host veth link-local autogeneration (`addr_gen_mode=1`, `keep_addr_on_down=1`, before link-up)
+8. Create TAP device in namespace, connect to bridge (br0) with veth
+9. Assign bridge IPs: `10.0.2.1/24` (IPv4 gateway) + `fd00::1/64` (IPv6 gateway, nodad)
+10. Bring up host veth, enable per-interface IPv6 forwarding
+11. Assign EUI-64 link-local to host veth with `nodad` (hard error if nexthop address cannot be made usable)
+12. Namespace default IPv6 route: via host veth link-local through bridge
+13. Host: route `vm_ipv6/128` via host veth
+14. Proxy NDP for vm_ipv6 on default interface (so network fabric routes to this host)
+15. ip6tables MASQUERADE on outbound interface (required for AWS source/dest check)
+16. TCP proxy port forwarding on unique loopback IP (127.x.y.z)
 
 **Port Forwarding** (built-in TCP proxy + loopback IP, same as rootless):
 ```
