@@ -23,6 +23,13 @@ env:
 jobs:
   # Gatekeeper: Check for non-member commits, comments, and author association
   safety-check:
+    # Dependabot-triggered runs get only Dependabot secrets (no repo Actions
+    # secrets), so create-github-app-token cannot mint a token and this job
+    # fails on every dependabot PR. Skip it instead: a skipped safety-check
+    # skips every Claude job (they all `needs:` it without always(), and
+    # `eligible` stays unset) — strictly more restrictive than running the
+    # eligibility gate, so this only ever reduces what runs. Fail-closed.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     outputs:
       safe: ${{ steps.check.outputs.safe }}
