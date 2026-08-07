@@ -235,6 +235,13 @@ help:
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
 	@echo ""
+	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
+	@echo "  train-create PRS=\"689 690\"  Build the ci-train branch from a batch of PRs"
+	@echo "  train-dispatch     Push the train and dispatch ONE full CI matrix for the batch"
+	@echo "  train-status       Show the train run's state"
+	@echo "  train-land         After a green run, merge every batch PR in order"
+	@echo "  train-bisect       Split a red train into two half-trains (recurse with TRAIN=ci-train-a)"
+	@echo ""
 	@echo "Other:"
 	@echo "  lint               Run linting (auto-installs tools if needed)"
 	@echo "  fmt                Format code"
@@ -664,6 +671,36 @@ lint: setup-lint-tools
 update-dependency:
 	@test -n "$(PACKAGE)" || (echo "ERROR: PACKAGE required"; exit 1)
 	$(CARGO) update -p "$(PACKAGE)" $(if $(VERSION),--precise "$(VERSION)")
+
+# CI merge train - pooled CI for a batch of independent low-risk PRs.
+# One full CI matrix validates the whole batch instead of one per PR.
+# Protocol, cost math, and when (not) to pool: docs/ci-train.md
+# TRAIN selects the branch (default ci-train; bisect halves are ci-train-a/-b).
+TRAIN ?= ci-train
+
+.PHONY: train-create train-dispatch train-status train-land train-bisect
+train-create:
+	@if [ -n "$(CONTINUE)" ]; then \
+		./scripts/ci-train.sh --branch $(TRAIN) create --continue; \
+	elif [ -n "$(PRS)" ]; then \
+		./scripts/ci-train.sh --branch $(TRAIN) create $(PRS); \
+	else \
+		echo 'ERROR: PRS required (e.g., make train-create PRS="689 690"),'; \
+		echo '       or CONTINUE=1 to resume after a manual conflict resolution'; \
+		exit 1; \
+	fi
+
+train-dispatch:
+	./scripts/ci-train.sh --branch $(TRAIN) dispatch
+
+train-status:
+	./scripts/ci-train.sh --branch $(TRAIN) status
+
+train-land:
+	./scripts/ci-train.sh --branch $(TRAIN) land
+
+train-bisect:
+	./scripts/ci-train.sh --branch $(TRAIN) bisect
 
 fmt:
 	$(CARGO) fmt
