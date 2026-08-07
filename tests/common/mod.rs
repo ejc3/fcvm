@@ -491,6 +491,32 @@ pub async fn spawn_fcvm_with_env_and_log_path(
     args: &[&str],
     env_vars: &[(&str, &str)],
 ) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
+    spawn_fcvm_with_env_and_log_path_inner(args, env_vars, &[]).await
+}
+
+/// Same as `spawn_fcvm_with_env_and_log_path`, but with the snapshot lifecycle
+/// explicitly ENABLED regardless of the ambient test environment.
+///
+/// The CI SnapshotDisabled lane exports `FCVM_NO_SNAPSHOT=1` so that ORDINARY
+/// tests cover fcvm's no-snapshot path. A test whose SUBJECT is the snapshot
+/// lifecycle (startup-snapshot healthy gate, pre-start snapshot quiesce,
+/// teardown racing a snapshot pause) would inherit that lane's env and assert
+/// behavior the lane deliberately turned off. Such a test must opt back into
+/// snapshots explicitly — then it tests what it claims in EVERY lane.
+pub async fn spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
+    spawn_fcvm_with_env_and_log_path_inner(args, env_vars, &["FCVM_NO_SNAPSHOT"]).await
+}
+
+/// Shared implementation: spawn fcvm with `env_vars` set and `env_remove`
+/// explicitly REMOVED from the child's environment (overriding inheritance).
+async fn spawn_fcvm_with_env_and_log_path_inner(
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+    env_remove: &[&str],
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
     // Ensure config exists (runs once per test process)
     ensure_config_exists();
 
@@ -517,6 +543,11 @@ pub async fn spawn_fcvm_with_env_and_log_path(
     for (key, value) in env_vars {
         cmd.env(key, value);
     }
+    // Explicitly drop inherited variables (e.g. the SnapshotDisabled CI lane's
+    // FCVM_NO_SNAPSHOT=1) that the test overrides for its subject.
+    for key in env_remove {
+        cmd.env_remove(key);
+    }
     set_test_pdeathsig(&mut cmd);
 
     let mut child = cmd
@@ -528,8 +559,8 @@ pub async fn spawn_fcvm_with_env_and_log_path(
         .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
 
     logger.info(&format!(
-        "Spawned fcvm PID={} args={:?} env={:?}",
-        pid, args, env_vars
+        "Spawned fcvm PID={} args={:?} env={:?} env_removed={:?}",
+        pid, args, env_vars, env_remove
     ));
 
     spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);

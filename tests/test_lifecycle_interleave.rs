@@ -573,6 +573,12 @@ async fn test_lifecycle_interleave_go_floor_across_ack_stall() -> Result<()> {
 /// ever regresses (Healthy persisted before/during the startup-snapshot
 /// pause), the 50ms poll lands inside the ≥3s frozen window and the one-shot
 /// 2s curl deterministically times out.
+///
+/// This test's SUBJECT is the startup-snapshot lifecycle, so it opts into
+/// snapshots explicitly (`spawn_fcvm_snapshots_enabled_*`) instead of
+/// inheriting the lane's env — the SnapshotDisabled CI lane's
+/// `FCVM_NO_SNAPSHOT=1` covers the no-snapshot path of ORDINARY tests and
+/// must not silently turn off the very pause this test pins.
 #[tokio::test]
 async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("ilv-healthy");
@@ -583,7 +589,7 @@ async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> 
     let host_port = common::find_available_high_port()?;
     let publish_arg = format!("{}:80", host_port);
 
-    let (mut child, pid, vm_log) = common::spawn_fcvm_with_env_and_log_path(
+    let (mut child, pid, vm_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
             "run",
@@ -719,6 +725,11 @@ async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> 
 /// serial lines and the container's console output appear after restore, the
 /// dead-serial watchdog ERROR ("captured the guest UART mid-transmit") never
 /// fires, the run reaches healthy, and SIGTERM produces an orderly exit.
+///
+/// Both runs' SUBJECT is the pre-start snapshot lifecycle, so they opt into
+/// snapshots explicitly (`spawn_fcvm_snapshots_enabled_*`) — the
+/// SnapshotDisabled lane's `FCVM_NO_SNAPSHOT=1` must not leak in and remove
+/// the create/restore path this test pins.
 #[tokio::test]
 async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()> {
     let (run1_name, run2_name, _, _) = common::unique_names("ilv-quiesce");
@@ -735,7 +746,7 @@ async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()
 
     // --- Run 1: cold boot, creates the pre-start snapshot inside the widened
     // quiesce window, and must itself have a live serial console.
-    let (mut child1, pid1, log1) = common::spawn_fcvm_with_env_and_log_path(
+    let (mut child1, pid1, log1) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
             "run",
@@ -782,7 +793,7 @@ async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()
     );
 
     // --- Run 2: same cmd + env → pre-start snapshot hit → restore.
-    let (mut child2, pid2, log2) = common::spawn_fcvm_with_env_and_log_path(
+    let (mut child2, pid2, log2) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
             "run",
@@ -860,6 +871,11 @@ async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()
 /// teardown work: the process exits within a bounded window WITHOUT SIGKILL,
 /// and afterwards this VM's firecracker and pasta processes are gone and its
 /// state file is deleted.
+///
+/// The interleaving under test IS the pre-start snapshot's pause window, so
+/// the VM opts into snapshots explicitly (`spawn_fcvm_snapshots_enabled_*`) —
+/// under the SnapshotDisabled lane's inherited `FCVM_NO_SNAPSHOT=1` the
+/// snapshot.pre_pause hold would never be reached.
 #[tokio::test]
 async fn test_lifecycle_interleave_no_leaks_after_interleaved_teardown() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("ilv-teardown");
@@ -867,7 +883,7 @@ async fn test_lifecycle_interleave_no_leaks_after_interleaved_teardown() -> Resu
     // (and therefore snapshot.pre_pause is hit) on THIS run.
     let script = format!("echo boot-{}; exec sleep 300", vm_name);
 
-    let (mut child, pid, vm_log) = common::spawn_fcvm_with_env_and_log_path(
+    let (mut child, pid, vm_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
             "run",
