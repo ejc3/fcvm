@@ -1,6 +1,6 @@
 # ANGLE: `ScopedVkLoaderEnvironment` setenv(VK_ICD_FILENAMES) races with concurrent getenv() → SIGSEGV during startup
 
-**STATUS: NOT FILED — filing requires a human-authenticated Google session.**
+**STATUS: FILED 2026-08-07 as https://issues.angleproject.org/issues/543664586.**
 
 **File at: https://issues.angleproject.org/issues/new** — this is ANGLE's tracker, and it is
 where `anglebug.com/new` (the URL ANGLE's own `README.md:113` and `doc/ContributingCode.md`
