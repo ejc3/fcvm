@@ -778,7 +778,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "loaded snapshot configuration"
     );
 
-    // Generate VM ID and name
+    // Generate VM ID and name. Restored VMs always get a FRESH vm_id and a
+    // fresh state file (vsock_epoch starts at 0) — including the podman-run
+    // snapshot-miss path, which tears its throwaway VM down (deleting its
+    // state) and relaunches through here. No pre-restore exec session can
+    // reference this state file, so restore needs no vsock-epoch bump.
     let vm_id = generate_vm_id();
     let runtime_config =
         snapshot_restore_runtime_config(&args, snapshot_config.metadata.kernel_profile.as_deref())
@@ -1553,6 +1557,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 &vsock_socket,
                 &cmd_args,
                 true, // in_container
+                &vm_id,
             )
             .await
         }

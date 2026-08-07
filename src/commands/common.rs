@@ -2088,9 +2088,10 @@ pub async fn create_disk_only_snapshot_core(
         "-f".to_string(),
         "/var/lib/fcvm/provisioned".to_string(),
     ];
-    let marker_out = run_exec_in_vm_captured(vsock_socket, &marker_cmd, false)
-        .await
-        .context("checking provisioned marker in guest")?;
+    let marker_out =
+        run_exec_in_vm_captured(vsock_socket, &marker_cmd, false, &snapshot_config.vm_id)
+            .await
+            .context("checking provisioned marker in guest")?;
     if marker_out.exit_code != 0 {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         anyhow::bail!(
@@ -2108,7 +2109,7 @@ pub async fn create_disk_only_snapshot_core(
     // device into the backing file while the rootfs is still writable. (Freezing the
     // rootfs first would deadlock that flush.) Unfreeze happens in reverse order.
     let sync_cmd = vec!["sync".to_string()];
-    let sync_out = run_exec_in_vm_captured(vsock_socket, &sync_cmd, false)
+    let sync_out = run_exec_in_vm_captured(vsock_socket, &sync_cmd, false, &snapshot_config.vm_id)
         .await
         .context("guest sync before freeze")?;
     if sync_out.exit_code != 0 {
@@ -2130,23 +2131,27 @@ pub async fn create_disk_only_snapshot_core(
     // An exec-level error (vsock reset after the request was written) can leave the
     // guest frozen with no response — always attempt a best-effort thaw of BOTH
     // mounts before bailing, never leave the source wedged.
-    let freeze_out = match run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false).await {
-        Ok(out) => out,
-        Err(e) => {
-            let thaw = vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "fsfreeze --unfreeze / 2>/dev/null; \
+    let freeze_out =
+        match run_exec_in_vm_captured(vsock_socket, &freeze_cmd, false, &snapshot_config.vm_id)
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                let thaw = vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "fsfreeze --unfreeze / 2>/dev/null; \
                      fsfreeze --unfreeze {m} 2>/dev/null; true",
-                    m = STORAGE_MOUNT
-                ),
-            ];
-            let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false).await;
-            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-            return Err(e).context("freezing guest filesystems");
-        }
-    };
+                        m = STORAGE_MOUNT
+                    ),
+                ];
+                let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false, &snapshot_config.vm_id)
+                    .await;
+                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                return Err(e).context("freezing guest filesystems");
+            }
+        };
     if freeze_out.exit_code != 0 {
         // Best-effort thaw in case the storage mount froze but the rootfs didn't.
         let thaw = vec![
@@ -2157,7 +2162,7 @@ pub async fn create_disk_only_snapshot_core(
                 m = STORAGE_MOUNT
             ),
         ];
-        let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false).await;
+        let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false, &snapshot_config.vm_id).await;
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         anyhow::bail!(
             "fsfreeze failed (exit {}): {}",
@@ -2192,7 +2197,8 @@ pub async fn create_disk_only_snapshot_core(
         m = STORAGE_MOUNT
     );
     let unfreeze_cmd = vec!["sh".to_string(), "-c".to_string(), unfreeze_script];
-    let unfreeze_result = run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false).await;
+    let unfreeze_result =
+        run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false, &snapshot_config.vm_id).await;
 
     if let Err(e) = copy_result {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
@@ -2242,6 +2248,46 @@ pub async fn create_disk_only_snapshot_core(
 
     info!(snapshot = %snapshot_config.name, "disk-only snapshot created");
     Ok(())
+}
+
+/// Record that this VM's vsock transport was reset by a snapshot pause, by
+/// bumping the persisted `vsock_epoch`.
+///
+/// MUST be called after the pause/save and BEFORE the resume (see
+/// `StateManager::bump_vsock_epoch` for the ordering contract that makes the
+/// exec-side orphan detection race-free). Best-effort: a missing state file
+/// (VM mid-teardown) is expected, and a failed bump must not fail the
+/// snapshot — it only degrades orphan detection for currently-blocked execs
+/// back to the pre-epoch behavior.
+async fn record_vsock_reset_for_snapshot(vm_id: &str, snapshot_name: &str) {
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    match state_manager.bump_vsock_epoch(vm_id).await {
+        Ok(Some(epoch)) => {
+            info!(
+                vm_id,
+                snapshot = snapshot_name,
+                vsock_epoch = epoch,
+                "bumped vsock epoch after snapshot pause \
+                 (exec sessions from before the pause are dead and will abort)"
+            );
+        }
+        Ok(None) => {
+            debug!(
+                vm_id,
+                snapshot = snapshot_name,
+                "no state file to bump vsock epoch on (VM being torn down)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                vm_id,
+                snapshot = snapshot_name,
+                error = %e,
+                "failed to bump vsock epoch after snapshot pause; exec sessions \
+                 orphaned by this pause will not detect it"
+            );
+        }
+    }
 }
 
 /// Create a snapshot of the running VM.
@@ -2453,7 +2499,12 @@ pub async fn create_snapshot_core(
                         );
                     }
                     Err(e) => {
-                        // Full retry failed — resume VM and abort
+                        // Full retry failed — record the vsock reset, resume VM, abort.
+                        record_vsock_reset_for_snapshot(
+                            &snapshot_config.vm_id,
+                            &snapshot_config.name,
+                        )
+                        .await;
                         let _ = snapshot_client
                             .patch_vm_state(ApiVmState {
                                 state: "Resumed".to_string(),
@@ -2478,6 +2529,13 @@ pub async fn create_snapshot_core(
     } else {
         Ok(()) // Skip disk copy if snapshot failed
     };
+
+    // The pause/save silently orphans in-flight host↔guest vsock connections
+    // (exec sessions block forever with no error on either side). Record it by
+    // bumping the persisted vsock epoch BEFORE resuming — see
+    // StateManager::bump_vsock_epoch for why this ordering makes the exec-side
+    // orphan detection race-free.
+    record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
 
     // Resume VM (ALWAYS, regardless of snapshot/disk copy result).
     // Memory merge happens after resume since it operates on snapshot files, not live disk.
@@ -2516,6 +2574,11 @@ pub async fn create_snapshot_core(
     // would trigger handle_clone_restore() in fc-agent, which kills TCP connections
     // and reconnects FUSE/output vsock unnecessarily, crashing the running container.
     // restore-epoch is bumped in the restore path (snapshot.rs) where it's needed.
+    //
+    // The HOST-side `vsock_epoch` (VmState) bumped above is a different mechanism:
+    // it never reaches the guest. It only tells host exec clients that byte streams
+    // in flight across the pause were silently lost (the CI-observed orphan mode),
+    // so their blocked reads abort instead of hanging.
 
     if use_diff {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
@@ -2699,6 +2762,10 @@ pub async fn create_snapshot_ch(
     } else {
         Ok(())
     };
+
+    // Same as the Firecracker path: record the vsock reset caused by the
+    // pause/save BEFORE resuming, so blocked exec sessions abort loudly.
+    record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
 
     // Resume ALWAYS, even if the snapshot or disk copy failed.
     let resume_result = client.resume_vm().await;

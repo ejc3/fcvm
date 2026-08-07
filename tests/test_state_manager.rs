@@ -24,6 +24,7 @@ async fn test_state_persistence() {
         pid: Some(12345),
         pid_start_time: None,
         holder_pid: None,
+        vsock_epoch: 0,
         created_at: now,
         last_updated: now,
         config: VmConfig {
@@ -120,6 +121,7 @@ async fn test_list_vms() {
             pid: Some(10000 + i),
             pid_start_time: None,
             holder_pid: None,
+            vsock_epoch: 0,
             created_at: now,
             last_updated: now,
             config: VmConfig {
@@ -187,6 +189,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             pid: Some(pid),
             pid_start_time: None,
             holder_pid: None,
+            vsock_epoch: 0,
             created_at: now,
             last_updated: now,
             config: VmConfig {
@@ -248,6 +251,7 @@ async fn test_load_state_by_name_duplicate_detection() {
         pid: Some(6000),
         pid_start_time: None,
         holder_pid: None,
+        vsock_epoch: 0,
         created_at: now,
         last_updated: now,
         config: VmConfig {
@@ -298,6 +302,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         pid: Some(pid),
         pid_start_time: None,
         holder_pid: None,
+        vsock_epoch: 0,
         created_at: Utc::now(),
         last_updated: Utc::now(),
         config: VmConfig {

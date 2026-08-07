@@ -687,6 +687,7 @@ name = "fc-mock"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "exec-proto",
  "hyper 0.14.32",
  "hyperlocal",
  "libc",
