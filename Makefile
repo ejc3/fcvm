@@ -114,11 +114,11 @@ endif
 endif
 endif
 
-# test-fast CI exclusions. test_cloud_hypervisor_cold_boot (a CH cold boot of an
-# instant-exit container, snapshots disabled) storms on x86_64 under full CI parallel
-# load: the host↔guest output-vsock/shutdown handshake loops and the VM never powers
-# off (180s timeout). Passes on arm64 and in isolation locally; same class as the #630
-# cold-boot event-loop storm. The snapshot-roundtrip test still cold-boots a CH VM
+# CI exclusions for test-fast and test-all. test_cloud_hypervisor_cold_boot (a CH cold
+# boot of an instant-exit container, snapshots disabled) storms on x86_64 under full CI
+# parallel load: the host↔guest output-vsock/shutdown handshake loops and the VM never
+# powers off (180s timeout). Passes on arm64 and in isolation locally; same class as the
+# #630 cold-boot event-loop storm. The snapshot-roundtrip test still cold-boots a CH VM
 # (nginx baseline) and exercises snapshot/restore, so CH cold boot keeps CI coverage.
 # Tracked in #687. Gated on CI=true; runs locally and with an explicit FILTER=.
 ifndef FILTER
@@ -395,7 +395,7 @@ _test-fast:
 
 _test-all:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(CI_FAST_FILTER) $(FILTER)
 
 _test-root:
 	@if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
