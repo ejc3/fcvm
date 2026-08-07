@@ -51,7 +51,7 @@ count_zombies() {
 mapfile -t STRAYS < <(list_strays)
 COUNT=${#STRAYS[@]}
 ZOMBIES=$(count_zombies)
-[ "$ZOMBIES" -gt 0 ] && echo "note: ${ZOMBIES} unreaped ${PHASE} zombie(s) ignored (already dead, hold no resources)"
+[ "$ZOMBIES" -gt 0 ] && echo "note (${PHASE}): ignoring ${ZOMBIES} unreaped zombie(s) — already dead, hold no resources, cannot be killed"
 
 echo "=== stray microVM guard (${PHASE}): ${COUNT} stray process(es) ==="
 
@@ -70,14 +70,15 @@ for row in "${STRAYS[@]}"; do
 done
 
 # A GitHub annotation surfaces on the run page, not just buried in the step log.
-echo "::warning title=Stray microVMs (${PHASE})::${COUNT} fcvm/firecracker process(es) were alive on this runner; killing them. A non-zero 'post' count means this job leaked VMs."
-
 if [ "$DRY_RUN" -eq 1 ]; then
+	echo "::warning title=Stray microVMs (${PHASE}, dry-run)::${COUNT} fcvm/firecracker process(es) are alive on this runner; NOT killing them (--dry-run)."
 	echo "--dry-run: reporting only, killing nothing"
 	[ -n "${GITHUB_STEP_SUMMARY:-}" ] &&
 		echo "- stray microVM guard (${PHASE}, dry-run): found ${COUNT}, zombies ${ZOMBIES}" >>"$GITHUB_STEP_SUMMARY"
 	exit 0
 fi
+
+echo "::warning title=Stray microVMs (${PHASE})::${COUNT} fcvm/firecracker process(es) were alive on this runner; killing them. A non-zero 'post' count means this job leaked VMs."
 
 for row in "${STRAYS[@]}"; do
 	# shellcheck disable=SC2086
