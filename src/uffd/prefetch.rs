@@ -168,10 +168,27 @@ pub fn populate_chunk(
     let dst = host_addr as *mut std::ffi::c_void;
     let result = match source {
         Source::Copy(mmap) => {
-            let src = mmap[file_offset as usize..file_offset as usize + len].as_ptr();
-            // SAFETY: `src` is a `len`-byte slice of the snapshot mapping, and `dst` is a
+            // Checked, not indexed. `plan` bounds segments by the `mem_len` it was given,
+            // which is a DIFFERENT value from this mapping's length (the caller passes
+            // `ctx.mem_size` and `&mmap[..]` separately). They are equal today - both come
+            // from the same `metadata().len()` - but nothing enforces it here, and this
+            // module promises at the top of the file that it can never fail a restore. A
+            // slice index would make a broken invariant a panic inside the fault-handler
+            // task, which hangs the guest; refusing degrades to demand paging instead.
+            let Some(chunk) = mmap.get(file_offset as usize..file_offset as usize + len) else {
+                debug!(
+                    target: "uffd",
+                    vm_id = %vm_id,
+                    file_offset,
+                    len,
+                    mapped = mmap.len(),
+                    "prefetch chunk runs past the snapshot mapping"
+                );
+                return Err(Stop::Refused);
+            };
+            // SAFETY: `chunk` is a `len`-byte slice of the snapshot mapping, and `dst` is a
             // page-aligned range inside a region the clone registered with this uffd.
-            unsafe { uffd.copy(src as *const std::ffi::c_void, dst, len, true) }
+            unsafe { uffd.copy(chunk.as_ptr() as *const std::ffi::c_void, dst, len, true) }
         }
         Source::Minor => uffd
             .r#continue(dst, len, true)

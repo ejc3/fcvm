@@ -2423,6 +2423,10 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
             .map(|s| s.to_string())
             .collect()
     };
+    // Clones created inside the verdict block below must stay reachable from the cleanup at
+    // the end: every `ensure!` in there returns early, and a leaked clone keeps holding the
+    // snapshot and can wedge later tests.
+    let mut iso_clones: Vec<(tokio::process::Child, u32)> = Vec::new();
     let spawn_clone = |name: String| async move {
         let args = clone_args(&name);
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -2514,7 +2518,9 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
 
         // ---- isolation, with two live clones that BOTH replayed ---------------
         let (b_child, b) = spawn_clone(format!("{}-b", snapshot_name)).await?;
+        iso_clones.push((b_child, b));
         let (c_child, c) = spawn_clone(format!("{}-c", snapshot_name)).await?;
+        iso_clones.push((c_child, c));
 
         // Replay must not change what the guest sees.
         let b_md5 = iso_md5(b).await?;
@@ -2551,15 +2557,17 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
         );
         println!("  ✓ replayed clones are isolated and the snapshot is byte-identical");
 
-        drop(b_child);
-        drop(c_child);
-        common::kill_process(b).await;
-        common::kill_process(c).await;
         anyhow::Ok(())
     }
     .await;
 
     // ---- cleanup --------------------------------------------------------------
+    // Clones first, then the server they depend on. Reached whether the block succeeded or
+    // returned early from any assertion.
+    for (child, pid) in iso_clones {
+        drop(child);
+        common::kill_process(pid).await;
+    }
     common::kill_process(serve_pid).await;
     common::kill_process(baseline_pid).await;
     let _ = tokio::process::Command::new(&fcvm_path)
