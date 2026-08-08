@@ -144,8 +144,14 @@ fi
 #                          --disable-gpu --remote-debugging-address=0.0.0.0
 #                          --remote-debugging-port=9222` too, so it is the build, not our
 #                          flag set. Host ingress therefore CANNOT come from a wildcard
-#                          bind on this image; it comes from fcvm's --forward-localhost
-#                          (routed mode), which forwards the GUEST's loopback port out.
+#                          bind on this image — and it CANNOT come from --forward-localhost
+#                          either. That flag runs GUEST -> HOST ("Enables containers to
+#                          reach host-only services via localhost", src/cli/args.rs:236;
+#                          fc-agent/src/network.rs::setup_localhost_forwarding binds the
+#                          GUEST's 127.0.0.1:<port> and dials the host gateway 10.0.2.2),
+#                          so pointing it at 9222 HIJACKS Chromium's own loopback CDP port
+#                          and breaks the readiness probe below. Ingress comes from the
+#                          socat relay + ordinary --publish; see the CDP RELAY block.
 #                          The flag stays because it is free and correct-in-intent: if a
 #                          future Chromium honours it, the wildcard bind becomes available
 #                          without another archaeology session. Re-verify /proc/net/tcp

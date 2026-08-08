@@ -6,7 +6,17 @@
 # each drive one CDP render via bench/chromium/render.py.
 #
 # Build (repo root context; .dockerignore excludes target/):
-#   podman build -t localhost/chromium-bench -f Containerfile.chromium-bench .
+#   podman build --format docker -t localhost/chromium-bench -f Containerfile.chromium-bench .
+#
+# --format docker is LOAD-BEARING. podman's default OCI format DROPS the
+# HEALTHCHECK at the bottom of this file with only a warning
+# ("HEALTHCHECK is not supported for OCI image format and will be ignored")
+# and exits 0. fcvm then sees no healthcheck, and src/health.rs treats a
+# MISSING one as a PASS (`None => HealthStatus::Healthy`), so the golden
+# snapshot fires on "container is running" — a COLD browser — and every
+# restored clone's "warm" latency is really a first-paint number. Verify:
+#   podman inspect localhost/chromium-bench --format '{{json .HealthCheck}}'
+# must print the Test array containing cdp_health.
 #
 # Host smoke test (fast loop, no VM):
 #   podman run -d --name cb localhost/chromium-bench
@@ -19,9 +29,12 @@
 #   fcvm exec --pid <PID> -c -- python3 /opt/bench/render.py \
 #       http://127.0.0.1:8000/medium.html --out-prefix /tmp/medium
 #
-# Golden-snapshot warm point: /ready returns 200 only after warmup, so
-#   --health-check http://127.0.0.1:8000/ready
-# makes the auto startup snapshot capture a WARM browser.
+# Golden-snapshot warm point: SUPERSEDED — do NOT pass a --health-check URL.
+# An earlier recipe here suggested `--health-check http://127.0.0.1:8000/ready`.
+# That sets `has_http_check` in src/health.rs, which SKIPS the podman HEALTHCHECK
+# entirely — i.e. it disables the CDP round-trip gate defined at the bottom of
+# this file, which is the trigger this design actually relies on. Leave
+# --health-check UNSET so fcvm's AND-logic consults the image's HEALTHCHECK.
 #
 # Fixtures live in bench/chromium/pages/ and are COPY'd in; the host-side
 # fixture server (bench harness) serves the SAME directory so in-guest and

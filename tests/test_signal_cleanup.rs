@@ -1020,6 +1020,30 @@ fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     None
 }
 
+/// Holder discovery is coupled to production by a literal string. Pin it.
+///
+/// `find_holder_for_fcvm` pgreps for `sleep infinity`, which is what
+/// `PastaNetwork::build_holder_command` emits. Nothing enforces that agreement, and
+/// when it broke (verified by changing the argv to `sleep 2147483647`) discovery
+/// returned `None`, the leak assertions in the two teardown tests silently stopped
+/// checking anything, and both tests still passed while a real orphan sat on the box.
+///
+/// Honest scope: this is GREEN today. It is a drift alarm, not a regression test for
+/// a present defect — it fires the moment someone changes the holder's argv, which is
+/// the one change that would re-disarm those assertions without any other symptom.
+#[test]
+fn holder_discovery_pattern_tracks_production_holder_argv() {
+    let argv = fcvm::network::PastaNetwork::new("t".into(), "tap-t".into(), vec![])
+        .build_holder_command()
+        .join(" ");
+    assert!(
+        argv.contains("sleep infinity"),
+        "find_holder_for_fcvm() pgreps for `sleep infinity`, but the production holder \
+         argv is `{argv}`. Holder discovery would silently return None and every \
+         holder-leak assertion in this file would stop checking anything. Update BOTH."
+    );
+}
+
 fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     let output = Command::new("pgrep")
         .args(["-f", "sleep infinity"])
@@ -1559,25 +1583,44 @@ fn test_start_time_identity_defeats_pid_reuse_628() {
 /// The bench fast-teardown path must not leak a microVM. Clone flavour.
 ///
 /// `bench/chromium/reqbench.py` (arm `cdp-fast`) delivers the rendered image the instant
-/// it is in hand and then SIGKILLs the clone's `fcvm`. It never signals Firecracker or the
-/// namespace holder itself: `PR_SET_PDEATHSIG(SIGKILL)` is set on both
-/// (`src/utils.rs::install_namespace_pre_exec`, `src/commands/common.rs::spawn_namespace_holder`),
-/// so the kernel's `exit_notify`/`forget_original_parent` pass delivers SIGKILL to BOTH in one
-/// go — concurrently by construction, with no ordering for the harness to get wrong and no
-/// cleanup code of ours that has to survive a SIGKILL in order to run.
+/// it is in hand and then SIGKILLs the clone's `fcvm`. It never signals Firecracker, the
+/// namespace holder or pasta itself: `PR_SET_PDEATHSIG(SIGKILL)` is armed on all three
+/// (`src/utils.rs::install_namespace_pre_exec`, `src/commands/common.rs::spawn_namespace_holder`,
+/// `src/network/pasta.rs`), so the kernel's `exit_notify`/`forget_original_parent` pass
+/// delivers SIGKILL to every one of them in a single go — concurrently by construction, with
+/// no ordering for the harness to get wrong and no cleanup code of ours that has to survive
+/// a SIGKILL in order to run.
 ///
-/// `test_sigkill_kills_firecracker_rootless` already proves that chain for a `podman run` VM.
+/// `test_sigkill_reaps_rootless_vm_tree` already proves that chain for a `podman run` VM.
 /// This test proves it for the shape the bench actually uses: a CLONE restored from a
 /// `snapshot serve` memory server, which reaches Firecracker through the restore path in
 /// `src/commands/snapshot.rs` rather than the fresh-boot path. Same guarantee, different
 /// spawn site — and a regression in either one is a repeat of #730, where a broken pdeathsig
 /// chain orphaned ~490 microVMs and wedged two CI runners at load 523.
 ///
+/// ALL THREE CHILDREN MUST BE FOUND, and a missing one is a hard failure rather than a
+/// skipped assertion. Until 2026-08-08 the holder was captured as a bare `Option` and the
+/// leak assertion read `assert!(!holder.as_ref().is_some_and(|h| h.running()))` — which is
+/// `assert!(!false)` when discovery returns `None`, i.e. an assertion that CANNOT FAIL when
+/// the thing it checks is absent. Discovery is coupled to production by string
+/// (`find_holder_for_fcvm` pgreps for the literal `sleep infinity` that
+/// `PastaNetwork::build_holder_command` emits), so any drift in that argv silently converted
+/// this test into coverage-shaped nothing. Verified by fault injection: with the holder argv
+/// changed to `sleep 2147483647` the OLD test still passed while a real `sleep` orphan sat on
+/// the box; with this `.context(...)?` it fails at discovery. Same reasoning applies to pasta,
+/// which the old version did not look for at all.
+///
+/// Scope, honestly (same caveat as `test_sigkill_reaps_rootless_vm_tree`): this asserts the
+/// END STATE — nothing from the VM tree outlives fcvm — not the mechanism by which each
+/// process dies. pasta joins the holder by PID and passt exits when that PID exits, so pasta
+/// dies here even with its own `pre_exec` removed.
+///
 /// It also pins the OTHER half of the fast-path contract: because SIGKILL cannot be caught,
-/// `cleanup_vm` never runs, so the state file survives the kill. The harness is therefore
-/// REQUIRED to reap on-disk state synchronously (it does; there is no janitor). Asserting
-/// that the file is still there after the kill is what stops someone "simplifying" the
-/// harness by deleting that step and silently leaking state files instead of VMs.
+/// `cleanup_vm` never runs, so the state file AND the clone's data directory survive the
+/// kill. The harness is therefore REQUIRED to reap both synchronously (it does; there is no
+/// janitor). Asserting that they are still there after the kill is what stops someone
+/// "simplifying" the harness by deleting that step and silently leaking state files and
+/// multi-GB reflinked rootfs images instead of VMs.
 #[test]
 fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
     println!("\ntest_bench_fast_teardown_leaks_nothing_clone");
@@ -1640,21 +1683,51 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
 
         // Capture the exact children by (pid, start_time) + pidfd, so neither the post-kill
         // zombie window nor PID reuse can fake a pass (#628).
-        let fc = find_firecracker_for_fcvm(clone_pid).context("clone has no firecracker child")?;
-        let holder = find_holder_for_fcvm(clone_pid);
-        assert!(
-            fc.running(),
-            "firecracker should be running before the fast teardown"
-        );
+        //
+        // A healthy rootless clone ALWAYS has all three, so a missing one is a failure, not a
+        // reason to skip an assertion — an assertion that cannot fail when its subject is
+        // absent reads as coverage while proving nothing. Bailing out must tear the fixture
+        // down first, or a discovery failure leaks the very microVM this test polices.
+        let discover = || -> Result<(Tracked, Tracked, Tracked)> {
+            let fc =
+                find_firecracker_for_fcvm(clone_pid).context("clone has no firecracker child")?;
+            let holder = find_holder_for_fcvm(clone_pid).context(
+                "clone has no namespace holder child — the rootless restore path spawns \
+                 `unshare --user --net -- sleep infinity`, and find_holder_for_fcvm pgreps for \
+                 that exact argv. If discovery drifts, the holder-leak assertion below checks \
+                 nothing at all",
+            )?;
+            let pasta = find_pasta_for_fcvm(clone_pid)
+                .context("clone has no pasta child — rootless networking always spawns one")?;
+            anyhow::ensure!(
+                fc.running(),
+                "firecracker should be running before teardown"
+            );
+            anyhow::ensure!(holder.running(), "holder should be running before teardown");
+            anyhow::ensure!(pasta.running(), "pasta should be running before teardown");
+            Ok((fc, holder, pasta))
+        };
+        let (fc, holder, pasta) = match discover() {
+            Ok(tree) => tree,
+            Err(e) => {
+                common::kill_process(clone_pid).await;
+                let _ = clone_child.wait().await;
+                let _ = serve_child.kill().await;
+                let _ = base_child.kill().await;
+                common::kill_process(base_pid).await;
+                common::kill_process(serve_pid).await;
+                return Err(e);
+            }
+        };
         println!(
-            "firecracker PID {}, holder {:?}",
-            fc.pid,
-            holder.as_ref().map(|h| h.pid)
+            "clone tree: firecracker={}, holder={}, pasta={}",
+            fc.pid, holder.pid, pasta.pid
         );
 
         // State files are keyed by vm_id (a UUID), NOT by the VM's name — find this
-        // clone's file by its recorded fcvm pid, the same way reqbench.py does.
-        let state_file = {
+        // clone's file by its recorded fcvm pid, the same way reqbench.py does. The data
+        // directory is `<data_root>/vm-disks/<vm_id>`; both must survive the SIGKILL.
+        let (state_file, data_dir) = {
             let dir = fcvm::paths::state_dir();
             let mut found = None;
             for entry in std::fs::read_dir(&dir).context("reading state dir")? {
@@ -1669,7 +1742,12 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                     continue;
                 };
                 if v.get("pid").and_then(|p| p.as_u64()) == Some(clone_pid as u64) {
-                    found = Some(path);
+                    let vm_id = v
+                        .get("vm_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    found = Some((path, fcvm::paths::vm_runtime_dir(&vm_id)));
                     break;
                 }
             }
@@ -1682,50 +1760,63 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
-            if !fc.running() && !holder.as_ref().is_some_and(|h| h.running()) {
+            if !fc.running() && !holder.running() && !pasta.running() {
                 break;
             }
             tokio::time::sleep(common::POLL_INTERVAL).await;
         }
 
-        let fc_alive = fc.running();
-        if fc_alive {
-            fc.kill_if_running();
+        // Snapshot all three BEFORE asserting, then clean up whatever survived, so a failure
+        // of this test cannot itself leak a microVM or a stray forwarding listener.
+        let survivors: Vec<(&str, Tracked)> =
+            [("firecracker", fc), ("holder", holder), ("pasta", pasta)]
+                .into_iter()
+                .filter(|(_, t)| t.running())
+                .collect();
+        for (role, t) in &survivors {
+            println!("LEAK: {} (PID {}) survived the fast teardown", role, t.pid);
+            t.kill_if_running();
         }
-        let holder_alive = holder.as_ref().is_some_and(|h| h.running());
-        if let Some(h) = holder.as_ref() {
-            if holder_alive {
-                h.kill_if_running();
-            }
-        }
+
+        let state_survived = state_file.exists();
+        let data_survived = data_dir.is_dir();
 
         // Clean up the rest of the fixture before asserting, so a failure does not also leak.
         let _ = serve_child.kill().await;
         let _ = base_child.kill().await;
         common::kill_process(base_pid).await;
         common::kill_process(serve_pid).await;
+        std::fs::remove_file(&state_file).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
 
         assert!(
-            !fc_alive,
-            "LEAK: firecracker (PID {}) survived the fast teardown's SIGKILL of fcvm — the \
-             PR_SET_PDEATHSIG chain through the snapshot-restore spawn path is broken (#730)",
-            fc.pid
-        );
-        assert!(
-            !holder_alive,
-            "LEAK: namespace holder survived the fast teardown's SIGKILL of fcvm"
+            survivors.is_empty(),
+            "LEAK: the fast teardown's single SIGKILL to fcvm left these orphaned to init: \
+             {:?}. The PR_SET_PDEATHSIG chain through the snapshot-restore spawn path is \
+             broken (#730). A surviving pasta is the dangerous one: it keeps the dead clone's \
+             forwarded loopback port bound, and that IP is recycled to a later clone.",
+            survivors
+                .iter()
+                .map(|(role, t)| format!("{} (PID {})", role, t.pid))
+                .collect::<Vec<_>>()
         );
 
         // The other half of the contract: SIGKILL cannot be caught, so cleanup_vm did NOT run
-        // and on-disk state is still there. The harness must reap it synchronously.
+        // and BOTH on-disk artifacts are still there. The harness must reap both synchronously.
         assert!(
-            state_file.exists(),
+            state_survived,
             "expected the clone's state file to SURVIVE the SIGKILL (at {}). If it is gone, \
              fcvm gained a cleanup path that runs under SIGKILL and reqbench.py's synchronous \
              on-disk reap should be revisited.",
             state_file.display()
         );
-        std::fs::remove_file(&state_file).ok();
+        assert!(
+            data_survived,
+            "expected the clone's data dir to SURVIVE the SIGKILL (at {}). It holds a reflinked \
+             copy of the golden rootfs, so a harness that does not reap it leaks disk without \
+             leaking a process — invisible to every stray-VM guard.",
+            data_dir.display()
+        );
 
         println!("test_bench_fast_teardown_leaks_nothing_clone PASSED");
         Ok::<(), anyhow::Error>(())

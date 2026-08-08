@@ -41,18 +41,65 @@ TAG="${TAG:-cb-req-golden}"
 FCVM_LOG="${FCVM_LOG:-fcvm=debug}"   # AGENTS.md defect 4: never measure at info
 URL="${URL:-http://127.0.0.1:8000/medium.html}"
 
+STATE_DIR="${STATE_DIR:-/mnt/fcvm-btrfs/state}"
+
 mkdir -p "$RESULTS/logs"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# TEARDOWN. Every background fcvm this script starts is registered here the
+# instant it exists, and the trap fires on EXIT/INT/TERM.
+#
+# Without it, `set -euo pipefail` turns every error path into a leak: an
+# unguarded failure exits the shell BEFORE the matching kill, and the VM or
+# serve it started keeps running. Two of the three phases did not even capture
+# `$!`, so on those paths there was no handle to kill at all. bench.sh in this
+# same directory has had this shape all along; this file did not have a single
+# `trap`. AGENTS.md: contention silently inflates every number, and a leaked
+# serve holds the snapshot mapping into the NEXT run.
+CLEANUP_PIDS=()
+track() { [ -n "${1:-}" ] && CLEANUP_PIDS+=("$1"); return 0; }
+
+cleanup() {
+    local rc=$?
+    set +e
+    for p in "${CLEANUP_PIDS[@]:-}"; do
+        [ -n "$p" ] && $SUDO kill -9 "$p" 2>/dev/null
+    done
+    # Belt and braces: sweep state files this script's naming owns, in case a
+    # pid was never captured (e.g. the process died between spawn and track).
+    for f in "$STATE_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        local nm pid
+        nm=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("name") or "")' \
+             "$f" 2>/dev/null) || continue
+        case "$nm" in
+            cb-req-*)
+                pid=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("pid") or "")' \
+                      "$f" 2>/dev/null)
+                [ -n "$pid" ] && $SUDO kill -9 "$pid" 2>/dev/null
+                ;;
+        esac
+    done
+    wait 2>/dev/null
+    return $rc
+}
+trap cleanup EXIT INT TERM
 
 # Refuse to measure on a box that is already busy. AGENTS.md: contention silently
 # inflates every number; a run published without saying so is the failure mode.
 guard_quiet() {
-    local fc; fc=$(pgrep -c firecracker || true)
+    # `pgrep -c firecracker` alone never matches a leaked `fcvm snapshot serve`
+    # (its comm is `fcvm`), which is exactly the residue this script's own error
+    # paths used to leave — it would accumulate invisibly while holding the
+    # snapshot mapping. scripts/ci-stray-vm-guard.sh uses this wider pattern for
+    # the same reason.
+    local fc; fc=$(pgrep -c -f '^(.*/)?(firecracker|cloud-hypervisor|fcvm)( |$)' || true)
     local la; la=$(cut -d' ' -f1 /proc/loadavg)
-    log "load=$la firecracker=$fc"
+    log "load=$la vm-processes=$fc"
     if [ "${ALLOW_BUSY:-0}" != 1 ] && { [ "${fc:-0}" -gt 0 ] || \
        [ "$(printf '%.0f' "$la")" -gt 2 ]; }; then
-        log "REFUSING: box is busy (load=$la, $fc firecracker). Set ALLOW_BUSY=1 to override"
+        log "REFUSING: box is busy (load=$la, $fc firecracker/fcvm). Set ALLOW_BUSY=1 to override"
         log "and SAY SO in the report — a number measured under contention is not a number."
         exit 3
     fi
@@ -90,6 +137,10 @@ cmd_golden() {
     FCVM_NO_SNAPSHOT=1 $SUDO env RUST_LOG=$FCVM_LOG "$FCVM" podman run --name "$name" \
         --cpu "$CPU" --mem "$MEM" --network "$NETMODE" --publish "$CDP_PORT:$CDP_PORT" \
         "$IMAGE" >"$lf" 2>&1 &
+    # Capture the handle IMMEDIATELY. The BOOT TIMEOUT path below fires before any
+    # state file exists, so `$!` is the ONLY way to reach this VM at that point.
+    local vm_bg=$!
+    track "$vm_bg"
     local t0=$SECONDS pid=""
     until grep -q CHROMIUM_BENCH_READY "$lf" 2>/dev/null; do
         [ $((SECONDS-t0)) -lt 300 ] || { log "golden: BOOT TIMEOUT"; tail -20 "$lf" >&2; return 1; }
@@ -97,6 +148,7 @@ cmd_golden() {
     done
     pid=$(state_pid_by_name "$name")
     [ -n "$pid" ] || { log "golden: no state pid"; return 1; }
+    track "$pid"
 
     # Wait for fcvm to publish Healthy — i.e. for the container HEALTHCHECK's real
     # CDP round trip to pass. THIS is the warm point the snapshot must capture.
@@ -108,8 +160,12 @@ cmd_golden() {
         sleep 1
     done
     log "golden: healthy after $((SECONDS-t0))s — snapshotting"
-    $SUDO "$FCVM" snapshot create --pid "$pid" --tag "$TAG" >>"$lf" 2>&1
-    $SUDO kill "$pid"
+    # Guarded: unguarded, a failed `snapshot create` exits the shell under `set -e`
+    # before the kill below, leaking a live VM. Now it reaches the trap.
+    $SUDO "$FCVM" snapshot create --pid "$pid" --tag "$TAG" >>"$lf" 2>&1 \
+        || { log "golden: SNAPSHOT CREATE FAILED"; tail -20 "$lf" >&2; return 1; }
+    $SUDO kill "$pid" 2>/dev/null || true
+    wait "$vm_bg" 2>/dev/null || true
     log "golden: done ($TAG)"
 }
 
@@ -117,44 +173,86 @@ cmd_golden() {
 # The end-to-end chain proof. Run this BEFORE trusting any number: it checks the
 # three hops separately so a failure names the hop instead of looking like
 # "networking is broken".
+
+# Start one clone against the running serve. Sets CLONE_PID and CLONE_IP.
+# Factored out so verify can start TWO of them: a single clone's target id
+# cannot answer a question about stability ACROSS clones.
+#
+# Results come back in GLOBALS, not on stdout, on purpose: `x=$(start_clone …)`
+# runs the function in a subshell, so its `track` calls would update a copy of
+# CLEANUP_PIDS that is discarded on return — i.e. the trap would never see the
+# clone it just started, which is the exact leak this trap exists to close.
+CLONE_PID=""
+CLONE_IP=""
+start_clone() {
+    local spid="$1" cname="$2" cl="$3"
+    CLONE_PID=""; CLONE_IP=""
+    $SUDO env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run --pid "$spid" --name "$cname" \
+        --no-dirty-tracking --no-swap >"$cl" 2>&1 &
+    track "$!"
+    local t0=$SECONDS cpid=""
+    until [ -n "$cpid" ]; do
+        cpid=$(state_pid_by_name "$cname")
+        [ $((SECONDS-t0)) -lt 120 ] || { log "clone $cname never registered"; tail -20 "$cl" >&2; return 1; }
+        sleep 0.2
+    done
+    track "$cpid"
+    CLONE_PID="$cpid"
+    CLONE_IP=$($SUDO "$FCVM" ls --json --pid "$cpid" | python3 -c '
+import json,sys
+n=json.load(sys.stdin)[0]["config"]["network"]
+print(n.get("loopback_ip") or n.get("host_ip") or n.get("guest_ip") or "")')
+}
+
+# Print the page target id for a clone, or nothing.
+target_id() {
+    python3 - "$1" <<'PY' 2>/dev/null || true
+import json, sys, urllib.request
+with urllib.request.urlopen(f"http://{sys.argv[1]}/json/list", timeout=10) as r:
+    for t in json.load(r):
+        if t.get("type") == "page":
+            print(t.get("id") or "")
+            break
+PY
+}
+
 cmd_verify() {
+    # Every hop feeds this counter and the function RETURNS it. Each hop used to
+    # be `... || echo "HOP X FAILED"`, which makes the compound command SUCCEED —
+    # so cmd_verify exited 0 no matter how many hops failed, and `all` (which
+    # relies on `set -e` to stop the chain) went straight on to the measured run
+    # after printing three FAILED lines. verify is documented as the gate; a gate
+    # that cannot fail is not a gate.
+    local fail=0
     log "verify: starting serve for $TAG"
     local sf="$RESULTS/logs/verify-serve.log"
     $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
-    local serve_pid=$!
+    local serve_bg=$!
+    track "$serve_bg"
     local t0=$SECONDS
     until grep -q "Waiting for VMs" "$sf" 2>/dev/null; do
         [ $((SECONDS-t0)) -lt 60 ] || { log "verify: serve never came up"; cat "$sf" >&2; return 1; }
         sleep 0.5
     done
     local spid; spid=$(grep -oP 'Serve PID: \K[0-9]+' "$sf" | head -1)
+    track "$spid"
     log "verify: serve pid $spid"
 
     local cname="cb-req-verify-$RUNID" cl="$RESULTS/logs/verify-clone.log"
-    $SUDO env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run --pid "$spid" --name "$cname" \
-        --no-dirty-tracking --no-swap >"$cl" 2>&1 &
-    local clone_bg=$!
-    t0=$SECONDS
-    local cpid=""
-    until [ -n "$cpid" ]; do
-        cpid=$(state_pid_by_name "$cname")
-        [ $((SECONDS-t0)) -lt 120 ] || { log "verify: clone never registered"; tail -20 "$cl" >&2; return 1; }
-        sleep 0.2
-    done
-
-    local ip
-    ip=$($SUDO "$FCVM" ls --json --pid "$cpid" | python3 -c '
-import json,sys
-n=json.load(sys.stdin)[0]["config"]["network"]
-print(n.get("loopback_ip") or n.get("host_ip") or n.get("guest_ip") or "")')
+    start_clone "$spid" "$cname" "$cl" || return 1
+    local cpid="$CLONE_PID" ip="$CLONE_IP"
+    # An empty IP is the most likely real misconfiguration, and it used to be
+    # fully swallowed: hops B and C then ran against ":9223", failed, printed
+    # FAILED, and verify still exited 0.
+    [ -n "$ip" ] || { log "verify: NO host-side IP in the clone's network config"; fail=1; }
     log "verify: clone pid=$cpid host-side ip=$ip"
 
     echo "--- HOP A: healthcheck path, 127.0.0.1:$CDP_PORT INSIDE the container ---"
-    $SUDO "$FCVM" exec --pid "$cpid" -c -- python3 /opt/bench/cdp_health.py || \
-        echo "HOP A FAILED (in-container CDP round trip)"
+    $SUDO "$FCVM" exec --pid "$cpid" -c -- python3 /opt/bench/cdp_health.py \
+        || { echo "HOP A FAILED (in-container CDP round trip)"; fail=1; }
 
     echo "--- HOP B: GET /json/version from the HOST against $ip:$CDP_PORT ---"
-    python3 - "$ip:$CDP_PORT" <<'PY' || echo "HOP B FAILED (host -> clone CDP HTTP)"
+    python3 - "$ip:$CDP_PORT" <<'PY' || { echo "HOP B FAILED (host -> clone CDP HTTP)"; fail=1; }
 import json, sys, urllib.request
 host = sys.argv[1]
 # Host-header check: Chromium's DevTools endpoint rejects Host values that are
@@ -173,21 +271,36 @@ PY
 
     echo "--- HOP C: WebSocket upgrade + one CDP command from the HOST ---"
     python3 "$HERE/cdpdrive.py" "$ip:$CDP_PORT" "$URL" --format jpeg --nav-timing \
-        --out-prefix "$RESULTS/verify" || echo "HOP C FAILED (host WS + CDP)"
+        --out-prefix "$RESULTS/verify" || { echo "HOP C FAILED (host WS + CDP)"; fail=1; }
 
-    echo "--- target id (is it stable across clones? -> can skip /json/list per request) ---"
-    python3 - "$ip:$CDP_PORT" <<'PY' || true
-import json, sys, urllib.request
-with urllib.request.urlopen(f"http://{sys.argv[1]}/json/list", timeout=10) as r:
-    for t in json.load(r):
-        if t.get("type") == "page":
-            print(f"  target id={t.get('id')}")
-PY
+    # --- target id stability, ACROSS CLONES, asserted.
+    # This block used to print one clone's id and compare it with nothing, under
+    # a heading that asked a cross-clone question. One id cannot answer it. The
+    # serve is already up, so a second clone is cheap.
+    echo "--- target id stability ACROSS CLONES (-> can /json/list be skipped?) ---"
+    local id1 id2 cname2="cb-req-verify2-$RUNID" cpid2 ip2
+    id1=$(target_id "$ip:$CDP_PORT")
+    start_clone "$spid" "$cname2" "$RESULTS/logs/verify-clone2.log" || return 1
+    cpid2="$CLONE_PID"; ip2="$CLONE_IP"
+    id2=$(target_id "$ip2:$CDP_PORT")
+    echo "  clone1 ($ip) id=${id1:-<none>}"
+    echo "  clone2 ($ip2) id=${id2:-<none>}"
+    if [ -z "$id1" ] || [ -z "$id2" ]; then
+        echo "  TARGET ID UNREADABLE on at least one clone — cannot judge stability"
+        fail=1
+    elif [ "$id1" = "$id2" ]; then
+        echo "  STABLE across 2 clones — --ws-url prewiring is sound for this snapshot"
+    else
+        echo "  TARGET ID NOT STABLE ACROSS CLONES ($id1 != $id2) — /json/list cannot be skipped"
+        fail=1
+    fi
 
+    $SUDO kill -9 "$cpid2" 2>/dev/null || true
     $SUDO kill -9 "$cpid" 2>/dev/null || true
-    wait "$clone_bg" 2>/dev/null || true
     $SUDO kill "$spid" 2>/dev/null || true
-    wait "$serve_pid" 2>/dev/null || true
+    wait 2>/dev/null || true
+    # Return AFTER the cleanup above, never before it.
+    [ "$fail" -eq 0 ] || { log "verify: FAILED ($fail check(s)) — do NOT run the A/B"; return 1; }
     log "verify: done (clone state/data left for inspection; reqbench.py reaps its own)"
 }
 
@@ -196,19 +309,31 @@ cmd_run() {
     log "run: starting serve for $TAG"
     local sf="$RESULTS/logs/serve.log"
     $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
+    local serve_bg=$!
+    track "$serve_bg"
     local t0=$SECONDS
     until grep -q "Waiting for VMs" "$sf" 2>/dev/null; do
         [ $((SECONDS-t0)) -lt 60 ] || { log "run: serve never came up"; cat "$sf" >&2; return 1; }
         sleep 0.5
     done
     local spid; spid=$(grep -oP 'Serve PID: \K[0-9]+' "$sf" | head -1)
+    [ -n "$spid" ] || { log "run: could not read Serve PID from $sf"; return 1; }
+    track "$spid"
     log "run: serve pid $spid -> reqbench.py"
+    # Guarded: unguarded, ANY non-zero exit from reqbench.py (including its new
+    # exit 4 when a teardown leaves a survivor) exits the shell under `set -e`
+    # before the kill below, leaking the serve into the next phase.
+    local rc=0
     $SUDO env RUST_LOG=$FCVM_LOG python3 "$HERE/reqbench.py" --serve-pid "$spid" --url "$URL" \
         --out-dir "$RESULTS" --reps "${REPS:-10}" --warmup "${WARMUP:-2}" \
         --cdp-port "$CDP_PORT" --fcvm "$FCVM" --rust-log "$FCVM_LOG" \
-        --arms "${ARMS:-exec,cdp,cdp-fast,noop}"
+        --arms "${ARMS:-exec,cdp,cdp-fast,noop}" || rc=$?
     $SUDO kill "$spid" 2>/dev/null || true
-    log "run: results in $RESULTS"
+    # WAIT for teardown to finish, so a following phase's guard_quiet does not
+    # race a serve that is still shutting down.
+    wait "$serve_bg" 2>/dev/null || true
+    log "run: results in $RESULTS (reqbench.py exit $rc)"
+    return $rc
 }
 
 case "${1:-}" in

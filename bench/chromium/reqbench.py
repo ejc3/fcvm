@@ -17,29 +17,45 @@ of being reported as one lump:
 
 WHY ONE SIGNAL IS THE CONCURRENT KILL
 -------------------------------------
-`kill(fcvm, SIGKILL)` is not "kill the parent and hope". fcvm spawns Firecracker
-and the namespace holder with `PR_SET_PDEATHSIG=SIGKILL`
-(`src/utils.rs::install_namespace_pre_exec`, `src/commands/common.rs::spawn_namespace_holder`).
-When fcvm dies the kernel's `exit_notify`/`forget_original_parent` walks its child
-list and delivers SIGKILL to EVERY child with a pdeathsig in one pass, before
-anything else can run. So the two kills are issued concurrently by construction —
-there is no ordering to get wrong, no `.await` between them, and no code of ours
-that has to survive to do it.
+`kill(fcvm, SIGKILL)` is not "kill the parent and hope". fcvm arms
+`PR_SET_PDEATHSIG=SIGKILL` on each of its three long-lived children:
+Firecracker (`src/utils.rs::install_namespace_pre_exec`), the namespace holder
+(`src/commands/common.rs::spawn_namespace_holder`) and pasta
+(`src/network/pasta.rs`). When fcvm dies the kernel's
+`exit_notify`/`forget_original_parent` walks its child list and delivers SIGKILL
+to EVERY child with a pdeathsig in one pass, before anything else can run. So the
+kills are issued concurrently by construction — there is no ordering to get
+wrong, no `.await` between them, and no code of ours that has to survive to do it.
 
-That is also why this is the fast path that CANNOT leak. AGENTS.md is explicit:
-"Prefer kernel-enforced reaping over cleanup code. A Drop impl, a signal handler,
-or an always() cleanup step does not run when the process is SIGKILLed — which is
-exactly the case that leaked." PR #730 restored precisely this chain after a
-privilege boundary broke it and ~490 microVMs leaked. This arm depends on the
-same guarantee the leak fix established, and
-`test_sigkill_kills_firecracker_rootless` plus `test_bench_fast_teardown_leaks_nothing_clone`
-(tests/test_signal_cleanup.rs) are its regression proof.
+WHAT THAT GUARANTEE DOES AND DOES NOT COVER. It is kernel-enforced for all three
+hops, but pasta's arming carries a precondition the other two do not:
+`commit_creds()` zeroes `pdeath_signal` whenever uid/gid change or
+`cred_cap_issubset(old, new)` fails, and pasta `setns()`es into the holder's user
+namespace after the `pre_exec`. Under sudo that is a capability LOSS, so the
+subset test passes and the signal survives; run fcvm genuinely unprivileged and it
+becomes a capability GAIN, the kernel clears the signal, and pasta falls back to
+passt's own 1-second PID watch of the holder. So: kernel-enforced for the VMM and
+the holder unconditionally, and for pasta while fcvm runs as root. This harness
+does not assume any of it — `teardown_fast` waits on a pidfd per child and
+REFUSES to reap on-disk state if any of them is still alive (see there).
 
-NO JANITOR. On-disk reaping (state file, data dir) is done synchronously, right
-here, after the clock stops. It is off the caller's critical path but it is not
-deferred to some sweeper that might not run — and it is MEASURED, not hidden.
-SIGKILL cannot be caught, so fcvm's `cleanup_vm` never runs and the state file
-survives the kill; reaping it here is REQUIRED, not an optimization.
+AGENTS.md is explicit: "Prefer kernel-enforced reaping over cleanup code. A Drop
+impl, a signal handler, or an always() cleanup step does not run when the process
+is SIGKILLed — which is exactly the case that leaked." PR #730 restored precisely
+this chain after a privilege boundary broke it and ~490 microVMs leaked. This arm
+depends on the same guarantee the leak fix established;
+`test_sigkill_reaps_rootless_vm_tree` plus
+`test_bench_fast_teardown_leaks_nothing_clone` (tests/test_signal_cleanup.rs) are
+its regression proof, and both require firecracker, holder AND pasta to be found
+before asserting, so a discovery drift fails loudly instead of silently checking
+nothing.
+
+NO JANITOR. On-disk reaping (state file, its lock, data dir) is done
+synchronously, right here, after the clock stops. It is off the caller's critical
+path but it is not deferred to some sweeper that might not run — and it is
+MEASURED, not hidden. SIGKILL cannot be caught, so fcvm's `cleanup_vm` never runs
+and both artifacts survive the kill; reaping them here is REQUIRED, not an
+optimization.
 
 WHAT IS ACTUALLY BEING CLAIMED (part 3)
 ---------------------------------------
@@ -82,6 +98,7 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse, urlunparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -118,6 +135,19 @@ def machine_busy_jiffies():
     vals = [int(x) for x in parts[1:11]]
     idle = vals[3] + vals[4]  # idle + iowait
     return sum(vals) - idle, sum(vals)
+
+
+def self_cpu_ms() -> float:
+    """This harness's OWN cpu (utime+stime), in ms.
+
+    Subtracted from BOTH accounting windows so the sampler's own load cancels by
+    construction instead of being attributed to kernel reclaim. Without this the
+    control window and the reclaim window carry different amounts of harness CPU
+    and the subtraction removes work that was never done in the window it is
+    subtracted from.
+    """
+    s = proc_stat_fields(os.getpid())
+    return (s[1] + s[2]) * 1000.0 / CLK_TCK if s else 0.0
 
 
 def children_of(pid: int) -> list[int]:
@@ -177,60 +207,164 @@ def wait_pidfds(fds: list[int], timeout_s: float) -> bool:
     return True
 
 
-def sample_until_gone(pid: int, deadline: float) -> dict:
-    """Busy-read /proc/<pid>/stat until the task vanishes; keep the LAST sample.
+def sample_all_until_gone(pids: dict, deadline: float) -> dict:
+    """Sample EVERY child's /proc/<pid>/stat concurrently until each one vanishes.
 
-    Deliberately a tight loop with no sleep: the zombie window between
+    Concurrently, not one at a time. The previous version was a per-child call
+    inside a dict comprehension, so child 2 was not sampled at all until child 1
+    had already gone. Children exit on wildly different timescales after a single
+    SIGKILL (the namespace holder in a fraction of a millisecond, Firecracker in
+    tens), so a fast child that was not first in `children_of()` order was ALWAYS
+    already reaped by the time its turn came: `proc_stat_fields` returned None on
+    the first read, `last` stayed None, and its `reclaim_cpu_ms` was recorded as
+    `null`. That is not a lower bound, it is a missing measurement whose presence
+    depended on procfs ordering.
+
+    Still a tight loop with no sleep, deliberately: the zombie window between
     `exit_notify()` and the reaper is short, and catching state `Z` is what
-    upgrades the CPU figure from a lower bound to a complete one (see module
-    docstring). The loop is bounded by `deadline`.
+    upgrades a CPU figure from a lower bound to a complete one (see the module
+    docstring). The cost of that spin is now measured (`self_cpu_ms`) and
+    subtracted from the machine accounting rather than left in it.
     """
-    last = None
-    zombie_seen = False
-    while time.monotonic() < deadline:
-        s = proc_stat_fields(pid)
-        if s is None:
-            break
-        last = s
-        if s[0] in ("Z", "X", "x"):
-            zombie_seen = True
-            break
-    if last is None:
-        return {"cpu_ms": None, "zombie_seen": False}
-    return {
-        "cpu_ms": (last[1] + last[2]) * 1000.0 / CLK_TCK,
-        "zombie_seen": zombie_seen,
-    }
+    live = dict(pids)
+    last: dict = {}
+    zombie: dict = {name: False for name in pids}
+    while live and time.monotonic() < deadline:
+        for name, pid in list(live.items()):
+            s = proc_stat_fields(pid)
+            if s is None:
+                del live[name]
+                continue
+            last[name] = s
+            if s[0] in ("Z", "X", "x"):
+                zombie[name] = True
+                del live[name]
+    out = {}
+    for name in pids:
+        s = last.get(name)
+        out[name] = {
+            "cpu_ms": (s[1] + s[2]) * 1000.0 / CLK_TCK if s else None,
+            "zombie_seen": zombie[name],
+        }
+    return out
 
 
 # ------------------------------------------------------------------ fcvm glue
 
 
-def find_state(state_dir: str, fcvm_pid: int, deadline: float):
-    """Locate the clone's state file by fcvm PID.
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
 
-    A filesystem scan, not an inotify watch, and deliberately OFF the measured
-    critical path where possible: it runs while the clone is still restoring.
-    Recorded as `discover_ms` so its cost is visible rather than smuggled into
-    the request time.
+
+class DirWatch:
+    """inotify watch on a directory. REGISTER BEFORE THE SPAWN THAT CAN TRIGGER IT.
+
+    fcvm itself uses exactly this discipline (`crate::utils::DirWatch`, e.g.
+    `src/network/pasta.rs`: "Register the inotify watch BEFORE ... the spawn"), and
+    for the same reason: a watch registered after the spawn can miss the event and
+    then wait for one that has already happened.
     """
-    while time.monotonic() < deadline:
-        try:
-            names = os.listdir(state_dir)
-        except OSError:
-            names = []
-        for name in names:
-            if not name.endswith(".json"):
-                continue
-            path = os.path.join(state_dir, name)
+
+    def __init__(self, path: str):
+        self.fd = _libc.inotify_init1(os.O_NONBLOCK)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), f"inotify_init1 on {path}")
+        wd = _libc.inotify_add_watch(
+            self.fd, path.encode(), IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE
+        )
+        if wd < 0:
+            err = ctypes.get_errno()
+            os.close(self.fd)
+            self.fd = -1
+            raise OSError(err, f"inotify_add_watch on {path}")
+
+    def drain(self) -> None:
+        """Consume queued events. Call BEFORE scanning, never after: an event that
+        lands between a scan and a drain would be thrown away, and the next wait
+        would block for a change that already happened."""
+        while True:
             try:
-                with open(path) as f:
-                    st = json.load(f)
-            except (OSError, ValueError):
-                continue
-            if st.get("pid") == fcvm_pid:
-                return path, st
+                if not os.read(self.fd, 65536):
+                    return
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+
+    def wait(self, timeout_s: float) -> bool:
+        """Block until the directory changes. Returns False on timeout."""
+        if timeout_s <= 0:
+            return False
+        poller = select.poll()
+        poller.register(self.fd, select.POLLIN)
+        return bool(poller.poll(timeout_s * 1000))
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+def scan_state(state_dir: str, fcvm_pid: int = 0, name: str = ""):
+    """One pass over the state dir. Matches on fcvm pid OR on VM name.
+
+    The name-keyed match is not a convenience: `allocate_loopback_ip` saves the
+    state file while `vm_state.pid` is still null (the pid is only set POST-RESUME,
+    `src/commands/common.rs`), so there is a whole window — network setup, mount
+    namespace, volume servers, the restore itself — in which the file exists,
+    Firecracker may already be running, and a pid-keyed scan returns nothing. The
+    name IS set before the first save, so it is the only key that covers that
+    window. A state file left behind with `pid: null` is never removed by fcvm's
+    own sweeper either (`cleanup_stale_state` bails on a null pid), so recovering
+    it here is the difference between a reaped clone and a permanent leak.
+    """
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return None, None
+    for fname in names:
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(state_dir, fname)
+        try:
+            with open(path) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if (fcvm_pid and st.get("pid") == fcvm_pid) or (name and st.get("name") == name):
+            return path, st
     return None, None
+
+
+def find_state(state_dir: str, fcvm_pid: int, deadline: float, watch=None, name: str = ""):
+    """Locate the clone's state file by fcvm PID (or name), EVENT-DRIVEN.
+
+    Was a `while time.monotonic() < deadline:` loop with an `os.listdir` plus a
+    full `json.load` of every file in it and NO sleep, no yield and no backoff. It
+    therefore burned 100% of one core for its entire duration — measured at 400 ms
+    of harness CPU for a 400 ms wall wait — while the 2-vCPU clone it is waiting on
+    was restoring on the same box. `wait_port` a few lines below already had a
+    backoff ladder, so the omission was local, not a policy.
+
+    Now it blocks in `poll()` on an inotify fd and rescans only when the directory
+    actually changes: zero CPU while waiting, and it notices the file sooner than a
+    poll loop would. `discover_ms` still records the wall cost.
+    """
+    own = watch is None
+    if own:
+        watch = DirWatch(state_dir)
+    try:
+        while True:
+            watch.drain()
+            path, st = scan_state(state_dir, fcvm_pid, name)
+            if st is not None:
+                return path, st
+            if not watch.wait(deadline - time.monotonic()):
+                return None, None
+    finally:
+        if own:
+            watch.close()
 
 
 def clone_cdp_endpoint(state: dict, port: int) -> str:
@@ -280,30 +414,113 @@ def wait_port(endpoint: str, deadline: float) -> float:
 # ------------------------------------------------------------------- teardown
 
 
+class SurvivedTeardown(RuntimeError):
+    """A tracked child outlived the fast teardown. The box is now contaminated.
+
+    Carries the partial teardown dict so the failure still lands in the artifact
+    with its survivor list. A leak that aborts the run but leaves no record is
+    only marginally better than one that does not abort it.
+    """
+
+    def __init__(self, message, teardown=None):
+        super().__init__(message)
+        self.teardown = teardown or {}
+        self.record: dict = {}
+
+
+def reap_disk(out: dict, state_path: str, data_dir: str) -> list:
+    """Remove the clone's state file (+ its lock) and data dir. Errors are RECORDED.
+
+    Never `ignore_errors=True`: a silently-failed rmtree reinstates the leak this
+    function exists to prevent, and clone dirs can be root-owned when the bench
+    runs under SUDO, so EPERM has to surface.
+    """
+    reaped = []
+    if state_path and os.path.exists(state_path):
+        try:
+            os.remove(state_path)
+            reaped.append(state_path)
+        except OSError as e:
+            out.setdefault("disk_errors", []).append(f"{state_path}: {e}")
+        # cleanup_stale_state removes `<vm_id>.json.lock` alongside the state file
+        # (src/state/manager.rs); it never runs under SIGKILL, so we remove it too.
+        lock = f"{state_path}.lock" if state_path else ""
+        if lock and os.path.exists(lock):
+            try:
+                os.remove(lock)
+                reaped.append(lock)
+            except OSError as e:
+                out.setdefault("disk_errors", []).append(f"{lock}: {e}")
+    if data_dir and os.path.isdir(data_dir):
+        try:
+            shutil.rmtree(data_dir)
+            reaped.append(data_dir)
+        except OSError as e:
+            out.setdefault("disk_errors", []).append(f"{data_dir}: {e}")
+    return reaped
+
+
 def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: float) -> dict:
-    """Concurrent SIGKILL via the pdeathsig chain, then synchronous on-disk reap."""
+    """Concurrent SIGKILL via the pdeathsig chain, then synchronous on-disk reap.
+
+    Raises `SurvivedTeardown` if any tracked child outlived the kill. That is not
+    politeness: reaping the state file and rmtree'ing the data dir of a VM whose
+    Firecracker is still RUNNING deletes the only record of a live microVM and
+    pulls its rootfs out from under it, and every later measurement then runs on a
+    box carrying an invisible ~1 GB tenant. Continuing the schedule after that is
+    measuring contention, not the request path.
+    """
     out: dict = {"mode": "fast"}
 
     kids = children_of(fcvm_pid)
-    tracked = {proc_comm(p) or f"pid{p}": p for p in kids}
+    # Keyed by comm, but a COLLISION MUST NOT DROP A CHILD. `{proc_comm(p): p for p
+    # in kids}` silently keeps only the last of any two children sharing a comm,
+    # and a child that is not in `tracked` is neither waited on nor CPU-accounted —
+    # it just does not exist as far as the leak check is concerned. fcvm's clone
+    # happens to have three distinct comms today (firecracker / sleep / pasta), so
+    # this never bit; that is luck, not a guarantee.
+    tracked: dict = {}
+    for p in kids:
+        base = proc_comm(p) or f"pid{p}"
+        key = base if base not in tracked else f"{base}#{p}"
+        tracked[key] = p
     out["children"] = tracked
     fds = {name: pidfd_open(pid) for name, pid in tracked.items()}
-    pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
 
     # Control window: same machine, same instant, no reclaim running. Gives the
     # background busy rate to subtract, so ambient load is not attributed to us.
-    ctl_busy0, ctl_tot0 = machine_busy_jiffies()
+    #
+    # It SLEEPS. It used to be `while time.monotonic() - ctl_t0 < 0.05: pass`,
+    # i.e. the "ambient" rate was measured while this thread held 100% of one
+    # core. Measured back to back on this box, same ambient load: the spinning
+    # version reported control_busy_cores 1.40 / 1.40 / 1.20 with 50.0 ms of the
+    # harness's OWN cpu inside a 50 ms window; the sleeping version reports
+    # 0.20 / 0.40 / 0.00 with 0.0 ms. That ~1.2-core inflation was then multiplied
+    # by the ENTIRE reclaim window — in which the harness spins only while a child
+    # is still alive — so the subtraction removed work that was never done there.
+    # Belt and braces: the harness's own CPU is measured over both windows and
+    # subtracted from each, so any residual self-load cancels by construction.
+    ctl_self0 = self_cpu_ms()
+    ctl_busy0, _ = machine_busy_jiffies()
     ctl_t0 = time.monotonic()
-    while time.monotonic() - ctl_t0 < 0.05:
-        pass
-    ctl_busy1, ctl_tot1 = machine_busy_jiffies()
+    time.sleep(0.05)
+    ctl_busy1, _ = machine_busy_jiffies()
     ctl_dt = time.monotonic() - ctl_t0
-    ctl_rate = (ctl_busy1 - ctl_busy0) / CLK_TCK / ctl_dt if ctl_dt > 0 else 0.0
+    ctl_self_ms = self_cpu_ms() - ctl_self0
+    ctl_busy_ms = (ctl_busy1 - ctl_busy0) * 1000.0 / CLK_TCK
+    ctl_rate = (ctl_busy_ms - ctl_self_ms) / 1000.0 / ctl_dt if ctl_dt > 0 else 0.0
 
+    # Sampled HERE, immediately before the kill — not before the control window.
+    # Spanning the control window made the delta absorb ~50 ms of the still-running
+    # VM's ordinary CPU and report it as reclaim.
+    pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
+
+    self0 = self_cpu_ms()
     busy0, _ = machine_busy_jiffies()
     t_kill = time.monotonic()
-    # ONE signal. The kernel fans SIGKILL out to firecracker AND the holder in a
-    # single forget_original_parent() pass — concurrent by construction.
+    # ONE signal. The kernel fans SIGKILL out to firecracker, the namespace holder
+    # AND pasta in a single forget_original_parent() pass — concurrent by
+    # construction (all three carry PR_SET_PDEATHSIG; see the module docstring).
     try:
         os.kill(fcvm_pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -311,10 +528,11 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     out["signal_ms"] = (time.monotonic() - t_kill) * 1000
 
     deadline = t_kill + timeout_s
-    cpu = {name: sample_until_gone(pid, deadline) for name, pid in tracked.items()}
+    cpu = sample_all_until_gone(tracked, deadline)
     all_gone = wait_pidfds(list(fds.values()), max(0.0, deadline - time.monotonic()))
     t_gone = time.monotonic()
     busy1, _ = machine_busy_jiffies()
+    self_ms = self_cpu_ms() - self0
 
     for fd in fds.values():
         if fd is not None:
@@ -325,37 +543,63 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     out["reap_wall_ms"] = window_s * 1000
     out["all_gone"] = all_gone
     out["machine_cpu_ms"] = machine_cpu_ms
-    out["machine_cpu_ms_excess"] = machine_cpu_ms - ctl_rate * window_s * 1000
+    out["harness_cpu_ms"] = self_ms
+    out["machine_cpu_ms_excess"] = (machine_cpu_ms - self_ms) - ctl_rate * window_s * 1000
     out["control_busy_cores"] = ctl_rate
+    out["control_harness_cpu_ms"] = ctl_self_ms
+
+    # /proc/<pid>/stat counts in jiffies, so every CPU figure here is quantized to
+    # one tick. At CLK_TCK=100 that is 10 ms, and a sub-tick reclaim reports a hard
+    # 0.0 — a claim of zero CPU with zero uncertainty, which is exactly AGENTS.md
+    # defect 6. Emit the bound instead of the point.
+    tick_ms = 1000.0 / CLK_TCK
+    out["tick_ms"] = tick_ms
     out["per_child_cpu"] = {}
     for name, pid in tracked.items():
         before = pre[name]
         base = (before[1] + before[2]) * 1000.0 / CLK_TCK if before else 0.0
         s = cpu[name]
+        delta = (s["cpu_ms"] - base) if s["cpu_ms"] is not None else None
         out["per_child_cpu"][name] = {
+            "pid": pid,
             "cpu_before_ms": base,
             "cpu_final_ms": s["cpu_ms"],
-            "reclaim_cpu_ms": (s["cpu_ms"] - base) if s["cpu_ms"] is not None else None,
+            "reclaim_cpu_ms": delta,
+            # The interval the two quantized reads can actually support: each
+            # endpoint is truncated to a tick, so the true delta lies in
+            # [delta, delta + 2*tick].
+            "reclaim_cpu_ms_lo": delta,
+            "reclaim_cpu_ms_hi": (delta + 2 * tick_ms) if delta is not None else None,
+            "below_resolution": (delta == 0.0) if delta is not None else None,
             # True  -> exit_mm() had already run, figure is COMPLETE.
             # False -> reaper won the race, figure is a LOWER BOUND.
             "complete": s["zombie_seen"],
         }
 
-    t_disk = time.monotonic()
-    reaped = []
-    for path in (state_path,):
-        if path and os.path.exists(path):
+    if not all_gone:
+        survivors = {
+            name: pid for name, pid in tracked.items() if proc_stat_fields(pid) is not None
+        }
+        out["survivors"] = survivors
+        out["disk_reap_skipped"] = True
+        # Do NOT reap: the state file is the only record that these are ours.
+        # SIGKILL each survivor directly so the box is not left carrying them, then
+        # abort the schedule — a later rep measured next to a leaked microVM is not
+        # a measurement of this request path.
+        for pid in survivors.values():
             try:
-                os.remove(path)
-                reaped.append(path)
-            except OSError as e:
-                out.setdefault("disk_errors", []).append(f"{path}: {e}")
-    if data_dir and os.path.isdir(data_dir):
-        try:
-            shutil.rmtree(data_dir)
-            reaped.append(data_dir)
-        except OSError as e:
-            out.setdefault("disk_errors", []).append(f"{data_dir}: {e}")
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
+        raise SurvivedTeardown(
+            f"fast teardown of fcvm {fcvm_pid} left {survivors} alive after "
+            f"{timeout_s:.1f}s; state {state_path} and data {data_dir} NOT reaped",
+            out,
+        )
+
+    t_disk = time.monotonic()
+    reaped = reap_disk(out, state_path, data_dir)
     out["disk_reap_ms"] = (time.monotonic() - t_disk) * 1000
     out["disk_reaped"] = reaped
     out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
@@ -399,6 +643,21 @@ def teardown_normal(proc: subprocess.Popen, fcvm_pid: int, timeout_s: float) -> 
 # ----------------------------------------------------------------- one request
 
 
+def clone_ws_url(supplied: str, endpoint: str) -> str:
+    """Re-host a prewired `--ws-url` onto THIS clone's endpoint.
+
+    `--ws-url` exists to skip the per-request `/json/list`, and the reusable part
+    of the URL is the PATH — the page target id, which the golden snapshot bakes
+    in so every clone presents the same one. The NETLOC is not reusable: every
+    clone gets its own host-side address (`clone_cdp_endpoint`), so a single
+    prewired URL passed verbatim names one fixed 127.x.y.z:port for the whole run.
+    If that address happens to answer, the rep measures a DIFFERENT clone than the
+    one it just spawned and tore down.
+    """
+    u = urlparse(supplied)
+    return urlunparse(u._replace(netloc=endpoint))
+
+
 def run_cdp_request(args, rep: int, fast: bool) -> dict:
     import cdpdrive
 
@@ -410,56 +669,86 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
+    # Watch registered BEFORE the spawn: a watch created afterwards can miss the
+    # state file's creation and then block waiting for an event already past.
+    watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
-    with open(log, "wb") as lf:
-        # stdout/stderr to a FILE, never a pipe we do not drain: an undrained
-        # 64 KB pipe blocks fcvm's writer and stalls everything behind it
-        # (AGENTS.md "Pipe Buffer Deadlock in Tests").
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
-    fcvm_pid = proc.pid
-
-    state_path = data_dir = None
     try:
-        deadline = t_spawn + args.timeout
-        t = time.monotonic()
-        state_path, state = find_state(args.state_dir, fcvm_pid, deadline)
-        if state is None:
-            raise TimeoutError("clone state file never appeared")
-        rec["discover_ms"] = (time.monotonic() - t) * 1000
-        vm_id = state.get("vm_id", "")
-        data_dir = os.path.join(args.data_root, "vm-disks", vm_id)
-        rec["vm_id"] = vm_id
+        with open(log, "wb") as lf:
+            # stdout/stderr to a FILE, never a pipe we do not drain: an undrained
+            # 64 KB pipe blocks fcvm's writer and stalls everything behind it
+            # (AGENTS.md "Pipe Buffer Deadlock in Tests").
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
+        fcvm_pid = proc.pid
 
-        endpoint = clone_cdp_endpoint(state, args.cdp_port)
-        rec["endpoint"] = endpoint
-        rec["port_wait_ms"] = wait_port(endpoint, deadline)
+        state_path = data_dir = None
+        try:
+            deadline = t_spawn + args.timeout
+            t = time.monotonic()
+            state_path, state = find_state(args.state_dir, fcvm_pid, deadline, watch, name)
+            if state is None:
+                raise TimeoutError("clone state file never appeared")
+            rec["discover_ms"] = (time.monotonic() - t) * 1000
+            vm_id = state.get("vm_id", "")
+            data_dir = os.path.join(args.data_root, "vm-disks", vm_id)
+            rec["vm_id"] = vm_id
 
-        drive_args = argparse.Namespace(
-            cdp_host=endpoint,
-            url=args.url,
-            format=args.format,
-            quality=args.quality,
-            timeout=max(1.0, deadline - time.monotonic()),
-            idle_wait_ms=0.0,
-            out_prefix="",
-            ws_url=args.ws_url,
-            connect_retries=200,
-            nav_timing=True,
-            render_module=os.path.join(HERE, "render.py"),
-        )
-        result = cdpdrive.drive(drive_args)
-        rec["render"] = result
-        rec["ok"] = bool(result.get("ok"))
-        # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
-        # teardown, and none of it is latency the caller pays.
-        rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
-    except Exception as e:
-        rec["ok"] = False
-        rec["error"] = f"{type(e).__name__}: {e}"
-        rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+            endpoint = clone_cdp_endpoint(state, args.cdp_port)
+            rec["endpoint"] = endpoint
+            rec["port_wait_ms"] = wait_port(endpoint, deadline)
+
+            ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
+            rec["ws_url_prewired"] = bool(ws_url)
+            drive_args = argparse.Namespace(
+                cdp_host=endpoint,
+                url=args.url,
+                format=args.format,
+                quality=args.quality,
+                timeout=max(1.0, deadline - time.monotonic()),
+                idle_wait_ms=0.0,
+                out_prefix="",
+                ws_url=ws_url,
+                connect_retries=200,
+                nav_timing=True,
+                print_target=False,
+                render_module=os.path.join(HERE, "render.py"),
+            )
+            result = cdpdrive.drive(drive_args)
+            rec["render"] = result
+            rec["ok"] = bool(result.get("ok"))
+            # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
+            # teardown, and none of it is latency the caller pays.
+            rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+        except Exception as e:
+            rec["ok"] = False
+            rec["error"] = f"{type(e).__name__}: {e}"
+            rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+            if state_path is None:
+                # find_state may have timed out while fcvm had ALREADY written the
+                # file (it is saved with `pid: null` until post-resume). Leaving
+                # state_path/data_dir as None here means teardown reaps nothing and
+                # the clone's disk artifacts leak permanently — nothing else ever
+                # removes a state file whose pid is null. Rescan by NAME once.
+                state_path, state = scan_state(args.state_dir, fcvm_pid, name)
+                if state is not None:
+                    rec["recovered_state_by_name"] = True
+                    rec["vm_id"] = state.get("vm_id", "")
+                    data_dir = os.path.join(args.data_root, "vm-disks", rec["vm_id"])
+    finally:
+        watch.close()
 
     if fast:
-        rec["teardown"] = teardown_fast(fcvm_pid, state_path, data_dir, args.teardown_timeout)
+        try:
+            rec["teardown"] = teardown_fast(fcvm_pid, state_path, data_dir,
+                                            args.teardown_timeout)
+        except SurvivedTeardown as e:
+            # The rep still gets a record, with the survivor list in it.
+            rec["teardown"] = e.teardown
+            rec["ok"] = False
+            rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+            rec["log"] = log
+            e.record = rec
+            raise
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -508,22 +797,26 @@ def run_noop_request(args, rep: int) -> dict:
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
+    watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
-    with open(log, "wb") as lf:
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
-    fcvm_pid = proc.pid
     try:
-        deadline = t_spawn + args.timeout
-        state_path, state = find_state(args.state_dir, fcvm_pid, deadline)
-        if state is None:
-            raise TimeoutError("clone state file never appeared")
-        rec["vm_id"] = state.get("vm_id", "")
-        endpoint = clone_cdp_endpoint(state, args.cdp_port)
-        rec["port_wait_ms"] = wait_port(endpoint, deadline)
-        rec["ok"] = True
-    except Exception as e:
-        rec["ok"] = False
-        rec["error"] = f"{type(e).__name__}: {e}"
+        with open(log, "wb") as lf:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
+        fcvm_pid = proc.pid
+        try:
+            deadline = t_spawn + args.timeout
+            state_path, state = find_state(args.state_dir, fcvm_pid, deadline, watch, name)
+            if state is None:
+                raise TimeoutError("clone state file never appeared")
+            rec["vm_id"] = state.get("vm_id", "")
+            endpoint = clone_cdp_endpoint(state, args.cdp_port)
+            rec["port_wait_ms"] = wait_port(endpoint, deadline)
+            rec["ok"] = True
+        except Exception as e:
+            rec["ok"] = False
+            rec["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        watch.close()
     rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["teardown"] = teardown_normal(proc, fcvm_pid, args.teardown_timeout)
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
@@ -543,10 +836,35 @@ def run_exec_request(args, rep: int) -> dict:
         "--name", name, "--no-dirty-tracking", "--no-swap", "--exec", driver,
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
+    rec: dict = {"arm": "exec", "rep": rep, "name": name, "timed_out": False}
     t0 = time.monotonic()
     with open(log, "wb") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
-    rc = proc.wait(timeout=args.timeout + args.teardown_timeout)
+    try:
+        rc = proc.wait(timeout=args.timeout + args.teardown_timeout)
+    except subprocess.TimeoutExpired:
+        # This was a bare `proc.wait(timeout=...)` with no handler, so a single
+        # slow rep raised `TimeoutExpired` straight out of main() and killed the
+        # harness — leaving the spawned fcvm ORPHANED (Python installs no
+        # pdeathsig and reqbench is not a subreaper) with its Firecracker, holder,
+        # pasta, state file and vm-disks dir still live, into the next run's
+        # measurements. The exec arm was the only arm with this hole; the other two
+        # always reach a teardown call.
+        rec["timed_out"] = True
+        try:
+            os.kill(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        rc = -9
+        # The exec arm never resolves the clone's state file in the happy path, so
+        # find it now — by name, since the pid may never have been written.
+        sp, state = scan_state(args.state_dir, proc.pid, name)
+        dd = os.path.join(args.data_root, "vm-disks", state.get("vm_id", "")) if state else ""
+        rec["reaped"] = reap_disk(rec, sp, dd)
     wall = (time.monotonic() - t0) * 1000
     render_ms = None
     try:
@@ -558,14 +876,15 @@ def run_exec_request(args, rep: int) -> dict:
                             render_ms = float(tok.split("=", 1)[1])
     except OSError:
         pass
-    return {
-        "arm": "exec", "rep": rep, "name": name, "ok": rc == 0,
+    rec.update(
+        ok=(rc == 0),
         # The exec arm has no separable "response in hand" instant that the host
         # can observe: fcvm returns only after its own teardown. blocking == wall
         # is not an approximation, it is the arm's defining property.
-        "blocking_ms": wall, "wall_ms": wall,
-        "render_total_ms": render_ms, "rc": rc, "log": log,
-    }
+        blocking_ms=wall, wall_ms=wall,
+        render_total_ms=render_ms, rc=rc, log=log,
+    )
+    return rec
 
 
 def main() -> int:
@@ -621,12 +940,25 @@ def main() -> int:
         out.write(json.dumps(meta) + "\n")
         out.flush()
         for rep, arm, is_warmup in schedule:
-            if arm == "exec":
-                rec = run_exec_request(args, rep)
-            elif arm == "noop":
-                rec = run_noop_request(args, rep)
-            else:
-                rec = run_cdp_request(args, rep, fast=(arm == "cdp-fast"))
+            # Every rep records something, including the ones that blow up. A rep
+            # that raises out of the loop used to take the whole run with it and
+            # leave no trace in the artifact, so `n=` was the only evidence that
+            # anything had been dropped.
+            try:
+                if arm == "exec":
+                    rec = run_exec_request(args, rep)
+                elif arm == "noop":
+                    rec = run_noop_request(args, rep)
+                else:
+                    rec = run_cdp_request(args, rep, fast=(arm == "cdp-fast"))
+                fatal = None
+            except SurvivedTeardown as e:
+                rec = dict(e.record) or {"arm": arm, "rep": rep}
+                rec.update(ok=False, error=f"{type(e).__name__}: {e}")
+                fatal = e
+            except Exception as e:  # noqa: BLE001 - record, then re-raise
+                rec = {"arm": arm, "rep": rep, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
             rec["loadavg1"] = float(open("/proc/loadavg").read().split()[0])
             out.write(json.dumps(rec) + "\n")
@@ -638,6 +970,12 @@ def main() -> int:
                 f"teardown={rec.get('teardown', {}).get('teardown_total_ms', 0):.1f}ms",
                 flush=True,
             )
+            if fatal is not None:
+                # STOP. A survivor means the box now carries a microVM this harness
+                # cannot see; every later rep would be measuring contention.
+                print(f"\nABORTING SCHEDULE: {fatal}", file=sys.stderr, flush=True)
+                print(f"wrote {out_path}")
+                return 4
     print(f"\nwrote {out_path}")
     return 0
 

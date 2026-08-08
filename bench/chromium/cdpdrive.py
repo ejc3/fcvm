@@ -286,6 +286,14 @@ def drive(args) -> dict:
     except (OSError, RuntimeError, TimeoutError, KeyError, ValueError, render.WsClosed) as e:
         out["error"] = f"{type(e).__name__}: {e}"
         out["stage"] = stage
+        # Classify, so downstream can gate on it instead of substring-matching the
+        # message. A `WsClosed` is the PEER closing the TCP connection — it is NOT
+        # this driver's own timeout (render.py raises TimeoutError for that), so a
+        # failure at ~5 s against a 120 s deadline is a real transport drop in the
+        # socat+pasta relay this arm adds and the exec arm does not have.
+        out["failure_class"] = (
+            "transport" if isinstance(e, (render.WsClosed, ConnectionError)) else "render"
+        )
     finally:
         if ws is not None:
             try:
@@ -309,8 +317,19 @@ def main() -> int:
     p.add_argument("--ws-url", default="", help="pre-resolved target; skips /json/list")
     p.add_argument("--connect-retries", type=int, default=200)
     p.add_argument("--nav-timing", action="store_true")
+    p.add_argument("--print-target", action="store_true",
+                   help="print the page target id and exit; nothing else is done")
     p.add_argument("--render-module", default=os.path.join(HERE, "render.py"))
     args = p.parse_args()
+    if args.print_target:
+        # The docstring above has promised this flag since the file was written,
+        # and argparse did not have it — so `--print-target` exited 2 with
+        # "unrecognized arguments", and NEITHER of the two places that claim the
+        # target id can be checked across clones could actually check it.
+        target = resolve_target(args.cdp_host, time.monotonic() + args.timeout,
+                                args.connect_retries)
+        print(target.get("id", ""), flush=True)
+        return 0
     out = drive(args)
     print(json.dumps(out, separators=(",", ":")), flush=True)
     return 0 if out["ok"] else 1
