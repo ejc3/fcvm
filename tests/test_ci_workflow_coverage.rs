@@ -137,3 +137,152 @@ fn gating_jobs_live_in_the_pull_request_workflow() {
         );
     }
 }
+
+/// Every self-hosted job that checks out must first repair workspace ownership.
+///
+/// Self-hosted runners keep their workspace between jobs. fcvm's privileged
+/// tests write root-owned files into it (`artifacts/fc-agent` and friends), so
+/// the next `actions/checkout` fails: `git clean -ffdx` gets "Permission
+/// denied" and the "recreate the repository" fallback gets EACCES. The job dies
+/// at checkout, before it builds anything.
+///
+/// ci.yml has guarded its self-hosted jobs this way for a long time. kernels.yml
+/// never got the guard, and **every Build Kernels run from 2026-06-11 onward
+/// failed at checkout** — so the FICLONE >4 GiB fix, merged to main on
+/// 2026-06-11, was never compiled into a kernel. Two months of "the fix is in
+/// main" while every deployed kernel still truncated at `u32::MAX`.
+#[test]
+fn self_hosted_checkouts_repair_workspace_ownership_first() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+
+    let mut checked = 0usize;
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let wf: Value = match serde_norway::from_str(&std::fs::read_to_string(&path).unwrap()) {
+            Ok(v) => v,
+            Err(e) => panic!("{name} is not valid YAML: {e}"),
+        };
+        let Some(jobs) = wf.get("jobs").and_then(Value::as_mapping) else {
+            continue;
+        };
+
+        for (job_name, job) in jobs {
+            // Only self-hosted jobs share a persistent workspace.
+            let runs_on = job
+                .get("runs-on")
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_default();
+            if !runs_on.contains("self-hosted") {
+                continue;
+            }
+            let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
+                continue;
+            };
+            // Find the first checkout step; anything before it is pre-checkout.
+            let checkout_at = steps.iter().position(|s| {
+                s.get("uses")
+                    .and_then(Value::as_str)
+                    .is_some_and(|u| u.starts_with("actions/checkout"))
+            });
+            let Some(idx) = checkout_at else { continue };
+            checked += 1;
+
+            // Both words must appear in the SAME command. Matching them anywhere
+            // in the step's script is not enough: `weekly.yml`'s bench-vm job has
+            // `sudo rm -rf ${{ github.workspace }}/...` on one line and
+            // `sudo chown -R $USER ~/.cargo/advisory-db*` on another, which
+            // satisfies a whole-block substring check while chowning nothing in
+            // the workspace. That false negative is precisely what this test
+            // exists to prevent, so it must not commit it itself.
+            let guarded = steps[..idx].iter().any(|s| {
+                s.get("run").and_then(Value::as_str).is_some_and(|r| {
+                    r.lines()
+                        .any(|line| line.contains("chown") && line.contains("workspace"))
+                })
+            });
+            let job_label = job_name.as_str().unwrap_or("<job>");
+            assert!(
+                guarded,
+                "{name}: self-hosted job `{job_label}` runs actions/checkout with no preceding \
+                 workspace-ownership repair. Root-owned leftovers from a privileged run make \
+                 checkout fail with EACCES, and the job dies before building. Add the \
+                 `Fix workspace permissions (pre-checkout)` step used by ci.yml."
+            );
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "found no self-hosted checkout steps to inspect — the walk is broken, and a check that \
+         inspects nothing must not report success"
+    );
+}
+
+/// A `gh` existence probe must not send its error to `/dev/null`.
+///
+/// `kernels.yml` decided whether to build a kernel with
+/// `if gh release view "$TAG" &>/dev/null; then ... else "does not exist"`.
+/// That step has no `working-directory`, and every checkout lands in a
+/// subdirectory (`path: fcvm`), so `gh` could not infer the repository and
+/// failed for a reason unrelated to existence. The redirect discarded the
+/// error and the `else` branch reported "does not exist" — for releases that
+/// demonstrably did exist. The build then ran to completion and died at the
+/// release step:
+///
+/// ```text
+/// Release kernel-nested-6.18.3-aarch64-0fc501348cc2 does not exist   <- step 9
+/// a release with the same tag name already exists: ...               <- step 12
+/// ```
+///
+/// That is how Build Kernels failed on 2026-06-14 and 2026-08-07 — the same
+/// "cannot tell, so assume the permissive answer" shape as the base-branch
+/// filter and the Summary job.
+#[test]
+fn gh_existence_probes_do_not_discard_their_error() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut probes = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("read workflows dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(&path).expect("read workflow");
+
+        for (i, line) in text.lines().enumerate() {
+            let l = line.trim();
+            // Inspect commands, not prose. A shell comment explaining the old
+            // broken probe is not itself a broken probe — without this the test
+            // flags the very comment documenting the fix.
+            if l.starts_with('#') {
+                continue;
+            }
+            if !l.contains("gh ") || !l.contains("view") {
+                continue;
+            }
+            probes += 1;
+            assert!(
+                !(l.contains("&>/dev/null")
+                    || l.contains("> /dev/null 2>&1")
+                    || l.contains(">/dev/null 2>&1")),
+                "{name}:{}: `{l}` discards gh's error, so a failure for any reason other than \
+                 non-existence is indistinguishable from \"it does not exist\". Capture the \
+                 output, branch on \"not found\", and fail the step on anything else.",
+                i + 1
+            );
+        }
+    }
+
+    assert!(
+        probes > 0,
+        "found no `gh ... view` probes to inspect — the scan is broken, and a check that \
+         inspects nothing must not report success"
+    );
+}

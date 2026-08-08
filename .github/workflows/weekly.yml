@@ -138,6 +138,11 @@ jobs:
       - name: Clean workspace (pre-checkout)
         run: |
           sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+          # Removing target/ and artifacts/ covers the two directories seen so far,
+          # but any other root-owned file a privileged run leaves anywhere in the
+          # workspace still fails checkout with EACCES. Chown the whole tree, as
+          # the Lifecycle-Fuzz job above and every self-hosted job in ci.yml do.
+          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm 2>/dev/null || true
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
       - uses: actions/checkout@v7

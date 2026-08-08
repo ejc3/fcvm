@@ -32,6 +32,17 @@ jobs:
     permissions:
       contents: write  # Required for creating releases
     steps:
+      # This workflow shares a persistent runner workspace with ci.yml, whose
+      # privileged tests leave root-owned files behind (artifacts/fc-agent and
+      # friends). checkout's `git clean -ffdx` then hits "Permission denied",
+      # and its "recreate the repository" fallback fails with EACCES, so the
+      # job dies before compiling anything. ci.yml guards all three of its
+      # self-hosted jobs exactly this way; this workflow never got the guard,
+      # and every Build Kernels run since 2026-06-09 failed here.
+      - name: Fix workspace permissions (pre-checkout)
+        run: |
+          sudo chown -R $USER:$USER ${{ github.workspace }} 2>/dev/null || true
+
       - uses: actions/checkout@v7
         with:
           path: fcvm
@@ -97,14 +108,33 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          # This step has no working-directory, and every checkout lands in a
+          # subdirectory (path: fcvm), so the default cwd is not a git repo and
+          # `gh` cannot infer the repository. GH_REPO makes it explicit rather
+          # than cwd-dependent.
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG="${{ steps.kernel.outputs.tag }}"
-          if gh release view "$TAG" &>/dev/null; then
+          # Distinguish "the release does not exist" from "the query failed".
+          # The old code was `gh release view "$TAG" &>/dev/null` with the failure
+          # falling into the else branch, so a gh error that had nothing to do
+          # with existence was reported as "does not exist". The build then ran
+          # to completion and died at the release step with
+          #   a release with the same tag name already exists: <tag>
+          # which is how Build Kernels failed on 2026-06-14 and 2026-08-07.
+          set +e
+          OUT=$(gh release view "$TAG" --json tagName 2>&1)
+          RC=$?
+          set -e
+          if [ $RC -eq 0 ]; then
             echo "Release $TAG already exists"
             echo "exists=true" >> $GITHUB_OUTPUT
-          else
+          elif printf '%s' "$OUT" | grep -qi 'release not found\|not found'; then
             echo "Release $TAG does not exist"
             echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "::error::cannot determine whether release $TAG exists (rc=$RC): $OUT"
+            exit 1
           fi
 
       - name: Setup btrfs for fcvm
@@ -220,6 +250,17 @@ jobs:
     permissions:
       contents: write  # Required for creating releases
     steps:
+      # This workflow shares a persistent runner workspace with ci.yml, whose
+      # privileged tests leave root-owned files behind (artifacts/fc-agent and
+      # friends). checkout's `git clean -ffdx` then hits "Permission denied",
+      # and its "recreate the repository" fallback fails with EACCES, so the
+      # job dies before compiling anything. ci.yml guards all three of its
+      # self-hosted jobs exactly this way; this workflow never got the guard,
+      # and every Build Kernels run since 2026-06-09 failed here.
+      - name: Fix workspace permissions (pre-checkout)
+        run: |
+          sudo chown -R $USER:$USER ${{ github.workspace }} 2>/dev/null || true
+
       - uses: actions/checkout@v7
         with:
           path: fcvm
@@ -285,14 +326,33 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          # This step has no working-directory, and every checkout lands in a
+          # subdirectory (path: fcvm), so the default cwd is not a git repo and
+          # `gh` cannot infer the repository. GH_REPO makes it explicit rather
+          # than cwd-dependent.
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG="${{ steps.kernel.outputs.tag }}"
-          if gh release view "$TAG" &>/dev/null; then
+          # Distinguish "the release does not exist" from "the query failed".
+          # The old code was `gh release view "$TAG" &>/dev/null` with the failure
+          # falling into the else branch, so a gh error that had nothing to do
+          # with existence was reported as "does not exist". The build then ran
+          # to completion and died at the release step with
+          #   a release with the same tag name already exists: <tag>
+          # which is how Build Kernels failed on 2026-06-14 and 2026-08-07.
+          set +e
+          OUT=$(gh release view "$TAG" --json tagName 2>&1)
+          RC=$?
+          set -e
+          if [ $RC -eq 0 ]; then
             echo "Release $TAG already exists"
             echo "exists=true" >> $GITHUB_OUTPUT
-          else
+          elif printf '%s' "$OUT" | grep -qi 'release not found\|not found'; then
             echo "Release $TAG does not exist"
             echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "::error::cannot determine whether release $TAG exists (rc=$RC): $OUT"
+            exit 1
           fi
 
       - name: Setup btrfs for fcvm
