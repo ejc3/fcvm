@@ -14,7 +14,7 @@ diff --git a/fs/fuse/file.c b/fs/fuse/file.c
 index 676fd9856bfbf..1a47c623a0868 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3158,6 +3158,105 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3158,6 +3158,127 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  	return ret;
  }
  
@@ -43,6 +43,7 @@ index 676fd9856bfbf..1a47c623a0868 100644
 +	struct fuse_write_out outarg;
 +	loff_t err;
 +	loff_t end_in, end_out;
++	loff_t effective;
 +	bool is_unstable;
 +
 +	if (fc->no_remap_file_range)
@@ -52,9 +53,21 @@ index 676fd9856bfbf..1a47c623a0868 100644
 +		return -EXDEV;
 +
 +	if (len == 0) {
++		/*
++		 * FICLONE: the whole source from pos_in is cloned. Refresh the
++		 * source size so the post-clone attribute update below records
++		 * the real cloned extent.
++		 */
++		err = fuse_update_attributes(inode_in, file_in, STATX_SIZE);
++		if (err)
++			return err;
++		effective = i_size_read(inode_in) - pos_in;
++		if (effective < 0)
++			effective = 0;
 +		end_in = LLONG_MAX;
 +		end_out = LLONG_MAX;
 +	} else {
++		effective = len;
 +		end_in = pos_in + len - 1;
 +		end_out = pos_out + len - 1;
 +	}
@@ -99,14 +112,23 @@ index 676fd9856bfbf..1a47c623a0868 100644
 +	if (err)
 +		goto out;
 +
++	/*
++	 * The server's clone (host FICLONE/FICLONERANGE) is all-or-nothing:
++	 * success means the entire requested range was cloned. Derive the
++	 * result from the request, NOT from outarg.size — fuse_write_out's
++	 * size field is u32 and silently truncates large clones (a 10GiB
++	 * FICLONE reported 2GiB, and the truncated value poisoned the cached
++	 * inode size: reads past 2GiB went short until the attr cache
++	 * expired).
++	 */
 +	truncate_inode_pages_range(inode_out->i_mapping,
 +				   ALIGN_DOWN(pos_out, PAGE_SIZE),
-+				   ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1);
++				   ALIGN(pos_out + effective, PAGE_SIZE) - 1);
 +
 +	file_update_time(file_out);
-+	fuse_write_update_attr(inode_out, pos_out + outarg.size, outarg.size);
++	fuse_write_update_attr(inode_out, pos_out + effective, effective);
 +
-+	err = outarg.size;
++	err = effective;
 +out:
 +	if (is_unstable)
 +		clear_bit(FUSE_I_SIZE_UNSTABLE, &fi_out->state);
@@ -120,7 +142,7 @@ index 676fd9856bfbf..1a47c623a0868 100644
  static const struct file_operations fuse_file_operations = {
  	.llseek		= fuse_file_llseek,
  	.read_iter	= fuse_file_read_iter,
-@@ -3178,6 +3277,7 @@ static const struct file_operations fuse_file_operations = {
+@@ -3178,6 +3299,7 @@ static const struct file_operations fuse_file_operations = {
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
  	.setlease	= generic_setlease,
