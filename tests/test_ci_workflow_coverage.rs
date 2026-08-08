@@ -193,10 +193,18 @@ fn self_hosted_checkouts_repair_workspace_ownership_first() {
             let Some(idx) = checkout_at else { continue };
             checked += 1;
 
+            // Both words must appear in the SAME command. Matching them anywhere
+            // in the step's script is not enough: `weekly.yml`'s bench-vm job has
+            // `sudo rm -rf ${{ github.workspace }}/...` on one line and
+            // `sudo chown -R $USER ~/.cargo/advisory-db*` on another, which
+            // satisfies a whole-block substring check while chowning nothing in
+            // the workspace. That false negative is precisely what this test
+            // exists to prevent, so it must not commit it itself.
             let guarded = steps[..idx].iter().any(|s| {
-                s.get("run")
-                    .and_then(Value::as_str)
-                    .is_some_and(|r| r.contains("chown") && r.contains("workspace"))
+                s.get("run").and_then(Value::as_str).is_some_and(|r| {
+                    r.lines()
+                        .any(|line| line.contains("chown") && line.contains("workspace"))
+                })
             });
             let job_label = job_name.as_str().unwrap_or("<job>");
             assert!(
