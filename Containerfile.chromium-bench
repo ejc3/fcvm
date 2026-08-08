@@ -6,7 +6,17 @@
 # each drive one CDP render via bench/chromium/render.py.
 #
 # Build (repo root context; .dockerignore excludes target/):
-#   podman build -t localhost/chromium-bench -f Containerfile.chromium-bench .
+#   podman build --format docker -t localhost/chromium-bench -f Containerfile.chromium-bench .
+#
+# --format docker is LOAD-BEARING. podman's default OCI format DROPS the
+# HEALTHCHECK at the bottom of this file with only a warning
+# ("HEALTHCHECK is not supported for OCI image format and will be ignored")
+# and exits 0. fcvm then sees no healthcheck, and src/health.rs treats a
+# MISSING one as a PASS (`None => HealthStatus::Healthy`), so the golden
+# snapshot fires on "container is running" — a COLD browser — and every
+# restored clone's "warm" latency is really a first-paint number. Verify:
+#   podman inspect localhost/chromium-bench --format '{{json .HealthCheck}}'
+# must print the Test array containing cdp_health.
 #
 # Host smoke test (fast loop, no VM):
 #   podman run -d --name cb localhost/chromium-bench
@@ -19,9 +29,12 @@
 #   fcvm exec --pid <PID> -c -- python3 /opt/bench/render.py \
 #       http://127.0.0.1:8000/medium.html --out-prefix /tmp/medium
 #
-# Golden-snapshot warm point: /ready returns 200 only after warmup, so
-#   --health-check http://127.0.0.1:8000/ready
-# makes the auto startup snapshot capture a WARM browser.
+# Golden-snapshot warm point: SUPERSEDED — do NOT pass a --health-check URL.
+# An earlier recipe here suggested `--health-check http://127.0.0.1:8000/ready`.
+# That sets `has_http_check` in src/health.rs, which SKIPS the podman HEALTHCHECK
+# entirely — i.e. it disables the CDP round-trip gate defined at the bottom of
+# this file, which is the trigger this design actually relies on. Leave
+# --health-check UNSET so fcvm's AND-logic consults the image's HEALTHCHECK.
 #
 # Fixtures live in bench/chromium/pages/ and are COPY'd in; the host-side
 # fixture server (bench harness) serves the SAME directory so in-guest and
@@ -40,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     python3 \
     fonts-dejavu-core \
+    socat \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial
 
 # Belt-and-braces half of the getenv/setenv workaround documented at length in
@@ -56,7 +70,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV VK_ICD_FILENAMES=/usr/lib/chromium/./vk_swiftshader_icd.json
 
 COPY bench/chromium/pages/ /opt/bench/pages/
-COPY bench/chromium/pageserver.py bench/chromium/render.py bench/chromium/entry.sh /opt/bench/
-RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py
+COPY bench/chromium/pageserver.py bench/chromium/render.py bench/chromium/entry.sh \
+     bench/chromium/cdp_health.py /opt/bench/
+RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py \
+     /opt/bench/cdp_health.py
+
+# The request path IS Chromium's DevTools Protocol endpoint -- no wrapper of
+# ours parses, re-encodes or re-frames a single CDP message. But reaching it
+# from the host needs ONE relay hop, and that is a MEASURED cost, not a detail:
+#
+#   Chromium IGNORES --remote-debugging-address on this build (151.0.7922.71,
+#   Debian bookworm arm64). Verified, not assumed: the flag is present in
+#   /proc/<pid>/cmdline while /proc/net/tcp shows 0100007F:2406 (127.0.0.1:9222)
+#   and nothing else -- in the same container where the page server's
+#   00000000:1F40 proves a wildcard bind works fine. It is Chromium, not us.
+#
+#   fcvm has NO feature that exposes a guest-LOOPBACK port to the host.
+#   --forward-localhost runs the other way (guest -> host: "enables containers
+#   to reach host-only services via localhost", src/cli/args.rs; the guest relay
+#   dials 10.0.2.2 at fc-agent/src/network.rs:479). Pointing it at 9222 does not
+#   just fail to help -- it HIJACKS the guest's own 127.0.0.1:9222 and breaks
+#   Chromium's readiness probe.
+#
+# So: socat bridges guest-wildcard 9223 -> guest-loopback 9222, and fcvm's
+# --publish 9223:9223 carries host -> guest (clones inherit port_mappings from
+# snapshot metadata, src/commands/snapshot.rs:1001/1051/1070). socat is ~1 MB
+# resident and is the ONLY process this design adds to a clone; its cost is
+# reported rather than waved away.
+EXPOSE 9223
+
+# fcvm's health gate is the golden-snapshot trigger. With no `--health-check`
+# URL, `Healthy` = container running AND podman's HEALTHCHECK healthy
+# (src/health.rs, "AND logic"), so THIS is what decides when the snapshot is
+# taken. cdp_health.py requires a warm marker AND a live CDP round trip that
+# finds a page target: healthy means provably able to screenshot.
+# start-period covers Chromium's cold launch + the warm render; interval is the
+# resolution of the snapshot trigger, so it is short.
+HEALTHCHECK --interval=1s --timeout=5s --start-period=90s --retries=3 \
+    CMD ["python3", "/opt/bench/cdp_health.py"]
 
 CMD ["/opt/bench/entry.sh"]

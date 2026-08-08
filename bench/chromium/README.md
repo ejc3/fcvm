@@ -44,7 +44,20 @@ Fan-out phases add burst latency and marginal memory per concurrent request.
 
 ```bash
 # repo root context (.dockerignore excludes target/)
-podman build -t localhost/chromium-bench -f Containerfile.chromium-bench .
+# --format docker is LOAD-BEARING: podman's default OCI format drops the image's
+# HEALTHCHECK with only a warning, and fcvm treats a MISSING healthcheck as a
+# pass — so the golden snapshot would fire on a COLD browser.
+podman build --format docker -t localhost/chromium-bench -f Containerfile.chromium-bench .
+
+# ...and verify it survived — this FAILS (exit 1) if the OCI format dropped it.
+# It must FAIL, not print a warning: fcvm treats a MISSING healthcheck as a PASS
+# (src/health.rs AND-logic), so a dropped HEALTHCHECK means the golden snapshot
+# fires on a COLD browser and silently inflates page load, screenshot, artifact
+# and total for every restore in the run. `bench.sh` — the harness
+# `make bench-chromium` actually runs — has no build step and no healthcheck
+# check, so on that route this line is the ENTIRE verification.
+podman image inspect localhost/chromium-bench --format '{{json .HealthCheck}}' \
+  | grep -q cdp_health || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
 
 # host smoke test, no VM:
 podman run -d --name cb localhost/chromium-bench
