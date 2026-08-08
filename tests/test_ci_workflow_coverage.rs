@@ -223,3 +223,66 @@ fn self_hosted_checkouts_repair_workspace_ownership_first() {
          inspects nothing must not report success"
     );
 }
+
+/// A `gh` existence probe must not send its error to `/dev/null`.
+///
+/// `kernels.yml` decided whether to build a kernel with
+/// `if gh release view "$TAG" &>/dev/null; then ... else "does not exist"`.
+/// That step has no `working-directory`, and every checkout lands in a
+/// subdirectory (`path: fcvm`), so `gh` could not infer the repository and
+/// failed for a reason unrelated to existence. The redirect discarded the
+/// error and the `else` branch reported "does not exist" — for releases that
+/// demonstrably did exist. The build then ran to completion and died at the
+/// release step:
+///
+/// ```text
+/// Release kernel-nested-6.18.3-aarch64-0fc501348cc2 does not exist   <- step 9
+/// a release with the same tag name already exists: ...               <- step 12
+/// ```
+///
+/// That is how Build Kernels failed on 2026-06-14 and 2026-08-07 — the same
+/// "cannot tell, so assume the permissive answer" shape as the base-branch
+/// filter and the Summary job.
+#[test]
+fn gh_existence_probes_do_not_discard_their_error() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut probes = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("read workflows dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(&path).expect("read workflow");
+
+        for (i, line) in text.lines().enumerate() {
+            let l = line.trim();
+            // Inspect commands, not prose. A shell comment explaining the old
+            // broken probe is not itself a broken probe — without this the test
+            // flags the very comment documenting the fix.
+            if l.starts_with('#') {
+                continue;
+            }
+            if !l.contains("gh ") || !l.contains("view") {
+                continue;
+            }
+            probes += 1;
+            assert!(
+                !(l.contains("&>/dev/null")
+                    || l.contains("> /dev/null 2>&1")
+                    || l.contains(">/dev/null 2>&1")),
+                "{name}:{}: `{l}` discards gh's error, so a failure for any reason other than \
+                 non-existence is indistinguishable from \"it does not exist\". Capture the \
+                 output, branch on \"not found\", and fail the step on anything else.",
+                i + 1
+            );
+        }
+    }
+
+    assert!(
+        probes > 0,
+        "found no `gh ... view` probes to inspect — the scan is broken, and a check that \
+         inspects nothing must not report success"
+    );
+}
