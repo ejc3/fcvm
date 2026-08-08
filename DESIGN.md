@@ -944,7 +944,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
                  ▼
 ┌─────────────────────────────────────────────────────────┐
 │ 2. Create Unix socket for clone connections             │
-│    - /mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock         │
+│    - uffd-{snapshot}-{pid}-{pid_start_time}.sock        │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐

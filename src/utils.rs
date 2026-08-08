@@ -99,6 +99,24 @@ pub fn is_process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
 }
 
+/// Read the start time of a process in clock ticks since boot (field 22 of
+/// `/proc/<pid>/stat`). Returns `None` if the process doesn't exist or the field
+/// can't be parsed.
+///
+/// A `(pid, start_time)` pair uniquely identifies a process even after the OS
+/// reuses the PID for something else. This is fcvm's ONE definition of that
+/// identity: the state manager persists it as `VmState::pid_start_time`, and the
+/// UFFD server pins the VMM on the other end of a connection with it before ever
+/// signalling that PID.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // The comm field (field 2) may contain spaces and parentheses; everything
+    // after the last ')' is space-separated starting at field 3 (state), so
+    // starttime (field 22) is the 20th token after the closing paren.
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// Check whether `pid` runs the same executable name (`/proc/<pid>/comm`) as the current process.
 ///
 /// State files can outlive a crashed/SIGKILL'd fcvm process, so a PID recorded in a state file

@@ -20,20 +20,7 @@ fn open_lock_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// Read the start time of a process in clock ticks since boot (field 22 of
-/// /proc/<pid>/stat). Returns None if the process doesn't exist or the field
-/// can't be parsed.
-///
-/// Used as a process identity check: a (pid, start_time) pair uniquely
-/// identifies a process even after the OS reuses the PID for something else.
-fn process_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // The comm field (field 2) may contain spaces and parentheses; everything
-    // after the last ')' is space-separated starting at field 3 (state), so
-    // starttime (field 22) is the 20th token after the closing paren.
-    let after_comm = stat.rsplit_once(')')?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
+use crate::utils::process_start_time;
 
 /// Check whether the process recorded in a state file is still the same
 /// process that wrote it. Returns false when the state records a start time
