@@ -1277,8 +1277,19 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 "starting implicit UFFD server for snapshot restore"
             );
 
+            // Just "implicit" — NOT the vm_id. This socket is created inside `data_dir`,
+            // which IS this VM's own directory (`vm-disks/<vm_id>/`), so repeating the id in
+            // the filename buys no uniqueness and costs 9 bytes of a 107-byte budget.
+            // `UffdServer::new` appends `-{pid}-{pid_start_time}`, which is what actually
+            // makes the name unique, and that identity is unaffected by this.
+            //
+            // Those 9 bytes were not spare. The full path under a root-owned data dir is
+            //   /mnt/fcvm-btrfs/root/vm-disks/vm-<32 hex>/uffd-implicit-vm-<8>-<pid>-<start>.sock
+            // which measured 109 bytes in CI against `sun_path`'s 107 — every hugepage test
+            // failed on BOTH arches, because hugepages force UFFD and so are the only tests
+            // that build this path at all.
             let server = match UffdServer::new(
-                format!("implicit-{}", truncate_id(&vm_id, 8)),
+                "implicit".to_string(),
                 &snapshot_config.memory_path,
                 &data_dir,
                 backing,

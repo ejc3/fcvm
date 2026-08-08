@@ -1698,6 +1698,58 @@ pub fn preflight_clone_hugepages(memory_mib: usize) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The implicit-restore socket must fit in `sun_path` under the LONGEST path fcvm
+    /// actually produces, not the one that happened to be measured.
+    ///
+    /// This is a regression test for a real CI failure: the name carried a redundant
+    /// `-vm-<8>` (redundant because the socket already lives in `vm-disks/<vm_id>/`), the
+    /// path came to 109 bytes against a 107-byte limit, and EVERY hugepage test failed on
+    /// both arches — hugepages force UFFD, so they are the only tests that build this path.
+    ///
+    /// The two numeric fields are why this needs pinning rather than eyeballing:
+    /// `pid` runs to `/proc/sys/kernel/pid_max` (7 digits at the 4194304 default), and
+    /// `pid_start_time` is clock ticks since boot, so at 100 Hz it takes an 8th digit after
+    /// ~27 hours of uptime and a 9th after ~115 days. A CI runner up for a week silently
+    /// eats headroom that a freshly booted dev box never will.
+    #[test]
+    fn implicit_socket_path_fits_sun_path_at_worst_case() {
+        // Deepest real layout: root-owned data dir (the `/root` component only appears
+        // when running as root, which is exactly what Host-Root CI does) + a full 32-hex
+        // vm_id directory.
+        let dir = std::path::Path::new(
+            "/mnt/fcvm-btrfs/root/vm-disks/vm-0bf42fb1345f416da3b18c0c5cda3e92",
+        );
+        // Widest plausible numbers, not today's: pid at the 4194304 default ceiling, and a
+        // 9-digit start_time (~115 days of uptime at 100 Hz).
+        let path = UffdServer::socket_path_for(dir, "implicit", 4_194_304, 999_999_999);
+        let len = path.as_os_str().len();
+        assert!(
+            len <= MAX_UNIX_SOCKET_PATH_LEN,
+            "implicit UFFD socket path is {len} bytes, over the {MAX_UNIX_SOCKET_PATH_LEN}-byte \
+             sun_path limit: {}. Adding to this name breaks every hugepage test on every arch.",
+            path.display()
+        );
+    }
+
+    /// Guard the guard: the assertion above is only meaningful if this construction can
+    /// actually exceed the limit. If a future refactor made the name unconditionally tiny,
+    /// the test above would pass vacuously and stop protecting anything.
+    #[test]
+    fn the_sun_path_limit_is_reachable() {
+        let dir = std::path::Path::new(
+            "/mnt/fcvm-btrfs/root/vm-disks/vm-0bf42fb1345f416da3b18c0c5cda3e92",
+        );
+        // The name this code shipped with in CI, which measured 109 bytes.
+        let path = UffdServer::socket_path_for(dir, "implicit-vm-0bf42", 1_802_889, 1_201_836);
+        assert!(
+            path.as_os_str().len() > MAX_UNIX_SOCKET_PATH_LEN,
+            "the historical over-length name now fits ({} bytes) — either the limit or the \
+             layout changed, and `implicit_socket_path_fits_sun_path_at_worst_case` may be \
+             passing vacuously. Re-derive both from the current layout.",
+            path.as_os_str().len()
+        );
+    }
+
     #[test]
     fn test_mapping_contains_basic() {
         let mapping = GuestRegionUffdMapping {
