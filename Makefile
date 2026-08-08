@@ -146,7 +146,15 @@ endif
 # the checkout path, so all fcvm worktrees collide on one name and would run
 # each other's binaries. Suffix with a hash of the absolute path so two
 # worktrees sharing a basename stay separate too.
-CARGO_TARGET_BTRFS := /mnt/fcvm-btrfs/cargo-target/$(notdir $(CURDIR))-$(shell printf '%s' '$(CURDIR)' | sha256sum | cut -c1-8)
+# Derived INSIDE the shell from `pwd -P`, never by interpolating $(CURDIR) into
+# shell source: a checkout path containing a quote would otherwise break make, and
+# a crafted path could inject shell syntax at expansion time. The basename is also
+# sanitized to [A-Za-z0-9._-] so it cannot introduce path separators.
+CARGO_TARGET_BTRFS := /mnt/fcvm-btrfs/cargo-target/$(shell \
+	p=$$(pwd -P); \
+	name=$$(printf '%s' "$$(basename "$$p")" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'); \
+	hash=$$(printf '%s' "$$p" | sha256sum | cut -c1-8); \
+	printf '%s-%s' "$$name" "$$hash")
 
 # Base test command
 # `target` is a symlink to CARGO_TARGET_BTRFS, created by the check-disk target
@@ -200,7 +208,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium bench-clone-latency \
 	lint fmt update-dependency ssh test-serve-sdk
 
@@ -272,10 +280,43 @@ help:
 	@echo "  check-disk         Check disk space requirements"
 	@echo ""
 	@echo "Options: FILTER=pattern STREAM=1 LIST=1"
+# Point this worktree's target/ at its own directory on btrfs.
+#
+# Every entry point that invokes cargo must depend on this. `make build` had no
+# such prerequisite, so a fresh worktree created a REAL target/ on the root
+# filesystem — which is nearly full — silently defeating the whole arrangement.
+.PHONY: cargo-target-link
+cargo-target-link:
+	@# Build artifacts belong on btrfs (root is small and fills up), but each
+	@# worktree needs its OWN directory. Cargo names a test binary from a hash
+	@# over package name/version/features that does NOT include the checkout
+	@# path, so every fcvm worktree produces the same filename — pointing them
+	@# all at one directory means `cargo test` in one worktree can run a binary
+	@# another worktree built. Observed 2026-08-08: a run in worktree A listed a
+	@# test that exists only in worktree B and silently omitted the one under
+	@# test, which makes red/green verification meaningless.
+	@if [ -d /mnt/fcvm-btrfs ]; then \
+		WT_TARGET="$(CARGO_TARGET_BTRFS)"; \
+		mkdir -p "$$WT_TARGET"; \
+		if [ -L target ] && [ "$$(readlink target)" != "$$WT_TARGET" ]; then \
+			echo "==> Repointing shared target/ → $$WT_TARGET (per-worktree)"; \
+			rm -f target; \
+		fi; \
+		if ! [ -L target ]; then \
+			if [ -d target ]; then \
+				echo "==> Moving existing target/ to $$WT_TARGET..."; \
+				mv target/* "$$WT_TARGET"/ 2>/dev/null || true; \
+				rm -rf target; \
+			fi; \
+			ln -s "$$WT_TARGET" target; \
+			echo "==> Symlinked target/ → $$WT_TARGET"; \
+		fi; \
+	fi
+
 
 # Disk space check - fails if either root or btrfs is too full
 # Requires 10GB free on root (for cargo target) and 15GB on btrfs (for VMs)
-check-disk:
+check-disk: cargo-target-link
 	@# Ensure test log directory exists for container mounts
 	@mkdir -p $(TEST_LOG_DIR)
 	@# Fix advisory-db ownership (sudo/non-sudo mixing corrupts it)
@@ -317,31 +358,6 @@ check-disk:
 		mkdir -p "$$HOME/.cargo/bin"; \
 		curl -LsSf "$$NURL" | tar zxf - -C "$$HOME/.cargo/bin" \
 			|| PATH="$$HOME/.cargo/bin:$$PATH" cargo install cargo-nextest --locked; \
-	fi
-	@# Build artifacts belong on btrfs (root is small and fills up), but each
-	@# worktree needs its OWN directory. Cargo names a test binary from a hash
-	@# over package name/version/features that does NOT include the checkout
-	@# path, so every fcvm worktree produces the same filename — pointing them
-	@# all at one directory means `cargo test` in one worktree can run a binary
-	@# another worktree built. Observed 2026-08-08: a run in worktree A listed a
-	@# test that exists only in worktree B and silently omitted the one under
-	@# test, which makes red/green verification meaningless.
-	@if [ -d /mnt/fcvm-btrfs ]; then \
-		WT_TARGET="$(CARGO_TARGET_BTRFS)"; \
-		if [ -L target ] && [ "$$(readlink target)" != "$$WT_TARGET" ]; then \
-			echo "==> Repointing shared target/ → $$WT_TARGET (per-worktree)"; \
-			rm -f target; \
-		fi; \
-		if ! [ -L target ]; then \
-			mkdir -p "$$WT_TARGET"; \
-			if [ -d target ]; then \
-				echo "==> Moving existing target/ to $$WT_TARGET..."; \
-				mv target/* "$$WT_TARGET"/ 2>/dev/null || true; \
-				rm -rf target; \
-			fi; \
-			ln -s "$$WT_TARGET" target; \
-			echo "==> Symlinked target/ → $$WT_TARGET"; \
-		fi; \
 	fi
 	@BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$BTRFS_FREE" ] && [ "$$BTRFS_FREE" -lt 15 ]; then \
@@ -389,7 +405,7 @@ clean-test-data: build
 	mkdir -p /tmp/fcvm-test-logs
 	@echo "==> Cleaned test data (preserved cached assets)"
 
-build:
+build: cargo-target-link
 	@echo "==> Building..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-agent --target $(MUSL_TARGET)
@@ -397,7 +413,7 @@ build:
 	@# Sync embedded config to user config dir (config is embedded at compile time)
 	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
-build-fc-mock:
+build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-mock
 	@# Install to /usr/local/bin so it's accessible from within user namespaces
