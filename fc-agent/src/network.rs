@@ -559,3 +559,111 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
         }
     }
 }
+
+/// Make every published guest port reachable even when the service binds
+/// 127.0.0.1 only.
+///
+/// # Why this exists
+///
+/// `--publish` delivers a packet to the guest's external interface. A service
+/// listening on `0.0.0.0` receives it; one listening on `127.0.0.1` does not,
+/// and there was no way to reach it — `--forward-localhost` runs the other
+/// direction (guest -> host), so aiming it at such a port HIJACKS the guest's own
+/// listener rather than exposing it.
+///
+/// The motivating case is Chromium's DevTools endpoint. Measured on chromium
+/// 151.0.7922.71 (Debian bookworm arm64): with `--remote-debugging-address=0.0.0.0`
+/// confirmed present in `/proc/<pid>/cmdline`, `/proc/net/tcp` shows
+/// `0100007F:2406` (127.0.0.1:9222) and nothing else. The browser ignores the
+/// flag, so the only previous route in was a userspace relay running inside the
+/// guest — an extra process per clone, in the byte path, on the one arm that
+/// dropped connections.
+///
+/// # Why DNAT works HERE and not in `setup_localhost_forwarding`
+///
+/// That function documents that DNAT is unusable for guest -> host, because the
+/// DNAT'd packet keeps its `127.0.0.1` SOURCE and pasta's L4 translation cannot
+/// carry a loopback source out through the TAP. This is the opposite direction:
+/// the source stays external and only the DESTINATION becomes loopback, and
+/// conntrack rewrites the reply's source back to the original destination before
+/// it leaves. Nothing downstream ever sees a loopback source address.
+///
+/// `route_localnet` is required: without it the kernel drops a packet routed to
+/// 127.0.0.0/8 that arrived on a non-loopback interface (martian source). fcvm
+/// already relies on the same switch for host-side port forwarding — see
+/// `src/network/portmap.rs::enable_route_localnet`.
+///
+/// # Security
+///
+/// This widens nothing that `--publish` did not already open. The port is
+/// reachable exactly when the operator published it, and the microVM boundary is
+/// what guards ingress: reaching the guest at all means going through fcvm's
+/// per-VM forwarding. A failure here is logged and never fatal — the VM still
+/// boots and a `0.0.0.0` service still works.
+pub fn publish_to_loopback(ports: &[String]) {
+    if ports.is_empty() {
+        return;
+    }
+
+    // Martian-source guard. `all` is not sufficient on its own for every kernel
+    // config, so set the interface too; failures are logged, not fatal.
+    for key in [
+        "net.ipv4.conf.all.route_localnet",
+        "net.ipv4.conf.eth0.route_localnet",
+    ] {
+        match std::process::Command::new("sysctl")
+            .arg("-w")
+            .arg(format!("{key}=1"))
+            .output()
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => eprintln!(
+                "[fc-agent] WARNING: {key}=1 failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!("[fc-agent] WARNING: could not run sysctl for {key}: {e}"),
+        }
+    }
+
+    for port_str in ports {
+        let port: u16 = match port_str.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[fc-agent] WARNING: invalid published port '{port_str}': {e}");
+                continue;
+            }
+        };
+
+        // PREROUTING so the rewrite happens before the routing decision, which is
+        // what lets 127.0.0.1 become a valid destination for a packet that arrived
+        // on eth0. -w takes the xtables lock rather than racing another caller.
+        let out = std::process::Command::new("iptables")
+            .args([
+                "-w",
+                "-t",
+                "nat",
+                "-A",
+                "PREROUTING",
+                "-p",
+                "tcp",
+                "--dport",
+                &port.to_string(),
+                "-j",
+                "DNAT",
+                "--to-destination",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .output();
+
+        match out {
+            Ok(o) if o.status.success() => {
+                eprintln!("[fc-agent] published port {port} also reaches 127.0.0.1:{port}")
+            }
+            Ok(o) => eprintln!(
+                "[fc-agent] WARNING: DNAT for published port {port} failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!("[fc-agent] WARNING: could not run iptables for port {port}: {e}"),
+        }
+    }
+}

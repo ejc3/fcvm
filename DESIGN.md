@@ -221,6 +221,47 @@ impl VmManager {
 
 Three implementations based on execution mode.
 
+#### Published ports always reach guest loopback
+
+**Location**: `fc-agent/src/network.rs::publish_to_loopback`
+
+`--publish` delivers a packet to the guest's external interface. A guest service
+listening on `0.0.0.0` receives it; one listening on `127.0.0.1` does not. fcvm
+therefore DNATs **every published TCP port** to `127.0.0.1:<port>` inside the
+guest, unconditionally — the caller cannot know which kind of service is on the
+other end, and a rule that only fires for loopback-bound listeners is free for
+the rest.
+
+```
+host:P --publish--> guest eth0:P --DNAT--> 127.0.0.1:P --> the listener
+```
+
+Two details that are not obvious:
+
+- **`route_localnet=1` is required.** Without it the kernel treats a packet
+  routed to `127.0.0.0/8` that arrived on a non-loopback interface as a martian
+  source and drops it. fcvm already depends on the same switch host-side —
+  `src/network/portmap.rs::enable_route_localnet`.
+- **This direction works where the reverse does not.** `setup_localhost_forwarding`
+  (guest → host) documents that DNAT is unusable there, because the DNAT'd packet
+  keeps its `127.0.0.1` **source** and pasta's L4 translation cannot carry a
+  loopback source out through the TAP. Here only the **destination** becomes
+  loopback; conntrack rewrites the reply's source back to the original
+  destination, so nothing downstream ever sees a loopback source.
+
+The container inherits this for free: fc-agent always runs it with
+`--network=host` (`fc-agent/src/container.rs:1203`), so container loopback *is*
+guest loopback.
+
+**Why it exists.** Chromium's DevTools endpoint ignores
+`--remote-debugging-address`: measured on chromium 151.0.7922.71 (Debian bookworm
+arm64), with the flag confirmed in `/proc/<pid>/cmdline`, `/proc/net/tcp` shows
+`0100007F:2406` (`127.0.0.1:9222`) and nothing else. Before this, the only way in
+was a userspace relay process running inside every clone, in the byte path — and
+that arm was the only one that dropped connections. Ingress is guarded by the
+microVM boundary, so nothing here widens what `--publish` already opened.
+
+
 #### Rootless Networking (`pasta.rs`)
 
 Uses `pasta` (from the passt project) for L4 splice-based networking.
