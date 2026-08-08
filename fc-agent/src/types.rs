@@ -23,6 +23,11 @@ pub struct Plan {
     pub user: Option<String>,
     #[serde(default)]
     pub forward_localhost: Vec<String>,
+    /// Guest TCP ports the host publishes. Each is DNAT'd to 127.0.0.1 so a
+    /// service bound to guest loopback ONLY is still reachable — see
+    /// `network::publish_to_loopback`.
+    #[serde(default)]
+    pub published_guest_ports: Vec<String>,
     #[serde(default)]
     pub privileged: bool,
     #[serde(default)]

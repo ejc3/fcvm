@@ -41,6 +41,10 @@ pub async fn run() -> Result<()> {
 
     system::save_proxy_settings(&plan);
 
+    // Always, for every published port: a guest service that binds loopback only
+    // is otherwise unreachable, and the caller cannot tell which kind it is.
+    network::publish_to_loopback(&plan.published_guest_ports);
+
     if !plan.forward_localhost.is_empty() {
         network::setup_localhost_forwarding(&plan.forward_localhost);
     }

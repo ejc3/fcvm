@@ -391,6 +391,15 @@ impl FirecrackerConfig {
                     "subuid_count": runtime.subuid_count,
                     "non_blocking_output": self.non_blocking_output,
                     "forward_localhost": self.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                    // Guest ports reachable from the host. fc-agent DNATs each to
+                    // 127.0.0.1 so a service that binds guest loopback ONLY is still
+                    // reachable through --publish. Chromium's CDP is the motivating
+                    // case: it ignores --remote-debugging-address and binds
+                    // 127.0.0.1:9222 regardless, so without this the only way in was a
+                    // userspace relay inside the guest.
+                    "published_guest_ports": self.port_mappings.iter()
+                        .filter(|m| matches!(m.proto, crate::network::Protocol::Tcp))
+                        .map(|m| m.guest_port.to_string()).collect::<Vec<_>>(),
                     "egress_proxy": matches!(self.network_mode, NetworkMode::Rootless),
                     "interactive": self.interactive,
                     "tty": self.tty,
