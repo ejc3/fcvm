@@ -1198,7 +1198,9 @@ pub async fn kill_process(pid: u32) {
 
 /// Wait for a snapshot serve process to be ready by polling for its socket file.
 ///
-/// The serve process creates a socket at `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
+/// The serve process creates a socket named by `UffdServer::socket_path_for`, i.e.
+/// `<data_dir>/uffd-{snapshot}-{pid}-{pid_start_time}.sock` — the start time is what makes
+/// two servers for the same snapshot unable to collide. Derive it, never hand-format it.
 /// when it's ready to accept clone connections.
 ///
 /// # Arguments
