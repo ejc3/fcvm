@@ -536,14 +536,24 @@ impl UffdServer {
                                         "could not pin the connecting VMM — stopping it unpinned \
                                          rather than dropping the connection"
                                     );
-                                    // Dropping the stream here would NOT be safe: Firecracker
-                                    // may already have sent its userfaultfd and closed its own
-                                    // copy, so closing the socket destroys the in-flight fd and
-                                    // the guest runs on zero pages — the same trap the over-cap
-                                    // path avoids. SO_PEERPIDFD is probed at startup, so the only
-                                    // way to reach this is fd exhaustion mid-flight; the unpinned
-                                    // PID from SO_PEERCRED is then the only handle left, and a
-                                    // vanishingly unlikely mis-signal beats a CERTAIN corruption.
+                                    // Dropping the stream here would NOT be safe, though not for
+                                    // the reason it is tempting to give. Firecracker KEEPS its own
+                                    // reference to the userfaultfd for the VM's lifetime ("Save
+                                    // UFFD in order to keep it open in the Firecracker process, as
+                                    // well." — firecracker src/vmm/src/lib.rs), so closing this
+                                    // socket does not drop the last reference and the guest does
+                                    // NOT fall through to zero pages. It FREEZES: with a reference
+                                    // still held, userfaultfd_release() never runs, the VMAs stay
+                                    // registered, and every fault waits forever. Verified on a live
+                                    // clone — both vCPUs parked in wchan=handle_userfault 30s after
+                                    // its server died, with no exit code, no signal and no log.
+                                    //
+                                    // A frozen clone is not milder than a corrupt one: it holds its
+                                    // memory, its loopback port and its disk indefinitely while
+                                    // looking alive. SO_PEERPIDFD is probed at startup, so the only
+                                    // way here is fd exhaustion mid-flight; the unpinned PID from
+                                    // SO_PEERCRED is then the only handle left, and a vanishingly
+                                    // unlikely mis-signal beats a CERTAIN wedge.
                                     kill_unpinned_peer(&stream, &vm_id);
                                     continue;
                                 }
