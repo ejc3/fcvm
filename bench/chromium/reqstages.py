@@ -108,11 +108,11 @@ def main():
         # render.py's total_ms covers connect+navigate+screenshot ONLY, so this
         # residual IS the guest python interpreter boot + imports. It is a
         # residual and is labelled as one -- no fcvm log can see inside the guest.
-        gо = d("handshake_done", "exec_finished")
-        if gо is not None:
-            add("GO->exec_finished (guest python up + render + exit)", []).append(gо)
+        go_ms = d("handshake_done", "exec_finished")
+        if go_ms is not None:
+            add("GO->exec_finished (guest python up + render + exit)", []).append(go_ms)
             add("  = render.py measured work", []).append(r["total_ms"])
-            add("  = RESIDUAL guest python up + exit", []).append(gо - r["total_ms"])
+            add("  = RESIDUAL guest python up + exit", []).append(go_ms - r["total_ms"])
         for k in ("connect_ms", "navigate_ms", "screenshot_ms", "total_ms"):
             if k in r:
                 add(f"render.py {k}", []).append(r[k])
