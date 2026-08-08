@@ -1617,3 +1617,42 @@ class DocLint(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class NoConfusableIdentifiers(unittest.TestCase):
+    """No bench source may contain a Cyrillic homoglyph.
+
+    `reqstages.py` had a variable whose name was Latin `g` followed by CYRILLIC SMALL
+    LETTER O (U+043E) rather than Latin `o`. It runs, and it is indistinguishable on
+    screen from `go`, so anyone who types the name they can plainly see gets a NameError
+    on a variable that is right there. The same trap exists for U+0441/c, U+0435/e,
+    U+0430/a, U+0440/p, U+0445/x.
+
+    This file states those characters by CODEPOINT, never literally: an earlier version
+    spelled them out and the guard flagged its own docstring, which is funny once and
+    useless afterwards.
+
+    A reviewer caught the first one. This catches the next.
+    """
+
+    def test_no_cyrillic_homoglyphs_in_bench_sources(self):
+        import pathlib
+
+        here = pathlib.Path(__file__).parent
+        offenders = []
+        for path in sorted(here.glob("*.py")) + sorted(here.glob("*.sh")):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for lineno, line in enumerate(text.split("\n"), 1):
+                bad = [ch for ch in line if 0x0400 <= ord(ch) <= 0x04FF]
+                if bad:
+                    offenders.append(
+                        f"{path.name}:{lineno} contains {[hex(ord(c)) for c in bad]} "
+                        f"in: {line.strip()[:70]}"
+                    )
+        self.assertEqual(
+            offenders,
+            [],
+            "Cyrillic characters found in bench sources. If one sits inside an identifier "
+            "it is a homoglyph trap: the name reads as ASCII and is not.\n"
+            + "\n".join(offenders),
+        )
