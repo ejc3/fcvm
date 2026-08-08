@@ -73,6 +73,91 @@ fn max_clones_per_server() -> Result<usize> {
     parse_max_clones(std::env::var(MAX_CLONES_ENV).ok().as_deref())
 }
 
+/// `SO_PEERPIDFD` (Linux 6.5+). Not exposed by the `libc` crate; value from
+/// `asm-generic/socket.h`.
+const SO_PEERPIDFD: libc::c_int = 77;
+
+/// Fetch a pidfd for the peer of a connected Unix socket, atomically (see [`PeerVmm`]).
+fn peer_pidfd(sock: RawFd) -> Result<OwnedFd> {
+    let mut raw: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt into a `c_int` with its exact size; `sock` is a live socket fd.
+    let rc = unsafe {
+        libc::getsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            SO_PEERPIDFD,
+            std::ptr::addr_of_mut!(raw).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("getsockopt(SO_PEERPIDFD)");
+    }
+    // SAFETY: the kernel just installed `raw` as a fresh, owned fd in this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// The PID a pidfd refers to, from `/proc/self/fdinfo/<fd>`. Log-only (see [`PeerVmm::pid`]).
+fn pidfd_pid(pidfd: &OwnedFd) -> Result<u32> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))
+        .context("reading pidfd fdinfo")?;
+    info.lines()
+        .find_map(|l| l.strip_prefix("Pid:")?.trim().parse().ok())
+        .ok_or_else(|| anyhow!("pidfd fdinfo has no parsable Pid: line"))
+}
+
+/// Refuse to start unless this kernel can pin a socket peer atomically.
+///
+/// Checked ONCE, at server construction, so the unsupported-kernel case is a loud startup
+/// error instead of a per-connection surprise on a server that is already serving clones.
+/// Without `SO_PEERPIDFD` there is no race-free way to identify the VMM behind a connection,
+/// and without that there is no way to guarantee it can be stopped — which is the entire
+/// premise of this server (see [`PeerVmm`]).
+fn require_peer_pidfd_support() -> Result<()> {
+    let (a, _b) = std::os::unix::net::UnixStream::pair().context("probing SO_PEERPIDFD")?;
+    peer_pidfd(a.as_raw_fd()).map(|_| ()).context(
+        "this kernel cannot report a peer pidfd (SO_PEERPIDFD, Linux 6.5+), so the UFFD \
+         memory server cannot guarantee it is able to stop a clone whose page faults it \
+         fails to serve — refusing to start rather than serving memory it cannot fail \
+         closed on",
+    )
+}
+
+/// Last-resort stop for a peer we could not pin: SIGKILL the PID `SO_PEERCRED` reports.
+///
+/// Only reachable when [`peer_pidfd`] fails on a kernel that passed the startup probe, i.e.
+/// file-descriptor exhaustion. `SO_PEERCRED` needs no fd, so it still works there. This is
+/// the one place in the server that signals a bare PID; it is justified only because the
+/// alternative (drop the connection) releases a possibly in-flight userfaultfd and corrupts
+/// that guest with certainty.
+fn kill_unpinned_peer(stream: &UnixStream, vm_id: &str) {
+    let Ok(cred) = stream.peer_cred() else {
+        error!(
+            target: "uffd",
+            vm_id = %vm_id,
+            "peer could be neither pinned nor identified — a VMM may now be running on \
+             unserved memory and this server cannot stop it"
+        );
+        return;
+    };
+    let Some(pid) = cred.pid() else {
+        error!(target: "uffd", vm_id = %vm_id, "peer credentials carry no PID; cannot stop the VMM");
+        return;
+    };
+    let killed = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    error!(
+        target: "uffd",
+        vm_id = %vm_id,
+        peer_pid = pid,
+        result = ?killed,
+        "killed an UNPINNED peer VMM (could not obtain its pidfd)"
+    );
+}
+
 /// The VMM process on the other end of one clone's UFFD connection, held as a **pidfd** so
 /// signalling it can never land on a different process.
 ///
@@ -86,49 +171,60 @@ fn max_clones_per_server() -> Result<usize> {
 /// that exact process even if the PID has since been recycled.
 #[derive(Debug)]
 struct PeerVmm {
+    /// The peer's PID, read back from the pidfd itself — for LOGS ONLY. Every decision uses
+    /// the pidfd, so a PID that has since been recycled cannot misdirect anything.
     pid: u32,
-    /// Start time in clock ticks (`/proc/<pid>/stat` field 22) — fcvm's process-identity
-    /// pattern, carried for logs and liveness reporting. The kill path uses the pidfd.
-    start_time: u64,
     pidfd: OwnedFd,
 }
 
 impl PeerVmm {
-    /// Identify the process that opened `stream` from its kernel-supplied peer credentials.
+    /// Pin the process that opened `stream`, atomically.
+    ///
+    /// `SO_PEERPIDFD` hands back a **pidfd** for the peer that was recorded at connect time.
+    /// The obvious-looking alternative — `SO_PEERCRED` for a PID, then `pidfd_open(pid)` — has
+    /// a real window: if the peer exits and is reaped between the two calls and the kernel
+    /// recycles its PID, the pidfd pins a STRANGER, and every later decision (including a
+    /// SIGKILL) lands on that stranger. There is no amount of re-checking that closes the
+    /// window, because the check itself is a second observation of the same racy number. So
+    /// the identity is taken from the socket in one atomic step and never re-derived.
     fn from_stream(stream: &UnixStream) -> Result<Self> {
-        let cred = stream
-            .peer_cred()
-            .context("reading peer credentials (SO_PEERCRED) of the connecting VMM")?;
-        let pid = cred
-            .pid()
-            .ok_or_else(|| anyhow!("peer credentials carry no PID"))?;
-        let pid = u32::try_from(pid).map_err(|_| anyhow!("peer PID {pid} is out of range"))?;
-        Self::from_pid(pid)
+        let pidfd = peer_pidfd(stream.as_raw_fd())
+            .context("SO_PEERPIDFD on the accepted UFFD connection")?;
+        // Read the PID back OUT of the pinned handle rather than from SO_PEERCRED, so even
+        // the log line cannot name a different process than the one we hold.
+        let pid = pidfd_pid(&pidfd).context("reading the peer pidfd's PID from fdinfo")?;
+        Ok(Self { pid, pidfd })
     }
 
-    /// Pin an already-known PID. `pidfd_open` is the whole point: from here on the handle
-    /// refers to that process, not to the number.
+    /// Pin an already-known PID via `pidfd_open`. Test-only: production identity always comes
+    /// from the socket ([`PeerVmm::from_stream`]), which has no PID-reuse window.
+    #[cfg(test)]
     fn from_pid(pid: u32) -> Result<Self> {
-        let start_time = crate::utils::process_start_time(pid)
-            .ok_or_else(|| anyhow!("peer PID {pid} has no /proc entry — it already exited"))?;
         // SAFETY: pidfd_open(2) with no flags; the returned fd is owned by us.
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
             return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("pidfd_open on peer PID {pid}"));
+                .with_context(|| format!("pidfd_open on PID {pid}"));
         }
         // SAFETY: `raw` is a fresh, owned, valid file descriptor.
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw as RawFd) };
-        Ok(Self {
-            pid,
-            start_time,
-            pidfd,
-        })
+        Ok(Self { pid, pidfd })
     }
 
-    /// Whether this exact process (not merely this PID) is still running.
+    /// Whether the pinned process is still running — asked of the pidfd (signal 0), not of
+    /// its PID, so a recycled PID can never make a dead VMM look alive.
     fn is_alive(&self) -> bool {
-        crate::utils::process_start_time(self.pid) == Some(self.start_time)
+        // SAFETY: pidfd_send_signal(2) with signal 0 (existence probe) on an owned pidfd.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                0,
+                std::ptr::null_mut::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        rc == 0
     }
 
     /// SIGKILL the VMM. Returns whether the signal was delivered.
@@ -285,6 +381,9 @@ impl UffdServer {
         dir: &Path,
         backing: UffdBacking,
     ) -> Result<Self> {
+        // Before anything else: prove we can fail closed on this kernel.
+        require_peer_pidfd_support()?;
+
         let my_pid = std::process::id();
         let my_start_time = crate::utils::process_start_time(my_pid)
             .ok_or_else(|| anyhow!("cannot read this process's own start time from /proc"))?;
@@ -415,10 +514,18 @@ impl UffdServer {
                                         target: "uffd",
                                         vm_id = %vm_id,
                                         error = ?e,
-                                        "refusing a connection whose VMM cannot be identified — \
-                                         without a handle on it this server could not stop it if \
-                                         serving later failed, and fail-closed is not optional"
+                                        "could not pin the connecting VMM — stopping it unpinned \
+                                         rather than dropping the connection"
                                     );
+                                    // Dropping the stream here would NOT be safe: Firecracker
+                                    // may already have sent its userfaultfd and closed its own
+                                    // copy, so closing the socket destroys the in-flight fd and
+                                    // the guest runs on zero pages — the same trap the over-cap
+                                    // path avoids. SO_PEERPIDFD is probed at startup, so the only
+                                    // way to reach this is fd exhaustion mid-flight; the unpinned
+                                    // PID from SO_PEERCRED is then the only handle left, and a
+                                    // vanishingly unlikely mis-signal beats a CERTAIN corruption.
+                                    kill_unpinned_peer(&stream, &vm_id);
                                     continue;
                                 }
                             };
@@ -2030,20 +2137,40 @@ mod tests {
         let (server_side, _) = listener.accept().await.unwrap();
         let _client_side = connector.await.unwrap();
 
-        let peer = PeerVmm::from_stream(&server_side).expect("peer credentials must be readable");
+        let peer = PeerVmm::from_stream(&server_side).expect("peer must be pinnable");
         assert_eq!(
             peer.pid,
             std::process::id(),
-            "SO_PEERCRED must report the connecting process"
+            "the pinned pidfd must refer to the connecting process"
         );
-        assert_eq!(
-            Some(peer.start_time),
-            crate::utils::process_start_time(std::process::id()),
-            "the peer must be pinned with the connecting process's start time"
-        );
-        assert!(peer.is_alive());
+        assert!(peer.is_alive(), "liveness must be answered by the pidfd");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The peer handle must come from the SOCKET in one step. `SO_PEERCRED` + `pidfd_open`
+    /// would leave a window in which the peer exits, its PID is recycled, and the pidfd ends
+    /// up pinning a stranger that a later failure would then SIGKILL.
+    #[test]
+    fn test_peer_pidfd_is_taken_atomically_from_the_socket() {
+        require_peer_pidfd_support()
+            .expect("SO_PEERPIDFD must be available; the server refuses to start without it");
+
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let pidfd = peer_pidfd(a.as_raw_fd()).expect("SO_PEERPIDFD on a connected socket");
+        assert_eq!(
+            pidfd_pid(&pidfd).unwrap(),
+            std::process::id(),
+            "the pidfd must name the peer of THIS socket"
+        );
+
+        // An unconnected socket has no peer: the failure must surface, never be papered over
+        // with a PID guess.
+        let lonely = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        assert!(
+            peer_pidfd(lonely.as_raw_fd()).is_err(),
+            "a socket with no peer must not yield a pidfd"
+        );
     }
 
     /// The kill must land on the process we accepted, and must NEVER land on a stranger
