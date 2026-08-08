@@ -288,7 +288,7 @@ def main_with(argv=None):
 
     # ---- 4. CDP stage decomposition (the per-request connect cost this design ADDS)
     print("\n" + "-" * 78)
-    print("CDP ARMS: per-request stage decomposition (host -> clone over forward-localhost)")
+    print("CDP ARMS: per-request stage decomposition (host -> clone via socat relay + published port)")
     print("-" * 78)
     stage_keys = ["resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms", "connect_total_ms",
                   "navigate_ms", "screenshot_ms", "total_ms"]
