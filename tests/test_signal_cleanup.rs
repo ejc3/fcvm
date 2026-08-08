@@ -1742,12 +1742,32 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                     continue;
                 };
                 if v.get("pid").and_then(|p| p.as_u64()) == Some(clone_pid as u64) {
+                    // NEVER default this. `vm_runtime_dir("")` is `<data_dir>/vm-disks`
+                    // ITSELF, and this test later calls `remove_dir_all` on that path — so
+                    // a state file missing `vm_id` would delete every VM's disks on the
+                    // machine, including those of tests running concurrently in CI. A
+                    // missing id means the state file is not what we think it is; fail
+                    // loudly instead of computing a path that is catastrophic when wrong.
                     let vm_id = v
                         .get("vm_id")
                         .and_then(|s| s.as_str())
-                        .unwrap_or_default()
+                        .filter(|s| !s.is_empty())
+                        .with_context(|| {
+                            format!(
+                                "state file {} matched the clone PID but carries no vm_id; \
+                                 refusing to derive a runtime directory from an empty id",
+                                path.display()
+                            )
+                        })?
                         .to_string();
-                    found = Some((path, fcvm::paths::vm_runtime_dir(&vm_id)));
+                    let dir = fcvm::paths::vm_runtime_dir(&vm_id);
+                    anyhow::ensure!(
+                        dir.starts_with(fcvm::paths::data_dir().join("vm-disks"))
+                            && dir != fcvm::paths::data_dir().join("vm-disks"),
+                        "refusing to treat {} as a per-VM runtime directory",
+                        dir.display()
+                    );
+                    found = Some((path, dir));
                     break;
                 }
             }
@@ -1821,4 +1841,32 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         println!("test_bench_fast_teardown_leaks_nothing_clone PASSED");
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// `vm_runtime_dir("")` is the shared `vm-disks` directory, not a per-VM one.
+///
+/// A test that derives a runtime directory from a state file and then `remove_dir_all`s it
+/// must never accept an empty id: doing so deletes EVERY VM's disks on the machine,
+/// including those of tests running concurrently in CI. This pins the arithmetic so the
+/// guard above cannot be simplified away by someone who has not thought about it.
+#[test]
+fn an_empty_vm_id_resolves_to_the_shared_disk_root_and_must_be_rejected() {
+    let shared = fcvm::paths::data_dir().join("vm-disks");
+
+    assert_eq!(
+        fcvm::paths::vm_runtime_dir(""),
+        shared,
+        "an empty vm_id collapses to the SHARED vm-disks root. Any caller that deletes its \
+         computed runtime directory would wipe every VM on the host — which is why the \
+         lookup rejects an empty id rather than defaulting it."
+    );
+    assert_ne!(
+        fcvm::paths::vm_runtime_dir("vm-abc123"),
+        shared,
+        "a real vm_id must resolve BELOW the shared root, never to it"
+    );
+    assert!(
+        fcvm::paths::vm_runtime_dir("vm-abc123").starts_with(&shared),
+        "a per-VM directory must still live under the shared root"
+    );
 }
