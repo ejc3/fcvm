@@ -621,9 +621,24 @@ impl PastaNetwork {
         //
         // Must be the LAST pre_exec (there is only this one, but keep the invariant
         // explicit): a credential change zeroes `task->pdeath_signal`, so anything that
-        // switches namespaces or identity first would silently drop it. pasta's own
-        // `--runas 0:0` under sudo is a no-op re-assertion of root, and its namespace entry
-        // happens in a forked child, so the signal set here survives into steady state.
+        // switches namespaces or identity first would silently drop it.
+        //
+        // pasta DOES change credentials after this exec — it setns()es into the holder's
+        // user namespace (measured CapEff 0x1ffffffffff -> 0x2014c2) — and the signal
+        // survives it. `commit_creds()` clears it only when uid/gid change or
+        // `cred_cap_issubset(old, new)` FAILS; under sudo pasta's prior creds are full root
+        // and `--runas 0:0` holds uid/gid at 0:0, so the new set is a strict SUBSET and that
+        // branch is never taken — the signal survives because pasta LOSES privilege on entry.
+        // pasta does not fork either: `--foreground` is single-threaded and its own -P
+        // pidfile reports the PID armed here. Verified with the holder held ALIVE so passt's
+        // PID watch cannot fire — armed pasta dies 2-54ms after fcvm is SIGKILLed, unarmed
+        // pasta survives 5s.
+        //
+        // PRECONDITION: this holds only while fcvm runs as ROOT. Unprivileged, entering the
+        // userns is a capability GAIN, `cred_cap_issubset` fails, the kernel zeroes the
+        // signal, and pasta silently reverts to passt's 1-second PID watch with no symptom
+        // until something leaks. Argued from the kernel rule, NOT measured — the harness
+        // that verified the above was itself root.
         //
         // The `getppid` re-check closes the fork/exec window: a parent that dies after
         // fork() but before the prctl above would leave the signal unarmed and pasta
