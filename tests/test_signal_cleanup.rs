@@ -1555,3 +1555,179 @@ fn test_start_time_identity_defeats_pid_reuse_628() {
         assert!(!is_dead_state(s), "{} should count as a live state", s);
     }
 }
+
+/// The bench fast-teardown path must not leak a microVM. Clone flavour.
+///
+/// `bench/chromium/reqbench.py` (arm `cdp-fast`) delivers the rendered image the instant
+/// it is in hand and then SIGKILLs the clone's `fcvm`. It never signals Firecracker or the
+/// namespace holder itself: `PR_SET_PDEATHSIG(SIGKILL)` is set on both
+/// (`src/utils.rs::install_namespace_pre_exec`, `src/commands/common.rs::spawn_namespace_holder`),
+/// so the kernel's `exit_notify`/`forget_original_parent` pass delivers SIGKILL to BOTH in one
+/// go — concurrently by construction, with no ordering for the harness to get wrong and no
+/// cleanup code of ours that has to survive a SIGKILL in order to run.
+///
+/// `test_sigkill_kills_firecracker_rootless` already proves that chain for a `podman run` VM.
+/// This test proves it for the shape the bench actually uses: a CLONE restored from a
+/// `snapshot serve` memory server, which reaches Firecracker through the restore path in
+/// `src/commands/snapshot.rs` rather than the fresh-boot path. Same guarantee, different
+/// spawn site — and a regression in either one is a repeat of #730, where a broken pdeathsig
+/// chain orphaned ~490 microVMs and wedged two CI runners at load 523.
+///
+/// It also pins the OTHER half of the fast-path contract: because SIGKILL cannot be caught,
+/// `cleanup_vm` never runs, so the state file survives the kill. The harness is therefore
+/// REQUIRED to reap on-disk state synchronously (it does; there is no janitor). Asserting
+/// that the file is still there after the kill is what stops someone "simplifying" the
+/// harness by deleting that step and silently leaking state files instead of VMs.
+#[test]
+fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
+    println!("\ntest_bench_fast_teardown_leaks_nothing_clone");
+
+    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+    rt.block_on(async {
+        let fcvm_path = common::find_fcvm_binary()?;
+        let (base_name, clone_name, snapshot_name, serve_name) =
+            common::unique_names("fastteardown");
+
+        // Baseline VM -> snapshot -> memory server: the exact topology the bench uses.
+        let (mut base_child, base_pid) = common::spawn_fcvm_with_logs(
+            &["podman", "run", "--name", &base_name, common::TEST_IMAGE],
+            &base_name,
+        )
+        .await
+        .context("spawning baseline VM")?;
+        common::poll_health_by_pid(base_pid, 120).await?;
+
+        let out = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &base_pid.to_string(),
+                "--tag",
+                &snapshot_name,
+            ])
+            .output()
+            .await
+            .context("running snapshot create")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "snapshot create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let (mut serve_child, serve_pid) =
+            common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_name)
+                .await
+                .context("spawning memory server")?;
+        common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+        // The clone: no --exec, exactly as the `cdp-fast` arm restores it.
+        let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid.to_string(),
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("spawning clone")?;
+        common::poll_health_by_pid(clone_pid, 120).await?;
+        println!("clone healthy (fcvm PID {})", clone_pid);
+
+        // Capture the exact children by (pid, start_time) + pidfd, so neither the post-kill
+        // zombie window nor PID reuse can fake a pass (#628).
+        let fc = find_firecracker_for_fcvm(clone_pid).context("clone has no firecracker child")?;
+        let holder = find_holder_for_fcvm(clone_pid);
+        assert!(
+            fc.running(),
+            "firecracker should be running before the fast teardown"
+        );
+        println!(
+            "firecracker PID {}, holder {:?}",
+            fc.pid,
+            holder.as_ref().map(|h| h.pid)
+        );
+
+        // State files are keyed by vm_id (a UUID), NOT by the VM's name — find this
+        // clone's file by its recorded fcvm pid, the same way reqbench.py does.
+        let state_file = {
+            let dir = fcvm::paths::state_dir();
+            let mut found = None;
+            for entry in std::fs::read_dir(&dir).context("reading state dir")? {
+                let path = entry?.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if v.get("pid").and_then(|p| p.as_u64()) == Some(clone_pid as u64) {
+                    found = Some(path);
+                    break;
+                }
+            }
+            found.context("no state file recorded for the clone")?
+        };
+
+        // THE FAST TEARDOWN: one signal to fcvm. Nothing else is signalled by us.
+        send_signal(clone_pid, "KILL").context("SIGKILL to clone fcvm")?;
+        let _ = clone_child.wait().await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if !fc.running() && !holder.as_ref().is_some_and(|h| h.running()) {
+                break;
+            }
+            tokio::time::sleep(common::POLL_INTERVAL).await;
+        }
+
+        let fc_alive = fc.running();
+        if fc_alive {
+            fc.kill_if_running();
+        }
+        let holder_alive = holder.as_ref().is_some_and(|h| h.running());
+        if let Some(h) = holder.as_ref() {
+            if holder_alive {
+                h.kill_if_running();
+            }
+        }
+
+        // Clean up the rest of the fixture before asserting, so a failure does not also leak.
+        let _ = serve_child.kill().await;
+        let _ = base_child.kill().await;
+        common::kill_process(base_pid).await;
+        common::kill_process(serve_pid).await;
+
+        assert!(
+            !fc_alive,
+            "LEAK: firecracker (PID {}) survived the fast teardown's SIGKILL of fcvm — the \
+             PR_SET_PDEATHSIG chain through the snapshot-restore spawn path is broken (#730)",
+            fc.pid
+        );
+        assert!(
+            !holder_alive,
+            "LEAK: namespace holder survived the fast teardown's SIGKILL of fcvm"
+        );
+
+        // The other half of the contract: SIGKILL cannot be caught, so cleanup_vm did NOT run
+        // and on-disk state is still there. The harness must reap it synchronously.
+        assert!(
+            state_file.exists(),
+            "expected the clone's state file to SURVIVE the SIGKILL (at {}). If it is gone, \
+             fcvm gained a cleanup path that runs under SIGKILL and reqbench.py's synchronous \
+             on-disk reap should be revisited.",
+            state_file.display()
+        );
+        std::fs::remove_file(&state_file).ok();
+
+        println!("test_bench_fast_teardown_leaks_nothing_clone PASSED");
+        Ok::<(), anyhow::Error>(())
+    })
+}
