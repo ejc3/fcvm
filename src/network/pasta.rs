@@ -658,6 +658,9 @@ impl PastaNetwork {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let _ = child.kill().await;
+                    // The kill closed the pipe's write end — wait for the stderr
+                    // reader to drain, same as the child.wait() branch above.
+                    self.await_stderr_eof().await;
                     anyhow::bail!(
                         "pasta did not become ready within {:?}{}",
                         PASTA_READY_TIMEOUT,
