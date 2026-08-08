@@ -895,8 +895,43 @@ async fn test_sanity_chrony_ntp_configured() -> Result<()> {
          (makestep 1 -1) for snapshot restore; got: {written_conf:?}"
     );
 
-    // 3. The daemon really has sources — established by the loop above, which
+    // 3. The config states where its sources came from, and its source lines match
+    // that claim. When they come from the host they must be literal addresses: the
+    // host resolves them in ITS namespace precisely because a guest on a restricted
+    // network may resolve nothing, so a name surviving to here would mean the
+    // resolution step silently did not happen.
+    let origin = written_conf
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("# NTP sources from "))
+        .unwrap_or_else(|| {
+            panic!(
+                "fc-agent's chrony config must record where its sources came from; \
+                 got: {written_conf:?}"
+            )
+        });
+    let sources: Vec<&str> = written_conf
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("server ") || l.starts_with("pool "))
+        .collect();
+    assert!(
+        !sources.is_empty(),
+        "chrony config names NO time source, so the guest clock drifts unchecked; \
+         got: {written_conf:?}"
+    );
+    if origin.contains("host") {
+        for line in &sources {
+            let addr = line.split_whitespace().nth(1).unwrap_or_default();
+            assert!(
+                addr.parse::<std::net::IpAddr>().is_ok(),
+                "host-supplied NTP source must be a resolved address, not the name \
+                 {addr:?} the guest may be unable to resolve; config was: {written_conf:?}"
+            );
+        }
+    }
+
+    // 4. The daemon really has sources — established by the loop above, which
     // only exits on source_lines > 0 or by failing the test.
-    println!("✅ chrony: {source_lines} NTP source(s) from fc-agent's config");
+    println!("✅ chrony: {source_lines} NTP source(s) from {origin}");
     Ok(())
 }

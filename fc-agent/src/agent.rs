@@ -166,7 +166,7 @@ pub async fn run() -> Result<()> {
     // process spawn plus a command-socket round trip — awaiting it inline made
     // every cold boot wait for chrony before it could mount disks and launch
     // the container. The task logs its own outcome, including the loud failure.
-    tokio::spawn(start_chronyd());
+    tokio::spawn(start_chronyd(plan.ntp_servers.clone()));
 
     let mounted_disk_paths = if !plan.extra_disks.is_empty() {
         eprintln!(
@@ -520,10 +520,10 @@ pub async fn run() -> Result<()> {
 /// the one that matters after a snapshot restore.
 const CHRONY_CONF: &str = "/etc/chrony.conf";
 
-/// The distro config shipped in the rootfs (see `rootfs-config.toml`), and the
-/// single source of truth for WHICH NTP servers a guest uses. fc-agent copies
-/// its `server`/`pool` directives rather than restating them, so changing the
-/// servers stays a rootfs-config change.
+/// The distro config shipped in the rootfs (see `rootfs-config.toml`), used when
+/// the host did not supply its own servers. fc-agent copies its `server`/`pool`
+/// directives rather than restating them, so changing the servers stays a
+/// rootfs-config change.
 const ROOTFS_CHRONY_CONF: &str = "/etc/chrony/chrony.conf";
 
 /// Used only if the rootfs config carries no `server`/`pool` directive at all.
@@ -555,8 +555,22 @@ const CHRONYD_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 /// discarded with no error, leaving a VM with ZERO NTP sources and a clock free
 /// to drift — worst exactly after a snapshot restore, where chrony is the
 /// correction.
-async fn start_chronyd() {
-    let mut sources = rootfs_ntp_sources().await;
+async fn start_chronyd(host_servers: Vec<String>) {
+    // The HOST's own servers win when it has any. They arrive already resolved to
+    // addresses (see `host_ntp_servers` in vm_config.rs), which is what makes them
+    // usable here: a guest on a restricted network typically cannot reach the
+    // public pool the rootfs names, and often cannot resolve it either.
+    let (mut sources, origin): (Vec<String>, String) = if host_servers.is_empty() {
+        (rootfs_ntp_sources().await, ROOTFS_CHRONY_CONF.to_string())
+    } else {
+        (
+            host_servers
+                .iter()
+                .map(|addr| format!("server {addr} iburst"))
+                .collect(),
+            "the host's NTP servers, via the boot plan".to_string(),
+        )
+    };
     if sources.is_empty() {
         eprintln!(
             "[fc-agent] WARNING: no server/pool directive in {ROOTFS_CHRONY_CONF}; \
@@ -569,7 +583,7 @@ async fn start_chronyd() {
     // restored VM can resume hours off; slewing that back would take days.
     let config = format!(
         "# Written by fc-agent at boot; chronyd is started with -f on this path.\n\
-         # NTP sources copied from {ROOTFS_CHRONY_CONF} (set in rootfs-config.toml).\n\
+         # NTP sources from {origin}.\n\
          {}\n\
          makestep 1 -1\n\
          driftfile /var/lib/chrony/drift\n\
