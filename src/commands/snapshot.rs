@@ -20,7 +20,7 @@ use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
 };
 use crate::storage::SnapshotManager;
-use crate::uffd::{UffdBacking, UffdServer};
+use crate::uffd::{Prefetch, UffdBacking, UffdServer};
 use crate::volume::VolumeConfig;
 
 use super::common::{
@@ -406,12 +406,20 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         None => UffdBacking::Copy,
     };
 
+    // Whether clones replay the snapshot's recorded working set instead of faulting it in
+    // one page at a time (--uffd-prefetch / FCVM_UFFD_PREFETCH).
+    let prefetch = match args.uffd_prefetch.as_deref() {
+        Some(value) => Prefetch::parse(value)?,
+        None => Prefetch::On,
+    };
+
     // Create UFFD server with custom socket path
     let server = UffdServer::new_with_path(
         args.snapshot_name.clone(),
         &snapshot_config.memory_path,
         &socket_path,
         backing,
+        prefetch,
     )
     .await
     .context("creating UFFD server")?;
@@ -1261,10 +1269,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 "FCVM_FORCE_UFFD"
             };
             let backing = UffdBacking::from_env(hugepages)?;
+            let prefetch = Prefetch::from_env()?;
             info!(
                 socket = %implicit_socket_path.display(),
                 reason = %reason,
                 mode = backing.name(),
+                prefetch = ?prefetch,
                 "starting implicit UFFD server for snapshot restore"
             );
 
@@ -1273,6 +1283,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 &snapshot_config.memory_path,
                 &implicit_socket_path,
                 backing,
+                prefetch,
             )
             .await
             .context("creating implicit UFFD server")

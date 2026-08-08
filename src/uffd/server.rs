@@ -14,9 +14,26 @@ use userfaultfd::{Event, FaultKind, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::paths;
+use crate::uffd::prefetch;
+use crate::uffd::working_set::{PageSet, WorkingSetStore};
 
 /// 2MiB — the only huge page size fcvm supports for guest memory.
 const HUGE_PAGE_2M: usize = 2 * 1024 * 1024;
+
+/// How long to wait for new events before re-attempting parked CONTINUEs. Retries are also
+/// attempted after every drain and between prefetch chunks, so this only bounds the
+/// idle-queue case.
+const CONTINUE_RETRY_DELAY: Duration = Duration::from_millis(2);
+
+/// How long a parked MINOR fault may stay unresolved before the handler gives up.
+///
+/// `mmap_changing` clears as soon as the queued event is read, so a fault still stuck after
+/// this is something wedged, not something slow. Bounded by TIME rather than by a retry count
+/// because the two callers retry at completely different cadences — the idle loop every
+/// [`CONTINUE_RETRY_DELAY`], the prefetch loop between every chunk — and only the elapsed time
+/// means the same thing to both. Failing the handler is loud; an infinite loop or a dropped
+/// fault would not be.
+const MAX_CONTINUE_WAIT: Duration = Duration::from_secs(2);
 
 /// How the server materialises snapshot pages into a clone's guest memory.
 ///
@@ -89,12 +106,49 @@ enum PageSource {
     Minor { backing: File },
 }
 
+/// Whether a server records each clone's restore working set and replays it into the next.
+///
+/// `Off` is completely inert — no recording, no replay, no files — so it is a true baseline
+/// for measuring what the replay is worth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prefetch {
+    On,
+    Off,
+}
+
+impl Prefetch {
+    /// Parse the `FCVM_UFFD_PREFETCH` env var / `--uffd-prefetch` flag value.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            other => anyhow::bail!(
+                "invalid UFFD prefetch setting {other:?} (expected \"on\" or \"off\")"
+            ),
+        }
+    }
+
+    /// Resolve from `FCVM_UFFD_PREFETCH`, defaulting to [`Prefetch::On`].
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("FCVM_UFFD_PREFETCH") {
+            Ok(v) => Self::parse(&v),
+            Err(_) => Ok(Self::On),
+        }
+    }
+}
+
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
 pub struct UffdServer {
     snapshot_id: String,
     socket_path: PathBuf,
     source: Arc<PageSource>,
     backing: UffdBacking,
+    /// Bytes of snapshot memory behind `source`.
+    mem_size: usize,
+    /// Records what each clone faults and replays it into later ones. `None` when prefetch
+    /// is off, or when the working set beside this snapshot could not be opened — in both
+    /// cases every clone simply faults on demand.
+    working_set: Option<Arc<WorkingSetStore>>,
 }
 
 impl UffdServer {
@@ -103,9 +157,10 @@ impl UffdServer {
         snapshot_id: String,
         mem_file_path: &Path,
         backing: UffdBacking,
+        prefetch: Prefetch,
     ) -> Result<Self> {
         let socket_path = paths::data_dir().join(format!("uffd-{}.sock", snapshot_id));
-        Self::new_with_path(snapshot_id, mem_file_path, &socket_path, backing).await
+        Self::new_with_path(snapshot_id, mem_file_path, &socket_path, backing, prefetch).await
     }
 
     /// Create a new UFFD server with custom socket path
@@ -114,6 +169,7 @@ impl UffdServer {
         mem_file_path: &Path,
         socket_path: &Path,
         backing: UffdBacking,
+        prefetch: Prefetch,
     ) -> Result<Self> {
         info!(
             target: "uffd",
@@ -169,11 +225,35 @@ impl UffdServer {
         // Remove stale socket (ignore errors if not exists - avoids TOCTOU race)
         let _ = tokio::fs::remove_file(&socket_path).await;
 
+        // The recorded working set is an optimisation: if it cannot be opened (unwritable
+        // snapshot directory, unreadable file, an image too large to map), say so once and
+        // serve exactly as before — on demand.
+        let working_set = match prefetch {
+            Prefetch::Off => {
+                info!(target: "uffd", snapshot = %snapshot_id, "working-set replay disabled");
+                None
+            }
+            Prefetch::On => match WorkingSetStore::open(mem_file_path, mem_size as u64) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(e) => {
+                    warn!(
+                        target: "uffd",
+                        snapshot = %snapshot_id,
+                        error = %e,
+                        "no restore working set for this snapshot - clones will fault on demand"
+                    );
+                    None
+                }
+            },
+        };
+
         Ok(Self {
             snapshot_id,
             socket_path: socket_path.to_path_buf(),
             source: Arc::new(source),
             backing,
+            mem_size,
+            working_set,
         })
     }
 
@@ -213,6 +293,8 @@ impl UffdServer {
                             let vm_id = format!("vm-{}", next_vm_id);
                             next_vm_id += 1;
                             let source = Arc::clone(&self.source);
+                            let working_set = self.working_set.clone();
+                            let mem_size = self.mem_size;
 
                             info!(target: "uffd", vm_id = %vm_id, "new VM connection");
 
@@ -221,9 +303,9 @@ impl UffdServer {
                             vm_tasks.spawn(async move {
                                 match tokio::time::timeout(
                                     Duration::from_secs(30),
-                                    handshake(stream, &source),
+                                    handshake(stream, &source, &vm_id),
                                 ).await {
-                                    Ok(Ok((uffd, mappings))) => {
+                                    Ok(Ok((uffd, mappings, clone_exit))) => {
                                         info!(
                                             target: "uffd",
                                             vm_id = %vm_id,
@@ -231,7 +313,7 @@ impl UffdServer {
                                             "received UFFD with {} memory regions",
                                             mappings.len()
                                         );
-                                        match handle_vm_page_faults(vm_id.clone(), uffd, mappings, source).await {
+                                        match handle_vm_page_faults(vm_id.clone(), uffd, mappings, source, working_set, mem_size, clone_exit).await {
                                             Ok(()) => info!(target: "uffd", vm_id = %vm_id, "VM handler exited cleanly"),
                                             Err(e) => error!(
                                                 target: "uffd",
@@ -434,12 +516,151 @@ fn continue_page(
     Ok(ContinueOutcome::Resolved)
 }
 
+/// Waits for the clone's Firecracker to exit.
+///
+/// # Why this is needed at all
+///
+/// A userfaultfd gives NO signal when the process that created it dies. Measured on this
+/// kernel (`poll` for 2 s on a uffd whose creating process has been reaped, while we still
+/// hold the fd):
+///
+/// ```text
+/// poll()       -> 0, revents=0x0        (no POLLIN, no POLLERR, no POLLHUP - ever)
+/// read()       -> -1 EAGAIN
+/// UFFDIO_COPY  -> -1 ESRCH              (only a resolve attempt reveals it)
+/// ```
+///
+/// The fd stays alive because WE hold a reference, so `userfaultfd_release` never runs. A
+/// handler parked in `readable()` therefore waits forever for a VM that is already gone: the
+/// "VM exited" summary had never once been logged across 137 recorded serve logs, and every
+/// finished clone left its task and its uffd pinned until the whole server shut down.
+///
+/// # The signal
+///
+/// `SO_PEERCRED` on the handshake socket gives the connecting Firecracker's pid (Firecracker's
+/// own `send_uffd_handshake` recommends exactly this), and `pidfd_open` turns that into an fd
+/// that becomes readable when the process exits. Event-driven, no polling, no timers.
+///
+/// **Pid reuse cannot cause a premature exit.** The dangerous case would be watching some
+/// unrelated process while our clone still runs — but a LIVE process's pid cannot be handed to
+/// another process, so while Firecracker is alive its pid resolves to Firecracker. The only
+/// window (Firecracker dies between `connect` and `pidfd_open`, and its pid is recycled) needs
+/// the clone to be dead already, and closing a dead clone's uffd harms nothing.
+struct CloneExit(AsyncFd<std::os::fd::OwnedFd>);
+
+impl CloneExit {
+    /// Watch the process that opened `stream`. `None` disables exit detection for this clone
+    /// (it then behaves as it always has: the handler lives until the server stops).
+    fn watch(stream: &std::os::unix::net::UnixStream, vm_id: &str) -> Option<Self> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred`/`len` are correctly sized for SO_PEERCRED on a connected socket.
+        let got = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if got < 0 || cred.pid <= 0 {
+            warn!(
+                target: "uffd",
+                vm_id = %vm_id,
+                error = %std::io::Error::last_os_error(),
+                "SO_PEERCRED gave no pid for the connecting Firecracker (different pid \
+                 namespace?) - this clone's exit cannot be detected, so its working set will \
+                 not be recorded"
+            );
+            return None;
+        }
+
+        // SAFETY: plain syscall; on success it returns a fresh owned fd.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, cred.pid, 0) };
+        if raw < 0 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH: it already exited. Everything else is unexpected.
+            info!(
+                target: "uffd",
+                vm_id = %vm_id,
+                pid = cred.pid,
+                error = %err,
+                "cannot watch the clone's Firecracker for exit"
+            );
+            return None;
+        }
+        // SAFETY: `raw` is a fresh fd owned by us.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        match AsyncFd::new(fd) {
+            Ok(async_fd) => {
+                debug!(target: "uffd", vm_id = %vm_id, pid = cred.pid, "watching clone for exit");
+                Some(Self(async_fd))
+            }
+            Err(e) => {
+                warn!(target: "uffd", vm_id = %vm_id, error = %e, "cannot register pidfd with tokio");
+                None
+            }
+        }
+    }
+
+    /// Resolves when the clone's Firecracker has exited.
+    async fn exited(watch: &Option<Self>) {
+        match watch {
+            // A pidfd is readable exactly once the process has exited; nothing is ever read
+            // from it, so the guard is dropped without clearing readiness.
+            Some(Self(pidfd)) => match pidfd.readable().await {
+                Ok(_guard) => {}
+                Err(_) => std::future::pending().await,
+            },
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// What one clone's fault handler needs and never changes while it is being served.
+struct VmContext<'a> {
+    vm_id: &'a str,
+    mappings: &'a [GuestRegionUffdMapping],
+    source: &'a PageSource,
+    /// Fault granularity Firecracker reported for this clone (4 KiB, 16 KiB or 2 MiB).
+    page_size: usize,
+    page_mask: usize,
+    /// Bytes of snapshot memory behind the mappings.
+    mem_size: usize,
+}
+
+/// Per-clone state that both the working-set replay and the fault loop mutate.
+struct VmState<'a> {
+    /// Faults served on demand. Replaying a recorded working set should make this a small
+    /// fraction of what the recording clone needed — it is the number that proves it worked.
+    fault_count: u64,
+    /// MINOR faults whose UFFDIO_CONTINUE came back `EAGAIN` (`mmap_changing` was set),
+    /// keyed by page address, value = when it was first parked. The faulting vCPU sleeps
+    /// until a successful CONTINUE wakes it and will never re-fault on its own, so every
+    /// entry here MUST eventually resolve or the handler must die loudly — silently
+    /// dropping one is a permanently hung guest.
+    pending_continues: std::collections::BTreeMap<usize, std::time::Instant>,
+    /// The pages this clone actually faulted, to be merged into the snapshot's record.
+    recorder: Option<&'a mut PageSet>,
+    started: std::time::Instant,
+}
+
 /// Handle page faults for a single VM
 async fn handle_vm_page_faults(
     vm_id: String,
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
     source: Arc<PageSource>,
+    working_set: Option<Arc<WorkingSetStore>>,
+    mem_size: usize,
+    clone_exit: Option<CloneExit>,
 ) -> Result<()> {
     // Derive page size from mappings (all regions use the same page size)
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
@@ -462,142 +683,310 @@ async fn handle_vm_page_faults(
     // Wrap UFFD in AsyncFd for tokio integration
     let async_uffd = AsyncFd::new(uffd).context("creating AsyncFd for UFFD")?;
 
-    let mut fault_count = 0u64;
-    let start_time = std::time::Instant::now();
+    let ctx = VmContext {
+        vm_id: &vm_id,
+        mappings: &mappings,
+        source: &source,
+        page_size,
+        page_mask,
+        mem_size,
+    };
+    let mut recorded = working_set.as_deref().map(WorkingSetStore::recorder);
+    let mut state = VmState {
+        fault_count: 0,
+        pending_continues: std::collections::BTreeMap::new(),
+        recorder: recorded.as_mut(),
+        started: std::time::Instant::now(),
+    };
 
-    // MINOR faults whose UFFDIO_CONTINUE came back `EAGAIN` (`mmap_changing` was set),
-    // keyed by page address, value = retry attempts so far. The faulting vCPU sleeps
-    // until a successful CONTINUE wakes it and will never re-fault on its own, so every
-    // entry here MUST eventually resolve or the handler must die loudly — silently
-    // dropping one is a permanently hung guest.
-    let mut pending_continues: std::collections::BTreeMap<usize, u32> =
-        std::collections::BTreeMap::new();
-    // How long to wait for new events before re-attempting parked CONTINUEs. Retries are
-    // also attempted after every drain, so this only bounds the idle-queue case.
-    const CONTINUE_RETRY_DELAY: Duration = Duration::from_millis(2);
-    // Hard bound on retries per fault (~2s at CONTINUE_RETRY_DELAY): mmap_changing
-    // clears as soon as the queued event is read, so persistent EAGAIN means something
-    // is wedged. Failing the handler is loud; an infinite loop or a drop would not be.
-    const MAX_CONTINUE_ATTEMPTS: u32 = 1000;
+    let result = serve_clone(
+        &ctx,
+        &async_uffd,
+        &mut state,
+        working_set.as_deref(),
+        &clone_exit,
+    )
+    .await;
 
-    loop {
-        // Wait for UFFD to be readable — but never park indefinitely while resolved-later
-        // faults are waiting, because no new event will ever arrive for THEM.
-        let maybe_guard = if pending_continues.is_empty() {
-            match async_uffd.readable().await {
-                Ok(guard) => Some(guard),
-                Err(e) => {
-                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
-                    return Err(e.into());
+    // Publish what this clone faulted however the handler ended — a clone that died early
+    // still learned something, and half a recording is repaired by the next clone rather
+    // than being baked in. Purely a cache: a failure here is logged, never propagated.
+    if let (Some(store), Some(observed)) = (working_set.as_deref(), recorded.as_ref()) {
+        match store.merge_and_persist(observed) {
+            Ok(outcome) => info!(
+                target: "uffd",
+                vm_id = %vm_id,
+                faulted_pages = observed.len(),
+                added_pages = outcome.added,
+                known_pages = outcome.total,
+                persisted = outcome.persisted,
+                "merged this clone's faults into the snapshot's working set"
+            ),
+            Err(e) => warn!(
+                target: "uffd",
+                vm_id = %vm_id,
+                error = ?e,
+                "could not record the working set - the next clone just faults on demand"
+            ),
+        }
+    }
+
+    result
+}
+
+/// Replay the recorded working set, then serve faults until the clone exits.
+async fn serve_clone(
+    ctx: &VmContext<'_>,
+    async_uffd: &AsyncFd<Uffd>,
+    state: &mut VmState<'_>,
+    working_set: Option<&WorkingSetStore>,
+    clone_exit: &Option<CloneExit>,
+) -> Result<()> {
+    if let Some(store) = working_set {
+        let recorded = store.to_prefetch();
+        if !recorded.is_empty() && replay_working_set(ctx, async_uffd, &recorded, state).await? {
+            return Ok(()); // clone exited during replay
+        }
+    }
+    serve_faults(ctx, async_uffd, state, clone_exit).await
+}
+
+/// Bulk-populate every page the recorded working set says this clone will touch.
+///
+/// Returns `Ok(true)` when the clone exited while this ran.
+///
+/// # Ordering
+///
+/// This runs in the window between Firecracker handing over the userfaultfd and the guest's
+/// first instruction: fcvm loads the snapshot with `resume_vm: false` and only resumes after
+/// the drive patch (`src/commands/common.rs`). It is not a *barrier* though — the resume is
+/// issued by the clone process, not by this server — so the loop stays interleaved: a drain
+/// of real faults precedes every chunk, and `UFFDIO_COPY`/`UFFDIO_CONTINUE` wake anything
+/// already blocked on a page they populate. A guest that resumes mid-replay therefore waits
+/// at most one chunk behind speculation, never the whole set.
+async fn replay_working_set(
+    ctx: &VmContext<'_>,
+    async_uffd: &AsyncFd<Uffd>,
+    recorded: &PageSet,
+    state: &mut VmState<'_>,
+) -> Result<bool> {
+    let regions: Vec<prefetch::Region> = ctx
+        .mappings
+        .iter()
+        .map(|m| prefetch::Region {
+            base_host_virt_addr: m.base_host_virt_addr,
+            file_offset: m.offset,
+            size: m.size,
+        })
+        .collect();
+    let segments = prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64);
+    let source = match ctx.source {
+        PageSource::Copy { mmap } => prefetch::Source::Copy(&mmap[..]),
+        PageSource::Minor { .. } => prefetch::Source::Minor,
+    };
+
+    let uffd = async_uffd.get_ref();
+    let started = std::time::Instant::now();
+    let mut bytes = 0u64;
+    let mut refused = 0u64;
+
+    'segments: for segment in &segments {
+        let mut done = 0usize;
+        while done < segment.len {
+            // Demand beats speculation: serve anything that arrived while the previous
+            // chunk was being copied before starting the next one.
+            if !drain_events(ctx, uffd, state)? {
+                return Ok(true);
+            }
+            if !retry_pending_continues(ctx, uffd, state)? {
+                return Ok(true);
+            }
+
+            match prefetch::populate_chunk(uffd, &source, segment, done, ctx.page_size, ctx.vm_id) {
+                Ok(progress) => {
+                    done += progress;
+                    bytes += progress as u64;
+                }
+                Err(prefetch::Stop::VmGone) => return Ok(true),
+                Err(prefetch::Stop::Refused) => {
+                    refused += 1;
+                    continue 'segments;
                 }
             }
-        } else {
-            match tokio::time::timeout(CONTINUE_RETRY_DELAY, async_uffd.readable()).await {
-                Ok(Ok(guard)) => Some(guard),
-                Ok(Err(e)) => {
-                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
-                    return Err(e.into());
-                }
-                // Timeout: no new events. Fall through and retry the parked faults.
-                Err(_) => None,
+
+            // Other clones' handlers share these worker threads; never hold one for the
+            // whole replay.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    info!(
+        target: "uffd",
+        vm_id = %ctx.vm_id,
+        prefetched_pages = bytes / ctx.page_size as u64,
+        prefetched_mib = bytes / (1024 * 1024),
+        segments = segments.len(),
+        refused_segments = refused,
+        prefetch_ms = started.elapsed().as_millis(),
+        demand_faults_during_replay = state.fault_count,
+        "replayed recorded working set"
+    );
+    Ok(false)
+}
+
+/// Serve demand faults until the clone exits.
+async fn serve_faults(
+    ctx: &VmContext<'_>,
+    async_uffd: &AsyncFd<Uffd>,
+    state: &mut VmState<'_>,
+    clone_exit: &Option<CloneExit>,
+) -> Result<()> {
+    loop {
+        // Three things can wake this handler:
+        //  * the uffd has events (a real fault) — always takes priority;
+        //  * the clone's Firecracker exited — the ONLY reliable end-of-clone signal
+        //    (see `CloneExit`), and what lets the working set be recorded;
+        //  * a parked MINOR fault is due for a retry. That branch is `pending` unless
+        //    something is actually parked, so an idle clone costs no wakeups at all.
+        let retry_due = async {
+            if state.pending_continues.is_empty() {
+                std::future::pending::<()>().await
+            } else {
+                tokio::time::sleep(CONTINUE_RETRY_DELAY).await
             }
         };
 
-        if let Some(mut guard) = maybe_guard {
-            if !drain_events(
-                &mut guard,
-                &vm_id,
-                &mappings,
-                &source,
-                page_size,
-                page_mask,
-                &mut fault_count,
-                &mut pending_continues,
-                start_time,
-            )? {
-                return Ok(()); // VM exited
+        tokio::select! {
+            biased;
+
+            readable = async_uffd.readable() => {
+                match readable {
+                    Ok(mut guard) => {
+                        if !drain_events(ctx, guard.get_inner(), state)? {
+                            return Ok(()); // VM exited
+                        }
+                        guard.clear_ready();
+                    }
+                    Err(e) => {
+                        error!(target: "uffd", vm_id = %ctx.vm_id, error = %e, "error waiting for UFFD readability");
+                        return Err(e.into());
+                    }
+                }
             }
-            guard.clear_ready();
+
+            _ = CloneExit::exited(clone_exit) => {
+                // Safe to stop here, and only here: the guest's address space is gone, so
+                // no fault can be pending and no page can be left unserved.
+                log_clone_finished(ctx, state, "clone process exited");
+                return Ok(());
+            }
+
+            _ = retry_due => {}
         }
 
         // Retry parked faults now that the queue is drained — reading the queued event is
         // exactly what allows the in-flight operation to finish and `mmap_changing` to
         // clear, so this is the earliest moment a retry can succeed.
-        if !pending_continues.is_empty() {
-            let mut resolved = Vec::new();
-            for (&page, attempts) in pending_continues.iter_mut() {
-                match continue_page(async_uffd.get_ref(), &vm_id, page, page_size)? {
-                    ContinueOutcome::Resolved => resolved.push(page),
-                    ContinueOutcome::VmGone => {
-                        info!(target: "uffd", vm_id = %vm_id, "VM exited during CONTINUE retry");
-                        return Ok(());
-                    }
-                    ContinueOutcome::Retry => {
-                        *attempts += 1;
-                        if *attempts >= MAX_CONTINUE_ATTEMPTS {
-                            return Err(anyhow!(
-                                "UFFDIO_CONTINUE at 0x{:x} still EAGAIN after {} attempts — \
-                                 mmap_changing never cleared. Refusing to drop the fault \
-                                 (a dropped fault is a permanently hung vCPU); failing the \
-                                 handler for vm {} instead",
-                                page,
-                                MAX_CONTINUE_ATTEMPTS,
-                                vm_id
-                            ));
-                        }
-                    }
-                }
-            }
-            for page in resolved {
-                pending_continues.remove(&page);
-            }
+        if !retry_pending_continues(ctx, async_uffd.get_ref(), state)? {
+            return Ok(());
         }
     }
 }
 
+/// The one place that reports how a clone's paging went. `fault_count` is the number that
+/// shows whether working-set replay worked.
+fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState<'_>, reason: &str) {
+    let elapsed = state.started.elapsed();
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        state.fault_count as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    info!(
+        target: "uffd",
+        vm_id = %ctx.vm_id,
+        fault_count = state.fault_count,
+        elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
+        pages_per_sec = format!("{:.0}", rate),
+        reason,
+        "VM exited"
+    );
+}
+
+/// Re-attempt every MINOR fault parked by `mmap_changing`.
+///
+/// Returns `Ok(false)` when the clone has exited. A fault still unresolved after
+/// [`MAX_CONTINUE_WAIT`] fails the handler rather than being dropped: dropping one is a
+/// permanently hung vCPU.
+fn retry_pending_continues(
+    ctx: &VmContext<'_>,
+    uffd: &Uffd,
+    state: &mut VmState<'_>,
+) -> Result<bool> {
+    if state.pending_continues.is_empty() {
+        return Ok(true);
+    }
+    let mut resolved = Vec::new();
+    for (&page, parked_at) in state.pending_continues.iter() {
+        match continue_page(uffd, ctx.vm_id, page, ctx.page_size)? {
+            ContinueOutcome::Resolved => resolved.push(page),
+            ContinueOutcome::VmGone => {
+                info!(target: "uffd", vm_id = %ctx.vm_id, "VM exited during CONTINUE retry");
+                return Ok(false);
+            }
+            ContinueOutcome::Retry => {
+                let waited = parked_at.elapsed();
+                if waited >= MAX_CONTINUE_WAIT {
+                    return Err(anyhow!(
+                        "UFFDIO_CONTINUE at 0x{:x} still EAGAIN after {:?} — mmap_changing \
+                         never cleared. Refusing to drop the fault (a dropped fault is a \
+                         permanently hung vCPU); failing the handler for vm {} instead",
+                        page,
+                        waited,
+                        ctx.vm_id
+                    ));
+                }
+            }
+        }
+    }
+    for page in resolved {
+        state.pending_continues.remove(&page);
+    }
+    Ok(true)
+}
+
 /// Drain every ready event from the uffd. Returns `Ok(false)` when the VM has exited
 /// (uffd closed), `Ok(true)` to keep serving.
-#[allow(clippy::too_many_arguments)]
-fn drain_events(
-    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, Uffd>,
-    vm_id: &str,
-    mappings: &[GuestRegionUffdMapping],
-    source: &PageSource,
-    page_size: usize,
-    page_mask: usize,
-    fault_count: &mut u64,
-    pending_continues: &mut std::collections::BTreeMap<usize, u32>,
-    start_time: std::time::Instant,
-) -> Result<bool> {
+///
+/// Called both from the fault loop (under a readiness guard) and between replay chunks
+/// (directly on the fd). Reading outside a guard can leave tokio's cached readiness set, which
+/// costs one spurious wakeup and nothing else — the loop drains, finds nothing, and clears it.
+fn drain_events(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState<'_>) -> Result<bool> {
+    let (vm_id, mappings, source, page_size, page_mask) = (
+        ctx.vm_id,
+        ctx.mappings,
+        ctx.source,
+        ctx.page_size,
+        ctx.page_mask,
+    );
     {
         // Read all available events (non-blocking)
         loop {
-            let event = match guard.get_inner().read_event() {
+            let event = match uffd.read_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => break, // No more events ready
                 Err(_) => {
-                    // UFFD closed = VM exited
-                    let elapsed = start_time.elapsed();
-                    let rate = if elapsed.as_secs_f64() > 0.0 {
-                        *fault_count as f64 / elapsed.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    info!(
-                        target: "uffd",
-                        vm_id = %vm_id,
-                        fault_count = *fault_count,
-                        elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
-                        pages_per_sec = format!("{:.0}", rate),
-                        "VM exited"
-                    );
+                    // The uffd itself is unusable. This is NOT how a finished clone is
+                    // detected — a dead clone's uffd just goes quiet forever (see
+                    // `CloneExit`) — so getting here means the fd broke under us.
+                    log_clone_finished(ctx, state, "userfaultfd unreadable");
                     return Ok(false);
                 }
             };
 
             match event {
                 Event::Pagefault { addr, kind, .. } => {
-                    *fault_count += 1;
+                    state.fault_count += 1;
 
                     // Find which memory region this address belongs to
                     let fault_page = (addr as usize) & page_mask;
@@ -616,6 +1005,20 @@ fn drain_events(
                             fault_page,
                             base_host
                         ));
+                    }
+
+                    let offset_in_region = fault_page - base_host;
+                    let mapping_offset = usize::try_from(mapping.offset)
+                        .map_err(|_| anyhow!("mapping offset exceeds host address space"))?;
+                    let offset_in_file = mapping_offset
+                        .checked_add(offset_in_region)
+                        .ok_or_else(|| anyhow!("mapping offset overflow"))?;
+
+                    // Record what the guest ACTUALLY asked for — never what was speculatively
+                    // populated — so the persisted set converges on the true working set
+                    // instead of on its own prediction.
+                    if let Some(set) = state.recorder.as_deref_mut() {
+                        set.insert_range(offset_in_file as u64, page_size as u64);
                     }
 
                     let mmap = match source {
@@ -640,7 +1043,7 @@ fn drain_events(
                                     fault_page
                                 ));
                             }
-                            match continue_page(guard.get_inner(), vm_id, fault_page, page_size)? {
+                            match continue_page(uffd, vm_id, fault_page, page_size)? {
                                 ContinueOutcome::Resolved => {}
                                 ContinueOutcome::VmGone => return Ok(false),
                                 ContinueOutcome::Retry => {
@@ -653,7 +1056,10 @@ fn drain_events(
                                         fault_addr = format!("0x{:x}", fault_page),
                                         "UFFDIO_CONTINUE EAGAIN (mmap_changing) - parked for retry"
                                     );
-                                    pending_continues.entry(fault_page).or_insert(0);
+                                    state
+                                        .pending_continues
+                                        .entry(fault_page)
+                                        .or_insert_with(std::time::Instant::now);
                                 }
                             }
                             continue;
@@ -661,12 +1067,6 @@ fn drain_events(
                         PageSource::Copy { mmap } => mmap,
                     };
 
-                    let offset_in_region = fault_page - base_host;
-                    let mapping_offset = usize::try_from(mapping.offset)
-                        .map_err(|_| anyhow!("mapping offset exceeds host address space"))?;
-                    let offset_in_file = mapping_offset
-                        .checked_add(offset_in_region)
-                        .ok_or_else(|| anyhow!("mapping offset overflow"))?;
                     let mmap_len = mmap.len();
 
                     if offset_in_file >= mmap_len {
@@ -679,7 +1079,7 @@ fn drain_events(
                         // Heap-allocate zero buffer (2MB on stack would overflow for hugepages)
                         let zero_page: Vec<u8> = vec![0u8; page_size];
                         let result = unsafe {
-                            guard.get_inner().copy(
+                            uffd.copy(
                                 zero_page.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
                                 page_size,
@@ -704,7 +1104,7 @@ fn drain_events(
                     let copy_result = if bytes_available >= page_size {
                         let page_data = &mmap[offset_in_file..offset_in_file + page_size];
                         unsafe {
-                            guard.get_inner().copy(
+                            uffd.copy(
                                 page_data.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
                                 page_size,
@@ -719,7 +1119,7 @@ fn drain_events(
                             &mmap[offset_in_file..offset_in_file + bytes_available],
                         );
                         unsafe {
-                            guard.get_inner().copy(
+                            uffd.copy(
                                 temp.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
                                 page_size,
@@ -818,7 +1218,7 @@ fn drain_events(
                     // by falling back to per-page zeroing that skips already-present pages.
                     // Killing the handler here would close the uffd and silently corrupt the
                     // still-running VM.
-                    let bulk_result = unsafe { guard.get_inner().zeropage(start, len, true) };
+                    let bulk_result = unsafe { uffd.zeropage(start, len, true) };
                     if let Err(e) = bulk_result {
                         if !zeropage_hit_present_page(&e) {
                             error!(
@@ -842,11 +1242,7 @@ fn drain_events(
                         let mut page = start_addr;
                         while page < end_addr {
                             let page_result = unsafe {
-                                guard.get_inner().zeropage(
-                                    page as *mut std::ffi::c_void,
-                                    page_size,
-                                    true,
-                                )
+                                uffd.zeropage(page as *mut std::ffi::c_void, page_size, true)
                             };
                             if let Err(page_err) = page_result {
                                 if !zeropage_hit_present_page(&page_err) {
@@ -954,8 +1350,13 @@ impl GuestRegionUffdMapping {
 async fn handshake(
     stream: tokio::net::UnixStream,
     source: &PageSource,
-) -> Result<(Uffd, Vec<GuestRegionUffdMapping>)> {
+    vm_id: &str,
+) -> Result<(Uffd, Vec<GuestRegionUffdMapping>, Option<CloneExit>)> {
     let std_stream = stream.into_std().context("converting to std stream")?;
+    // Take the exit watch BEFORE the handshake: the peer is certainly alive right now, and
+    // Firecracker closes its end as soon as it has sent the uffd (`send_uffd_handshake`
+    // consumes the socket), so this is the last moment SO_PEERCRED has a live peer behind it.
+    let exit = CloneExit::watch(&std_stream, vm_id);
     // Keep non-blocking — AsyncFd handles readiness
     let async_stream = AsyncFd::new(std_stream).context("creating AsyncFd for handshake socket")?;
 
@@ -1001,7 +1402,7 @@ async fn handshake(
     // Convert File to Uffd
     let uffd = unsafe { Uffd::from_raw_fd(uffd_file.into_raw_fd()) };
 
-    Ok((uffd, mappings))
+    Ok((uffd, mappings, exit))
 }
 
 /// Send the shared backing memfd to a connecting Firecracker over `SCM_RIGHTS`.
@@ -1421,6 +1822,83 @@ mod tests {
         assert!(mapping.contains(0x200000));
         assert!(mapping.contains(0x300000));
         assert!(!mapping.contains(0x400000));
+    }
+
+    /// The end-of-clone signal. A uffd reports NOTHING when its creator dies (measured: see
+    /// [`CloneExit`]), so the handler is woken by a pidfd on the process that connected. This
+    /// test pins both halves of the contract: it must NOT fire while that process lives, and
+    /// it MUST fire once it exits.
+    #[test]
+    fn clone_exit_fires_only_once_the_peer_process_dies() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let path = std::env::temp_dir().join(format!(
+            "fcvm-cloneexit-{}-{:?}.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        // A real second process, because SO_PEERCRED on a socketpair would just name us.
+        // SAFETY: the child only connects, reads one byte, and _exits.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let mut sock = UnixStream::connect(&path).expect("child connect");
+            let mut go = [0u8; 1];
+            let _ = sock.read_exact(&mut go); // block until the parent says die
+                                              // SAFETY: _exit skips atexit handlers inherited from the test harness.
+            unsafe { libc::_exit(0) };
+        }
+
+        let (stream, _) = listener.accept().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Inside the runtime: registering the pidfd needs a reactor, exactly as it does
+            // on the real path (`handshake` runs in a server task).
+            let watch =
+                Some(CloneExit::watch(&stream, "exit-test").expect("peer pid is watchable"));
+            // Must NOT fire while the clone is alive — a false positive here would close a
+            // running guest's uffd and serve it zero pages.
+            let early =
+                tokio::time::timeout(Duration::from_millis(200), CloneExit::exited(&watch)).await;
+            assert!(
+                early.is_err(),
+                "CloneExit fired while the peer process was still alive"
+            );
+
+            // Release the child, then the signal must arrive.
+            (&stream).write_all(b"x").unwrap();
+            tokio::time::timeout(Duration::from_secs(10), CloneExit::exited(&watch))
+                .await
+                .expect("CloneExit must fire once the peer process exits");
+        });
+
+        // SAFETY: reaping our own child.
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// With no watchable peer the handler must simply never be woken by this path (it then
+    /// behaves as it always has), rather than firing immediately and killing a live clone.
+    #[test]
+    fn clone_exit_without_a_watch_never_fires() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let result =
+                tokio::time::timeout(Duration::from_millis(200), CloneExit::exited(&None)).await;
+            assert!(result.is_err(), "an absent watch must never resolve");
+        });
     }
 
     // =========================================================================

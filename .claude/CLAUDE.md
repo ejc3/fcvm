@@ -1516,6 +1516,54 @@ fcvm snapshot run --pid <serve_pid> --name clone1
   clean pages via the page cache (MAP_PRIVATE) — measured 3x 1GiB clones
   ≈ 230MiB total PSS, with or without dirty tracking (#632)
 
+### Working-Set Replay (`--uffd-prefetch`, default on)
+
+Demand paging is the UFFD path's latency tax: a Chromium clone takes ~56,300 faults at
+~5.6 us marginal each (+316 ms versus a file-backed restore on the same page). Clones of one
+snapshot fault almost the same PAGES — pairwise Jaccard median 0.927 across 8 clones, 82.2% of
+the union faulted by all 8 — but NOT in the same ORDER (only 8.6% of faults are the next
+sequential page, which is why readahead and fault-around do nothing here). So the server
+records the SET and replays it.
+
+- **Record**: every demand fault marks its snapshot file offset in a 4 KiB-granular bitmap
+  (32 KiB per GiB of guest RAM). On handler exit the bitmap is merged into
+  `<memory.bin>.working-set` beside the snapshot, under an `flock` + atomic rename, and only
+  written when the union actually grew — so the steady state writes nothing, and a clone that
+  was killed mid-restore gets completed by the next one instead of baking in a truncated set.
+- **Replay**: at handshake the recorded set is coalesced into runs, mapped into that clone's
+  regions, aligned to its page size, and populated in 2 MiB `UFFDIO_COPY`/`UFFDIO_CONTINUE`
+  chunks. This runs before the guest's first instruction (fcvm loads with `resume_vm: false`),
+  but it is NOT a barrier — the resume comes from the clone process — so a drain of real
+  faults precedes every chunk and demand always beats speculation.
+- **Invalidation**: keyed by the memory image's identity (`len, mtime, ino, dev`), not a
+  content hash — SHA-256 of a 2 GiB image measures 1.4 s at 1.5 GB/s here, which costs more
+  than the mis-prefetch it would prevent. Safe because a working set only says WHICH offsets
+  to copy; the BYTES always come from the file being served, so a stale set wastes a copy and
+  can never corrupt a guest.
+- **Isolation**: replay touches pages the guest never asked for, so it must stay private.
+  `UFFDIO_COPY` writes into the clone's own anonymous memory, and `UFFDIO_CONTINUE` installs a
+  read-only PTE that copies on write. Proven by `prefetched_pages_are_private_to_each_clone`
+  (mechanism level, milliseconds) and `test_snapshot_clone_working_set_replay` (two clones,
+  cross-write invisibility, `memory.bin` byte-identical).
+- **Measuring it**: the memory server logs `replayed recorded working set` with
+  `prefetched_pages`, and `VM exited` with `fault_count`. Compare a recording clone against a
+  replaying one; `--uffd-prefetch off` (or `FCVM_UFFD_PREFETCH=off`) gives an inert baseline
+  arm — no recording, no replay, no files.
+- **The trade is latency for eagerness, not for total memory.** A replaying clone materialises
+  its working set at restore instead of over the first ~750 ms, so a clone that lives a full
+  life ends up at the same footprint, just sooner; a clone that is created and destroyed
+  immediately pays for pages it would not have reached. Density claims above (idle clones cost
+  only what they faulted) still hold per page — replay changes WHEN, not WHAT. Turn it off for
+  workloads that spawn many clones which never run.
+
+**End of clone (`CloneExit`)**: a userfaultfd reports nothing when the process that created it
+dies — measured on this kernel, `poll` returns 0/revents=0 forever, `read` returns EAGAIN, and
+only `UFFDIO_COPY` reveals it with `ESRCH` — because the server holds its own reference so
+`userfaultfd_release` never runs. The server therefore takes `SO_PEERCRED` on the handshake
+socket and watches the connecting Firecracker with a `pidfd`. That is what ends a handler (and
+what lets the working set be recorded); before it, `VM exited` had never once been logged and
+every finished clone pinned its task and uffd until the server stopped.
+
 ### FUSE Parallelism (fuse-pipe)
 
 **Kernel clone fd model (`FUSE_DEV_IOC_CLONE`):**
