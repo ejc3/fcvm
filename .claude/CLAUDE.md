@@ -1534,7 +1534,9 @@ early burst misses most of the set.
   image as `memory.bin.working-set` (exclusive `flock` + atomic rename).
 - **Replay**: at handshake — before Firecracker finishes loading, so before any
   vCPU runs — the union's contiguous runs are bulk-populated with one
-  `UFFDIO_COPY` (or `UFFDIO_CONTINUE` in MINOR mode) per run.
+  `UFFDIO_COPY` (or `UFFDIO_CONTINUE` in MINOR mode) per 2 MiB chunk instead of
+  one per page. Chunks are bounded because the handler cannot drain a demand
+  fault while it is inside the ioctl.
 - **Key**: SHA-256 of the image's `(len, mtime, ino, dev)`. Rewriting a snapshot
   writes a new file, so the stale set is dropped.
 - **A wrong set cannot corrupt a guest.** It only says WHICH offsets to
