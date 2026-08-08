@@ -283,8 +283,9 @@ impl PeerVmm {
                 peer_pid = self.pid,
                 reason = %reason,
                 "KILLED the clone's VMM: its guest memory can no longer be served, and a \
-                 surviving VMM would run on zero-filled pages (silent corruption). The clone \
-                 is now dead and its `fcvm snapshot run` exits non-zero."
+                 surviving VMM would freeze on unserved faults (Firecracker holds its own \
+                 uffd reference, so the guest wedges rather than receiving zero pages). \
+                 The clone is now dead and its `fcvm snapshot run` exits non-zero."
             );
             return true;
         }
@@ -645,9 +646,9 @@ impl UffdServer {
 
         // Stop accepting new connections, but keep serving page faults for VMs that are
         // already connected until each one closes its uffd (i.e. its Firecracker exits).
-        // Aborting the handlers here would close the uffds while those VMs are still
-        // running, and the kernel would then resolve their page faults with zero pages
-        // instead of snapshot contents — silent guest memory corruption.
+        // Aborting the handlers here would drop the server's uffd while those VMs are still
+        // running — Firecracker holds its own reference, so the guest freezes on the next
+        // unserved fault rather than receiving zero pages (a silent, permanent wedge).
         drop(listener);
         if !vm_tasks.is_empty() {
             info!(
@@ -680,10 +681,10 @@ impl Drop for UffdServer {
 /// Serve one admitted clone, and KILL its VMM if serving fails at any point.
 ///
 /// This is the whole fail-closed contract in one place. Before it, a handler error was only
-/// logged: the clone's userfaultfd closed with the guest still running, the kernel began
-/// resolving that guest's faults with zero pages, and the only trace was a log line asking a
-/// human to "kill the affected clone". A request service cannot depend on someone reading a
-/// log — the corrupted guest happily answers requests with garbage. Now the failure is
+/// logged: the clone's userfaultfd was abandoned with the guest still running. Firecracker
+/// holds its own reference to the uffd, so the guest does not receive zero pages — it
+/// FREEZES, with every unserved fault waiting forever and no error reported anywhere. The
+/// only trace was a log line asking a human to "kill the affected clone". Now the failure is
 /// converted into the one state a caller cannot miss: a dead VMM, which makes the clone's
 /// `fcvm snapshot run` exit non-zero (see `vmm_exit_failure` in `commands/snapshot.rs`).
 async fn serve_clone_fail_closed(
@@ -720,8 +721,9 @@ async fn serve_clone_fail_closed(
 /// have the same remedy: the handshake can fail with the clone's userfaultfd already in
 /// flight (COPY mode sends the fd and the mappings in ONE message, so a malformed message
 /// means we hold an fd we cannot use), and the fault handler can fail after serving for
-/// hours. In both cases the uffd ends up closed while the guest is alive, which the kernel
-/// turns into zero-filled pages.
+/// hours. In both cases the server's ability to resolve faults is gone while the guest is
+/// alive — Firecracker holds its own uffd reference, so the guest freezes on unserved
+/// faults rather than receiving zero pages.
 async fn serve_clone(vm_id: &str, stream: UnixStream, source: Arc<PageSource>) -> Result<()> {
     let (uffd, mappings) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(stream, &source))
         .await
@@ -2210,8 +2212,8 @@ mod tests {
                     let _ = victim.wait();
                     panic!(
                         "the clone's VMM is STILL RUNNING after its UFFD service failed — \
-                         it would keep executing on zero-filled guest memory (the exact \
-                         silent corruption this fail-closed path exists to prevent)"
+                         it would freeze on unserved faults (Firecracker holds its own uffd \
+                         reference, so the guest wedges rather than receiving zero pages)"
                     );
                 }
                 None => tokio::time::sleep(Duration::from_millis(10)).await,
@@ -2302,7 +2304,8 @@ mod tests {
 
     /// The headline regression: when the page-fault handler fails, the clone's VMM is
     /// KILLED. Before this, the handler merely logged that the VM "should be killed" and
-    /// left it running on zero-filled memory.
+    /// left it frozen on unserved faults (Firecracker holds its own uffd reference, so the
+    /// guest wedges rather than receiving zero pages).
     ///
     /// The failure injected is a real one from `drain_events`: a fault at an address the
     /// handshake's mappings do not cover, which is unresolvable by construction.

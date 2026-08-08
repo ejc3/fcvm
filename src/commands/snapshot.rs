@@ -467,9 +467,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // First Ctrl-C warns about clones, second one shuts down
     //
     // Shutdown ordering matters: clones are stopped BEFORE the UFFD server is cancelled
-    // (see the cleanup below). Cancelling the server first would close the clones'
-    // userfaultfds while they are still running, and the kernel would then resolve their
-    // page faults with zero pages instead of snapshot contents — silent memory corruption.
+    // (see the cleanup below). Cancelling the server first would drop the server's uffd
+    // references while the clones are still running — Firecracker holds its own reference,
+    // so the guests freeze on unserved faults rather than receiving zero pages (a silent,
+    // permanent wedge).
     let mut shutdown_requested = false;
     let mut confirm_deadline: Option<tokio::time::Instant> = None;
     let mut server_exited = false;
@@ -538,12 +539,13 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
     // Cleanup ordering: stop clones FIRST, then the UFFD server.
     //
-    // The per-VM page-fault handlers own the clones' userfaultfds. Cancelling the server
-    // before the clones have exited closes those uffds while the clones are still running,
-    // and the kernel then resolves their outstanding/future faults with zero pages instead
-    // of snapshot contents — silent guest memory corruption that can be flushed to host
-    // volumes. So: signal the clones, wait for them to exit (SIGKILL stragglers after a
-    // bounded timeout), and only then cancel the server and remove the socket/state.
+    // The per-VM page-fault handlers own the server's side of each clone's userfaultfd.
+    // Cancelling the server before the clones have exited drops those references while the
+    // clones are still running — Firecracker holds its own reference, so the guests freeze
+    // on unserved faults rather than receiving zero pages (a silent, permanent wedge that
+    // holds memory, ports and disks indefinitely). So: signal the clones, wait for them to
+    // exit (SIGKILL stragglers after a bounded timeout), and only then cancel the server
+    // and remove the socket/state.
     info!("cleaning up clones connected to serve PID {}", my_pid);
     let my_clones: Vec<crate::state::VmState> = match state_manager.list_vms().await {
         Ok(all_vms) => all_vms
@@ -2189,9 +2191,10 @@ fn vmm_exit_failure(status: &Result<std::process::ExitStatus>) -> Option<String>
         return Some(format!(
             "its VMM was killed by signal {signal} without fcvm asking it to stop. If this \
              clone was restored from a memory server, that server kills clones whose page \
-             faults it can no longer serve — a clone left running would read zero-filled \
-             pages where guest memory should be. Check the serve process log for the \
-             matching 'KILLED the clone's VMM' line."
+             faults it can no longer serve — a clone left running would freeze on unserved \
+             faults (Firecracker holds its own uffd reference, so the guest wedges rather \
+             than receiving zero pages). Check the serve process log for the matching \
+             'KILLED the clone's VMM' line."
         ));
     }
     // NOT a failure classifier for the exit CODE. Firecracker's exit status does not
