@@ -55,6 +55,76 @@ def pss_kb_of_pid(pid):
     return 0
 
 
+# --- matched-basis memory accounting -------------------------------------
+# The first run's density claim was refuted because the fcvm side summed PSS
+# over firecracker processes ONLY while the container side measured a whole
+# cgroup. Everything below measures both sides through the SAME two bases:
+#   cgroup  memory.current of the cgroup that contains the entire process set
+#   pss     PSS summed over exactly that cgroup's process set
+# plus a machine-level MemAvailable delta recorded by the caller.
+
+def cgroup_bytes(cg_path):
+    """memory.current of one cgroup (bytes), or None if unreadable."""
+    try:
+        with open(os.path.join(cg_path, "memory.current")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def cgroup_procs(cg_path):
+    try:
+        with open(os.path.join(cg_path, "cgroup.procs")) as f:
+            return [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def cgroup_stat(cg_path):
+    out = {}
+    try:
+        with open(os.path.join(cg_path, "memory.stat")) as f:
+            for line in f:
+                k, _, v = line.partition(" ")
+                try:
+                    out[k] = int(v)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def measure_cgroup_set(root, prefix):
+    """Sum both bases over every leaf cgroup under `root` whose name starts
+    with `prefix`. Returns (n_leaves, cgroup_bytes, pss_kb, n_procs, stat_sums)."""
+    n = tot_cg = tot_pss = tot_procs = 0
+    stat_sums = {"anon": 0, "file": 0, "kernel": 0, "sock": 0}
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return 0, 0, 0, 0, stat_sums
+    for name in entries:
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        procs = cgroup_procs(path)
+        if not procs:
+            continue  # leaf with no live process contributes nothing
+        cb = cgroup_bytes(path)
+        n += 1
+        tot_procs += len(procs)
+        if cb is not None:
+            tot_cg += cb
+        tot_pss += sum(pss_kb_of_pid(p) for p in procs)
+        st = cgroup_stat(path)
+        for k in stat_sums:
+            stat_sums[k] += st.get(k, 0)
+    return n, tot_cg, tot_pss, tot_procs, stat_sums
+
+
 def firecracker_pids_for_vm_ids(vm_ids):
     """Map vm_id -> firecracker pid by the --api-sock path in the cmdline."""
     out = {}
@@ -77,23 +147,42 @@ def firecracker_pids_for_vm_ids(vm_ids):
 def cmd_sample(args):
     rec = {"ts": time.time()}
     mi = read_meminfo()
+    # machine-level basis (independent of any per-process attribution)
     rec["mem_available_kb"] = mi.get("MemAvailable", 0)
+    rec["mem_free_kb"] = mi.get("MemFree", 0)
     rec["cached_kb"] = mi.get("Cached", 0)
+    rec["shmem_kb"] = mi.get("Shmem", 0)
     rec["hugepages_free"] = mi.get("HugePages_Free", 0)
+    rec["hugepages_total"] = mi.get("HugePages_Total", 0)
+
+    # --- fcvm clones: EVERY process of each clone, via its own cgroup --------
+    if args.cgroup_root and args.cgroup_prefix:
+        n, cg, pss, nproc, st = measure_cgroup_set(args.cgroup_root, args.cgroup_prefix)
+        rec["clones"] = n
+        rec["clone_procs"] = nproc
+        rec["clone_cgroup_kb"] = cg // 1024
+        rec["clone_pss_kb"] = pss
+        rec["clone_anon_kb"] = st["anon"] // 1024
+        rec["clone_file_kb"] = st["file"] // 1024
+        rec["basis"] = "cgroup+pss over full per-clone process set"
+
+    # legacy firecracker-only PSS, kept ONLY as the refuted comparator so the
+    # report can show how large the basis error was. Never the headline number.
     if args.state_dir and args.name_prefix:
         vm_ids = []
         for f in glob.glob(os.path.join(args.state_dir, "*.json")):
             try:
-                st = json.load(open(f))
+                st_json = json.load(open(f))
             except (OSError, json.JSONDecodeError):
                 continue
-            if (st.get("name") or "").startswith(args.name_prefix):
-                vm_ids.append(st.get("vm_id"))
+            if (st_json.get("name") or "").startswith(args.name_prefix):
+                vm_ids.append(st_json.get("vm_id"))
         fps = firecracker_pids_for_vm_ids([v for v in vm_ids if v])
-        pss = {vid: pss_kb_of_pid(p) for vid, p in fps.items()}
-        rec["clones"] = len(vm_ids)
+        rec.setdefault("clones", len(vm_ids))
         rec["fc_procs"] = len(fps)
-        rec["pss_kb"] = sum(pss.values())
+        rec["fc_only_pss_kb"] = sum(pss_kb_of_pid(p) for p in fps.values())
+
+    # --- host-native container pool: the SAME two bases ----------------------
     if args.podman_prefix:
         import subprocess
         try:
@@ -103,18 +192,26 @@ def cmd_sample(args):
         except Exception:
             names = []
         names = [n for n in names if n.startswith(args.podman_prefix)]
-        total = 0
+        tot_pss = tot_cg = tot_procs = 0
         for n in names:
             try:
                 cg = subprocess.run(
                     ["podman", "inspect", "--format", "{{.State.CgroupPath}}", n],
                     capture_output=True, text=True, timeout=20).stdout.strip()
-                procs = open(f"/sys/fs/cgroup{cg}/cgroup.procs").read().split()
             except Exception:
-                procs = []
-            total += sum(pss_kb_of_pid(p) for p in procs)
+                continue
+            path = "/sys/fs/cgroup" + cg
+            procs = cgroup_procs(path)
+            tot_procs += len(procs)
+            tot_pss += sum(pss_kb_of_pid(p) for p in procs)
+            cb = cgroup_bytes(path)
+            if cb is not None:
+                tot_cg += cb
         rec["pool_containers"] = len(names)
-        rec["pool_pss_kb"] = total
+        rec["pool_procs"] = tot_procs
+        rec["pool_pss_kb"] = tot_pss
+        rec["pool_cgroup_kb"] = tot_cg // 1024
+
     if args.extra:
         rec.update(json.loads("{" + args.extra + "}"))
     print(json.dumps(rec))
@@ -131,7 +228,11 @@ def parse_request_log(path):
     rec = {"file": base}
     if len(parts) == 5:
         rec.update(dict(zip(["phase", "mode", "arm", "url"], parts[:4])))
-        rec["rep"] = int(parts[4].lstrip("r")) if parts[4].lstrip("r").isdigit() else 0
+        # rN (matrix) or rNiM (fan-out: rep N, clone M inside that burst — the
+        # burst is the experimental unit, the clone index is a pseudoreplicate)
+        mrep = re.match(r"^r(\d+)(?:i(\d+))?$", parts[4])
+        rec["rep"] = int(mrep.group(1)) if mrep else 0
+        rec["clone_idx"] = int(mrep.group(2)) if mrep and mrep.group(2) else 0
     t = {}
     for line in open(path, errors="replace"):
         m = re.match(r"^([\d.]+) (.*)$", line.rstrip("\n"))
@@ -139,11 +240,45 @@ def parse_request_log(path):
             continue
         ts, text = float(m.group(1)), m.group(2)
         t.setdefault("t0", ts)
+        # Proof that debug logging was on for this request. The exec client only
+        # logs its retry summary when attempt > 1, so "debug on and no retry
+        # line" means exactly one attempt and zero retry sleep — recording that
+        # explicitly is what makes the exec stage fully attributable instead of
+        # silently missing. This MUST stay outside the elif chain below: as a
+        # branch of it, it matched the ACK/GO handshake lines first (they are
+        # themselves fcvm::commands::exec DEBUG lines) and swallowed them, which
+        # left exec_handshake_ms/exec_spawn_ms permanently None.
+        if "DEBUG fcvm::commands::exec" in text:
+            rec["exec_debug_seen"] = True
         # NOTE: markers must be anchored at line start — fcvm's "executing
         # command in clone: ..." info line echoes the whole driver source,
         # which contains the marker strings inside print(...) calls.
-        if text.startswith("BENCH_T0"):
+        if text.startswith("BENCH_SCHED"):
+            # when the scheduler picked this cell — the drift regressor
+            t["t_sched"] = ts
+            mm = re.search(r"cgroup=(\S+)", text)
+            if mm:
+                rec["cgroup"] = mm.group(1)
+        elif text.startswith("BENCH_T0"):
             t["t0"] = ts
+        elif text.startswith("BENCH_HOLD_START"):
+            t["t_hold"] = ts
+            for k, v in KV_RE.findall(text):
+                if k == "hold_s":
+                    rec["hold_s"] = float(v)
+        elif text.startswith("CHROME_MEM "):
+            for k, v in KV_RE.findall(text):
+                rec["chrome_" + k] = float(v)
+        elif "connected to exec server after retries" in text:
+            # defect 4: the exec client's own retry ladder, so waiting inside
+            # fcvm's polling is attributable and never mistaken for guest latency
+            for k, v in KV_RE.findall(text):
+                if k in ("attempts", "retry_wait_ms"):
+                    rec["exec_" + k] = float(v)
+        elif "exec handshake: ACK received" in text:
+            t["t_ack"] = ts
+        elif "exec handshake: GO sent" in text:
+            t["t_go"] = ts
         elif "cloned from snapshot" in text:
             t["t_restored"] = ts
             rec["restore_mode"] = "direct" if "direct mode" in text else "uffd"
@@ -163,6 +298,9 @@ def parse_request_log(path):
                 if k in ("connect_ms", "navigate_ms", "idle_ms", "screenshot_ms",
                          "dom_ms", "total_ms", "png_bytes", "dom_bytes"):
                     rec["r_" + k] = float(v)
+            mf = re.search(r"shot_fmt=(\w+)", text)
+            if mf:
+                rec["shot_fmt"] = mf.group(1)
             rec["render_ok"] = True
         elif text.startswith("RENDER_FAIL"):
             rec["render_ok"] = False
@@ -179,7 +317,17 @@ def parse_request_log(path):
         if a in t and b in t:
             return round((t[a] - t[b]) * 1000, 1)
         return None
+    if rec.get("exec_debug_seen"):
+        rec.setdefault("exec_attempts", 1.0)
+        rec.setdefault("exec_retry_wait_ms", 0.0)
+    rec["sched_ts"] = t.get("t_sched") or t.get("t0")
+    rec["t0_ts"] = t.get("t0")
     rec["restore_ms"] = delta("t_restored", "t0")
+    # exec_up splits into fcvm's own handshake (restore -> GO sent) and the
+    # guest-side cost of actually starting the command (GO -> first output).
+    # Without that split the whole gap is unattributable, which is defect 4.
+    rec["exec_handshake_ms"] = delta("t_go", "t_restored")
+    rec["exec_spawn_ms"] = delta("t_exec", "t_go")
     rec["exec_up_ms"] = delta("t_exec", "t_restored")
     rec["first_output_ms"] = delta("t_exec", "t0")
     rec["net_ready_host_ms"] = delta("t_net", "t_exec")
@@ -187,6 +335,11 @@ def parse_request_log(path):
     rec["artifact_ms"] = delta("t_render", "t0")
     rec["destroy_ms"] = delta("t_exit", "t_render")
     rec["total_ms"] = delta("t_exit", "t0")
+    # Density cells deliberately idle after the render so memory can be sampled
+    # at a steady concurrency. Their artifact_ms is still a real per-request
+    # number, but destroy_ms/total_ms carry the hold and must not enter latency
+    # statistics — flag them rather than silently averaging them in.
+    rec["held"] = rec.get("hold_s", 0) > 0
     rec["ok"] = bool(rec.get("render_ok")) and rec.get("rc", 1) == 0
     return rec
 
@@ -539,6 +692,8 @@ def main():
     s.add_argument("--state-dir")
     s.add_argument("--name-prefix")
     s.add_argument("--podman-prefix")
+    s.add_argument("--cgroup-root", help="directory holding one leaf cgroup per clone")
+    s.add_argument("--cgroup-prefix", default="req-", help="leaf cgroup name prefix")
     s.add_argument("--extra", help='extra JSON fields, e.g. "cell":"uffd-4k","rate":2')
     s.set_defaults(func=cmd_sample)
     f = sub.add_parser("finalize")
