@@ -1,4 +1,4 @@
-//! The runner AMI's cache key must cover everything baked into the AMI.
+//! The runner AMI's cache key must change when the host kernel's inputs change.
 //!
 //! `scripts/build-ami.sh` skips the (expensive) rebuild when an AMI already
 //! exists tagged with the same `compute_hash`. Anything the host kernel is built
@@ -14,94 +14,187 @@
 //! `nv2-vsock-rx-barrier.patch`, the DSB cache-coherency patches AGENTS.md
 //! documents as required for NV2 correctness. `kernel_version` was not read
 //! either, so a pure version bump changed nothing the cache key could see.
+//!
+//! These tests EXECUTE the real `compute_hash` against a fixture tree and assert
+//! that mutating each input moves the hash. An earlier version scanned the
+//! function's source text for the strings `patches-arm64` and `kernel_version` —
+//! which the explanatory COMMENTS also contain, so deleting the code and keeping
+//! the comments left it green. A check satisfiable by a comment about the check
+//! is exactly the failure mode this file exists to prevent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn build_ami_sh() -> String {
-    let p = repo_root().join("scripts/build-ami.sh");
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
-}
+/// Extract `compute_hash()` verbatim from the real script and run it against a
+/// fixture tree. `create_user_data` (its only helper call) is stubbed so this
+/// exercises the kernel-input behaviour in isolation.
+fn run_compute_hash(fixture: &Path) -> String {
+    let script = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh"))
+        .expect("read scripts/build-ami.sh");
 
-/// Return the `compute_hash()` function body, so assertions cannot be satisfied
-/// by an unrelated mention of a path elsewhere in the script.
-fn compute_hash_body(script: &str) -> String {
     let start = script
         .find("compute_hash()")
         .expect("build-ami.sh has no compute_hash() — cannot evaluate the cache key");
     let rest = &script[start..];
     let end = rest
         .find("\n}\n")
-        .expect("compute_hash() has no closing brace");
-    rest[..end].to_string()
-}
+        .expect("compute_hash() has no closing brace")
+        + 2;
+    let func = &rest[..end];
 
-fn host_kernel_table() -> toml::Value {
-    let p = repo_root().join("rootfs-config.toml");
-    let text =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    let cfg: toml::Value = text.parse().expect("rootfs-config.toml is not valid TOML");
-    cfg.get("kernel_profiles")
-        .and_then(|v| v.get("nested"))
-        .and_then(|v| v.get("arm64"))
-        .and_then(|v| v.get("host_kernel"))
-        .cloned()
-        .expect("rootfs-config.toml has no [kernel_profiles.nested.arm64.host_kernel]")
-}
-
-/// Every `build_inputs` glob of the host kernel must be read by `compute_hash`.
-#[test]
-fn ami_hash_covers_every_host_kernel_build_input() {
-    let body = compute_hash_body(&build_ami_sh());
-    let host = host_kernel_table();
-
-    let inputs = host
-        .get("build_inputs")
-        .and_then(|v| v.as_array())
-        .expect("host_kernel has no build_inputs array");
-    assert!(
-        !inputs.is_empty(),
-        "host_kernel.build_inputs is empty — nothing to check, which means this test \
-         would pass no matter what compute_hash reads"
+    let program = format!(
+        "set -u\n\
+         KERNEL_DIR={fx}/kernel\n\
+         SCRIPT_DIR={fx}/scripts\n\
+         create_user_data() {{ printf 'stub-user-data'; }}\n\
+         {func}\n\
+         compute_hash\n",
+        fx = fixture.display(),
+        func = func
     );
 
-    for input in inputs {
-        let pattern = input
-            .as_str()
-            .expect("a build_inputs entry is not a string");
-        // Compare on the directory: the script iterates a glob, so the literal
-        // pattern string need not appear, but the directory must.
-        let dir = pattern
-            .rsplit_once('/')
-            .map(|(d, _)| d)
-            .unwrap_or(pattern)
-            .trim_start_matches("kernel/");
-        assert!(
-            body.contains(dir),
-            "the host kernel is built from `{pattern}`, but compute_hash() in \
-             scripts/build-ami.sh never reads `{dir}`. A change there would leave the AMI \
-             hash identical, so the builder reuses an image carrying the OLD host kernel. \
-             compute_hash body:\n{body}"
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(&program)
+        .output()
+        .expect("run bash");
+    assert!(
+        out.status.success(),
+        "compute_hash failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !hash.is_empty(),
+        "compute_hash produced no output — every comparison below would be vacuously equal"
+    );
+    hash
+}
+
+/// Build a minimal tree with the layout `compute_hash` reads.
+fn make_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let w = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+
+    w("kernel/nested.conf", "CONFIG_KVM=y\n");
+    w("kernel/patches/0001-fuse.patch", "fuse patch v1\n");
+    // The host kernel's real patch set, including the arm64-only files that were
+    // invisible to the old hash.
+    w("kernel/patches-arm64/0001-fuse.patch", "fuse patch v1\n");
+    w(
+        "kernel/patches-arm64/nv2-vsock-cache-sync.patch",
+        "dsb sy\n",
+    );
+    w(
+        "kernel/patches-arm64/nv2-vsock-rx-barrier.patch",
+        "dsb sy rx\n",
+    );
+    w("kernel/patches-arm64/wfx-stopped-exit.patch", "wfx\n");
+    // Guest-only; must NOT affect the host kernel's hash.
+    w(
+        "kernel/patches-arm64/mmfr4-override.vm.patch",
+        "guest only\n",
+    );
+    w(
+        "rootfs-config.toml",
+        "boot_args = \"kvm-arm.mode=nested\"\nkernel_version = \"6.18.3\"\n",
+    );
+    w("scripts/build-passt.sh", "#!/bin/sh\n");
+    w("scripts/passt-0001.patch", "passt\n");
+    w("scripts/runner-disk-preflight.sh", "#!/bin/sh\n");
+    w("scripts/runner-disk-guard.service", "[Unit]\n");
+    w("scripts/runner-disk-guard.timer", "[Timer]\n");
+    dir
+}
+
+/// Same inputs must give the same hash — otherwise "it changed" proves nothing.
+#[test]
+fn ami_hash_is_stable_for_identical_inputs() {
+    let fx = make_fixture();
+    let a = run_compute_hash(fx.path());
+    let b = run_compute_hash(fx.path());
+    assert_eq!(
+        a, b,
+        "compute_hash is not deterministic, so every mutation test below would pass for the \
+         wrong reason (a hash that changes for everything gates nothing)"
+    );
+}
+
+/// Mutating any host-kernel patch must move the hash.
+#[test]
+fn ami_hash_changes_when_a_host_kernel_patch_changes() {
+    let fx = make_fixture();
+    let base = run_compute_hash(fx.path());
+
+    // The seven arm64-only patches were the ones the old hash could not see.
+    for patch in [
+        "nv2-vsock-cache-sync.patch",
+        "nv2-vsock-rx-barrier.patch",
+        "wfx-stopped-exit.patch",
+    ] {
+        let p = fx.path().join("kernel/patches-arm64").join(patch);
+        let original = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, format!("{original}MUTATED\n")).unwrap();
+        let mutated = run_compute_hash(fx.path());
+        std::fs::write(&p, &original).unwrap();
+
+        assert_ne!(
+            base, mutated,
+            "editing kernel/patches-arm64/{patch} left the AMI hash at {base}. That patch is \
+             built into the host kernel, so build-ami.sh would find a 'matching' AMI and reuse \
+             an image carrying the OLD kernel. For the two nv2-vsock-* patches that means \
+             shipping a host kernel without the DSB cache-coherency fix."
         );
     }
 }
 
-/// The kernel version is part of the baked kernel's identity.
+/// Bumping the host kernel version must move the hash.
 #[test]
-fn ami_hash_covers_host_kernel_version() {
-    let body = compute_hash_body(&build_ami_sh());
-    let host = host_kernel_table();
-    host.get("kernel_version")
-        .and_then(|v| v.as_str())
-        .expect("host_kernel has no kernel_version");
+fn ami_hash_changes_when_kernel_version_changes() {
+    let fx = make_fixture();
+    let base = run_compute_hash(fx.path());
 
-    assert!(
-        body.contains("kernel_version"),
-        "compute_hash() never reads `kernel_version`, so bumping the host kernel version \
-         alone leaves the AMI cache key unchanged and the builder reuses an AMI built from \
-         the previous version. compute_hash body:\n{body}"
+    let cfg = fx.path().join("rootfs-config.toml");
+    let original = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, original.replace("6.18.3", "7.0.14")).unwrap();
+    let mutated = run_compute_hash(fx.path());
+    std::fs::write(&cfg, &original).unwrap();
+
+    assert_ne!(
+        base, mutated,
+        "bumping kernel_version left the AMI hash at {base}, so a version bump alone reuses an \
+         AMI built from the previous kernel version"
+    );
+}
+
+/// A guest-only `.vm.patch` must NOT move the host hash — otherwise the hash
+/// churns on changes that cannot affect the baked host kernel, and "it changed"
+/// stops meaning anything.
+#[test]
+fn ami_hash_ignores_guest_only_vm_patches() {
+    let fx = make_fixture();
+    let base = run_compute_hash(fx.path());
+
+    let p = fx
+        .path()
+        .join("kernel/patches-arm64/mmfr4-override.vm.patch");
+    let original = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, format!("{original}MUTATED\n")).unwrap();
+    let mutated = run_compute_hash(fx.path());
+    std::fs::write(&p, &original).unwrap();
+
+    assert_eq!(
+        base, mutated,
+        "a *.vm.patch is applied only to the GUEST kernel (see compute_host_kernel_sha in \
+         src/setup/kernel.rs, which excludes them), so it must not invalidate the host AMI"
     );
 }
