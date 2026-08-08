@@ -397,6 +397,7 @@ impl FirecrackerConfig {
                     "http_proxy": runtime.http_proxy,
                     "https_proxy": runtime.https_proxy,
                     "no_proxy": runtime.no_proxy,
+                    "ntp_servers": runtime.ntp_servers,
                 },
                 "host-time": runtime.host_time,
             }
@@ -427,6 +428,12 @@ pub struct MmdsRuntime {
     pub subuid_count: Option<u64>,
     /// Host timestamp (UTC epoch seconds)
     pub host_time: String,
+    /// The host's NTP servers, already resolved to addresses, for the guest's chronyd.
+    ///
+    /// Resolved host-side for the same reason proxies are: the guest configures them
+    /// through `chronyc add server`, which takes an address, and shipping addresses
+    /// means the guest needs no DNS of its own to end up with real sources.
+    pub ntp_servers: Vec<String>,
 }
 
 #[cfg(test)]
