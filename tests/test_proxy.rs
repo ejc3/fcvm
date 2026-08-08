@@ -356,22 +356,22 @@ async fn test_no_proxy() -> Result<()> {
     // fcvm passes it to MMDS, fc-agent writes it to /etc/fcvm-proxy.env,
     // and exec reads it back for container commands.
     let fcvm_path = common::find_fcvm_binary()?;
-    let child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "rootless",
-            "--no-snapshot",
-            common::TEST_IMAGE,
-        ])
-        .env("NO_PROXY", "thefacebook.com,localhost,10.0.2.2")
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ])
+    .env("NO_PROXY", "thefacebook.com,localhost,10.0.2.2")
+    .stdout(std::process::Stdio::inherit())
+    .stderr(std::process::Stdio::inherit());
+    common::set_test_pdeathsig(&mut cmd);
+    let child = cmd.spawn().context("spawning fcvm")?;
 
     let pid = child.id().expect("no pid");
 

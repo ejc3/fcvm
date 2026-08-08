@@ -142,6 +142,15 @@ endif
 export CARGO_TARGET_DIR := target
 NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
 
+# cargo/nextest target runner for the privileged suites. cargo-nextest stays unprivileged
+# and only the test binary is elevated, so the `sudo` hop sits in the middle of the process
+# tree — and a privilege boundary breaks parent->child teardown in BOTH directions: nextest
+# (uid 1000) cannot signal the uid-0 test binary at all, and `sudo` cannot forward the
+# SIGKILL that killed it. The elevated test binary is then orphaned-but-alive and its whole
+# microVM subtree with it. root-test-runner.sh restores the link with a kernel-enforced
+# PR_SET_PDEATHSIG; see that script's header for the measurements.
+ROOT_TEST_RUNNER := sudo -E env PATH=$(PATH) $(CURDIR)/scripts/root-test-runner.sh
+
 # Optional cargo cache directory (for CI caching)
 CARGO_CACHE_DIR ?=
 ifneq ($(CARGO_CACHE_DIR),)
@@ -396,8 +405,8 @@ _test-root:
 	fi
 	@RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --features privileged-tests $(IPV6_FILTER) $(CI_NESTED_FILTER) $(FILTER) || \
 	{ echo ""; \
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
@@ -433,8 +442,8 @@ _test-fc-mock:
 	@FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
 	RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$${FCVM_DATA_DIR:-$(ROOT_DATA_DIR)} \
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E '$(FC_MOCK_FILTER)' $(FILTER) || \
 	{ echo ""; \
 	  echo "TEST FAILED (fc-mock mode)"; \
@@ -607,22 +616,22 @@ bench-chromium: build
 
 bench: build
 	@echo "==> Running benchmarks..."
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	$(CARGO) bench -p fuse-pipe --bench throughput
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	$(CARGO) bench -p fuse-pipe --bench operations
 	$(CARGO) bench -p fuse-pipe --bench protocol
 
 # VM benchmarks (exec, clone) - require KVM, Firecracker, setup
 bench-vm: build setup-default
 	@echo "==> Running VM benchmarks..."
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	$(CARGO) bench --bench exec -- --test
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	$(CARGO) bench --bench clone -- --test
 
 # Hugepages benchmark: compare clone speed with 4KB vs 2MB pages

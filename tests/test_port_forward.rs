@@ -35,22 +35,22 @@ fn test_port_forward_bridged() -> Result<()> {
 
     // Start VM with port forwarding
     // Use --health-check to wait for nginx to be ready (not just container running)
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "bridged",
-            "--publish",
-            "8080:80",
-            "--health-check",
-            "http://localhost/",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--publish",
+        "8080:80",
+        "--health-check",
+        "http://localhost/",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
@@ -203,22 +203,22 @@ fn test_port_forward_rootless() -> Result<()> {
     // Start VM with rootless networking and port forwarding
     // Rootless uses unique loopback IPs (127.x.y.z) per VM
     // Use --health-check to wait for nginx to be ready (not just container running)
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "rootless",
-            "--publish",
-            &publish_arg,
-            "--health-check",
-            "http://localhost/",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--publish",
+        &publish_arg,
+        "--health-check",
+        "http://localhost/",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
@@ -337,22 +337,22 @@ fn test_port_forward_routed() -> Result<()> {
 
     // Start VM with routed networking and port forwarding
     // Routed uses TCP proxy + unique loopback IPs (like rootless)
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "routed",
-            "--publish",
-            &publish_arg,
-            "--health-check",
-            "http://localhost/",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "routed",
+        "--publish",
+        &publish_arg,
+        "--health-check",
+        "http://localhost/",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);

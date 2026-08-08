@@ -2328,7 +2328,8 @@ async fn boot_vm_for_setup(
         serial_path.display()
     );
     let firecracker_bin = setup_vm_firecracker_bin()?;
-    let mut fc_process = Command::new(&firecracker_bin)
+    let mut fc_cmd = Command::new(&firecracker_bin);
+    fc_cmd
         .args([
             "--api-sock",
             path_to_str(&api_socket)?,
@@ -2339,8 +2340,23 @@ async fn boot_vm_for_setup(
         ])
         .stdout(serial_file.try_clone().context("cloning serial file")?)
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("starting Firecracker")?;
+        // Several `?` between here and the wait loop below return without killing the VM.
+        // kill_on_drop closes those windows while fcvm is still alive; pdeathsig covers the
+        // case where fcvm itself dies without unwinding.
+        .kill_on_drop(true);
+    // The Layer 2 build boots a VM for MINUTES. Every other VMM spawn in fcvm goes
+    // through this helper for PR_SET_PDEATHSIG; this one did not, so a `fcvm setup`
+    // that died without running its cleanup (SIGKILL, a cancelled CI job) orphaned a
+    // live Firecracker to init. No namespaces here — the setup VM runs on the host
+    // network — so the helper installs only the parent-death hook.
+    crate::utils::install_namespace_pre_exec(
+        &mut fc_cmd,
+        &crate::utils::NamespaceParams {
+            vm_id: "layer2-setup".to_string(),
+            ..Default::default()
+        },
+    )?;
+    let mut fc_process = fc_cmd.spawn().context("starting Firecracker")?;
 
     // Wait for socket to be ready
     for _ in 0..50 {

@@ -20,13 +20,15 @@ async fn test_serve_create_run_destroy() {
     let port = 18090 + (std::process::id() % 1000) as u16;
     logger.info(&format!("Starting fcvm serve on port {}", port));
 
-    let mut serve_child = tokio::process::Command::new(&fcvm_path)
+    let mut serve_cmd = tokio::process::Command::new(&fcvm_path);
+    serve_cmd
         .args(["serve", "--port", &port.to_string()])
         .env("RUST_LOG", "info")
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("spawn fcvm serve");
+        .stderr(std::process::Stdio::inherit());
+    // `fcvm serve` owns every sandbox VM it creates, so orphaning it orphans all of them.
+    common::set_test_pdeathsig(&mut serve_cmd);
+    let mut serve_child = serve_cmd.spawn().expect("spawn fcvm serve");
 
     let serve_pid = serve_child.id().expect("serve process has PID");
     logger.info(&format!("fcvm serve started with PID {}", serve_pid));

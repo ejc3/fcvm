@@ -160,23 +160,23 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     // Start fcvm in background
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("signal-int");
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "bridged",
-            // One-shot test: boot, send a signal, verify cleanup. It never restores
-            // a snapshot, so skip the pre-start snapshot create (#618) — under
-            // SnapshotEnabled CI its ~1GB memory dump can exceed the health-wait
-            // budget when this VM is first-to-create under disk contention.
-            "--no-snapshot",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        // One-shot test: boot, send a signal, verify cleanup. It never restores
+        // a snapshot, so skip the pre-start snapshot create (#618) — under
+        // SnapshotEnabled CI its ~1GB memory dump can exceed the health-wait
+        // budget when this VM is first-to-create under disk contention.
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
@@ -297,23 +297,23 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     // Start fcvm in background
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("signal-term");
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "bridged",
-            // One-shot test: boot, send a signal, verify cleanup. It never restores
-            // a snapshot, so skip the pre-start snapshot create (#618) — under
-            // SnapshotEnabled CI its ~1GB memory dump can exceed the health-wait
-            // budget when this VM is first-to-create under disk contention.
-            "--no-snapshot",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        // One-shot test: boot, send a signal, verify cleanup. It never restores
+        // a snapshot, so skip the pre-start snapshot create (#618) — under
+        // SnapshotEnabled CI its ~1GB memory dump can exceed the health-wait
+        // budget when this VM is first-to-create under disk contention.
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
@@ -428,21 +428,21 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     // Start fcvm in rootless mode
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("cleanup-rootless");
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "rootless",
-            // One-shot test (boot, signal, verify cleanup); never restores a
-            // snapshot, so skip the pre-start snapshot create (#618).
-            "--no-snapshot",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        // One-shot test (boot, signal, verify cleanup); never restores a
+        // snapshot, so skip the pre-start snapshot create (#618).
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
@@ -569,21 +569,21 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
 
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("sigkill-rootless");
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "rootless",
-            // One-shot test (boot, signal, verify cleanup); never restores a
-            // snapshot, so skip the pre-start snapshot create (#618).
-            "--no-snapshot",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        // One-shot test (boot, signal, verify cleanup); never restores a
+        // snapshot, so skip the pre-start snapshot create (#618).
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
@@ -684,6 +684,217 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
 
     println!("test_sigkill_kills_firecracker_rootless PASSED");
     Ok(())
+}
+
+/// The `sudo` hop in the CI process tree must not break VM teardown.
+///
+/// `make test-root` runs cargo-nextest UNPRIVILEGED and elevates only the test binary, via
+/// `CARGO_TARGET_*_RUNNER='sudo -E env PATH=... scripts/root-test-runner.sh'`. The resulting
+/// tree is `nextest (uid 1000) -> sudo (ruid 1000) -> test binary (uid 0) -> fcvm -> firecracker`.
+/// When nextest's `slow-timeout.terminate-after` fires it signals the test's process group —
+/// but the kernel refuses uid 1000 -> uid 0 signals, so the ONLY member it can actually kill is
+/// the `sudo` front-end, and SIGKILL cannot be caught, so `sudo` never forwards it. Everything
+/// below `sudo` is orphaned to init and keeps running; because the test binary never dies, the
+/// PR_SET_PDEATHSIG chain beneath it (test binary -> fcvm -> firecracker) never fires either.
+/// A self-hosted runner accumulated ~490 live `firecracker` processes this way and wedged.
+///
+/// So this test reproduces that topology exactly — the real runner script, a real `sudo` hop, a
+/// real VM — and SIGKILLs ONLY the `sudo` front-end, the single process nextest can reach.
+/// Everything below it must be gone. Drop `setpriv --pdeathsig KILL` from the runner script and
+/// this test fails with fcvm reparented to init and its Firecracker still serving a live VM.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn test_root_test_runner_reaps_vm_when_sudo_is_killed() -> Result<()> {
+    println!("\ntest_root_test_runner_reaps_vm_when_sudo_is_killed");
+
+    // The SAME runner the Makefile installs as CARGO_TARGET_*_RUNNER — one source of truth.
+    let runner = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/root-test-runner.sh");
+    assert!(
+        std::path::Path::new(runner).is_file(),
+        "privileged test runner missing at {runner}"
+    );
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("sudo-hop");
+    let path_env = std::env::var("PATH").unwrap_or_default();
+
+    // Never Stdio::piped() without a consumer (pipe-buffer deadlock); a file keeps the VM's
+    // output for post-mortem.
+    std::fs::create_dir_all("/tmp/fcvm-test-logs").ok();
+    let log_path = format!("/tmp/fcvm-test-logs/{}.log", vm_name);
+    let log = std::fs::File::create(&log_path).context("creating VM log file")?;
+
+    // Reproduce the runner invocation verbatim: sudo -E env PATH=... <runner> <program> <args>.
+    let mut sudo = Command::new("sudo")
+        .args([
+            "-E",
+            "env",
+            &format!("PATH={}", path_env),
+            runner,
+            fcvm_path.to_str().context("fcvm path is not UTF-8")?,
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            // One-shot test (boot, signal, verify cleanup); never restores a snapshot,
+            // so skip the pre-start snapshot create (#618).
+            "--no-snapshot",
+            common::TEST_IMAGE,
+        ])
+        .stdout(log.try_clone().context("cloning log file")?)
+        .stderr(log)
+        .spawn()
+        .context("spawning sudo runner")?;
+
+    let sudo_pid = sudo.id();
+    println!("sudo front-end PID: {} (log: {})", sudo_pid, log_path);
+
+    // fcvm replaces the runner's own image (env -> sh -> setpriv -> fcvm all exec in place),
+    // so it is a descendant of sudo. Search by ancestry rather than assuming a direct child,
+    // which also covers the pty path where sudo interposes a monitor process.
+    let start = std::time::Instant::now();
+    let fcvm = loop {
+        if let Some(t) = find_descendant_by_comm(sudo_pid, "fcvm") {
+            break t;
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = sudo.kill();
+            anyhow::bail!(
+                "fcvm never appeared under the sudo runner (see {})",
+                log_path
+            );
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    };
+    println!("fcvm PID under sudo: {}", fcvm.pid);
+
+    // Wait for the VM to be fully up, so the kill lands on a real running microVM.
+    let start = std::time::Instant::now();
+    let mut healthy = false;
+    while start.elapsed() < Duration::from_secs(180) {
+        std::thread::sleep(common::POLL_INTERVAL);
+        let output = Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &fcvm.pid.to_string()])
+            .output()
+            .context("running fcvm ls")?;
+        if is_vm_healthy(&String::from_utf8_lossy(&output.stdout)) {
+            healthy = true;
+            println!("VM is healthy after {:?}", start.elapsed());
+            break;
+        }
+    }
+    if !healthy {
+        fcvm.kill_if_running();
+        let _ = sudo.kill();
+        let _ = sudo.wait();
+        anyhow::bail!("VM did not become healthy within 180s (see {})", log_path);
+    }
+
+    let fc = find_firecracker_for_fcvm(fcvm.pid);
+    assert!(
+        fc.is_some(),
+        "should have started a firecracker process under fcvm (PID {})",
+        fcvm.pid
+    );
+    let fc = fc.unwrap();
+    println!("firecracker PID: {}", fc.pid);
+
+    // Exactly what cargo-nextest can reach: the sudo front-end, and nothing else.
+    println!("SIGKILL to the sudo front-end (PID {}) only", sudo_pid);
+    send_signal(sudo_pid, "KILL").context("sending SIGKILL to sudo")?;
+    let _ = sudo.wait();
+
+    // PR_SET_PDEATHSIG chain: sudo dies -> kernel SIGKILLs fcvm -> kernel SIGKILLs firecracker.
+    // Each hop is one scheduler wakeup; 30s is orders of magnitude of headroom for a loaded runner.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if !fcvm.running() && !fc.running() {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
+    let fcvm_alive = fcvm.running();
+    let fc_alive = fc.running();
+
+    // Clean up before asserting so a failure of THIS test cannot itself leak a microVM.
+    if fcvm_alive {
+        fcvm.kill_if_running();
+    }
+    if fc_alive {
+        fc.kill_if_running();
+    }
+
+    assert!(
+        !fcvm_alive,
+        "fcvm (PID {}) survived the death of its sudo parent — the privileged test runner is \
+         not setting PR_SET_PDEATHSIG, so a nextest timeout kill orphans the whole VM tree",
+        fcvm.pid
+    );
+    assert!(
+        !fc_alive,
+        "firecracker (PID {}) survived the death of the sudo parent of its fcvm (PID {})",
+        fc.pid, fcvm.pid
+    );
+
+    println!("test_root_test_runner_reaps_vm_when_sudo_is_killed PASSED");
+    Ok(())
+}
+
+/// Find the SHALLOWEST live descendant of `root_pid` whose `comm` starts with `comm_prefix`,
+/// tracked by (pid, start_time) + pidfd so later liveness checks survive PID reuse and the
+/// post-kill zombie window.
+///
+/// Breadth-first on purpose: fcvm spawns its own short-lived `fcvm exec` health-check children,
+/// which have the same `comm`. A flat /proc scan could return one of those (and then "the
+/// process died" would mean nothing); the shallowest match is always the VM's own fcvm.
+#[cfg(feature = "privileged-tests")]
+fn find_descendant_by_comm(root_pid: u32, comm_prefix: &str) -> Option<Tracked> {
+    // One /proc pass -> pid -> ppid, so the walk sees a single consistent snapshot.
+    let mut parents: Vec<(u32, u32)> = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if let Some(ppid) = proc_ppid(pid) {
+            parents.push((pid, ppid));
+        }
+    }
+
+    let mut frontier = vec![root_pid];
+    for _ in 0..6 {
+        let children: Vec<u32> = parents
+            .iter()
+            .filter(|(_, ppid)| frontier.contains(ppid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        if children.is_empty() {
+            return None;
+        }
+        for pid in &children {
+            if proc_comm(*pid).is_some_and(|c| c.starts_with(comm_prefix)) {
+                if let Some(t) = capture_descendant(*pid, root_pid, comm_prefix) {
+                    return Some(t);
+                }
+            }
+        }
+        frontier = children;
+    }
+    None
+}
+
+/// Parent pid from `/proc/<pid>/stat` (field 4). `comm` (field 2) can contain spaces and
+/// parens, so parse the remainder after the last `") "`.
+#[cfg(feature = "privileged-tests")]
+fn proc_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 /// Find the firecracker process spawned by a specific fcvm process
@@ -856,23 +1067,23 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     // Start fcvm in bridged mode
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("cleanup-bridged");
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "bridged",
-            // One-shot test: boot, send a signal, verify cleanup. It never restores
-            // a snapshot, so skip the pre-start snapshot create (#618) — under
-            // SnapshotEnabled CI its ~1GB memory dump can exceed the health-wait
-            // budget when this VM is first-to-create under disk contention.
-            "--no-snapshot",
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        // One-shot test: boot, send a signal, verify cleanup. It never restores
+        // a snapshot, so skip the pre-start snapshot create (#618) — under
+        // SnapshotEnabled CI its ~1GB memory dump can exceed the health-wait
+        // budget when this VM is first-to-create under disk contention.
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
@@ -986,23 +1197,23 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
     let host_port = common::find_available_high_port().context("finding available port")?;
     let publish_arg = format!("{}:80", host_port);
 
-    let mut fcvm = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "routed",
-            // One-shot test (boot, signal, verify cleanup); never restores a
-            // snapshot, so skip the pre-start snapshot create (#618).
-            "--no-snapshot",
-            "--publish",
-            &publish_arg,
-            common::TEST_IMAGE,
-        ])
-        .spawn()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "routed",
+        // One-shot test (boot, signal, verify cleanup); never restores a
+        // snapshot, so skip the pre-start snapshot create (#618).
+        "--no-snapshot",
+        "--publish",
+        &publish_arg,
+        common::TEST_IMAGE,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
 
     let fcvm_pid = fcvm.id();
     println!("Started fcvm with PID: {}", fcvm_pid);
