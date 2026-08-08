@@ -41,6 +41,13 @@ const EXERCISED_MAX_CLONES_PER_SERVER: usize = 100;
 /// `fcvm snapshot serve` and split the clones across two failure domains.
 pub const DEFAULT_MAX_CLONES_PER_SERVER: usize = 256;
 
+// Lowering the default back under the fan-out fcvm actually supports is a BUILD error, not a
+// mystery stress-test failure two hours later. (Shipping 64 cost exactly that.)
+const _: () = assert!(
+    DEFAULT_MAX_CLONES_PER_SERVER > EXERCISED_MAX_CLONES_PER_SERVER,
+    "the default UFFD clone cap must exceed the per-server fan-out the stress tests restore"
+);
+
 /// How many uffd events one handler drains before yielding to the runtime.
 ///
 /// `drain_events` is a synchronous loop that owns its worker thread while it runs, and it
@@ -2291,20 +2298,6 @@ mod tests {
         assert_eq!(toucher.join().unwrap(), 0);
         unsafe { libc::munmap(guest, 4096) };
         drop(client);
-    }
-
-    /// The cap must never refuse a fan-out fcvm supports. Shipping 64 broke
-    /// `test_snapshot_clone_stress_100_bridged` — 100 clones on one serve process — with the
-    /// server killing clones 65..100 exactly as designed. The bound is a backstop against
-    /// unbounded growth, so it belongs comfortably above what the suite exercises.
-    #[test]
-    fn test_default_cap_clears_the_fan_out_the_suite_exercises() {
-        assert!(
-            DEFAULT_MAX_CLONES_PER_SERVER > EXERCISED_MAX_CLONES_PER_SERVER,
-            "default cap {DEFAULT_MAX_CLONES_PER_SERVER} would refuse the \
-             {EXERCISED_MAX_CLONES_PER_SERVER}-clone fan-out the stress tests restore from a \
-             single server"
-        );
     }
 
     #[test]
