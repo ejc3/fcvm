@@ -1198,7 +1198,9 @@ pub async fn kill_process(pid: u32) {
 
 /// Wait for a snapshot serve process to be ready by polling for its socket file.
 ///
-/// The serve process creates a socket at `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
+/// The serve process creates a socket named by `UffdServer::socket_path_for`, i.e.
+/// `<data_dir>/uffd-{snapshot}-{pid}-{pid_start_time}.sock` — the start time is what makes
+/// two servers for the same snapshot unable to collide. Derive it, never hand-format it.
 /// when it's ready to accept clone connections.
 ///
 /// # Arguments
@@ -1210,8 +1212,17 @@ pub async fn poll_serve_ready(
     serve_pid: u32,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    let socket_path =
-        fcvm::paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, serve_pid));
+    // Same derivation the clone uses: the serve socket is named after the serve process's
+    // (pid, start_time), so a reused PID can never point at the wrong server's socket.
+    let serve_start_time = fcvm::utils::process_start_time(serve_pid).ok_or_else(|| {
+        anyhow::anyhow!("serve process {serve_pid} has no /proc entry — it already exited")
+    })?;
+    let socket_path = fcvm::uffd::UffdServer::socket_path_for(
+        &fcvm::paths::data_dir(),
+        snapshot_name,
+        serve_pid,
+        serve_start_time,
+    );
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);

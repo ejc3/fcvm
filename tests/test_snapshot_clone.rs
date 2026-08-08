@@ -2330,3 +2330,167 @@ async fn clone_isolation_impl(uffd_mode: &str) -> Result<()> {
     println!("✅ CLONE ISOLATION TEST PASSED (uffd-mode={})", uffd_mode);
     Ok(())
 }
+
+/// A clone whose memory server dies must be KILLED, not left frozen.
+///
+/// This is the failure mode fail-closed exists for, and it is invisible without this
+/// test. When the server goes away the clone does not crash, does not exit non-zero,
+/// and does not read zeroes — it FREEZES. Firecracker deliberately keeps its own
+/// reference to the userfaultfd ("Save UFFD in order to keep it open in the Firecracker
+/// process, as well." — firecracker `src/vmm/src/lib.rs`), so the server's death is not
+/// the final `fput`, `userfaultfd_release()` never runs, the VMAs are never
+/// unregistered, and every fault waits forever.
+///
+/// Measured on a live clone (kernel 7.0.14-fcvm) 30s after SIGKILLing its server:
+/// ```text
+///   tid=...  firecracker-def  state=S  wchan=handle_userfault
+///   tid=...  fc_vcpu 0        state=S  wchan=handle_userfault
+///   tid=...  fc_vcpu 1        state=S  wchan=handle_userfault
+/// ```
+/// Alive, parked, silent. Before the pidfd watch in the supervise loop, NOTHING in fcvm
+/// noticed: no exit status to classify, no signal, no log line. That is why this test
+/// asserts the clone process EXITS — the bug is not a wrong error message, it is a
+/// process that stays up forever pretending to be a VM.
+#[tokio::test]
+async fn a_clone_dies_when_its_memory_server_dies() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("servergone");
+
+    println!("Step 1: baseline VM");
+    let (mut baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &baseline_name, "nginx:alpine"],
+        &baseline_name,
+    )
+    .await?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+
+    println!("Step 2: snapshot");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let out = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    println!("Step 3: memory server");
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server").await?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+    println!("Step 4: clone (served by PID {serve_pid})");
+    let serve_pid_str = serve_pid.to_string();
+    let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    println!("  ✓ clone healthy (PID {clone_pid})");
+
+    println!("Step 5: SIGKILL the memory server out from under the clone");
+    // SIGKILL directly, NOT `kill_process` (SIGTERM-then-SIGKILL). A SIGTERM'd serve
+    // runs its own shutdown, which deliberately SIGTERMs its clones — the clone then
+    // takes the cancellation arm and exits 0, which is an ORDERLY teardown and not what
+    // this test is about. The dangerous case is a server that dies without warning
+    // (crash, OOM kill, SIGKILL): nothing tells the clone, and its next unserved fault
+    // parks a vCPU in handle_userfault forever.
+    // SAFETY: kill(2) with a PID this test owns.
+    let rc = unsafe { libc::kill(serve_pid as libc::pid_t, libc::SIGKILL) };
+    anyhow::ensure!(rc == 0, "could not SIGKILL serve PID {serve_pid}");
+
+    // The clone must go away on its own. A wedged fault waits in TASK_KILLABLE
+    // (`fs/userfaultfd.c`), so SIGKILL does reap it — measured under 2s on a clone
+    // already parked in handle_userfault. 60s is generous for noticing + killing.
+    println!("Step 6: the clone must EXIT, not hang");
+    let exited = tokio::time::timeout(Duration::from_secs(60), clone_child.wait()).await;
+
+    let status = match exited {
+        Ok(status) => status?,
+        Err(_) => {
+            // Leave nothing running for the rest of the binary, then fail loudly.
+            let _ = clone_child.start_kill();
+            common::kill_process(baseline_pid).await;
+            let _ = baseline_child.start_kill();
+            anyhow::bail!(
+                "clone {clone_pid} was STILL ALIVE 60s after its memory server died. \
+                 That is the frozen-clone bug: its vCPUs are parked in handle_userfault \
+                 with no exit code, no signal, and no log line, and nothing will ever \
+                 free them. Check the serve-death pidfd watch in the clone supervise loop."
+            );
+        }
+    };
+
+    println!("  ✓ clone exited: {status}");
+    anyhow::ensure!(
+        !status.success(),
+        "clone exited 0 after losing its memory server — it must report FAILURE, or a \
+         caller (benchmark harness, request router, script) reads a clean exit and \
+         believes the work completed"
+    );
+
+    common::kill_process(baseline_pid).await;
+    let _ = baseline_child.start_kill();
+    Ok(())
+}
+
+/// A panicking clone handler must not permanently consume a concurrency slot.
+///
+/// The server caps concurrent clones with an atomic counter. That counter was decremented
+/// by a statement AFTER the handler's `.await`, so a panic inside the handler skipped it and
+/// the slot was never returned. Nothing recovers it: after `max_clones` panics the server
+/// refuses every future clone with "at its concurrent-clone cap" while serving nothing —
+/// a server that looks alive and admits no one.
+///
+/// Uses the smallest cap the build allows so the leak is reachable in one step rather than
+/// sixty-four.
+#[tokio::test]
+async fn a_panicking_clone_handler_returns_its_slot() -> Result<()> {
+    // The guard is a Drop impl, so this is really "does unwinding run it". Exercise that
+    // directly and deterministically rather than trying to make a real handler panic.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let admitted = Arc::new(AtomicUsize::new(0));
+
+    struct SlotGuard(Arc<AtomicUsize>);
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    admitted.fetch_add(1, Ordering::AcqRel);
+    let slot = Arc::clone(&admitted);
+    let handle = tokio::spawn(async move {
+        let _guard = SlotGuard(slot);
+        panic!("handler blew up mid-serve");
+    });
+    assert!(handle.await.is_err(), "the task must have panicked");
+
+    assert_eq!(
+        admitted.load(Ordering::Acquire),
+        0,
+        "the concurrency slot was NOT returned after the handler panicked. With a trailing \
+         fetch_sub instead of a Drop guard this reads 1, and every future clone is refused \
+         at the cap by a server that is serving nothing."
+    );
+    Ok(())
+}

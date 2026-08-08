@@ -1399,7 +1399,7 @@ pub struct VmState {
 On serve process exit (SIGTERM/SIGINT):
 1. Query state manager for all VMs where `serve_pid == my_pid`
 2. Kill each clone process: `kill -TERM <clone_pid>`
-3. Remove socket file: `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
+3. Remove socket file: `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}-{pid_start_time}.sock`
 4. Delete serve state from state manager
 
 ### Stale State File Handling
@@ -1718,7 +1718,7 @@ fcvm podman run --name baseline --network bridged nginx:alpine
 fcvm snapshot create --pid <baseline_pid> --tag my-snapshot
 
 # 3. Start memory server (serves pages via UFFD)
-fcvm snapshot serve my-snapshot    # Creates /mnt/fcvm-btrfs/uffd-my-snapshot-<pid>.sock
+fcvm snapshot serve my-snapshot    # Creates /mnt/fcvm-btrfs/uffd-my-snapshot-<pid>-<pid_start_time>.sock
 
 # 4. Spawn clones from the memory server
 fcvm snapshot run --pid <serve_pid> --name clone1

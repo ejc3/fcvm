@@ -1,5 +1,6 @@
 //! Utility functions for process management and system operations.
 
+use anyhow::Context as _;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -97,6 +98,95 @@ impl DirWatch {
 /// `true` if the process exists, `false` otherwise
 pub fn is_process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+/// Read the start time of a process in clock ticks since boot (field 22 of
+/// `/proc/<pid>/stat`). Returns `None` if the process doesn't exist or the field
+/// can't be parsed.
+///
+/// A `(pid, start_time)` pair uniquely identifies a process even after the OS
+/// reuses the PID for something else. This is fcvm's ONE definition of that
+/// identity: the state manager persists it as `VmState::pid_start_time`, and the
+/// UFFD server pins the VMM on the other end of a connection with it before ever
+/// signalling that PID.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // The comm field (field 2) may contain spaces and parentheses; everything
+    // after the last ')' is space-separated starting at field 3 (state), so
+    // starttime (field 22) is the 20th token after the closing paren.
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// A watch on another process's lifetime, established up front and awaited later.
+///
+/// Split deliberately into "open" and "wait": opening can FAIL (no permission, kernel
+/// too old, process already gone), and a caller must be able to tell that apart from
+/// "the process died". Conflating them means a clone that merely could not be watched
+/// gets killed as though its dependency had crashed — a false positive that destroys
+/// healthy work. Open at startup, fail loudly there, and treat every later wakeup as a
+/// real death.
+pub struct ProcessWatch {
+    async_fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    pid: u32,
+}
+
+impl ProcessWatch {
+    /// Pin `pid` for later waiting, or explain why it cannot be pinned.
+    ///
+    /// `Ok(None)` means the process was ALREADY gone — not an error, and not something to
+    /// wait for; the caller has simply learned the answer immediately.
+    ///
+    /// PID reuse is handled by bracketing the `pidfd_open` with `/proc/<pid>/stat`
+    /// start-time reads. A pidfd pins whatever process holds the PID *at the moment of
+    /// the call*, so if the target died just before, this could otherwise pin a stranger
+    /// and then wait forever on a process nobody cares about — the failure mode being
+    /// watched for would pass silently.
+    pub fn open(pid: u32) -> anyhow::Result<Option<Self>> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let before = process_start_time(pid);
+        if before.is_none() {
+            return Ok(None); // already gone
+        }
+
+        // SAFETY: pidfd_open(2) with no flags; the fd is owned by the OwnedFd below.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if raw < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None); // died while we were looking
+            }
+            return Err(anyhow::Error::new(err))
+                .with_context(|| format!("pidfd_open on PID {pid}"));
+        }
+        // SAFETY: a fresh, valid fd we just created and have not shared.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) };
+
+        // If the start time moved, the PID was recycled between our two reads: the
+        // process we meant to watch is already dead and this fd points at a stranger.
+        if process_start_time(pid) != before {
+            return Ok(None);
+        }
+
+        let async_fd = tokio::io::unix::AsyncFd::new(fd)
+            .with_context(|| format!("registering pidfd for PID {pid} with the reactor"))?;
+        Ok(Some(Self { async_fd, pid }))
+    }
+
+    /// The PID being watched, for messages.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Resolves when the watched process exits. A pidfd becomes readable on exit, so this
+    /// is a real edge, not a poll.
+    pub async fn exited(&mut self) {
+        // A readability error here would mean the reactor itself is broken; there is no
+        // meaningful recovery and reporting "still alive" would be a lie, so treat any
+        // wakeup as the exit it almost certainly is.
+        let _ = self.async_fd.readable().await.map(|mut g| g.clear_ready());
+    }
 }
 
 /// Check whether `pid` runs the same executable name (`/proc/<pid>/comm`) as the current process.
