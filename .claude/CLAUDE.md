@@ -890,18 +890,26 @@ gh pr view <pr-number> --json comments \
 
 **GitHub re-anchors still-open review comments onto the current head.** After you push a fix,
 an *old* comment's `commit_id` and `line` both change to match the new HEAD — so a finding you
-already fixed reappears looking brand new, at a shifted line number. Acting on that means
-re-fixing work you already did, or concluding your fix was rejected when nobody said so.
-`commit_id` cannot distinguish the two. `original_commit_id` (the commit the comment was
-actually written against) plus `created_at` can:
+already fixed reappears looking brand new, at a shifted line number. Observed live: four
+comments created at `09:01:36Z` against `23558456` re-anchored onto the fix commit, with
+`prefetch.rs:179 → 196` and `server.rs:1975 → 1991`, while the comment count never changed.
+
+**`isResolved` is the ONLY field that means resolved.** Age does not:
 ```bash
-gh api repos/{owner}/{repo}/pulls/<pr-number>/comments \
-  --jq '.[] | "\(.created_at) orig=\(.original_commit_id[0:8]) now=\(.commit_id[0:8]) \(.path)"'
-# created_at BEFORE your fix commit => already addressed, re-anchored. Not a new finding.
+gh api graphql -f query='{repository(owner:"O",name:"R"){pullRequest(number:N){
+  reviewThreads(first:100){nodes{isResolved comments(first:100){nodes{author{login} path line body}}}}}}}' \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false)'
 ```
-Observed live: four comments created at `09:01:36Z` against `23558456` re-anchored onto the
-fix commit, with `prefetch.rs:179 → 196` and `server.rs:1975 → 1991`. Comment count never
-changed. Compare timestamps, not commit ids.
+An earlier version of this file said "`created_at` BEFORE your fix commit ⇒ already addressed",
+and that rule is **unsound** — it was wrong here for months of nothing and then wrong in
+practice within a day. When one commit fixes SOME of several findings, every older comment
+still predates it, **including the ones nobody fixed**, so the rule silently reclassifies
+unfixed blockers as handled. `original_commit_id` + `created_at` can tell you a comment is OLD
+or RE-ANCHORED; neither can tell you its concern was addressed. Only a human reading the
+thread, or `isResolved`, can.
+
+Use age for one thing only: deciding whether a finding needs re-reading after a push, never
+whether it needs fixing.
 
 ### GitHub Actions Workflow Security (claude.yml)
 
