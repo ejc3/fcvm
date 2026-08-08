@@ -749,6 +749,17 @@ gh pr close <fix-pr-number>  # Close the auto-generated PR
 gh pr view <pr-number> --json comments --jq '.comments[] | .body'
 ```
 
+**A green `CodeRabbit` check does NOT mean CodeRabbit reviewed anything.** When it hits its
+rate limit it posts *"Review limit reached ... we couldn't start this review"* and the check
+still renders as `CodeRabbit  pass`. "The reviewer never ran" is indistinguishable from "the
+reviewer approved" — the same class of bug as a contention detector that can never fire, or a
+leak check whose pattern can never match. Prove the review happened before counting it:
+```bash
+gh pr view <pr-number> --json comments \
+  --jq '.comments[] | select(.author.login=="coderabbitai") | .body' | head -5
+# "Review limit reached" / "next review in NN minutes" => NOT reviewed. Re-run before merging.
+```
+
 ### GitHub Actions Workflow Security (claude.yml)
 
 Jobs run with secrets, so editing `.github/workflows/claude.yml` is security-critical. Rules
