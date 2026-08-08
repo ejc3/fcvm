@@ -63,6 +63,68 @@ Enforcement: `scripts/check-review-threads.sh <pr>` fails while any review threa
 unresolved, AND while any thread that *describes* broken behaviour has been resolved without a
 `RED-VERIFIED: <test>` reply. CI state cannot tell you whether a finding was answered.
 
+### A GATE MUST FAIL CLOSED — check your dependencies before you trust your verdict
+
+A check that cannot run must **block**, never pass. Passing is a claim, and a tool that could
+not evaluate anything has no basis for making it.
+
+This bit immediately, in the gate written to enforce the rule above. `jq` is not in the CI
+container. Every `jq` call failed to stderr, the counts came back empty, and the script printed
+`verdict: CLEAR ... exit 0` — waving every PR through *precisely because it could not evaluate
+them*. Strictly worse than having no gate, because it looks like one:
+
+```
+review threads:  total,  unresolved
+verdict: CLEAR — every thread resolved, ...
+check-review-threads.sh: line 49: jq: command not found
+```
+
+Any script that renders a verdict must begin by proving it can:
+```bash
+for tool in jq gh; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
+done
+```
+And its tests must run **where CI runs it**, not only on a dev box that happens to have the
+tooling. A green unit test on your laptop says nothing about the container.
+
+### HOW TO GET CI LOGS — there is always a way; never report "no logs available"
+
+"The logs aren't available yet" is almost always a tooling mistake, not a fact. Two independent
+routes, in order of preference:
+
+**1. Per-job API — works even while the RUN is still in progress.**
+```bash
+JOB=$(gh api repos/{o}/{r}/commits/<sha>/check-runs \
+       --jq '.check_runs[] | select(.conclusion=="failure") | .id' | head -1)
+gh api --allow-escape-sequences repos/{o}/{r}/actions/jobs/$JOB/logs > job.log
+sed -i 's/\x1b\[[0-9;]*m//g' job.log
+```
+`--allow-escape-sequences` is **mandatory**: job logs contain ANSI, and without it `gh api`
+writes nothing to stdout and puts the reason **only on stderr** — so `> job.log` yields an
+empty file from a command that looks like it succeeded. That empty file is what makes people
+announce there are no logs.
+
+Note `gh run view --log` refuses while the RUN is in progress even for jobs that finished long
+ago. Do not wait for the run; use the per-job API above.
+
+**2. SSH to the self-hosted runner — it has the checkout AND the environment.**
+```bash
+gh api repos/{o}/{r}/actions/runners --jq '.runners[] | "\(.name)\t\(.status)\t\(.busy)"'
+# names are runner-i-<instance-id>; get IPs read-only:
+aws ec2 describe-instances --instance-ids i-... \
+  --query 'Reservations[].Instances[].{id:InstanceId,pub:PublicIpAddress,arch:Architecture}' --output text
+ssh -i ~/.ssh/runner_key ubuntu@<public-ip>
+# the CI tree, exactly as the job saw it (merge commit of PR head into base):
+cd /opt/actions-runner/_work/fcvm/fcvm/fcvm && sudo git log --oneline -1
+```
+This is how a `cargo fmt --check` failure was diagnosed in one command after the API route had
+been (wrongly) given up on. `_diag/Worker_*.log` is runner METADATA — step output is not there;
+either use route 1 or re-run the failing command in that checkout.
+
+**Check `busy` first and leave a busy runner alone** — it is executing someone's job, and a
+build you start competes for its cargo cache and disk.
+
 ### "It is too big / slow / expensive to test" is almost always false
 
 That excuse is how the worst bugs stay uncovered, because expensive-to-reach paths are exactly

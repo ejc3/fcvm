@@ -20,6 +20,21 @@
 #   check-review-threads.sh --from-file <json>   # parse a saved response (tests)
 set -uo pipefail
 
+# A GATE MUST FAIL CLOSED. Without this check the script degraded silently when `jq`
+# was absent (it is not in the CI container): every `jq` call errored to stderr, the
+# counts came back empty, and it printed "verdict: CLEAR ... exit 0" — a merge gate
+# waving everything through precisely because it could not run. That is strictly worse
+# than no gate, because it looks like one.
+for tool in jq gh; do
+  # gh is only needed for the live query; --from-file parsing needs jq alone.
+  if [ "$tool" = "gh" ] && [ "${1:-}" = "--from-file" ]; then continue; fi
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "verdict: BLOCKED — '$tool' is not installed, so this gate cannot evaluate" >&2
+    echo "review threads. Refusing to report CLEAR for a check that did not run." >&2
+    exit 2
+  }
+done
+
 REPO_OWNER=${REPO_OWNER:-ejc3}
 REPO_NAME=${REPO_NAME:-fcvm}
 
@@ -27,7 +42,10 @@ fetch_threads() {
   local pr=$1 cursor=null all='[]'
   while :; do
     local after="" resp
-    [ "$cursor" != "null" ] && after=", after: \\\"$cursor\\\""
+    # `\"` here, NOT `\\\"`: the latter puts a literal backslash into the GraphQL
+    # argument and the query fails to parse. Only reachable on page 2+, which is why
+    # single-page fixtures never caught it.
+    [ "$cursor" != "null" ] && after=", after: \"$cursor\""
     resp=$(gh api graphql -f query="
       { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
           pullRequest(number: $pr) {
@@ -35,7 +53,7 @@ fetch_threads() {
               pageInfo { hasNextPage endCursor }
               nodes {
                 isResolved isOutdated
-                comments(first: 1) { nodes { author { login } path line originalLine body } }
+                comments(first: 100) { nodes { author { login } path line originalLine body } }
               } } } } }" 2>/dev/null) || return 1
     all=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviewThreads.nodes // [])' \
           <(echo "$all") <(echo "$resp"))
@@ -84,14 +102,14 @@ defect_re='panic|crash|hang|deadlock|leak|corrupt|race|overflow|truncat|silently
 needs_proof=$(jq -r --arg re "$defect_re" '
   [ .[] | select(.isResolved == true)
         | select([.comments.nodes[].body] | join(" ") | test($re; "i"))
-        | select(([.comments.nodes[].body] | join(" ") | test("RED-VERIFIED:"; "i")) | not) ]
+        | select(([.comments.nodes[1:][].body] | join(" ") | test("RED-VERIFIED:"; "i")) | not) ]
   | length' <<<"$threads" 2>/dev/null || echo 0)
 
 if [ "${needs_proof:-0}" -gt 0 ]; then
   echo
   jq -r --arg re "$defect_re" '.[] | select(.isResolved == true)
     | select([.comments.nodes[].body] | join(" ") | test($re; "i"))
-    | select(([.comments.nodes[].body] | join(" ") | test("RED-VERIFIED:"; "i")) | not)
+    | select(([.comments.nodes[1:][].body] | join(" ") | test("RED-VERIFIED:"; "i")) | not)
     | .comments.nodes[0]
     | "  UNPROVEN   \(.author.login)  \(.path):\(.line // .originalLine // "?")\n    \(.body | split("\n")[0][0:150])"' \
     <<<"$threads"

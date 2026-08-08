@@ -213,3 +213,128 @@ fn a_resolved_defect_claim_with_a_red_test_is_accepted() {
         "a RED-VERIFIED reply must satisfy the gate:\n{out}"
     );
 }
+
+/// A gate that cannot run must BLOCK, not pass.
+///
+/// This is a regression test for the gate itself. `jq` is absent from the CI container,
+/// so every `jq` call errored to stderr, the counts came back empty, and the script
+/// printed `verdict: CLEAR` and exited 0 — waving every PR through precisely because it
+/// could not evaluate any of them. Strictly worse than no gate, because it looks like one.
+///
+/// Runs the script with a PATH that genuinely cannot reach `jq`. Note `/bin` is a symlink
+/// to `/usr/bin` on usr-merged systems, so removing one directory from PATH does NOT hide
+/// a tool — the PATH has to be replaced outright.
+#[test]
+fn the_gate_blocks_when_it_cannot_run_at_all() {
+    let empty = std::env::temp_dir().join(format!("fcvm-nodeps-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let out = Command::new("/usr/bin/bash")
+        .arg(repo_root().join("scripts/check-review-threads.sh"))
+        .arg("--from-file")
+        .arg(repo_root().join("tests/fixtures/review-threads-unresolved.json"))
+        .env("PATH", &empty) // jq unreachable
+        .output()
+        .expect("script must be runnable");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = out.status.code().unwrap_or(-1);
+
+    assert_ne!(
+        code, 0,
+        "with `jq` unreachable the gate MUST NOT exit 0. Exit 0 here means it reported a \
+         verdict it had no ability to compute.\n{combined}"
+    );
+    assert!(
+        !combined.contains("verdict: CLEAR"),
+        "the gate claimed CLEAR while unable to parse anything — fail closed, always.\n{combined}"
+    );
+    assert!(
+        combined.contains("BLOCKED"),
+        "a gate that cannot evaluate must say so explicitly.\n{combined}"
+    );
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// The gate must work on REAL data, not only on fixtures someone hand-wrote.
+///
+/// This exists because a hand-written fixture lied. It carried two comments per thread
+/// while the query asked for `comments(first: 1)`, so the "a RED-VERIFIED reply satisfies
+/// the gate" test passed against a response the code could never produce — green, and
+/// proving nothing. `scripts/capture-review-threads-fixture.sh` regenerates this file
+/// straight from a live PR so the shape cannot drift from the query again.
+///
+/// Captured from PR #748 (the PR that added this gate), which at capture time had 10
+/// threads, 9 unresolved.
+#[test]
+fn the_gate_handles_a_real_captured_pr_response() {
+    let (out, code) = run_threads("review-threads-live-748.json");
+
+    assert_ne!(code, 0, "a PR with unresolved threads must block:\n{out}");
+    assert!(
+        out.contains("10 total, 9 unresolved"),
+        "the captured response has 10 threads with 9 unresolved; if this count moved, \
+         re-capture with scripts/capture-review-threads-fixture.sh and check WHY.\n{out}"
+    );
+    // Real bodies are markdown with badges, HTML comments and embedded shell blocks —
+    // far messier than anything hand-written. Parsing must survive that.
+    assert!(
+        out.contains("UNRESOLVED"),
+        "individual findings must still be listed from real, messy bodies.\n{out}"
+    );
+}
+
+/// Every fixture must carry the fields the live query actually selects. A fixture missing
+/// one would make the gate silently skip a check it believes it performed.
+#[test]
+fn every_fixture_matches_the_shape_the_query_returns() {
+    const REQUIRED: [&str; 5] = ["author", "body", "line", "originalLine", "path"];
+    let dir = repo_root().join("tests/fixtures");
+    let mut checked = 0;
+
+    for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !name.starts_with("review-threads-") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read fixture");
+        for field in REQUIRED {
+            assert!(
+                text.contains(&format!("\"{field}\"")),
+                "fixture {name} is missing the `{field}` field that the live query selects. \
+                 A fixture that does not match the query lets a test pass against data the \
+                 code can never receive."
+            );
+        }
+        assert!(
+            text.contains("\"isResolved\""),
+            "fixture {name} lacks isResolved — the only field that means 'resolved'."
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 4,
+        "expected several review-thread fixtures, found {checked}"
+    );
+}
+
+/// A defect report cannot prove itself.
+///
+/// The marker must appear in a REPLY. If the check searched every comment including the
+/// opening one, a bot report that merely QUOTES the policy — "resolutions require a
+/// RED-VERIFIED: <test> reply" — would satisfy its own requirement and close a real bug
+/// on nothing. The fixture is exactly that shape: one comment, containing the marker.
+#[test]
+fn a_defect_report_cannot_serve_as_its_own_red_verification() {
+    let (out, code) = run_threads("review-threads-selfproof.json");
+    assert_ne!(
+        code, 0,
+        "a lone defect comment containing the marker must NOT count as proof — the \
+         evidence has to come from a reply.\n{out}"
+    );
+    assert!(out.contains("UNPROVEN"), "{out}");
+}

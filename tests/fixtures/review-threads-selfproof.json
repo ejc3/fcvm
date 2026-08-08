@@ -1,0 +1,5 @@
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+ {"isResolved":true,"isOutdated":false,"comments":{"nodes":[
+   {"author":{"login":"chatgpt-codex-connector"},"path":"src/uffd/prefetch.rs","line":196,"originalLine":196,"body":"P1: this can panic inside the fault handler and hang the guest. Policy note: resolutions require a RED-VERIFIED: <test> reply."}
+ ]}}
+]}}}}}
