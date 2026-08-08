@@ -537,11 +537,23 @@ const NTP_SERVER_LIMIT: usize = 4;
 fn parse_chrony_servers(conf: &str) -> Vec<String> {
     conf.lines()
         .map(str::trim)
+        // chrony treats a line starting with '!', ';', '#' or '%' as a comment.
+        // Without this, a commented-out server is propagated into the guest as a real one.
+        .filter(|line| !line.starts_with(['!', ';', '#', '%']))
         .filter_map(|line| {
-            let rest = line
-                .strip_prefix("server ")
-                .or_else(|| line.strip_prefix("pool "))?;
-            rest.split_whitespace().next().map(str::to_string)
+            // Directive names are case-INSENSITIVE in chrony.conf, and the separator is
+            // any run of whitespace, not one space. `strip_prefix("server ")` missed
+            // `SERVER\tntp.example` entirely — and because the caller treats "no matches"
+            // as "this host has no NTP servers", the guest silently ends up with ZERO
+            // sources and a clock free to drift. Same failure shape as reading a config
+            // path that is never mounted: no error, no log, just nothing.
+            let mut parts = line.split_whitespace();
+            let directive = parts.next()?;
+            if !directive.eq_ignore_ascii_case("server") && !directive.eq_ignore_ascii_case("pool")
+            {
+                return None;
+            }
+            parts.next().map(str::to_string)
         })
         .collect()
 }
@@ -1438,6 +1450,43 @@ async fn run_vm_setup_inner(
 
 #[cfg(test)]
 mod tests {
+    /// chrony.conf directives are case-insensitive and whitespace-separated, and the
+    /// consequence of missing one is not a parse error — it is a guest with ZERO time
+    /// sources and no complaint anywhere. Cases taken from the review finding.
+    #[test]
+    fn chrony_directives_parse_regardless_of_case_or_spacing() {
+        use super::parse_chrony_servers;
+
+        assert_eq!(
+            parse_chrony_servers("server ntp.example\npool pool.example"),
+            vec!["ntp.example", "pool.example"],
+            "the ordinary lowercase-and-space form must still work"
+        );
+        assert_eq!(
+            parse_chrony_servers("SERVER\tntp.example\nPOOL\tpool.example"),
+            vec!["ntp.example", "pool.example"],
+            "uppercase directives separated by TABS are valid chrony.conf and were silently \
+             dropped by `strip_prefix(\"server \")` — a host configured this way handed its \
+             guests no NTP sources at all"
+        );
+        assert_eq!(
+            parse_chrony_servers("SeRvEr   mixed.example\nPoOl mixed-pool.example"),
+            vec!["mixed.example", "mixed-pool.example"],
+            "mixed case with runs of spaces is also valid"
+        );
+        assert_eq!(
+            parse_chrony_servers(
+                "# server commented.example\n; pool also-commented\nserver real.example"
+            ),
+            vec!["real.example"],
+            "commented-out directives must NOT be propagated into the guest as real sources"
+        );
+        assert!(
+            parse_chrony_servers("servertypo.example\npoolish thing").is_empty(),
+            "a token that merely STARTS WITH the directive name is not that directive"
+        );
+    }
+
     use super::*;
 
     #[test]
