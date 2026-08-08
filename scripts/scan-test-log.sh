@@ -47,6 +47,18 @@ flaky=$(count '(^|[^A-Z])FLAKY \[')
 
 summary=$(grep -aE 'Summary \[.*tests run:' "$clean" | tail -1 | sed 's/^[[:space:]]*//')
 
+# Parse the summary's own failure count. The summary is the only trustworthy total
+# (lines 14-15), yet until now the verdict relied entirely on grep-counted verdict
+# lines. When nextest crashes before printing individual FAIL [ lines — setup script
+# failure, killed test binary, internal error — the summary records the failure but
+# no verdict line exists to grep, and the scanner reported CLEAN.
+summary_failed=0
+if [ -n "$summary" ]; then
+  # Match patterns like "0 passed, 1 failed" or "1 failed"
+  summary_failed=$(echo "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)
+  [ -z "$summary_failed" ] && summary_failed=0
+fi
+
 echo "summary: ${summary:-<none found>}"
 echo "pass: $pass"
 echo "fail: $fail"
@@ -62,6 +74,9 @@ if [ -z "$summary" ]; then
   exit 3
 elif [ "$fail" -gt 0 ] || [ "$timeout" -gt 0 ] || [ "$leak" -gt 0 ]; then
   echo "verdict: FAILED"
+  exit 1
+elif [ "$summary_failed" -gt 0 ]; then
+  echo "verdict: FAILED (summary reports $summary_failed failed but no verdict lines found)"
   exit 1
 elif [ "$try_fail" -gt 0 ] || [ "$flaky" -gt 0 ]; then
   echo "verdict: FLAKY (passed only on retry — name it, do not absorb it)"

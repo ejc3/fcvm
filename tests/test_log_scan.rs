@@ -153,6 +153,36 @@ fn a_log_without_a_summary_is_never_reported_clean() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A summary line that reports failures must produce FAILED, even when no
+/// individual `FAIL [` verdict lines exist. This happens when nextest crashes
+/// during setup, when a test binary is killed before nextest prints its verdict,
+/// or on an internal error. Without parsing the summary, the scanner declares
+/// CLEAN because no verdict lines were grepped — the summary says "failed" and
+/// the gate waves it through.
+#[test]
+fn a_summary_reporting_failures_is_never_declared_clean() {
+    let dir = std::env::temp_dir().join(format!("fcvm-logscan-sumfail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("summary-failed.log");
+    std::fs::write(
+        &log,
+        "    Starting 1 tests across 1 binaries\n\
+         \x20    Summary [ 10.0s] 1 tests run: 0 passed, 1 failed\n",
+    )
+    .unwrap();
+
+    let (out, code) = run_scan(&log);
+    assert_eq!(
+        code, 1,
+        "a summary reporting failures must exit 1 (FAILED), not 0 (CLEAN).\n{out}"
+    );
+    assert!(
+        out.contains("FAILED"),
+        "verdict must be FAILED when the summary reports failures.\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // Review-thread gate
 // ---------------------------------------------------------------------------
@@ -257,6 +287,43 @@ fn the_gate_blocks_when_it_cannot_run_at_all() {
         "a gate that cannot evaluate must say so explicitly.\n{combined}"
     );
     let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// The gate must block on invalid JSON input, not report CLEAR.
+///
+/// Before this fix, invalid JSON or a GraphQL error payload caused $total and $unresolved
+/// to be empty, the arithmetic comparisons to silently fail (no `set -e`), and the gate
+/// to fall through to `verdict: CLEAR ... exit 0` — exactly the fail-open pattern the
+/// script's own header warns against.
+#[test]
+fn the_gate_blocks_on_invalid_json_input() {
+    let dir = std::env::temp_dir().join(format!("fcvm-badjson-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, "not valid json at all").unwrap();
+
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/check-review-threads.sh"))
+        .arg("--from-file")
+        .arg(&bad)
+        .output()
+        .expect("script must be runnable");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = out.status.code().unwrap_or(-1);
+
+    assert_ne!(
+        code, 0,
+        "invalid JSON must not exit 0. Exit 0 means it reported CLEAR on unparseable input.\n{combined}"
+    );
+    assert!(
+        !combined.contains("verdict: CLEAR"),
+        "the gate must never claim CLEAR when it cannot parse the input.\n{combined}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The gate must work on REAL data, not only on fixtures someone hand-wrote.

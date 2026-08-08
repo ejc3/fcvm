@@ -64,14 +64,24 @@ fetch_threads() {
 }
 
 if [ "${1:-}" = "--from-file" ]; then
-  threads=$(jq '.data.repository.pullRequest.reviewThreads.nodes' "${2:?need a json file}")
+  threads=$(jq '.data.repository.pullRequest.reviewThreads.nodes' "${2:?need a json file}") || {
+    echo "verdict: BLOCKED — jq could not parse ${2}; refusing to report CLEAR." >&2; exit 2; }
 else
   pr=${1:?usage: check-review-threads.sh <pr-number> | --from-file <json>}
   threads=$(fetch_threads "$pr") || { echo "could not query review threads for #$pr" >&2; exit 2; }
 fi
 
-total=$(jq 'length' <<<"$threads")
-unresolved=$(jq '[.[] | select(.isResolved == false)] | length' <<<"$threads")
+# Validate that jq produced a JSON array, not empty/error output. Without this,
+# invalid JSON or a GraphQL error payload causes $total and $unresolved to be empty,
+# the arithmetic comparisons to silently fail, and the gate to report CLEAR — the
+# exact fail-open pattern described at the top of this file.
+total=$(jq 'length' <<<"$threads") || { echo "verdict: BLOCKED — could not count threads." >&2; exit 2; }
+unresolved=$(jq '[.[] | select(.isResolved == false)] | length' <<<"$threads") || {
+  echo "verdict: BLOCKED — could not count unresolved threads." >&2; exit 2; }
+if ! [[ "$total" =~ ^[0-9]+$ ]] || ! [[ "$unresolved" =~ ^[0-9]+$ ]]; then
+  echo "verdict: BLOCKED — thread counts are not integers (total='$total', unresolved='$unresolved')." >&2
+  exit 2
+fi
 
 echo "review threads: $total total, $unresolved unresolved"
 rc=0

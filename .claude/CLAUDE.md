@@ -895,9 +895,12 @@ re-fixing work you already did, or concluding your fix was rejected when nobody 
 `commit_id` cannot distinguish the two. `original_commit_id` (the commit the comment was
 actually written against) plus `created_at` can:
 ```bash
-gh api repos/{owner}/{repo}/pulls/<pr-number>/comments \
+gh api --paginate repos/{owner}/{repo}/pulls/<pr-number>/comments \
   --jq '.[] | "\(.created_at) orig=\(.original_commit_id[0:8]) now=\(.commit_id[0:8]) \(.path)"'
-# created_at BEFORE your fix commit => already addressed, re-anchored. Not a new finding.
+# Use timestamps to UNDERSTAND re-anchoring, not to DECIDE whether a finding was addressed.
+# A comment predating your fix does NOT mean it was handled — a fix that addresses SOME
+# findings leaves unfixed ones equally old. Use `isResolved` via the GraphQL review-threads
+# query (scripts/check-review-threads.sh) for resolution decisions.
 ```
 Observed live: four comments created at `09:01:36Z` against `23558456` re-anchored onto the
 fix commit, with `prefetch.rs:179 → 196` and `server.rs:1975 → 1991`. Comment count never
