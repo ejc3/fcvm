@@ -166,7 +166,14 @@ pub async fn run() -> Result<()> {
     // process spawn plus a command-socket round trip — awaiting it inline made
     // every cold boot wait for chrony before it could mount disks and launch
     // the container. The task logs its own outcome, including the loud failure.
-    tokio::spawn(start_chronyd(plan.ntp_servers.clone()));
+    //
+    // The handle is KEPT, not dropped. Fire-and-forget is exactly what AGENTS.md
+    // forbids ("DON'T: Use fire-and-forget without lifecycle management"), and the
+    // hazard here is concrete: this task writes /etc/chrony.conf, signals an old
+    // daemon and waits on a command socket. Dropping the handle means shutdown can
+    // tear the VM down mid-sequence, leaving a half-written config for the next
+    // boot to read. Awaited (bounded) at shutdown below.
+    let chronyd_task = tokio::spawn(start_chronyd(plan.ntp_servers.clone()));
 
     let mounted_disk_paths = if !plan.extra_disks.is_empty() {
         eprintln!(
@@ -503,6 +510,24 @@ pub async fn run() -> Result<()> {
     mounts::unmount_disks(&mounted_disk_paths);
     if let Some("overlay") = plan.image_mode.as_deref() {
         mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
+    }
+
+    // Let chronyd setup finish before the VM goes away, so it cannot be killed
+    // between writing the config and starting the daemon.
+    //
+    // Bounded, and the bound is not a guess: `start_chronyd` already bounds its own
+    // waits (CHRONYD_READY_TIMEOUT), so a task still running here is one whose
+    // internal deadline has not yet expired. A short grace covers the ordinary case —
+    // it is nearly always finished long before the container exits — without letting
+    // a wedged setup hold the VM open, which would trade a boot-path stall for a
+    // shutdown-path stall and defeat the point of moving it off the critical path.
+    match tokio::time::timeout(Duration::from_secs(5), chronyd_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[fc-agent] chronyd setup task panicked: {e}"),
+        Err(_) => eprintln!(
+            "[fc-agent] chronyd setup still running after 5s at shutdown; abandoning it. \
+             The guest may boot next time with a partially written /etc/chrony.conf."
+        ),
     }
 
     // Shutdown output writer
