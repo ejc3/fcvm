@@ -911,6 +911,32 @@ thread, or `isResolved`, can.
 Use age for one thing only: deciding whether a finding needs re-reading after a push, never
 whether it needs fixing.
 
+**A CLOSED PR reports CI results for a commit you are no longer on.** GitHub does not advance
+a closed PR's head, and `pull_request` events do not fire for one — so `git push` updates
+`refs/heads/<branch>` and creates **zero check-runs**, while `gh pr checks` keeps serving the
+*previous* commit's results. Same shape as the above: "CI never ran" is indistinguishable from
+"CI passed", and it survives a fetch, a re-push, and a `--force`. Anyone can close a PR out
+from under you (a dedupe, a bot, a stale-branch sweep), so check PR state before trusting its
+checks, and bind results to a SHA rather than to the PR:
+```bash
+gh pr view <pr> --json state,headRefOid --jq '"\(.state) head=\(.headRefOid)"'
+git rev-parse HEAD   # must equal headRefOid; if it does not, the checks are for other code
+gh api repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs --jq '.check_runs | length'
+# 0 => nothing ran for this commit. `gh pr reopen <pr>` resyncs the head and triggers CI.
+```
+**Reopening is not guaranteed to start CI.** It fires a `reopened` event, which a workflow
+receives only if its `pull_request` trigger omits `types` (or lists `reopened`) — but even
+then `paths`/`paths-ignore` still applies, so a PR whose every changed file matches an
+ignored pattern gets a `reopened` event and **still runs nothing**. Docs-only and
+bench-only PRs land in exactly that hole. Check, and fall back to an explicit dispatch:
+```bash
+gh api repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs --jq '.check_runs | length'
+# still 0 after reopen => the workflow filtered this PR out, not a sync problem
+gh workflow run ci.yml --ref "$(git branch --show-current)"
+```
+Do not read "0 checks" as "CI passed"; it means nothing ran, which is the same
+green-by-absence trap as a reviewer that never started.
+
 ### GitHub Actions Workflow Security (claude.yml)
 
 Jobs run with secrets, so editing `.github/workflows/claude.yml` is security-critical. Rules
@@ -1149,8 +1175,10 @@ Do not run `sudo cargo`. Use Makefile targets so cargo runs as your user and tes
 orphans the entire subtree below it.** The chain that must hold, end to end:
 
 ```
-cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm → firecracker
-                           ^ setpriv --pdeathsig  ^ set_test_pdeathsig  ^ install_namespace_pre_exec
+cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm ─┬→ firecracker
+                           ^ setpriv --pdeathsig  ^ set_test_pdeathsig     ├→ holder
+                                                                           └→ pasta (rootless)
+                                                                              ^ see per-hop list below
 ```
 
 - `scripts/root-test-runner.sh` (`ROOT_TEST_RUNNER` in the Makefile) covers the **sudo hop**.
@@ -1160,6 +1188,14 @@ cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm �
 - `src/utils.rs::install_namespace_pre_exec` covers **every VMM spawn** (Firecracker, Cloud
   Hypervisor, and the Layer-2 setup VM in `src/setup/rootfs.rs`). It must stay the LAST
   `pre_exec` — `setns(CLONE_NEWUSER)` zeroes `pdeath_signal`, so setting it earlier is lost.
+- `src/commands/common.rs::spawn_namespace_holder` covers the **holder hop** (rootless mode).
+  The holder's pdeathsig is armed in its `pre_exec`, before UID/GID mappings are written.
+- `src/network/pasta.rs` (in `start_pasta`) covers the **pasta hop** (rootless mode). Must be
+  the last `pre_exec`; includes a `getppid` re-check to close the fork/exec race window.
+
+Regression tests: `test_sigkill_reaps_rootless_vm_tree` asserts all three children (firecracker,
+holder, pasta) die when fcvm is SIGKILL'd. `test_root_test_runner_reaps_vm_when_sudo_is_killed`
+covers the sudo hop specifically.
 
 **Why a privilege boundary is special:** the kernel refuses a signal from uid 1000 to a uid-0
 process, and `killpg` still returns success when it managed to signal *any* member — so

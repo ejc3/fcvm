@@ -206,14 +206,59 @@ pub fn strip_firecracker_prefix(line: &str) -> &str {
     result
 }
 
+/// A process spawned by [`spawn_streaming`], plus the background tasks draining
+/// its stdout and stderr pipes.
+///
+/// The reader handles are returned, not detached, so that a caller which sees
+/// the child exit early can WAIT for the stderr reader to reach EOF before
+/// formatting an error out of the tail it captured. Without a handle there is
+/// nothing to await: every such caller resorted to a fixed sleep, which is both
+/// a tax on the happy path and too short under load — reporting "no stderr
+/// captured" exactly when the process printed the reason it died.
+pub struct StreamingChild {
+    /// The spawned process. The caller owns its lifecycle.
+    pub child: tokio::process::Child,
+    /// Completes when stdout hits EOF and every line has reached the callback.
+    pub stdout_reader: tokio::task::JoinHandle<()>,
+    /// Completes when stderr hits EOF and every line has reached the callback.
+    pub stderr_reader: tokio::task::JoinHandle<()>,
+}
+
+/// Wait for a [`StreamingChild`] stderr reader to finish, bounded by `timeout`.
+///
+/// Call this on an error path that has already observed the child exit and is
+/// about to render its stderr tail. Completion is the real signal that the tail
+/// is whole: the reader task ends only at EOF, and the write end of the pipe is
+/// closed by the exit that got us here, so EOF normally arrives in microseconds.
+///
+/// The bound covers the one case where EOF can be delayed indefinitely — a
+/// grandchild inherited the pipe and holds it open. There the error is reported
+/// with whatever was captured rather than hanging.
+///
+/// The handle is taken, so a second call is a no-op.
+pub async fn wait_for_stderr_eof(
+    reader: &mut Option<tokio::task::JoinHandle<()>>,
+    timeout: Duration,
+) {
+    let Some(handle) = reader.take() else {
+        return;
+    };
+    if tokio::time::timeout(timeout, handle).await.is_err() {
+        warn!(
+            timeout_ms = timeout.as_millis() as u64,
+            "stderr pipe did not reach EOF within the bound; error output may be truncated"
+        );
+    }
+}
+
 /// Spawn a command and stream its output via tracing logs.
 ///
 /// Takes a closure that receives each line and logs it appropriately.
-/// Returns the child process handle (caller must manage lifecycle).
+/// Returns the child and its reader tasks (caller must manage lifecycle).
 pub fn spawn_streaming<F>(
     mut cmd: tokio::process::Command,
     log_line: F,
-) -> anyhow::Result<tokio::process::Child>
+) -> anyhow::Result<StreamingChild>
 where
     F: Fn(&str, bool) + Send + Sync + Clone + 'static,
 {
@@ -224,31 +269,38 @@ where
 
     let mut child = cmd.spawn()?;
 
+    // Both pipes were just configured above, so `take()` yields them here.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("spawned child has no stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("spawned child has no stderr pipe"))?;
+
     // Stream stdout (is_stderr=false)
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        let log = log_line.clone();
-        tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                log(&line, false);
-            }
-        });
-    }
+    let log = log_line.clone();
+    let stdout_reader = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            log(&line, false);
+        }
+    });
 
     // Stream stderr (is_stderr=true)
-    if let Some(stderr) = child.stderr.take() {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        let log = log_line;
-        tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                log(&line, true);
-            }
-        });
-    }
+    let stderr_reader = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            log_line(&line, true);
+        }
+    });
 
-    Ok(child)
+    Ok(StreamingChild {
+        child,
+        stdout_reader,
+        stderr_reader,
+    })
 }
 
 /// Run a command and stream its output via tracing at INFO/WARN level.
@@ -259,14 +311,17 @@ pub async fn run_streaming(
     prefix: &str,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let prefix = prefix.to_string();
-    let mut child = spawn_streaming(cmd, move |line, is_stderr| {
+    // The reader handles are deliberately dropped: this helper logs each line as
+    // it arrives and renders no tail afterwards, so it has nothing to wait for.
+    // Dropping detaches the tasks, which run on to EOF on their own.
+    let mut spawned = spawn_streaming(cmd, move |line, is_stderr| {
         if is_stderr {
             warn!("[{}] {}", prefix, line);
         } else {
             info!("[{}] {}", prefix, line);
         }
     })?;
-    Ok(child.wait().await?)
+    Ok(spawned.child.wait().await?)
 }
 
 /// Result of waiting for namespace readiness.

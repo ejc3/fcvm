@@ -51,6 +51,10 @@ pub struct Plan {
     /// the TAP/bridge/pasta data path for outbound connections.
     #[serde(default)]
     pub egress_proxy: bool,
+    /// The host's NTP servers, already resolved to addresses by fcvm. Configured
+    /// into the guest's chronyd at boot; empty means the host had none to give.
+    #[serde(default)]
+    pub ntp_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +154,20 @@ mod tests {
         assert!(!plan.volumes[0].read_only);
         assert!(plan.tty);
         assert!(plan.privileged);
+    }
+
+    /// The NTP list rides in the boot plan because nothing mounts the host's /etc
+    /// into a guest. A plan without the field must still parse (older/minimal plans).
+    #[test]
+    fn test_plan_ntp_servers() {
+        let plan: Plan = serde_json::from_str(
+            r#"{"image": "alpine:latest", "ntp_servers": ["10.0.0.1", "fd00::1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.ntp_servers, vec!["10.0.0.1", "fd00::1"]);
+
+        let bare: Plan = serde_json::from_str(r#"{"image": "alpine:latest"}"#).unwrap();
+        assert!(bare.ntp_servers.is_empty());
     }
 
     #[test]
