@@ -14,7 +14,7 @@ diff --git a/fs/fuse/file.c b/fs/fuse/file.c
 index 676fd9856bfbf..1a47c623a0868 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3158,6 +3158,127 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3158,6 +3158,136 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  	return ret;
  }
  
@@ -64,6 +64,15 @@ index 676fd9856bfbf..1a47c623a0868 100644
 +		effective = i_size_read(inode_in) - pos_in;
 +		if (effective < 0)
 +			effective = 0;
++		/*
++		 * Send the CONCRETE length, not the 0 that means "to EOF". The
++		 * kernel is about to cache `effective` for the destination; if the
++		 * request still said 0, a concurrent extend of the source between
++		 * this size read and the server handling the remap would clone a
++		 * different extent than the size we cache, poisoning it exactly as
++		 * the u32 truncation did.
++		 */
++		inarg.len = effective;
 +		end_in = LLONG_MAX;
 +		end_out = LLONG_MAX;
 +	} else {
