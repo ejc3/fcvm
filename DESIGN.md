@@ -1400,6 +1400,8 @@ The memory server:
 - Listens for clone connections via Unix socket
 - Serves memory pages on-demand via UFFD (userfaultfd)
 - Enables sharing physical pages across multiple clones
+- Records each clone's restore working set and replays it into later clones
+  (`--uffd-prefetch on|off`, env `FCVM_UFFD_PREFETCH`, default `on`)
 
 **Example**:
 ```bash
@@ -1572,7 +1574,9 @@ fcvm/
 │   ├── uffd/               # UFFD memory server
 │   │   ├── mod.rs
 │   │   ├── server.rs       # Userfaultfd page handler
-│   │   └── handler.rs      # UFFD event handler
+│   │   ├── handler.rs      # UFFD event handler
+│   │   ├── prefetch.rs     # Working-set replay into restoring clones
+│   │   └── working_set.rs  # Record/persist/load the restore working set
 │   │
 │   ├── volume/             # FUSE volume handling
 │   │   └── mod.rs          # Host → guest filesystem mapping
