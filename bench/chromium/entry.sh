@@ -226,5 +226,5 @@ echo "CHROMIUM_BENCH_READY cdp=127.0.0.1:$CDP_PORT pages=http://127.0.0.1:$HTTP_
 # container stops instead of hiding a dead browser behind sleep infinity. As
 # PID 1 this shell gets no default signal handlers — without the trap a
 # `podman stop` SIGTERM is dropped and teardown eats the 10s SIGKILL fallback.
-trap 'kill "$CHROME_PID" "$RELAY_PID" 2>/dev/null; exit 0' TERM INT
+trap 'kill "$CHROME_PID" 2>/dev/null; exit 0' TERM INT
 wait "$CHROME_PID"
