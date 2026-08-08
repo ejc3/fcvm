@@ -111,8 +111,12 @@ impl Hypervisor for FirecrackerBackend {
         self.vm.wait().await
     }
 
-    async fn kill(&mut self) -> Result<()> {
-        self.vm.kill().await
+    fn start_kill(&mut self) -> Result<()> {
+        self.vm.start_kill()
+    }
+
+    async fn reap(&mut self) {
+        self.vm.reap().await
     }
 
     async fn stream_console(&self, console_path: &Path) -> Result<mpsc::Receiver<String>> {

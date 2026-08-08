@@ -515,16 +515,35 @@ impl VmManager {
         }
     }
 
-    /// Kill the VM process
-    pub async fn kill(&mut self) -> Result<()> {
-        if let Some(mut process) = self.process.take() {
-            info!(vm_id = %self.vm_id, "killing Firecracker process");
+    /// SIGKILL the Firecracker process without waiting for it to exit.
+    ///
+    /// Pairs with [`Self::reap`]. Keeping the handle here (rather than taking it) is what
+    /// lets the caller signal other processes before coming back to wait on this one.
+    pub fn start_kill(&mut self) -> Result<()> {
+        if let Some(ref mut process) = self.process {
+            info!(vm_id = %self.vm_id, "SIGKILL to Firecracker process");
             process
-                .kill()
-                .await
-                .context("killing Firecracker process")?;
-            let _ = process.wait().await; // Wait to clean up zombie
+                .start_kill()
+                .context("sending SIGKILL to Firecracker process")?;
         }
+        Ok(())
+    }
+
+    /// Wait for the Firecracker process to exit and reap it.
+    ///
+    /// The bulk of the wait is the kernel reclaiming the guest's address space, so this
+    /// returning means the guest memory is genuinely released — not just signalled.
+    pub async fn reap(&mut self) {
+        if let Some(mut process) = self.process.take() {
+            let _ = process.wait().await;
+        }
+    }
+
+    /// SIGKILL the Firecracker process and reap it. For callers that have nothing else to
+    /// tear down concurrently; teardown proper uses the two phases separately.
+    pub async fn kill(&mut self) -> Result<()> {
+        self.start_kill()?;
+        self.reap().await;
         Ok(())
     }
 
