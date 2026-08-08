@@ -556,6 +556,159 @@ mod tests {
         unsafe { libc::munmap(base as *mut std::ffi::c_void, len) };
     }
 
+    /// A corrupt record must cost nothing but the prefetch: the clone restores on demand,
+    /// with the RIGHT BYTES, and never hangs.
+    ///
+    /// Ported from the closed #742 branch, which had it as an end-to-end serve test. Valid
+    /// magic is the dangerous shape — it is exactly what a length or checksum check can wave
+    /// through — and a bitmap that silently replayed the WRONG pages into a guest would look
+    /// like success from the outside. So every case here pins all three outcomes: nothing
+    /// replayed, every page faulted on demand, and the bytes the guest reads are correct.
+    #[test]
+    fn a_corrupt_working_set_falls_back_to_on_demand_faulting() {
+        use crate::uffd::working_set::WorkingSetStore;
+
+        const PAGES: usize = 6;
+        let len = PAGES * PAGE;
+        // "Snapshot": page i is filled with byte i + 1.
+        let snapshot: Vec<u8> = (0..PAGES)
+            .flat_map(|i| std::iter::repeat_n(i as u8 + 1, PAGE))
+            .collect();
+
+        // Each case writes a working-set file that has a VALID `FCVMWSET` magic and is
+        // unusable after it. Building the bytes by hand (rather than via the encoder) means
+        // the test cannot be fooled by a change to the encoder itself.
+        type Corrupt = Box<dyn Fn(&std::path::Path, u64)>;
+        let cases: Vec<(&str, Corrupt)> = vec![
+            // The #742 payload: valid magic, garbage after it, shorter than a header.
+            (
+                "valid magic, garbage body",
+                Box::new(|ws: &std::path::Path, _len: u64| {
+                    std::fs::write(ws, b"FCVMWSET this is not a working set").unwrap();
+                }),
+            ),
+            // Structurally perfect for ANOTHER image: right magic, version, granule, image
+            // size, granule count and bitmap length, claiming every page. A length or
+            // checksum check waves this through; only the identity key rejects it. If it
+            // were replayed, a foreign bitmap would populate this guest.
+            (
+                "well-formed but foreign",
+                Box::new(|ws: &std::path::Path, len: u64| {
+                    let granules = len.div_ceil(GRANULE);
+                    let mut buf = Vec::new();
+                    buf.extend_from_slice(b"FCVMWSET");
+                    buf.extend_from_slice(&1u64.to_le_bytes()); // version
+                    buf.extend_from_slice(&GRANULE.to_le_bytes());
+                    buf.extend_from_slice(&len.to_le_bytes());
+                    buf.extend_from_slice(&granules.to_le_bytes());
+                    buf.extend_from_slice(&[0xAAu8; 32]); // a key that is not this image's
+                    for _ in 0..granules.div_ceil(64) {
+                        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // every page "recorded"
+                    }
+                    std::fs::write(ws, &buf).unwrap();
+                }),
+            ),
+            // A genuine record for THIS image, one byte short. Produced through the real API
+            // so the header and key are authentic and only the bitmap is truncated.
+            (
+                "authentic header, truncated bitmap",
+                Box::new(|ws: &std::path::Path, len: u64| {
+                    let image = ws.with_file_name("memory.bin");
+                    let store = WorkingSetStore::open(&image, len).unwrap();
+                    let mut observed = store.recorder();
+                    observed.insert_range(0, len);
+                    assert!(store.merge_and_persist(&observed).unwrap().persisted);
+                    let mut good = std::fs::read(ws).unwrap();
+                    good.truncate(good.len() - 1);
+                    std::fs::write(ws, &good).unwrap();
+                }),
+            ),
+        ];
+
+        for (label, write_corrupt) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let image = dir.path().join("memory.bin");
+            std::fs::write(&image, &snapshot).unwrap();
+            write_corrupt(&WorkingSetStore::path_for(&image), len as u64);
+
+            // 1. Nothing is replayed: the record is refused, so there is no plan at all.
+            let store = WorkingSetStore::open(&image, len as u64).unwrap();
+            let recorded = store.to_prefetch();
+            assert!(
+                recorded.is_empty(),
+                "[{label}] a corrupt record must never be replayed"
+            );
+
+            let base = guest_memory(len);
+            let uffd = register_missing(base, len);
+            let regions = [Region {
+                base_host_virt_addr: base as u64,
+                file_offset: 0,
+                size: len,
+            }];
+            let segments = plan(&recorded, &regions, PAGE, len as u64);
+            assert!(
+                segments.is_empty(),
+                "[{label}] nothing to prefetch means no segments"
+            );
+            run_plan(&uffd, &Source::Copy(&snapshot), &segments, PAGE);
+
+            // 2. Every page is served on demand, and 3. carries the right bytes.
+            let mut faults = 0u64;
+            for page in 0..PAGES {
+                let reader = std::thread::spawn(move || read_u8(base + page * PAGE));
+                assert!(
+                    wait_for_event(&uffd, 5000),
+                    "[{label}] page {page} must fault - the fallback is demand paging"
+                );
+                let event = uffd.read_event().unwrap().expect("queued fault");
+                let fault_addr = match event {
+                    userfaultfd::Event::Pagefault { addr, .. } => addr as usize & !(PAGE - 1),
+                    other => panic!("[{label}] expected a page fault, got {other:?}"),
+                };
+                assert_eq!(fault_addr, base + page * PAGE, "[{label}] wrong fault addr");
+                faults += 1;
+                // SAFETY: resolving the pending fault at a registered address.
+                unsafe {
+                    uffd.copy(
+                        snapshot[page * PAGE..].as_ptr() as *const std::ffi::c_void,
+                        fault_addr as *mut std::ffi::c_void,
+                        PAGE,
+                        true,
+                    )
+                }
+                .unwrap();
+                assert_eq!(
+                    reader.join().unwrap(),
+                    page as u8 + 1,
+                    "[{label}] page {page} must hold its snapshot byte"
+                );
+            }
+            assert_eq!(
+                faults, PAGES as u64,
+                "[{label}] every page must have been served on demand"
+            );
+
+            // The corrupt file is REPAIRED rather than left to poison every later restore:
+            // the image is unchanged, so publication passes the identity gate and the next
+            // server replays a correct record.
+            let mut observed = store.recorder();
+            observed.insert_range(0, 2 * GRANULE);
+            let outcome = store.merge_and_persist(&observed).unwrap();
+            assert!(
+                outcome.persisted && !outcome.superseded,
+                "[{label}] recording over a corrupt record must repair it"
+            );
+            let repaired = WorkingSetStore::open(&image, len as u64)
+                .unwrap()
+                .to_prefetch();
+            assert_eq!(repaired.len(), 2, "[{label}] the repaired record must load");
+
+            // SAFETY: unmapping our own mapping.
+            unsafe { libc::munmap(base as *mut std::ffi::c_void, len) };
+        }
+    }
+
     /// Prefetching a page the guest already faulted (EEXIST) is a no-op, not a failure: the
     /// two paths race by design.
     #[test]
