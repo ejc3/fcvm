@@ -1198,7 +1198,7 @@ pub async fn kill_process(pid: u32) {
 
 /// Wait for a snapshot serve process to be ready by polling for its socket file.
 ///
-/// The serve process creates a socket at `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
+/// The serve process creates a socket at `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}-{start_time}.sock`
 /// when it's ready to accept clone connections.
 ///
 /// # Arguments

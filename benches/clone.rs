@@ -161,8 +161,31 @@ impl CloneFixture {
 
         let serve_pid = serve_child.id();
 
+        // Read serve process's start time from /proc — the UFFD server includes
+        // (pid, pid_start_time) in its socket path to prevent collisions when PIDs
+        // are reused.
+        let serve_start_time = {
+            let stat =
+                std::fs::read_to_string(format!("/proc/{}/stat", serve_pid)).unwrap_or_else(
+                    |e| panic!("read /proc/{}/stat for serve start time: {}", serve_pid, e),
+                );
+            let after_comm = stat
+                .rsplit_once(')')
+                .expect("malformed /proc/PID/stat: no closing paren")
+                .1;
+            after_comm
+                .split_whitespace()
+                .nth(19)
+                .expect("malformed /proc/PID/stat: too few fields")
+                .parse::<u64>()
+                .expect("malformed /proc/PID/stat: starttime not a u64")
+        };
+
         // Wait for serve socket
-        let socket_path = format!("/mnt/fcvm-btrfs/uffd-{}-{}.sock", snapshot_name, serve_pid);
+        let socket_path = format!(
+            "/mnt/fcvm-btrfs/uffd-{}-{}-{}.sock",
+            snapshot_name, serve_pid, serve_start_time
+        );
         let start = Instant::now();
         loop {
             if start.elapsed() > Duration::from_secs(30) {
