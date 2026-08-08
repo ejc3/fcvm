@@ -1278,7 +1278,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             );
 
             let server = match UffdServer::new(
-                format!("implicit-{}", truncate_id(&vm_id, 8)),
+                format!("i-{}", truncate_id(&vm_id, 5)),
                 &snapshot_config.memory_path,
                 &data_dir,
                 backing,
