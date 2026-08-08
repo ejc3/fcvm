@@ -36,9 +36,11 @@ const PASTA_DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Number of recent pasta stderr lines kept for error reporting
 const PASTA_STDERR_TAIL_LINES: usize = 20;
 
-/// How long to let the async stderr reader drain the pipe after pasta exits,
-/// so the failure error can include what it actually printed.
-const PASTA_STDERR_DRAIN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+/// Upper bound on waiting for the stderr reader to reach EOF after pasta exits,
+/// so the failure error can include what it actually printed. The wait ends on
+/// EOF (pasta's exit closed the write end); this only bounds the pathological
+/// case of an inherited, still-open pipe.
+const PASTA_STDERR_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Heredoc delimiter separating the batched `ip` commands from the shell script.
 const IP_BATCH_DELIMITER: &str = "FCVM_IP_BATCH";
@@ -183,6 +185,10 @@ pub struct PastaNetwork {
     // State (populated during setup)
     pasta_process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few pasta stderr lines, for failure attribution
+    // Reader task for pasta's stderr pipe. Awaited (bounded) before rendering
+    // `stderr_tail` on the paths that report a dead pasta, so the attribution
+    // carries what pasta printed instead of racing the reader task.
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
     pid_file: Option<PathBuf>,
     loopback_ip: Option<String>, // Unique loopback IP for port forwarding (127.x.y.z)
     holder_pid: Option<u32>,     // Namespace PID (set in post_start)
@@ -200,6 +206,7 @@ impl PastaNetwork {
             guest_ipv6: GUEST_IPV6.to_string(),
             pasta_process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stderr_reader: None,
             pid_file: None,
             loopback_ip: None,
             holder_pid: None,
@@ -609,7 +616,7 @@ impl PastaNetwork {
         // unrelated bridge setup failure.
         if let Some(stderr) = child.stderr.take() {
             let stderr_tail = Arc::clone(&self.stderr_tail);
-            tokio::spawn(async move {
+            self.stderr_reader = Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     warn!(target: "pasta", "{}", line);
@@ -620,7 +627,7 @@ impl PastaNetwork {
                         tail.push_back(line);
                     }
                 }
-            });
+            }));
         }
 
         // Wait for the PID file to appear (pasta writes it once ready).
@@ -639,9 +646,14 @@ impl PastaNetwork {
 
             tokio::select! {
                 status = child.wait() => {
-                    // pasta died during startup. Give the stderr reader a moment
-                    // to drain the pipe so the error includes what pasta printed.
-                    tokio::time::sleep(PASTA_STDERR_DRAIN_DELAY).await;
+                    // pasta died during startup. Wait for the stderr reader to hit
+                    // EOF — pasta's exit closed the write end, so this returns as
+                    // soon as the pipe is drained — and the error names the cause.
+                    crate::utils::wait_for_stderr_eof(
+                        &mut self.stderr_reader,
+                        PASTA_STDERR_EOF_TIMEOUT,
+                    )
+                    .await;
                     match status {
                         Ok(status) => anyhow::bail!(
                             "pasta exited before becoming ready (status: {}){}",
@@ -738,9 +750,13 @@ impl PastaNetwork {
             };
             if let Some(status) = pasta_exit {
                 self.pasta_process = None;
-                // Give the stderr reader a moment to drain the pipe so the
-                // error includes what pasta actually printed.
-                tokio::time::sleep(PASTA_STDERR_DRAIN_DELAY).await;
+                // Wait for the stderr reader to hit EOF so the error includes what
+                // pasta actually printed before dying.
+                crate::utils::wait_for_stderr_eof(
+                    &mut self.stderr_reader,
+                    PASTA_STDERR_EOF_TIMEOUT,
+                )
+                .await;
                 anyhow::bail!(
                     "pasta exited (status: {}) before its TAP device {} appeared in the namespace{}",
                     status,
