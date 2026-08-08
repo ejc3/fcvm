@@ -1820,10 +1820,66 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // Get disk path for startup snapshot creation
         let disk_path = data_dir.join("disks/rootfs.raw");
 
-        // Wait for cancellation, VM exit, or startup snapshot trigger
+        // Watch the memory server for this clone's whole life, not just at connect time.
+        //
+        // A UFFD-restored clone's guest RAM is served by that process. If it dies, the
+        // clone does not crash and does not read zeroes — it FREEZES. Firecracker keeps
+        // its own reference to the userfaultfd ("Save UFFD in order to keep it open in
+        // the Firecracker process, as well." — firecracker `src/vmm/src/lib.rs`), so the
+        // server's death is not the final `fput`; `userfaultfd_release()` never runs, the
+        // VMAs are never unregistered, and every fault waits forever. Verified on a live
+        // clone: both vCPUs parked in `wchan=handle_userfault` 30s after its server was
+        // SIGKILLed, with no exit status, no signal, and nothing in any log.
+        //
+        // Opened HERE rather than inside the loop so that "cannot watch" fails the
+        // restore immediately, and every later wakeup means exactly one thing: it died.
+        // Only served clones need this — a file-backed restore owns its memory outright,
+        // so `serve_pid` is None and no watch exists.
+        let mut serve_watch = match serve_pid {
+            Some(pid) => crate::utils::ProcessWatch::open(pid)
+                .with_context(|| format!("watching memory server PID {pid}"))?,
+            None => None,
+        };
+        if serve_pid.is_some() && serve_watch.is_none() {
+            // Already gone before we even started: the clone is restored but nothing can
+            // serve the pages it has not touched yet. Refuse now rather than hand back a
+            // VM that will freeze on its first unserved fault.
+            bail!(
+                "memory server PID {} was already gone before this clone started; its \
+                 unfaulted pages can never be served",
+                serve_pid.unwrap_or(0)
+            );
+        }
+
+        // Wait for cancellation, VM exit, memory-server death, or startup snapshot trigger
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
+                    container_exit_code = None;
+                    break;
+                }
+                // `serve_watch` is None for file-backed restores, so this branch is
+                // disabled entirely there rather than firing on a dummy future.
+                Some(()) = async {
+                    match serve_watch.as_mut() {
+                        Some(w) => { w.exited().await; Some(()) }
+                        None => None,
+                    }
+                } => {
+                    // Every page this clone has not already faulted in just became
+                    // unreachable, and an unserved fault waits forever rather than
+                    // failing. Recording the failure is enough: the shared reporting
+                    // path below logs it, marks the state file, and the post-loop
+                    // `bail!` turns it into a non-zero exit. `cleanup_vm` then kills the
+                    // VMM — a wedged task waits in TASK_KILLABLE (`fs/userfaultfd.c`), so
+                    // SIGKILL does reap it, measured under 2s on an already-parked clone.
+                    clone_failure = Some(format!(
+                        "its memory server (PID {}) exited while this clone was still \
+                         running. Every page not already faulted in is unreachable, and \
+                         an unserved fault waits forever rather than failing, so the \
+                         clone was killed rather than left frozen with no error.",
+                        serve_pid.unwrap_or(0)
+                    ));
                     container_exit_code = None;
                     break;
                 }
@@ -1957,28 +2013,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     } else {
                         vmm_exit_failure(&status)
                     };
-                    if let Some(ref reason) = clone_failure {
-                        error!(
-                            vm_id = %vm_id,
-                            snapshot = %snapshot_name,
-                            "clone FAILED: {}",
-                            reason
-                        );
-                        // Publish the failure while the state file still exists, so anything
-                        // watching `fcvm ls` sees `failed` rather than a VM that merely
-                        // vanished. cleanup_vm deletes the file moments later; the durable
-                        // signal is this process's non-zero exit.
-                        if let Err(e) = state_manager
-                            .update_state(&vm_id, |state| {
-                                state.status = VmStatus::Failed;
-                                state.health_status = crate::state::HealthStatus::Unhealthy;
-                            })
-                            .await
-                        {
-                            warn!(vm_id = %vm_id, error = %e, "could not record clone failure in state");
-                        }
-                    }
-
                     // If in TTY mode, get exit code from TTY handle
                     if let Some(handle) = tty_handle {
                         container_exit_code = handle.join().ok().and_then(|r| r.ok());
@@ -2072,6 +2106,27 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
+    // ONE place that reports a failed clone, whichever arm set it: the VMM dying under
+    // us, or the memory server disappearing. Both are "this clone did not do its job",
+    // and both must reach a caller the same way.
+    //
+    // Deliberately BEFORE cleanup_vm: it deletes the state file moments from now, and
+    // the point of writing `failed` is that anything watching `fcvm ls` sees a failure
+    // rather than a VM that merely vanished. The durable signal is this process's
+    // non-zero exit, published by the `bail!` further down.
+    if let Some(ref reason) = clone_failure {
+        error!(vm_id = %vm_id, snapshot = %snapshot_name, "clone FAILED: {}", reason);
+        if let Err(e) = state_manager
+            .update_state(&vm_id, |state| {
+                state.status = VmStatus::Failed;
+                state.health_status = crate::state::HealthStatus::Unhealthy;
+            })
+            .await
+        {
+            warn!(vm_id = %vm_id, error = %e, "could not record clone failure in state");
+        }
+    }
+
     // Stop implicit UFFD server if running
     implicit_uffd_cancel.cancel();
     // The status listener never exits on its own (no idle timeout) — abort it.
@@ -2139,10 +2194,18 @@ fn vmm_exit_failure(status: &Result<std::process::ExitStatus>) -> Option<String>
              matching 'KILLED the clone's VMM' line."
         ));
     }
-    match status.code() {
-        Some(0) | None => None,
-        Some(code) => Some(format!("its VMM exited with status {code}")),
-    }
+    // NOT a failure classifier for the exit CODE. Firecracker's exit status does not
+    // mean what the obvious reading suggests: across one CI job, 71 of 77 VM exits were
+    // status 1 and only 6 were 0 — an orderly guest poweroff routinely exits non-zero.
+    // Sixty of those were plain (non-clone) VMs on the podman path, which never consults
+    // this function and never cared. Treating non-zero as failure here turned a normal
+    // shutdown into `clone FAILED` and made `test_trailing_args_command` red: the
+    // container exited 0, the guest powered itself off, and the VMM followed 3.4s later.
+    //
+    // The signal branch above is the one that carries meaning, and it stays. Real loss of
+    // the memory server is detected directly by the pidfd watch in the supervise loop, not
+    // inferred from a number.
+    None
 }
 
 /// Build the up-front reboot plan for a restored clone: everything needed to
