@@ -138,7 +138,19 @@ $(info Note: IPv6-only host detected - bridged tests will be skipped)
 endif
 
 
+# Per-worktree cargo target directory, on btrfs.
+#
+# The root filesystem is small and fills up (a link step then dies with
+# "No space left on device" mid-build); /mnt/fcvm-btrfs has terabytes. But the
+# directory must be UNIQUE PER WORKTREE: cargo's test-binary filename hash omits
+# the checkout path, so all fcvm worktrees collide on one name and would run
+# each other's binaries. Suffix with a hash of the absolute path so two
+# worktrees sharing a basename stay separate too.
+CARGO_TARGET_BTRFS := /mnt/fcvm-btrfs/cargo-target/$(notdir $(CURDIR))-$(shell printf '%s' '$(CURDIR)' | sha256sum | cut -c1-8)
+
 # Base test command
+# `target` is a symlink to CARGO_TARGET_BTRFS, created by the check-disk target
+# (a prerequisite of every build/test target).
 export CARGO_TARGET_DIR := target
 NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
 
@@ -306,16 +318,30 @@ check-disk:
 		curl -LsSf "$$NURL" | tar zxf - -C "$$HOME/.cargo/bin" \
 			|| PATH="$$HOME/.cargo/bin:$$PATH" cargo install cargo-nextest --locked; \
 	fi
-	@if [ -d /mnt/fcvm-btrfs ] && ! [ -L target ]; then \
-		if [ -d target ]; then \
-			echo "==> Moving existing target/ to /mnt/fcvm-btrfs/cargo-target..."; \
-			sudo rm -rf /mnt/fcvm-btrfs/cargo-target; \
-			mv target /mnt/fcvm-btrfs/cargo-target; \
-		else \
-			mkdir -p /mnt/fcvm-btrfs/cargo-target; \
+	@# Build artifacts belong on btrfs (root is small and fills up), but each
+	@# worktree needs its OWN directory. Cargo names a test binary from a hash
+	@# over package name/version/features that does NOT include the checkout
+	@# path, so every fcvm worktree produces the same filename — pointing them
+	@# all at one directory means `cargo test` in one worktree can run a binary
+	@# another worktree built. Observed 2026-08-08: a run in worktree A listed a
+	@# test that exists only in worktree B and silently omitted the one under
+	@# test, which makes red/green verification meaningless.
+	@if [ -d /mnt/fcvm-btrfs ]; then \
+		WT_TARGET="$(CARGO_TARGET_BTRFS)"; \
+		if [ -L target ] && [ "$$(readlink target)" != "$$WT_TARGET" ]; then \
+			echo "==> Repointing shared target/ → $$WT_TARGET (per-worktree)"; \
+			rm -f target; \
 		fi; \
-		ln -s /mnt/fcvm-btrfs/cargo-target target; \
-		echo "==> Symlinked target/ → /mnt/fcvm-btrfs/cargo-target"; \
+		if ! [ -L target ]; then \
+			mkdir -p "$$WT_TARGET"; \
+			if [ -d target ]; then \
+				echo "==> Moving existing target/ to $$WT_TARGET..."; \
+				mv target/* "$$WT_TARGET"/ 2>/dev/null || true; \
+				rm -rf target; \
+			fi; \
+			ln -s "$$WT_TARGET" target; \
+			echo "==> Symlinked target/ → $$WT_TARGET"; \
+		fi; \
 	fi
 	@BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$BTRFS_FREE" ] && [ "$$BTRFS_FREE" -lt 15 ]; then \
