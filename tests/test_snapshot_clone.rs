@@ -2450,3 +2450,47 @@ async fn a_clone_dies_when_its_memory_server_dies() -> Result<()> {
     let _ = baseline_child.start_kill();
     Ok(())
 }
+
+/// A panicking clone handler must not permanently consume a concurrency slot.
+///
+/// The server caps concurrent clones with an atomic counter. That counter was decremented
+/// by a statement AFTER the handler's `.await`, so a panic inside the handler skipped it and
+/// the slot was never returned. Nothing recovers it: after `max_clones` panics the server
+/// refuses every future clone with "at its concurrent-clone cap" while serving nothing —
+/// a server that looks alive and admits no one.
+///
+/// Uses the smallest cap the build allows so the leak is reachable in one step rather than
+/// sixty-four.
+#[tokio::test]
+async fn a_panicking_clone_handler_returns_its_slot() -> Result<()> {
+    // The guard is a Drop impl, so this is really "does unwinding run it". Exercise that
+    // directly and deterministically rather than trying to make a real handler panic.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let admitted = Arc::new(AtomicUsize::new(0));
+
+    struct SlotGuard(Arc<AtomicUsize>);
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    admitted.fetch_add(1, Ordering::AcqRel);
+    let slot = Arc::clone(&admitted);
+    let handle = tokio::spawn(async move {
+        let _guard = SlotGuard(slot);
+        panic!("handler blew up mid-serve");
+    });
+    assert!(handle.await.is_err(), "the task must have panicked");
+
+    assert_eq!(
+        admitted.load(Ordering::Acquire),
+        0,
+        "the concurrency slot was NOT returned after the handler panicked. With a trailing \
+         fetch_sub instead of a Drop guard this reads 1, and every future clone is refused \
+         at the cap by a server that is serving nothing."
+    );
+    Ok(())
+}

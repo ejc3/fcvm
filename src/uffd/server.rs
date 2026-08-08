@@ -94,6 +94,14 @@ fn max_clones_per_server() -> Result<usize> {
 
 /// `SO_PEERPIDFD` (Linux 6.5+). Not exposed by the `libc` crate; value from
 /// `asm-generic/socket.h`.
+///
+/// **Linux 6.5 is therefore the minimum host kernel for a UFFD restore**, and it is not
+/// negotiable: this is the only way to obtain the connecting VMM's pidfd ATOMICALLY from
+/// the accepted socket. A PID read separately can be recycled between the read and the
+/// kill, landing a SIGKILL on a stranger, so fail-closed would not be safe without it.
+/// [`require_peer_pidfd_support`] probes it at startup, so an older kernel fails loudly at
+/// `snapshot serve` rather than at the first clone that needs stopping. File-backed
+/// restores (`snapshot run --snapshot`) carry no such requirement.
 const SO_PEERPIDFD: libc::c_int = 77;
 
 /// Fetch a pidfd for the peer of a connected Unix socket, atomically (see [`PeerVmm`]).
@@ -614,8 +622,21 @@ impl UffdServer {
                             // Spawn per-connection task so the accept loop returns
                             // immediately — no blocking on slow/misbehaving clones.
                             vm_tasks.spawn(async move {
+                                // Release the slot from a Drop guard, not a trailing
+                                // statement. A panic inside serve_clone_fail_closed skips
+                                // everything after the await, so a bare fetch_sub leaks the
+                                // slot PERMANENTLY: the cap never comes back down, and after
+                                // `max_clones` panics the server refuses every future clone
+                                // as "at its concurrent-clone cap" while serving nothing.
+                                // Drop runs during unwind; a trailing statement does not.
+                                struct SlotGuard(std::sync::Arc<AtomicUsize>);
+                                impl Drop for SlotGuard {
+                                    fn drop(&mut self) {
+                                        self.0.fetch_sub(1, Ordering::AcqRel);
+                                    }
+                                }
+                                let _slot = SlotGuard(admitted_slot);
                                 serve_clone_fail_closed(&vm_id, stream, source, peer).await;
-                                admitted_slot.fetch_sub(1, Ordering::AcqRel);
                                 vm_id
                             });
                         }
@@ -646,8 +667,10 @@ impl UffdServer {
         // Stop accepting new connections, but keep serving page faults for VMs that are
         // already connected until each one closes its uffd (i.e. its Firecracker exits).
         // Aborting the handlers here would close the uffds while those VMs are still
-        // running, and the kernel would then resolve their page faults with zero pages
-        // instead of snapshot contents — silent guest memory corruption.
+        // running. Firecracker holds its OWN uffd reference for the VM's lifetime, so the
+        // kernel never falls through to zero-fill; those guests would WEDGE instead, both
+        // vCPUs parked in handle_userfault forever with no exit code and no signal.
+        // (Measured — see the PeerVmm doc for the evidence and the kernel path.)
         drop(listener);
         if !vm_tasks.is_empty() {
             info!(
