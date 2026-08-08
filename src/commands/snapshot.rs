@@ -415,6 +415,8 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     )
     .await
     .context("creating UFFD server")?;
+    // Taken before the server moves into its task; reported at shutdown.
+    let stats = server.stats();
 
     // Save serve state for tracking
     let serve_id = generate_vm_id();
@@ -668,7 +670,18 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         info!("deleted serve state");
     }
 
+    // The fault count is the number that shows whether working-set replay did its job: a
+    // restore that replayed a recorded set faults a small fraction of what the restore that
+    // recorded it did.
     println!("Memory server stopped");
+    println!("  Faults served on demand: {}", stats.faults());
+    if stats.prefetched_bytes() > 0 {
+        println!(
+            "  Replayed from the recorded working set: {} MiB in {:.1} ms",
+            stats.prefetched_bytes() / (1024 * 1024),
+            stats.prefetch_micros() as f64 / 1000.0,
+        );
+    }
 
     Ok(())
 }

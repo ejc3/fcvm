@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
@@ -14,6 +15,7 @@ use userfaultfd::{Event, FaultKind, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::paths;
+use crate::uffd::working_set::{PageSet, Run, WorkingSetStore};
 
 /// 2MiB — the only huge page size fcvm supports for guest memory.
 const HUGE_PAGE_2M: usize = 2 * 1024 * 1024;
@@ -86,7 +88,49 @@ enum PageSource {
     Copy { mmap: memmap2::Mmap },
     /// A memfd holding the whole snapshot image. Handed to each Firecracker over
     /// `SCM_RIGHTS`; faults are resolved in place with `UFFDIO_CONTINUE`.
-    Minor { backing: File },
+    Minor { backing: File, len: usize },
+}
+
+impl PageSource {
+    /// Bytes of snapshot image this source can actually serve. Offsets at or past it have
+    /// no snapshot content behind them.
+    fn usable_len(&self) -> usize {
+        match self {
+            Self::Copy { mmap } => mmap.len(),
+            Self::Minor { len, .. } => *len,
+        }
+    }
+}
+
+/// Counters for one server, shared by every clone it serves.
+///
+/// `faults` is the number that shows whether working-set replay worked: a restore that
+/// replays its recorded set should fault a small fraction of what the recording restore did.
+#[derive(Debug, Default)]
+pub struct UffdStats {
+    faults: AtomicU64,
+    prefetched_bytes: AtomicU64,
+    prefetch_micros: AtomicU64,
+}
+
+impl UffdStats {
+    /// Page faults served on demand across all clones.
+    pub fn faults(&self) -> u64 {
+        self.faults.load(Ordering::Relaxed)
+    }
+
+    /// Guest memory bulk-populated from recorded working sets across all clones.
+    ///
+    /// Bytes, not pages: clones of one snapshot can be restored at different page sizes
+    /// (`--hugepages`), so a page count would not be summable across them.
+    pub fn prefetched_bytes(&self) -> u64 {
+        self.prefetched_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Wall time spent bulk-populating, summed over clones.
+    pub fn prefetch_micros(&self) -> u64 {
+        self.prefetch_micros.load(Ordering::Relaxed)
+    }
 }
 
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
@@ -95,6 +139,24 @@ pub struct UffdServer {
     socket_path: PathBuf,
     source: Arc<PageSource>,
     backing: UffdBacking,
+    /// Records the working set of each clone and replays it into the next one. `None` when
+    /// `FCVM_UFFD_WORKING_SET=off`, or when the memory image cannot carry one.
+    working_set: Option<Arc<WorkingSetStore>>,
+    stats: Arc<UffdStats>,
+}
+
+/// Whether to record and replay restore working sets.
+///
+/// `FCVM_UFFD_WORKING_SET=off` turns both halves off, which is how a before/after latency
+/// measurement gets its control arm. An unrecognised value is an error: a typo must not
+/// silently leave the feature in the opposite state from the one the operator intended.
+fn working_set_enabled() -> Result<bool> {
+    match std::env::var("FCVM_UFFD_WORKING_SET") {
+        Ok(v) if v == "off" => Ok(false),
+        Ok(v) if v == "on" => Ok(true),
+        Ok(v) => anyhow::bail!("invalid FCVM_UFFD_WORKING_SET={v:?} (expected \"on\" or \"off\")"),
+        Err(_) => Ok(true),
+    }
 }
 
 impl UffdServer {
@@ -155,8 +217,30 @@ impl UffdServer {
                 .context("joining memfd population task")??;
                 PageSource::Minor {
                     backing: backing_file,
+                    len: mem_size,
                 }
             }
+        };
+
+        // Record what clones fault, and replay it into later clones. The store is a cache:
+        // if it cannot be opened, clones simply fault on demand, so a failure here is a
+        // warning and not the end of the restore. (The switch itself is validated first —
+        // a typo in it IS fatal.)
+        let working_set = if working_set_enabled()? {
+            match WorkingSetStore::open(mem_file_path, mem_size as u64) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(e) => {
+                    warn!(
+                        target: "uffd",
+                        error = ?e,
+                        "working-set record/replay unavailable - clones will fault on demand"
+                    );
+                    None
+                }
+            }
+        } else {
+            info!(target: "uffd", "FCVM_UFFD_WORKING_SET=off - no working-set record or replay");
+            None
         };
 
         // Ensure parent directory exists
@@ -174,6 +258,8 @@ impl UffdServer {
             socket_path: socket_path.to_path_buf(),
             source: Arc::new(source),
             backing,
+            working_set,
+            stats: Arc::new(UffdStats::default()),
         })
     }
 
@@ -185,6 +271,11 @@ impl UffdServer {
     /// The page-materialisation mode this server was created with.
     pub fn backing(&self) -> UffdBacking {
         self.backing
+    }
+
+    /// Live counters for this server (faults served, pages prefetched).
+    pub fn stats(&self) -> Arc<UffdStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Run the UFFD server (blocks until cancelled via CancellationToken)
@@ -213,6 +304,8 @@ impl UffdServer {
                             let vm_id = format!("vm-{}", next_vm_id);
                             next_vm_id += 1;
                             let source = Arc::clone(&self.source);
+                            let working_set = self.working_set.clone();
+                            let stats = Arc::clone(&self.stats);
 
                             info!(target: "uffd", vm_id = %vm_id, "new VM connection");
 
@@ -231,7 +324,7 @@ impl UffdServer {
                                             "received UFFD with {} memory regions",
                                             mappings.len()
                                         );
-                                        match handle_vm_page_faults(vm_id.clone(), uffd, mappings, source).await {
+                                        match handle_vm_page_faults(vm_id.clone(), uffd, mappings, source, working_set, stats).await {
                                             Ok(()) => info!(target: "uffd", vm_id = %vm_id, "VM handler exited cleanly"),
                                             Err(e) => error!(
                                                 target: "uffd",
@@ -434,12 +527,341 @@ fn continue_page(
     Ok(ContinueOutcome::Resolved)
 }
 
+/// One slice of a recorded run that lands inside a single guest memory region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrefetchChunk {
+    /// Offset into the snapshot memory image.
+    file_offset: usize,
+    /// Host virtual address in the clone's guest memory.
+    host_addr: usize,
+    len: usize,
+}
+
+/// Cut the recorded runs down to what THIS clone actually mapped, at ITS page granularity.
+///
+/// A recorded set is in memory-image offsets; the host addresses are per clone, so every run
+/// is intersected with the regions Firecracker just sent. Anything outside every region, or
+/// past the end of the servable image (`usable_len`), is dropped rather than clamped to
+/// something arbitrary: those pages just fault on demand.
+///
+/// The result is then trimmed to whole `page_size` granules. Sets are recorded at 4 KiB
+/// granularity so one set serves clones of any page size, but a partial huge page cannot be
+/// installed — `--hugepages` on a clone of a 4 KiB-recorded snapshot would otherwise make
+/// every ioctl fail `EINVAL`. Trimming replays the fully covered huge pages and leaves the
+/// edges to fault.
+///
+/// Runs and regions are both ordered and disjoint, so the result is ordered too — which is
+/// what makes the copies sequential in the source file.
+fn plan_chunks(
+    runs: impl Iterator<Item = Run>,
+    mappings: &[GuestRegionUffdMapping],
+    usable_len: u64,
+    page_size: u64,
+) -> Vec<PrefetchChunk> {
+    let mut chunks = Vec::new();
+    for run in runs {
+        let run_end = run.offset.saturating_add(run.len);
+        for mapping in mappings {
+            let region_end = mapping.offset.saturating_add(mapping.size as u64);
+            let start = run.offset.max(mapping.offset);
+            let end = run_end.min(region_end).min(usable_len);
+            if start >= end {
+                continue;
+            }
+            // Round in to whole granules of THIS clone's page size.
+            let start = start.next_multiple_of(page_size);
+            let end = end - (end % page_size);
+            if start >= end {
+                continue;
+            }
+            let Some(host_addr) = mapping
+                .base_host_virt_addr
+                .checked_add(start - mapping.offset)
+                .and_then(|a| usize::try_from(a).ok())
+            else {
+                continue;
+            };
+            let (Ok(file_offset), Ok(len)) = (usize::try_from(start), usize::try_from(end - start))
+            else {
+                continue;
+            };
+            chunks.push(PrefetchChunk {
+                file_offset,
+                host_addr,
+                len,
+            });
+        }
+    }
+    chunks
+}
+
+/// Upper bound on the bytes one replay ioctl moves.
+///
+/// The point of replay is one ioctl per run instead of one per page, but a run can be
+/// hundreds of megabytes and the handler cannot drain a demand fault while it is inside the
+/// ioctl. 2 MiB caps that stall at ~400 us of `memcpy` while still amortising the ioctl over
+/// 512 4 KiB pages, and it is exactly one huge page, so a hugepage clone never gets a chunk
+/// that splits a granule.
+const REPLAY_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+/// How populating one chunk of a recorded working set ended.
+enum PopulateOutcome {
+    /// Bytes installed in the clone (short of the request when pages were already present).
+    Populated(usize),
+    /// The clone exited (`ESRCH`); stop prefetching, there is nobody left to serve.
+    VmGone,
+}
+
+/// Bulk-populate one contiguous chunk — one ioctl for the whole run where the kernel allows
+/// it, which is the entire point: 56k single-page ioctls become a few hundred bulk ones.
+///
+/// Prefetching is best effort by construction: nothing is blocked on these pages, so every
+/// way the kernel can decline (a page already present, `mmap_changing`, a short count, an
+/// unexpected errno) just ends this chunk and leaves the rest to fault on demand. Each
+/// iteration advances by at least one granule, so the loop cannot spin.
+fn populate_chunk(
+    uffd: &Uffd,
+    source: &PageSource,
+    chunk: &PrefetchChunk,
+    page_size: usize,
+) -> PopulateOutcome {
+    let mut done = 0usize;
+    while done < chunk.len {
+        // Never ask for more than REPLAY_CHUNK_BYTES at once, but never ask for less than one
+        // page either — a sub-page request is not addressable.
+        let remaining = (chunk.len - done).min(REPLAY_CHUNK_BYTES.max(page_size));
+        let dst = (chunk.host_addr + done) as *mut std::ffi::c_void;
+        let step = match source {
+            PageSource::Copy { mmap } => {
+                let src_start = chunk.file_offset + done;
+                // `plan_chunks` clamped the chunk to `source.usable_len()`, so this range is
+                // inside the mapping.
+                let src = &mmap[src_start..src_start + remaining];
+                // SAFETY: `dst` is inside the clone's uffd-registered guest memory, which
+                // only the kernel writes through this ioctl; `src` is a live borrow of the
+                // read-only snapshot mapping for the whole call.
+                match unsafe { uffd.copy(src.as_ptr().cast(), dst, remaining, true) } {
+                    Ok(n) if n > 0 && n <= remaining => n,
+                    // EEXIST: the granule at `dst` is already present (a guest thread beat
+                    // us to it). Skip it and carry on with the rest of the chunk.
+                    Err(userfaultfd::Error::CopyFailed(errno))
+                        if (errno as i32) == libc::EEXIST =>
+                    {
+                        page_size
+                    }
+                    Err(userfaultfd::Error::CopyFailed(errno)) if (errno as i32) == libc::ESRCH => {
+                        return PopulateOutcome::VmGone;
+                    }
+                    // A partial copy reports how far it got. Anything outside 1..=remaining
+                    // is not progress — notably a zero-progress EAGAIN (`mmap_changing`),
+                    // which the crate reports as a nonsense byte count — so stop.
+                    Err(userfaultfd::Error::PartiallyCopied(n)) if n > 0 && n <= remaining => n,
+                    Ok(_) | Err(_) => break,
+                }
+            }
+            // MINOR: the folio is already in the shared memfd's page cache; CONTINUE just
+            // installs the PTE. No source pointer, no copy.
+            // SAFETY: `dst` is inside the clone's uffd-registered guest memory.
+            PageSource::Minor { .. } => match uffd.r#continue(dst, remaining, true) {
+                Ok(n) => match usize::try_from(n) {
+                    Ok(n) if n > 0 && n <= remaining => n,
+                    _ => break,
+                },
+                Err(e) if continue_hit_present_page(&e) => page_size,
+                Err(e) if continue_vm_gone(&e) => return PopulateOutcome::VmGone,
+                // EAGAIN here means `mmap_changing`. A real fault would be parked and
+                // retried because a vCPU is asleep on it; a prefetch has nobody waiting.
+                Err(_) => break,
+            },
+        };
+        done += step;
+    }
+    PopulateOutcome::Populated(done)
+}
+
+/// Replay a snapshot's recorded working set into a freshly restored clone.
+///
+/// Runs right after the handshake, which is the earliest moment the uffd exists and is
+/// before the guest can run: Firecracker is still loading the vmstate, and fcvm only sends
+/// `Resumed` once that returns. Faults raised while this is in flight are not lost — they
+/// sit in the uffd queue and are drained by the handler immediately afterwards — and every
+/// page this installs first is a fault that never happens.
+///
+/// Returns the bytes actually installed.
+fn prefetch_working_set(
+    uffd: &Uffd,
+    vm_id: &str,
+    mappings: &[GuestRegionUffdMapping],
+    source: &PageSource,
+    set: &PageSet,
+    page_size: usize,
+) -> u64 {
+    let chunks = plan_chunks(
+        set.runs(),
+        mappings,
+        source.usable_len() as u64,
+        page_size as u64,
+    );
+    let mut bytes = 0usize;
+    let mut declined = 0usize;
+    for chunk in &chunks {
+        match populate_chunk(uffd, source, chunk, page_size) {
+            PopulateOutcome::Populated(n) => {
+                bytes += n;
+                declined += chunk.len - n;
+            }
+            PopulateOutcome::VmGone => {
+                info!(target: "uffd", vm_id = %vm_id, "clone exited during working-set replay");
+                break;
+            }
+        }
+    }
+    if declined > 0 {
+        debug!(
+            target: "uffd",
+            vm_id = %vm_id,
+            declined_bytes = declined,
+            "some recorded pages were not populated - they will fault on demand"
+        );
+    }
+    bytes as u64
+}
+
+/// The single per-fault observation point for one clone's handler.
+///
+/// One `record()` call per resolved fault feeds both consumers, so the hot loop never grows
+/// a second instrumentation path:
+///
+/// * the working set this snapshot replays into the NEXT clone, and
+/// * the per-fault trace (`FCVM_UFFD_FAULT_TRACE=<dir>`) the benchmark tooling reads —
+///   `<dir>/<serve_pid>-<vm_id>.faults`, little-endian `(image_offset, ns_before, ns_after)`
+///   u64 triples relative to handler start.
+///
+/// Publishing happens in [`Drop`] so that EVERY handler exit contributes: clean VM exit,
+/// `VmGone` mid-CONTINUE, or an error return.
+struct FaultRecorder {
+    store: Option<Arc<WorkingSetStore>>,
+    observed: PageSet,
+    vm_id: String,
+    trace_path: Option<PathBuf>,
+    trace: Vec<[u64; 3]>,
+    origin: std::time::Instant,
+}
+
+impl FaultRecorder {
+    fn new(store: Option<Arc<WorkingSetStore>>, vm_id: &str, origin: std::time::Instant) -> Self {
+        let trace_path = std::env::var("FCVM_UFFD_FAULT_TRACE").ok().and_then(|dir| {
+            let dir = PathBuf::from(dir);
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => Some(dir.join(format!("{}-{}.faults", std::process::id(), vm_id))),
+                Err(e) => {
+                    warn!(
+                        target: "uffd",
+                        dir = %dir.display(),
+                        error = %e,
+                        "FCVM_UFFD_FAULT_TRACE directory not usable - fault tracing disabled"
+                    );
+                    None
+                }
+            }
+        });
+        let observed = match store.as_ref() {
+            Some(s) => s.recorder(),
+            None => PageSet::empty(0),
+        };
+        Self {
+            store,
+            observed,
+            vm_id: vm_id.to_string(),
+            trace_path,
+            trace: Vec::new(),
+            origin,
+        }
+    }
+
+    /// True when the trace half wants timestamps, so the handler can skip two clock reads
+    /// per fault when nobody is measuring.
+    #[inline]
+    fn wants_timing(&self) -> bool {
+        self.trace_path.is_some()
+    }
+
+    #[inline]
+    fn now_ns(&self) -> u64 {
+        self.origin.elapsed().as_nanos() as u64
+    }
+
+    /// Record one resolved fault covering `[image_offset, image_offset + len)`.
+    #[inline]
+    fn record(&mut self, image_offset: u64, len: u64, before_ns: u64, after_ns: u64) {
+        if self.store.is_some() {
+            self.observed.insert_range(image_offset, len);
+        }
+        if self.trace_path.is_some() {
+            self.trace.push([image_offset, before_ns, after_ns]);
+        }
+    }
+}
+
+impl Drop for FaultRecorder {
+    fn drop(&mut self) {
+        if let Some(path) = self.trace_path.take() {
+            let mut buf = Vec::with_capacity(self.trace.len() * 24);
+            for rec in &self.trace {
+                for v in rec {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            match std::fs::write(&path, &buf) {
+                Ok(()) => info!(
+                    target: "uffd",
+                    path = %path.display(),
+                    faults = self.trace.len(),
+                    "wrote UFFD fault trace"
+                ),
+                Err(e) => warn!(
+                    target: "uffd",
+                    path = %path.display(),
+                    error = %e,
+                    "failed to write UFFD fault trace"
+                ),
+            }
+        }
+
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        if self.observed.is_empty() {
+            return;
+        }
+        match store.merge_and_persist(&self.observed) {
+            Ok(outcome) => info!(
+                target: "uffd",
+                vm_id = %self.vm_id,
+                observed = self.observed.len(),
+                added = outcome.added,
+                total = outcome.total,
+                persisted = outcome.persisted,
+                "merged this clone's faults into the snapshot's working set"
+            ),
+            Err(e) => warn!(
+                target: "uffd",
+                vm_id = %self.vm_id,
+                error = ?e,
+                "could not persist the working set - the next restore faults on demand"
+            ),
+        }
+    }
+}
+
 /// Handle page faults for a single VM
 async fn handle_vm_page_faults(
     vm_id: String,
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
     source: Arc<PageSource>,
+    working_set: Option<Arc<WorkingSetStore>>,
+    stats: Arc<UffdStats>,
 ) -> Result<()> {
     // Derive page size from mappings (all regions use the same page size)
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
@@ -452,6 +874,50 @@ async fn handle_vm_page_faults(
         "page fault handler started"
     );
 
+    let start_time = std::time::Instant::now();
+
+    // Replay this snapshot's recorded working set before the guest asks for it. On a
+    // blocking thread: this is a multi-hundred-megabyte copy, and stalling the reactor
+    // would stall every other clone's handler with it.
+    let recorded = working_set
+        .as_ref()
+        .map(|s| s.to_prefetch())
+        .filter(|s| !s.is_empty());
+    let uffd = match recorded {
+        Some(set) => {
+            let source = Arc::clone(&source);
+            let vm = vm_id.clone();
+            let regions = mappings.clone();
+            let started = std::time::Instant::now();
+            let (uffd, bytes) = tokio::task::spawn_blocking(move || {
+                let bytes = prefetch_working_set(&uffd, &vm, &regions, &source, &set, page_size);
+                (uffd, bytes)
+            })
+            .await
+            .context("joining working-set replay task")?;
+            let elapsed = started.elapsed();
+            stats.prefetched_bytes.fetch_add(bytes, Ordering::Relaxed);
+            stats
+                .prefetch_micros
+                .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+            info!(
+                target: "uffd",
+                vm_id = %vm_id,
+                pages = bytes / page_size as u64,
+                mib = bytes / (1024 * 1024),
+                elapsed_ms = elapsed.as_millis(),
+                "replayed the recorded working set before the guest resumed"
+            );
+            uffd
+        }
+        None => uffd,
+    };
+
+    // The single per-fault observation point: it feeds the working set the NEXT clone
+    // replays and the FCVM_UFFD_FAULT_TRACE measurement trace. Its Drop publishes both,
+    // so every exit path below contributes what this clone learned.
+    let mut recorder = FaultRecorder::new(working_set, &vm_id, start_time);
+
     // Set UFFD to non-blocking mode for async integration
     let uffd_fd = uffd.as_raw_fd();
     unsafe {
@@ -463,7 +929,6 @@ async fn handle_vm_page_faults(
     let async_uffd = AsyncFd::new(uffd).context("creating AsyncFd for UFFD")?;
 
     let mut fault_count = 0u64;
-    let start_time = std::time::Instant::now();
 
     // MINOR faults whose UFFDIO_CONTINUE came back `EAGAIN` (`mmap_changing` was set),
     // keyed by page address, value = retry attempts so far. The faulting vCPU sleeps
@@ -514,6 +979,8 @@ async fn handle_vm_page_faults(
                 &mut fault_count,
                 &mut pending_continues,
                 start_time,
+                &mut recorder,
+                &stats,
             )? {
                 return Ok(()); // VM exited
             }
@@ -555,6 +1022,21 @@ async fn handle_vm_page_faults(
     }
 }
 
+/// Note one resolved fault against both recorder outputs.
+///
+/// Split out so the several resolution paths below (MINOR continue, zero-fill past the end
+/// of the image, EEXIST, ordinary copy) all report through one call and none can be
+/// forgotten. The closing timestamp is only read when something is consuming timings.
+#[inline]
+fn record_fault(recorder: &mut FaultRecorder, offset_in_file: usize, len: usize, t0: u64) {
+    let t1 = if recorder.wants_timing() {
+        recorder.now_ns()
+    } else {
+        0
+    };
+    recorder.record(offset_in_file as u64, len as u64, t0, t1);
+}
+
 /// Drain every ready event from the uffd. Returns `Ok(false)` when the VM has exited
 /// (uffd closed), `Ok(true)` to keep serving.
 #[allow(clippy::too_many_arguments)]
@@ -568,6 +1050,8 @@ fn drain_events(
     fault_count: &mut u64,
     pending_continues: &mut std::collections::BTreeMap<usize, u32>,
     start_time: std::time::Instant,
+    recorder: &mut FaultRecorder,
+    stats: &UffdStats,
 ) -> Result<bool> {
     {
         // Read all available events (non-blocking)
@@ -598,6 +1082,7 @@ fn drain_events(
             match event {
                 Event::Pagefault { addr, kind, .. } => {
                     *fault_count += 1;
+                    stats.faults.fetch_add(1, Ordering::Relaxed);
 
                     // Find which memory region this address belongs to
                     let fault_page = (addr as usize) & page_mask;
@@ -617,6 +1102,22 @@ fn drain_events(
                             base_host
                         ));
                     }
+
+                    // Offset of this granule within the snapshot memory image. Computed for
+                    // both backings — COPY needs it to find the bytes, MINOR does not — because
+                    // it is the only fault key that means anything across clones: host virtual
+                    // addresses are per process, image offsets are not.
+                    let offset_in_region = fault_page - base_host;
+                    let mapping_offset = usize::try_from(mapping.offset)
+                        .map_err(|_| anyhow!("mapping offset exceeds host address space"))?;
+                    let offset_in_file = mapping_offset
+                        .checked_add(offset_in_region)
+                        .ok_or_else(|| anyhow!("mapping offset overflow"))?;
+                    let fault_t0 = if recorder.wants_timing() {
+                        recorder.now_ns()
+                    } else {
+                        0
+                    };
 
                     let mmap = match source {
                         PageSource::Minor { .. } => {
@@ -656,17 +1157,15 @@ fn drain_events(
                                     pending_continues.entry(fault_page).or_insert(0);
                                 }
                             }
+                            // Recorded when the EVENT is seen, not when the ioctl lands: the
+                            // guest touched this page either way, so it belongs in the
+                            // working set even if the CONTINUE is parked for retry.
+                            record_fault(recorder, offset_in_file, page_size, fault_t0);
                             continue;
                         }
                         PageSource::Copy { mmap } => mmap,
                     };
 
-                    let offset_in_region = fault_page - base_host;
-                    let mapping_offset = usize::try_from(mapping.offset)
-                        .map_err(|_| anyhow!("mapping offset exceeds host address space"))?;
-                    let offset_in_file = mapping_offset
-                        .checked_add(offset_in_region)
-                        .ok_or_else(|| anyhow!("mapping offset overflow"))?;
                     let mmap_len = mmap.len();
 
                     if offset_in_file >= mmap_len {
@@ -696,6 +1195,7 @@ fn drain_events(
                             );
                             return Err(e.into());
                         }
+                        record_fault(recorder, offset_in_file, page_size, fault_t0);
                         continue;
                     }
 
@@ -742,6 +1242,7 @@ fn drain_events(
                                     fault_addr = format!("0x{:x}", fault_page),
                                     "UFFD copy skipped - page already filled (EEXIST)"
                                 );
+                                record_fault(recorder, offset_in_file, page_size, fault_t0);
                                 continue;
                             }
                         }
@@ -757,6 +1258,8 @@ fn drain_events(
                         );
                         return Err(e.into());
                     }
+
+                    record_fault(recorder, offset_in_file, page_size, fault_t0);
                 }
                 Event::Remove { start, end } => {
                     // Balloon device removed pages - zero them
@@ -888,7 +1391,7 @@ fn drain_events(
 /// - 16384 (16KB): ARM64 with CONFIG_ARM64_16K_PAGES (future)
 ///
 /// The `page_size` field is required — our Firecracker fork always sends it.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 struct GuestRegionUffdMapping {
     base_host_virt_addr: u64,
     size: usize,
@@ -959,7 +1462,7 @@ async fn handshake(
     // Keep non-blocking — AsyncFd handles readiness
     let async_stream = AsyncFd::new(std_stream).context("creating AsyncFd for handshake socket")?;
 
-    if let PageSource::Minor { backing } = source {
+    if let PageSource::Minor { backing, .. } = source {
         send_backing_fd(&async_stream, backing).await?;
     }
 
@@ -1620,5 +2123,551 @@ mod tests {
             pristine[8192], 0xCD,
             "clone write must not reach the snapshot"
         );
+    }
+
+    // =========================================================================
+    // Working-set replay: cutting a recorded set down to what a clone mapped.
+    // =========================================================================
+
+    fn mapping(base: u64, size: usize, offset: u64) -> GuestRegionUffdMapping {
+        GuestRegionUffdMapping {
+            base_host_virt_addr: base,
+            size,
+            offset,
+            page_size: 4096,
+        }
+    }
+
+    #[test]
+    fn plan_chunks_translates_image_offsets_to_this_clones_addresses() {
+        let mappings = [
+            mapping(0x1000_0000, 3 * 4096, 0),
+            mapping(0x9000_0000, 3 * 4096, 3 * 4096),
+        ];
+        // One run spanning both regions must be split at the region boundary — the two
+        // regions are contiguous in the image but nowhere near each other in the clone.
+        let runs = [Run {
+            offset: 0,
+            len: 6 * 4096,
+        }];
+        let chunks = plan_chunks(runs.into_iter(), &mappings, 6 * 4096, 4096);
+        assert_eq!(
+            chunks,
+            vec![
+                PrefetchChunk {
+                    file_offset: 0,
+                    host_addr: 0x1000_0000,
+                    len: 3 * 4096
+                },
+                PrefetchChunk {
+                    file_offset: 3 * 4096,
+                    host_addr: 0x9000_0000,
+                    len: 3 * 4096
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_chunks_drops_what_this_clone_did_not_map() {
+        let mappings = [mapping(0x2000_0000, 4 * 4096, 4096)];
+        let runs = [
+            // Entirely before the region.
+            Run {
+                offset: 0,
+                len: 4096,
+            },
+            // Straddles the start: only the mapped tail survives.
+            Run {
+                offset: 0,
+                len: 3 * 4096,
+            },
+            // Entirely past the region.
+            Run {
+                offset: 100 * 4096,
+                len: 4096,
+            },
+        ];
+        let chunks = plan_chunks(runs.into_iter(), &mappings, 1024 * 4096, 4096);
+        assert_eq!(
+            chunks,
+            vec![PrefetchChunk {
+                file_offset: 4096,
+                host_addr: 0x2000_0000,
+                len: 2 * 4096
+            }],
+            "unmapped offsets must be dropped, never clamped onto some other page"
+        );
+    }
+
+    #[test]
+    fn plan_chunks_stops_at_the_end_of_the_servable_image() {
+        // A recorded run that reaches past the bytes the server can actually serve (a
+        // truncated image) is cut, not clamped: the tail faults on demand and takes the
+        // existing zero-fill path.
+        let mappings = [mapping(0x3000_0000, 8 * 4096, 0)];
+        let runs = [Run {
+            offset: 0,
+            len: 8 * 4096,
+        }];
+        let chunks = plan_chunks(runs.into_iter(), &mappings, 5 * 4096, 4096);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len, 5 * 4096);
+    }
+
+    #[test]
+    fn plan_chunks_trims_a_4k_recorded_set_to_whole_huge_pages() {
+        // `--hugepages` on a clone of a snapshot whose set was recorded by 4 KiB clones.
+        // A partial huge page cannot be installed (EINVAL), so only the whole ones are
+        // replayed and the ragged edges fault on demand.
+        const HUGE: u64 = 2 * 1024 * 1024;
+        let mappings = [mapping(0x4000_0000, 8 * HUGE as usize, 0)];
+        let runs = [
+            // Straddles two huge pages, covering neither completely.
+            Run {
+                offset: HUGE - 4096,
+                len: 2 * 4096,
+            },
+            // Covers huge pages 2 and 3 completely, plus a ragged page either side.
+            Run {
+                offset: 2 * HUGE - 4096,
+                len: 2 * HUGE + 2 * 4096,
+            },
+        ];
+        let chunks = plan_chunks(runs.into_iter(), &mappings, 8 * HUGE, HUGE);
+        assert_eq!(
+            chunks,
+            vec![PrefetchChunk {
+                file_offset: 2 * HUGE as usize,
+                host_addr: 0x4000_0000 + 2 * HUGE as usize,
+                len: 2 * HUGE as usize,
+            }]
+        );
+    }
+
+    // =========================================================================
+    // Record -> persist -> replay, against a real userfaultfd.
+    //
+    // The clones here are what Firecracker is to this server: a mapping, a userfaultfd
+    // registered over it, and the handshake. That makes these tests exercise the real
+    // handshake, the real replay ioctls and the real fault handler — no VM required.
+    // =========================================================================
+
+    const PAGE: usize = 4096;
+    /// 4 MiB of guest memory, of which 3 MiB is recorded — both bigger than
+    /// [`REPLAY_CHUNK_BYTES`], so replay has to span several ioctls per run.
+    const CLONE_PAGES: usize = 1024;
+    const RECORDED_PAGES: usize = 768;
+
+    /// Stamp identifying one page of the fake snapshot. Distinct per page so a chunk placed
+    /// at the wrong address is caught, and never 0 so a zero-filled page cannot pass.
+    fn page_stamp(page: usize) -> u32 {
+        page as u32 | 0x8000_0000
+    }
+
+    struct TestSnapshot {
+        dir: PathBuf,
+        mem: PathBuf,
+        socket: PathBuf,
+    }
+
+    impl TestSnapshot {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "fcvm-ws-e2e-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mem = dir.join("memory.bin");
+            let mut image = vec![0xA5u8; CLONE_PAGES * PAGE];
+            for page in 0..CLONE_PAGES {
+                image[page * PAGE..page * PAGE + 4]
+                    .copy_from_slice(&page_stamp(page).to_le_bytes());
+            }
+            std::fs::write(&mem, &image).unwrap();
+            Self {
+                dir: dir.clone(),
+                mem,
+                socket: dir.join("uffd.sock"),
+            }
+        }
+
+        fn image_digest(&self) -> Vec<u8> {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(std::fs::read(&self.mem).unwrap());
+            h.finalize().to_vec()
+        }
+
+        /// Record `pages` as this snapshot's working set through the production writer.
+        fn record_working_set(&self, pages: std::ops::Range<usize>) {
+            let store = WorkingSetStore::open(&self.mem, (CLONE_PAGES * PAGE) as u64).unwrap();
+            let mut observed = store.recorder();
+            observed.insert_range(
+                (pages.start * PAGE) as u64,
+                ((pages.end - pages.start) * PAGE) as u64,
+            );
+            assert!(store.merge_and_persist(&observed).unwrap().persisted);
+        }
+
+        async fn serve(&self, backing: UffdBacking) -> Arc<UffdStats> {
+            let server =
+                UffdServer::new_with_path("e2e".to_string(), &self.mem, &self.socket, backing)
+                    .await
+                    .unwrap();
+            let stats = server.stats();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            // Deliberately not cancelled at the end of the test: the clones below live in
+            // this process, so their mm never dies and their handlers never see the uffd
+            // close. Dropping the runtime tears the tasks down instead.
+            tokio::spawn(async move { server.run(cancel).await });
+            stats
+        }
+    }
+
+    impl Drop for TestSnapshot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A stand-in for a restoring Firecracker: guest memory mapped the way the backing
+    /// requires, a userfaultfd registered over it, and the real handshake.
+    struct FakeClone {
+        map: memmap2::MmapMut,
+        /// Kept open for the clone's life, exactly as Firecracker keeps its own copy.
+        _uffd: Uffd,
+        _stream: std::os::unix::net::UnixStream,
+        /// MINOR only: the shared backing the server handed over.
+        backing_fd: Option<File>,
+    }
+
+    impl FakeClone {
+        fn connect(socket: &Path, mem_len: usize, backing: UffdBacking) -> Self {
+            let stream = Self::connect_socket(socket);
+
+            // MINOR mode: the server speaks first, handing over the shared memfd that this
+            // clone maps MAP_PRIVATE.
+            let (mut map, backing_fd) = match backing {
+                UffdBacking::Copy => (MmapOptions::new().len(mem_len).map_anon().unwrap(), None),
+                UffdBacking::Minor { .. } => {
+                    let mut hello = [0u8; 64];
+                    let (_, fd) = stream.recv_with_fd(&mut hello).unwrap();
+                    let fd = fd.expect("server must send the backing memfd first");
+                    let map = unsafe { MmapOptions::new().len(mem_len).map_copy(&fd).unwrap() };
+                    (map, Some(fd))
+                }
+            };
+
+            let base = map.as_mut_ptr() as usize;
+            let uffd = userfaultfd::UffdBuilder::new()
+                .close_on_exec(true)
+                .non_blocking(false)
+                .user_mode_only(true)
+                .create()
+                .unwrap();
+            let mode = match backing {
+                UffdBacking::Copy => userfaultfd::RegisterMode::MISSING,
+                UffdBacking::Minor { .. } => userfaultfd::RegisterMode::MINOR,
+            };
+            uffd.register_with_mode(base as *mut std::ffi::c_void, mem_len, mode)
+                .unwrap();
+
+            let json = format!(
+                "[{{\"base_host_virt_addr\":{base},\"size\":{mem_len},\"offset\":0,\
+                  \"page_size\":{PAGE}}}]"
+            );
+            stream
+                .send_with_fd(json.as_bytes(), uffd.as_raw_fd())
+                .unwrap();
+
+            Self {
+                map,
+                _uffd: uffd,
+                _stream: stream,
+                backing_fd,
+            }
+        }
+
+        /// Retry until the server has bound its socket. Bounded by a deadline and driven by
+        /// the connect result itself, so it ends the moment the server is up.
+        fn connect_socket(socket: &Path) -> std::os::unix::net::UnixStream {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match std::os::unix::net::UnixStream::connect(socket) {
+                    Ok(s) => return s,
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        let _ = e;
+                    }
+                    Err(e) => panic!("server never bound {}: {e}", socket.display()),
+                }
+            }
+        }
+
+        /// Read a page's stamp — this is what raises a fault when the page is not already
+        /// present.
+        fn read_page(&self, page: usize) -> u32 {
+            unsafe { std::ptr::read_volatile(self.map.as_ptr().add(page * PAGE) as *const u32) }
+        }
+
+        fn write_page(&mut self, page: usize, stamp: u32) {
+            unsafe {
+                std::ptr::write_volatile(self.map.as_mut_ptr().add(page * PAGE) as *mut u32, stamp)
+            }
+        }
+
+        /// The pristine snapshot stamp behind a MINOR clone's private mapping.
+        fn backing_page(&self, page: usize) -> u32 {
+            let fd = self.backing_fd.as_ref().expect("MINOR clones only");
+            let map = unsafe { MmapOptions::new().map_copy_read_only(fd).unwrap() };
+            u32::from_le_bytes(map[page * PAGE..page * PAGE + 4].try_into().unwrap())
+        }
+    }
+
+    /// Poll an observable condition to a deadline. Not a fixed delay: it returns as soon as
+    /// the condition holds, and fails loudly instead of hanging if it never does.
+    async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The core claim, on the default (COPY) backing: a recorded set is replayed in bulk
+    /// before the clone touches anything, those pages then cost ZERO faults, pages outside
+    /// the set still fault and are served correctly, and one clone's writes are invisible to
+    /// the other and to the snapshot file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn working_set_replay_serves_pages_without_faults_and_keeps_clones_isolated() {
+        let snap = TestSnapshot::new("copy");
+        let digest_before = snap.image_digest();
+        snap.record_working_set(0..RECORDED_PAGES);
+
+        let stats = snap.serve(UffdBacking::Copy).await;
+        let mem_len = CLONE_PAGES * PAGE;
+
+        let first = FakeClone::connect(&snap.socket, mem_len, UffdBacking::Copy);
+        wait_for("first clone's replay", || {
+            stats.prefetched_bytes() >= (RECORDED_PAGES * PAGE) as u64
+        })
+        .await;
+        assert_eq!(
+            stats.faults(),
+            0,
+            "replay must not go through the fault path"
+        );
+
+        let second = FakeClone::connect(&snap.socket, mem_len, UffdBacking::Copy);
+        wait_for("second clone's replay", || {
+            stats.prefetched_bytes() >= (2 * RECORDED_PAGES * PAGE) as u64
+        })
+        .await;
+
+        // Every replayed page is readable with the right content and no fault.
+        let (first, second) = tokio::task::spawn_blocking(move || {
+            for page in 0..RECORDED_PAGES {
+                assert_eq!(
+                    first.read_page(page),
+                    page_stamp(page),
+                    "replayed page {page} has the wrong content"
+                );
+                assert_eq!(
+                    second.read_page(page),
+                    page_stamp(page),
+                    "replayed page {page} has the wrong content in the second clone"
+                );
+            }
+            (first, second)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.faults(),
+            0,
+            "{} pages were replayed, so reading them must raise no faults",
+            RECORDED_PAGES
+        );
+
+        // A page outside the recorded set still faults and is still served correctly —
+        // a partial list degrades to on-demand faulting, it does not break the clone.
+        let first = tokio::task::spawn_blocking(move || {
+            let unrecorded = CLONE_PAGES - 1;
+            assert_eq!(first.read_page(unrecorded), page_stamp(unrecorded));
+            first
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.faults(),
+            1,
+            "exactly the one unrecorded page should have faulted"
+        );
+
+        // Isolation: one clone writes into a replayed page; the other must not see it.
+        let (first, second) = tokio::task::spawn_blocking(move || {
+            let mut first = first;
+            first.write_page(5, 0x1111_1111);
+            assert_eq!(first.read_page(5), 0x1111_1111);
+            assert_eq!(
+                second.read_page(5),
+                page_stamp(5),
+                "one clone's write leaked into another clone"
+            );
+            (first, second)
+        })
+        .await
+        .unwrap();
+        drop((first, second));
+
+        assert_eq!(
+            snap.image_digest(),
+            digest_before,
+            "the snapshot memory image must be byte-identical after replay + a clone write"
+        );
+    }
+
+    /// Same claim on the MINOR backing, where it is not free: replay installs PTEs onto
+    /// folios SHARED by every clone, so a guest write must copy-on-write instead of
+    /// modifying the shared page. (This is the mode where a MAP_SHARED mistake once
+    /// corrupted a golden snapshot.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn working_set_replay_on_shared_backing_still_isolates_clones() {
+        let snap = TestSnapshot::new("minor");
+        let digest_before = snap.image_digest();
+        snap.record_working_set(0..RECORDED_PAGES);
+
+        let backing = UffdBacking::Minor { hugepages: false };
+        let stats = snap.serve(backing).await;
+        let mem_len = CLONE_PAGES * PAGE;
+
+        let first = FakeClone::connect(&snap.socket, mem_len, backing);
+        wait_for("first clone's replay", || {
+            stats.prefetched_bytes() >= (RECORDED_PAGES * PAGE) as u64
+        })
+        .await;
+        let second = FakeClone::connect(&snap.socket, mem_len, backing);
+        wait_for("second clone's replay", || {
+            stats.prefetched_bytes() >= (2 * RECORDED_PAGES * PAGE) as u64
+        })
+        .await;
+        assert_eq!(
+            stats.faults(),
+            0,
+            "replay must not go through the fault path"
+        );
+
+        let (first, second) = tokio::task::spawn_blocking(move || {
+            let mut first = first;
+            for page in 0..RECORDED_PAGES {
+                assert_eq!(first.read_page(page), page_stamp(page));
+                assert_eq!(second.read_page(page), page_stamp(page));
+            }
+            first.write_page(7, 0x2222_2222);
+            assert_eq!(first.read_page(7), 0x2222_2222);
+            assert_eq!(
+                second.read_page(7),
+                page_stamp(7),
+                "a write to a CONTINUE-mapped page leaked into another clone"
+            );
+            assert_eq!(
+                first.backing_page(7),
+                page_stamp(7),
+                "a write to a CONTINUE-mapped page reached the shared backing"
+            );
+            (first, second)
+        })
+        .await
+        .unwrap();
+        assert_eq!(stats.faults(), 0);
+        drop((first, second));
+
+        assert_eq!(
+            snap.image_digest(),
+            digest_before,
+            "the snapshot memory image must be byte-identical"
+        );
+    }
+
+    /// A corrupt list must cost nothing but the prefetch: the clone restores on demand,
+    /// with the right bytes, and never hangs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_corrupt_working_set_falls_back_to_on_demand_faulting() {
+        let snap = TestSnapshot::new("corrupt");
+        std::fs::write(
+            WorkingSetStore::path_for(&snap.mem),
+            b"FCVMWSET this is not a working set",
+        )
+        .unwrap();
+
+        let stats = snap.serve(UffdBacking::Copy).await;
+        let clone = FakeClone::connect(&snap.socket, CLONE_PAGES * PAGE, UffdBacking::Copy);
+
+        tokio::task::spawn_blocking(move || {
+            for page in 0..CLONE_PAGES {
+                assert_eq!(clone.read_page(page), page_stamp(page));
+            }
+            clone
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(stats.prefetched_bytes(), 0, "nothing should be replayed");
+        assert_eq!(
+            stats.faults(),
+            CLONE_PAGES as u64,
+            "every page must have been served on demand"
+        );
+    }
+
+    /// The recorder publishes on drop, from whatever exit path the handler took.
+    #[test]
+    fn fault_recorder_publishes_the_observed_set_on_drop() {
+        let snap = TestSnapshot::new("recorder");
+        let mem_len = (CLONE_PAGES * PAGE) as u64;
+        let store = Arc::new(WorkingSetStore::open(&snap.mem, mem_len).unwrap());
+        assert!(store.to_prefetch().is_empty());
+
+        let mut recorder =
+            FaultRecorder::new(Some(Arc::clone(&store)), "vm-0", std::time::Instant::now());
+        record_fault(&mut recorder, 0, PAGE, 0);
+        record_fault(&mut recorder, 9 * PAGE, PAGE, 0);
+        assert!(
+            store.to_prefetch().is_empty(),
+            "nothing is published before the handler exits"
+        );
+        drop(recorder);
+
+        // Published in memory for the clones this server is still hosting...
+        assert_eq!(store.to_prefetch().len(), 2);
+        // ...and on disk for the next server.
+        let reopened = WorkingSetStore::open(&snap.mem, mem_len).unwrap();
+        assert_eq!(
+            reopened.to_prefetch().runs().collect::<Vec<_>>(),
+            vec![
+                Run {
+                    offset: 0,
+                    len: PAGE as u64
+                },
+                Run {
+                    offset: 9 * PAGE as u64,
+                    len: PAGE as u64
+                },
+            ]
+        );
+    }
+
+    /// With recording disabled there is nothing to publish and nothing to replay.
+    #[test]
+    fn fault_recorder_without_a_store_records_nothing() {
+        let mut recorder = FaultRecorder::new(None, "vm-0", std::time::Instant::now());
+        record_fault(&mut recorder, 0, PAGE, 0);
+        assert!(recorder.observed.is_empty());
     }
 }

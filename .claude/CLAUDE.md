@@ -1516,6 +1516,41 @@ fcvm snapshot run --pid <serve_pid> --name clone1
   clean pages via the page cache (MAP_PRIVATE) — measured 3x 1GiB clones
   ≈ 230MiB total PSS, with or without dirty tracking (#632)
 
+#### Working-Set Replay (`src/uffd/working_set.rs`)
+
+Laziness costs latency: every page the guest touches is a vCPU trap plus an
+ioctl (~5.6 us marginal, measured), and a Chromium clone takes ~56,300 of them —
++316 ms versus a file-backed restore of the same snapshot.
+
+**Why replay and not readahead.** Across 8 clones of one snapshot the pairwise
+page-set Jaccard median is 0.927 and 82.2% of the union is faulted by ALL 8, so
+the SET is predictable. The ORDER is not: only 8.6% of faults land on the page
+after the previous one, and faults are spread over the whole restore (50% by
+300 ms, 98% by 750 ms), so fault-around/readahead guesses wrong and warming an
+early burst misses most of the set.
+
+- **Record**: every clone's faults are marked in a bitmap over 4 KiB granules of
+  the memory image; on handler exit it is OR-ed into the union stored beside the
+  image as `memory.bin.working-set` (exclusive `flock` + atomic rename).
+- **Replay**: at handshake — before Firecracker finishes loading, so before any
+  vCPU runs — the union's contiguous runs are bulk-populated with one
+  `UFFDIO_COPY` (or `UFFDIO_CONTINUE` in MINOR mode) per run.
+- **Key**: SHA-256 of the image's `(len, mtime, ino, dev)`. Rewriting a snapshot
+  writes a new file, so the stale set is dropped.
+- **A wrong set cannot corrupt a guest.** It only says WHICH offsets to
+  populate; the bytes always come from the image being served, at that offset,
+  through the same path a demand fault uses. Missing/stale/corrupt ⇒ on-demand
+  faulting, never an error and never a hang.
+- **Isolation**: replay touches pages the guest never asked for, so it must not
+  be visible across clones. COPY gives each clone a private page; MINOR installs
+  a read-only PTE onto the shared folio and the first guest write CoWs.
+  `working_set_replay_*` in `src/uffd/server.rs` proves both, plus that the
+  snapshot image stays byte-identical.
+- **A/B switch**: `FCVM_UFFD_WORKING_SET=off` disables record and replay (an
+  unrecognised value is a hard error). `FCVM_UFFD_FAULT_TRACE=<dir>` writes a
+  per-fault trace (`<pid>-<vm_id>.faults`, LE `(offset, ns_before, ns_after)`
+  u64 triples) for measurement tooling.
+
 ### FUSE Parallelism (fuse-pipe)
 
 **Kernel clone fd model (`FUSE_DEV_IOC_CLONE`):**
