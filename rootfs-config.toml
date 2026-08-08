@@ -205,7 +205,7 @@ remove_dirs = [
 # arm64 nested profile (ARM64 NV2 with custom kernel and firecracker)
 [kernel_profiles.nested.arm64]
 description = "Nested virtualization support for running VMs inside VMs"
-kernel_version = "6.18.3"
+kernel_version = "7.0.14"
 kernel_repo = "ejc3/fcvm"
 
 # Build configuration - these files determine when kernel needs rebuilding
@@ -238,7 +238,7 @@ fuse_readers = 64
 # which includes all EC2/AWS modules (ENA networking, NVMe, etc.)
 # Then applies fcvm patches for NV2 cache coherency (DSB barriers)
 [kernel_profiles.nested.arm64.host_kernel]
-kernel_version = "6.18.3"
+kernel_version = "7.0.14"
 patches_dir = "kernel/patches-arm64"
 
 # Build inputs for SHA calculation (patches only, skip *.vm.patch for host)
@@ -253,7 +253,7 @@ build_inputs = [
 # Requires CONFIG_PCI=y for GENERIC_MSI_IRQ (virtio-mmio IRQ infrastructure).
 [kernel_profiles.nested.amd64]
 description = "Nested virtualization support for running VMs inside VMs (x86_64)"
-kernel_version = "6.18.3"
+kernel_version = "7.0.14"
 kernel_repo = "ejc3/fcvm"
 
 # Build configuration - these files determine when kernel needs rebuilding
@@ -276,7 +276,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,
 # then applies FUSE remap_file_range patch for reflink support in nested VMs
 [kernel_profiles.nested.amd64.host_kernel]
-kernel_version = "6.18.3"
+kernel_version = "7.0.14"
 patches_dir = "kernel/patches-x86"
 
 # Build inputs for SHA calculation
@@ -291,7 +291,7 @@ build_inputs = [
 [kernel_profiles.btrfs.arm64]
 rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage"
-kernel_version = "6.18.3"
+kernel_version = "7.0.14"
 kernel_repo = "ejc3/fcvm"
 
 build_inputs = [
@@ -307,7 +307,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 [kernel_profiles.btrfs.amd64]
 rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage (x86_64)"
-kernel_version = "6.18.3"
+kernel_version = "7.0.14"
 kernel_repo = "ejc3/fcvm"
 
 build_inputs = [
