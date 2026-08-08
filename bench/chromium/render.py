@@ -204,7 +204,20 @@ def find_page_ws_url(cdp_host: str, deadline: float) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="fixture URL to render")
-    parser.add_argument("--out-prefix", default="/tmp/render", help="writes <prefix>.png + <prefix>.dom.html")
+    parser.add_argument("--out-prefix", default="/tmp/render", help="writes <prefix>.<fmt> + <prefix>.dom.html")
+    parser.add_argument(
+        "--format",
+        choices=("png", "jpeg"),
+        default="png",
+        help="screenshot encoding. jpeg is lossy but encodes far cheaper than png's "
+        "lossless deflate; the bench measures both to size the artifact-stage effect",
+    )
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=80,
+        help="jpeg quality 0-100 (ignored for png)",
+    )
     parser.add_argument("--cdp-host", default="127.0.0.1:9222")
     parser.add_argument("--timeout", type=float, default=30.0, help="overall deadline (s)")
     parser.add_argument(
@@ -253,11 +266,17 @@ def main() -> int:
 
         stage = "screenshot"
         t_shot = time.monotonic()
-        shot = cdp.cmd("Page.captureScreenshot", {"format": "png"}, deadline=deadline)
+        shot_params = {"format": args.format}
+        if args.format == "jpeg":
+            shot_params["quality"] = args.quality
+        shot = cdp.cmd("Page.captureScreenshot", shot_params, deadline=deadline)
         png = base64.b64decode(shot["data"])
-        if not png.startswith(b"\x89PNG"):
-            raise RuntimeError("captureScreenshot returned non-PNG data")
-        png_path = args.out_prefix + ".png"
+        # Magic-byte check per format: a silently-wrong encoding would make the
+        # png-vs-jpeg comparison meaningless.
+        magic = b"\x89PNG" if args.format == "png" else b"\xff\xd8\xff"
+        if not png.startswith(magic):
+            raise RuntimeError(f"captureScreenshot returned non-{args.format.upper()} data")
+        png_path = args.out_prefix + ("." + args.format)
         with open(png_path, "wb") as f:
             f.write(png)
         screenshot_ms = (time.monotonic() - t_shot) * 1000
@@ -294,6 +313,7 @@ def main() -> int:
             f"RENDER_OK url={args.url} connect_ms={connect_ms:.1f} "
             f"navigate_ms={navigate_ms:.1f} idle_ms={idle_ms:.1f} idle_timeout={idle_timeout} "
             f"screenshot_ms={screenshot_ms:.1f} dom_ms={dom_ms:.1f} total_ms={total_ms:.1f} "
+            f"shot_fmt={args.format} shot_quality={args.quality if args.format == 'jpeg' else 0} "
             f"png_bytes={len(png)} dom_bytes={len(dom)} png={png_path} dom={dom_path}",
             flush=True,
         )

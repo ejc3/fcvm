@@ -1,0 +1,13 @@
+{
+ "modes": {
+  "rootless-proxy": {"available": "yes", "reason": ""},
+  "rootless-pasta": {"available": "yes", "reason": ""},
+  "rootless-proxy6": {"available": "yes", "reason": ""},
+  "rootless-pasta6": {"available": "yes", "reason": ""},
+  "bridged": {"available": "yes", "reason": ""},
+  "routed": {"available": "yes", "reason": ""}
+ },
+ "hugepages": {"available": "yes", "reason": "", "pool_pages": 18432},
+ "file_huge_cell": "UNAVAILABLE as file-backed: snapshot.rs requires UFFD for hugepage snapshots (Firecracker rejects the File memory backend); measured as the implicit per-clone UFFD fallback instead",
+ "http_port": 18150, "https_port": 18151
+}

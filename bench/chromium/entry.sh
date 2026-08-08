@@ -103,6 +103,17 @@ echo "chromium-bench: launching chromium"
 VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/lib/chromium/./vk_swiftshader_icd.json}"
 export VK_ICD_FILENAMES
 
+# CB_SITE_ISOLATION=off adds --disable-site-isolation-trials, which collapses
+# per-origin renderer processes into one. It must be decided BEFORE the golden
+# snapshot is taken (the process structure is baked into guest memory), so it is
+# a boot-time env var (`fcvm podman run --env CB_SITE_ISOLATION=off`), not a
+# per-request flag. The bench measures on and off as separate golden snapshots.
+SITE_ISO_FLAGS=""
+if [ "${CB_SITE_ISOLATION:-on}" = "off" ]; then
+    SITE_ISO_FLAGS="--disable-site-isolation-trials"
+    echo "chromium-bench: site isolation DISABLED (--disable-site-isolation-trials)"
+fi
+
 # --no-sandbox           : no user namespaces inside the guest container
 # --remote-allow-origins : primary bench arm connects CDP from outside the page origin
 # --ignore-certificate-errors : bench arm renders self-signed https from the host
@@ -130,6 +141,7 @@ HOME=/tmp chromium \
     --disable-breakpad \
     --disable-component-update \
     --user-data-dir=/tmp/chrome-profile \
+    $SITE_ISO_FLAGS \
     about:blank &
 CHROME_PID=$!
 wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp
