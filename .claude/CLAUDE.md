@@ -213,6 +213,29 @@ sudo cargo test ...
 
 If the Makefile is missing a target or broken, **fix the Makefile** - don't work around it.
 
+### Raw `cargo` runs a SIBLING WORKTREE's test binary — this is why the rule exists
+
+The environment exports `CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target`, **shared by every
+worktree**. `Makefile:160` overrides it (`export CARGO_TARGET_DIR := target`), so anything run
+through `make` gets a per-worktree `./target`. A raw `cargo test` does not — it inherits the
+shared directory, and two worktrees building the same package produce the *same* test-binary
+path. Cargo then considers it fresh and runs whatever the other worktree built.
+
+Observed 2026-08-08 while verifying two stacked PRs: `cargo test --test
+test_ci_workflow_coverage` in worktree A printed a test that exists **only in worktree B** and
+silently omitted the one under test:
+
+```
+Running .../cargo-target/debug/deps/test_ci_workflow_coverage-113926a94ccc9fad
+test gh_existence_probes_do_not_discard_their_error ... ok    <- not on this branch
+test result: ok. 4 passed                                     <- summary_fails never ran
+```
+
+Red/green verification is worthless under these conditions: "it went red" and "it went green"
+may both be reports about code you are not editing. Use `make test-unit FILTER=<pattern>`. If
+you must invoke cargo directly, set an explicit per-worktree `CARGO_TARGET_DIR` — and confirm
+the `Running .../deps/<binary>` line points inside it before believing any result.
+
 ## NEVER ROUTE AROUND BUILD PROCESSES
 
 **If a build fails, FIX THE BUILD. Never manually copy files.**

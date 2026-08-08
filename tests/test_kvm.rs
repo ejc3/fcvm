@@ -408,6 +408,10 @@ except OSError as e:
     // The outer VM has --privileged so iptables/namespaces work
     // Use --cmd for the container command (fcvm doesn't support trailing args after IMAGE)
     // Set HOME explicitly to ensure config file is found
+    // Assembled by the guest from two halves (see the assertion below), so this literal
+    // cannot appear in the argv fcvm echoes into the stderr this test captures.
+    const NESTED_MARKER: &str = "NESTED_SUCCESS_INNER_VM_WORKS";
+
     let inner_cmd = r#"
         export PATH=/opt/fcvm:/mnt/fcvm-btrfs/bin:$PATH
         export HOME=/root
@@ -422,7 +426,7 @@ except OSError as e:
         fcvm podman run \
             --name inner-test \
             --network bridged \
-            --cmd "echo NESTED_SUCCESS_INNER_VM_WORKS" \
+            --cmd "printf '%s_%s\n' NESTED_SUCCESS INNER_VM_WORKS" \
             public.ecr.aws/nginx/nginx:alpine
     "#;
 
@@ -469,17 +473,36 @@ except OSError as e:
     common::kill_process(outer_pid).await;
 
     // 6. Verify success
+    //
     // Check both stdout and stderr since fcvm logs container output to its own stderr
-    // with [ctr:stdout] prefix, so when running via exec, the output appears in stderr
+    // with [ctr:stdout] prefix, so when running via exec, the output appears in stderr.
+    //
+    // The marker MUST NOT appear literally in the command we send. fcvm logs the whole
+    // argv at INFO ("exec request acknowledged, command starting command=[...]") and that
+    // log lands in the captured stderr — so a literal `echo NESTED_SUCCESS_INNER_VM_WORKS`
+    // made this assertion match fcvm's echo of the command it was about to run, whether or
+    // not the inner VM ever produced a byte. On 2026-08-08, run 31259262664 "passed" three
+    // times that way in 9.7s/20.1s/6.7s (the three fastest of 94 recorded executions) while
+    // the inner fcvm was dying with "ensuring rootfs free space: e2fsck found uncorrectable
+    // errors". The guest therefore assembles the marker from two halves via printf, so the
+    // joined string can only exist if the guest actually ran the command.
+    assert!(
+        !inner_cmd.contains(NESTED_MARKER),
+        "the success marker `{NESTED_MARKER}` appears literally in the command sent to the \
+         guest. fcvm echoes the argv into its own stderr, which this test captures, so the \
+         assertion below would pass without the inner VM running at all. Build the marker \
+         in the guest (e.g. printf '%s_%s') instead of inlining it."
+    );
+
     let combined = format!("{}\n{}", stdout, stderr);
-    if combined.contains("NESTED_SUCCESS_INNER_VM_WORKS") {
+    if combined.contains(NESTED_MARKER) {
         println!("\n✅ NESTED TEST PASSED!");
         println!("   Successfully ran fcvm inside fcvm (nested virtualization)");
         Ok(())
     } else {
         bail!(
             "Nested virtualization failed - inner VM did not produce expected output\n\
-             Expected: NESTED_SUCCESS_INNER_VM_WORKS\n\
+             Expected: {NESTED_MARKER}\n\
              Got stdout: {}\n\
              Got stderr: {}",
             stdout,
