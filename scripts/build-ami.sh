@@ -11,7 +11,23 @@ KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 compute_hash() {
   local repo_root="$(dirname "$KERNEL_DIR")"
   {
-    cat "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null
+    cat "$KERNEL_DIR/nested.conf" 2>/dev/null
+    # The HOST kernel baked into this AMI is built from the arm64 patch set —
+    # [kernel_profiles.nested.arm64.host_kernel] build_inputs is
+    # "kernel/patches-arm64/*.patch" — NOT kernel/patches. Only two of those nine
+    # are symlinks into kernel/patches; the other seven (nv2-vsock-cache-sync,
+    # nv2-vsock-rx-barrier, wfx-stopped-exit, the psci-debug set) were invisible
+    # to this hash, so changing one produced an identical AMI hash and the
+    # builder reused a stale image carrying the OLD host kernel.
+    # `.vm.patch` is excluded to match compute_host_kernel_sha in
+    # src/setup/kernel.rs, which applies those only to the guest kernel.
+    for p in "$KERNEL_DIR/patches-arm64/"*.patch; do
+      case "$p" in *.vm.patch) continue ;; esac
+      cat "$p" 2>/dev/null
+    done
+    # kernel_version is part of the host kernel's identity but was never read,
+    # so a pure version bump left the AMI hash unchanged.
+    grep -E '^kernel_version\s*=' "$repo_root/rootfs-config.toml" 2>/dev/null || true
     # Include boot_args from config to invalidate cache when they change
     grep -E '^boot_args\s*=' "$repo_root/rootfs-config.toml" 2>/dev/null || true
     # Include the passt build inputs so a pin or patch change rebuilds the AMI
