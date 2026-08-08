@@ -161,8 +161,34 @@ impl CloneFixture {
 
         let serve_pid = serve_child.id();
 
-        // Wait for serve socket
-        let socket_path = format!("/mnt/fcvm-btrfs/uffd-{}-{}.sock", snapshot_name, serve_pid);
+        // Wait for serve socket.
+        //
+        // Derive the name with the SAME function the server uses. Hand-formatting it here
+        // is what broke this bench: the server's socket carries `(pid, pid_start_time)`
+        // so two servers can never collide, and a literal `uffd-{snap}-{pid}.sock` waits
+        // 30s for a file that is never created. `socket_path_for` is the one definition;
+        // a caller that reimplements it silently drifts the moment the format changes.
+        let serve_start_time = {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(t) = fcvm::utils::process_start_time(serve_pid) {
+                    break t;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "serve process {serve_pid} never appeared in /proc"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let socket_path = fcvm::uffd::UffdServer::socket_path_for(
+            std::path::Path::new("/mnt/fcvm-btrfs"),
+            &snapshot_name,
+            serve_pid,
+            serve_start_time,
+        )
+        .display()
+        .to_string();
         let start = Instant::now();
         loop {
             if start.elapsed() > Duration::from_secs(30) {
