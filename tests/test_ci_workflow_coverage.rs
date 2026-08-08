@@ -77,9 +77,13 @@ fn ci_runs_on_pull_requests_regardless_of_base_branch() {
 /// Guards the other half of the same failure: keeping the trigger open but
 /// letting a gating job drift out of the gate. Checking only "the job is
 /// defined in this file" is too weak — a refactor can leave `fc-mock` defined
-/// while dropping it from `summary.needs`, at which point it no longer gates
-/// anything and this test would still have passed. So assert membership in
-/// `summary.needs`, which is what actually makes a job a gate.
+/// while dropping it from `summary.needs`, at which point Summary no longer
+/// even waits for it.
+///
+/// Membership in `summary.needs` is necessary but NOT sufficient: `needs` only
+/// makes Summary *wait*, and with `if: always()` Summary then reports its own
+/// result regardless of theirs. `summary_fails_when_a_gating_job_fails` below
+/// covers the second half.
 #[test]
 fn gating_jobs_live_in_the_pull_request_workflow() {
     let ci = parse_workflow("ci.yml");
@@ -285,4 +289,63 @@ fn gh_existence_probes_do_not_discard_their_error() {
         "found no `gh ... view` probes to inspect — the scan is broken, and a check that \
          inspects nothing must not report success"
     );
+}
+
+/// `Summary` must actually fail when something it gates on failed.
+///
+/// `needs:` makes Summary wait; `if: always()` makes it run even when a
+/// dependency failed. Together those mean Summary reports *its own* success
+/// while a gating job is red — unless it explicitly inspects `needs.*.result`.
+///
+/// It did not. Across the 40 most recent ci.yml runs, 8 finished with
+/// `Summary=success` over genuinely failed jobs:
+///
+/// ```text
+/// run 31271693501: Summary=success but FAILED: Host-Root-arm64-SnapshotEnabled
+/// run 31262066685: Summary=success but FAILED: Lint, Container-x64, Container-arm64
+/// run 31266285914: Summary=success but FAILED: Container-arm64, Container-x64
+/// ```
+///
+/// Anything treating "Summary green" as "CI green" was reading a gate that
+/// could not fail — the same shape as a `CodeRabbit pass` from a review that
+/// never started.
+#[test]
+fn summary_fails_when_a_gating_job_fails() {
+    let ci = parse_workflow("ci.yml");
+    let summary = ci
+        .get("jobs")
+        .and_then(|j| j.get("summary"))
+        .expect("ci.yml has no `summary` job");
+
+    let steps = summary
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`summary` job has no steps");
+
+    let conds: Vec<&str> = steps
+        .iter()
+        .filter_map(|s| s.get("if").and_then(Value::as_str))
+        .filter(|c| c.contains("needs.*.result"))
+        .collect();
+
+    assert!(
+        !conds.is_empty(),
+        "ci.yml's `summary` job never inspects `needs.*.result`. With `if: always()` it \
+         therefore reports success no matter what its gating jobs did — observed in 8 of the \
+         last 40 runs, including one where Lint failed. Add a step conditioned on \
+         `contains(needs.*.result, 'failure')` that exits non-zero."
+    );
+
+    // Require each non-success terminal state independently. Accepting
+    // `failure OR cancelled` would let a later edit drop the `failure` arm while
+    // keeping `cancelled`, and this test would still pass while Summary went
+    // green over a failed Lint — exactly the regression it exists to prevent.
+    for state in ["failure", "cancelled"] {
+        assert!(
+            conds.iter().any(|c| c.contains(state)),
+            "`summary` inspects `needs.*.result` but never checks for `{state}`, so a {state} \
+             gating job still yields a green Summary. Each non-success terminal state must be \
+             checked on its own, not as one arm of an `||` that a later edit can halve."
+        );
+    }
 }
