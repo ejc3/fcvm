@@ -987,8 +987,10 @@ Do not run `sudo cargo`. Use Makefile targets so cargo runs as your user and tes
 orphans the entire subtree below it.** The chain that must hold, end to end:
 
 ```
-cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm → firecracker
-                           ^ setpriv --pdeathsig  ^ set_test_pdeathsig  ^ install_namespace_pre_exec
+cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm ─┬→ firecracker
+                           ^ setpriv --pdeathsig  ^ set_test_pdeathsig     ├→ holder
+                                                                           └→ pasta (rootless)
+                                                                              ^ see per-hop list below
 ```
 
 - `scripts/root-test-runner.sh` (`ROOT_TEST_RUNNER` in the Makefile) covers the **sudo hop**.
@@ -998,6 +1000,14 @@ cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm �
 - `src/utils.rs::install_namespace_pre_exec` covers **every VMM spawn** (Firecracker, Cloud
   Hypervisor, and the Layer-2 setup VM in `src/setup/rootfs.rs`). It must stay the LAST
   `pre_exec` — `setns(CLONE_NEWUSER)` zeroes `pdeath_signal`, so setting it earlier is lost.
+- `src/commands/common.rs::spawn_namespace_holder` covers the **holder hop** (rootless mode).
+  The holder's pdeathsig is armed in its `pre_exec`, before UID/GID mappings are written.
+- `src/network/pasta.rs` (in `start_pasta`) covers the **pasta hop** (rootless mode). Must be
+  the last `pre_exec`; includes a `getppid` re-check to close the fork/exec race window.
+
+Regression tests: `test_sigkill_reaps_rootless_vm_tree` asserts all three children (firecracker,
+holder, pasta) die when fcvm is SIGKILL'd. `test_root_test_runner_reaps_vm_when_sudo_is_killed`
+covers the sudo hop specifically.
 
 **Why a privilege boundary is special:** the kernel refuses a signal from uid 1000 to a uid-0
 process, and `killpg` still returns success when it managed to signal *any* member — so
