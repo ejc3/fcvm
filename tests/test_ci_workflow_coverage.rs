@@ -72,10 +72,14 @@ fn ci_runs_on_pull_requests_regardless_of_base_branch() {
     }
 }
 
-/// The jobs a merge depends on must be reachable from the `pull_request` trigger.
+/// Every job a merge depends on must exist here AND still gate `Summary`.
 ///
 /// Guards the other half of the same failure: keeping the trigger open but
-/// moving the gating jobs into a workflow that stacked PRs never fire.
+/// letting a gating job drift out of the gate. Checking only "the job is
+/// defined in this file" is too weak — a refactor can leave `fc-mock` defined
+/// while dropping it from `summary.needs`, at which point it no longer gates
+/// anything and this test would still have passed. So assert membership in
+/// `summary.needs`, which is what actually makes a job a gate.
 #[test]
 fn gating_jobs_live_in_the_pull_request_workflow() {
     let ci = parse_workflow("ci.yml");
@@ -88,12 +92,48 @@ fn gating_jobs_live_in_the_pull_request_workflow() {
         .and_then(Value::as_mapping)
         .expect("ci.yml has no `jobs:` mapping");
 
-    for job in ["lint", "host", "host-root", "container", "packaging"] {
+    let needs: Vec<String> = jobs
+        .get(Value::from("summary"))
+        .and_then(|s| s.get("needs"))
+        .and_then(Value::as_sequence)
+        .expect("ci.yml `summary` job has no `needs:` list — nothing aggregates the gates")
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .expect("a `summary.needs` entry is not a string")
+                .to_string()
+        })
+        .collect();
+
+    // The floor. Shrinking this set is a deliberate act that must be argued for
+    // in review, not something a rename can do silently.
+    for job in [
+        "lint",
+        "packaging",
+        "fc-mock",
+        "host",
+        "host-root",
+        "container",
+    ] {
         assert!(
             jobs.contains_key(Value::from(job)),
             "ci.yml no longer defines the `{job}` job. If it moved to another workflow, that \
              workflow must also trigger on `pull_request` with no base-branch filter, or \
              stacked PRs lose the check while still reporting no failures."
+        );
+        assert!(
+            needs.iter().any(|n| n == job),
+            "`{job}` is defined but is no longer in `summary.needs`, so it no longer gates \
+             anything: Summary can go green while it fails or never runs. Add it back, or \
+             remove the gate deliberately and update this floor list in the same commit."
+        );
+    }
+
+    // Anything Summary waits on must actually exist, or the gate is a no-op.
+    for n in &needs {
+        assert!(
+            jobs.contains_key(Value::from(n.as_str())),
+            "`summary.needs` lists `{n}`, which is not defined in ci.yml"
         );
     }
 }
