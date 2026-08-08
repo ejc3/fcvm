@@ -11,8 +11,12 @@ on:
           - both
           - host
           - container
+  # No `branches:` filter. That filter matches the PR's BASE branch, and stacked
+  # PRs (the documented default in AGENTS.md) are based on the previous PR's
+  # branch, not main — so `branches: [main]` skipped every job below for exactly
+  # the PRs the workflow tells people to open, while still rendering a check set
+  # with no failures. See tests/test_ci_workflow_coverage.rs.
   pull_request:
-    branches: [main]
     paths-ignore:
       - 'scripts/claude-assistant/**'
       - '.github/workflows/claude*.yml'

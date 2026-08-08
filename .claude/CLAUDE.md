@@ -62,6 +62,33 @@ gh pr view 2 --json baseRefName
 
 **PR description:** Always note `**Stacked on:** <base-branch> (PR #N)` so reviewers understand the dependency.
 
+### A STACKED PR MUST ACTUALLY RUN CI — "no failures" is not "it ran"
+
+**A `pull_request:` trigger's `branches:` filter matches the PR's BASE branch.** So
+`branches: [main]` silently skips the whole workflow for every stacked PR — the exact PRs this
+section tells you to open. GitHub then shows a check set containing whatever *other* workflows
+did fire (here: `safety-check`), with zero failures. It looks green. Nothing ran.
+
+Observed 2026-08-08: #752 (base `kernel-7.0.14`) was merged on a "no failures" reading. Its
+head sha had **zero** runs of `lint`, `packaging`, `host`, `host-root`, `container` — the only
+non-skipped check was `safety-check`. It carried three rustfmt violations that surfaced the
+moment the change reached a PR whose base *was* main.
+
+**Before treating any PR as green, prove the checks EXIST, then that they passed:**
+```bash
+SHA=$(gh api repos/{o}/{r}/pulls/<N> --jq .head.sha)
+gh api repos/{o}/{r}/commits/$SHA/check-runs \
+  --jq '.check_runs[] | select(.conclusion != "skipped") | "\(.name)\t\(.conclusion)"' | sort -u
+# An expected job missing from this list is a FAILURE to verify, not a pass.
+```
+Any monitor, gate, or script that renders a verdict from `statusCheckRollup` must assert the
+required jobs are **present**. Counting failures and finding none is the fail-open form of the
+same bug as `jq: command not found` printing `verdict: CLEAR`, and as a `CodeRabbit  pass` that
+means the reviewer never started.
+
+Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces a
+`branches:`/`branches-ignore:` filter on `pull_request`, or if a gating job leaves that file.
+
 ## Sending Email
 
 Use `aws ses send-email --region us-east-1` (recipient must be verified in SES sandbox).
