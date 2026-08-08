@@ -2292,6 +2292,286 @@ async fn iso_stamp(pid: u32, tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Value of `key=` in a tracing line, e.g. `field(line, "fault_count=")`.
+fn field(line: &str, key: &str) -> Option<String> {
+    let rest = line.split(key).nth(1)?;
+    Some(
+        rest.split_whitespace()
+            .next()?
+            .trim_matches('"')
+            .to_string(),
+    )
+}
+
+/// `(vm_id, fault_count)` for every clone the memory server has finished serving.
+fn faults_by_vm(log: &str) -> Vec<(String, u64)> {
+    log.lines()
+        .filter(|l| l.contains("VM exited") && l.contains("fault_count="))
+        .filter_map(|l| Some((field(l, "vm_id=")?, field(l, "fault_count=")?.parse().ok()?)))
+        .collect()
+}
+
+/// `(vm_id, prefetched_pages)` for every clone that replayed a recorded working set.
+fn prefetched_by_vm(log: &str) -> Vec<(String, u64)> {
+    log.lines()
+        .filter(|l| l.contains("replayed recorded working set"))
+        .filter_map(|l| {
+            Some((
+                field(l, "vm_id=")?,
+                field(l, "prefetched_pages=")?.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Wait until the memory server's log satisfies `ready`, then return it.
+async fn serve_log_until(
+    path: &std::path::Path,
+    timeout_secs: u64,
+    what: &str,
+    ready: impl Fn(&str) -> bool,
+) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let log = tokio::fs::read_to_string(path).await.unwrap_or_default();
+        if ready(&log) {
+            return Ok(log);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out after {timeout_secs}s waiting for {what} in {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn sha256_of(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+/// WORKING-SET REPLAY. One clone's faults are recorded beside the snapshot and replayed into
+/// the next clones, which must then barely fault at all — and because replay populates pages
+/// the guest never asked for, it must not leak between clones or touch the golden snapshot.
+///
+/// The fault counts are the evidence: the recording clone pays full demand paging, the
+/// replaying clones pay a small fraction of it for the same workload.
+#[tokio::test]
+async fn test_snapshot_clone_working_set_replay() -> Result<()> {
+    let (baseline_name, _, snapshot_name, _) = common::unique_names("wsreplay");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    println!("\n=== Working-set replay test ===");
+
+    // ---- baseline VM with a known 8 MiB pattern in guest RAM ------------------
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+
+    common::exec_in_vm(
+        baseline_pid,
+        &[&format!(
+            "yes ABCDEFGH | head -c {} > {} && sync",
+            ISO_BYTES, ISO_FILE
+        )],
+    )
+    .await
+    .context("writing baseline pattern")?;
+    let base_md5 = iso_md5(baseline_pid).await?;
+
+    common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+
+    let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
+    let mem_path = snapshots.load_snapshot(&snapshot_name).await?.memory_path;
+    let mem_len = tokio::fs::metadata(&mem_path).await?.len();
+    let working_set_path = fcvm::uffd::WorkingSetStore::path_for(&mem_path);
+    anyhow::ensure!(
+        !working_set_path.exists(),
+        "a freshly created snapshot must not already carry a working set: {}",
+        working_set_path.display()
+    );
+
+    // ---- memory server --------------------------------------------------------
+    let (_serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_log_path(
+        &["snapshot", "serve", &snapshot_name],
+        "uffd-serve-wsreplay",
+    )
+    .await
+    .context("spawning memory server")?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+    let serve_pid_str = serve_pid.to_string();
+    let clone_args = |name: &str| -> Vec<String> {
+        ["snapshot", "run", "--pid", &serve_pid_str, "--name", name]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let spawn_clone = |name: String| async move {
+        let args = clone_args(&name);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let (child, pid) = common::spawn_fcvm_with_logs(&arg_refs, &name).await?;
+        common::poll_health_by_pid(pid, 150)
+            .await
+            .with_context(|| format!("clone {name} never became healthy"))?;
+        anyhow::Ok((child, pid))
+    };
+
+    // One clone's life, start to finish: restore, read the whole 8 MiB pattern, die. Both
+    // measured clones run EXACTLY this, so their fault counts are comparable — the only
+    // difference between them is whether a recorded working set existed to replay.
+    let run_one_clone = |name: String| async move {
+        let (child, pid) = spawn_clone(name).await?;
+        let md5 = iso_md5(pid).await?;
+        drop(child);
+        common::kill_process(pid).await;
+        anyhow::Ok(md5)
+    };
+
+    let verdict = async {
+        // ---- clone 1 records: nothing to replay, so it faults everything in ----
+        let rec_md5 = run_one_clone(format!("{}-rec", snapshot_name)).await?;
+        anyhow::ensure!(
+            rec_md5 == base_md5,
+            "recording clone restored WRONG memory: {rec_md5} != {base_md5}"
+        );
+
+        // Its handler publishes what it faulted on the way out.
+        serve_log_until(&serve_log, 60, "the recording clone to be merged", |log| {
+            log.contains("merged this clone's faults into the snapshot's working set")
+        })
+        .await?;
+        anyhow::ensure!(
+            working_set_path.exists(),
+            "the first clone must leave a working set at {}",
+            working_set_path.display()
+        );
+        let recorded_pages = fcvm::uffd::WorkingSetStore::open(&mem_path, mem_len)?
+            .to_prefetch()
+            .len();
+        anyhow::ensure!(
+            recorded_pages > 0,
+            "the recorded working set must not be empty"
+        );
+        println!("  recorded working set: {recorded_pages} pages");
+
+        // The snapshot itself must be untouched by all of this.
+        let mem_before = sha256_of(&mem_path).await?;
+
+        // ---- clone 2 replays it: same workload, same lifetime -----------------
+        let replay_md5 = run_one_clone(format!("{}-replay", snapshot_name)).await?;
+        anyhow::ensure!(
+            replay_md5 == base_md5,
+            "replaying clone restored WRONG memory: {replay_md5} != {base_md5}"
+        );
+
+        // ---- the number that proves replay worked -----------------------------
+        let log = serve_log_until(&serve_log, 60, "both measured clones to exit", |log| {
+            faults_by_vm(log).len() >= 2
+        })
+        .await?;
+        let faults = faults_by_vm(&log);
+        let prefetched = prefetched_by_vm(&log);
+        println!("  faults by clone: {faults:?}");
+        println!("  prefetched by clone: {prefetched:?}");
+
+        let (recorder_faults, replay_faults) = (faults[0].1, faults[1].1);
+        anyhow::ensure!(
+            recorder_faults > 0,
+            "the recording clone must have faulted its memory in"
+        );
+        anyhow::ensure!(
+            prefetched.first().is_some_and(|(_, pages)| *pages > 0),
+            "the replaying clone must have replayed pages from a {recorded_pages}-page \
+             working set, got {prefetched:?}"
+        );
+        anyhow::ensure!(
+            replay_faults * 2 < recorder_faults,
+            "REPLAY DID NOT WORK: the replaying clone still took {replay_faults} demand \
+             faults against {recorder_faults} for the identical workload with no recording"
+        );
+        println!(
+            "  ✓ demand faults {recorder_faults} -> {replay_faults} for the same workload \
+             ({:.0}% fewer)",
+            100.0 - (replay_faults as f64 / recorder_faults as f64) * 100.0
+        );
+
+        // ---- isolation, with two live clones that BOTH replayed ---------------
+        let (b_child, b) = spawn_clone(format!("{}-b", snapshot_name)).await?;
+        let (c_child, c) = spawn_clone(format!("{}-c", snapshot_name)).await?;
+
+        // Replay must not change what the guest sees.
+        let b_md5 = iso_md5(b).await?;
+        let c_md5 = iso_md5(c).await?;
+        anyhow::ensure!(
+            b_md5 == base_md5 && c_md5 == base_md5,
+            "a replaying clone restored WRONG memory: b={b_md5} c={c_md5} snapshot={base_md5}"
+        );
+
+        // Prefetched pages are private: B writes, C must not see it.
+        iso_stamp(b, "CLONEB").await?;
+        let b_head = iso_head(b, 6).await?;
+        let c_head = iso_head(c, 6).await?;
+        anyhow::ensure!(
+            b_head == "CLONEB",
+            "clone B did not observe its own write (got {b_head:?})"
+        );
+        anyhow::ensure!(
+            c_head == "ABCDEF",
+            "MEMORY LEAKED BETWEEN CLONES: clone C sees {c_head:?} after clone B wrote to a \
+             PREFETCHED page"
+        );
+        anyhow::ensure!(
+            iso_md5(c).await? == base_md5,
+            "MEMORY LEAKED BETWEEN CLONES: clone C's memory changed after clone B wrote"
+        );
+
+        // And the golden snapshot on disk is byte-identical.
+        let mem_after = sha256_of(&mem_path).await?;
+        anyhow::ensure!(
+            mem_after == mem_before,
+            "SNAPSHOT CORRUPTED: {} changed while clones ran ({mem_before} -> {mem_after})",
+            mem_path.display()
+        );
+        println!("  ✓ replayed clones are isolated and the snapshot is byte-identical");
+
+        drop(b_child);
+        drop(c_child);
+        common::kill_process(b).await;
+        common::kill_process(c).await;
+        anyhow::Ok(())
+    }
+    .await;
+
+    // ---- cleanup --------------------------------------------------------------
+    common::kill_process(serve_pid).await;
+    common::kill_process(baseline_pid).await;
+    let _ = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshots", "delete", &snapshot_name])
+        .output()
+        .await;
+
+    verdict?;
+    println!("✅ WORKING-SET REPLAY TEST PASSED");
+    Ok(())
+}
+
 async fn clone_isolation_impl(uffd_mode: &str) -> Result<()> {
     let (baseline_name, _, snapshot_name, _) = common::unique_names(&format!("iso-{}", uffd_mode));
     let fcvm_path = common::find_fcvm_binary()?;
