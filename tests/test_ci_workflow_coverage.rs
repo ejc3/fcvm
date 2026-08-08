@@ -88,7 +88,14 @@ fn gating_jobs_live_in_the_pull_request_workflow() {
         .and_then(Value::as_mapping)
         .expect("ci.yml has no `jobs:` mapping");
 
-    for job in ["lint", "host", "host-root", "container", "packaging"] {
+    for job in [
+        "lint",
+        "host",
+        "host-root",
+        "container",
+        "packaging",
+        "fc-mock",
+    ] {
         assert!(
             jobs.contains_key(Value::from(job)),
             "ci.yml no longer defines the `{job}` job. If it moved to another workflow, that \
