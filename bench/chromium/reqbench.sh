@@ -24,11 +24,13 @@ FCVM="${FCVM:-$REPO/target/release/fcvm}"
 # pointed at a root-only mode later without rewriting every call site.
 SUDO="${SUDO:-}"
 IMAGE="${IMAGE:-localhost/chromium-bench-req}"
-# 9223 is the RELAY port (socat, in entry.sh). Chromium ignores
-# --remote-debugging-address and binds guest loopback 9222 only; fcvm has no
-# feature that exposes a guest LOOPBACK port, so the relay + --publish is the
-# path. See Containerfile.chromium-bench for the measured evidence.
-CDP_PORT="${CDP_PORT:-9223}"
+# 9222 is Chromium's own CDP port. It binds guest loopback ONLY (it ignores
+# --remote-debugging-address; measured evidence in entry.sh), but fcvm DNATs every
+# published port to guest 127.0.0.1, so `--publish 9222:9222` reaches it directly.
+# The socat relay that used to bridge 9223 -> 9222 is gone: it was the only thing
+# in the CDP arm's byte path that the exec arm did not have, and the only arm that
+# dropped connections. See fc-agent/src/network.rs::publish_to_loopback.
+CDP_PORT="${CDP_PORT:-9222}"
 # rootless: --publish is supported (pasta -t) and clones inherit port_mappings
 # from snapshot metadata (src/commands/snapshot.rs:1070). No root needed, and it
 # matches the network mode the exec-path baseline was measured on.
@@ -127,7 +129,7 @@ cmd_golden() {
     $SUDO "$FCVM" snapshots delete -f "$TAG" >/dev/null 2>&1 || true
     local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
     # --publish carries host -> guest; socat inside the container carries
-    # guest-wildcard 9223 -> guest-loopback 9222, which is the hop Chromium
+    # host -> guest-published port -> DNAT -> guest-loopback, the hop Chromium
     # refuses to make itself. Clones inherit port_mappings from the snapshot
     # metadata (src/commands/snapshot.rs:1070), which is what makes a restored
     # clone drivable at all.

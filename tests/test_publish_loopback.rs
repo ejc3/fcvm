@@ -17,6 +17,11 @@
 //! pass cannot come from a wildcard bind that would have worked anyway. Without
 //! `fc-agent::network::publish_to_loopback` the host connect is refused.
 
+// The entire file is privileged-only. Gating just the test fn leaves the
+// imports and GUEST_PORT unused in the default build, which `-D warnings`
+// rejects.
+#![cfg(feature = "privileged-tests")]
+
 mod common;
 
 use anyhow::{Context, Result};
@@ -27,7 +32,6 @@ use std::time::Duration;
 /// test publishes, so a stray VM cannot answer for us.
 const GUEST_PORT: u16 = 9231;
 
-#[cfg(feature = "privileged-tests")]
 #[test]
 fn test_published_port_reaches_a_loopback_only_listener() -> Result<()> {
     println!("\ntest_published_port_reaches_a_loopback_only_listener");
