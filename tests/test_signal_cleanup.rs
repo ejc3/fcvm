@@ -557,15 +557,31 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     Ok(())
 }
 
-/// Test that SIGKILL on fcvm also kills Firecracker via PR_SET_PDEATHSIG.
+/// SIGKILL on fcvm must reap the ENTIRE rootless process tree via PR_SET_PDEATHSIG:
+/// Firecracker, the namespace holder, AND pasta.
 ///
-/// Unlike SIGTERM/SIGINT, SIGKILL cannot be caught — fcvm gets no chance to run
-/// cleanup code. The Firecracker child dies because pre_exec sets
-/// PR_SET_PDEATHSIG(SIGKILL), which makes the kernel automatically send SIGKILL
-/// to the child when its parent dies.
+/// Unlike SIGTERM/SIGINT, SIGKILL cannot be caught — fcvm gets no chance to run cleanup
+/// code, so nothing in `cleanup_vm` executes. Each child survives or dies purely on whether
+/// its own `pre_exec` armed `PR_SET_PDEATHSIG(SIGKILL)`; teardown is per-hop, and one
+/// unprotected hop orphans everything under it.
+///
+/// pasta is asserted here because it is the hop that most recently gained its own
+/// pdeathsig, and because an orphaned pasta is worse than wasted memory: it would keep
+/// listening on the loopback IP:port it was forwarding for a VM that no longer exists, and
+/// loopback IPs are allocated sequentially and recycled, so a later clone can be handed the
+/// same address while the old listener is still bound.
+///
+/// Scope, honestly: this asserts the END STATE — nothing from the VM tree outlives fcvm —
+/// not the mechanism by which each process dies. It does NOT isolate pasta's own pdeathsig,
+/// and it cannot. pasta joins the holder by PID and passt exits when that PID exits, so
+/// pasta dies here even with its `pre_exec` removed (measured; it also still dies with the
+/// holder's netns pinned open, ruling out namespace teardown as the trigger). What this
+/// test does catch is any regression that lets the whole chain go slack — a dropped
+/// pdeathsig on the holder, or a passt version that stops watching the PID — which is
+/// exactly the failure that left ~490 orphaned processes on two runners.
 #[test]
-fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
-    println!("\ntest_sigkill_kills_firecracker_rootless");
+fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
+    println!("\ntest_sigkill_reaps_rootless_vm_tree");
 
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("sigkill-rootless");
@@ -613,22 +629,24 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
         anyhow::bail!("VM did not become healthy within 120 seconds");
     }
 
-    // Find the specific child processes for THIS VM
-    let our_fc_pid = find_firecracker_for_fcvm(fcvm_pid);
-    let our_holder_pid = find_holder_for_fcvm(fcvm_pid);
+    // Find the specific child processes for THIS VM. A healthy rootless VM ALWAYS has all
+    // three, so a missing one is a failure, not a reason to skip an assertion — silently
+    // not-asserting is how an orphaned pasta stayed invisible in the first place.
+    // Each is tracked by (pid, start_time) + pidfd so the post-kill checks survive both the
+    // SIGKILL'd-but-unreaped zombie window and PID reuse under parallel load (#628).
+    let fc = find_firecracker_for_fcvm(fcvm_pid)
+        .context("no firecracker process found under this fcvm")?;
+    let holder =
+        find_holder_for_fcvm(fcvm_pid).context("no namespace holder found under this fcvm")?;
+    let pasta = find_pasta_for_fcvm(fcvm_pid).context("no pasta process found under this fcvm")?;
     println!(
-        "Our firecracker PID: {:?}, holder PID: {:?}",
-        our_fc_pid, our_holder_pid
+        "Our tree: firecracker={}, holder={}, pasta={}",
+        fc.pid, holder.pid, pasta.pid
     );
 
-    assert!(
-        our_fc_pid.is_some(),
-        "should have started a firecracker process"
-    );
-    // `fc`/`holder` are tracked by (pid, start_time) so the post-kill checks below survive
-    // both the SIGKILL'd-but-unreaped zombie window and PID reuse under parallel load (#628).
-    let fc = our_fc_pid.unwrap();
     assert!(fc.running(), "firecracker should be running before SIGKILL");
+    assert!(holder.running(), "holder should be running before SIGKILL");
+    assert!(pasta.running(), "pasta should be running before SIGKILL");
 
     // Send SIGKILL to fcvm — no cleanup handler runs
     println!("Sending SIGKILL to fcvm (PID {})", fcvm_pid);
@@ -642,47 +660,44 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
     // Poll briefly in case of scheduling delay.
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        if !fc.running() && !opt_running(our_holder_pid) {
+        if !fc.running() && !holder.running() && !pasta.running() {
             break;
         }
         std::thread::sleep(common::POLL_INTERVAL);
     }
 
-    let fc_still_running = fc.running();
-    if fc_still_running {
+    // Snapshot all three BEFORE asserting, then clean up whatever survived, so a failure of
+    // this test cannot itself leak a microVM or a stray listener onto the runner.
+    let survivors: Vec<(&str, Tracked)> =
+        [("firecracker", fc), ("holder", holder), ("pasta", pasta)]
+            .into_iter()
+            .filter(|(_, t)| t.running())
+            .collect();
+    for (role, t) in &survivors {
         println!(
-            "BUG: firecracker (PID {}) still running after fcvm SIGKILL!",
-            fc.pid
+            "BUG: {} (PID {}) still running after fcvm SIGKILL!",
+            role, t.pid
         );
-        fc.kill_if_running();
+        t.kill_if_running();
     }
-    assert!(
-        !fc_still_running,
-        "firecracker (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
-        fc.pid
-    );
 
-    if let Some(holder) = our_holder_pid {
-        let holder_still_running = holder.running();
-        if holder_still_running {
-            println!(
-                "BUG: namespace holder (PID {}) still running after fcvm SIGKILL!",
-                holder.pid
-            );
-            holder.kill_if_running();
-        }
-        assert!(
-            !holder_still_running,
-            "namespace holder (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
-            holder.pid
-        );
-        println!("Holder PID {} correctly cleaned up", holder.pid);
-    }
+    assert!(
+        survivors.is_empty(),
+        "every child must die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd, but these \
+         survived and were orphaned to init: {:?}. A surviving pasta is the dangerous one: \
+         it keeps the dead VM's forwarded loopback port bound, and that IP is recycled to a \
+         later clone.",
+        survivors
+            .iter()
+            .map(|(role, t)| format!("{} (PID {})", role, t.pid))
+            .collect::<Vec<_>>()
+    );
+    println!("firecracker, holder and pasta all reaped by the kernel");
 
     // fcvm.wait() above already reaped the exact child, so no procfs assert needed (a bare
     // /proc check would only add a PID-reuse false failure).
 
-    println!("test_sigkill_kills_firecracker_rootless PASSED");
+    println!("test_sigkill_reaps_rootless_vm_tree PASSED");
     Ok(())
 }
 
