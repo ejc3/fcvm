@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::podman::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
@@ -393,10 +393,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         "loaded snapshot configuration"
     );
 
-    // Generate unique socket name with PID to allow multiple serves per snapshot
     let my_pid = std::process::id();
-    let socket_path =
-        paths::data_dir().join(format!("uffd-{}-{}.sock", args.snapshot_name, my_pid));
 
     // How pages reach the clones: private per-clone UFFDIO_COPY (default) or one shared
     // memfd resolved with UFFDIO_CONTINUE (--uffd-mode minor / FCVM_UFFD_MODE=minor).
@@ -406,15 +403,17 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         None => UffdBacking::Copy,
     };
 
-    // Create UFFD server with custom socket path
-    let server = UffdServer::new_with_path(
+    // The server derives its own socket name, unique to this process, so concurrent
+    // serves of the same snapshot cannot unlink each other's sockets.
+    let server = UffdServer::new(
         args.snapshot_name.clone(),
         &snapshot_config.memory_path,
-        &socket_path,
+        &paths::data_dir(),
         backing,
     )
     .await
     .context("creating UFFD server")?;
+    let socket_path = server.socket_path().to_path_buf();
 
     // Save serve state for tracking
     let serve_id = generate_vm_id();
@@ -422,8 +421,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     serve_state.pid = Some(my_pid);
     serve_state.config.snapshot_name = Some(args.snapshot_name.clone());
     serve_state.config.process_type = Some(crate::state::ProcessType::Serve);
-    // Clones read this back to pick the matching Firecracker memory backend.
+    // Clones read these back to reach this exact server: the socket it bound, and the
+    // page-materialisation mode whose handshake it speaks.
     serve_state.config.uffd_mode = Some(backing.name().to_string());
+    serve_state.config.uffd_socket = Some(socket_path.clone());
     serve_state.config.hugepages = hugepages;
     serve_state.status = VmStatus::Running;
 
@@ -650,16 +651,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         }
     }
 
-    // Clean up socket file
-    if let Err(e) = std::fs::remove_file(&socket_path) {
-        warn!(
-            "failed to remove socket file {}: {}",
-            socket_path.display(),
-            e
-        );
-    } else {
-        info!("removed socket file: {}", socket_path.display());
-    }
+    // The socket is removed by the UffdServer that bound it, on drop. Unlinking it from
+    // here would be the same destructive unlink this path used to do to OTHER servers:
+    // if the server above did not stop within its timeout it is still listening, and its
+    // clones still need the socket to exist.
 
     // Delete serve state
     if let Err(e) = state_manager.delete_state(&serve_id).await {
@@ -671,6 +666,56 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("Memory server stopped");
 
     Ok(())
+}
+
+/// Describe an abnormal VMM exit, or `None` if the VMM ended the way a healthy VM's does.
+///
+/// A guest that powers itself off leaves the VMM exiting 0. Anything else means the VM
+/// stopped for a reason nobody asked for:
+///
+/// * **killed by a signal** — someone external stopped the VMM. The UFFD memory server
+///   does exactly this when it can no longer serve the clone's guest memory: killing the
+///   VMM is the only way to stop a guest before the kernel starts resolving its faults
+///   with zero pages. A clone that dies this way has not "finished", it has FAILED, and
+///   its caller must be told so rather than reading a silent exit 0.
+/// * **non-zero exit** — the VMM itself failed.
+fn abnormal_vmm_exit(status: &Result<std::process::ExitStatus>) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    match status {
+        Err(e) => Some(format!("could not be reaped: {e}")),
+        Ok(s) if s.success() => None,
+        Ok(s) => Some(match s.signal() {
+            Some(sig) => format!("was killed by signal {sig}"),
+            None => format!("exited with code {}", s.code().unwrap_or(-1)),
+        }),
+    }
+}
+
+/// Count the clones currently attached to a serve process.
+///
+/// State files outlive crashed clones, so "attached" means the recorded process is still
+/// alive AND still an fcvm process — the same identity check the serve shutdown path uses
+/// before signalling a clone. A state file we cannot read is not evidence of a clone, so
+/// an unreadable state directory counts zero rather than blocking every clone.
+async fn count_live_clones(state_manager: &StateManager, serve_pid: u32) -> usize {
+    match state_manager.list_vms().await {
+        Ok(vms) => vms
+            .into_iter()
+            .filter(|vm| vm.config.serve_pid == Some(serve_pid))
+            .filter(|vm| {
+                vm.pid
+                    .map(|pid| {
+                        crate::utils::is_process_alive(pid)
+                            && crate::utils::is_same_process_name(pid)
+                    })
+                    .unwrap_or(false)
+            })
+            .count(),
+        Err(e) => {
+            warn!("could not list VMs to count clones on serve PID {serve_pid}: {e}");
+            0
+        }
+    }
 }
 
 /// Rebuild `HOST:GUEST[:ro]` volume specs and the portable flag from snapshot volume metadata.
@@ -706,7 +751,8 @@ fn volume_state_from_snapshot(
 /// This is public so podman.rs can call it directly for cache hits.
 pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Determine mode and get snapshot name
-    let (snapshot_name, serve_pid, use_uffd, serve_uffd_mode) = match (&args.pid, &args.snapshot) {
+    let (snapshot_name, serve_pid, uffd_socket, serve_uffd_mode) = match (&args.pid, &args.snapshot)
+    {
         (Some(pid), None) => {
             // UFFD mode: verify serve process is alive
             if !crate::utils::is_process_alive(*pid) {
@@ -728,18 +774,41 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             // sends the backing fd first, COPY mode does not).
             let mode = serve_state.config.uffd_mode.clone();
 
+            // Use the socket the serve process published, never a locally rebuilt guess:
+            // the name is unique to that server instance and only it knows it.
+            let socket = serve_state.config.uffd_socket.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "serve process (PID {pid}) published no UFFD socket path in its state"
+                )
+            })?;
+
+            // One server is one shared failure and fairness domain, and it enforces a hard
+            // cap of its own. Checking here turns "your clone was killed by the memory
+            // server" into an error before a VM is ever spawned. Advisory: clones racing
+            // for the last slot are settled authoritatively by the server itself.
+            let live_clones = count_live_clones(&state_manager, *pid).await;
+            let max_clones = crate::uffd::max_clones_per_server()?;
+            if live_clones >= max_clones {
+                anyhow::bail!(
+                    "serve process (PID {pid}) already has {live_clones} clone(s), its limit \
+                     of {max_clones}. Every clone on one server shares that server's failure \
+                     domain. Start another 'fcvm snapshot serve', or raise {}.",
+                    crate::uffd::MAX_CLONES_ENV
+                );
+            }
+
             let name = serve_state
                 .config
                 .snapshot_name
                 .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
 
             info!("Cloning VM from serve PID {} (snapshot: {})", pid, name);
-            (name, Some(*pid), true, mode)
+            (name, Some(*pid), Some(socket), mode)
         }
         (None, Some(name)) => {
             // Direct file mode: no serve process needed
             info!("Cloning VM directly from snapshot: {}", name);
-            (name.clone(), None, false, None)
+            (name.clone(), None, None, None)
         }
         (None, None) => {
             anyhow::bail!("Either --pid or --snapshot must be specified");
@@ -851,23 +920,17 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let socket_path = data_dir.join("firecracker.sock");
 
-    // Build UFFD socket path for memory server (only for UFFD mode)
-    let uffd_socket = if use_uffd {
-        let pid = serve_pid.expect("serve_pid must be set for UFFD mode");
-        let socket = paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, pid));
-        info!(
+    match (&uffd_socket, serve_pid) {
+        (Some(socket), Some(pid)) => info!(
             uffd_socket = %socket.display(),
             serve_pid = pid,
             "connecting to memory server"
-        );
-        Some(socket)
-    } else {
-        info!(
+        ),
+        _ => info!(
             memory_file = %snapshot_config.memory_path.display(),
             "loading memory directly from file"
-        );
-        None
-    };
+        ),
+    }
 
     // Setup VolumeServers for clones if snapshot has volumes
     //
@@ -1249,7 +1312,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // Hugepages require UFFD (Firecracker rejects File backend for hugepage snapshots).
         // FCVM_FORCE_UFFD=1 forces UFFD for debugging/testing.
         if hugepages || std::env::var("FCVM_FORCE_UFFD").is_ok() {
-            let implicit_socket_path = data_dir.join("uffd.sock");
             let reason = if hugepages {
                 // Same admission logic as the serve-process path above: refuse to spawn a
                 // hugepage clone the pool cannot hold at its CoW worst case.
@@ -1262,16 +1324,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             };
             let backing = UffdBacking::from_env(hugepages)?;
             info!(
-                socket = %implicit_socket_path.display(),
                 reason = %reason,
                 mode = backing.name(),
                 "starting implicit UFFD server for snapshot restore"
             );
 
-            let server = match UffdServer::new_with_path(
+            let server = match UffdServer::new(
                 format!("implicit-{}", truncate_id(&vm_id, 8)),
                 &snapshot_config.memory_path,
-                &implicit_socket_path,
+                &data_dir,
                 backing,
             )
             .await
@@ -1289,6 +1350,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     return Err(e);
                 }
             };
+
+            let implicit_socket_path = server.socket_path().to_path_buf();
+            info!(
+                socket = %implicit_socket_path.display(),
+                "implicit UFFD server socket"
+            );
 
             let cancel = implicit_uffd_cancel.clone();
             tokio::spawn(async move {
@@ -1519,14 +1586,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // exec rebind → wait for confirmation → output.reconnect(). No host-side
     // notify needed — the listener will accept fc-agent's new connection naturally.
 
-    let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
+    let served_by_serve_process = uffd_socket.is_some();
+    let is_uffd = served_by_serve_process || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
     if is_uffd {
         info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
         println!(
             "✓ VM '{}' cloned from snapshot '{}' (UFFD mode)",
             vm_name, snapshot_name
         );
-        if use_uffd {
+        if served_by_serve_process {
             println!("  Memory pages served on-demand by UFFD serve process");
         } else {
             println!("  Memory pages served on-demand from snapshot file");
@@ -1764,6 +1832,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Track container exit code (from TTY mode)
     let mut container_exit_code: Option<i32> = None;
+    // Set when the VMM ended abnormally — the clone failed and this command must say so.
+    let mut vmm_failure: Option<String> = None;
     let mut health_monitor_handle = None;
 
     if verify_result.is_ok() {
@@ -1801,6 +1871,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 }
                 status = vm_manager.wait() => {
                     info!(status = ?status, "Firecracker child exited");
+                    // Diagnose the exit before the reboot path can consume it.
+                    let exit_diagnosis = abnormal_vmm_exit(&status);
 
                     // Guest reboot? Relaunch in place as a cold boot from the
                     // provisioned disk (disk-only-clone semantics): same fcvm
@@ -1910,6 +1982,30 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         } else {
                             warn!("guest rebooted but reboot-in-place is unavailable for this clone; treating as VM exit");
                         }
+                    }
+
+                    // The VM was not rebooted, so this exit is the end of the clone. If the
+                    // VMM did not end the way a healthy guest ends, the clone FAILED — say so
+                    // in the state file (for anything watching it right now) and remember it,
+                    // so this command exits non-zero after cleanup instead of reporting
+                    // success for a VM that was killed.
+                    if let Some(reason) = exit_diagnosis {
+                        error!(
+                            vm_id = %vm_id,
+                            vm_name = %vm_name,
+                            reason = %reason,
+                            "clone FAILED: its VMM {}. If its memory was served by a UFFD \
+                             server, check that server's log — it kills a clone it can no \
+                             longer serve rather than let the guest run on zero pages.",
+                            reason
+                        );
+                        let _ = state_manager
+                            .update_state(&vm_id, |state| {
+                                state.status = crate::state::VmStatus::Failed;
+                                state.health_status = crate::state::HealthStatus::Unhealthy;
+                            })
+                            .await;
+                        vmm_failure = Some(reason);
                     }
 
                     // If in TTY mode, get exit code from TTY handle
@@ -2030,6 +2126,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Propagate post-restore verification failure only after cleanup has run
     verify_result?;
+
+    // A clone whose VMM was killed or crashed did not run to completion. Fail the command
+    // so the caller gets an authoritative signal instead of a silent exit 0 — this is the
+    // signal a UFFD server's fail-closed kill ultimately surfaces through.
+    if let Some(reason) = vmm_failure {
+        bail!("clone '{vm_name}' failed: its VMM {reason}");
+    }
 
     // Return error if container exited with non-zero code
     if let Some(code) = container_exit_code {

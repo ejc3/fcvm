@@ -20,21 +20,6 @@ fn open_lock_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// Read the start time of a process in clock ticks since boot (field 22 of
-/// /proc/<pid>/stat). Returns None if the process doesn't exist or the field
-/// can't be parsed.
-///
-/// Used as a process identity check: a (pid, start_time) pair uniquely
-/// identifies a process even after the OS reuses the PID for something else.
-fn process_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // The comm field (field 2) may contain spaces and parentheses; everything
-    // after the last ')' is space-separated starting at field 3 (state), so
-    // starttime (field 22) is the 20th token after the closing paren.
-    let after_comm = stat.rsplit_once(')')?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
 /// Check whether the process recorded in a state file is still the same
 /// process that wrote it. Returns false when the state records a start time
 /// and the process currently at that PID has a different one (PID reuse by an
@@ -42,7 +27,7 @@ fn process_start_time(pid: u32) -> Option<u64> {
 /// PID-only match.
 fn pid_identity_matches(state: &VmState) -> bool {
     match (state.pid, state.pid_start_time) {
-        (Some(pid), Some(recorded)) => process_start_time(pid) == Some(recorded),
+        (Some(pid), Some(recorded)) => crate::utils::process_start_time(pid) == Some(recorded),
         _ => true,
     }
 }
@@ -132,7 +117,7 @@ impl StateManager {
             state.last_updated = chrono::Utc::now();
             // Record the start time of the process at `pid` so later lookups
             // can detect PID reuse by an unrelated process (see pid_identity_matches).
-            state.pid_start_time = state.pid.and_then(process_start_time);
+            state.pid_start_time = state.pid.and_then(crate::utils::process_start_time);
 
             let state_json = serde_json::to_string_pretty(&state)?;
 
@@ -301,7 +286,9 @@ impl StateManager {
                             let recorded_start_time =
                                 state.get("pid_start_time").and_then(|t| t.as_u64());
                             let identity_matches = match recorded_start_time {
-                                Some(recorded) => process_start_time(pid as u32) == Some(recorded),
+                                Some(recorded) => {
+                                    crate::utils::process_start_time(pid as u32) == Some(recorded)
+                                }
                                 None => true,
                             };
 

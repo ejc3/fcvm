@@ -147,7 +147,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             .context("spawning memory server")?;
 
     // Wait for serve process to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     let serve_time = step3_start.elapsed();
     println!(
         "  ✓ Memory server ready (PID: {}, took {:.1}s)",
@@ -559,7 +559,7 @@ async fn clone_while_baseline_running_impl(network_mode: &str) -> Result<()> {
             .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 5: Clone WHILE baseline is still running (this is the key test!)
@@ -714,7 +714,7 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
             .await
             .context("spawning memory server")?;
 
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     let serve_pid_str = serve_pid.to_string();
@@ -1023,7 +1023,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone
@@ -1362,7 +1362,7 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
             .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone (port forwarding inherited from snapshot)
@@ -1551,7 +1551,7 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
             .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone (port forwarding + network mode inherited from snapshot)
@@ -1711,7 +1711,7 @@ async fn test_clone_port_forward_routed() -> Result<()> {
             .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone (port forwarding + network mode inherited from snapshot)
@@ -2024,7 +2024,7 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
             .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Run clone with --exec (command that outputs something)
@@ -2201,7 +2201,7 @@ async fn clone_isolation_impl(uffd_mode: &str) -> Result<()> {
     )
     .await
     .context("spawning memory server")?;
-    common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+    common::poll_serve_ready(serve_pid, 60).await?;
 
     // ---- two clones ---------------------------------------------------------
     // The clone's Firecracker must understand the "UffdMinor" backend. The snapshot

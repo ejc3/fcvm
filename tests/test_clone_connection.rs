@@ -257,7 +257,7 @@ async fn test_clone_connection_reset_rootless() -> Result<()> {
             .await
             .context("spawning serve")?;
 
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  Memory server ready (PID: {})", serve_pid);
 
     // =========================================================================
@@ -493,7 +493,7 @@ async fn test_clone_reconnect_latency_rootless() -> Result<()> {
     println!("\nStep 5: Starting serve...");
     let (_serve_child, serve_pid) =
         common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server").await?;
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
 
     // Record sequence before clone
     let seq_before_clone = server_seq.load(Ordering::Relaxed);
@@ -741,7 +741,7 @@ async fn test_clone_connection_timing_rootless() -> Result<()> {
     println!("\nStep 6: Starting serve...");
     let (_serve_child, serve_pid) =
         common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server").await?;
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
 
     // Clone - the clone inherits the snapshot state INCLUDING the nc process mid-connection
     println!("\nStep 7: Spawning clone (has nc process from snapshot state!)...");
@@ -1129,7 +1129,7 @@ done
     println!("\nStep 7: Starting serve...");
     let (_serve_child, serve_pid) =
         common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server").await?;
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
 
     // Clone
     println!("\nStep 8: Spawning clone (resilient client should detect error and reconnect!)...");

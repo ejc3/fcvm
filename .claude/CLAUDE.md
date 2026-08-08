@@ -1174,8 +1174,16 @@ pub struct VmState {
 On serve process exit (SIGTERM/SIGINT):
 1. Query state manager for all VMs where `serve_pid == my_pid`
 2. Kill each clone process: `kill -TERM <clone_pid>`
-3. Remove socket file: `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
+3. Remove socket file (the server's own unique socket — see below)
 4. Delete serve state from state manager
+
+**UFFD socket naming.** A server's socket is
+`/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}-{pid_start_time}.sock` — the serve process's own
+`(pid, start_time)` identity, so two live servers can never derive the same name and
+unlink each other's socket. It is NOT reconstructible from the snapshot name: the serve
+process publishes it in `VmConfig::uffd_socket`, and clones (and `poll_serve_ready` in
+tests) read it from there. A server refuses to start if something is *listening* on its
+path, and only clears a proven-dead socket.
 
 ### Stale State File Handling
 
@@ -1493,7 +1501,7 @@ fcvm podman run --name baseline --network bridged nginx:alpine
 fcvm snapshot create --pid <baseline_pid> --tag my-snapshot
 
 # 3. Start memory server (serves pages via UFFD)
-fcvm snapshot serve my-snapshot    # Creates /mnt/fcvm-btrfs/uffd-my-snapshot-<pid>.sock
+fcvm snapshot serve my-snapshot    # Binds a unique socket; path is published in its state
 
 # 4. Spawn clones from the memory server
 fcvm snapshot run --pid <serve_pid> --name clone1
@@ -1508,6 +1516,27 @@ fcvm snapshot run --pid <serve_pid> --name clone1
 - Each VM gets dedicated async task (JoinSet) for page faults
 - All tasks share Arc<Mmap> reference to memory file
 - Server exits gracefully when last VM disconnects
+
+**Fail closed — a clone whose faults cannot be served is KILLED:**
+
+Closing a userfaultfd does NOT stop the guest. The kernel resolves every subsequent fault
+with a **zero page**, so the VM keeps running on memory that is silently wrong and can
+commit it to disk, to a volume, or to a response. There is no in-band way to tell a
+restored Firecracker "your memory backend is gone", so the server SIGKILLs the clone's VMM
+instead — identified by `SO_PEERCRED` on its own socket and pinned by `(pid, start_time)`
+so a reused PID is never signalled. This covers handler errors, handshake failure/timeout,
+a panicking handler, and refusal at the clone cap. The clone then exits non-zero
+(`abnormal_vmm_exit` in `commands/snapshot.rs`) rather than reporting a silent exit 0.
+**A corrupted answer is worse than no answer.**
+
+**Bounded blast radius:** every clone on one server shares its failure and fairness domain,
+so a server serves at most `FCVM_UFFD_MAX_CLONES` clones (default 64) — checked advisorily
+in `snapshot run` for a good error, and authoritatively at accept time. Handlers drain at
+most 128 faults before yielding, so one fault-heavy clone cannot hold a runtime thread and
+starve the others.
+
+`FCVM_UFFD_FAIL_AFTER_FAULTS=<n>` is test-only instrumentation that fails a handler after
+`n` faults; it is what `tests/test_uffd_fail_closed.rs` uses to exercise the above.
 
 **Memory efficiency:**
 - UFFD path: density comes from laziness — only each clone's faulted working

@@ -139,6 +139,13 @@ pub struct VmConfig {
     /// memory backend — the two ends of the handshake must agree.
     #[serde(default)]
     pub uffd_mode: Option<String>,
+    /// For serve processes: the socket its UFFD server is listening on.
+    ///
+    /// Published by the serve process rather than recomputed by each clone. The name is
+    /// unique per server instance (it embeds the serve process's pid and start time), so
+    /// there is exactly one authority for it — the server that bound it.
+    #[serde(default)]
+    pub uffd_socket: Option<std::path::PathBuf>,
     /// Original VM ID for vsock socket path redirect.
     /// Set when VM is restored from cache or snapshot. The vmstate.bin stores
     /// paths from the original VM, so when this VM is later snapshotted, we need
@@ -239,6 +246,7 @@ impl VmState {
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
                 uffd_mode: None,
+                uffd_socket: None,
                 original_vsock_vm_id: None,
                 port_mappings: Vec::new(),
                 forward_localhost: Vec::new(),

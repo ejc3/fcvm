@@ -129,7 +129,7 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
             .await
             .context("spawning memory server")?;
 
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn all clones concurrently

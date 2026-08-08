@@ -1196,36 +1196,35 @@ pub async fn kill_process(pid: u32) {
         .await;
 }
 
-/// Wait for a snapshot serve process to be ready by polling for its socket file.
+/// Wait for a snapshot serve process to be ready, and return the socket it bound.
 ///
-/// The serve process creates a socket at `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
-/// when it's ready to accept clone connections.
+/// The socket name is unique per server instance (it embeds the serve process's pid and
+/// start time), so it is NOT reconstructible from the snapshot name — the serve process
+/// publishes it in its state file, and that is the only authority for it. This helper
+/// reads it back the same way a clone does, so a test can never wait on a name no server
+/// ever bound.
 ///
 /// # Arguments
-/// * `snapshot_name` - Name of the snapshot being served
 /// * `serve_pid` - PID of the serve process
 /// * `timeout_secs` - Maximum seconds to wait
-pub async fn poll_serve_ready(
-    snapshot_name: &str,
-    serve_pid: u32,
-    timeout_secs: u64,
-) -> anyhow::Result<()> {
-    let socket_path =
-        fcvm::paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, serve_pid));
-
+pub async fn poll_serve_ready(serve_pid: u32, timeout_secs: u64) -> anyhow::Result<PathBuf> {
+    let state_manager = fcvm::state::StateManager::new(fcvm::paths::state_dir());
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
     loop {
-        if start.elapsed() > timeout {
-            anyhow::bail!(
-                "timeout waiting for serve socket: {}",
-                socket_path.display()
-            );
+        // The state file appears first, then the socket it names. Both must exist before
+        // a clone can connect, so wait for both rather than for whichever lands first.
+        if let Ok(state) = state_manager.load_state_by_pid(serve_pid).await {
+            if let Some(socket) = state.config.uffd_socket {
+                if socket.exists() {
+                    return Ok(socket);
+                }
+            }
         }
 
-        if socket_path.exists() {
-            return Ok(());
+        if start.elapsed() > timeout {
+            anyhow::bail!("timeout waiting for serve PID {serve_pid} to publish a bound socket");
         }
 
         sleep(Duration::from_millis(50)).await;
@@ -1283,7 +1282,7 @@ impl SnapshotFixture {
         let serve_log_name = format!("{}-serve", snapshot_name);
         let (_serve_child, serve_pid) =
             spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_log_name).await?;
-        poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+        poll_serve_ready(serve_pid, 30).await?;
 
         Ok(Self {
             baseline_pid,

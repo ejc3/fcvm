@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -13,10 +15,87 @@ use memmap2::MmapOptions;
 use userfaultfd::{Event, FaultKind, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::paths;
-
 /// 2MiB — the only huge page size fcvm supports for guest memory.
 const HUGE_PAGE_2M: usize = 2 * 1024 * 1024;
+
+/// Env var overriding [`DEFAULT_MAX_CLONES_PER_SERVER`].
+pub const MAX_CLONES_ENV: &str = "FCVM_UFFD_MAX_CLONES";
+
+/// How many clones one server will serve concurrently.
+///
+/// Every clone attached to a server shares that server's **failure domain** (one process,
+/// one page source, one set of file descriptors) and its **fairness domain** (one tokio
+/// task each, competing for the same runtime). An unbounded server therefore has an
+/// unbounded blast radius: one fault-handler fault, one OOM, or one pathologically
+/// fault-heavy clone degrades or kills every clone the server holds. This cap is the
+/// bound. Raise it with `FCVM_UFFD_MAX_CLONES` when a workload genuinely needs a wider
+/// server — and accept the wider blast radius that comes with it.
+pub const DEFAULT_MAX_CLONES_PER_SERVER: usize = 64;
+
+/// Resolve the per-server clone cap from [`MAX_CLONES_ENV`].
+///
+/// A malformed or zero value is an error, not a silent fallback: a server that quietly
+/// ignores its configured bound is exactly the unbounded server this cap exists to prevent.
+pub fn max_clones_per_server() -> Result<usize> {
+    let Ok(raw) = std::env::var(MAX_CLONES_ENV) else {
+        return Ok(DEFAULT_MAX_CLONES_PER_SERVER);
+    };
+    let parsed: usize = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("{MAX_CLONES_ENV}={raw:?} is not a non-negative integer"))?;
+    anyhow::ensure!(
+        parsed > 0,
+        "{MAX_CLONES_ENV}=0 would refuse every clone; set it to at least 1"
+    );
+    Ok(parsed)
+}
+
+/// How many uffd events one handler drains before yielding to the tokio runtime.
+///
+/// `drain_events` is a synchronous loop: while it runs it owns a runtime worker thread
+/// outright. A clone faulting hard enough to keep its queue non-empty would hold that
+/// thread indefinitely and starve every other clone on the server. Batching bounds one
+/// handler's uninterrupted turn without adding a scheduler — after each batch the handler
+/// yields, and the runtime picks whoever has been waiting longest.
+///
+/// The batch is deliberately small. A yield costs a queue push, not a syscall, so even at
+/// a million faults/second this is noise; the clones waiting behind it are vCPUs stopped
+/// dead on a page fault, and they are what the bound protects.
+const MAX_EVENTS_PER_BATCH: usize = 128;
+
+/// Env var arming [`fail_after_faults`].
+pub const FAIL_AFTER_FAULTS_ENV: &str = "FCVM_UFFD_FAIL_AFTER_FAULTS";
+
+/// Test-only: make a page-fault handler fail after it has served this many faults.
+///
+/// Test instrumentation in the same `FCVM_*` env-gated style as `FCVM_FUSE_TRACE_RATE`
+/// and the `failpoint` crate, and it exists because there is no other honest way to
+/// exercise fail-closed end to end. What the path must guarantee is what happens to a
+/// **healthy, running** guest the moment its server can no longer serve it — and a real
+/// Firecracker never makes its own memory server fail. Corrupting the snapshot or the
+/// socket would kill the clone by a different route and prove nothing about this one.
+///
+/// Resolved once into a static, and consulted once per fault batch rather than per fault,
+/// so an unarmed production run pays a single relaxed load per ≤[`MAX_EVENTS_PER_BATCH`]
+/// faults. A malformed value panics: instrumentation that silently fails to arm makes a
+/// fail-closed test vacuously pass, which is the one outcome worse than a failing test.
+fn fail_after_faults() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var(FAIL_AFTER_FAULTS_ENV).ok().map(|raw| {
+            raw.trim().parse().unwrap_or_else(|e| {
+                panic!("{FAIL_AFTER_FAULTS_ENV}={raw:?} is not a fault count: {e}")
+            })
+        })
+    })
+}
+
+/// The longest socket path `bind(2)` accepts, minus the NUL terminator.
+///
+/// `sockaddr_un.sun_path` is a fixed 108-byte array on Linux. Overflowing it fails the
+/// bind with a bare `EINVAL`; checking up front names the actual problem.
+const MAX_UNIX_SOCKET_PATH_LEN: usize = 107;
 
 /// How the server materialises snapshot pages into a clone's guest memory.
 ///
@@ -89,38 +168,228 @@ enum PageSource {
     Minor { backing: File },
 }
 
+/// The VMM process on the far end of one clone's UFFD connection.
+///
+/// A UFFD server has no name for the clone it serves: the connection carries Firecracker's
+/// memory mappings and its userfaultfd, nothing else. But the kernel does tell us which
+/// process opened the connection (`SO_PEERCRED`), and that process is precisely the one
+/// whose guest memory this server is responsible for. So it is both the identity we log
+/// and the authority we exercise when we can no longer serve it.
+///
+/// The `(pid, start_time)` pair is the same process identity fcvm's state files use. A PID
+/// on its own is reusable, and a server must never fire a signal at a stranger that
+/// inherited a dead clone's number.
+#[derive(Debug, Clone)]
+struct ClonePeer {
+    /// Server-local connection label (`vm-0`, `vm-1`, …) used in logs.
+    vm_id: String,
+    /// PID of the connecting VMM, captured by the kernel at `connect(2)` time.
+    pid: u32,
+    /// `/proc/<pid>/stat` field 22 at connect time, or `None` if the peer was already gone.
+    start_time: Option<u64>,
+}
+
+impl ClonePeer {
+    /// Identify the VMM behind an accepted connection.
+    fn from_stream(vm_id: String, stream: &UnixStream) -> Result<Self> {
+        let cred = stream
+            .peer_cred()
+            .context("reading UFFD peer credentials (SO_PEERCRED)")?;
+        let raw = cred.pid().ok_or_else(|| {
+            anyhow!(
+                "UFFD peer credentials carry no PID — this server cannot identify, and so \
+                 cannot fail closed on, the VMM it would be serving"
+            )
+        })?;
+        let pid = u32::try_from(raw)
+            .map_err(|_| anyhow!("UFFD peer reported an out-of-range PID {raw}"))?;
+        Ok(Self {
+            vm_id,
+            start_time: crate::utils::process_start_time(pid),
+            pid,
+        })
+    }
+
+    /// FAIL CLOSED: SIGKILL this clone's VMM because the server can no longer serve its
+    /// guest memory.
+    ///
+    /// Closing a userfaultfd under a running guest does not stop the guest — the kernel
+    /// resolves every subsequent fault with a **zero page**. The VM carries on executing
+    /// against memory that is silently wrong and can commit that wrongness to its disk, to
+    /// a mounted volume, or to a response it returns to a caller. There is no in-band way
+    /// to tell a restored Firecracker "your memory backend is gone", so the only honest
+    /// outcome is to stop the guest before it can act on zeros. A corrupted answer is
+    /// worse than no answer.
+    ///
+    /// SIGKILL, not SIGTERM: a graceful shutdown would run guest and VMM code that touches
+    /// unserved pages on its way out, which is the very thing being prevented.
+    fn kill_fail_closed(&self, reason: &str) {
+        // PID reuse guard: only signal a process we can still prove is the one that
+        // connected. Same (pid, start_time) identity the state files use.
+        let current = crate::utils::process_start_time(self.pid);
+        if current.is_none() {
+            info!(
+                target: "uffd",
+                vm_id = %self.vm_id,
+                peer_pid = self.pid,
+                reason,
+                "clone VMM already exited; nothing to fail closed"
+            );
+            return;
+        }
+        if current != self.start_time {
+            warn!(
+                target: "uffd",
+                vm_id = %self.vm_id,
+                peer_pid = self.pid,
+                reason,
+                "PID {} is no longer the clone VMM that connected (PID reuse) — NOT signalling \
+                 it; the clone it belonged to is already gone",
+                self.pid
+            );
+            return;
+        }
+
+        error!(
+            target: "uffd",
+            vm_id = %self.vm_id,
+            peer_pid = self.pid,
+            reason,
+            "FAIL CLOSED: killing clone VMM (PID {}) because {}. Its userfaultfd is going \
+             away, and a running guest whose faults are unserved is served ZERO PAGES by \
+             the kernel — silent memory corruption. The clone dies now instead of returning \
+             corrupt results.",
+            self.pid,
+            reason
+        );
+
+        match nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(()) => info!(
+                target: "uffd",
+                vm_id = %self.vm_id,
+                peer_pid = self.pid,
+                "clone VMM killed"
+            ),
+            // ESRCH: it exited between the identity check and the signal. Fine — the
+            // outcome we wanted (no running guest on unserved memory) already holds.
+            Err(nix::errno::Errno::ESRCH) => info!(
+                target: "uffd",
+                vm_id = %self.vm_id,
+                peer_pid = self.pid,
+                "clone VMM exited before the fail-closed kill landed"
+            ),
+            Err(e) => error!(
+                target: "uffd",
+                vm_id = %self.vm_id,
+                peer_pid = self.pid,
+                error = %e,
+                "FAILED to kill clone VMM (PID {}) — it may still be running on unserved \
+                 memory. Kill it manually.",
+                self.pid
+            ),
+        }
+    }
+}
+
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
 pub struct UffdServer {
     snapshot_id: String,
     socket_path: PathBuf,
     source: Arc<PageSource>,
     backing: UffdBacking,
+    /// How many clones this server will serve at once — its blast-radius bound.
+    max_clones: usize,
+    /// Set once `run()` owns the bound listener. Gates socket removal in `Drop` so a
+    /// server can only ever unlink a socket it created itself.
+    bound: AtomicBool,
+}
+
+/// Build the socket path for a server instance, unique to the process that owns it.
+///
+/// The name carries this process's `(pid, start_time)` — fcvm's existing process identity.
+/// Two live servers can therefore never derive the same path, which is what makes it safe
+/// for a server to unlink "its" socket on startup and on drop: before this, every server
+/// unlinked a name any other server could also be listening on, so overlapping servers
+/// deleted each other's sockets and clones connected to nothing.
+///
+/// A leftover file at this exact name cannot be a live server, only residue from a
+/// pre-reboot process that happened to reuse both the PID and its start time.
+fn socket_path_for(dir: &Path, snapshot_id: &str) -> Result<PathBuf> {
+    let pid = std::process::id();
+    // A process can always read its own start time; if /proc says otherwise the identity
+    // guarantee is gone and a unique name cannot be built.
+    let start_time = crate::utils::process_start_time(pid).ok_or_else(|| {
+        anyhow!("cannot read this process's start time from /proc/{pid}/stat to build a unique UFFD socket name")
+    })?;
+    let path = dir.join(format!("uffd-{snapshot_id}-{pid}-{start_time}.sock"));
+    let len = path.as_os_str().len();
+    anyhow::ensure!(
+        len <= MAX_UNIX_SOCKET_PATH_LEN,
+        "UFFD socket path is {len} bytes, over the {MAX_UNIX_SOCKET_PATH_LEN}-byte \
+         sockaddr_un limit: {}. Use a shorter snapshot name or data directory.",
+        path.display()
+    );
+    Ok(path)
+}
+
+/// Take ownership of this server's socket path, refusing to disturb a live server.
+///
+/// The old behaviour was an unconditional `remove_file` on a name other servers could also
+/// hold — a startup that silently unlinked a live server's socket. With a per-instance
+/// name a collision should be impossible, so anything found here is investigated rather
+/// than deleted on sight: if something is *listening* there, this server refuses to start
+/// instead of stealing the name; only a proven-dead socket is cleared.
+async fn claim_socket_path(socket_path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(socket_path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("stat-ing {}", socket_path.display())),
+        Ok(_) => {}
+    }
+
+    // Something is at our name. A successful connect proves a live listener owns it.
+    if UnixStream::connect(socket_path).await.is_ok() {
+        anyhow::bail!(
+            "refusing to start: a LIVE UFFD server is already listening on {}. Unlinking it \
+             would strand that server's clones on a socket nobody accepts.",
+            socket_path.display()
+        );
+    }
+
+    warn!(
+        target: "uffd",
+        socket = %socket_path.display(),
+        "removing a dead socket left at this server's unique path (residue from a \
+         pre-reboot process that reused this PID and start time)"
+    );
+    tokio::fs::remove_file(socket_path)
+        .await
+        .with_context(|| format!("removing dead socket {}", socket_path.display()))
 }
 
 impl UffdServer {
-    /// Create a new UFFD server for a snapshot
+    /// Create a UFFD server that will listen on a unique socket inside `socket_dir`.
+    ///
+    /// The server derives its own socket name (see [`socket_path_for`]) rather than
+    /// accepting one: the name is what keeps concurrent servers from unlinking each other,
+    /// so it is not a caller's to choose. Read it back with [`UffdServer::socket_path`].
     pub async fn new(
         snapshot_id: String,
         mem_file_path: &Path,
+        socket_dir: &Path,
         backing: UffdBacking,
     ) -> Result<Self> {
-        let socket_path = paths::data_dir().join(format!("uffd-{}.sock", snapshot_id));
-        Self::new_with_path(snapshot_id, mem_file_path, &socket_path, backing).await
-    }
-
-    /// Create a new UFFD server with custom socket path
-    pub async fn new_with_path(
-        snapshot_id: String,
-        mem_file_path: &Path,
-        socket_path: &Path,
-        backing: UffdBacking,
-    ) -> Result<Self> {
+        let socket_path = socket_path_for(socket_dir, &snapshot_id)?;
+        let max_clones = max_clones_per_server()?;
         info!(
             target: "uffd",
             snapshot = %snapshot_id,
             mem_file = %mem_file_path.display(),
             socket = %socket_path.display(),
             mode = backing.name(),
+            max_clones,
             "creating UFFD server"
         );
 
@@ -166,14 +435,15 @@ impl UffdServer {
                 .context("creating socket directory")?;
         }
 
-        // Remove stale socket (ignore errors if not exists - avoids TOCTOU race)
-        let _ = tokio::fs::remove_file(&socket_path).await;
+        claim_socket_path(&socket_path).await?;
 
         Ok(Self {
             snapshot_id,
-            socket_path: socket_path.to_path_buf(),
+            socket_path,
             source: Arc::new(source),
             backing,
+            max_clones,
+            bound: AtomicBool::new(false),
         })
     }
 
@@ -198,10 +468,19 @@ impl UffdServer {
 
         // Bind Unix socket
         let listener = UnixListener::bind(&self.socket_path).context("binding Unix socket")?;
+        // We own the socket file now, so Drop may remove it.
+        self.bound.store(true, Ordering::Release);
 
-        info!(target: "uffd", "UFFD server listening, waiting for VM connections...");
+        info!(
+            target: "uffd",
+            max_clones = self.max_clones,
+            "UFFD server listening, waiting for VM connections..."
+        );
 
-        let mut vm_tasks: JoinSet<String> = JoinSet::new();
+        let mut vm_tasks: JoinSet<()> = JoinSet::new();
+        // Every in-flight handler's peer, so a PANICKING handler — which never runs its own
+        // error path — can still be failed closed from here.
+        let mut peers: HashMap<tokio::task::Id, ClonePeer> = HashMap::new();
         let mut next_vm_id = 0u64;
 
         loop {
@@ -212,13 +491,64 @@ impl UffdServer {
                         Ok((stream, _)) => {
                             let vm_id = format!("vm-{}", next_vm_id);
                             next_vm_id += 1;
+
+                            // Identify the VMM before anything else: without it this server
+                            // cannot fail closed on the clone, so it must not serve it.
+                            let peer = match ClonePeer::from_stream(vm_id.clone(), &stream) {
+                                Ok(peer) => peer,
+                                Err(e) => {
+                                    error!(
+                                        target: "uffd",
+                                        vm_id = %vm_id,
+                                        error = ?e,
+                                        "refusing connection: cannot identify the connecting VMM"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Reap finished handlers before measuring occupancy, so the cap
+                            // counts clones that are actually being served rather than
+                            // completed-but-unjoined tasks. Refusing a clone we have room
+                            // for would be a spurious kill.
+                            while let Some(result) = vm_tasks.try_join_next_with_id() {
+                                Self::reap(result, &mut peers);
+                            }
+
+                            if vm_tasks.len() >= self.max_clones {
+                                // Fail closed, not open. Simply closing the socket is not an
+                                // option: in COPY mode Firecracker never waits for a reply,
+                                // so it would restore and then hang forever on its first
+                                // fault with no diagnosis anywhere.
+                                error!(
+                                    target: "uffd",
+                                    vm_id = %vm_id,
+                                    peer_pid = peer.pid,
+                                    active_vms = vm_tasks.len(),
+                                    max_clones = self.max_clones,
+                                    "at the {}-clone cap for this server; refusing a new clone. \
+                                     Start another `fcvm snapshot serve` or raise {}.",
+                                    self.max_clones,
+                                    MAX_CLONES_ENV
+                                );
+                                peer.kill_fail_closed("this server is at its concurrent-clone cap");
+                                continue;
+                            }
+
                             let source = Arc::clone(&self.source);
 
-                            info!(target: "uffd", vm_id = %vm_id, "new VM connection");
+                            info!(
+                                target: "uffd",
+                                vm_id = %vm_id,
+                                peer_pid = peer.pid,
+                                "new VM connection"
+                            );
 
                             // Spawn per-connection task so the accept loop returns
                             // immediately — no blocking on slow/misbehaving clones.
-                            vm_tasks.spawn(async move {
+                            let task_peer = peer.clone();
+                            let handle = vm_tasks.spawn(async move {
+                                let peer = task_peer;
                                 match tokio::time::timeout(
                                     Duration::from_secs(30),
                                     handshake(stream, &source),
@@ -226,32 +556,39 @@ impl UffdServer {
                                     Ok(Ok((uffd, mappings))) => {
                                         info!(
                                             target: "uffd",
-                                            vm_id = %vm_id,
+                                            vm_id = %peer.vm_id,
                                             regions = mappings.len(),
                                             "received UFFD with {} memory regions",
                                             mappings.len()
                                         );
-                                        match handle_vm_page_faults(vm_id.clone(), uffd, mappings, source).await {
-                                            Ok(()) => info!(target: "uffd", vm_id = %vm_id, "VM handler exited cleanly"),
-                                            Err(e) => error!(
-                                                target: "uffd",
-                                                vm_id = %vm_id,
-                                                error = ?e,
-                                                "VM page-fault handler died; its userfaultfd is now closed and the \
-                                                 still-running VM will receive zero pages for unfaulted memory \
-                                                 (silent corruption) — kill the affected clone"
-                                            ),
+                                        match handle_vm_page_faults(peer.vm_id.clone(), uffd, mappings, source).await {
+                                            // The uffd closed because the VM exited — the
+                                            // normal end of a clone's life, nothing to do.
+                                            Ok(()) => info!(target: "uffd", vm_id = %peer.vm_id, "VM handler exited cleanly"),
+                                            Err(e) => {
+                                                error!(
+                                                    target: "uffd",
+                                                    vm_id = %peer.vm_id,
+                                                    error = ?e,
+                                                    "VM page-fault handler died"
+                                                );
+                                                peer.kill_fail_closed(
+                                                    "its page-fault handler died and can no longer serve its memory",
+                                                );
+                                            }
                                         }
                                     }
                                     Ok(Err(e)) => {
-                                        error!(target: "uffd", vm_id = %vm_id, error = ?e, "handshake failed");
+                                        error!(target: "uffd", vm_id = %peer.vm_id, error = ?e, "handshake failed");
+                                        peer.kill_fail_closed("its UFFD handshake failed");
                                     }
                                     Err(_) => {
-                                        error!(target: "uffd", vm_id = %vm_id, "handshake timed out after 30s");
+                                        error!(target: "uffd", vm_id = %peer.vm_id, "handshake timed out after 30s");
+                                        peer.kill_fail_closed("its UFFD handshake timed out after 30s");
                                     }
                                 }
-                                vm_id
                             });
+                            peers.insert(handle.id(), peer);
 
                             info!(target: "uffd", active_vms = vm_tasks.len(), "VM connection spawned");
                         }
@@ -262,12 +599,8 @@ impl UffdServer {
                 }
 
                 // Handle completed VM tasks
-                Some(result) = vm_tasks.join_next() => {
-                    match result {
-                        Ok(vm_id) => info!(target: "uffd", vm_id = %vm_id, "VM disconnected"),
-                        Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
-                    }
-
+                Some(result) = vm_tasks.join_next_with_id() => {
+                    Self::reap(result, &mut peers);
                     info!(target: "uffd", active_vms = vm_tasks.len(), "VM exited");
                 }
 
@@ -292,22 +625,61 @@ impl UffdServer {
                 "draining VM handlers before shutdown"
             );
         }
-        while let Some(result) = vm_tasks.join_next().await {
-            match result {
-                Ok(vm_id) => info!(target: "uffd", vm_id = %vm_id, "VM disconnected"),
-                Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
-            }
+        while let Some(result) = vm_tasks.join_next_with_id().await {
+            Self::reap(result, &mut peers);
         }
 
         info!(target: "uffd", "UFFD server stopped");
         Ok(())
     }
+
+    /// Retire one finished handler.
+    ///
+    /// A handler that returned reported its own outcome (and failed closed if it had to).
+    /// A handler that **panicked** ran none of that code, yet its userfaultfd is just as
+    /// closed and its guest just as exposed to zero pages — so the kill happens here.
+    fn reap(
+        result: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+        peers: &mut HashMap<tokio::task::Id, ClonePeer>,
+    ) {
+        match result {
+            Ok((id, ())) => {
+                if let Some(peer) = peers.remove(&id) {
+                    info!(target: "uffd", vm_id = %peer.vm_id, "VM disconnected");
+                }
+            }
+            Err(e) => {
+                let id = e.id();
+                match peers.remove(&id) {
+                    Some(peer) => {
+                        error!(
+                            target: "uffd",
+                            vm_id = %peer.vm_id,
+                            error = %e,
+                            "VM page-fault handler PANICKED"
+                        );
+                        peer.kill_fail_closed("its page-fault handler panicked");
+                    }
+                    None => error!(
+                        target: "uffd",
+                        error = %e,
+                        "VM task panicked and its peer is unknown — a clone may be running \
+                         on unserved memory"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 impl Drop for UffdServer {
     fn drop(&mut self) {
-        // Clean up socket file (ignore errors - avoids TOCTOU race and handles concurrent cleanup)
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Only remove a socket this server actually bound. The path is unique to this
+        // process, but a server that never got as far as binding has no business
+        // unlinking anything.
+        if self.bound.load(Ordering::Acquire) {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
@@ -503,8 +875,12 @@ async fn handle_vm_page_faults(
             }
         };
 
+        // Set when this poll stopped on the batch limit rather than an empty queue, so the
+        // handler yields before coming back for more.
+        let mut hit_batch_limit = false;
+
         if let Some(mut guard) = maybe_guard {
-            if !drain_events(
+            match drain_events(
                 &mut guard,
                 &vm_id,
                 &mappings,
@@ -515,9 +891,15 @@ async fn handle_vm_page_faults(
                 &mut pending_continues,
                 start_time,
             )? {
-                return Ok(()); // VM exited
+                DrainOutcome::VmExited => return Ok(()),
+                DrainOutcome::Drained => guard.clear_ready(),
+                // Events are still queued. Deliberately do NOT clear readiness: the
+                // AsyncFd registration is edge-triggered, so clearing it here would park
+                // this handler waiting for an edge that never comes — the guest is
+                // blocked on the very faults still sitting in that queue. Leaving the
+                // readiness set makes the next `readable()` return immediately.
+                DrainOutcome::BatchLimit => hit_batch_limit = true,
             }
-            guard.clear_ready();
         }
 
         // Retry parked faults now that the queue is drained — reading the queued event is
@@ -552,11 +934,33 @@ async fn handle_vm_page_faults(
                 pending_continues.remove(&page);
             }
         }
+
+        // Hand the worker thread back so the other clones on this server get a turn. The
+        // draining loop above is synchronous: without this, a clone that keeps its fault
+        // queue non-empty would hold a runtime thread for as long as it liked and starve
+        // every clone sharing the server.
+        if hit_batch_limit {
+            tokio::task::yield_now().await;
+        }
     }
 }
 
-/// Drain every ready event from the uffd. Returns `Ok(false)` when the VM has exited
-/// (uffd closed), `Ok(true)` to keep serving.
+/// Why [`drain_events`] returned.
+enum DrainOutcome {
+    /// The uffd closed: the clone's VMM exited. Stop serving it.
+    VmExited,
+    /// The event queue is empty. Readiness may be cleared and the handler may park.
+    Drained,
+    /// [`MAX_EVENTS_PER_BATCH`] events were handled and more are queued. Readiness must
+    /// NOT be cleared; the handler should yield and come straight back.
+    BatchLimit,
+}
+
+/// Serve up to [`MAX_EVENTS_PER_BATCH`] ready events from the uffd.
+///
+/// Bounded rather than unbounded on purpose: this function is synchronous, so for as long
+/// as it runs it owns a tokio worker thread and every other clone on the server waits.
+/// See [`DrainOutcome`] for how the caller must treat each ending.
 #[allow(clippy::too_many_arguments)]
 fn drain_events(
     guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, Uffd>,
@@ -568,10 +972,32 @@ fn drain_events(
     fault_count: &mut u64,
     pending_continues: &mut std::collections::BTreeMap<usize, u32>,
     start_time: std::time::Instant,
-) -> Result<bool> {
+) -> Result<DrainOutcome> {
     {
-        // Read all available events (non-blocking)
+        // Test-only fault injection, checked once per batch (see `fail_after_faults`).
+        if let Some(limit) = fail_after_faults() {
+            if *fault_count >= limit {
+                return Err(anyhow!(
+                    "{FAIL_AFTER_FAULTS_ENV}={limit} armed: failing the page-fault handler \
+                     for vm {vm_id} after {} faults",
+                    *fault_count
+                ));
+            }
+        }
+
+        // Read available events (non-blocking), up to this batch's budget
+        let mut served = 0usize;
         loop {
+            if served >= MAX_EVENTS_PER_BATCH {
+                debug!(
+                    target: "uffd",
+                    vm_id = %vm_id,
+                    served,
+                    "fault batch budget reached, yielding to other clones"
+                );
+                return Ok(DrainOutcome::BatchLimit);
+            }
+            served += 1;
             let event = match guard.get_inner().read_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => break, // No more events ready
@@ -591,7 +1017,7 @@ fn drain_events(
                         pages_per_sec = format!("{:.0}", rate),
                         "VM exited"
                     );
-                    return Ok(false);
+                    return Ok(DrainOutcome::VmExited);
                 }
             };
 
@@ -642,7 +1068,7 @@ fn drain_events(
                             }
                             match continue_page(guard.get_inner(), vm_id, fault_page, page_size)? {
                                 ContinueOutcome::Resolved => {}
-                                ContinueOutcome::VmGone => return Ok(false),
+                                ContinueOutcome::VmGone => return Ok(DrainOutcome::VmExited),
                                 ContinueOutcome::Retry => {
                                     // mmap_changing is set and the event that raised it is
                                     // somewhere in THIS queue. Don't spin here — park the
@@ -876,7 +1302,7 @@ fn drain_events(
             }
         }
     }
-    Ok(true)
+    Ok(DrainOutcome::Drained)
 }
 
 /// Memory region mapping from Firecracker.
@@ -1234,6 +1660,208 @@ pub fn preflight_clone_hugepages(memory_mib: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Fail closed: the server's authority over a clone it can no longer serve.
+    // =========================================================================
+
+    /// Spawn a real, killable child and wait until the kernel has published it.
+    fn spawn_victim() -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning victim process");
+        // `spawn` returns once the child exists, so /proc/<pid> is already there.
+        assert!(
+            crate::utils::process_start_time(child.id()).is_some(),
+            "victim must be visible in /proc"
+        );
+        child
+    }
+
+    /// Wait for a child to die, returning the signal that killed it.
+    ///
+    /// Bounded rather than unbounded: a SIGKILL that never lands must fail the test, not
+    /// hang it. Polling `try_wait` is the only option here — the whole point is that
+    /// nothing in this process asked the child to exit.
+    fn wait_for_death(child: &mut std::process::Child) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("waiting on victim") {
+                Some(status) => return status.signal(),
+                None => assert!(
+                    std::time::Instant::now() < deadline,
+                    "victim was not killed within 10s"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A handler that can no longer serve its clone must LEAVE NO RUNNING GUEST behind.
+    ///
+    /// This is the whole point of the fix: before it, the server logged that the VM
+    /// "should be killed" and left it running on memory the kernel would answer with zero
+    /// pages. Here the process is actually dead, by SIGKILL, when the server says so.
+    #[test]
+    fn test_kill_fail_closed_kills_the_clone_vmm() {
+        let mut victim = spawn_victim();
+        let peer = ClonePeer {
+            vm_id: "vm-test".to_string(),
+            pid: victim.id(),
+            start_time: crate::utils::process_start_time(victim.id()),
+        };
+
+        peer.kill_fail_closed("the test said so");
+
+        assert_eq!(
+            wait_for_death(&mut victim),
+            Some(libc::SIGKILL),
+            "a clone the server cannot serve must be SIGKILLed, not merely logged about"
+        );
+    }
+
+    /// The kill must never land on a stranger that inherited a dead clone's PID.
+    ///
+    /// Simulated by recording a start time that does not match the process now at that PID
+    /// — exactly what a PID-reuse victim looks like. The process must survive untouched.
+    #[test]
+    fn test_kill_fail_closed_refuses_a_reused_pid() {
+        let mut bystander = spawn_victim();
+        let real_start = crate::utils::process_start_time(bystander.id()).unwrap();
+        let peer = ClonePeer {
+            vm_id: "vm-test".to_string(),
+            pid: bystander.id(),
+            // The clone we connected to started earlier; this PID is someone else now.
+            start_time: Some(real_start.wrapping_sub(1)),
+        };
+
+        peer.kill_fail_closed("the test said so");
+
+        assert!(
+            bystander
+                .try_wait()
+                .expect("waiting on bystander")
+                .is_none(),
+            "a PID that is no longer our clone must NOT be signalled"
+        );
+        bystander.kill().ok();
+        bystander.wait().ok();
+    }
+
+    /// The server identifies its clone from the kernel's `SO_PEERCRED`, not from anything
+    /// the connecting process claims — that is what makes the identity trustworthy enough
+    /// to fire a SIGKILL at.
+    #[tokio::test]
+    async fn test_clone_peer_identity_comes_from_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let connector = tokio::spawn(async move { UnixStream::connect(&path).await.unwrap() });
+        let (server_side, _) = listener.accept().await.unwrap();
+        let _client = connector.await.unwrap();
+
+        let peer = ClonePeer::from_stream("vm-0".to_string(), &server_side).unwrap();
+        assert_eq!(
+            peer.pid,
+            std::process::id(),
+            "peer PID must be the process that actually connected"
+        );
+        assert_eq!(
+            peer.start_time,
+            crate::utils::process_start_time(std::process::id()),
+            "peer identity must pin the start time so a reused PID is detectable"
+        );
+    }
+
+    /// A server refuses to start on a path a LIVE server is listening on, rather than
+    /// unlinking it — the old behaviour, which stranded the live server's clones on a
+    /// socket nobody was accepting on.
+    #[tokio::test]
+    async fn test_claim_socket_path_refuses_a_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let _live = UnixListener::bind(&path).unwrap();
+
+        let err = claim_socket_path(&path)
+            .await
+            .expect_err("must refuse to take a live server's socket");
+        assert!(
+            err.to_string().contains("LIVE UFFD server"),
+            "error must name the cause, got: {err}"
+        );
+        assert!(path.exists(), "the live server's socket must survive");
+    }
+
+    /// A dead socket at this server's own unique path is residue, and is cleared.
+    #[tokio::test]
+    async fn test_claim_socket_path_clears_a_dead_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dead.sock");
+        drop(UnixListener::bind(&path).unwrap()); // bound, then no listener: a dead socket
+        assert!(path.exists());
+
+        claim_socket_path(&path)
+            .await
+            .expect("dead socket is ours to clear");
+        assert!(
+            !path.exists(),
+            "dead socket must be removed so bind can succeed"
+        );
+    }
+
+    /// Two servers in one process never derive the same socket name for different
+    /// snapshots, and the name pins this process's identity so no other live server can
+    /// ever hold it.
+    #[test]
+    fn test_socket_path_is_unique_per_server_instance() {
+        let dir = Path::new("/tmp");
+        let a = socket_path_for(dir, "snap-a").unwrap();
+        let b = socket_path_for(dir, "snap-b").unwrap();
+        assert_ne!(a, b);
+
+        let pid = std::process::id();
+        let start = crate::utils::process_start_time(pid).unwrap();
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name, format!("uffd-snap-a-{pid}-{start}.sock"));
+    }
+
+    /// An over-long socket path is refused with an explanation instead of a bare EINVAL
+    /// out of `bind(2)`.
+    #[test]
+    fn test_socket_path_rejects_oversized_paths() {
+        let err = socket_path_for(Path::new("/tmp"), &"x".repeat(200)).unwrap_err();
+        assert!(err.to_string().contains("sockaddr_un limit"), "got: {err}");
+    }
+
+    /// The clone cap is configurable, and a value that would make the server useless or
+    /// is not a number is refused rather than silently ignored.
+    #[test]
+    fn test_max_clones_parsing() {
+        // Serialized against other env-mutating tests in this module by a shared lock.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: env mutation is serialized by ENV_LOCK; no other test reads this var.
+        unsafe { std::env::remove_var(MAX_CLONES_ENV) };
+        assert_eq!(
+            max_clones_per_server().unwrap(),
+            DEFAULT_MAX_CLONES_PER_SERVER
+        );
+
+        unsafe { std::env::set_var(MAX_CLONES_ENV, "3") };
+        assert_eq!(max_clones_per_server().unwrap(), 3);
+
+        unsafe { std::env::set_var(MAX_CLONES_ENV, "0") };
+        assert!(max_clones_per_server().is_err(), "0 must be refused");
+
+        unsafe { std::env::set_var(MAX_CLONES_ENV, "many") };
+        assert!(max_clones_per_server().is_err(), "garbage must be refused");
+
+        unsafe { std::env::remove_var(MAX_CLONES_ENV) };
+    }
 
     #[test]
     fn test_mapping_contains_basic() {
