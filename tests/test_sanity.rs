@@ -787,3 +787,116 @@ async fn test_rootless_map_nonroot_reader() -> Result<()> {
     println!("✅ #683: non-root read of rootless --map'd volume works");
     Ok(())
 }
+
+/// The guest actually has NTP sources, from the config fc-agent wrote.
+///
+/// fc-agent's chrony setup used to fail SILENTLY in both halves. It read the NTP
+/// servers from `/etc-host/chrony.conf`, a path nothing ever mounts, so the list
+/// was always empty and the `chronyc add server` loop it slept a second for ran
+/// zero times. And it started `chronyd -u root` with no `-f`, so the config it
+/// wrote — carrying `makestep 1 -1`, which is what lets a restored VM step a
+/// multi-hour clock jump — was read by nobody; chronyd loaded the rootfs's
+/// `/etc/chrony/chrony.conf` (`makestep 1.0 3`) instead. Nothing logged an error
+/// in either case, and a VM with no correctable clock looks perfectly healthy.
+///
+/// So this asserts the POSITIVE, all three links of the chain:
+/// 1. chronyd is running against the config fc-agent wrote (`-f`),
+/// 2. that config carries `makestep 1 -1`,
+/// 3. the daemon really has NTP sources configured.
+#[tokio::test]
+async fn test_sanity_chrony_ntp_configured() -> Result<()> {
+    println!("\nTest guest chrony has NTP sources from fc-agent's config");
+    println!("========================================================");
+
+    let (vm_name, _, _, _) = common::unique_names("chrony-ntp");
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning fcvm for chrony check")?;
+    let _ = &mut child;
+
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
+        common::kill_process(fcvm_pid).await;
+        return Err(e.context("VM failed to become healthy"));
+    }
+
+    // chronyd runs off the boot critical path, so it can still be coming up when
+    // the VM first reports healthy, and a `pool` directive only materializes its
+    // sources once the pool name resolves. Retry until sources actually appear —
+    // the loop ends on the real condition, and the bound is what fails the test.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let source_lines = loop {
+        let attempt = match common::exec_in_vm(fcvm_pid, &["chronyc", "-n", "sources"]).await {
+            Ok(out) => {
+                // `chronyc -n sources` prints a header, a `=====` rule, then one
+                // line per source.
+                let count = out
+                    .lines()
+                    .skip_while(|line| !line.contains("====="))
+                    .skip(1)
+                    .filter(|line| !line.trim().is_empty())
+                    .count();
+                if count > 0 {
+                    break count;
+                }
+                format!("chronyd answered but reported 0 sources; it said:\n{out}")
+            }
+            Err(e) => format!("chronyc did not answer: {e:#}"),
+        };
+        if std::time::Instant::now() >= deadline {
+            common::kill_process(fcvm_pid).await;
+            return Err(anyhow::anyhow!(
+                "guest never reported an NTP source within 60s — its clock would silently \
+                 drift with nothing to correct it. Last attempt: {attempt}"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+
+    let chronyd_argv = common::exec_in_vm(fcvm_pid, &["ps", "-o", "args=", "-C", "chronyd"]).await;
+    let written_conf = common::exec_in_vm(fcvm_pid, &["cat", "/etc/chrony.conf"]).await;
+
+    common::kill_process(fcvm_pid).await;
+
+    // 1. EVERY running chronyd is fc-agent's, reading the config fc-agent wrote.
+    // Without the `-f` the config is inert; a daemon without it is either the
+    // systemd-started one fc-agent is supposed to have replaced, or fc-agent's
+    // own falling back to the distro default.
+    let chronyd_argv = chronyd_argv.context("reading chronyd argv in the guest")?;
+    let daemons: Vec<&str> = chronyd_argv
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert!(
+        !daemons.is_empty(),
+        "no chronyd running in the guest, yet chronyc answered: {chronyd_argv:?}"
+    );
+    assert!(
+        daemons
+            .iter()
+            .all(|argv| argv.contains("-f /etc/chrony.conf")),
+        "every chronyd must run against fc-agent's config (-f /etc/chrony.conf), \
+         else the config it writes is inert; got: {daemons:?}"
+    );
+
+    // 2. That config carries the restore-critical makestep.
+    let written_conf = written_conf.context("reading /etc/chrony.conf in the guest")?;
+    assert!(
+        written_conf.contains("makestep 1 -1"),
+        "fc-agent's chrony config must allow stepping the clock at any time \
+         (makestep 1 -1) for snapshot restore; got: {written_conf:?}"
+    );
+
+    // 3. The daemon really has sources — established by the loop above, which
+    // only exits on source_lines > 0 or by failing the test.
+    println!("✅ chrony: {source_lines} NTP source(s) from fc-agent's config");
+    Ok(())
+}

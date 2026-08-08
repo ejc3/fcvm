@@ -7,6 +7,15 @@ use tracing::{debug, info, warn};
 
 use super::types::{CacheRequest, LogLine};
 
+/// Upper bound on waiting for fc-agent to close the cache handshake connection.
+///
+/// The close is the guest's acknowledgement of the ack (see the drain in
+/// [`run_status_listener`]); it follows the guest's read within microseconds.
+/// This only bounds the case where no close is coming at all — the ack was
+/// suppressed because the VM is being replaced, or the VM died — so the drain
+/// releases the connection instead of holding it for the process's lifetime.
+const CACHE_ACK_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Listen for fc-agent status messages on the status vsock port.
 ///
 /// Firecracker forwards guest vsock connections to Unix sockets with format:
@@ -247,28 +256,75 @@ pub(crate) async fn run_status_listener(
                     let _ = write_half.flush().await;
                 }
 
-                // Grace-drain before the connection drops at the `break` below:
-                // consume any last in-flight guest probe bytes so the close is
-                // clean — an unread byte at close becomes a vsock RST that can
-                // flush the guest's receive buffer before it reads the ack.
-                let mut tail = String::new();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(250),
-                    reader.read_line(&mut tail),
-                )
-                .await;
+                // Positive close handshake. fc-agent closes this connection the
+                // instant it has read the ack (see `notify_cache_ready_and_wait`
+                // in fc-agent/src/container.rs), so EOF here is PROOF the ack
+                // landed and that no liveness probe is still in flight. Only then
+                // is it safe to drop the connection: closing with an unread byte
+                // queued turns the close into a vsock RST that can flush the
+                // guest's receive buffer BEFORE it reads cache-ack, so the guest
+                // classifies a cold start as a warm restore (#627). A fixed grace
+                // window cannot give that guarantee — a probe landing one
+                // millisecond after it expires reopens exactly the same race.
+                //
+                // Detached so the accept loop is never held up. The next
+                // connection carries "ready", and it must not queue behind a
+                // guest that is slow to close — or never closes, which is the
+                // normal outcome when the ack was suppressed above and this VM is
+                // being torn down and replaced by a restore.
+                let drain_vm_id = vm_id.to_string();
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + CACHE_ACK_CLOSE_TIMEOUT;
+                    let mut probe = String::new();
+                    loop {
+                        probe.clear();
+                        match tokio::time::timeout_at(deadline, reader.read_line(&mut probe)).await
+                        {
+                            // EOF: fc-agent closed after reading the ack.
+                            Ok(Ok(0)) => {
+                                debug!(vm_id = %drain_vm_id, "cache handshake connection closed by guest");
+                                break;
+                            }
+                            // A liveness probe still in flight — discard it and
+                            // keep reading. Leaving it unread is the RST above.
+                            Ok(Ok(_)) => {}
+                            // Reset or read error: the guest is gone either way.
+                            Ok(Err(e)) => {
+                                debug!(vm_id = %drain_vm_id, error = %e, "cache handshake connection ended");
+                                break;
+                            }
+                            Err(_) => {
+                                debug!(
+                                    vm_id = %drain_vm_id,
+                                    "guest did not close the cache handshake connection within \
+                                     the bound; releasing it"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    // Load-bearing, not tidying: an `async move` block captures
+                    // only what its body mentions. Without this the write half
+                    // would stay behind and drop at the `break` below, shutting
+                    // down the connection's write side while the drain is still
+                    // reading — reintroducing the close-with-unread-bytes RST
+                    // this whole handshake exists to prevent. Both halves must
+                    // outlive the drain, so both are dropped here.
+                    drop(write_half);
+                });
 
-                // Stop reading this connection and go back to accept(). fc-agent
-                // sends each status message ("cache-ready", then "ready", then
-                // "exit") on a SEPARATE vsock connection, so nothing more arrives
-                // here. Critically, this connection is the one held open across
-                // the pre-start snapshot's pause/resume: after resume the vsock
-                // transport can fail to propagate its close, so a second read_line
-                // here would block for the full 300s timeout before the accept
-                // loop could take the new connection carrying "ready" — stalling
+                // Go back to accept(). fc-agent sends each status message
+                // ("cache-ready", then "ready", then "exit") on a SEPARATE vsock
+                // connection, so nothing more arrives on this one. Critically,
+                // this connection is the one held open across the pre-start
+                // snapshot's pause/resume: after resume the vsock transport can
+                // fail to propagate its close, so reading it again on THIS task
+                // would block for the full 300s timeout before the accept loop
+                // could take the new connection carrying "ready" — stalling
                 // container startup by ~5 minutes (intermittently, worse on the
-                // NV2 nested kernel). Breaking to re-accept delivers "ready"
-                // immediately regardless of when this connection's EOF arrives.
+                // NV2 nested kernel). That is why the close handshake above runs
+                // detached: re-accepting here delivers "ready" immediately,
+                // whenever this connection's EOF arrives.
                 break;
             } else {
                 warn!(vm_id = %vm_id, msg = %msg, "Unexpected status message");

@@ -21,9 +21,11 @@ const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of recent Firecracker stderr lines kept for error reporting.
 const STDERR_TAIL_LINES: usize = 10;
-/// How long to let the async stderr reader drain the pipe after Firecracker
-/// exits, so the failure error can include what it actually printed.
-const STDERR_DRAIN_DELAY: Duration = Duration::from_millis(200);
+/// Upper bound on waiting for the stderr reader to reach EOF after Firecracker
+/// exits, so the failure error can include what it actually printed. The wait
+/// ends on EOF (normally microseconds — the exit closed the write end); this
+/// only bounds the pathological case of an inherited, still-open pipe.
+const STDERR_EOF_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Manages a Firecracker VM process
 ///
@@ -53,6 +55,10 @@ pub struct VmManager {
     mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
+    // Reader task for the child's stderr pipe. Awaited (bounded) before rendering
+    // `stderr_tail` on a launch failure, so the tail is complete rather than
+    // whatever happened to have been logged by then.
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
     /// Guest serial console lines observed on the Firecracker child's stdout
     /// since spawn. Watched by the restore path to detect a dead serial
     /// console (snapshot captured the UART mid-transmit).
@@ -74,6 +80,7 @@ impl VmManager {
             mount_redirects: None,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stderr_reader: None,
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: None,
         }
@@ -289,7 +296,7 @@ impl VmManager {
         // Spawn process with streaming output
         let stderr_tail = Arc::clone(&self.stderr_tail);
         let console_lines = Arc::clone(&self.console_lines);
-        let child = spawn_streaming(cmd, move |line, is_stderr| {
+        let spawned = spawn_streaming(cmd, move |line, is_stderr| {
             let clean = strip_firecracker_prefix(line);
             // fc-agent and container output at INFO/WARN, everything else at DEBUG
             let is_important = clean.contains("fc-agent") || clean.contains("[ctr:");
@@ -322,7 +329,8 @@ impl VmManager {
         })
         .context("spawning Firecracker process")?;
 
-        self.process = Some(child);
+        self.process = Some(spawned.child);
+        self.stderr_reader = Some(spawned.stderr_reader);
 
         // Wait for socket to be ready
         self.wait_for_socket().await?;
@@ -400,9 +408,11 @@ impl VmManager {
             }
 
             if let Some(status) = self.try_wait()? {
-                // Give the async stderr reader a moment to drain the pipe so
-                // the error includes what Firecracker actually printed.
-                sleep(STDERR_DRAIN_DELAY).await;
+                // Wait for the stderr reader to hit EOF so the error includes
+                // everything Firecracker printed. The exit closed the write end,
+                // so this returns as soon as the reader drains the pipe.
+                crate::utils::wait_for_stderr_eof(&mut self.stderr_reader, STDERR_EOF_TIMEOUT)
+                    .await;
                 bail!(
                     "Firecracker exited with {} before its API socket became ready{}",
                     status,
