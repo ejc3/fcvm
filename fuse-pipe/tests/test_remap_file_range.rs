@@ -555,7 +555,8 @@ fn test_ficlone_above_u32_boundary() {
 
     let got = fs::metadata(&dst_path).expect("stat dest").len();
     assert_eq!(
-        got, SIZE,
+        got,
+        SIZE,
         "destination is {got} bytes, expected {SIZE}. A value near 4 GiB \
          ({}) means the inode was sized from the 32-bit `fuse_write_out.size` \
          instead of the request-derived length.",
@@ -569,7 +570,10 @@ fn test_ficlone_above_u32_boundary() {
     let mut byte = [0u8; 1];
     dst.read_exact(&mut byte)
         .expect("read the last byte — a short read here is the truncation bug");
-    assert_eq!(byte[0], SENTINEL, "tail byte past the 4 GiB boundary is wrong");
+    assert_eq!(
+        byte[0], SENTINEL,
+        "tail byte past the 4 GiB boundary is wrong"
+    );
 
     drop(dst);
     cleanup(&data_dir, &mount_dir);

@@ -22,8 +22,7 @@ use std::path::PathBuf;
 fn patch_text() -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("kernel/patches/0001-fuse-add-remap_file_range-support.patch");
-    std::fs::read_to_string(&p)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
 }
 
 /// The clone length must be derived from the REQUEST, not from the 32-bit reply.
