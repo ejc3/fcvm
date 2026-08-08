@@ -552,6 +552,13 @@ fn parse_chrony_servers(conf: &str) -> Vec<String> {
 /// a VM — so the boot plan carries the servers instead. Resolution happens here, on
 /// the host, for the same reason proxy URLs are resolved here: the guest adds each
 /// one with `chronyc add server <addr>`, and an address needs no guest-side DNS.
+///
+/// This is a blocking lookup on the launch path, so it was measured rather than
+/// assumed: 0.2-0.5ms warm and 5.5ms on the first (cold-resolver) call on a c7g box
+/// whose host chronyd keeps these names in the local resolver cache. That is in line
+/// with the launch path's existing millisecond-scale steps; the cap below keeps it to
+/// a single lookup in the common case, since one `pool` name already yields four
+/// addresses.
 fn host_ntp_servers() -> Vec<String> {
     let names = HOST_CHRONY_CONFS
         .iter()
