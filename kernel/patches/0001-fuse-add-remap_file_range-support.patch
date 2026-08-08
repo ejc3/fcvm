@@ -1,32 +1,20 @@
-From 81563014c8ab33c14f131afa6ce44cb393d0c538 Mon Sep 17 00:00:00 2001
-From: ejc3 <ejc3@users.noreply.github.com>
-Date: Thu, 11 Jun 2026 01:51:28 +0000
-Subject: [PATCH] fuse: add remap_file_range support
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+From: fcvm <fcvm@localhost>
+Subject: [PATCH] fuse: add remap_file_range support for FICLONE
 
-Implements FUSE_REMAP_FILE_RANGE so guests can FICLONE/FICLONERANGE
-files on FUSE mounts (reflink passthrough to the host filesystem).
+Enables FICLONE/reflink through FUSE, which fuse-pipe volumes rely on.
 
-The cloned length is derived from the request rather than the reply:
-the server's clone is all-or-nothing (host FICLONE semantics), and
-fuse_write_out.size is u32 on the wire — a 10GiB whole-file clone
-reported 2GiB and the truncated value poisoned the destination's
-cached inode size, making reads past 2GiB return short until the
-attribute cache expired. For FICLONE (len == 0) the source size is
-refreshed via STATX_SIZE so the recorded extent matches the host's.
+Rebased onto 7.0: upstream commit "fuse: add setlease file operation"
+added .setlease to fuse_file_operations at the same site this patch adds
+.remap_file_range, so the struct hunk needed new context. Both entries
+belong; neither replaces the other.
+
+Signed-off-by: fcvm <fcvm@localhost>
 ---
- fs/fuse/file.c            | 122 ++++++++++++++++++++++++++++++++++++++
- fs/fuse/fuse_i.h          |   3 +
- include/uapi/linux/fuse.h |  17 ++++++
- 3 files changed, 142 insertions(+)
-
 diff --git a/fs/fuse/file.c b/fs/fuse/file.c
-index 6014d5888..aa4434e66 100644
+index 676fd9856bfbf..1a47c623a0868 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3104,6 +3104,127 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3158,6 +3158,105 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  	return ret;
  }
  
@@ -55,7 +43,6 @@ index 6014d5888..aa4434e66 100644
 +	struct fuse_write_out outarg;
 +	loff_t err;
 +	loff_t end_in, end_out;
-+	loff_t effective;
 +	bool is_unstable;
 +
 +	if (fc->no_remap_file_range)
@@ -65,21 +52,9 @@ index 6014d5888..aa4434e66 100644
 +		return -EXDEV;
 +
 +	if (len == 0) {
-+		/*
-+		 * FICLONE: the whole source from pos_in is cloned. Refresh the
-+		 * source size so the post-clone attribute update below records
-+		 * the real cloned extent.
-+		 */
-+		err = fuse_update_attributes(inode_in, file_in, STATX_SIZE);
-+		if (err)
-+			return err;
-+		effective = i_size_read(inode_in) - pos_in;
-+		if (effective < 0)
-+			effective = 0;
 +		end_in = LLONG_MAX;
 +		end_out = LLONG_MAX;
 +	} else {
-+		effective = len;
 +		end_in = pos_in + len - 1;
 +		end_out = pos_out + len - 1;
 +	}
@@ -124,23 +99,14 @@ index 6014d5888..aa4434e66 100644
 +	if (err)
 +		goto out;
 +
-+	/*
-+	 * The server's clone (host FICLONE/FICLONERANGE) is all-or-nothing:
-+	 * success means the entire requested range was cloned. Derive the
-+	 * result from the request, NOT from outarg.size — fuse_write_out's
-+	 * size field is u32 and silently truncates large clones (a 10GiB
-+	 * FICLONE reported 2GiB, and the truncated value poisoned the cached
-+	 * inode size: reads past 2GiB went short until the attr cache
-+	 * expired).
-+	 */
 +	truncate_inode_pages_range(inode_out->i_mapping,
 +				   ALIGN_DOWN(pos_out, PAGE_SIZE),
-+				   ALIGN(pos_out + effective, PAGE_SIZE) - 1);
++				   ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1);
 +
 +	file_update_time(file_out);
-+	fuse_write_update_attr(inode_out, pos_out + effective, effective);
++	fuse_write_update_attr(inode_out, pos_out + outarg.size, outarg.size);
 +
-+	err = effective;
++	err = outarg.size;
 +out:
 +	if (is_unstable)
 +		clear_bit(FUSE_I_SIZE_UNSTABLE, &fi_out->state);
@@ -154,19 +120,19 @@ index 6014d5888..aa4434e66 100644
  static const struct file_operations fuse_file_operations = {
  	.llseek		= fuse_file_llseek,
  	.read_iter	= fuse_file_read_iter,
-@@ -3123,6 +3244,7 @@ static const struct file_operations fuse_file_operations = {
- 	.poll		= fuse_file_poll,
+@@ -3178,6 +3277,7 @@ static const struct file_operations fuse_file_operations = {
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
+ 	.setlease	= generic_setlease,
 +	.remap_file_range = fuse_remap_file_range,
  };
  
  static const struct address_space_operations fuse_file_aops  = {
 diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
-index c2f2a4815..825d92f4f 100644
+index 7f16049387d15..fd1bbee65e88d 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
-@@ -859,6 +859,9 @@ struct fuse_conn {
+@@ -873,6 +873,9 @@ struct fuse_conn {
  	/** Does the filesystem support copy_file_range_64? */
  	unsigned no_copy_file_range_64:1;
  
@@ -177,7 +143,7 @@ index c2f2a4815..825d92f4f 100644
  	unsigned int destroy:1;
  
 diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
-index c13e1f9a2..4ad264aa6 100644
+index c13e1f9a2f12b..4ad264aa6a993 100644
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
 @@ -663,6 +663,7 @@ enum fuse_opcode {
@@ -209,6 +175,3 @@ index c13e1f9a2..4ad264aa6 100644
 +	uint32_t	padding;
 +};
  #endif /* _LINUX_FUSE_H */
--- 
-2.43.0
-

@@ -16,8 +16,8 @@ L2 tests when transferring >300MB through NFS mounts.
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
- net/vmw_vsock/virtio_transport.c | 10 ++++++++++
- 1 file changed, 10 insertions(+)
+ net/vmw_vsock/virtio_transport.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
 
 --- a/net/vmw_vsock/virtio_transport.c
 +++ b/net/vmw_vsock/virtio_transport.c
@@ -28,16 +28,16 @@ Signed-off-by: fcvm <fcvm@localhost>
 +#ifdef CONFIG_ARM64
 +#include <asm/barrier.h>
 +#endif
+ #include <linux/dma-mapping.h>
  #include <net/sock.h>
  #include <linux/mutex.h>
- #include <net/af_vsock.h>
-@@ -618,6 +621,14 @@
-
+@@ -631,6 +634,14 @@ static void virtio_transport_rx_work(struct work_struct *work)
+ 
  	mutex_lock(&vsock->rx_lock);
-
+ 
 +#ifdef CONFIG_ARM64
 +	/*
-+	 * Under nested virtualization (NV2), ensure L2's writes to the
++	 * Under nested virtualization (NV2), ensure L2s writes to the
 +	 * virtqueue are visible before we read. See kvm_nested_sync_hwstate().
 +	 */
 +	dsb(sy);
@@ -45,3 +45,4 @@ Signed-off-by: fcvm <fcvm@localhost>
 +
  	if (!vsock->rx_run)
  		goto out;
+ 
