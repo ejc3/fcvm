@@ -181,13 +181,28 @@ fn kill_unpinned_peer(stream: &UnixStream, vm_id: &str) {
 /// signalling it can never land on a different process.
 ///
 /// This is what makes the server fail CLOSED. A clone's guest memory exists only as long as
-/// this server answers its faults: once Firecracker hands over the userfaultfd it closes its
-/// own copy, so if this server stops resolving faults the kernel resolves them with ZERO
-/// PAGES and the guest keeps running on silently corrupt memory. There is no in-band way to
-/// tell that guest "your memory is gone". The only honest response is to stop the VMM, and
-/// the only safe way to stop it is a handle that refers to the process itself — `SO_PEERCRED`
-/// gives the PID at connect time, `pidfd_open` pins it, and `pidfd_send_signal` delivers to
-/// that exact process even if the PID has since been recycled.
+/// this server answers its faults, and if it stops the guest does not crash and does not read
+/// zeroes — it FREEZES, permanently and silently.
+///
+/// Firecracker KEEPS its own reference to the userfaultfd for the VM's lifetime ("Save UFFD in
+/// order to keep it open in the Firecracker process, as well." — firecracker
+/// `src/vmm/src/lib.rs`). So this server's death is never the final `fput`:
+/// `userfaultfd_release()` (fs/userfaultfd.c) does not run, `userfaultfd_release_all()`
+/// (mm/userfaultfd.c) never strips `__VM_UFFD_FLAGS`, and faults never fall through to
+/// anonymous zero-fill. They just wait. Verified on a live clone — serve and firecracker each
+/// holding `userfaultfd_fds=1`, and 30s after SIGKILLing the server both vCPUs sat in
+/// `wchan=handle_userfault` with no exit code, no signal and nothing in any log.
+///
+/// (Zero-fill IS what the kernel does once the LAST reference closes — measured at 0.07ms —
+/// which is why this comment used to say "corrupt memory". That path is unreachable while
+/// Firecracker holds its copy. A wedge is not milder: the clone holds its memory, loopback
+/// port and disk indefinitely while looking alive.)
+///
+/// Either way there is no in-band way to tell that guest "your memory is gone". The only
+/// honest response is to stop the VMM, and the only safe way to stop it is a handle that
+/// refers to the process itself — `SO_PEERPIDFD` yields that pidfd atomically from the
+/// accepted socket, and `pidfd_send_signal` delivers to that exact process even if the PID
+/// has since been recycled.
 #[derive(Debug)]
 struct PeerVmm {
     /// The peer's PID, read back from the pidfd itself — for LOGS ONLY. Every decision uses
@@ -572,10 +587,13 @@ impl UffdServer {
                                      or raise {}.",
                                     MAX_CLONES_ENV
                                 );
-                                // Closing the socket is not enough to refuse safely: in COPY
-                                // mode Firecracker sends its uffd and closes its own copy, so a
-                                // connection dropped after that point releases the uffd and the
-                                // guest silently runs on zero pages. Refusal means killing.
+                                // Closing the socket is not enough to refuse safely — but not
+                                // because of zero pages. Firecracker holds its own uffd
+                                // reference for the VM's lifetime, so dropping this connection
+                                // never releases the last one; the guest WEDGES instead, both
+                                // vCPUs parked in handle_userfault forever with no exit code
+                                // and no signal. A refused clone that merely hangs still holds
+                                // its memory, port and disk. Refusal means killing.
                                 peer.kill_now("server is at its concurrent-clone cap");
                                 continue;
                             }
