@@ -600,6 +600,32 @@ impl PastaNetwork {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
+        // NO PR_SET_PDEATHSIG HERE — the kernel would discard it. Do not "fix" this by
+        // adding a pre_exec pdeathsig: it is a no-op, and measurement says so.
+        //
+        // Every other long-lived child fcvm spawns (the VMM, the namespace holder) is reaped
+        // by PR_SET_PDEATHSIG. pasta cannot be, because passt changes its own credentials
+        // AFTER exec: given a bare PID, `conf_pasta_ns()` derives `/proc/PID/ns/user` and
+        // `isolate_user()` does `setns(CLONE_NEWUSER)` into the holder's user namespace. That
+        // grants capabilities (observed on this host: pasta CapEff 0x200400 = CAP_SYS_ADMIN |
+        // CAP_NET_BIND_SERVICE, while fcvm's is 0x0), and `commit_creds()` zeroes
+        // `task->pdeath_signal` on any credential change that is not a capability subset. It
+        // is the same rule that forces install_namespace_pre_exec's hook to run LAST — except
+        // here the transition happens inside passt, after exec, where fcvm cannot re-arm it.
+        // Measured with the pre_exec installed: holder died 2ms after fcvm's SIGKILL, pasta
+        // 169-699ms — i.e. unchanged, still on passt's own schedule.
+        //
+        // What DOES reap pasta: passt's `pasta_netns_quit_*` watchdog. Its target
+        // `/proc/<holder>/ns/net` vanishes when the holder dies (kernel-enforced, 2ms), and
+        // passt exits when it notices. Because the path is on procfs, passt cannot use
+        // inotify and falls back to `pasta_netns_quit_timer()` — a ONE-SECOND interval poll.
+        // So pasta is never permanently orphaned, but it can outlive its VM by up to ~1s
+        // while still holding the host-side listening sockets for this VM's forwarded ports.
+        // With teardown now ~40ms, that window is wide enough for the next VM to be handed
+        // this VM's loopback IP. Closing it requires making passt itself re-arm pdeathsig
+        // after its isolation completes (a patch in pasta/patches/, which is how #661 was
+        // fixed) — not another pre_exec here. Tracked by
+        // test_sigkill_kills_firecracker_rootless, which asserts no PERMANENT orphan.
         debug!(cmd = ?cmd, "pasta command");
         let mut child = cmd.spawn().context("failed to spawn pasta")?;
 
@@ -968,11 +994,21 @@ impl NetworkManager for PastaNetwork {
         Ok(())
     }
 
+    fn start_kill_processes(&mut self) {
+        if let Some(ref mut process) = self.pasta_process {
+            if let Err(e) = process.start_kill() {
+                warn!(vm_id = %self.vm_id, error = %e, "failed to signal pasta");
+            }
+        }
+    }
+
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up pasta resources");
 
         if let Some(mut process) = self.pasta_process.take() {
-            if let Err(e) = process.kill().await {
+            // Idempotent with start_kill_processes: signalling an already-signalled (or
+            // already-exited) child is a no-op, and the wait below reaps it either way.
+            if let Err(e) = process.start_kill() {
                 warn!("failed to kill pasta: {}", e);
             }
             let _ = process.wait().await;

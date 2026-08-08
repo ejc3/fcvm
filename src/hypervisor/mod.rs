@@ -171,6 +171,22 @@ pub trait Hypervisor: Send {
     /// Wait for the VMM process to exit.
     async fn wait(&mut self) -> Result<ExitStatus>;
 
+    /// SIGKILL the VMM process WITHOUT waiting for it to exit.
+    ///
+    /// Split from the reap so teardown can signal every child (VMM, namespace holder, pasta)
+    /// before blocking on any one of them: the kernel's address-space reclaim of a
+    /// multi-GiB guest mapping then overlaps with the other deaths instead of serializing
+    /// behind them. Always pair with [`Self::reap`] — a signalled process that is never
+    /// waited for is a zombie.
+    fn start_kill(&mut self) -> Result<()>;
+
+    /// Wait for a [`Self::start_kill`]ed VMM process to exit, reaping it.
+    ///
+    /// Returns when the process is genuinely gone: the kernel unmaps the guest's address
+    /// space in `exit_mmap()` before the task becomes reapable, so this returning is proof
+    /// the reclaim finished — not just that the signal was delivered.
+    async fn reap(&mut self);
+
     /// Kill the VMM process and reap it.
     async fn kill(&mut self) -> Result<()>;
 

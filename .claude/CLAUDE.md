@@ -1013,6 +1013,44 @@ every self-hosted job plus the `scripts/ci-stray-vm-guard.sh` pre/post steps in 
 `always()` cleanup step does not run when the process is SIGKILLed — which is exactly the case
 that leaked. If teardown matters, it must survive SIGKILL.
 
+**pasta is the one hop pdeathsig CANNOT cover — do not "fix" it with a pre_exec.** passt
+changes its own credentials *after* exec: from a bare PID argument, `conf_pasta_ns()` derives
+`/proc/PID/ns/user` and `isolate_user()` does `setns(CLONE_NEWUSER)` into the holder's user
+namespace. That grants capabilities (measured: pasta `CapEff 0x200400` vs fcvm's `0x0`), and
+`commit_creds()` zeroes `task->pdeath_signal` on any credential change that is not a
+capability subset — the same rule that forces `install_namespace_pre_exec`'s hook to run LAST,
+except this transition is inside passt where fcvm cannot re-arm it. Measured with a pre_exec
+pdeathsig installed on pasta: holder gone 2ms after fcvm's SIGKILL, pasta 169-699ms — i.e. the
+hook changed nothing. What actually reaps pasta is passt's own `pasta_netns_quit_*` watchdog:
+`/proc/<holder>/ns/net` disappears when the (pdeathsig'd) holder dies, and passt exits when it
+notices — on procfs it cannot use inotify, so it falls back to a ONE-SECOND interval poll.
+Consequence: pasta is never permanently orphaned, but it can outlive its VM by up to ~1s while
+still holding that VM's forwarded host-side listening sockets, and teardown is now ~40ms, so
+the next VM can be handed the dead VM's loopback IP inside that window. Closing it properly
+means patching passt to re-arm pdeathsig after its isolation completes (`pasta/patches/`, the
+same mechanism as the #661 addr_seen patch). Covered by
+`test_sigkill_kills_firecracker_rootless`, which asserts no PERMANENT orphan.
+
+### TEARDOWN: SIGNAL EVERY CHILD BEFORE WAITING ON ANY
+
+`src/commands/common.rs::cleanup_vm` runs teardown in five phases: stop in-process tasks →
+**SIGKILL the VMM, the holder and the network helper with no await between them** → join their
+exits → network cleanup → synchronous on-disk reaping. The middle rule is load-bearing: the
+kernel reclaims the guest's multi-GiB address space in `exit_mmap()`, charged to the dying
+VMM's system time, and killing-and-waiting each child in turn made every other death queue
+behind it. Never introduce an `.await` between the `start_kill` calls.
+
+**On-disk reaping stays synchronous. Always.** State file, VM data dir, reflink copy, VMM log:
+"leave nothing on disk" is a correctness contract of the same rank as "leave no orphaned VM".
+No janitor, no detached task, no deferral — a process that exits before proving the work is
+done has not done it. It is also not where the time goes: measured `disk_reap_ms` is 54-72ms
+for a full VM's data dir on a loaded host (~10ms for a clone's).
+
+**Report teardown honestly.** `cleanup_vm` logs `caller_blocking_ms`, `processes_gone_ms` and
+`reclaim_cpu_ms` (from `getrusage(RUSAGE_CHILDREN)`) as three separate numbers. Overlapping
+teardown with other work moves the kernel's reclaim cost; it does not delete it. Never quote
+the caller-blocking number alone as if teardown were free.
+
 ### Container Build Rules
 
 **Container builds work naturally with layer caching.** No workarounds needed.

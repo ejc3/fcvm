@@ -412,6 +412,94 @@ pub async fn wait_for_namespace_ready(
     }
 }
 
+/// Arm `PR_SET_PDEATHSIG=SIGKILL` on the calling process, then verify the parent we meant
+/// to bind to is still the parent.
+///
+/// Call ONLY from a `pre_exec` hook (post-fork, pre-exec): every call it makes is
+/// async-signal-safe (`prctl`, `getppid`). `expected_ppid` is the spawner's PID, captured
+/// BEFORE the fork.
+///
+/// The re-check closes the fork/prctl race: if the parent dies in the window between
+/// `fork()` and `prctl()`, the kernel has already sent (and lost) the parent-death
+/// notification, and this process would run forever with nothing to kill it — precisely the
+/// orphan class that wedged two CI runners (#730). Returning an error here aborts the `exec`,
+/// so the child exits instead of orphaning.
+///
+/// Must be the LAST `pre_exec` hook installed on a command that also changes credentials or
+/// namespaces: a credential change (`setns(CLONE_NEWUSER)`, `setuid`) zeroes
+/// `task->pdeath_signal`, so an earlier call would be silently discarded.
+pub fn set_pdeathsig_sigkill(expected_ppid: u32) -> std::io::Result<()> {
+    // SAFETY: prctl(PR_SET_PDEATHSIG) only mutates this task's pdeath_signal; no memory
+    // effects. Return value is checked.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: getppid() cannot fail and has no memory effects.
+    let ppid = unsafe { libc::getppid() } as u32;
+    if ppid != expected_ppid {
+        return Err(std::io::Error::other(format!(
+            "parent {expected_ppid} died before PR_SET_PDEATHSIG was armed (now reparented to \
+             {ppid}); refusing to exec an unreapable orphan"
+        )));
+    }
+    Ok(())
+}
+
+/// CPU time (user + system) a LIVE process has consumed so far, from `utime`+`stime`
+/// (fields 14 and 15) of `/proc/<pid>/stat`. `Duration::ZERO` if it is gone or unreadable.
+///
+/// Paired with [`reaped_children_cpu_time`] to isolate what a child spends DYING: sample this
+/// just before the kill and subtract it from the whole-lifetime total that `RUSAGE_CHILDREN`
+/// publishes at reap.
+pub fn process_cpu_time(pid: u32) -> Duration {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return Duration::ZERO;
+    };
+    // `comm` (field 2) can contain spaces and ')', so parse the remainder after the LAST ") ".
+    let Some((_, after_comm)) = stat.rsplit_once(") ") else {
+        return Duration::ZERO;
+    };
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // In `after_comm`, field 3 (state) is index 0, so utime (14) is index 11, stime (15) is 12.
+    let (Some(u), Some(st)) = (fields.get(11), fields.get(12)) else {
+        return Duration::ZERO;
+    };
+    let (Ok(u), Ok(st)) = (u.parse::<u64>(), st.parse::<u64>()) else {
+        return Duration::ZERO;
+    };
+    // SAFETY: sysconf has no memory effects. A non-positive answer means "unknown"; fall back
+    // to the near-universal 100Hz USER_HZ.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = if hz > 0 { hz as u64 } else { 100 };
+    Duration::from_nanos((u + st).saturating_mul(1_000_000_000 / hz))
+}
+
+/// Cumulative CPU time (user + system) charged to every child of this process that has
+/// already been reaped, from `getrusage(RUSAGE_CHILDREN)`.
+///
+/// A child's rusage is folded in when it is REAPED and covers its WHOLE life, so a raw delta
+/// across a kill+reap window is that child's lifetime CPU — not what dying cost. Subtract
+/// [`process_cpu_time`] sampled just before the kill to get the death itself: the kernel
+/// unmaps the guest's address space in `exit_mmap()`, in the dying task's own context,
+/// charged to its system time and therefore counted here. That is how teardown reports what
+/// the kernel actually spends releasing a multi-GiB guest, instead of pretending a
+/// fast-returning `kill()` made the work disappear.
+///
+/// Process-wide, so a delta also picks up any OTHER child this process happens to reap in
+/// the same window. Read it as a diagnostic of what teardown cost the machine, not as an
+/// exact per-process attribution.
+pub fn reaped_children_cpu_time() -> Duration {
+    // SAFETY: getrusage writes into a fully-initialized local; the who value is a constant.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
+        return Duration::ZERO;
+    }
+    let tv = |t: libc::timeval| {
+        Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64)
+    };
+    tv(usage.ru_utime) + tv(usage.ru_stime)
+}
+
 /// Network/user/mount-namespace isolation to apply to a spawned VMM process before exec.
 ///
 /// VMM-neutral: both Firecracker and Cloud Hypervisor run as a child process inside the
@@ -603,13 +691,9 @@ pub fn install_namespace_pre_exec(
 
     // Kill the VMM if the parent (fcvm) dies, even from SIGKILL. Unconditional; must be the
     // LAST pre_exec so it runs AFTER setns(CLONE_NEWUSER), which clears pdeath_signal.
+    let fcvm_pid = std::process::id();
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(move || set_pdeathsig_sigkill(fcvm_pid));
     }
 
     Ok(())

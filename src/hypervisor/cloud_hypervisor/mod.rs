@@ -397,15 +397,26 @@ impl Hypervisor for CloudHypervisorBackend {
         }
     }
 
-    async fn kill(&mut self) -> Result<()> {
+    fn start_kill(&mut self) -> Result<()> {
         if let Some(tail) = self.console_tail.take() {
             tail.abort();
         }
+        if let Some(ref mut p) = self.process {
+            info!(vm_id = %self.vm_id, "signalling Cloud Hypervisor process (SIGKILL)");
+            p.start_kill().context("signalling Cloud Hypervisor")?;
+        }
+        Ok(())
+    }
+
+    async fn reap(&mut self) {
         if let Some(mut p) = self.process.take() {
-            info!(vm_id = %self.vm_id, "killing Cloud Hypervisor process");
-            p.kill().await.context("killing Cloud Hypervisor")?;
             let _ = p.wait().await;
         }
+    }
+
+    async fn kill(&mut self) -> Result<()> {
+        self.start_kill()?;
+        self.reap().await;
         Ok(())
     }
 

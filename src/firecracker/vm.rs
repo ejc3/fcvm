@@ -515,16 +515,28 @@ impl VmManager {
         }
     }
 
-    /// Kill the VM process
-    pub async fn kill(&mut self) -> Result<()> {
-        if let Some(mut process) = self.process.take() {
-            info!(vm_id = %self.vm_id, "killing Firecracker process");
+    /// SIGKILL the VM process without waiting for it to exit. Pair with [`Self::reap`].
+    pub fn start_kill(&mut self) -> Result<()> {
+        if let Some(ref mut process) = self.process {
+            info!(vm_id = %self.vm_id, "signalling Firecracker process (SIGKILL)");
             process
-                .kill()
-                .await
-                .context("killing Firecracker process")?;
+                .start_kill()
+                .context("signalling Firecracker process")?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the signalled VM process to exit, reaping it.
+    pub async fn reap(&mut self) {
+        if let Some(mut process) = self.process.take() {
             let _ = process.wait().await; // Wait to clean up zombie
         }
+    }
+
+    /// Kill the VM process and reap it.
+    pub async fn kill(&mut self) -> Result<()> {
+        self.start_kill()?;
+        self.reap().await;
         Ok(())
     }
 

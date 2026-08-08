@@ -557,12 +557,30 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     Ok(())
 }
 
-/// Test that SIGKILL on fcvm also kills Firecracker via PR_SET_PDEATHSIG.
+/// Test that SIGKILL on fcvm leaves NO surviving child: Firecracker, the namespace holder,
+/// and pasta must all be gone.
 ///
-/// Unlike SIGTERM/SIGINT, SIGKILL cannot be caught — fcvm gets no chance to run
-/// cleanup code. The Firecracker child dies because pre_exec sets
-/// PR_SET_PDEATHSIG(SIGKILL), which makes the kernel automatically send SIGKILL
-/// to the child when its parent dies.
+/// Unlike SIGTERM/SIGINT, SIGKILL cannot be caught — fcvm gets no chance to run cleanup code,
+/// so every guarantee here has to be kernel-enforced.
+///
+/// Firecracker and the holder die from their own `PR_SET_PDEATHSIG(SIGKILL)`, set in
+/// pre_exec: the kernel signals them the instant fcvm dies (measured: 2ms). pdeathsig is
+/// per-hop — a child without it survives no matter what the others have.
+///
+/// **pasta gets there by a different, slower route, and this test pins it.** pasta cannot use
+/// pdeathsig at all: passt does `setns(CLONE_NEWUSER)` into the holder's user namespace after
+/// exec, and that credential change zeroes `task->pdeath_signal` (see the long comment in
+/// `PastaNetwork::start_pasta`). It dies instead because passt watches its target namespace
+/// `/proc/<holder>/ns/net`, which vanishes with the (pdeathsig'd) holder — on a one-second
+/// poll, so pasta lags the holder by up to ~1s (measured 169-699ms).
+///
+/// So the assertion below proves NO PERMANENT ORPHAN, not promptness: it fails if pasta is
+/// ever left running for good — e.g. if `--no-netns-quit` were passed, if the holder stopped
+/// dying, or if pasta were reparented somewhere the watchdog can't see. It deliberately does
+/// NOT assert a tight deadline, because passt's poll makes that a coin flip. The residual
+/// sub-second window (a dead VM's pasta still holding this VM's forwarded host ports while
+/// its loopback IP is recycled) is real and is documented at the call site; closing it needs
+/// a passt-side patch, and if that lands this test should tighten to a deadline.
 #[test]
 fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
     println!("\ntest_sigkill_kills_firecracker_rootless");
@@ -616,19 +634,30 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
     // Find the specific child processes for THIS VM
     let our_fc_pid = find_firecracker_for_fcvm(fcvm_pid);
     let our_holder_pid = find_holder_for_fcvm(fcvm_pid);
+    let our_pasta_pid = find_pasta_for_fcvm(fcvm_pid);
     println!(
-        "Our firecracker PID: {:?}, holder PID: {:?}",
-        our_fc_pid, our_holder_pid
+        "Our firecracker PID: {:?}, holder PID: {:?}, pasta PID: {:?}",
+        our_fc_pid, our_holder_pid, our_pasta_pid
     );
 
     assert!(
         our_fc_pid.is_some(),
         "should have started a firecracker process"
     );
-    // `fc`/`holder` are tracked by (pid, start_time) so the post-kill checks below survive
-    // both the SIGKILL'd-but-unreaped zombie window and PID reuse under parallel load (#628).
+    // Rootless networking is pasta — if we cannot find it the test would silently stop
+    // covering the pasta hop, so demand it rather than skipping the assertion (NO HEDGES).
+    assert!(
+        our_pasta_pid.is_some(),
+        "rootless mode should have started a pasta process under fcvm (PID {})",
+        fcvm_pid
+    );
+    // `fc`/`holder`/`pasta` are tracked by (pid, start_time) so the post-kill checks below
+    // survive both the SIGKILL'd-but-unreaped zombie window and PID reuse under parallel
+    // load (#628).
     let fc = our_fc_pid.unwrap();
+    let pasta = our_pasta_pid.unwrap();
     assert!(fc.running(), "firecracker should be running before SIGKILL");
+    assert!(pasta.running(), "pasta should be running before SIGKILL");
 
     // Send SIGKILL to fcvm — no cleanup handler runs
     println!("Sending SIGKILL to fcvm (PID {})", fcvm_pid);
@@ -638,15 +667,20 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
     let _ = fcvm.wait();
     println!("fcvm process reaped");
 
-    // PR_SET_PDEATHSIG delivers SIGKILL to child processes when parent dies.
-    // Poll briefly in case of scheduling delay.
+    // PR_SET_PDEATHSIG delivers SIGKILL to firecracker and the holder when the parent dies.
+    // pasta follows on passt's one-second namespace-gone poll, so the window has to cover
+    // several poll periods, not just a scheduling delay.
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        if !fc.running() && !opt_running(our_holder_pid) {
+    while start.elapsed() < Duration::from_secs(10) {
+        if !fc.running() && !pasta.running() && !opt_running(our_holder_pid) {
             break;
         }
         std::thread::sleep(common::POLL_INTERVAL);
     }
+    println!(
+        "all children gone after {:?} (firecracker+holder: pdeathsig; pasta: passt netns poll)",
+        start.elapsed()
+    );
 
     let fc_still_running = fc.running();
     if fc_still_running {
@@ -661,6 +695,25 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
         "firecracker (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
         fc.pid
     );
+
+    let pasta_still_running = pasta.running();
+    if pasta_still_running {
+        println!(
+            "BUG: pasta (PID {}) still running after fcvm SIGKILL!",
+            pasta.pid
+        );
+        pasta.kill_if_running();
+    }
+    assert!(
+        !pasta_still_running,
+        "pasta (PID {}) is still running long after fcvm was SIGKILL'd — it is now a permanent \
+         orphan holding this VM's forwarded host ports, so a later VM that is handed this \
+         loopback IP can have its clients accepted by this DEAD VM's pasta. passt's \
+         namespace-gone watchdog should have exited it once the holder died; check that the \
+         holder still dies via pdeathsig and that --no-netns-quit was not introduced",
+        pasta.pid
+    );
+    println!("pasta PID {} correctly cleaned up", pasta.pid);
 
     if let Some(holder) = our_holder_pid {
         let holder_still_running = holder.running();

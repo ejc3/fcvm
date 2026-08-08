@@ -76,6 +76,15 @@ pub trait NetworkManager: Send + Sync {
         Ok(())
     }
 
+    /// SIGKILL any long-lived helper process this network owns, WITHOUT waiting for it.
+    ///
+    /// Lets teardown signal the network helper in the same instant as the VMM and the
+    /// namespace holder, so the helper is already dead by the time [`Self::cleanup`] reaps
+    /// it — its exit overlaps the VMM's address-space reclaim instead of queueing behind it.
+    /// Purely an optimization: `cleanup()` still kills and reaps unconditionally, so calling
+    /// this is optional and calling it twice is harmless. Default: no-op (no helper process).
+    fn start_kill_processes(&mut self) {}
+
     /// Cleanup network after VM stop
     async fn cleanup(&mut self) -> Result<()>;
 
