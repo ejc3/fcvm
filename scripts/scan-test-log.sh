@@ -38,7 +38,7 @@ pass=$(count '(^|[^A-Z])PASS \[')
 # A hard FAIL must exclude retry lines: "TRY 1 FAIL [" also ends in " FAIL [",
 # so counting it here would double-report every retry as a hard failure.
 fail=$(grep -aE '(^|[^A-Z])FAIL \[' "$clean" | grep -acvE 'TRY [0-9]+ FAIL'; true)
-try_fail=$(count 'TRY [0-9]+ FAIL')
+try_fail=$(count 'TRY [0-9]+ FAIL \[')
 timeout=$(count '(^|[^A-Z])TIMEOUT \[')
 leak=$(count '(^|[^A-Z])LEAK \[')
 # The per-test "FLAKY [" verdict and the summary's "(N flaky)" describe the SAME
@@ -57,9 +57,30 @@ echo "flaky: $flaky"
 
 # A run is clean only if the summary says so AND nothing was retried. A retry
 # that passed is a flake, not a pass, and must not be absorbed into a total.
+# The summary's own numbers are authoritative. Counting per-test verdict lines is NOT
+# enough: a truncated or filtered log can carry the summary while every `FAIL [` line is
+# gone, and this then reported CLEAN on a run the summary itself called failed —
+#   "Summary [10.0s] 1 tests run: 0 passed, 1 failed"  ->  verdict: CLEAN, exit 0
+# which is the exact defect this scanner exists to catch.
+summary_failed=$(sed -nE 's/.*tests? run:.*[^0-9]([0-9]+) failed.*/\1/p' <<<"$summary" | head -1)
+summary_flaky=$(sed -nE 's/.*\(([0-9]+) flaky\).*/\1/p' <<<"$summary" | head -1)
+summary_passed=$(sed -nE 's/.*tests? run:[^0-9]*([0-9]+) passed.*/\1/p' <<<"$summary" | head -1)
+summary_total=$(sed -nE 's/.*\] ([0-9]+) tests? run:.*/\1/p' <<<"$summary" | head -1)
+
 if [ -z "$summary" ]; then
   echo "verdict: UNKNOWN (no summary line — did the run finish?)"
   exit 3
+elif [ -n "${summary_total:-}" ] && [ -n "${summary_passed:-}" ] \
+     && [ "${summary_failed:-0}" -eq 0 ] && [ "$summary_passed" -ne "$summary_total" ]; then
+  # Neither failed nor accounted for: tests vanished between "run" and "passed".
+  echo "verdict: FAILED (summary says $summary_passed of $summary_total passed and 0 failed — unaccounted tests)"
+  exit 1
+elif [ "${summary_failed:-0}" -gt 0 ]; then
+  echo "verdict: FAILED (the run's own summary reports $summary_failed failed)"
+  exit 1
+elif [ "${summary_flaky:-0}" -gt 0 ]; then
+  echo "verdict: FLAKY (the run's own summary reports $summary_flaky flaky)"
+  exit 1
 elif [ "$fail" -gt 0 ] || [ "$timeout" -gt 0 ] || [ "$leak" -gt 0 ]; then
   echo "verdict: FAILED"
   exit 1

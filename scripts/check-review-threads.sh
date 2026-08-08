@@ -70,6 +70,22 @@ else
   threads=$(fetch_threads "$pr") || { echo "could not query review threads for #$pr" >&2; exit 2; }
 fi
 
+# Prove the payload is what we think before counting it. `jq` emits `null` for a missing
+# path and an empty string on a parse error, and `[ "" -gt 0 ]` is a shell error, not a
+# block — so malformed input previously slid through to a CLEAR verdict. Same failure
+# shape as the missing-jq case: a gate that cannot read its input must not bless it.
+if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$threads"; then
+  echo "verdict: BLOCKED — review-thread data is not an array; refusing to judge input" >&2
+  echo "this gate could not parse. Re-run, or re-capture the fixture." >&2
+  exit 2
+fi
+if ! jq -e 'all(has("isResolved") and (.comments.nodes | type == "array"))' \
+     >/dev/null 2>&1 <<<"$threads"; then
+  echo "verdict: BLOCKED — a thread is missing isResolved or its comments array. The" >&2
+  echo "only field that means 'resolved' is isResolved; without it nothing can be judged." >&2
+  exit 2
+fi
+
 total=$(jq 'length' <<<"$threads")
 unresolved=$(jq '[.[] | select(.isResolved == false)] | length' <<<"$threads")
 

@@ -338,3 +338,116 @@ fn a_defect_report_cannot_serve_as_its_own_red_verification() {
     );
     assert!(out.contains("UNPROVEN"), "{out}");
 }
+
+/// The run's OWN summary is authoritative — counting per-test lines is not enough.
+///
+/// A truncated or filtered log can carry the summary while every `FAIL [` line is gone.
+/// This scanner then counted zero failures and said CLEAN, exit 0, on a run the summary
+/// itself called failed:
+///   "Summary [10.0s] 1 tests run: 0 passed, 1 failed"  ->  verdict: CLEAN
+/// which is precisely the defect it exists to catch.
+#[test]
+fn a_summary_reporting_failures_is_never_clean() {
+    let dir = std::env::temp_dir().join(format!("fcvm-sumfail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("failing-summary.log");
+    std::fs::write(
+        &log,
+        "     Summary [  10.0s] 1 tests run: 0 passed, 1 failed, 0 skipped\n",
+    )
+    .unwrap();
+
+    let (out, code) = run_scan(&log);
+    assert_eq!(
+        code, 1,
+        "a summary reporting failures must exit 1, not 0.\n{out}"
+    );
+    assert!(out.contains("verdict: FAILED"), "{out}");
+    assert!(
+        !out.contains("CLEAN"),
+        "the scanner must not call this run clean.\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tests that vanish between "run" and "passed" are not a pass either.
+#[test]
+fn a_summary_with_unaccounted_tests_is_not_clean() {
+    let dir = std::env::temp_dir().join(format!("fcvm-sumgap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("unaccounted.log");
+    // 5 run, 3 passed, 0 failed: two tests are simply missing.
+    std::fs::write(
+        &log,
+        "     Summary [ 1.0s] 5 tests run: 3 passed, 0 skipped\n",
+    )
+    .unwrap();
+
+    let (out, code) = run_scan(&log);
+    assert_ne!(
+        code, 0,
+        "3-of-5 passed with 0 failed must not be clean.\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The retry pattern must anchor on the verdict form, not bare prose.
+#[test]
+fn retry_matching_does_not_fire_on_prose() {
+    let dir = std::env::temp_dir().join(format!("fcvm-prose-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("prose.log");
+    // A test that PRINTS about retries must not be counted as one.
+    std::fs::write(
+        &log,
+        "    note: the harness will TRY 1 FAIL semantics on the next pass\n\
+             Summary [ 1.0s] 1 tests run: 1 passed, 0 skipped\n",
+    )
+    .unwrap();
+
+    let (out, code) = run_scan(&log);
+    assert_eq!(
+        field(&out, "try_fail"),
+        0,
+        "prose mentioning a retry is not a retry; only `TRY n FAIL [` counts.\n{out}"
+    );
+    assert_eq!(code, 0, "a genuinely clean run must stay clean.\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Malformed thread data must BLOCK, exactly like a missing dependency.
+///
+/// `jq` yields `null` for a missing path and an empty string on a parse error, and
+/// `[ "" -gt 0 ]` is a shell error rather than a block — so bad input previously slid
+/// through to CLEAR.
+#[test]
+fn malformed_thread_data_blocks_instead_of_clearing() {
+    let dir = std::env::temp_dir().join(format!("fcvm-malformed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("malformed.json");
+    // A thread with no isResolved: the one field that means "resolved".
+    std::fs::write(
+        &f,
+        r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isOutdated":true}]}}}}}"#,
+    )
+    .unwrap();
+
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/check-review-threads.sh"))
+        .arg("--from-file")
+        .arg(&f)
+        .output()
+        .expect("script must run");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "unparseable thread data must not produce a passing verdict.\n{combined}"
+    );
+    assert!(combined.contains("BLOCKED"), "{combined}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
