@@ -634,19 +634,35 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
     // not-asserting is how an orphaned pasta stayed invisible in the first place.
     // Each is tracked by (pid, start_time) + pidfd so the post-kill checks survive both the
     // SIGKILL'd-but-unreaped zombie window and PID reuse under parallel load (#628).
-    let fc = find_firecracker_for_fcvm(fcvm_pid)
-        .context("no firecracker process found under this fcvm")?;
-    let holder =
-        find_holder_for_fcvm(fcvm_pid).context("no namespace holder found under this fcvm")?;
-    let pasta = find_pasta_for_fcvm(fcvm_pid).context("no pasta process found under this fcvm")?;
+    //
+    // Bailing out of here must tear the VM down first. `set_test_pdeathsig_std` only fires
+    // when the whole test BINARY exits, which can be many minutes and many tests away — so
+    // an early return would leave a live microVM holding a loopback port for the rest of
+    // the run, i.e. exactly the leak this test exists to catch.
+    let discover = || -> Result<(Tracked, Tracked, Tracked)> {
+        let fc = find_firecracker_for_fcvm(fcvm_pid)
+            .context("no firecracker process found under this fcvm")?;
+        let holder =
+            find_holder_for_fcvm(fcvm_pid).context("no namespace holder found under this fcvm")?;
+        let pasta =
+            find_pasta_for_fcvm(fcvm_pid).context("no pasta process found under this fcvm")?;
+        anyhow::ensure!(fc.running(), "firecracker should be running before SIGKILL");
+        anyhow::ensure!(holder.running(), "holder should be running before SIGKILL");
+        anyhow::ensure!(pasta.running(), "pasta should be running before SIGKILL");
+        Ok((fc, holder, pasta))
+    };
+    let (fc, holder, pasta) = match discover() {
+        Ok(tree) => tree,
+        Err(e) => {
+            fcvm::utils::graceful_kill(fcvm_pid, 2000);
+            let _ = fcvm.wait();
+            return Err(e);
+        }
+    };
     println!(
         "Our tree: firecracker={}, holder={}, pasta={}",
         fc.pid, holder.pid, pasta.pid
     );
-
-    assert!(fc.running(), "firecracker should be running before SIGKILL");
-    assert!(holder.running(), "holder should be running before SIGKILL");
-    assert!(pasta.running(), "pasta should be running before SIGKILL");
 
     // Send SIGKILL to fcvm — no cleanup handler runs
     println!("Sending SIGKILL to fcvm (PID {})", fcvm_pid);

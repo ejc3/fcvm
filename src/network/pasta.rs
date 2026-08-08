@@ -631,7 +631,13 @@ impl PastaNetwork {
         // reparented, fail the exec so no pasta exists to leak.
         //
         // SAFETY: pre_exec runs between fork() and exec(). `prctl` and `getppid` are both
-        // async-signal-safe, and the closure allocates nothing (`fcvm_pid` is copied in).
+        // async-signal-safe, `fcvm_pid` is copied in, and NEITHER return path allocates:
+        // both errors use the `Repr::Os` errno representation of `io::Error`, which stores
+        // a bare i32. A message-carrying error (`io::Error::other`) would box its payload,
+        // and malloc after fork(2) in a multi-threaded process can deadlock outright if
+        // another thread held the allocator lock at fork — which would hang the child in
+        // exactly the parent-death race the getppid check exists to handle. ESRCH ("no such
+        // process") is the errno for that case and needs no message.
         let fcvm_pid = std::process::id() as libc::pid_t;
         unsafe {
             cmd.pre_exec(move || {
@@ -639,9 +645,7 @@ impl PastaNetwork {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() != fcvm_pid {
-                    return Err(std::io::Error::other(
-                        "parent died before PR_SET_PDEATHSIG was armed",
-                    ));
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
                 Ok(())
             });
