@@ -744,10 +744,18 @@ git push
 gh pr close <fix-pr-number>  # Close the auto-generated PR
 ```
 
-**MANDATORY before merging any PR:** Read all review comments first:
+**MANDATORY before merging any PR:** Read all review comments first — and note that
+`--json comments` returns **only issue comments**. Inline review comments, which is where
+CodeRabbit and Codex put their actual findings, live on a different endpoint and are invisible
+to that query:
 ```bash
-gh pr view <pr-number> --json comments --jq '.comments[] | .body'
+gh pr view <pr-number> --json comments --jq '.comments[] | .body'   # top-level only
+gh api repos/{owner}/{repo}/pulls/<pr-number>/comments \
+  --jq '.[] | "\(.user.login) \(.path):\(.line) \(.body[0:200])"'   # inline — the findings
 ```
+On 2026-08-08 a PR carried **four unread inline findings, two of them Major**, while the check
+rendered `CodeRabbit  pass`. One was a slice index that would panic inside the fault-handler
+task and hang the guest. Reading only the top-level comments would have merged all four.
 
 **A green `CodeRabbit` check does NOT mean CodeRabbit reviewed anything.** When it hits its
 rate limit it posts *"Review limit reached ... we couldn't start this review"* and the check
@@ -759,6 +767,21 @@ gh pr view <pr-number> --json comments \
   --jq '.comments[] | select(.author.login=="coderabbitai") | .body' | head -5
 # "Review limit reached" / "next review in NN minutes" => NOT reviewed. Re-run before merging.
 ```
+
+**GitHub re-anchors still-open review comments onto the current head.** After you push a fix,
+an *old* comment's `commit_id` and `line` both change to match the new HEAD — so a finding you
+already fixed reappears looking brand new, at a shifted line number. Acting on that means
+re-fixing work you already did, or concluding your fix was rejected when nobody said so.
+`commit_id` cannot distinguish the two. `original_commit_id` (the commit the comment was
+actually written against) plus `created_at` can:
+```bash
+gh api repos/{owner}/{repo}/pulls/<pr-number>/comments \
+  --jq '.[] | "\(.created_at) orig=\(.original_commit_id[0:8]) now=\(.commit_id[0:8]) \(.path)"'
+# created_at BEFORE your fix commit => already addressed, re-anchored. Not a new finding.
+```
+Observed live: four comments created at `09:01:36Z` against `23558456` re-anchored onto the
+fix commit, with `prefetch.rs:179 → 196` and `server.rs:1975 → 1991`. Comment count never
+changed. Compare timestamps, not commit ids.
 
 ### GitHub Actions Workflow Security (claude.yml)
 
