@@ -3,12 +3,26 @@
 #
 # Sequence: start pageserver -> launch Chromium with CDP -> warm it (navigate a
 # fixture, screenshot once to heat the raster/encode path, park on about:blank)
-# -> touch the ready file (flips /ready to 200 for --health-check based golden
-# snapshots) -> print the READY marker -> hold the browser open.
+# -> touch the ready file (which the container HEALTHCHECK gates on) -> print the
+# READY marker -> hold the browser open.
+#
+# REQUEST PATH: there is NOTHING of ours on it. Chromium's own DevTools Protocol
+# endpoint IS the request server -- it is a fully specified, already-implemented
+# protocol that returns the screenshot as base64 in the CDP response. The host
+# opens a WebSocket straight to the page target and sends Page.navigate +
+# Page.captureScreenshot. No resident interpreter, no bespoke wire format, and
+# nothing of ours that a snapshot restore could invalidate: Chromium's listener
+# is an ordinary in-guest TCP socket, not a virtio-vsock socket, so the
+# VIRTIO_VSOCK_EVENT_TRANSPORT_RESET that a restore raises does not touch it.
+#
+# The pageserver and render.py remain in the image but are OFF the request path:
+# the pageserver serves fixtures (the in-guest fixture arm), and render.py is
+# used once here to warm the renderer and by the legacy per-request exec arm the
+# benchmark A/Bs against.
 #
 # The pageserver binds 0.0.0.0 by default (not 127.0.0.1): fcvm health checks
 # arrive on the guest's eth0 IP via nsenter, not on guest loopback, so a
-# loopback-only bind would break the `--health-check http://127.0.0.1:<port>/ready`
+# loopback-only bind would break a `--health-check http://127.0.0.1:<port>/ready`
 # warm-point trigger. Fixture URLs used by the driver stay on 127.0.0.1. Set
 # BENCH_HTTP_ADDR=127.0.0.1 for a strictly loopback-only server.
 set -eu
@@ -17,6 +31,9 @@ PAGES_DIR="${BENCH_PAGES_DIR:-/opt/bench/pages}"
 HTTP_ADDR="${BENCH_HTTP_ADDR:-0.0.0.0}"
 HTTP_PORT="${BENCH_HTTP_PORT:-8000}"
 CDP_PORT="${BENCH_CDP_PORT:-9222}"
+# Wildcard by default so the host can ingress. See the flag comment below for the
+# security rationale and the one condition that makes it acceptable.
+CDP_ADDR="${BENCH_CDP_ADDR:-0.0.0.0}"
 READY_FILE="${BENCH_READY_FILE:-/run/bench-ready}"
 
 rm -f "$READY_FILE"
@@ -103,8 +120,47 @@ echo "chromium-bench: launching chromium"
 VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/lib/chromium/./vk_swiftshader_icd.json}"
 export VK_ICD_FILENAMES
 
+# CB_SITE_ISOLATION=off adds --disable-site-isolation-trials, which collapses
+# per-origin renderer processes into one. It must be decided BEFORE the golden
+# snapshot is taken (the process structure is baked into guest memory), so it is
+# a boot-time env var (`fcvm podman run --env CB_SITE_ISOLATION=off`), not a
+# per-request flag. The bench measures on and off as separate golden snapshots.
+SITE_ISO_FLAGS=""
+if [ "${CB_SITE_ISOLATION:-on}" = "off" ]; then
+    SITE_ISO_FLAGS="--disable-site-isolation-trials"
+    echo "chromium-bench: site isolation DISABLED (--disable-site-isolation-trials)"
+fi
+
 # --no-sandbox           : no user namespaces inside the guest container
-# --remote-allow-origins : primary bench arm connects CDP from outside the page origin
+# --remote-debugging-address=0.0.0.0 : IGNORED BY THIS CHROMIUM. Kept deliberately.
+#                          MEASURED 2026-08-08 on chromium 151.0.7922.71 (Debian bookworm
+#                          arm64): with BOTH --remote-debugging-port=9222 and
+#                          --remote-debugging-address=0.0.0.0 on the command line
+#                          (confirmed present in /proc/<pid>/cmdline), /proc/net/tcp shows
+#                          the listener bound to 127.0.0.1:9222 and nothing else. A host
+#                          connect to the published port TCP-connects and is then RESET —
+#                          which looks exactly like a Host-header rejection and is not one.
+#                          Reproduced with a minimal `chromium --headless=new --no-sandbox
+#                          --disable-gpu --remote-debugging-address=0.0.0.0
+#                          --remote-debugging-port=9222` too, so it is the build, not our
+#                          flag set. Host ingress therefore CANNOT come from a wildcard
+#                          bind on this image; it comes from fcvm's --forward-localhost
+#                          (routed mode), which forwards the GUEST's loopback port out.
+#                          The flag stays because it is free and correct-in-intent: if a
+#                          future Chromium honours it, the wildcard bind becomes available
+#                          without another archaeology session. Re-verify /proc/net/tcp
+#                          before believing it works.
+#                          SECURITY: were it honoured, it would hand full browser control (arbitrary
+#                          navigation, JS execution, local file reads via CDP) to
+#                          anything that can reach the port. Acceptable HERE for exactly
+#                          the reason --no-sandbox is: the microVM is the isolation
+#                          boundary, each clone is single-tenant, serves one request and
+#                          is destroyed, and the port is reachable only through fcvm's
+#                          per-clone forwarding. NOT acceptable in a shared or
+#                          long-lived VM -- do not copy this into a context where the VM
+#                          boundary is not doing that work.
+# --remote-allow-origins : primary bench arm connects CDP from outside the page origin;
+#                          without it the WebSocket upgrade is rejected on Origin check
 # --ignore-certificate-errors : bench arm renders self-signed https from the host
 #                          fixture server; must be baked in BEFORE the snapshot
 # --disable-gpu          : no GPU on this platform; forces deterministic software raster
@@ -117,6 +173,7 @@ HOME=/tmp chromium \
     --headless=new \
     --no-sandbox \
     --remote-debugging-port="$CDP_PORT" \
+    --remote-debugging-address="$CDP_ADDR" \
     --remote-allow-origins='*' \
     --ignore-certificate-errors \
     --disable-gpu \
@@ -130,20 +187,52 @@ HOME=/tmp chromium \
     --disable-breakpad \
     --disable-component-update \
     --user-data-dir=/tmp/chrome-profile \
+    $SITE_ISO_FLAGS \
     about:blank &
 CHROME_PID=$!
 wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp
+
+# ---------------------------------------------------------------------------
+# CDP RELAY. The one process this design adds to a clone, and the reason it is
+# needed is measured, not assumed:
+#
+#   Chromium 151.0.7922.71 (Debian bookworm arm64) IGNORES
+#   --remote-debugging-address. The flag is in /proc/<pid>/cmdline; /proc/net/tcp
+#   shows 0100007F:2406 (127.0.0.1:9222) and nothing else, in the same container
+#   where the page server's 00000000:1F40 proves a wildcard bind works. It is
+#   the browser, not our flags, and not a Host-header rejection.
+#
+#   fcvm cannot bridge that gap either: --forward-localhost runs GUEST -> HOST
+#   (fc-agent/src/network.rs:479 dials 10.0.2.2), so aiming it at 9222 hijacks
+#   the guest's own loopback CDP port and breaks the readiness probe above.
+#
+# socat is deliberately the smallest thing that closes the gap: it copies bytes,
+# it does not parse, re-encode or re-frame CDP, so the wire protocol the host
+# speaks is byte-identical to the in-guest arm's. `fork` gives one short-lived
+# child per connection; the listener is what is resident in the snapshot.
+RELAY_PORT="${BENCH_CDP_RELAY_PORT:-9223}"
+echo "chromium-bench: starting CDP relay 0.0.0.0:$RELAY_PORT -> 127.0.0.1:$CDP_PORT"
+socat TCP-LISTEN:"$RELAY_PORT",fork,reuseaddr,bind=0.0.0.0 \
+      TCP:127.0.0.1:"$CDP_PORT" &
+RELAY_PID=$!
+# Prove the relay end to end BEFORE the warm marker, so the health gate (and
+# therefore the golden snapshot) cannot fire on a browser the host cannot reach.
+wait_http "http://127.0.0.1:$RELAY_PORT/json/version" 100 cdp-relay
 
 echo "chromium-bench: warming renderer"
 python3 /opt/bench/render.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
     --out-prefix /tmp/warmup --then-blank
 
+# Warm marker. The container HEALTHCHECK (cdp_health.py) requires BOTH this file
+# AND a live CDP round trip that finds a page target, so fcvm's health gate — the
+# trigger for the golden snapshot — cannot fire on a browser that is merely
+# listening. "Healthy" therefore means "warm and provably able to screenshot".
 touch "$READY_FILE"
-echo "CHROMIUM_BENCH_READY cdp=127.0.0.1:$CDP_PORT pages=http://127.0.0.1:$HTTP_PORT"
+echo "CHROMIUM_BENCH_READY cdp=$CDP_ADDR:$CDP_PORT relay=0.0.0.0:$RELAY_PORT pages=http://127.0.0.1:$HTTP_PORT"
 
 # Hold the warm browser. wait exits with chromium's status if it dies, so the
 # container stops instead of hiding a dead browser behind sleep infinity. As
 # PID 1 this shell gets no default signal handlers — without the trap a
 # `podman stop` SIGTERM is dropped and teardown eats the 10s SIGKILL fallback.
-trap 'kill "$CHROME_PID" 2>/dev/null; exit 0' TERM INT
+trap 'kill "$CHROME_PID" "$RELAY_PID" 2>/dev/null; exit 0' TERM INT
 wait "$CHROME_PID"
