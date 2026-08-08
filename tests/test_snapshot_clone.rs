@@ -2081,3 +2081,252 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
         )
     }
 }
+
+// =============================================================================
+// Clone memory isolation
+// =============================================================================
+
+/// Marker file inside the guest's tmpfs (`/dev/shm` is guest RAM, so writing it
+/// dirties exactly the guest pages this test is about).
+const ISO_FILE: &str = "/dev/shm/fcvm-iso";
+/// 8 MiB of a repeating pattern — spans ~2048 4 KiB pages (or 4 huge pages),
+/// so the assertions cover many pages, not one lucky one.
+const ISO_BYTES: usize = 8 * 1024 * 1024;
+
+/// Two clones restored from ONE snapshot must never observe each other's guest
+/// writes, and the snapshot itself must stay pristine for later clones.
+///
+/// This is the correctness gate for shared-memory restore: MINOR + UFFDIO_CONTINUE
+/// deliberately points every clone's PTEs at the SAME physical page-cache folio, so
+/// the only thing standing between "8x density" and "clones silently corrupt each
+/// other" is that the kernel installs that PTE read-only on a MAP_PRIVATE VMA and
+/// copies on write. If that ever regresses (e.g. someone maps the backing memfd
+/// MAP_SHARED), this test fails.
+#[tokio::test]
+async fn test_snapshot_clone_isolation_uffd_minor() -> Result<()> {
+    clone_isolation_impl("minor").await
+}
+
+/// Same isolation contract for the private-copy UFFD path (UFFDIO_COPY into
+/// anonymous memory). Guards the shared assertion set against both backends.
+#[tokio::test]
+async fn test_snapshot_clone_isolation_uffd_copy() -> Result<()> {
+    clone_isolation_impl("copy").await
+}
+
+/// Read the first `n` bytes of the marker file in a VM.
+async fn iso_head(pid: u32, n: usize) -> Result<String> {
+    let out = common::exec_in_vm(pid, &[&format!("head -c {} {}", n, ISO_FILE)]).await?;
+    Ok(out.trim().to_string())
+}
+
+/// md5 of the whole marker file in a VM.
+async fn iso_md5(pid: u32) -> Result<String> {
+    let out = common::exec_in_vm(pid, &[&format!("md5sum {}", ISO_FILE)]).await?;
+    let digest = out
+        .split_whitespace()
+        .next()
+        .with_context(|| format!("no md5 in output: {out:?}"))?;
+    Ok(digest.to_string())
+}
+
+/// Overwrite the first 6 bytes of the marker file in place (no truncate, so the
+/// rest of the 8 MiB stays whatever the clone inherited).
+async fn iso_stamp(pid: u32, tag: &str) -> Result<()> {
+    assert_eq!(tag.len(), 6, "stamp must be exactly 6 bytes");
+    common::exec_in_vm(
+        pid,
+        &[&format!(
+            "printf '{}' | dd of={} bs=6 count=1 conv=notrunc status=none",
+            tag, ISO_FILE
+        )],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn clone_isolation_impl(uffd_mode: &str) -> Result<()> {
+    let (baseline_name, _, snapshot_name, _) = common::unique_names(&format!("iso-{}", uffd_mode));
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    println!("\n=== Clone isolation test (uffd-mode={}) ===", uffd_mode);
+
+    // ---- baseline VM with a known 8 MiB pattern in guest RAM ----------------
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+
+    common::exec_in_vm(
+        baseline_pid,
+        &[&format!(
+            "yes ABCDEFGH | head -c {} > {} && sync",
+            ISO_BYTES, ISO_FILE
+        )],
+    )
+    .await
+    .context("writing baseline pattern")?;
+
+    let base_md5 = iso_md5(baseline_pid).await?;
+    let base_head = iso_head(baseline_pid, 6).await?;
+    println!("  baseline: head={} md5={}", base_head, base_md5);
+    assert_eq!(
+        base_head, "ABCDEF",
+        "baseline pattern not written correctly"
+    );
+
+    // ---- snapshot + memory server in the mode under test --------------------
+    common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+
+    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "serve",
+            &snapshot_name,
+            "--uffd-mode",
+            uffd_mode,
+        ],
+        &format!("uffd-serve-{}", uffd_mode),
+    )
+    .await
+    .context("spawning memory server")?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+    // ---- two clones ---------------------------------------------------------
+    // The clone's Firecracker must understand the "UffdMinor" backend. The snapshot
+    // profile's pinned binary wins over the FCVM_FIRECRACKER_BIN env var in
+    // `find_firecracker`, so to exercise a locally built fork (before the pinned branch
+    // carries UffdMinor) the override has to travel as an explicit CLI flag.
+    let fork_fc = std::env::var("FCVM_FIRECRACKER_BIN").ok();
+    let serve_pid_str = serve_pid.to_string();
+    let clone_args = |name: &str| -> Vec<String> {
+        let mut args: Vec<String> = ["snapshot", "run", "--pid", &serve_pid_str, "--name", name]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if let Some(ref fc) = fork_fc {
+            args.push("--firecracker-bin".to_string());
+            args.push(fc.clone());
+        }
+        args
+    };
+
+    let mut clone_children = Vec::new();
+    let mut clone_pids = Vec::new();
+    for i in 0..2 {
+        let name = format!("{}-c{}", baseline_name.replace("-base-", "-clone-"), i);
+        let args = clone_args(&name);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let (child, pid) = common::spawn_fcvm_with_logs(&arg_refs, &name)
+            .await
+            .with_context(|| format!("spawning clone {i}"))?;
+        common::poll_health_by_pid(pid, 150)
+            .await
+            .with_context(|| format!("clone {i} never became healthy"))?;
+        clone_children.push(child);
+        clone_pids.push(pid);
+    }
+    let (a, b) = (clone_pids[0], clone_pids[1]);
+
+    // Run the assertions in a block so cleanup always happens.
+    let verdict = async {
+        // 1. Both clones must see the SNAPSHOT's memory, byte for byte. With
+        //    MINOR+CONTINUE this is the proof that the shared folio actually carries
+        //    the snapshot contents (a broken handler would serve zeros here).
+        let a_md5 = iso_md5(a).await?;
+        let b_md5 = iso_md5(b).await?;
+        anyhow::ensure!(
+            a_md5 == base_md5,
+            "clone A restored WRONG memory: md5 {a_md5} != snapshot {base_md5}"
+        );
+        anyhow::ensure!(
+            b_md5 == base_md5,
+            "clone B restored WRONG memory: md5 {b_md5} != snapshot {base_md5}"
+        );
+        println!("  ✓ both clones restored the snapshot's 8 MiB pattern");
+
+        // 2. Clone A writes. Clone B must not see it.
+        iso_stamp(a, "CLONEA").await?;
+        let a_head = iso_head(a, 6).await?;
+        let b_head = iso_head(b, 6).await?;
+        anyhow::ensure!(
+            a_head == "CLONEA",
+            "clone A did not observe its own write (got {a_head:?})"
+        );
+        anyhow::ensure!(
+            b_head == "ABCDEF",
+            "MEMORY LEAKED BETWEEN CLONES: clone B sees {b_head:?} after clone A wrote 'CLONEA'"
+        );
+        let b_md5_after = iso_md5(b).await?;
+        anyhow::ensure!(
+            b_md5_after == base_md5,
+            "MEMORY LEAKED BETWEEN CLONES: clone B md5 changed to {b_md5_after} after clone A wrote"
+        );
+        println!("  ✓ clone A's write is invisible to clone B");
+
+        // 3. Clone B writes a DIFFERENT value to the SAME page. Neither may win over
+        //    the other — this is the case that a MAP_SHARED mapping would fail.
+        iso_stamp(b, "CLONEB").await?;
+        let a_head = iso_head(a, 6).await?;
+        let b_head = iso_head(b, 6).await?;
+        anyhow::ensure!(
+            a_head == "CLONEA",
+            "MEMORY LEAKED BETWEEN CLONES: clone A sees {a_head:?} after clone B wrote 'CLONEB'"
+        );
+        anyhow::ensure!(
+            b_head == "CLONEB",
+            "clone B did not observe its own write (got {b_head:?})"
+        );
+        println!("  ✓ both clones keep their own value for the same guest page");
+
+        // 4. The golden snapshot must still be reusable: a clone started AFTER both
+        //    writes must see the pristine pattern.
+        let name = format!("{}-late", baseline_name.replace("-base-", "-clone-"));
+        let args = clone_args(&name);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let (late_child, late_pid) = common::spawn_fcvm_with_logs(&arg_refs, &name)
+            .await
+            .context("spawning late clone")?;
+        common::poll_health_by_pid(late_pid, 150)
+            .await
+            .context("late clone never became healthy")?;
+        let late_md5 = iso_md5(late_pid).await?;
+        let late_head = iso_head(late_pid, 6).await?;
+        drop(late_child);
+        anyhow::ensure!(
+            late_md5 == base_md5 && late_head == "ABCDEF",
+            "SNAPSHOT CORRUPTED by clone writes: late clone sees head={late_head:?} md5={late_md5} \
+             (expected head=\"ABCDEF\" md5={base_md5})"
+        );
+        println!("  ✓ snapshot still pristine for a clone started after both writes");
+        anyhow::Ok(())
+    }
+    .await;
+
+    // ---- cleanup ------------------------------------------------------------
+    drop(clone_children);
+    for pid in clone_pids {
+        common::kill_process(pid).await;
+    }
+    common::kill_process(serve_pid).await;
+    common::kill_process(baseline_pid).await;
+    let _ = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshots", "delete", &snapshot_name])
+        .output()
+        .await;
+
+    verdict?;
+    println!("✅ CLONE ISOLATION TEST PASSED (uffd-mode={})", uffd_mode);
+    Ok(())
+}

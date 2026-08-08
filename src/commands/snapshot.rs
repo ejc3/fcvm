@@ -20,7 +20,7 @@ use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
 };
 use crate::storage::SnapshotManager;
-use crate::uffd::UffdServer;
+use crate::uffd::{UffdBacking, UffdServer};
 use crate::volume::VolumeConfig;
 
 use super::common::{
@@ -398,11 +398,20 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     let socket_path =
         paths::data_dir().join(format!("uffd-{}-{}.sock", args.snapshot_name, my_pid));
 
+    // How pages reach the clones: private per-clone UFFDIO_COPY (default) or one shared
+    // memfd resolved with UFFDIO_CONTINUE (--uffd-mode minor / FCVM_UFFD_MODE=minor).
+    let hugepages = snapshot_config.metadata.hugepages;
+    let backing = match args.uffd_mode.as_deref() {
+        Some(mode) => UffdBacking::parse_mode(mode, hugepages)?,
+        None => UffdBacking::Copy,
+    };
+
     // Create UFFD server with custom socket path
     let server = UffdServer::new_with_path(
         args.snapshot_name.clone(),
         &snapshot_config.memory_path,
         &socket_path,
+        backing,
     )
     .await
     .context("creating UFFD server")?;
@@ -413,6 +422,9 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     serve_state.pid = Some(my_pid);
     serve_state.config.snapshot_name = Some(args.snapshot_name.clone());
     serve_state.config.process_type = Some(crate::state::ProcessType::Serve);
+    // Clones read this back to pick the matching Firecracker memory backend.
+    serve_state.config.uffd_mode = Some(backing.name().to_string());
+    serve_state.config.hugepages = hugepages;
     serve_state.status = VmStatus::Running;
 
     let state_manager = Arc::new(StateManager::new(paths::state_dir()));
@@ -431,6 +443,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("Serving snapshot: {}", args.snapshot_name);
     println!("  Serve PID: {}", my_pid);
     println!("  Socket: {}", socket_path.display());
+    println!("  UFFD mode: {}", backing.name());
     println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
     println!("  Waiting for VMs to connect...");
     println!();
@@ -693,7 +706,7 @@ fn volume_state_from_snapshot(
 /// This is public so podman.rs can call it directly for cache hits.
 pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Determine mode and get snapshot name
-    let (snapshot_name, serve_pid, use_uffd) = match (&args.pid, &args.snapshot) {
+    let (snapshot_name, serve_pid, use_uffd, serve_uffd_mode) = match (&args.pid, &args.snapshot) {
         (Some(pid), None) => {
             // UFFD mode: verify serve process is alive
             if !crate::utils::is_process_alive(*pid) {
@@ -710,18 +723,23 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 .await
                 .context("loading serve process state - is serve running?")?;
 
+            // The serve process decides how pages are materialised; the clone must ask
+            // Firecracker for the matching backend or the handshake deadlocks (MINOR mode
+            // sends the backing fd first, COPY mode does not).
+            let mode = serve_state.config.uffd_mode.clone();
+
             let name = serve_state
                 .config
                 .snapshot_name
                 .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
 
             info!("Cloning VM from serve PID {} (snapshot: {})", pid, name);
-            (name, Some(*pid), true)
+            (name, Some(*pid), true, mode)
         }
         (None, Some(name)) => {
             // Direct file mode: no serve process needed
             info!("Cloning VM directly from snapshot: {}", name);
-            (name.clone(), None, false)
+            (name.clone(), None, false, None)
         }
         (None, None) => {
             anyhow::bail!("Either --pid or --snapshot must be specified");
@@ -1204,9 +1222,27 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             memory_path: snapshot_config.memory_path.clone(),
         }
     } else if let Some(ref uffd_socket_path) = uffd_socket {
-        // Explicit UFFD mode (--pid): connect to existing serve process
-        MemoryBackend::Uffd {
-            socket_path: uffd_socket_path.clone(),
+        // Explicit UFFD mode (--pid): connect to existing serve process, speaking whichever
+        // page-materialisation protocol that serve process was started with.
+        //
+        // A hugepage clone can privatise up to the whole guest in 2 MiB CoW pages, so
+        // admit it only if the pool could hold that. Advisory here (concurrent clones
+        // race for the same pages); for MINOR restores the kernel additionally RESERVES
+        // the range at mmap time, failing an unservable restore with ENOMEM instead of
+        // letting a running guest SIGBUS.
+        if hugepages {
+            crate::uffd::preflight_clone_hugepages(
+                args.mem.unwrap_or(snapshot_config.metadata.memory_mib) as usize,
+            )?;
+        }
+        let mode = serve_uffd_mode.as_deref().unwrap_or("copy");
+        match UffdBacking::parse_mode(mode, hugepages)? {
+            UffdBacking::Copy => MemoryBackend::Uffd {
+                socket_path: uffd_socket_path.clone(),
+            },
+            UffdBacking::Minor { .. } => MemoryBackend::UffdMinor {
+                socket_path: uffd_socket_path.clone(),
+            },
         }
     } else {
         // Use file-backed restore by default, UFFD when required.
@@ -1215,13 +1251,20 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         if hugepages || std::env::var("FCVM_FORCE_UFFD").is_ok() {
             let implicit_socket_path = data_dir.join("uffd.sock");
             let reason = if hugepages {
+                // Same admission logic as the serve-process path above: refuse to spawn a
+                // hugepage clone the pool cannot hold at its CoW worst case.
+                crate::uffd::preflight_clone_hugepages(
+                    args.mem.unwrap_or(snapshot_config.metadata.memory_mib) as usize,
+                )?;
                 "hugepages require UFFD"
             } else {
                 "FCVM_FORCE_UFFD"
             };
+            let backing = UffdBacking::from_env(hugepages)?;
             info!(
                 socket = %implicit_socket_path.display(),
                 reason = %reason,
+                mode = backing.name(),
                 "starting implicit UFFD server for snapshot restore"
             );
 
@@ -1229,6 +1272,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 format!("implicit-{}", truncate_id(&vm_id, 8)),
                 &snapshot_config.memory_path,
                 &implicit_socket_path,
+                backing,
             )
             .await
             .context("creating implicit UFFD server")
@@ -1270,8 +1314,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            MemoryBackend::Uffd {
-                socket_path: implicit_socket_path,
+            match backing {
+                UffdBacking::Copy => MemoryBackend::Uffd {
+                    socket_path: implicit_socket_path,
+                },
+                UffdBacking::Minor { .. } => MemoryBackend::UffdMinor {
+                    socket_path: implicit_socket_path,
+                },
             }
         } else {
             MemoryBackend::File {

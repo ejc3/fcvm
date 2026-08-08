@@ -368,6 +368,19 @@ pub struct SnapshotCreateArgs {
 pub struct SnapshotServeArgs {
     /// Snapshot name to serve
     pub snapshot_name: String,
+
+    /// How guest memory pages reach the clones:
+    ///
+    /// - `copy` (default): MISSING faults on anonymous guest memory resolved with
+    ///   UFFDIO_COPY. Lazy, but each clone gets a PRIVATE copy of every page it touches.
+    /// - `minor`: clones map one shared (sealed, read-only) memfd MAP_PRIVATE and MINOR
+    ///   faults are resolved with UFFDIO_CONTINUE. Clean pages have ONE physical copy
+    ///   across all clones; guest writes take a normal copy-on-write fault into private
+    ///   memory. For hugepage snapshots each clone additionally RESERVES its full guest
+    ///   size from the hugepage pool at restore, so admission fails cleanly (ENOMEM)
+    ///   instead of a running guest dying with SIGBUS when the pool runs dry.
+    #[arg(long, value_name = "copy|minor", env = "FCVM_UFFD_MODE")]
+    pub uffd_mode: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -420,9 +433,11 @@ pub struct SnapshotRunArgs {
     #[arg(skip)]
     pub mem: Option<u32>,
 
-    /// Firecracker binary path (internal use only).
-    /// Passed from podman run runtime config when restoring from a snapshot cache hit.
-    #[arg(skip)]
+    /// Run the clone on this Firecracker binary instead of the snapshot profile's
+    /// content-addressed build. This is how a locally built Firecracker (e.g. a fork
+    /// branch under review) is exercised by clones; also passed internally from podman
+    /// run's runtime config when restoring from a snapshot cache hit.
+    #[arg(long, value_name = "PATH")]
     pub firecracker_bin: Option<String>,
 
     /// Extra Firecracker args (internal use only).

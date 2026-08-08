@@ -10,23 +10,102 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use memmap2::MmapOptions;
-use userfaultfd::{Event, Uffd};
+use userfaultfd::{Event, FaultKind, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::paths;
+
+/// 2MiB — the only huge page size fcvm supports for guest memory.
+const HUGE_PAGE_2M: usize = 2 * 1024 * 1024;
+
+/// How the server materialises snapshot pages into a clone's guest memory.
+///
+/// Both modes serve the same snapshot; they differ in whether the physical page a clone
+/// reads is *shared* with the other clones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UffdBacking {
+    /// MISSING faults on anonymous guest memory, resolved with `UFFDIO_COPY` out of a
+    /// mapping of the snapshot memory file.
+    ///
+    /// Lazy, but every clone ends up with its own private copy of every page it touches:
+    /// N clones that touch the same page cost N physical pages.
+    Copy,
+    /// MINOR faults on a `MAP_PRIVATE` mapping of a shared memfd, resolved with
+    /// `UFFDIO_CONTINUE`.
+    ///
+    /// The server holds the snapshot's guest memory in one memfd and hands that fd to every
+    /// clone's Firecracker over the handshake socket. Because the clone maps it
+    /// `MAP_PRIVATE`, `UFFDIO_CONTINUE` installs a **read-only** PTE pointing at the shared
+    /// page-cache folio (`mm/userfaultfd.c`: `if (page_in_cache && !vm_shared) writable =
+    /// false`), so reads across all clones hit ONE physical copy and the first guest write
+    /// takes an ordinary copy-on-write fault into private memory. The snapshot stays
+    /// pristine and reusable.
+    ///
+    /// `hugepages` selects `MFD_HUGETLB|MFD_HUGE_2MB` for 2MiB-backed guests.
+    Minor { hugepages: bool },
+}
+
+impl UffdBacking {
+    /// Parse the `FCVM_UFFD_MODE` env var / `--uffd-mode` flag value.
+    pub fn parse_mode(value: &str, hugepages: bool) -> Result<Self> {
+        match value {
+            "copy" => Ok(Self::Copy),
+            "minor" => Ok(Self::Minor { hugepages }),
+            other => anyhow::bail!("invalid UFFD mode {other:?} (expected \"copy\" or \"minor\")"),
+        }
+    }
+
+    /// Resolve the backing mode from `FCVM_UFFD_MODE`, defaulting to [`UffdBacking::Copy`].
+    pub fn from_env(hugepages: bool) -> Result<Self> {
+        match std::env::var("FCVM_UFFD_MODE") {
+            Ok(v) => Self::parse_mode(&v, hugepages),
+            Err(_) => Ok(Self::Copy),
+        }
+    }
+
+    /// The Firecracker `mem_backend.backend_type` string this mode requires.
+    pub fn firecracker_backend_type(&self) -> &'static str {
+        match self {
+            Self::Copy => "Uffd",
+            Self::Minor { .. } => "UffdMinor",
+        }
+    }
+
+    /// Short name used in state files and logs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Minor { .. } => "minor",
+        }
+    }
+}
+
+/// Where a clone's pages come from — the per-mode server state, shared by all clones.
+enum PageSource {
+    /// Read-only mapping of the snapshot memory file; pages are `UFFDIO_COPY`'d out of it.
+    Copy { mmap: memmap2::Mmap },
+    /// A memfd holding the whole snapshot image. Handed to each Firecracker over
+    /// `SCM_RIGHTS`; faults are resolved in place with `UFFDIO_CONTINUE`.
+    Minor { backing: File },
+}
 
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
 pub struct UffdServer {
     snapshot_id: String,
     socket_path: PathBuf,
-    mmap: Arc<memmap2::Mmap>,
+    source: Arc<PageSource>,
+    backing: UffdBacking,
 }
 
 impl UffdServer {
     /// Create a new UFFD server for a snapshot
-    pub async fn new(snapshot_id: String, mem_file_path: &Path) -> Result<Self> {
+    pub async fn new(
+        snapshot_id: String,
+        mem_file_path: &Path,
+        backing: UffdBacking,
+    ) -> Result<Self> {
         let socket_path = paths::data_dir().join(format!("uffd-{}.sock", snapshot_id));
-        Self::new_with_path(snapshot_id, mem_file_path, &socket_path).await
+        Self::new_with_path(snapshot_id, mem_file_path, &socket_path, backing).await
     }
 
     /// Create a new UFFD server with custom socket path
@@ -34,32 +113,51 @@ impl UffdServer {
         snapshot_id: String,
         mem_file_path: &Path,
         socket_path: &Path,
+        backing: UffdBacking,
     ) -> Result<Self> {
         info!(
             target: "uffd",
             snapshot = %snapshot_id,
             mem_file = %mem_file_path.display(),
             socket = %socket_path.display(),
+            mode = backing.name(),
             "creating UFFD server"
         );
 
-        // Open and mmap the memory snapshot file (shared across all VMs)
+        // Open the memory snapshot file (shared across all VMs)
         let mem_file = File::open(mem_file_path).context("opening memory file")?;
         let mem_size = mem_file.metadata()?.len() as usize;
 
         info!(
             target: "uffd",
             mem_size_mb = mem_size / (1024 * 1024),
-            "mapping memory file"
+            mode = backing.name(),
+            "preparing snapshot page source"
         );
 
-        // Safety: We're mapping a read-only file for serving pages
-        let mmap = Arc::new(unsafe {
-            MmapOptions::new()
-                .len(mem_size)
-                .map(&mem_file)
-                .context("mmapping memory file")?
-        });
+        let source = match backing {
+            UffdBacking::Copy => {
+                // Safety: We're mapping a read-only file for serving pages
+                let mmap = unsafe {
+                    MmapOptions::new()
+                        .len(mem_size)
+                        .map(&mem_file)
+                        .context("mmapping memory file")?
+                };
+                PageSource::Copy { mmap }
+            }
+            UffdBacking::Minor { hugepages } => {
+                let backing_file = tokio::task::spawn_blocking({
+                    let id = snapshot_id.clone();
+                    move || create_backing_memfd(&id, mem_file, mem_size, hugepages)
+                })
+                .await
+                .context("joining memfd population task")??;
+                PageSource::Minor {
+                    backing: backing_file,
+                }
+            }
+        };
 
         // Ensure parent directory exists
         if let Some(parent) = socket_path.parent() {
@@ -74,13 +172,19 @@ impl UffdServer {
         Ok(Self {
             snapshot_id,
             socket_path: socket_path.to_path_buf(),
-            mmap,
+            source: Arc::new(source),
+            backing,
         })
     }
 
     /// Get the socket path for this server
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// The page-materialisation mode this server was created with.
+    pub fn backing(&self) -> UffdBacking {
+        self.backing
     }
 
     /// Run the UFFD server (blocks until cancelled via CancellationToken)
@@ -108,7 +212,7 @@ impl UffdServer {
                         Ok((stream, _)) => {
                             let vm_id = format!("vm-{}", next_vm_id);
                             next_vm_id += 1;
-                            let mmap = Arc::clone(&self.mmap);
+                            let source = Arc::clone(&self.source);
 
                             info!(target: "uffd", vm_id = %vm_id, "new VM connection");
 
@@ -117,7 +221,7 @@ impl UffdServer {
                             vm_tasks.spawn(async move {
                                 match tokio::time::timeout(
                                     Duration::from_secs(30),
-                                    receive_uffd_async(stream),
+                                    handshake(stream, &source),
                                 ).await {
                                     Ok(Ok((uffd, mappings))) => {
                                         info!(
@@ -127,7 +231,7 @@ impl UffdServer {
                                             "received UFFD with {} memory regions",
                                             mappings.len()
                                         );
-                                        match handle_vm_page_faults(vm_id.clone(), uffd, mappings, mmap).await {
+                                        match handle_vm_page_faults(vm_id.clone(), uffd, mappings, source).await {
                                             Ok(()) => info!(target: "uffd", vm_id = %vm_id, "VM handler exited cleanly"),
                                             Err(e) => error!(
                                                 target: "uffd",
@@ -221,12 +325,121 @@ fn zeropage_hit_present_page(e: &userfaultfd::Error) -> bool {
     )
 }
 
+/// Whether a UFFDIO_CONTINUE error means the page is already mapped in the clone.
+///
+/// Two threads in the guest can fault on the same page before the first `UFFDIO_CONTINUE`
+/// lands; the kernel reports `EEXIST` for the loser. Nothing is wrong — the page is present.
+fn continue_hit_present_page(e: &userfaultfd::Error) -> bool {
+    // Compare the raw errno: the `userfaultfd` crate pins its own `nix` version, which is
+    // not necessarily the one fcvm depends on.
+    matches!(
+        e,
+        userfaultfd::Error::SystemError(errno) if (*errno as i32) == libc::EEXIST
+    )
+}
+
+/// Whether a UFFDIO_CONTINUE error is the kernel saying "not now, try again".
+///
+/// The ioctl fails with `EAGAIN` (and zero progress) while the context's `mmap_changing`
+/// flag is raised — an event-generating operation (fork, mremap, madvise) is mid-flight
+/// and its event is sitting in the uffd queue waiting to be READ. The fault is NOT
+/// resolved and the faulting vCPU stays asleep until a successful CONTINUE wakes it, so
+/// the caller must drain the event queue (which is what lets the blocked operation finish
+/// and clear `mmap_changing`) and retry. Dropping the fault = a permanently hung vCPU.
+fn continue_would_block(e: &userfaultfd::Error) -> bool {
+    matches!(
+        e,
+        userfaultfd::Error::SystemError(errno) if (*errno as i32) == libc::EAGAIN
+    )
+}
+
+/// Whether a UFFDIO_CONTINUE error means the clone's mm is gone (process exited).
+fn continue_vm_gone(e: &userfaultfd::Error) -> bool {
+    matches!(
+        e,
+        userfaultfd::Error::SystemError(errno) if (*errno as i32) == libc::ESRCH
+    )
+}
+
+/// How one attempt at resolving a MINOR fault ended.
+enum ContinueOutcome {
+    /// The whole granule is mapped in the clone (by us, or by a racing fault — EEXIST).
+    Resolved,
+    /// `EAGAIN` with no progress: `mmap_changing` is set. The fault is still pending and
+    /// MUST be retried after the event queue has been drained.
+    Retry,
+    /// `ESRCH`: the clone exited while we were resolving. Nothing left to serve.
+    VmGone,
+}
+
+/// Resolve one faulting granule (`page_size` bytes: 4 KiB shmem / 2 MiB hugetlb) with
+/// `UFFDIO_CONTINUE`, handling every outcome the kernel documents:
+///
+/// * `Ok(mapped)` — the kernel maps from the start of the range and reports the bytes it
+///   installed. A short count means it stopped early (the ioctl signals this as `EAGAIN`
+///   after partial progress); advance past the mapped bytes and continue the remainder
+///   instead of discarding the count.
+/// * `EEXIST` — the granule at the current position is already mapped (a racing guest
+///   thread won). That sub-range is DONE; skip it, it is not an error.
+/// * `EAGAIN` with zero progress — `mmap_changing` is set; report [`ContinueOutcome::Retry`]
+///   so the caller drains the event queue and retries. Never drop the fault.
+/// * `ESRCH` — the clone died; report [`ContinueOutcome::VmGone`].
+/// * anything else — a real error; propagate loudly (a dropped fault is a hung vCPU).
+fn continue_page(
+    uffd: &Uffd,
+    vm_id: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<ContinueOutcome> {
+    let mut done = 0usize;
+    while done < page_size {
+        let addr = (page + done) as *mut std::ffi::c_void;
+        let remaining = page_size - done;
+        match uffd.r#continue(addr, remaining, true) {
+            Ok(mapped) => {
+                let mapped = usize::try_from(mapped).unwrap_or(0);
+                // The kernel never reports zero-byte success; guard against a spin.
+                anyhow::ensure!(
+                    mapped > 0,
+                    "UFFDIO_CONTINUE reported zero mapped bytes at 0x{:x}",
+                    page + done
+                );
+                done += mapped;
+            }
+            Err(e) if continue_hit_present_page(&e) => {
+                debug!(
+                    target: "uffd",
+                    vm_id = %vm_id,
+                    fault_addr = format!("0x{:x}", page + done),
+                    "UFFDIO_CONTINUE skipped - page already mapped (EEXIST)"
+                );
+                // EEXIST refers to the granule at the current position; with per-granule
+                // requests that is the whole remaining range.
+                done += remaining;
+            }
+            Err(e) if continue_would_block(&e) => return Ok(ContinueOutcome::Retry),
+            Err(e) if continue_vm_gone(&e) => return Ok(ContinueOutcome::VmGone),
+            Err(e) => {
+                error!(
+                    target: "uffd",
+                    vm_id = %vm_id,
+                    fault_addr = format!("0x{:x}", page + done),
+                    error = ?e,
+                    "UFFDIO_CONTINUE failed"
+                );
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(ContinueOutcome::Resolved)
+}
+
 /// Handle page faults for a single VM
 async fn handle_vm_page_faults(
     vm_id: String,
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
-    mmap: Arc<memmap2::Mmap>,
+    source: Arc<PageSource>,
 ) -> Result<()> {
     // Derive page size from mappings (all regions use the same page size)
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
@@ -252,16 +465,111 @@ async fn handle_vm_page_faults(
     let mut fault_count = 0u64;
     let start_time = std::time::Instant::now();
 
+    // MINOR faults whose UFFDIO_CONTINUE came back `EAGAIN` (`mmap_changing` was set),
+    // keyed by page address, value = retry attempts so far. The faulting vCPU sleeps
+    // until a successful CONTINUE wakes it and will never re-fault on its own, so every
+    // entry here MUST eventually resolve or the handler must die loudly — silently
+    // dropping one is a permanently hung guest.
+    let mut pending_continues: std::collections::BTreeMap<usize, u32> =
+        std::collections::BTreeMap::new();
+    // How long to wait for new events before re-attempting parked CONTINUEs. Retries are
+    // also attempted after every drain, so this only bounds the idle-queue case.
+    const CONTINUE_RETRY_DELAY: Duration = Duration::from_millis(2);
+    // Hard bound on retries per fault (~2s at CONTINUE_RETRY_DELAY): mmap_changing
+    // clears as soon as the queued event is read, so persistent EAGAIN means something
+    // is wedged. Failing the handler is loud; an infinite loop or a drop would not be.
+    const MAX_CONTINUE_ATTEMPTS: u32 = 1000;
+
     loop {
-        // Wait for UFFD to be readable
-        let mut guard = match async_uffd.readable().await {
-            Ok(guard) => guard,
-            Err(e) => {
-                error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
-                return Err(e.into());
+        // Wait for UFFD to be readable — but never park indefinitely while resolved-later
+        // faults are waiting, because no new event will ever arrive for THEM.
+        let maybe_guard = if pending_continues.is_empty() {
+            match async_uffd.readable().await {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
+                    return Err(e.into());
+                }
+            }
+        } else {
+            match tokio::time::timeout(CONTINUE_RETRY_DELAY, async_uffd.readable()).await {
+                Ok(Ok(guard)) => Some(guard),
+                Ok(Err(e)) => {
+                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
+                    return Err(e.into());
+                }
+                // Timeout: no new events. Fall through and retry the parked faults.
+                Err(_) => None,
             }
         };
 
+        if let Some(mut guard) = maybe_guard {
+            if !drain_events(
+                &mut guard,
+                &vm_id,
+                &mappings,
+                &source,
+                page_size,
+                page_mask,
+                &mut fault_count,
+                &mut pending_continues,
+                start_time,
+            )? {
+                return Ok(()); // VM exited
+            }
+            guard.clear_ready();
+        }
+
+        // Retry parked faults now that the queue is drained — reading the queued event is
+        // exactly what allows the in-flight operation to finish and `mmap_changing` to
+        // clear, so this is the earliest moment a retry can succeed.
+        if !pending_continues.is_empty() {
+            let mut resolved = Vec::new();
+            for (&page, attempts) in pending_continues.iter_mut() {
+                match continue_page(async_uffd.get_ref(), &vm_id, page, page_size)? {
+                    ContinueOutcome::Resolved => resolved.push(page),
+                    ContinueOutcome::VmGone => {
+                        info!(target: "uffd", vm_id = %vm_id, "VM exited during CONTINUE retry");
+                        return Ok(());
+                    }
+                    ContinueOutcome::Retry => {
+                        *attempts += 1;
+                        if *attempts >= MAX_CONTINUE_ATTEMPTS {
+                            return Err(anyhow!(
+                                "UFFDIO_CONTINUE at 0x{:x} still EAGAIN after {} attempts — \
+                                 mmap_changing never cleared. Refusing to drop the fault \
+                                 (a dropped fault is a permanently hung vCPU); failing the \
+                                 handler for vm {} instead",
+                                page,
+                                MAX_CONTINUE_ATTEMPTS,
+                                vm_id
+                            ));
+                        }
+                    }
+                }
+            }
+            for page in resolved {
+                pending_continues.remove(&page);
+            }
+        }
+    }
+}
+
+/// Drain every ready event from the uffd. Returns `Ok(false)` when the VM has exited
+/// (uffd closed), `Ok(true)` to keep serving.
+#[allow(clippy::too_many_arguments)]
+fn drain_events(
+    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, Uffd>,
+    vm_id: &str,
+    mappings: &[GuestRegionUffdMapping],
+    source: &PageSource,
+    page_size: usize,
+    page_mask: usize,
+    fault_count: &mut u64,
+    pending_continues: &mut std::collections::BTreeMap<usize, u32>,
+    start_time: std::time::Instant,
+) -> Result<bool> {
+    {
         // Read all available events (non-blocking)
         loop {
             let event = match guard.get_inner().read_event() {
@@ -271,25 +579,25 @@ async fn handle_vm_page_faults(
                     // UFFD closed = VM exited
                     let elapsed = start_time.elapsed();
                     let rate = if elapsed.as_secs_f64() > 0.0 {
-                        fault_count as f64 / elapsed.as_secs_f64()
+                        *fault_count as f64 / elapsed.as_secs_f64()
                     } else {
                         0.0
                     };
                     info!(
                         target: "uffd",
                         vm_id = %vm_id,
-                        fault_count,
+                        fault_count = *fault_count,
                         elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
                         pages_per_sec = format!("{:.0}", rate),
                         "VM exited"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             };
 
             match event {
-                Event::Pagefault { addr, .. } => {
-                    fault_count += 1;
+                Event::Pagefault { addr, kind, .. } => {
+                    *fault_count += 1;
 
                     // Find which memory region this address belongs to
                     let fault_page = (addr as usize) & page_mask;
@@ -309,6 +617,49 @@ async fn handle_vm_page_faults(
                             base_host
                         ));
                     }
+
+                    let mmap = match source {
+                        PageSource::Minor { .. } => {
+                            // MINOR mode: the page is already in the page cache of the shared
+                            // memfd that this clone mapped MAP_PRIVATE. UFFDIO_CONTINUE just
+                            // installs a (read-only) PTE onto that folio — no copy, no file
+                            // offset arithmetic, because the clone mapped the backing file at
+                            // exactly the offsets the snapshot uses.
+                            // Only UFFDIO_REGISTER_MODE_MINOR is registered, so the kernel can
+                            // only ever deliver minor faults here. Holes in the backing memfd
+                            // (all-zero snapshot pages, deliberately not written) are resolved
+                            // by the kernel itself without any event, and the folio it
+                            // allocates lands in the memfd's page cache so later clones DO
+                            // fault MINOR onto it. Anything else means the registration mode
+                            // and this handler have drifted apart.
+                            if kind != FaultKind::Minor {
+                                return Err(anyhow!(
+                                    "unexpected {:?} fault at 0x{:x} in MINOR mode — Firecracker \
+                                     registered a mode this handler cannot resolve",
+                                    kind,
+                                    fault_page
+                                ));
+                            }
+                            match continue_page(guard.get_inner(), vm_id, fault_page, page_size)? {
+                                ContinueOutcome::Resolved => {}
+                                ContinueOutcome::VmGone => return Ok(false),
+                                ContinueOutcome::Retry => {
+                                    // mmap_changing is set and the event that raised it is
+                                    // somewhere in THIS queue. Don't spin here — park the
+                                    // fault; the caller retries it right after the drain.
+                                    debug!(
+                                        target: "uffd",
+                                        vm_id = %vm_id,
+                                        fault_addr = format!("0x{:x}", fault_page),
+                                        "UFFDIO_CONTINUE EAGAIN (mmap_changing) - parked for retry"
+                                    );
+                                    pending_continues.entry(fault_page).or_insert(0);
+                                }
+                            }
+                            continue;
+                        }
+                        PageSource::Copy { mmap } => mmap,
+                    };
 
                     let offset_in_region = fault_page - base_host;
                     let mapping_offset = usize::try_from(mapping.offset)
@@ -427,6 +778,38 @@ async fn handle_vm_page_faults(
                         continue; // Nothing to zero
                     }
 
+                    if matches!(source, PageSource::Minor { .. }) {
+                        // This branch is expected to be DEAD in MINOR mode. Remove events are
+                        // generated only by madvise(MADV_DONTNEED/MADV_REMOVE) on a registered
+                        // range (fs/userfaultfd.c userfaultfd_remove), but a MINOR clone's
+                        // guest memory is a file-backed MAP_PRIVATE mapping, and for those
+                        // Firecracker's balloon path (vstate/memory.rs discard_range) does NOT
+                        // madvise — it mmap()s fresh anonymous MAP_PRIVATE|MAP_FIXED memory
+                        // over the range. That replaces the VMA: the range reads back as
+                        // zeros (correct balloon semantics), the MINOR registration for it is
+                        // torn down with the old VMA, and no uffd event is generated at all,
+                        // so this server is simply never involved in that range again.
+                        //
+                        // If a Remove event nevertheless arrives (a future Firecracker
+                        // switching that path back to madvise), no action is needed or
+                        // possible: UFFDIO_ZEROPAGE is EINVAL on hugetlb VMAs and would
+                        // defeat page sharing on shmem, and after MADV_DONTNEED on a private
+                        // file mapping the next touch minor-faults again and gets served the
+                        // pristine snapshot page — an acceptable post-discard state, since
+                        // balloon-discarded contents are undefined for the guest. Warn so
+                        // drift from the expected Firecracker behaviour is visible.
+                        warn!(
+                            target: "uffd",
+                            vm_id = %vm_id,
+                            start = format!("0x{:x}", start_addr),
+                            len,
+                            "unexpected Remove event in MINOR mode (Firecracker balloon \
+                             discard should replace the VMA, not madvise) - ignoring; \
+                             still-registered pages will minor-fault normally"
+                        );
+                        continue;
+                    }
+
                     // Remove events and page faults for the same range arrive in either order,
                     // so a page in this range may already have been filled by UFFDIO_COPY before
                     // we see the Remove event. UFFDIO_ZEROPAGE then fails with EEXIST (first page
@@ -492,10 +875,8 @@ async fn handle_vm_page_faults(
                 }
             }
         }
-
-        // Clear readiness
-        guard.clear_ready();
     }
+    Ok(true)
 }
 
 /// Memory region mapping from Firecracker.
@@ -561,17 +942,27 @@ impl GuestRegionUffdMapping {
     }
 }
 
-/// Receive UFFD descriptor and memory mappings asynchronously using AsyncFd.
+/// Complete the handshake with a newly connected Firecracker.
 ///
-/// Uses the same AsyncFd pattern as `handle_vm_page_faults` — waits for readability
-/// on the Unix socket, then calls `recv_with_fd` which succeeds immediately since
-/// data is ready. This avoids blocking the tokio runtime.
-async fn receive_uffd_async(
+/// MINOR mode is a two-message exchange (fcvm speaks first):
+/// 1. fcvm sends the shared backing memfd over `SCM_RIGHTS`,
+/// 2. Firecracker maps it `MAP_PRIVATE`, registers a userfaultfd in
+///    `UFFDIO_REGISTER_MODE_MINOR`, and replies with the mappings JSON + that uffd.
+///
+/// COPY mode skips step 1 — Firecracker allocates anonymous memory itself and sends only
+/// the mappings + uffd.
+async fn handshake(
     stream: tokio::net::UnixStream,
+    source: &PageSource,
 ) -> Result<(Uffd, Vec<GuestRegionUffdMapping>)> {
     let std_stream = stream.into_std().context("converting to std stream")?;
     // Keep non-blocking — AsyncFd handles readiness
     let async_stream = AsyncFd::new(std_stream).context("creating AsyncFd for handshake socket")?;
+
+    if let PageSource::Minor { backing } = source {
+        send_backing_fd(&async_stream, backing).await?;
+    }
+
     // 4096 bytes for JSON message buffer (unrelated to page size)
     let mut message_buf = vec![0u8; 4096];
 
@@ -611,6 +1002,233 @@ async fn receive_uffd_async(
     let uffd = unsafe { Uffd::from_raw_fd(uffd_file.into_raw_fd()) };
 
     Ok((uffd, mappings))
+}
+
+/// Send the shared backing memfd to a connecting Firecracker over `SCM_RIGHTS`.
+async fn send_backing_fd(
+    async_stream: &AsyncFd<std::os::unix::net::UnixStream>,
+    backing: &File,
+) -> Result<()> {
+    // Payload is ignored by the receiver; SCM_RIGHTS needs at least one data byte.
+    const HELLO: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
+    loop {
+        let mut guard = async_stream.writable().await?;
+        match guard.get_inner().send_with_fd(HELLO, backing.as_raw_fd()) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.errno() == libc::EWOULDBLOCK || e.errno() == libc::EAGAIN => {
+                guard.clear_ready();
+                continue;
+            }
+            Err(e) => return Err(e).context("sending backing memfd to Firecracker"),
+        }
+    }
+}
+
+/// Create, populate, **seal**, and reopen read-only the shared memfd that MINOR-mode
+/// clones map `MAP_PRIVATE`.
+///
+/// The returned fd is what every clone receives over `SCM_RIGHTS`, so it must not be able
+/// to modify the golden snapshot: kernel CoW only covers *mapped* writes, and an unsealed
+/// fd could `pwrite(2)`/`ftruncate(2)` the backing file — or be reopened `O_RDWR` via
+/// `/proc/self/fd` — corrupting the snapshot for every other clone. Two independent locks
+/// close that door:
+///
+/// * the inode is sealed `F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE` once
+///   populated (verified to work for `MFD_HUGETLB` on this kernel), which makes every
+///   write path fail no matter how the fd is reopened: `write(2)` EPERM (hugetlbfs has no
+///   write support at all and fails EINVAL even unsealed), `ftruncate(2)` EPERM,
+///   `mmap(MAP_SHARED, PROT_WRITE)` EPERM;
+/// * the fd actually handed out is an `O_RDONLY` reopen, so plain `pwrite(2)` on it is
+///   EBADF before the seals even get a say.
+///
+/// `MAP_PRIVATE` mappings (any PROT) and `UFFDIO_CONTINUE` are unaffected by both —
+/// proven by `test_backing_memfd_is_sealed_and_serves_minor_faults` and the
+/// `/tmp/uffdproto/seal_reserve.c` kernel probe.
+///
+/// The memfd is resident for as long as the server lives (shmem is unswappable on a host
+/// with no swap), so it is the fixed cost of the whole scheme — every byte written here is
+/// paid once and then shared by every clone. Two rules govern what gets written:
+///
+/// * **All-zero pages are left as holes (shmem only).** The first clone to read a hole takes
+///   an ordinary fault; `shmem_fault` allocates the folio *in the inode's page cache*
+///   (`shmem_get_folio_gfp(..., SGP_CACHE, ...)`) regardless of `VM_SHARED`, so every later
+///   clone finds it there and faults MINOR onto the same physical page. Sharing is preserved
+///   and the resident cost drops to the snapshot's non-zero footprint (measured: 63% of a
+///   1 GiB idle alpine/nginx snapshot is zero pages).
+/// * **hugetlb is populated in full.** `hugetlb_no_page()` only calls
+///   `hugetlb_add_to_page_cache()` when `vma->vm_flags & VM_MAYSHARE`; on our `MAP_PRIVATE`
+///   VMA a hole fault allocates an *anonymous* huge page instead, one per clone. Leaving
+///   holes there would silently destroy the sharing this whole path exists for.
+fn create_backing_memfd(
+    snapshot_id: &str,
+    mut mem_file: File,
+    mem_size: usize,
+    hugepages: bool,
+) -> Result<File> {
+    use std::io::Read;
+
+    let page_size = if hugepages { HUGE_PAGE_2M } else { 4096 };
+    // hugetlbfs rounds allocations to whole huge pages; size the memfd accordingly so the
+    // final partial page is still fully backed.
+    let backing_size = mem_size.div_ceil(page_size) * page_size;
+
+    if hugepages {
+        preflight_hugepages(
+            backing_size / HUGE_PAGE_2M,
+            "a MINOR-mode snapshot backing (hugetlb backings are populated in full)",
+        )?;
+    }
+
+    let name = std::ffi::CString::new(format!("fcvm-snap-{snapshot_id}"))
+        .context("building memfd name")?;
+    let mut flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    if hugepages {
+        flags |= libc::MFD_HUGETLB | libc::MFD_HUGE_2MB;
+    }
+    // SAFETY: `name` is a valid NUL-terminated string that outlives the call.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "memfd_create(hugetlb={hugepages}) failed: {err} — MINOR-mode restore needs a \
+             shmem or hugetlbfs backing file"
+        );
+    }
+    // SAFETY: `fd` is a fresh, owned file descriptor.
+    let backing = unsafe { File::from_raw_fd(fd) };
+    backing
+        .set_len(backing_size as u64)
+        .context("sizing backing memfd")?;
+
+    // Populate: mmap the memfd MAP_SHARED and stream the snapshot file into it.
+    let mut dest = unsafe {
+        memmap2::MmapOptions::new()
+            .len(backing_size)
+            .map_mut(&backing)
+            .context("mmapping backing memfd for population")?
+    };
+
+    let start = std::time::Instant::now();
+    // Read through a scratch buffer so an all-zero page can be SKIPPED: touching `dest`
+    // is what allocates a folio, so not touching it leaves a hole.
+    let chunk_len = (8 * 1024 * 1024usize).next_multiple_of(page_size);
+    let mut scratch = vec![0u8; chunk_len];
+    let zero_page = vec![0u8; page_size];
+    let mut offset = 0usize;
+    let mut resident_pages = 0usize;
+    let mut hole_pages = 0usize;
+    while offset < mem_size {
+        let end = (offset + chunk_len).min(mem_size);
+        let len = end - offset;
+        mem_file
+            .read_exact(&mut scratch[..len])
+            .with_context(|| format!("reading snapshot memory at offset {offset}"))?;
+        let mut p = 0usize;
+        while p < len {
+            let plen = page_size.min(len - p);
+            let src = &scratch[p..p + plen];
+            if !hugepages && plen == page_size && src == &zero_page[..] {
+                hole_pages += 1;
+            } else {
+                dest[offset + p..offset + p + plen].copy_from_slice(src);
+                resident_pages += 1;
+            }
+            p += plen;
+        }
+        offset = end;
+    }
+    // Tail beyond the snapshot file (hugetlb rounding) stays zero — `set_len` guarantees it.
+    // Must be unmapped BEFORE sealing: F_SEAL_WRITE refuses while writable shared
+    // mappings exist.
+    drop(dest);
+
+    // Seal the inode so nothing — not this fd, not any /proc/self/fd reopen of it in a
+    // clone — can ever modify the populated snapshot again.
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: fcntl(F_ADD_SEALS) on an owned memfd created with MFD_ALLOW_SEALING; the
+    // only writable mapping was just dropped.
+    if unsafe { libc::fcntl(backing.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("sealing backing memfd (F_ADD_SEALS)");
+    }
+    // SAFETY: fcntl(F_GET_SEALS) on an owned fd.
+    let got = unsafe { libc::fcntl(backing.as_raw_fd(), libc::F_GET_SEALS) };
+    anyhow::ensure!(
+        got >= 0 && (got & seals) == seals,
+        "backing memfd seals did not stick (want {seals:#x}, got {got:#x}) — refusing to hand \
+         a writable snapshot fd to clones"
+    );
+
+    // Hand out an O_RDONLY reopen of the sealed inode, not the O_RDWR original.
+    let backing_ro = File::open(format!("/proc/self/fd/{}", backing.as_raw_fd()))
+        .context("reopening sealed backing memfd read-only")?;
+    drop(backing);
+
+    // The snapshot file's page cache is dead weight now: every clone reads the memfd.
+    // SAFETY: fadvise on a valid fd with a whole-file range.
+    unsafe {
+        libc::posix_fadvise(mem_file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
+
+    info!(
+        target: "uffd",
+        snapshot = %snapshot_id,
+        mem_size_mb = mem_size / (1024 * 1024),
+        backing_mb = backing_size / (1024 * 1024),
+        resident_mb = resident_pages * page_size / (1024 * 1024),
+        hole_mb = hole_pages * page_size / (1024 * 1024),
+        hugepages,
+        populate_ms = start.elapsed().as_millis(),
+        "populated, sealed and reopened read-only the shared backing memfd for MINOR-mode restore"
+    );
+
+    Ok(backing_ro)
+}
+
+/// Refuse an allocation the host hugepage pool cannot hold.
+///
+/// hugetlb pages are neither swappable nor reclaimable, so exhaustion is not "slow" — it
+/// is `ENOMEM`/`SIGBUS`. Checking `Free - Rsvd` up front turns that into an explanatory
+/// error at the point of the decision instead of a dead process later.
+fn preflight_hugepages(needed_pages: usize, what: &str) -> Result<()> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
+    let field = |name: &str| -> Option<usize> {
+        meminfo.lines().find_map(|l| {
+            let rest = l.strip_prefix(name)?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
+    };
+    let free = field("HugePages_Free:").unwrap_or(0);
+    let rsvd = field("HugePages_Rsvd:").unwrap_or(0);
+    let usable = free.saturating_sub(rsvd);
+    if usable < needed_pages {
+        anyhow::bail!(
+            "hugepage pool too small for {what}: need {needed_pages} x 2MiB ({} MiB) but only \
+             {usable} are usable (HugePages_Free={free}, HugePages_Rsvd={rsvd}). \
+             Raise vm.nr_hugepages.",
+            needed_pages * 2
+        );
+    }
+    Ok(())
+}
+
+/// Admission check for spawning one hugepage-backed UFFD clone.
+///
+/// Every hugepage clone can consume up to the FULL guest size in private huge pages: in
+/// MINOR mode each guest write CoWs a 2 MiB page out of the shared backing (and the
+/// kernel *reserves* the full range at restore — see `guest_memory_from_uffd_minor` in
+/// the Firecracker fork — so an unservable clone fails its mmap with ENOMEM instead of
+/// taking a SIGBUS mid-run); in COPY mode every faulted page is a fresh private huge
+/// page. This check exists to fail with an explanation *before* spawning Firecracker.
+/// It is advisory (another clone can win the race for the same pages); the authoritative,
+/// race-free gate for MINOR clones is the kernel's hugetlb reservation at restore time.
+pub fn preflight_clone_hugepages(memory_mib: usize) -> Result<()> {
+    let needed_pages = (memory_mib * 1024 * 1024).div_ceil(HUGE_PAGE_2M);
+    preflight_hugepages(
+        needed_pages,
+        "a hugepage-backed clone (worst case every guest page is privately copied-on-write; \
+         MINOR-mode restore reserves the full guest size up front so a running guest can \
+         never SIGBUS)",
+    )
 }
 
 #[cfg(test)]
@@ -803,5 +1421,204 @@ mod tests {
         assert!(mapping.contains(0x200000));
         assert!(mapping.contains(0x300000));
         assert!(!mapping.contains(0x400000));
+    }
+
+    // =========================================================================
+    // Backing-memfd immutability (the fd every clone receives must not be able
+    // to modify the golden snapshot) + MINOR/CONTINUE off the sealed fd.
+    // =========================================================================
+
+    /// Write a 3-page snapshot file: page0 = 0xAB, page1 = zeros (hole candidate),
+    /// page2 = 0xCD. Returns (path, mem_size).
+    fn write_test_snapshot() -> (std::path::PathBuf, usize) {
+        use std::io::Write;
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fcvm-seal-test-{}-{}.mem",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&[0xABu8; 4096]).unwrap();
+        f.write_all(&[0u8; 4096]).unwrap();
+        f.write_all(&[0xCDu8; 4096]).unwrap();
+        f.sync_all().unwrap();
+        (path, 3 * 4096)
+    }
+
+    fn errno_of(res: isize) -> i32 {
+        assert!(res < 0, "operation unexpectedly succeeded");
+        std::io::Error::last_os_error().raw_os_error().unwrap()
+    }
+
+    /// Every write door on a backing fd must be shut. The expected errno differs by which
+    /// lock stops the door first: for the O_RDONLY reopen we hand out, the fd mode does
+    /// (pwrite EBADF, writable shared mmap EACCES); for a sneaky O_RDWR /proc reopen only
+    /// the SEAL is left to do it (EPERM everywhere).
+    fn assert_fd_cannot_write(
+        fd: std::os::unix::io::RawFd,
+        expect_pwrite_errno: i32,
+        expect_mmap_errno: i32,
+    ) {
+        let byte = [0x5Au8];
+        // pwrite(2)
+        let r = unsafe { libc::pwrite(fd, byte.as_ptr().cast(), 1, 0) };
+        assert_eq!(
+            errno_of(r as isize),
+            expect_pwrite_errno,
+            "pwrite must be refused"
+        );
+        // ftruncate(2): shrink (destroys pages other clones are mapping)
+        let r = unsafe { libc::ftruncate(fd, 4096) };
+        let e = errno_of(r as isize);
+        assert!(
+            e == libc::EPERM || e == libc::EINVAL,
+            "ftruncate(shrink) must be refused, got errno {e}"
+        );
+        // ftruncate(2): grow
+        let r = unsafe { libc::ftruncate(fd, 1024 * 1024 * 1024) };
+        let e = errno_of(r as isize);
+        assert!(
+            e == libc::EPERM || e == libc::EINVAL,
+            "ftruncate(grow) must be refused, got errno {e}"
+        );
+        // mmap(MAP_SHARED, PROT_WRITE) — the door the MAP_SHARED experiment walked through
+        let r = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_eq!(
+            r,
+            libc::MAP_FAILED,
+            "writable shared mapping must be refused"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error().unwrap(),
+            expect_mmap_errno,
+            "writable shared mapping must be refused by fd mode (EACCES) or seal (EPERM)"
+        );
+    }
+
+    /// The fd `create_backing_memfd` returns (== what `send_backing_fd` hands every
+    /// clone) cannot pwrite/ftruncate/map-shared-writable the snapshot, even via a
+    /// /proc/self/fd O_RDWR reopen, while read paths still see the snapshot bytes.
+    #[test]
+    fn test_backing_memfd_is_sealed_and_read_only() {
+        let (path, mem_size) = write_test_snapshot();
+        let mem_file = File::open(&path).unwrap();
+        let backing = create_backing_memfd("seal-test", mem_file, mem_size, false).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // All four seals present.
+        let seals = unsafe { libc::fcntl(backing.as_raw_fd(), libc::F_GET_SEALS) };
+        let want = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(seals & want, want, "expected all seals, got {seals:#x}");
+
+        // The handed-out fd is O_RDONLY: pwrite dies on the fd mode (EBADF).
+        assert_fd_cannot_write(backing.as_raw_fd(), libc::EBADF, libc::EACCES);
+
+        // Reopening it O_RDWR through /proc (what a malicious/buggy clone could do)
+        // must ALSO be unable to write — that is the seal doing its job.
+        let rw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", backing.as_raw_fd()))
+            .expect("O_RDWR reopen of a sealed memfd is allowed to open");
+        assert_fd_cannot_write(rw.as_raw_fd(), libc::EPERM, libc::EPERM);
+
+        // Read paths still work: MAP_PRIVATE sees the snapshot (and the zero page
+        // stayed a hole but reads back as zeros).
+        let map = unsafe { MmapOptions::new().map_copy(&backing).unwrap() };
+        assert!(map[..4096].iter().all(|&b| b == 0xAB));
+        assert!(map[4096..8192].iter().all(|&b| b == 0));
+        assert!(map[8192..].iter().all(|&b| b == 0xCD));
+    }
+
+    /// Full-fidelity clone view: receive the backing fd over the real `send_backing_fd`
+    /// SCM_RIGHTS path, then prove the RECEIVED fd cannot write — and that MAP_PRIVATE +
+    /// UFFD MINOR registration + `continue_page` (UFFDIO_CONTINUE incl. the EEXIST race)
+    /// all still work off the sealed, read-only fd.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_backing_memfd_is_sealed_and_serves_minor_faults() {
+        let (path, mem_size) = write_test_snapshot();
+        let mem_file = File::open(&path).unwrap();
+        let backing = create_backing_memfd("seal-minor-test", mem_file, mem_size, false).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // --- receive the fd exactly the way a clone's Firecracker does ---
+        let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        let tx = AsyncFd::new(tx).unwrap();
+        send_backing_fd(&tx, &backing).await.unwrap();
+        let mut hello = [0u8; 64];
+        let (_, received) = rx.recv_with_fd(&mut hello).unwrap();
+        let received = received.expect("backing fd must arrive with the hello message");
+
+        // The received fd must be unable to modify the snapshot in every way.
+        assert_fd_cannot_write(received.as_raw_fd(), libc::EBADF, libc::EACCES);
+
+        // --- MAP_PRIVATE + MINOR + CONTINUE off the received fd ---
+        let mut map = unsafe { MmapOptions::new().map_copy(&received).unwrap() };
+        let base = map.as_mut_ptr() as usize;
+        let uffd = userfaultfd::UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(true)
+            .create()
+            .expect("creating userfaultfd (via /dev/userfaultfd)");
+        uffd.register_with_mode(
+            base as *mut std::ffi::c_void,
+            mem_size,
+            userfaultfd::RegisterMode::MINOR,
+        )
+        .expect("MINOR registration on a MAP_PRIVATE mapping of the sealed fd");
+
+        // Touch page 2 from another thread -> MINOR fault -> resolve with continue_page.
+        let reader = std::thread::spawn(move || unsafe {
+            std::ptr::read_volatile((base + 8192) as *const u8)
+        });
+        let event = uffd
+            .read_event()
+            .unwrap()
+            .expect("blocking read yields an event");
+        let fault_addr = match event {
+            Event::Pagefault {
+                kind: FaultKind::Minor,
+                addr,
+                ..
+            } => (addr as usize) & !0xFFF,
+            other => panic!("expected a MINOR pagefault, got {other:?}"),
+        };
+        assert_eq!(fault_addr, base + 8192);
+        match continue_page(&uffd, "seal-test", fault_addr, 4096).unwrap() {
+            ContinueOutcome::Resolved => {}
+            _ => panic!("continue_page must resolve a pending MINOR fault"),
+        }
+        assert_eq!(
+            reader.join().unwrap(),
+            0xCD,
+            "fault must be served snapshot content"
+        );
+
+        // The EEXIST race (page already mapped) is success, not an error.
+        match continue_page(&uffd, "seal-test", fault_addr, 4096).unwrap() {
+            ContinueOutcome::Resolved => {}
+            _ => panic!("EEXIST on an already-mapped page must count as resolved"),
+        }
+
+        // Guest-side CoW still works and never reaches the backing file.
+        map[8192] = 0x11;
+        assert_eq!(map[8192], 0x11);
+        let pristine = unsafe { MmapOptions::new().map_copy_read_only(&received).unwrap() };
+        assert_eq!(
+            pristine[8192], 0xCD,
+            "clone write must not reach the snapshot"
+        );
     }
 }

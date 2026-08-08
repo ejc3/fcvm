@@ -134,6 +134,11 @@ pub struct VmConfig {
     pub process_type: Option<ProcessType>,
     /// For clones: which serve process PID spawned this clone
     pub serve_pid: Option<u32>,
+    /// For serve processes: how the UFFD server materialises pages ("copy" | "minor").
+    /// Clones read this off the serve state so they ask Firecracker for the matching
+    /// memory backend — the two ends of the handshake must agree.
+    #[serde(default)]
+    pub uffd_mode: Option<String>,
     /// Original VM ID for vsock socket path redirect.
     /// Set when VM is restored from cache or snapshot. The vmstate.bin stores
     /// paths from the original VM, so when this VM is later snapshotted, we need
@@ -233,6 +238,7 @@ impl VmState {
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
+                uffd_mode: None,
                 original_vsock_vm_id: None,
                 port_mappings: Vec::new(),
                 forward_localhost: Vec::new(),
