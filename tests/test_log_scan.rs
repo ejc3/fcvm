@@ -157,7 +157,27 @@ fn a_log_without_a_summary_is_never_reported_clean() {
 // Review-thread gate
 // ---------------------------------------------------------------------------
 
+/// Fail with ONE clear message when the gate's own dependency is missing, instead of
+/// six assertion failures whose real cause ("jq: command not found") is buried in the
+/// captured output. This bit for real: `jq` was absent from the CI container, and the
+/// first symptom was six unrelated-looking test failures.
+fn require_jq() {
+    let ok = Command::new("sh")
+        .args(["-c", "command -v jq"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        ok,
+        "`jq` is not installed, and the review-thread gate cannot run without it. \
+         This is a MISSING DEPENDENCY, not a broken gate — install jq (it is in the \
+         Containerfile for exactly this reason). The gate itself refusing to render a \
+         verdict without jq is covered by `the_gate_blocks_when_it_cannot_run_at_all`."
+    );
+}
+
 fn run_threads(fixture: &str) -> (String, i32) {
+    require_jq();
     let out = Command::new("bash")
         .arg(repo_root().join("scripts/check-review-threads.sh"))
         .arg("--from-file")
