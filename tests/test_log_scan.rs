@@ -208,5 +208,8 @@ fn a_resolved_defect_claim_without_a_red_test_blocks_the_merge() {
 #[test]
 fn a_resolved_defect_claim_with_a_red_test_is_accepted() {
     let (out, code) = run_threads("review-threads-resolved-proven.json");
-    assert_eq!(code, 0, "a RED-VERIFIED reply must satisfy the gate:\n{out}");
+    assert_eq!(
+        code, 0,
+        "a RED-VERIFIED reply must satisfy the gate:\n{out}"
+    );
 }
