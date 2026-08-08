@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs btrfs-progs \
     parted fdisk podman skopeo git curl sudo procps zstd busybox-static cpio uidmap iputils-ping patch \
     flex bison bc libelf-dev libssl-dev libseccomp-dev \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Build passt from source for consistent version across environments
