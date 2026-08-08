@@ -35,7 +35,7 @@ fetch_threads() {
               pageInfo { hasNextPage endCursor }
               nodes {
                 isResolved isOutdated
-                comments(first: 1) { nodes { author { login } path line originalLine body } }
+                comments(first: 100) { nodes { author { login } path line originalLine body } }
               } } } } }" 2>/dev/null) || return 1
     all=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviewThreads.nodes // [])' \
           <(echo "$all") <(echo "$resp"))
