@@ -1,0 +1,6 @@
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+ {"isResolved":true,"isOutdated":false,"comments":{"nodes":[
+   {"author":{"login":"chatgpt-codex-connector"},"path":"src/uffd/prefetch.rs","line":196,"originalLine":196,"body":"P1: indexing the snapshot mapping can panic inside the fault-handler task and hang the guest."},
+   {"author":{"login":"ejc3"},"path":"src/uffd/prefetch.rs","line":196,"originalLine":196,"body":"Fixed in 7672df92 — now uses a checked get()."}
+ ]}}
+]}}}}}

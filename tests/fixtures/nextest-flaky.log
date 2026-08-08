@@ -1,0 +1,18 @@
+    Starting 681 tests across 24 binaries (4 skipped)
+        PASS [   0.012s] (1/681) fcvm::test_state_manager test_save_and_load
+    running 1 test
+    Test trailing args command syntax
+    ==================================
+      fcvm PID: 3440176
+^[[35;1m  TRY 1 FAIL^[[0m [   2.914s] (───────) ^[[35;1mfcvm::test_sanity^[[0m ^[[34;1mtest_trailing_args_command^[[0m
+    [trailing-args-base-3440084-0 ERR] ERROR fcvm: Error: clone FAILED: its VMM exited with status 1
+    ✅ STARTUP FAILURE SHUTDOWN PASSED!
+        PASS [   8.502s] (419/681) fcvm::test_state_manager test_load_state_by_pid_cleans_stale_on_retry
+    PASSED: hugepage cache restore served 4096 pages
+    PASSED: egress reached the proxy on the first attempt
+        PASS [  15.828s] (422/681) fcvm::test_signal_cleanup test_sigint_kills_firecracker_bridged
+    PASSED: pasta exited with the holder still alive
+^[[33;1m       FLAKY^[[0m [   9.565s] (421/681) ^[[35;1mfcvm::test_sanity^[[0m ^[[34;1mtest_trailing_args_command^[[0m
+    PASSED: teardown reclaimed every namespace
+------------
+^[[32;1m     Summary^[[0m [ 728.830s] ^[[1m681^[[0m tests run: ^[[1m681^[[0m ^[[32;1mpassed^[[0m ^[[1m(1 flaky)^[[0m, ^[[1m4^[[0m ^[[33;1mskipped^[[0m

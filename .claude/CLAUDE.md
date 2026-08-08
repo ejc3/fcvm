@@ -37,6 +37,55 @@ Writing tests without running them is pointless. Compilation does not equal corr
 
 **Anti-pattern:** "All 85 unit tests pass" + never ran the integration tests that actually exercise the new code paths.
 
+## A DEFECT CLAIM IS CLOSED BY A RED TEST, NOT BY A FIX
+
+**Whenever anyone — a reviewer, a bot, a teammate, you — says "this is broken", the thing that
+closes it is a test that FAILS WITHOUT THE FIX.** Not the fix. Not "verified manually". Not a
+green suite after the change, which proves only that the suite never covered it.
+
+Applies to every source of a defect claim, not just review comments: a CI failure, a bug
+report, a hunch you had in the shower, a comment you wrote yourself.
+
+**The procedure, in order:**
+1. Write the test. Run it against the **unfixed** tree. **Watch it fail.**
+2. Apply the fix. Watch it pass.
+3. Revert the fix once more and confirm it goes red again — if you skipped step 1, this is
+   your last chance to learn the test was vacuous.
+4. Only then resolve the thread / close the issue, citing the test by name.
+
+A test written after the fix, never observed failing, is indistinguishable from a test that
+cannot fail. This repo has repeatedly found checks that could never fire — a contention
+detector matching a truncated `comm`, a leak check whose pattern never matched, a `"VM exited"`
+branch logged 0 times across 137 runs, a `grep '^ *FAIL'` blind to nextest's `TRY 1 FAIL`.
+Every one of them was green for its whole life.
+
+Enforcement: `scripts/check-review-threads.sh <pr>` fails while any review thread is
+unresolved, AND while any thread that *describes* broken behaviour has been resolved without a
+`RED-VERIFIED: <test>` reply. CI state cannot tell you whether a finding was answered.
+
+### "It is too big / slow / expensive to test" is almost always false
+
+That excuse is how the worst bugs stay uncovered, because expensive-to-reach paths are exactly
+where nobody looks. Find the cheap equivalent:
+
+- **Large files → sparse files.** The FUSE `remap_file_range` u32 truncation
+  (`kernel/patches/0001-fuse-add-remap_file_range-support.patch`) only bites above 4 GiB,
+  because `fuse_write_out.size` is a `u32` and the client saturates it — the destination inode
+  records ~4 GiB and later guest reads come back short. Sounds like it needs a 4 GiB fixture.
+  It does not: a sparse file costs no real blocks and on btrfs the reflink is O(1).
+  `truncate -s 5G` + FICLONE reproduces it for free.
+- **Slow timeouts → inject the signal.** Use the failpoint harness (`make fuzz`, `FAILPOINT`
+  specs) instead of waiting out a real timeout.
+- **Rare races → make the interleaving deterministic.** A seeded schedule beats hoping.
+- **Huge memory → test the arithmetic.** Feed the boundary value (`u32::MAX`, `pid_max`, a
+  9-digit `pid_start_time`) to the function directly rather than provisioning the machine that
+  would produce it naturally.
+- **Multi-hour soak → assert the invariant, not the duration.** If a leak takes 6 hours to be
+  visible, count the resource instead of watching the clock.
+
+If after genuinely trying you cannot make it cheap, say so **in the test file**, with what it
+would take — never only in a commit message, where the next reader will not find it.
+
 ## STACKED PRs BY DEFAULT
 
 **All work goes in stacked PRs.** Each new PR should be based on the previous one, not main.
@@ -750,9 +799,18 @@ CodeRabbit and Codex put their actual findings, live on a different endpoint and
 to that query:
 ```bash
 gh pr view <pr-number> --json comments --jq '.comments[] | .body'   # top-level only
-gh api repos/{owner}/{repo}/pulls/<pr-number>/comments \
-  --jq '.[] | "\(.user.login) \(.path):\(.line) \(.body[0:200])"'   # inline — the findings
+gh api --paginate repos/{owner}/{repo}/pulls/<pr-number>/comments \
+  --jq '.[] | "=== \(.user.login) \(.path):\(.line // .original_line)\n\(.body)\n"'
 ```
+Two things that look like details and are not:
+
+- **`--paginate` is mandatory.** Without it you get the first page only, so a PR that has
+  accumulated findings over several review rounds silently reports a subset — and the audit
+  that was supposed to catch hidden findings becomes one.
+- **Print `.body` whole.** A `[0:200]` preview drops the scenario, the evidence, and the
+  suggested fix — the parts you need in order to decide. A truncated finding is not a finding
+  you have read.
+
 On 2026-08-08 a PR carried **four unread inline findings, two of them Major**, while the check
 rendered `CodeRabbit  pass`. One was a slice index that would panic inside the fault-handler
 task and hang the guest. Reading only the top-level comments would have merged all four.
