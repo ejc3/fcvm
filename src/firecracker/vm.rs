@@ -21,9 +21,6 @@ const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of recent Firecracker stderr lines kept for error reporting.
 const STDERR_TAIL_LINES: usize = 10;
-/// How long to let the async stderr reader drain the pipe after Firecracker
-/// exits, so the failure error can include what it actually printed.
-const STDERR_DRAIN_DELAY: Duration = Duration::from_millis(200);
 
 /// Manages a Firecracker VM process
 ///
@@ -53,6 +50,11 @@ pub struct VmManager {
     mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
+    /// Fires when the stderr reader has drained the pipe to EOF. Awaited before
+    /// rendering `stderr_tail` on a launch failure so the tail is COMPLETE — kept
+    /// outside `process` because `try_wait()` clears that handle on exit, which is
+    /// exactly when the tail is needed.
+    stderr_eof: Option<crate::utils::StderrEof>,
     /// Guest serial console lines observed on the Firecracker child's stdout
     /// since spawn. Watched by the restore path to detect a dead serial
     /// console (snapshot captured the UART mid-transmit).
@@ -74,6 +76,7 @@ impl VmManager {
             mount_redirects: None,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stderr_eof: None,
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: None,
         }
@@ -322,7 +325,8 @@ impl VmManager {
         })
         .context("spawning Firecracker process")?;
 
-        self.process = Some(child);
+        self.process = Some(child.child);
+        self.stderr_eof = Some(child.stderr_eof);
 
         // Wait for socket to be ready
         self.wait_for_socket().await?;
@@ -400,9 +404,10 @@ impl VmManager {
             }
 
             if let Some(status) = self.try_wait()? {
-                // Give the async stderr reader a moment to drain the pipe so
-                // the error includes what Firecracker actually printed.
-                sleep(STDERR_DRAIN_DELAY).await;
+                // Wait for the stderr reader to reach EOF — the exit just closed the
+                // pipe's write end, so this is the real "the tail is complete" signal
+                // rather than a fixed delay that expires first under load.
+                self.await_stderr_eof().await;
                 bail!(
                     "Firecracker exited with {} before its API socket became ready{}",
                     status,
@@ -445,6 +450,22 @@ impl VmManager {
             "Firecracker socket not ready after {} seconds",
             SOCKET_WAIT_TIMEOUT.as_secs()
         )
+    }
+
+    /// Wait (bounded) for Firecracker's stderr pipe to reach EOF.
+    ///
+    /// Call after observing the process exited and before rendering
+    /// [`Self::stderr_tail_message`], so the tail carries everything Firecracker
+    /// printed on its way down.
+    async fn await_stderr_eof(&mut self) {
+        if let Some(eof) = self.stderr_eof.as_mut() {
+            if !eof.wait(crate::utils::STDERR_EOF_TIMEOUT).await {
+                warn!(
+                    vm_id = %self.vm_id,
+                    "Firecracker stderr pipe did not reach EOF; error tail may be incomplete"
+                );
+            }
+        }
     }
 
     /// Render the captured Firecracker stderr tail for error messages.

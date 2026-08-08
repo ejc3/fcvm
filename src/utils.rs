@@ -206,14 +206,80 @@ pub fn strip_firecracker_prefix(line: &str) -> &str {
     result
 }
 
+/// Bound on [`StderrEof::wait`].
+///
+/// EOF arrives the moment the exited child's last copy of the pipe's write end is
+/// closed, which for a process spawned here is its exit — microseconds, not
+/// milliseconds. The bound exists only so an unexpected grandchild still holding the
+/// pipe cannot wedge an error path forever.
+pub const STDERR_EOF_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// "The stderr reader has consumed EOF" signal for a spawned child.
+///
+/// An error path that reports a child's stderr tail has to know the reader actually
+/// drained the pipe. This is that signal. It is *level-triggered* (a `watch` value,
+/// not a notification), so a waiter arriving after EOF still returns immediately —
+/// there is no window in which the signal can be missed.
+#[derive(Debug, Clone)]
+pub struct StderrEof(tokio::sync::watch::Receiver<bool>);
+
+impl StderrEof {
+    /// Wait until the stderr reader has consumed EOF, bounded by `timeout`.
+    ///
+    /// Returns `true` if EOF was observed, `false` if the bound expired first (the
+    /// tail is then whatever the reader managed to consume).
+    pub async fn wait(&mut self, timeout: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(timeout, self.0.wait_for(|eof| *eof)).await,
+            Ok(Ok(_))
+        )
+    }
+}
+
+/// Read `stderr` line by line into `on_line` on a background task, returning the
+/// [`StderrEof`] signal that fires when the pipe closes.
+///
+/// Used by [`spawn_streaming`] and by callers that pipe stderr themselves (pasta
+/// discards stdout, so it cannot use `spawn_streaming`).
+pub fn spawn_stderr_reader<R, F>(stderr: R, on_line: F) -> StderrEof
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    F: Fn(String) + Send + 'static,
+{
+    let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
+    let mut lines = BufReader::new(stderr).lines();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            on_line(line);
+        }
+        // The read loop ends only at EOF (or an unrecoverable read error): nothing
+        // more of this child's stderr is coming, so error paths may render their tail.
+        let _ = eof_tx.send(true);
+    });
+    StderrEof(eof_rx)
+}
+
+/// A child spawned by [`spawn_streaming`], together with its stderr EOF signal.
+///
+/// The signal is returned rather than dropped on the floor so that a caller which
+/// finds the child exited early can await the drain instead of sleeping a fixed
+/// interval and hoping. It is a separate field from `child` because callers reap and
+/// clear the `Child` handle (`try_wait` takes it) and still need to render the tail
+/// afterwards.
+pub struct StreamingChild {
+    pub child: tokio::process::Child,
+    pub stderr_eof: StderrEof,
+}
+
 /// Spawn a command and stream its output via tracing logs.
 ///
 /// Takes a closure that receives each line and logs it appropriately.
-/// Returns the child process handle (caller must manage lifecycle).
+/// Returns the child process handle (caller must manage lifecycle) and the
+/// stderr EOF signal.
 pub fn spawn_streaming<F>(
     mut cmd: tokio::process::Command,
     log_line: F,
-) -> anyhow::Result<tokio::process::Child>
+) -> anyhow::Result<StreamingChild>
 where
     F: Fn(&str, bool) + Send + Sync + Clone + 'static,
 {
@@ -237,18 +303,20 @@ where
     }
 
     // Stream stderr (is_stderr=true)
-    if let Some(stderr) = child.stderr.take() {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        let log = log_line;
-        tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                log(&line, true);
-            }
-        });
-    }
+    let stderr_eof = match child.stderr.take() {
+        Some(stderr) => {
+            let log = log_line;
+            spawn_stderr_reader(stderr, move |line| log(&line, true))
+        }
+        // Unreachable (stderr is piped above), but a signal that never fires would
+        // make every error path wait out the bound: report EOF immediately instead.
+        None => {
+            let (_tx, rx) = tokio::sync::watch::channel(true);
+            StderrEof(rx)
+        }
+    };
 
-    Ok(child)
+    Ok(StreamingChild { child, stderr_eof })
 }
 
 /// Run a command and stream its output via tracing at INFO/WARN level.
@@ -259,14 +327,14 @@ pub async fn run_streaming(
     prefix: &str,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let prefix = prefix.to_string();
-    let mut child = spawn_streaming(cmd, move |line, is_stderr| {
+    let mut spawned = spawn_streaming(cmd, move |line, is_stderr| {
         if is_stderr {
             warn!("[{}] {}", prefix, line);
         } else {
             info!("[{}] {}", prefix, line);
         }
     })?;
-    Ok(child.wait().await?)
+    Ok(spawned.child.wait().await?)
 }
 
 /// Result of waiting for namespace readiness.
@@ -618,6 +686,7 @@ pub fn install_namespace_pre_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_is_process_alive_current_process() {
@@ -687,5 +756,63 @@ mod tests {
     #[test]
     fn test_strip_firecracker_prefix_plain() {
         assert_eq!(strip_firecracker_prefix("plain message"), "plain message");
+    }
+
+    /// The contract error paths rely on: once [`StderrEof`] fires, EVERY line the
+    /// child wrote has already reached the logging callback. A fixed sleep gave no
+    /// such guarantee — it reported "no stderr captured" whenever the child was
+    /// slower than the sleep.
+    #[tokio::test]
+    async fn stderr_eof_fires_only_after_every_line_is_delivered() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&lines);
+
+        let mut cmd = tokio::process::Command::new("sh");
+        // Write after a delay that is far longer than the 200ms sleep this replaces,
+        // so a time-based drain would miss the output entirely.
+        cmd.args([
+            "-c",
+            "sleep 0.5; for i in $(seq 1 500); do echo err-$i >&2; done; exit 3",
+        ]);
+        let mut spawned = spawn_streaming(cmd, move |line, is_stderr| {
+            if is_stderr {
+                collected.lock().unwrap().push(line.to_string());
+            }
+        })
+        .expect("spawn");
+
+        let status = spawned.child.wait().await.expect("wait");
+        assert_eq!(status.code(), Some(3));
+
+        assert!(
+            spawned.stderr_eof.wait(STDERR_EOF_TIMEOUT).await,
+            "stderr EOF must be observed after the child exits"
+        );
+        let seen = lines.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            500,
+            "every stderr line must be delivered before EOF fires, got {}",
+            seen.len()
+        );
+        assert_eq!(seen.first().map(String::as_str), Some("err-1"));
+        assert_eq!(seen.last().map(String::as_str), Some("err-500"));
+    }
+
+    /// A waiter that arrives long after EOF must still return immediately: the
+    /// signal is level-triggered, so there is no window where it can be missed.
+    #[tokio::test]
+    async fn stderr_eof_is_level_triggered() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo late >&2"]);
+        let mut spawned = spawn_streaming(cmd, |_line, _is_stderr| {}).expect("spawn");
+        let _ = spawned.child.wait().await;
+
+        assert!(spawned.stderr_eof.wait(STDERR_EOF_TIMEOUT).await);
+        // Second wait, after the sender is long gone.
+        assert!(
+            spawned.stderr_eof.wait(Duration::from_millis(0)).await,
+            "an already-fired EOF signal must still report EOF"
+        );
     }
 }

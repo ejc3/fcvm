@@ -161,10 +161,19 @@ pub async fn run() -> Result<()> {
     };
     let has_shared_volume = mounted_fuse_paths.iter().any(|p| p == "/mnt/shared");
 
-    // Start chronyd for ongoing NTP time sync.
-    // Must be after FUSE mounts so /etc-host/chrony.conf is readable.
-    // makestep 1 -1 allows stepping the clock at any time (critical after snapshot restore).
-    start_chronyd().await;
+    // Start chronyd for ongoing NTP time sync — SPAWNED, not awaited.
+    //
+    // Nothing later in boot depends on chronyd: the clock is already set from the
+    // host's time in the boot plan, and chronyd only disciplines it from there on.
+    // Awaiting it here put its whole startup (kill the systemd-launched instance,
+    // wait for the command socket, configure servers) on the critical path of every
+    // cold boot for no benefit.
+    {
+        let ntp_servers = plan.ntp_servers.clone();
+        tokio::spawn(async move {
+            start_chronyd(ntp_servers).await;
+        });
+    }
 
     let mounted_disk_paths = if !plan.extra_disks.is_empty() {
         eprintln!(
@@ -509,44 +518,57 @@ pub async fn run() -> Result<()> {
     system::shutdown_vm(exit_code).await
 }
 
+/// Path chronyd is started with, so the config written here is the one in effect.
+///
+/// Without an explicit `-f`, chronyd reads its compiled-in default
+/// (`/etc/chrony/chrony.conf` on Ubuntu) — the copy baked into the rootfs, whose
+/// `makestep 1.0 3` stops stepping the clock after the third update. A restored
+/// snapshot can be hours behind, so the policy below has to be the live one.
+const CHRONY_CONF: &str = "/etc/chrony.conf";
+
+/// Bound on waiting for chronyd's command socket to answer. Generous: it is a
+/// deadline for a checked retry, not a delay anyone pays on the happy path.
+const CHRONYD_SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bound on waiting for a previous chronyd to exit after being signalled.
+const CHRONYD_EXIT_TIMEOUT_MS: u16 = 5_000;
+
 /// Start chronyd for NTP time sync.
 ///
-/// Writes a chrony config using the host's NTP servers (from /etc-host/chrony.conf),
-/// then starts chronyd as a daemon. `makestep 1 -1` allows stepping the clock at
-/// any time, which is critical after snapshot restore when the drift can be hours.
-async fn start_chronyd() {
-    // Read NTP server addresses from host's chrony.conf
-    let host_conf = std::path::Path::new("/etc-host/chrony.conf");
-    let mut server_addrs = Vec::new();
-    if let Ok(content) = tokio::fs::read_to_string(host_conf).await {
-        for line in content.lines() {
-            // Parse both "server" and "pool" directives (some distros only use pool)
-            if line.starts_with("server ") || line.starts_with("pool ") {
-                if let Some(addr) = line.split_whitespace().nth(1) {
-                    server_addrs.push(addr.to_string());
-                }
-            }
+/// `ntp_servers` are the host's servers, already resolved to addresses by fcvm and
+/// delivered in the boot plan (a guest cannot read the host's chrony.conf — nothing
+/// mounts the host's /etc into a VM).
+///
+/// Every step here reports what actually happened. The previous version discarded
+/// the result of each `chronyc add server` after a fixed 1s sleep, so a slow command
+/// socket produced a VM with ZERO NTP sources and no message saying so — worst
+/// exactly after a snapshot restore, where chrony is what corrects the clock.
+async fn start_chronyd(ntp_servers: Vec<String>) {
+    // Servers are added with chronyc rather than written as config lines because
+    // chronyd's config parser does not handle bare IPv6 addresses.
+    let config = format!(
+        "makestep 1 -1\ndriftfile /var/lib/chrony/drift\ncmdallow 127.0.0.1\n{}",
+        // Fallback only when the host gave us nothing: a guest with no source at all
+        // would drift silently. A pool needs guest DNS, which is why it is the
+        // fallback and not the norm.
+        if ntp_servers.is_empty() {
+            "pool pool.ntp.org iburst\n"
+        } else {
+            ""
         }
-    }
-
-    // Write minimal config — servers are added dynamically via chronyc because
-    // chronyd's config parser doesn't handle bare IPv6 addresses correctly.
-    let config = "makestep 1 -1\ndriftfile /var/lib/chrony/drift\ncmdallow 127.0.0.1\n";
+    );
 
     let _ = tokio::fs::create_dir_all("/var/lib/chrony").await;
     let _ = tokio::fs::create_dir_all("/var/run/chrony").await;
-    let _ = tokio::fs::write("/etc/chrony.conf", config).await;
+    if let Err(e) = tokio::fs::write(CHRONY_CONF, &config).await {
+        eprintln!("[fc-agent] ERROR: cannot write {CHRONY_CONF}: {e}; no NTP time sync");
+        return;
+    }
 
-    // Kill any existing chronyd (systemd may have started one as _chrony user,
-    // which can't send UDP in this VM). Then restart as root.
-    let _ = tokio::process::Command::new("pkill")
-        .args(["-x", "chronyd"])
-        .output()
-        .await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    kill_existing_chronyd().await;
 
     match tokio::process::Command::new("/usr/sbin/chronyd")
-        .args(["-u", "root"])
+        .args(["-u", "root", "-f", CHRONY_CONF])
         .output()
         .await
     {
@@ -555,27 +577,198 @@ async fn start_chronyd() {
         }
         Ok(out) => {
             eprintln!(
-                "[fc-agent] WARNING: chronyd failed: {}",
+                "[fc-agent] ERROR: chronyd failed to start ({}): {}; no NTP time sync",
+                out.status,
                 String::from_utf8_lossy(&out.stderr).trim()
             );
             return;
         }
         Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to start chronyd: {}", e);
+            eprintln!("[fc-agent] ERROR: failed to start chronyd: {e}; no NTP time sync");
             return;
         }
     }
 
-    // Add servers dynamically via chronyc (works reliably with IPv6)
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    for addr in &server_addrs {
-        let _ = tokio::process::Command::new("/usr/bin/chronyc")
-            .args(["add", "server", addr, "iburst"])
-            .output()
-            .await;
+    // Wait for the command socket by RETRYING A REAL COMMAND until it answers, then
+    // add each server and CHECK the result. Both are proof, where the old code had
+    // a 1s guess and threw the answers away.
+    if !wait_for_chronyd_socket().await {
+        eprintln!(
+            "[fc-agent] ERROR: chronyd command socket did not answer within {:?}; \
+             {} NTP server(s) NOT configured",
+            CHRONYD_SOCKET_TIMEOUT,
+            ntp_servers.len()
+        );
+        return;
     }
-    eprintln!(
-        "[fc-agent] added {} NTP servers via chronyc",
-        server_addrs.len()
-    );
+
+    let mut configured = 0usize;
+    for addr in &ntp_servers {
+        match chronyc(&["add", "server", addr, "iburst"]).await {
+            Ok(_) => configured += 1,
+            Err(e) => eprintln!("[fc-agent] WARNING: chronyc add server {addr} failed: {e}"),
+        }
+    }
+
+    // Assert the positive: report what chronyd actually has, not what we asked for.
+    // `-c` is CSV, one line per source.
+    let sources = chronyc(&["-c", "-n", "sources"])
+        .await
+        .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    if sources == 0 {
+        eprintln!(
+            "[fc-agent] ERROR: chronyd has NO time sources after configuring \
+             {configured}/{} server(s) — the guest clock will drift",
+            ntp_servers.len()
+        );
+    } else {
+        eprintln!(
+            "[fc-agent] NTP: {configured}/{} host server(s) configured, {sources} source(s) live",
+            ntp_servers.len()
+        );
+    }
+}
+
+/// Run `chronyc`, returning stdout on success and the daemon's complaint on failure.
+async fn chronyc(args: &[&str]) -> Result<String, String> {
+    let out = tokio::process::Command::new("/usr/bin/chronyc")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Err(format!(
+            "{}: {}",
+            out.status,
+            if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            }
+        ))
+    }
+}
+
+/// Wait until chronyd's command socket answers, by asking it something real.
+///
+/// chronyc fails with "506 Cannot talk to daemon" until chronyd has created
+/// /var/run/chrony/chronyd.sock. Retrying the actual command means the wait ends on
+/// proof that the daemon is answering — a fixed sleep ends on a guess, and when the
+/// guess was short every later `chronyc add server` failed silently.
+async fn wait_for_chronyd_socket() -> bool {
+    let deadline = std::time::Instant::now() + CHRONYD_SOCKET_TIMEOUT;
+    let mut backoff = Duration::from_millis(2);
+    loop {
+        if chronyc(&["-n", "tracking"]).await.is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(50));
+    }
+}
+
+/// Kill any chronyd already running and WAIT until it is really gone.
+///
+/// systemd starts chronyd as the `_chrony` user, which cannot send UDP in this VM,
+/// so it is replaced by one running as root. The old process holds
+/// /var/run/chrony/chronyd.sock, so the replacement must not start until it exits.
+///
+/// The wait is a pidfd readability event — the kernel's own "this process exited"
+/// notification — replacing a 500ms sleep that was simultaneously too long (paid on
+/// every cold boot) and unproven (nothing checked the process was gone). Signals go
+/// through the pidfd too, so a PID reused between the scan and the kill cannot be
+/// signalled by mistake.
+async fn kill_existing_chronyd() {
+    let pids = chronyd_pids().await;
+    if pids.is_empty() {
+        return;
+    }
+    for pid in pids {
+        let gone = tokio::task::spawn_blocking(move || signal_and_await_exit(pid))
+            .await
+            .unwrap_or(false);
+        if gone {
+            eprintln!("[fc-agent] replaced existing chronyd (pid {pid})");
+        } else {
+            eprintln!(
+                "[fc-agent] WARNING: chronyd pid {pid} did not exit; \
+                 the replacement may fail to bind its command socket"
+            );
+        }
+    }
+}
+
+/// PIDs of every running `chronyd`, from /proc (no pgrep/pkill subprocess needed).
+async fn chronyd_pids() -> Vec<i32> {
+    let mut pids = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir("/proc").await else {
+        return pids;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if let Ok(comm) = tokio::fs::read_to_string(format!("/proc/{pid}/comm")).await {
+            if comm.trim() == "chronyd" {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+/// SIGTERM `pid` through a pidfd and block until the kernel reports it exited,
+/// escalating to SIGKILL if it outstays the bound. Returns whether it is gone.
+fn signal_and_await_exit(pid: i32) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
+    // SAFETY: pidfd_open is a plain syscall; the returned fd is immediately wrapped
+    // in OwnedFd so it is closed exactly once.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        // ESRCH: it exited between the scan and here — which is the outcome we want.
+        return nix::errno::Errno::last() == nix::errno::Errno::ESRCH;
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) };
+
+    let send = |sig: libc::c_int| {
+        // SAFETY: pidfd_send_signal targets the process the pidfd refers to, so a
+        // recycled PID can never be signalled by accident.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                raw,
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        }
+    };
+    // A pidfd becomes readable when its process exits.
+    let exited = |timeout_ms: u16| {
+        let mut fds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
+        matches!(poll(&mut fds, PollTimeout::from(timeout_ms)), Ok(n) if n > 0)
+    };
+
+    if send(libc::SIGTERM) < 0 {
+        return nix::errno::Errno::last() == nix::errno::Errno::ESRCH;
+    }
+    if exited(CHRONYD_EXIT_TIMEOUT_MS) {
+        return true;
+    }
+    let _ = send(libc::SIGKILL);
+    exited(CHRONYD_EXIT_TIMEOUT_MS)
 }

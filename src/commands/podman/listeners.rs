@@ -7,6 +7,15 @@ use tracing::{debug, info, warn};
 
 use super::types::{CacheRequest, LogLine};
 
+/// Upper bound on the post-cache-ack drain (see the positive close handshake in
+/// [`run_status_listener`]).
+///
+/// This is NOT a race cover: the drain runs off the accept path, so nothing waits on
+/// it. It only stops fcvm holding the fd forever when the guest's close never
+/// propagates — which the vsock transport can do after the pre-start snapshot's
+/// pause/resume. Matches the per-message read timeout used on status connections.
+const CACHE_ACK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Listen for fc-agent status messages on the status vsock port.
 ///
 /// Firecracker forwards guest vsock connections to Unix sockets with format:
@@ -42,12 +51,21 @@ pub(crate) async fn run_status_listener(
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
 
+    // Post-ack drain tasks for finished cache-ready handshakes (see the positive
+    // close handshake below). Owned by this task so VM cleanup, which aborts the
+    // listener, aborts them too — dropping a JoinSet aborts everything in it.
+    let mut drains = tokio::task::JoinSet::new();
+
     // Accept connections for the lifetime of the VM ("cache-ready", "ready",
     // "exit:", "reboot", host-side "drain" probes). No idle timeout: a VM can run
     // for days before its only end-of-life message arrives, and losing the
     // listener (plus its socket) would silently break reboot-in-place and exit
     // reporting. The run loop's cleanup aborts this task.
     loop {
+        // Reap finished drains so a VM that reboots many times cannot accumulate
+        // completed handles in the set.
+        while drains.try_join_next().is_some() {}
+
         let (stream, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -247,16 +265,33 @@ pub(crate) async fn run_status_listener(
                     let _ = write_half.flush().await;
                 }
 
-                // Grace-drain before the connection drops at the `break` below:
-                // consume any last in-flight guest probe bytes so the close is
-                // clean — an unread byte at close becomes a vsock RST that can
-                // flush the guest's receive buffer before it reads the ack.
-                let mut tail = String::new();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(250),
-                    reader.read_line(&mut tail),
-                )
-                .await;
+                // POSITIVE CLOSE HANDSHAKE (#627). Closing this connection while a
+                // guest probe byte sits unread turns the close into a vsock RST, and
+                // an RST FLUSHES the guest's receive buffer — including a cache-ack
+                // it has not read yet, so a cold start misreports itself as a warm
+                // restore. The guest closes as soon as it has read the ack, so EOF
+                // here is proof the ack landed and no further probe can arrive.
+                //
+                // Hand the connection to a drain task instead of waiting inline: the
+                // accept loop must stay free (the guest opens a SEPARATE connection
+                // for "ready", and this one is the one held across the pre-start
+                // snapshot's pause/resume, where the close can fail to propagate at
+                // all). The task holds both halves — so nothing is ever closed with
+                // bytes outstanding — and ends at EOF, at the bound, or when the VM's
+                // listener task is aborted at cleanup (JoinSet drop aborts it).
+                drains.spawn(async move {
+                    let mut sink = String::new();
+                    let _ = tokio::time::timeout(CACHE_ACK_DRAIN_TIMEOUT, async move {
+                        // Read to EOF. Probe bytes are consumed and discarded; the
+                        // write half is held (not dropped) until EOF so the peer
+                        // never sees a half-closed connection.
+                        while matches!(reader.read_line(&mut sink).await, Ok(n) if n > 0) {
+                            sink.clear();
+                        }
+                        drop(write_half);
+                    })
+                    .await;
+                });
 
                 // Stop reading this connection and go back to accept(). fc-agent
                 // sends each status message ("cache-ready", then "ready", then
@@ -824,6 +859,121 @@ mod tests {
             wait_pos.is_some() && wait_pos.unwrap() < ack_pos,
             "expected at least one cache-wait keepalive before cache-ack; got: {received:?}"
         );
+        listener_task.abort();
+    }
+
+    /// After sending "cache-ack" the host must NOT close the cache-ready connection:
+    /// it drains to EOF and lets the GUEST close first.
+    ///
+    /// The guest write-probes this connection every 500ms while it waits. If the host
+    /// closes with a probe byte unread, the close becomes a vsock RST — and an RST
+    /// FLUSHES the guest's receive buffer, discarding a cache-ack it has not read yet.
+    /// The guest then classifies a cold start as a warm restore (#627). The old fixed
+    /// 250ms grace window only narrowed that race; the guest's close is the actual
+    /// proof the ack landed. Draining off the accept path also keeps the listener free
+    /// to take the next connection, which carries "ready".
+    #[tokio::test]
+    async fn test_status_listener_holds_cache_connection_until_guest_closes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = temp_dir.path().to_path_buf();
+        let socket_path = runtime_dir.join("status.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let runtime_dir_for_task = runtime_dir.clone();
+
+        // Ack as soon as the request arrives: this is the cold-start path.
+        let (cache_tx, mut cache_rx) = mpsc::channel::<CacheRequest>(1);
+        tokio::spawn(async move {
+            if let Some(req) = cache_rx.recv().await {
+                let _ = req.ack_tx.send(());
+            }
+        });
+
+        let reboot_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener_task = tokio::spawn(async move {
+            run_status_listener(
+                &socket_path_string,
+                &runtime_dir_for_task,
+                "vm-test",
+                Some(cache_tx),
+                reboot_flag,
+                exit_flag,
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (mut guest_rx, mut guest_tx) = stream.into_split();
+        guest_tx
+            .write_all(b"cache-ready:sha256:abc\n")
+            .await
+            .unwrap();
+
+        let mut received = String::new();
+        let mut buf = [0u8; 256];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !received.contains("cache-ack") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no cache-ack within deadline; got: {received:?}"
+            );
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(5), guest_rx.read(&mut buf))
+                    .await
+                    .expect("read timed out")
+                    .unwrap();
+            assert!(n > 0, "connection closed before ack; got: {received:?}");
+            received.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+        }
+
+        // Keep probing well past the old 250ms grace window. Every probe must be
+        // accepted: a failure means the host let go of the connection first.
+        for probe in 0..15 {
+            if let Err(e) = guest_tx.write_all(b"\n").await {
+                panic!(
+                    "host closed the cache connection after the ack (probe {probe} failed: {e}); \
+                     that close is the RST which flushes the guest's unread cache-ack (#627)"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // ...and the host must not have hung up on its side either.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            guest_rx.read(&mut buf),
+        )
+        .await
+        {
+            Err(_) => {} // Nothing sent, no EOF: the host is still holding it open.
+            Ok(Ok(0)) => panic!("host closed the cache connection (EOF) after the ack"),
+            Ok(Ok(n)) => panic!("unexpected {n} bytes after cache-ack: {:?}", &buf[..n]),
+            Ok(Err(e)) => panic!("cache connection broke after the ack: {e}"),
+        }
+
+        // The drain must run OFF the accept path: the next connection carries "ready",
+        // and container startup stalls if the listener is still stuck on the old one.
+        let mut ready_conn = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        ready_conn.write_all(b"ready\n").await.unwrap();
+        let ready_file = runtime_dir.join("container-ready");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener did not accept the 'ready' connection while draining the cache one"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         listener_task.abort();
     }
 

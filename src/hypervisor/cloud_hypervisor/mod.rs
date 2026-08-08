@@ -39,7 +39,6 @@ const GUEST_CID: u32 = 3;
 const SOCKET_WAIT_RETRY_COUNT: u32 = 500;
 const SOCKET_WAIT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const STDERR_TAIL_LINES: usize = 10;
-const STDERR_DRAIN_DELAY: Duration = Duration::from_millis(200);
 
 /// Buffered VM configuration accumulated by the `configure_*` methods, applied at boot.
 #[derive(Default)]
@@ -64,6 +63,11 @@ pub struct CloudHypervisorBackend {
     log_path: Option<PathBuf>,
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Fires when the stderr reader has drained the pipe to EOF. Awaited before
+    /// rendering `stderr_tail` on a launch failure so the tail is COMPLETE — kept
+    /// outside `process` because `try_wait()` clears that handle on exit, which is
+    /// exactly when the tail is needed.
+    stderr_eof: Option<crate::utils::StderrEof>,
     client: Option<ChClient>,
     pending: PendingConfig,
     vsock_path: Option<PathBuf>,
@@ -99,6 +103,7 @@ impl CloudHypervisorBackend {
             log_path,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stderr_eof: None,
             client: None,
             pending: PendingConfig::default(),
             vsock_path: None,
@@ -183,7 +188,10 @@ impl CloudHypervisorBackend {
                 return Ok(());
             }
             if let Some(status) = self.try_wait()? {
-                sleep(STDERR_DRAIN_DELAY).await;
+                // Wait for the stderr reader to reach EOF — the exit just closed the
+                // pipe's write end, so this is the real "the tail is complete" signal
+                // rather than a fixed delay that expires first under load.
+                self.await_stderr_eof().await;
                 bail!(
                     "Cloud Hypervisor exited with {} before its API socket became ready{}",
                     status,
@@ -196,6 +204,19 @@ impl CloudHypervisorBackend {
             "Cloud Hypervisor API socket not ready after {} seconds",
             SOCKET_WAIT_RETRY_COUNT as u64 * SOCKET_WAIT_RETRY_DELAY.as_millis() as u64 / 1000
         )
+    }
+
+    /// Wait (bounded) for Cloud Hypervisor's stderr pipe to reach EOF, so
+    /// [`Self::stderr_tail_message`] renders everything it printed on its way down.
+    async fn await_stderr_eof(&mut self) {
+        if let Some(eof) = self.stderr_eof.as_mut() {
+            if !eof.wait(crate::utils::STDERR_EOF_TIMEOUT).await {
+                warn!(
+                    vm_id = %self.vm_id,
+                    "Cloud Hypervisor stderr pipe did not reach EOF; error tail may be incomplete"
+                );
+            }
+        }
     }
 
     fn stderr_tail_message(&self) -> String {
@@ -345,7 +366,8 @@ impl Hypervisor for CloudHypervisorBackend {
         })
         .context("spawning Cloud Hypervisor process")?;
 
-        self.process = Some(child);
+        self.process = Some(child.child);
+        self.stderr_eof = Some(child.stderr_eof);
         self.wait_for_api().await?;
         self.client = Some(ChClient::new(self.api_socket.clone()));
 

@@ -1106,6 +1106,16 @@ pub fn notify_cache_ready_and_wait(
                 let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
                 if received.contains("cache-ack") {
                     eprintln!("[fc-agent] received cache-ack from host");
+                    // Positive close handshake (#627): shut the connection down NOW
+                    // that the ack is in hand. This is the host's proof that the ack
+                    // landed — it drains to EOF before letting the connection go, so
+                    // its close can never become an RST that flushes an unread
+                    // cache-ack out of our receive buffer. It also stops the 500ms
+                    // write probe below from ever firing again on this socket.
+                    let _ = nix::sys::socket::shutdown(
+                        sock.as_raw_fd(),
+                        nix::sys::socket::Shutdown::Both,
+                    );
                     return CacheResult::ColdStart;
                 }
                 // Host keepalive: it is alive but still queued on the snapshot

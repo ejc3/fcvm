@@ -115,6 +115,76 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
     result
 }
 
+/// fc-agent must leave the guest with a chronyd that is actually configured.
+///
+/// The old failure was SILENT: fc-agent wrote /etc/chrony.conf but started chronyd
+/// without `-f`, so chronyd read the rootfs copy instead and `makestep 1 -1` (step the
+/// clock at ANY time — what corrects a restored snapshot that is hours behind) never
+/// applied; and it read the host's NTP servers from /etc-host/chrony.conf, a path
+/// nothing ever mounts, so it added ZERO servers and logged only a count of 0. Nothing
+/// failed, nothing was reported, and the clock just drifted. Hence three POSITIVE
+/// assertions about the running guest.
+#[tokio::test]
+async fn test_sanity_chronyd_configured() -> Result<()> {
+    println!("\nchronyd configuration test");
+    println!("==========================");
+
+    let (vm_name, _, _, _) = common::unique_names("chronyd");
+    let (_child, fcvm_pid) =
+        common::spawn_fcvm(&["podman", "run", "--name", &vm_name, common::TEST_IMAGE])
+            .await
+            .context("spawning fcvm podman run")?;
+    println!("  fcvm PID: {}", fcvm_pid);
+
+    let result = async {
+        common::poll_health_by_pid(fcvm_pid, 300).await?;
+        println!("  VM healthy");
+
+        // 1. chronyd must be running with fc-agent's config, as root.
+        let args = common::exec_in_vm(fcvm_pid, &["ps", "-o", "args=", "-C", "chronyd"]).await?;
+        println!("  chronyd argv: {}", args.trim());
+        assert!(
+            args.contains("-f /etc/chrony.conf"),
+            "chronyd must run with fc-agent's config (-f /etc/chrony.conf), else the \
+             makestep policy below is dead text; argv was: {args:?}"
+        );
+        assert!(
+            args.contains("-u root"),
+            "chronyd must run as root (the _chrony user cannot send UDP here); argv was: {args:?}"
+        );
+
+        // 2. That config must carry the restore-critical stepping policy.
+        let conf = common::exec_in_vm(fcvm_pid, &["cat", "/etc/chrony.conf"]).await?;
+        assert!(
+            conf.contains("makestep 1 -1"),
+            "chrony config must allow stepping the clock at any time (critical after \
+             snapshot restore); config was: {conf:?}"
+        );
+
+        // 3. chronyd must actually have time sources. This is the assertion the old
+        //    code could not pass: with no servers configured it had none.
+        let sources = common::exec_in_vm(fcvm_pid, &["chronyc", "-c", "-n", "sources"]).await?;
+        let count = sources.lines().filter(|l| !l.trim().is_empty()).count();
+        println!(
+            "  chronyc sources ({} configured):\n{}",
+            count,
+            sources.trim()
+        );
+        assert!(
+            count > 0,
+            "guest chronyd has NO NTP sources — the clock will drift unchecked; \
+             `chronyc -c -n sources` returned: {sources:?}"
+        );
+        anyhow::Ok(())
+    }
+    .await;
+
+    common::kill_process(fcvm_pid).await;
+    result?;
+    println!("✅ CHRONYD CONFIG TEST PASSED!");
+    Ok(())
+}
+
 /// Test that VM exits gracefully when container finishes (PSCI shutdown)
 /// This tests the full shutdown path: container exit → fc-agent poweroff -f → PSCI SYSTEM_OFF → KVM exit
 #[tokio::test]

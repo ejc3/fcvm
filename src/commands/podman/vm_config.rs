@@ -519,6 +519,73 @@ pub(super) async fn attach_extra_disks(
     Ok((extra_disks, image_device))
 }
 
+/// Candidate paths for the host's chrony configuration, most specific first.
+const HOST_CHRONY_CONFS: &[&str] = &["/etc/chrony/chrony.conf", "/etc/chrony.conf"];
+
+/// Used when the host has no chrony configuration of its own, so a guest is never
+/// left with zero time sources. Matches the pool baked into the VM rootfs.
+const DEFAULT_NTP_POOL: &str = "pool.ntp.org";
+
+/// Cap on NTP addresses shipped to a guest. A `pool` directive resolves to many
+/// addresses and chronyd needs only a handful to discipline a clock.
+const NTP_SERVER_LIMIT: usize = 4;
+
+/// Extract the `server`/`pool` hostnames from a chrony configuration.
+///
+/// Both directives are collected: some distributions (Ubuntu included) ship only
+/// `pool` lines, and a guest that ignored those would end up with no time source.
+fn parse_chrony_servers(conf: &str) -> Vec<String> {
+    conf.lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("server ")
+                .or_else(|| line.strip_prefix("pool "))?;
+            rest.split_whitespace().next().map(str::to_string)
+        })
+        .collect()
+}
+
+/// The host's NTP servers, resolved to addresses, for the guest's chronyd.
+///
+/// The guest cannot read the host's chrony.conf — nothing mounts the host's /etc into
+/// a VM — so the boot plan carries the servers instead. Resolution happens here, on
+/// the host, for the same reason proxy URLs are resolved here: the guest adds each
+/// one with `chronyc add server <addr>`, and an address needs no guest-side DNS.
+fn host_ntp_servers() -> Vec<String> {
+    let names = HOST_CHRONY_CONFS
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|conf| parse_chrony_servers(&conf))
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| {
+            debug!("no NTP servers in host chrony config; using {DEFAULT_NTP_POOL}");
+            vec![DEFAULT_NTP_POOL.to_string()]
+        });
+
+    let mut addrs: Vec<String> = Vec::new();
+    for name in names {
+        match std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 123u16)) {
+            Ok(resolved) => {
+                for addr in resolved {
+                    let ip = addr.ip().to_string();
+                    if !addrs.contains(&ip) {
+                        addrs.push(ip);
+                    }
+                    if addrs.len() >= NTP_SERVER_LIMIT {
+                        return addrs;
+                    }
+                }
+            }
+            Err(e) => warn!(server = %name, error = %e, "failed to resolve host NTP server"),
+        }
+    }
+    if addrs.is_empty() {
+        warn!("no host NTP servers resolved; guest clock will rely on host-time sync only");
+    }
+    addrs
+}
+
 /// Build the boot-plan JSON (the `latest` object served to fc-agent).
 ///
 /// Used by both transports: MMDS (`hv.publish_boot_plan`) and vsock
@@ -617,6 +684,7 @@ pub(super) fn build_boot_plan_json(
         subuid_start: subuid_range.map(|(start, _)| start),
         subuid_count: subuid_range.map(|(_, count)| count),
         host_time: chrono::Utc::now().timestamp().to_string(),
+        ntp_servers: host_ntp_servers(),
     };
 
     launch_config.to_mmds_json(runtime)
@@ -1402,5 +1470,42 @@ mod tests {
     fn test_parse_subid_file_returns_none_for_missing_file() {
         let result = parse_subid_file("/tmp/nonexistent-subuid-test-file");
         assert_eq!(result, None);
+    }
+
+    /// Ubuntu's stock chrony.conf uses `pool`, not `server`. Ignoring `pool` would
+    /// send an empty NTP list to every guest — the silent zero-sources failure.
+    #[test]
+    fn test_parse_chrony_servers_collects_pool_and_server() {
+        let conf = "\
+# comment
+pool ntp.ubuntu.com        iburst maxsources 4
+server 10.0.0.1 iburst
+  pool 0.ubuntu.pool.ntp.org iburst maxsources 1
+serverfoo notadirective
+driftfile /var/lib/chrony/drift
+";
+        assert_eq!(
+            parse_chrony_servers(conf),
+            vec!["ntp.ubuntu.com", "10.0.0.1", "0.ubuntu.pool.ntp.org"]
+        );
+    }
+
+    #[test]
+    fn test_parse_chrony_servers_empty_without_directives() {
+        assert!(
+            parse_chrony_servers("driftfile /var/lib/chrony/drift\nmakestep 1 -1\n").is_empty()
+        );
+    }
+
+    /// A guest with no NTP source silently drifts, so the plan must never be empty
+    /// on a host that can resolve names.
+    #[test]
+    fn test_host_ntp_servers_resolves_to_addresses() {
+        for addr in host_ntp_servers() {
+            assert!(
+                addr.parse::<std::net::IpAddr>().is_ok(),
+                "boot plan must carry resolved addresses, got {addr:?}"
+            );
+        }
     }
 }
