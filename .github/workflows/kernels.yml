@@ -32,6 +32,17 @@ jobs:
     permissions:
       contents: write  # Required for creating releases
     steps:
+      # This workflow shares a persistent runner workspace with ci.yml, whose
+      # privileged tests leave root-owned files behind (artifacts/fc-agent and
+      # friends). checkout's `git clean -ffdx` then hits "Permission denied",
+      # and its "recreate the repository" fallback fails with EACCES, so the
+      # job dies before compiling anything. ci.yml guards all three of its
+      # self-hosted jobs exactly this way; this workflow never got the guard,
+      # and every Build Kernels run since 2026-06-09 failed here.
+      - name: Fix workspace permissions (pre-checkout)
+        run: |
+          sudo chown -R $USER:$USER ${{ github.workspace }} 2>/dev/null || true
+
       - uses: actions/checkout@v7
         with:
           path: fcvm
@@ -220,6 +231,17 @@ jobs:
     permissions:
       contents: write  # Required for creating releases
     steps:
+      # This workflow shares a persistent runner workspace with ci.yml, whose
+      # privileged tests leave root-owned files behind (artifacts/fc-agent and
+      # friends). checkout's `git clean -ffdx` then hits "Permission denied",
+      # and its "recreate the repository" fallback fails with EACCES, so the
+      # job dies before compiling anything. ci.yml guards all three of its
+      # self-hosted jobs exactly this way; this workflow never got the guard,
+      # and every Build Kernels run since 2026-06-09 failed here.
+      - name: Fix workspace permissions (pre-checkout)
+        run: |
+          sudo chown -R $USER:$USER ${{ github.workspace }} 2>/dev/null || true
+
       - uses: actions/checkout@v7
         with:
           path: fcvm

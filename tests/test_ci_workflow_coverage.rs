@@ -137,3 +137,81 @@ fn gating_jobs_live_in_the_pull_request_workflow() {
         );
     }
 }
+
+/// Every self-hosted job that checks out must first repair workspace ownership.
+///
+/// Self-hosted runners keep their workspace between jobs. fcvm's privileged
+/// tests write root-owned files into it (`artifacts/fc-agent` and friends), so
+/// the next `actions/checkout` fails: `git clean -ffdx` gets "Permission
+/// denied" and the "recreate the repository" fallback gets EACCES. The job dies
+/// at checkout, before it builds anything.
+///
+/// ci.yml has guarded its self-hosted jobs this way for a long time. kernels.yml
+/// never got the guard, and **every Build Kernels run from 2026-06-11 onward
+/// failed at checkout** — so the FICLONE >4 GiB fix, merged to main on
+/// 2026-06-11, was never compiled into a kernel. Two months of "the fix is in
+/// main" while every deployed kernel still truncated at `u32::MAX`.
+#[test]
+fn self_hosted_checkouts_repair_workspace_ownership_first() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+
+    let mut checked = 0usize;
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let wf: Value = match serde_norway::from_str(&std::fs::read_to_string(&path).unwrap()) {
+            Ok(v) => v,
+            Err(e) => panic!("{name} is not valid YAML: {e}"),
+        };
+        let Some(jobs) = wf.get("jobs").and_then(Value::as_mapping) else {
+            continue;
+        };
+
+        for (job_name, job) in jobs {
+            // Only self-hosted jobs share a persistent workspace.
+            let runs_on = job
+                .get("runs-on")
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_default();
+            if !runs_on.contains("self-hosted") {
+                continue;
+            }
+            let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
+                continue;
+            };
+            // Find the first checkout step; anything before it is pre-checkout.
+            let checkout_at = steps.iter().position(|s| {
+                s.get("uses")
+                    .and_then(Value::as_str)
+                    .is_some_and(|u| u.starts_with("actions/checkout"))
+            });
+            let Some(idx) = checkout_at else { continue };
+            checked += 1;
+
+            let guarded = steps[..idx].iter().any(|s| {
+                s.get("run")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r.contains("chown") && r.contains("workspace"))
+            });
+            let job_label = job_name.as_str().unwrap_or("<job>");
+            assert!(
+                guarded,
+                "{name}: self-hosted job `{job_label}` runs actions/checkout with no preceding \
+                 workspace-ownership repair. Root-owned leftovers from a privileged run make \
+                 checkout fail with EACCES, and the job dies before building. Add the \
+                 `Fix workspace permissions (pre-checkout)` step used by ci.yml."
+            );
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "found no self-hosted checkout steps to inspect — the walk is broken, and a check that \
+         inspects nothing must not report success"
+    );
+}
