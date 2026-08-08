@@ -144,8 +144,8 @@ fi
 #                          --disable-gpu --remote-debugging-address=0.0.0.0
 #                          --remote-debugging-port=9222` too, so it is the build, not our
 #                          flag set. Host ingress therefore CANNOT come from a wildcard
-#                          bind on this image; it comes from fcvm's --forward-localhost
-#                          (routed mode), which forwards the GUEST's loopback port out.
+#                          bind on this image, and --forward-localhost does not help
+#                          either (it is GUEST -> HOST, not host -> guest; see CDP RELAY).
 #                          The flag stays because it is free and correct-in-intent: if a
 #                          future Chromium honours it, the wildcard bind becomes available
 #                          without another archaeology session. Re-verify /proc/net/tcp
