@@ -174,19 +174,19 @@ def main():
     out["deltas"] = {}
     for a, b, label in pairs:
         if a in by and b in by:
+            print(f"  {label}")
             for metric in ("blocking_ms", "wall_ms"):
                 va = [r[metric] for r in by[a]]
                 vb = [r[metric] for r in by[b]]
                 d, lo, hi = hodges_lehmann_shift(va, vb)
                 sig = "" if (lo <= 0 <= hi) else "  *"
-                print(f"  {label}")
                 print(f"    {metric:12s} {a} -> {b}: {d:+.1f} ms  CI [{lo:+.1f}, {hi:+.1f}]{sig}")
                 out["deltas"][f"{a}->{b}:{metric}"] = {"delta": d, "ci": [lo, hi],
                                                        "significant": not (lo <= 0 <= hi)}
 
     # ---- 4. CDP stage decomposition (the per-request connect cost this design ADDS)
     print("\n" + "-" * 78)
-    print("CDP ARMS: per-request stage decomposition (host -> clone over forward-localhost)")
+    print("CDP ARMS: per-request stage decomposition (host -> clone via socat relay + published port)")
     print("-" * 78)
     stage_keys = ["resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms", "connect_total_ms",
                   "navigate_ms", "screenshot_ms", "total_ms"]
