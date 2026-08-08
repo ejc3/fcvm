@@ -20,14 +20,26 @@ const HUGE_PAGE_2M: usize = 2 * 1024 * 1024;
 /// Env var overriding [`DEFAULT_MAX_CLONES_PER_SERVER`].
 pub const MAX_CLONES_ENV: &str = "FCVM_UFFD_MAX_CLONES";
 
+/// The largest per-server clone fan-out the test suite exercises
+/// (`test_snapshot_clone_stress_100_*` restores 100 clones from ONE serve process). The
+/// default cap must stay above it: a bound that refuses a configuration fcvm supports is a
+/// bug, not a safety feature.
+const EXERCISED_MAX_CLONES_PER_SERVER: usize = 100;
+
 /// How many clones one server serves concurrently.
 ///
 /// Every clone attached to a server shares that server's **failure domain** (one process,
 /// one page source, one set of fds) and its **fairness domain** (one task each on the same
-/// runtime). An unbounded server therefore has an unbounded blast radius. This cap is the
-/// bound; raise it with `FCVM_UFFD_MAX_CLONES` and accept the wider blast radius, or run a
-/// second `fcvm snapshot serve` and split the clones across two failure domains.
-pub const DEFAULT_MAX_CLONES_PER_SERVER: usize = 64;
+/// runtime). An unbounded server therefore has an unbounded blast radius: a single
+/// fault-handler failure, OOM, or fd exhaustion takes out every clone attached to it.
+///
+/// This is a **backstop, not a ration**. It sits well clear of
+/// [`EXERCISED_MAX_CLONES_PER_SERVER`] so it never fires in supported use — the first
+/// version of this change shipped 64 and the 100-clone stress test caught it immediately,
+/// which is exactly the failure mode a too-tight bound produces. Raise it with
+/// `FCVM_UFFD_MAX_CLONES` and accept the wider blast radius, or run a second
+/// `fcvm snapshot serve` and split the clones across two failure domains.
+pub const DEFAULT_MAX_CLONES_PER_SERVER: usize = 256;
 
 /// How many uffd events one handler drains before yielding to the runtime.
 ///
@@ -2279,6 +2291,20 @@ mod tests {
         assert_eq!(toucher.join().unwrap(), 0);
         unsafe { libc::munmap(guest, 4096) };
         drop(client);
+    }
+
+    /// The cap must never refuse a fan-out fcvm supports. Shipping 64 broke
+    /// `test_snapshot_clone_stress_100_bridged` — 100 clones on one serve process — with the
+    /// server killing clones 65..100 exactly as designed. The bound is a backstop against
+    /// unbounded growth, so it belongs comfortably above what the suite exercises.
+    #[test]
+    fn test_default_cap_clears_the_fan_out_the_suite_exercises() {
+        assert!(
+            DEFAULT_MAX_CLONES_PER_SERVER > EXERCISED_MAX_CLONES_PER_SERVER,
+            "default cap {DEFAULT_MAX_CLONES_PER_SERVER} would refuse the \
+             {EXERCISED_MAX_CLONES_PER_SERVER}-clone fan-out the stress tests restore from a \
+             single server"
+        );
     }
 
     #[test]
