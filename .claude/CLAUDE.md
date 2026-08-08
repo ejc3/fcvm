@@ -1778,6 +1778,11 @@ records the SET and replays it.
   `<memory.bin>.working-set` beside the snapshot, under an `flock` + atomic rename, and only
   written when the union actually grew — so the steady state writes nothing, and a clone that
   was killed mid-restore gets completed by the next one instead of baking in a truncated set.
+  Publication is also gated on the image identity STILL matching under the lock: a serve
+  process keeps serving the inode it opened, but its working-set path resolves through the
+  snapshot tag, so a tag recreated underneath a running server would otherwise let an old
+  clone overwrite the new generation's record with one the decoder must reject. `flock`
+  serialises writers; it does not check what they are writing about.
 - **Replay**: at handshake the recorded set is coalesced into runs, mapped into that clone's
   regions, aligned to its page size, and populated in 2 MiB `UFFDIO_COPY`/`UFFDIO_CONTINUE`
   chunks. This runs before the guest's first instruction (fcvm loads with `resume_vm: false`),
@@ -1811,6 +1816,13 @@ only `UFFDIO_COPY` reveals it with `ESRCH` — because the server holds its own 
 socket and watches the connecting Firecracker with a `pidfd`. That is what ends a handler (and
 what lets the working set be recorded); before it, `VM exited` had never once been logged and
 every finished clone pinned its task and uffd until the server stopped.
+
+The three outcomes are distinct and must stay that way. `pidfd_open` returning `ESRCH` means
+the clone died between `connect` and the watch — a process we KNOW is dead, so it resolves
+IMMEDIATELY; folding it into "cannot watch" reintroduces exactly the hang this section
+describes (quiet uffd, pinned task, no recorded set, shutdown blocked on the `JoinSet` drain).
+"Cannot watch" (no peer pid, registration failed) must instead wait forever, because resolving
+early would tear down a LIVE clone's handler and hang its guest.
 
 ### FUSE Parallelism (fuse-pipe)
 

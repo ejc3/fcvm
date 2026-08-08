@@ -324,6 +324,11 @@ pub struct MergeOutcome {
     pub added: u64,
     /// Whether the union was written back to disk (only when it grew).
     pub persisted: bool,
+    /// The image at the memory path is no longer the one we served, so nothing was published.
+    /// Happens when a snapshot tag is recreated while this serve process is still running: the
+    /// server keeps its open (old) inode, but the working-set path now belongs to the NEW
+    /// image, and publishing our bitmap there would clobber the new generation's record.
+    pub superseded: bool,
 }
 
 /// The working set stored beside a snapshot's memory image.
@@ -334,6 +339,9 @@ pub struct MergeOutcome {
 /// earlier clone already discovered without a round trip through the filesystem.
 pub struct WorkingSetStore {
     path: PathBuf,
+    /// The memory image this set describes. Kept so the identity can be re-checked at publish
+    /// time — the path may name a different image by then (see `MergeOutcome::superseded`).
+    mem_path: PathBuf,
     lock_path: PathBuf,
     key: ImageKey,
     mem_len: u64,
@@ -381,6 +389,7 @@ impl WorkingSetStore {
 
         Ok(Self {
             path,
+            mem_path: mem_file_path.to_path_buf(),
             lock_path,
             key,
             mem_len,
@@ -438,7 +447,15 @@ impl WorkingSetStore {
         let added = known.union_from(observed);
         let total = known.len();
 
-        let persisted = total > disk_len;
+        // Publish ONLY if the path still names the image we served. A snapshot tag can be
+        // recreated while this serve process runs: we keep serving the old inode we already
+        // opened, but `self.path` resolves through the tag's directory and would now sit
+        // beside a NEW image. Writing our old-key bitmap there would overwrite the new
+        // generation's record with one the decoder must reject, sending later restores back
+        // to full demand paging. The `flock` cannot catch this — it serialises writers, it
+        // does not check WHAT is being written about.
+        let superseded = !self.image_is_still_ours();
+        let persisted = total > disk_len && !superseded;
         let result = if persisted {
             write_set(&self.path, &known, &self.key, self.mem_len)
         } else {
@@ -455,7 +472,27 @@ impl WorkingSetStore {
             total,
             added,
             persisted,
+            superseded,
         })
+    }
+
+    /// Whether the memory image at our path is still the one this set describes.
+    ///
+    /// A stat failure counts as "not ours": if the image cannot be identified we must not
+    /// publish, because the file we would write next to is not one we can vouch for.
+    fn image_is_still_ours(&self) -> bool {
+        match ImageKey::of(&self.mem_path) {
+            Ok(now) => now == self.key,
+            Err(e) => {
+                warn!(
+                    target: "uffd",
+                    path = %self.mem_path.display(),
+                    error = ?e,
+                    "cannot re-identify the memory image; not publishing a working set for it"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -738,7 +775,8 @@ mod tests {
             MergeOutcome {
                 total: 3,
                 added: 3,
-                persisted: true
+                persisted: true,
+                superseded: false
             }
         );
 
@@ -753,7 +791,8 @@ mod tests {
             MergeOutcome {
                 total: 4,
                 added: 1,
-                persisted: true
+                persisted: true,
+                superseded: false
             }
         );
 
@@ -764,7 +803,8 @@ mod tests {
             MergeOutcome {
                 total: 4,
                 added: 0,
-                persisted: false
+                persisted: false,
+                superseded: false
             }
         );
 
@@ -822,6 +862,65 @@ mod tests {
 
         std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
         let _ = std::fs::remove_file(store.lock_path);
+        std::fs::remove_file(&image).unwrap();
+    }
+
+    /// A serve process keeps serving the inode it opened, but its working-set PATH resolves
+    /// through the snapshot tag. If the tag is recreated underneath it, a clone finishing
+    /// afterwards must NOT publish its old-generation bitmap over the new generation's record
+    /// — the decoder would reject the stale key and every later restore would fall back to
+    /// full demand paging. `flock` cannot prevent this: it serialises writers, it does not
+    /// check what they are writing about.
+    #[test]
+    fn an_old_generation_clone_does_not_clobber_the_new_generations_record() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("supersede", mem_len);
+
+        // Generation 1: the serve process that is still running.
+        let old = WorkingSetStore::open(&image, mem_len).unwrap();
+
+        // The tag is recreated in place: same path, new image.
+        std::fs::remove_file(&image).unwrap();
+        let f = File::create(&image).unwrap();
+        f.set_len(mem_len).unwrap();
+        drop(f);
+
+        // Generation 2 records its own working set at the same path.
+        let new = WorkingSetStore::open(&image, mem_len).unwrap();
+        assert_ne!(
+            old.key, new.key,
+            "test is vacuous unless rewriting the image changed its identity"
+        );
+        let mut new_observed = new.recorder();
+        new_observed.insert_range(10 * GRANULE, 3 * GRANULE);
+        assert!(new.merge_and_persist(&new_observed).unwrap().persisted);
+
+        // Now generation 1's clone finishes and tries to record a DIFFERENT set.
+        let mut old_observed = old.recorder();
+        old_observed.insert_range(0, 5 * GRANULE);
+        let outcome = old.merge_and_persist(&old_observed).unwrap();
+        assert!(
+            outcome.superseded,
+            "publishing must be recognised as superseded once the image was replaced"
+        );
+        assert!(
+            !outcome.persisted,
+            "an old-generation set must never be published over the new one"
+        );
+
+        // The new generation's record must be intact and still usable.
+        let reloaded = WorkingSetStore::open(&image, mem_len)
+            .unwrap()
+            .to_prefetch();
+        assert_eq!(reloaded.len(), 3, "the new generation's set must survive");
+        assert!(reloaded.contains(10) && reloaded.contains(12));
+        assert!(
+            !reloaded.contains(0),
+            "the old generation's pages must not have leaked in"
+        );
+
+        std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
+        let _ = std::fs::remove_file(&old.lock_path);
         std::fs::remove_file(&image).unwrap();
     }
 
