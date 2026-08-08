@@ -207,7 +207,10 @@ def wait_pidfds(fds: list[int], timeout_s: float) -> bool:
     return True
 
 
-def sample_all_until_gone(pids: dict, deadline: float) -> dict:
+SAMPLE_PERIOD_S = 0.0002
+
+
+def sample_all_until_gone(pids: dict, deadline: float) -> tuple[dict, float]:
     """Sample EVERY child's /proc/<pid>/stat concurrently until each one vanishes.
 
     Concurrently, not one at a time. The previous version was a per-child call
@@ -220,11 +223,34 @@ def sample_all_until_gone(pids: dict, deadline: float) -> dict:
     `null`. That is not a lower bound, it is a missing measurement whose presence
     depended on procfs ordering.
 
-    Still a tight loop with no sleep, deliberately: the zombie window between
-    `exit_notify()` and the reaper is short, and catching state `Z` is what
-    upgrades a CPU figure from a lower bound to a complete one (see the module
-    docstring). The cost of that spin is now measured (`self_cpu_ms`) and
-    subtracted from the machine accounting rather than left in it.
+    IT SLEEPS BETWEEN PASSES, and the period is returned so the residual bias is
+    quantifiable. It used to be a tight loop with no sleep, defended on the
+    grounds that catching state `Z` upgrades a CPU figure from a lower bound to a
+    complete one and that the cost of the spin was "measured and subtracted".
+    Accounting is not throttling, and the subtraction could not survive its own
+    arithmetic. Measured on this box against a child that outlives its parent by
+    ~0.5 s:
+
+        reap_wall_ms=541.3  harness_cpu_ms=540.0   (100% of one core)
+        machine_cpu_ms=630.0  machine_cpu_ms_excess=-17.9
+
+    Three consequences, all INSIDE the window being measured. (a) `machine_cpu_ms
+    - self_ms` subtracts a ~540 ms quantity that is itself quantized to one jiffy
+    in order to expose a signal REVIEW.md states is below /proc tick resolution
+    (< 20 ms); the noise on the subtrahend is the size of the signal, and the run
+    above produced a NEGATIVE excess — impossible for a reclaim, and direct
+    evidence the attribution was broken. (b) The control window SLEEPS while this
+    one SPUN, so the two windows carried opposite harness load profiles — exactly
+    the defect the `+610.4 ms` machine-cost figure was withdrawn for, inverted
+    onto the other side of the same subtraction. (c) `reap_wall_ms` itself is
+    corrupted, because the spin competes for CPU with the exiting Firecracker it
+    is timing.
+
+    At 200 us the zombie argument still holds: `exit_mm()` completes before
+    `exit_notify()`, so the reclaim is already in the counters by the time state
+    `Z` is reachable, and MISSING the `Z` only downgrades that child's figure to a
+    labelled LOWER BOUND — a state the record already models (`complete`, and
+    reqanalyze prints the two populations separately, never averaged).
     """
     live = dict(pids)
     last: dict = {}
@@ -239,6 +265,8 @@ def sample_all_until_gone(pids: dict, deadline: float) -> dict:
             if s[0] in ("Z", "X", "x"):
                 zombie[name] = True
                 del live[name]
+        if live:
+            time.sleep(SAMPLE_PERIOD_S)
     out = {}
     for name in pids:
         s = last.get(name)
@@ -246,7 +274,7 @@ def sample_all_until_gone(pids: dict, deadline: float) -> dict:
             "cpu_ms": (s[1] + s[2]) * 1000.0 / CLK_TCK if s else None,
             "zombie_seen": zombie[name],
         }
-    return out
+    return out, SAMPLE_PERIOD_S
 
 
 # ------------------------------------------------------------------ fcvm glue
@@ -428,6 +456,31 @@ class SurvivedTeardown(RuntimeError):
         self.record: dict = {}
 
 
+def safe_vm_data_dir(data_dir: str) -> str:
+    """Return `data_dir` only if it is STRICTLY below a `vm-disks` root. Else "".
+
+    Every call site computes `os.path.join(data_root, "vm-disks", vm_id)` from a
+    state file, and `state.get("vm_id", "")` is empty on a partially-written
+    file. `os.path.join("/mnt/fcvm-btrfs", "vm-disks", "")` is
+    `/mnt/fcvm-btrfs/vm-disks/`, `os.path.isdir` says True, and the rmtree below
+    then deletes EVERY VM's disks on the box — under sudo. Commit e1286e3f called
+    exactly this arithmetic catastrophic and guarded `tests/test_signal_cleanup.rs`
+    (`an_empty_vm_id_resolves_to_the_shared_disk_root_and_must_be_rejected`); the
+    Python harness that does the identical computation was left unguarded, so the
+    guarantee held only for the Rust fixture.
+
+    Symlinks are resolved on both sides before comparing, so a `vm-disks/<id>`
+    that points somewhere else cannot smuggle the deletion out of the tree.
+    """
+    if not data_dir:
+        return ""
+    real = os.path.realpath(data_dir)
+    head, tail = os.path.split(real)
+    if not tail or os.path.basename(head) != "vm-disks":
+        return ""
+    return real
+
+
 def reap_disk(out: dict, state_path: str, data_dir: str) -> list:
     """Remove the clone's state file (+ its lock) and data dir. Errors are RECORDED.
 
@@ -436,6 +489,16 @@ def reap_disk(out: dict, state_path: str, data_dir: str) -> list:
     runs under SUDO, so EPERM has to surface.
     """
     reaped = []
+    if data_dir:
+        safe = safe_vm_data_dir(data_dir)
+        if not safe:
+            out.setdefault("disk_errors", []).append(
+                f"{data_dir}: refusing to remove — not strictly below a vm-disks root "
+                f"(an empty vm_id collapses to the SHARED disk root)"
+            )
+            data_dir = ""
+        else:
+            data_dir = safe
     if state_path and os.path.exists(state_path):
         try:
             os.remove(state_path)
@@ -528,7 +591,7 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     out["signal_ms"] = (time.monotonic() - t_kill) * 1000
 
     deadline = t_kill + timeout_s
-    cpu = sample_all_until_gone(tracked, deadline)
+    cpu, sample_period_s = sample_all_until_gone(tracked, deadline)
     all_gone = wait_pidfds(list(fds.values()), max(0.0, deadline - time.monotonic()))
     t_gone = time.monotonic()
     busy1, _ = machine_busy_jiffies()
@@ -547,6 +610,10 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     out["machine_cpu_ms_excess"] = (machine_cpu_ms - self_ms) - ctl_rate * window_s * 1000
     out["control_busy_cores"] = ctl_rate
     out["control_harness_cpu_ms"] = ctl_self_ms
+    # Both accounting windows now sleep, so the subtraction is between like and
+    # like. The sampler's residual duty cycle is bounded by this period and is
+    # recorded rather than argued about.
+    out["sample_period_s"] = sample_period_s
 
     # /proc/<pid>/stat counts in jiffies, so every CPU figure here is quantized to
     # one tick. At CLK_TCK=100 that is 10 ms, and a sub-tick reclaim reports a hard
@@ -602,7 +669,25 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     reaped = reap_disk(out, state_path, data_dir)
     out["disk_reap_ms"] = (time.monotonic() - t_disk) * 1000
     out["disk_reaped"] = reaped
+    # VERIFY ABSENCE, then gate. `reap_disk` recorded EPERM in `out["disk_errors"]`
+    # and nothing on the branch ever read that key: a rep whose rmtree failed was
+    # written with `ok: true` and the schedule continued. The asymmetry was the
+    # tell — the PROCESS half of this function already aborts, the DISK half did
+    # not. `vm-disks/<vm_id>` holds a reflink of the golden rootfs, so a failed
+    # rmtree pins the golden snapshot's extents on btrfs, and the state file it
+    # leaves behind can never be swept (`cleanup_stale_state` bails on a null
+    # pid). `disk_reap_ms` is also a published per-arm median, computed over
+    # records that included failed reaps.
+    left = [p for p in (state_path, f"{state_path}.lock" if state_path else "", data_dir)
+            if p and os.path.exists(p)]
     out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
+    if left or out.get("disk_errors"):
+        out["disk_reap_failed"] = left
+        raise SurvivedTeardown(
+            f"fast teardown of fcvm {fcvm_pid} could not reap on-disk state: "
+            f"left={left} errors={out.get('disk_errors', [])}",
+            out,
+        )
     return out
 
 
@@ -612,6 +697,24 @@ def teardown_normal(proc: subprocess.Popen, fcvm_pid: int, timeout_s: float) -> 
     kill -> holder kill -> network cleanup -> state delete -> FC log save ->
     data-dir removal, each awaited. This is the control the fast arm is measured
     against.
+
+    Raises `SurvivedTeardown` on a real survivor, for the same reason
+    `teardown_fast` does: the `cdp` and `noop` arms used to compute `all_gone`,
+    record it, and continue the schedule with a live Firecracker/holder/pasta on
+    the box. `reqanalyze` printed `** N NOT CONFIRMED GONE **` and still exited 0,
+    so nothing failed.
+
+    TWO defects, in opposite directions, and both had to be fixed together. On the
+    timed_out path the verdict was decided with a ZERO observation budget:
+    `proc.wait(timeout=timeout_s)` spends the whole budget, `proc.wait(timeout=10)`
+    spends more, so `max(0.0, t0 + timeout_s - now)` is always 0.0 by the time it
+    is used — and `wait_pidfds` with a 0 budget returns False WITHOUT EVER
+    POLLING. Measured: a pdeathsig child that died sub-millisecond with its parent
+    was reported `all_gone: False`. Gating on that boolean as it stood would have
+    aborted every healthy rep that merely hit the SIGTERM timeout. So the wait
+    gets a real budget, and the verdict is then re-decided by a fresh liveness
+    check on the PIDFDS — not on the raw pids, which can alias a reused pid, which
+    is why this file opened pidfds in the first place.
     """
     out: dict = {"mode": "normal"}
     kids = children_of(fcvm_pid)
@@ -631,12 +734,34 @@ def teardown_normal(proc: subprocess.Popen, fcvm_pid: int, timeout_s: float) -> 
             pass
         proc.wait(timeout=10)
     out["fcvm_exit_ms"] = (time.monotonic() - t0) * 1000
-    out["all_gone"] = wait_pidfds(fds, max(0.0, t0 + timeout_s - time.monotonic()))
+    left = max(0.0, t0 + timeout_s - time.monotonic())
+    out["all_gone"] = wait_pidfds(fds, left if left > 0 else 0.5)
+    live = []
+    if not out["all_gone"]:
+        poller = select.poll()
+        for fd in fds:
+            if fd is not None:
+                poller.register(fd, select.POLLIN)
+        ready = {fd for fd, _ev in poller.poll(0)}
+        live = [p for p, fd in zip(kids, fds) if fd is not None and fd not in ready]
+        out["all_gone"] = not live
     for fd in fds:
         if fd is not None:
             os.close(fd)
     out["reap_wall_ms"] = (time.monotonic() - t0) * 1000
     out["teardown_total_ms"] = out["reap_wall_ms"]
+    if live:
+        out["survivors"] = {p: proc_comm(p) for p in live}
+        for p in live:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        raise SurvivedTeardown(
+            f"normal teardown of fcvm {fcvm_pid} left {out['survivors']} alive after "
+            f"{timeout_s:.1f}s",
+            out,
+        )
     return out
 
 
@@ -711,11 +836,29 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
                 connect_retries=200,
                 nav_timing=True,
                 print_target=False,
+                # This Namespace is an explicit, CLOSED field list, so every flag
+                # cdpdrive grows has to be added here too or `drive()` raises
+                # AttributeError — which is not in its except tuple, escapes it,
+                # and is swallowed by the `except Exception` below, failing every
+                # cdp rep. cdpdrive also reads it with getattr; both halves.
+                host_header="",
                 render_module=os.path.join(HERE, "render.py"),
             )
             result = cdpdrive.drive(drive_args)
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
+            if not rec["ok"]:
+                # LIFT THE DIAGNOSTIC TO THE TOP LEVEL. cdpdrive can return
+                # ok=false WITHOUT raising, in which case the `except` below never
+                # runs and `rec["error"]` was never set — the label stayed buried
+                # under `rec["render"]`. reqanalyze's only failure breakdown reads
+                # the top level (`r.get("error", f"rc={r.get('rc')}")`), so a
+                # WsClosed transport drop printed as `FAILURE x1: rc=None`.
+                # Separating transport drops from render failures is the entire
+                # point of REVIEW.md's 200-request availability gate.
+                rec["error"] = result.get("error", "cdpdrive reported ok=false")
+                rec["failure_class"] = result.get("failure_class", "render")
+                rec["failure_stage"] = result.get("stage", "")
             # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
             # teardown, and none of it is latency the caller pays.
             rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
@@ -754,7 +897,15 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
         except subprocess.TimeoutExpired:
             pass
     else:
-        rec["teardown"] = teardown_normal(proc, fcvm_pid, args.teardown_timeout)
+        try:
+            rec["teardown"] = teardown_normal(proc, fcvm_pid, args.teardown_timeout)
+        except SurvivedTeardown as e:
+            rec["teardown"] = e.teardown
+            rec["ok"] = False
+            rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+            rec["log"] = log
+            e.record = rec
+            raise
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
     return rec
@@ -765,8 +916,12 @@ def clone_backend_args(args) -> list:
     """UFFD serve-backed vs FILE-backed restore, as CLI args.
 
     These are different memory backends with different per-request costs -- the
-    published 573 ms stage baseline is FILE-backed, and every guest page touched
-    during startup costs a UFFD round trip on the other path. Mixing them and
+    published stage baseline (`corrected.json` primary cell: total 890.6 ms
+    [869.6, 928.9], n=12) is UFFD-4K, and every guest page touched during startup
+    costs a UFFD round trip on that path but not on the file path. This comment
+    used to cite "the published 573 ms stage baseline", a figure that appears in
+    no committed artifact and whose only other occurrence was the AGENTS.md line
+    citing this file. Mixing the backends and
     comparing against that baseline would be exactly the matched-accounting
     failure AGENTS.md defect 1 describes, so the backend is explicit and recorded
     in the run metadata rather than implied by which flag happened to be passed.
@@ -818,7 +973,15 @@ def run_noop_request(args, rep: int) -> dict:
     finally:
         watch.close()
     rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
-    rec["teardown"] = teardown_normal(proc, fcvm_pid, args.teardown_timeout)
+    try:
+        rec["teardown"] = teardown_normal(proc, fcvm_pid, args.teardown_timeout)
+    except SurvivedTeardown as e:
+        rec["teardown"] = e.teardown
+        rec["ok"] = False
+        rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+        rec["log"] = log
+        e.record = rec
+        raise
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
     return rec
@@ -851,6 +1014,18 @@ def run_exec_request(args, rep: int) -> dict:
         # measurements. The exec arm was the only arm with this hole; the other two
         # always reach a teardown call.
         rec["timed_out"] = True
+        # CHILDREN FIRST, BEFORE THE KILL. This path used to SIGKILL fcvm, wait on
+        # fcvm ITSELF, and then unconditionally reap the state file and rmtree
+        # `vm-disks/<vm_id>` — deleting a live microVM's rootfs out from under it
+        # and destroying the only record that it is ours. Measured with a fake
+        # fcvm that forks an unarmed child:
+        #     reaped=['.../state/vm-red.json', '.../vm-disks/vm-red']
+        #     orphan child still alive=True   rootfs still on disk=False
+        # `children_of` MUST be captured before the signal: once fcvm dies,
+        # `/proc/<fcvm>/task/*/children` no longer exists and the survivors are
+        # unrecoverable. This is the same rule teardown_fast enforces.
+        kids = children_of(proc.pid)
+        fds = [pidfd_open(p) for p in kids]
         try:
             os.kill(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -860,10 +1035,35 @@ def run_exec_request(args, rep: int) -> dict:
         except subprocess.TimeoutExpired:
             pass
         rc = -9
+        all_gone = wait_pidfds(fds, args.teardown_timeout)
+        for fd in fds:
+            if fd is not None:
+                os.close(fd)
         # The exec arm never resolves the clone's state file in the happy path, so
         # find it now — by name, since the pid may never have been written.
         sp, state = scan_state(args.state_dir, proc.pid, name)
         dd = os.path.join(args.data_root, "vm-disks", state.get("vm_id", "")) if state else ""
+        rec["all_gone"] = all_gone
+        if not all_gone:
+            survivors = {p: proc_comm(p) for p in kids if proc_stat_fields(p) is not None}
+            rec["survivors"] = survivors
+            rec["disk_reap_skipped"] = True
+            rec["ok"] = False
+            rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
+            rec["rc"] = rc
+            rec["log"] = log
+            for pid in survivors:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            e = SurvivedTeardown(
+                f"exec-arm timeout left {survivors} alive; state {sp} and data {dd} "
+                f"NOT reaped",
+                rec,
+            )
+            e.record = rec
+            raise e
         rec["reaped"] = reap_disk(rec, sp, dd)
     wall = (time.monotonic() - t0) * 1000
     render_ms = None
@@ -910,6 +1110,15 @@ def main() -> int:
     p.add_argument("--teardown-timeout", type=float, default=60.0)
     p.add_argument("--rust-log", default="fcvm=debug")
     args = p.parse_args()
+
+    # EXACTLY ONE backend. With neither flag `clone_backend_args` returned
+    # `["--pid", "0"]` — a silently wrong invocation that would be recorded as
+    # `"backend": "uffd"` in the run metadata. With both, the tag silently wins
+    # and the serve is measured as if it were file-backed. These are different
+    # memory backends with different per-request costs; mixing them is AGENTS.md
+    # defect 1.
+    if bool(args.serve_pid) == bool(args.snapshot_tag):
+        p.error("give exactly one of --serve-pid (UFFD) or --snapshot-tag (FILE)")
 
     args.fcvm = os.path.abspath(args.fcvm)
     args.state_dir = args.state_dir or os.path.join(args.data_root, "state")

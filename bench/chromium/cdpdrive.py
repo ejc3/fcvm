@@ -42,6 +42,7 @@ import socket
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
@@ -89,20 +90,62 @@ def image_dimensions(data: bytes) -> tuple[int, int]:
     return 0, 0
 
 
-def resolve_target(cdp_host: str, deadline: float, retries: int) -> dict:
-    """GET /json/list and pick the page target.
+RESOLVE_RETRY_S = 0.05
+
+
+class TargetNotReady(ConnectionError):
+    """`/json/list` answered, but presented no usable page target in time.
+
+    Distinct from a transport failure ON PURPOSE. `resolve_target` used to raise a
+    bare `ConnectionError` whatever the cause, and `drive()` classifies
+    `ConnectionError` as `transport` — so "no page target among 3", which is pure
+    RESTORE READINESS, inflated the transport-failure count that REVIEW.md's whole
+    `WsClosed` diagnosis rests on. Two different defects must not share a bucket.
+    """
+
+
+def resolve_target(cdp_host: str, deadline: float, retries: int,
+                   host_header: str = "", stats: dict | None = None) -> dict:
+    """GET /json/list and pick the page target. Bounded by the DEADLINE, not by burst.
 
     Chromium's DevTools HTTP handler validates the Host header and rejects values
     that are neither `localhost` nor an IP literal (a 403 that reads like a
     network fault, not an auth fault). We connect by IP, so urllib's default
-    `Host: <ip>:<port>` satisfies the IP-literal branch. `--host-header` exists to
-    prove that specific failure mode rather than argue about it.
+    `Host: <ip>:<port>` satisfies the IP-literal branch. `--host-header` overrides
+    it, to prove that specific failure mode rather than argue about it.
+
+    IT SLEEPS BETWEEN ATTEMPTS. The loop had none: the `timeout` below is
+    urlopen's SOCKET timeout, not an inter-attempt delay, so the retry budget was
+    consumed at line rate and the DEADLINE — the variable that actually expresses
+    the readiness budget — went unused. Measured on this box against a closed port
+    with retries=200 and a 30 s deadline:
+
+        attempts=200  elapsed=40.7 ms  rate=4919 req/s
+        retry budget consumed in 0.041s of a 30.0s deadline -> 0.14% of the window
+
+    Three consequences. `resolve_ms` is a PUBLISHED stage, and the burst happens
+    inside the measured window. A clone 100 ms from ready is recorded as a hard
+    CDP failure, and `reqanalyze` sets `pub = n_bad == 0`, so a single spurious
+    exhaustion censors the arm's median. And 4900 req/s of HTTP is aimed straight
+    at the socat+pasta relay whose drops are under investigation — an uncontrolled
+    variable inside the arm being diagnosed.
+
+    A deterministic 4xx is NOT retried: `urllib.error.HTTPError` subclasses
+    `OSError`, so a 403 from the Host-validation branch used to be retried 200
+    times as though it were a transient socket error.
     """
     last = None
-    for _ in range(max(1, retries)):
+    attempts = 0
+    while True:
+        attempts += 1
+        if stats is not None:
+            stats["resolve_attempts"] = attempts
         try:
             timeout = max(0.05, deadline - time.monotonic())
-            with urllib.request.urlopen(f"http://{cdp_host}/json/list", timeout=timeout) as r:
+            req = urllib.request.Request(f"http://{cdp_host}/json/list")
+            if host_header:
+                req.add_header("Host", host_header)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 targets = json.load(r)
             pages = [
                 t
@@ -112,11 +155,24 @@ def resolve_target(cdp_host: str, deadline: float, retries: int) -> dict:
             if pages:
                 return pages[0]
             last = RuntimeError(f"no page target among {len(targets)}")
+        except urllib.error.HTTPError as e:
+            last = e
+            if 400 <= e.code < 500:
+                raise ConnectionError(
+                    f"CDP target resolution rejected after {attempts} attempt(s): {e} "
+                    f"(deterministic {e.code}; not retryable)"
+                ) from e
         except OSError as e:
             last = e
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= deadline or attempts >= max(1, retries):
             break
-    raise ConnectionError(f"CDP target resolution failed: {last}")
+        time.sleep(min(RESOLVE_RETRY_S, deadline - now))
+    msg = f"CDP target resolution failed after {attempts} attempts: {last}"
+    if isinstance(last, RuntimeError):
+        # The endpoint ANSWERED; it just had no page yet. Readiness, not transport.
+        raise TargetNotReady(msg)
+    raise ConnectionError(msg)
 
 
 class TimedWs:
@@ -203,7 +259,13 @@ def drive(args) -> dict:
             out["target_prewired"] = True
         else:
             t = time.monotonic()
-            target = resolve_target(args.cdp_host, deadline, args.connect_retries)
+            # getattr, not args.host_header: reqbench.run_cdp_request hand-builds
+            # an explicit, CLOSED Namespace, and AttributeError is not in this
+            # function's except tuple — it would escape drive(), be swallowed by
+            # run_cdp_request's `except Exception`, and fail EVERY cdp rep. The
+            # Namespace also carries the field now; both halves, deliberately.
+            target = resolve_target(args.cdp_host, deadline, args.connect_retries,
+                                    getattr(args, "host_header", ""), out)
             ws_url = target["webSocketDebuggerUrl"]
             target_id = target.get("id", "")
             stages["resolve_ms"] = (time.monotonic() - t) * 1000
@@ -291,8 +353,15 @@ def drive(args) -> dict:
         # this driver's own timeout (render.py raises TimeoutError for that), so a
         # failure at ~5 s against a 120 s deadline is a real transport drop in the
         # socat+pasta relay this arm adds and the exec arm does not have.
+        #
+        # `readiness` is checked FIRST and is its own bucket: TargetNotReady
+        # subclasses ConnectionError, so folding it into `transport` would keep
+        # inflating the count REVIEW.md's WsClosed investigation depends on with
+        # clones that were merely still restoring.
         out["failure_class"] = (
-            "transport" if isinstance(e, (render.WsClosed, ConnectionError)) else "render"
+            "readiness" if isinstance(e, TargetNotReady)
+            else "transport" if isinstance(e, (render.WsClosed, ConnectionError))
+            else "render"
         )
     finally:
         if ws is not None:
@@ -319,6 +388,9 @@ def main() -> int:
     p.add_argument("--nav-timing", action="store_true")
     p.add_argument("--print-target", action="store_true",
                    help="print the page target id and exit; nothing else is done")
+    p.add_argument("--host-header", default="",
+                   help="override the Host header on /json/list; proves Chromium's "
+                        "DevTools host validation rejects non-IP, non-localhost names")
     p.add_argument("--render-module", default=os.path.join(HERE, "render.py"))
     args = p.parse_args()
     if args.print_target:
@@ -326,8 +398,11 @@ def main() -> int:
         # and argparse did not have it — so `--print-target` exited 2 with
         # "unrecognized arguments", and NEITHER of the two places that claim the
         # target id can be checked across clones could actually check it.
+        # `--host-header` was the SECOND claim in the same docstring and survived
+        # that round untouched, because the fix did not audit the paragraph it was
+        # editing for the same class of promise.
         target = resolve_target(args.cdp_host, time.monotonic() + args.timeout,
-                                args.connect_retries)
+                                args.connect_retries, args.host_header)
         print(target.get("id", ""), flush=True)
         return 0
     out = drive(args)

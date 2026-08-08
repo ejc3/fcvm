@@ -134,7 +134,16 @@ cmd_golden() {
     # NO --health-check URL: leaving it unset is what makes fcvm consult the
     # image's podman HEALTHCHECK (src/health.rs "AND logic"), which is the real
     # CDP round trip we want as the snapshot trigger.
-    FCVM_NO_SNAPSHOT=1 $SUDO env RUST_LOG=$FCVM_LOG "$FCVM" podman run --name "$name" \
+    # The assignment goes AFTER $SUDO, inside the `env` that follows it. Written
+    # as `FCVM_NO_SNAPSHOT=1 $SUDO env RUST_LOG=... fcvm ...` it binds to `sudo`,
+    # whose default env_reset drops it — RUST_LOG survived only because it already
+    # rode the `env`. bench.sh in this same directory has always done it right.
+    # With the variable dropped, src/commands/podman/mod.rs gates `no_snapshot`
+    # false and this phase — documented as "golden: cold boot" — would RESTORE
+    # from a stale cached snapshot and then snapshot THAT as $TAG, contaminating
+    # every arm derived from it. Latent while SUDO defaults to "", live the moment
+    # anyone uses the documented root-mode hook.
+    $SUDO env FCVM_NO_SNAPSHOT=1 RUST_LOG="$FCVM_LOG" "$FCVM" podman run --name "$name" \
         --cpu "$CPU" --mem "$MEM" --network "$NETMODE" --publish "$CDP_PORT:$CDP_PORT" \
         "$IMAGE" >"$lf" 2>&1 &
     # Capture the handle IMMEDIATELY. The BOOT TIMEOUT path below fires before any
@@ -205,15 +214,24 @@ print(n.get("loopback_ip") or n.get("host_ip") or n.get("guest_ip") or "")')
 }
 
 # Print the page target id for a clone, or nothing.
+#
+# Delegates to cdpdrive.py --print-target rather than hand-rolling the lookup,
+# which fixes TWO defects at once. (1) READINESS: this was a single-shot urlopen
+# with `2>/dev/null || true`, and `start_clone` returns as soon as the state file
+# carries a pid — it never waits for the CDP port (contrast reqbench.py's
+# `wait_port`). Clone 1 is warm because HOPs A/B/C ran against it; clone 2 was
+# queried the instant it registered, so a connection refused produced an empty id
+# and the documented stability gate failed on a RACE. It fails closed, which is
+# the right direction, but a flaky gate is the thing people learn to bypass.
+# (2) FILTER MISMATCH: this took the first `type == "page"`, while the driver that
+# actually consumes the id skips `devtools://` pages — so the two could compare
+# different targets. `resolve_target` now retries against a real deadline and
+# applies the devtools:// filter, and both halves are covered by
+# CdpDriveResolveThrottling in test_reqbench.py.
+TARGET_ID_TIMEOUT="${TARGET_ID_TIMEOUT:-60}"
 target_id() {
-    python3 - "$1" <<'PY' 2>/dev/null || true
-import json, sys, urllib.request
-with urllib.request.urlopen(f"http://{sys.argv[1]}/json/list", timeout=10) as r:
-    for t in json.load(r):
-        if t.get("type") == "page":
-            print(t.get("id") or "")
-            break
-PY
+    python3 "$HERE/cdpdrive.py" "$1" http://unused/ --print-target \
+        --timeout "$TARGET_ID_TIMEOUT" 2>/dev/null || true
 }
 
 cmd_verify() {
@@ -304,43 +322,71 @@ PY
     log "verify: done (clone state/data left for inspection; reqbench.py reaps its own)"
 }
 
+# BOTH memory backends are runnable from here. reqbench.py has had the FILE path
+# fully built (`--snapshot-tag` -> fcvm's `--snapshot <name>`, recorded as
+# `"backend": "file"` in the run metadata) while this driver hardcoded the UFFD
+# serve and never passed `--snapshot-tag` at all — so the recorded metadata was
+# honest but could only ever carry one value, and REVIEW.md's re-run gate
+# (">=200 CDP requests PER BACKEND at 0 failures") was not runnable.
+BACKEND="${BACKEND:-uffd}"
+
 cmd_run() {
     guard_quiet
-    log "run: starting serve for $TAG"
-    local sf="$RESULTS/logs/serve.log"
-    $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
-    local serve_bg=$!
-    track "$serve_bg"
-    local t0=$SECONDS
-    until grep -q "Waiting for VMs" "$sf" 2>/dev/null; do
-        [ $((SECONDS-t0)) -lt 60 ] || { log "run: serve never came up"; cat "$sf" >&2; return 1; }
-        sleep 0.5
-    done
-    local spid; spid=$(grep -oP 'Serve PID: \K[0-9]+' "$sf" | head -1)
-    [ -n "$spid" ] || { log "run: could not read Serve PID from $sf"; return 1; }
-    track "$spid"
-    log "run: serve pid $spid -> reqbench.py"
-    # Guarded: unguarded, ANY non-zero exit from reqbench.py (including its new
+    local rc=0 spid="" serve_bg=""
+    local backend_args=()
+    case "$BACKEND" in
+        uffd)
+            log "run: BACKEND=uffd — starting serve for $TAG"
+            local sf="$RESULTS/logs/serve.log"
+            $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
+            serve_bg=$!
+            track "$serve_bg"
+            local t0=$SECONDS
+            until grep -q "Waiting for VMs" "$sf" 2>/dev/null; do
+                [ $((SECONDS-t0)) -lt 60 ] || { log "run: serve never came up"; cat "$sf" >&2; return 1; }
+                sleep 0.5
+            done
+            spid=$(grep -oP 'Serve PID: \K[0-9]+' "$sf" | head -1)
+            [ -n "$spid" ] || { log "run: could not read Serve PID from $sf"; return 1; }
+            track "$spid"
+            log "run: serve pid $spid -> reqbench.py"
+            backend_args=(--serve-pid "$spid")
+            ;;
+        file)
+            # No serve at all: clones restore MAP_PRIVATE from the snapshot files.
+            log "run: BACKEND=file — no UFFD serve, restoring from $TAG directly"
+            backend_args=(--snapshot-tag "$TAG")
+            ;;
+        *)
+            log "run: unknown BACKEND=$BACKEND (want uffd|file)"; return 2 ;;
+    esac
+    # Guarded: unguarded, ANY non-zero exit from reqbench.py (including its
     # exit 4 when a teardown leaves a survivor) exits the shell under `set -e`
     # before the kill below, leaking the serve into the next phase.
-    local rc=0
-    $SUDO env RUST_LOG=$FCVM_LOG python3 "$HERE/reqbench.py" --serve-pid "$spid" --url "$URL" \
+    $SUDO env RUST_LOG=$FCVM_LOG python3 "$HERE/reqbench.py" "${backend_args[@]}" --url "$URL" \
         --out-dir "$RESULTS" --reps "${REPS:-10}" --warmup "${WARMUP:-2}" \
         --cdp-port "$CDP_PORT" --fcvm "$FCVM" --rust-log "$FCVM_LOG" \
         --arms "${ARMS:-exec,cdp,cdp-fast,noop}" || rc=$?
-    $SUDO kill "$spid" 2>/dev/null || true
-    # WAIT for teardown to finish, so a following phase's guard_quiet does not
-    # race a serve that is still shutting down.
-    wait "$serve_bg" 2>/dev/null || true
-    log "run: results in $RESULTS (reqbench.py exit $rc)"
+    if [ -n "$spid" ]; then
+        $SUDO kill "$spid" 2>/dev/null || true
+        # WAIT for teardown to finish, so a following phase's guard_quiet does not
+        # race a serve that is still shutting down.
+        wait "$serve_bg" 2>/dev/null || true
+    fi
+    log "run: results in $RESULTS (backend=$BACKEND, reqbench.py exit $rc)"
     return $rc
 }
 
-case "${1:-}" in
-    build)  cmd_build ;;
-    golden) cmd_golden ;;
-    verify) cmd_verify ;;
-    run)    cmd_run ;;
-    all)    cmd_build; cmd_golden; cmd_verify; cmd_run ;;
-    *) echo "usage: $0 {build|golden|verify|run|all}" >&2; exit 2 ;;
-esac
+# Only dispatch when EXECUTED. Sourcing the file makes its helpers unit-testable
+# (see ReqbenchShell in test_reqbench.py) instead of reachable only through a
+# whole phase.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    case "${1:-}" in
+        build)  cmd_build ;;
+        golden) cmd_golden ;;
+        verify) cmd_verify ;;
+        run)    cmd_run ;;
+        all)    cmd_build; cmd_golden; cmd_verify; cmd_run ;;
+        *) echo "usage: $0 {build|golden|verify|run|all}" >&2; exit 2 ;;
+    esac
+fi

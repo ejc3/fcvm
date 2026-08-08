@@ -134,6 +134,27 @@ fn opt_running(t: Option<Tracked>) -> bool {
 }
 
 /// Send a signal to a process
+/// SIGTERM, await the exit, escalate only if it hangs.
+///
+/// `Child::kill()` is SIGKILL, which fcvm's `cleanup_vm` cannot survive — so a
+/// fixture torn down with it leaks the VM's state file AND its multi-GB reflinked
+/// `vm-disks/<vm_id>` directory every run, which is exactly the artifact class the
+/// tests in this file exist to police. No process leaks (pdeathsig reaps the
+/// tree), so the leak is invisible to every stray-VM guard.
+///
+/// Signal first, `wait()` second. `Child::kill()` is `start_kill()` + `wait()`, so
+/// it REAPS — a `kill_process(pid)` issued afterwards targets a freed PID, which
+/// is precisely the bare-PID signalling this file's #628 tests exist to forbid.
+async fn graceful_shutdown(child: &mut tokio::process::Child, pid: u32) {
+    let _ = send_signal(pid, "TERM");
+    if tokio::time::timeout(Duration::from_secs(30), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+}
+
 fn send_signal(pid: u32, signal: &str) -> Result<()> {
     let output = Command::new("kill")
         .arg(format!("-{}", signal))
@@ -1712,10 +1733,18 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
             Err(e) => {
                 common::kill_process(clone_pid).await;
                 let _ = clone_child.wait().await;
-                let _ = serve_child.kill().await;
-                let _ = base_child.kill().await;
-                common::kill_process(base_pid).await;
-                common::kill_process(serve_pid).await;
+                // GRACEFUL, not `Child::kill()` — see `graceful_shutdown`. A
+                // SIGKILLed baseline leaks its state file and its reflinked
+                // vm-disks dir, which this very test asserts about for the clone.
+                graceful_shutdown(&mut serve_child, serve_pid).await;
+                graceful_shutdown(&mut base_child, base_pid).await;
+                // The snapshot is uniquely tagged per run (`unique_names`), so
+                // nothing ever overwrites it: without an explicit delete it
+                // accumulates one guest-RAM `memory.bin` (default --mem 1024 MiB)
+                // plus vmstate and a reflinked disk per run. Ordering is
+                // load-bearing — `snapshot serve` holds memory.bin open and takes
+                // the snapshot-dir lock, so the delete must come AFTER it is dead.
+                let _ = common::delete_snapshot(&snapshot_name).await;
                 return Err(e);
             }
         };
@@ -1724,55 +1753,62 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
             fc.pid, holder.pid, pasta.pid
         );
 
-        // State files are keyed by vm_id (a UUID), NOT by the VM's name — find this
-        // clone's file by its recorded fcvm pid, the same way reqbench.py does. The data
-        // directory is `<data_root>/vm-disks/<vm_id>`; both must survive the SIGKILL.
-        let (state_file, data_dir) = {
-            let dir = fcvm::paths::state_dir();
-            let mut found = None;
-            for entry in std::fs::read_dir(&dir).context("reading state dir")? {
-                let path = entry?.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-                    continue;
-                };
-                if v.get("pid").and_then(|p| p.as_u64()) == Some(clone_pid as u64) {
-                    // NEVER default this. `vm_runtime_dir("")` is `<data_dir>/vm-disks`
-                    // ITSELF, and this test later calls `remove_dir_all` on that path — so
-                    // a state file missing `vm_id` would delete every VM's disks on the
-                    // machine, including those of tests running concurrently in CI. A
-                    // missing id means the state file is not what we think it is; fail
-                    // loudly instead of computing a path that is catastrophic when wrong.
-                    let vm_id = v
-                        .get("vm_id")
-                        .and_then(|s| s.as_str())
-                        .filter(|s| !s.is_empty())
-                        .with_context(|| {
-                            format!(
-                                "state file {} matched the clone PID but carries no vm_id; \
+        // State files are keyed by vm_id (a UUID), NOT by the VM's name — find a VM's
+        // file by its recorded fcvm pid, the same way reqbench.py does. The data
+        // directory is `<data_root>/vm-disks/<vm_id>`.
+        let artifacts_for =
+            |want_pid: u32| -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
+                let dir = fcvm::paths::state_dir();
+                for entry in std::fs::read_dir(&dir).context("reading state dir")? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    if v.get("pid").and_then(|p| p.as_u64()) == Some(want_pid as u64) {
+                        // NEVER default this. `vm_runtime_dir("")` is `<data_dir>/vm-disks`
+                        // ITSELF, and this test later calls `remove_dir_all` on that path — so
+                        // a state file missing `vm_id` would delete every VM's disks on the
+                        // machine, including those of tests running concurrently in CI. A
+                        // missing id means the state file is not what we think it is; fail
+                        // loudly instead of computing a path that is catastrophic when wrong.
+                        let vm_id = v
+                            .get("vm_id")
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.is_empty())
+                            .with_context(|| {
+                                format!(
+                                    "state file {} matched PID {} but carries no vm_id; \
                                  refusing to derive a runtime directory from an empty id",
-                                path.display()
-                            )
-                        })?
-                        .to_string();
-                    let dir = fcvm::paths::vm_runtime_dir(&vm_id);
-                    anyhow::ensure!(
-                        dir.starts_with(fcvm::paths::data_dir().join("vm-disks"))
-                            && dir != fcvm::paths::data_dir().join("vm-disks"),
-                        "refusing to treat {} as a per-VM runtime directory",
-                        dir.display()
-                    );
-                    found = Some((path, dir));
-                    break;
+                                    path.display(),
+                                    want_pid
+                                )
+                            })?
+                            .to_string();
+                        let dir = fcvm::paths::vm_runtime_dir(&vm_id);
+                        anyhow::ensure!(
+                            dir.starts_with(fcvm::paths::data_dir().join("vm-disks"))
+                                && dir != fcvm::paths::data_dir().join("vm-disks"),
+                            "refusing to treat {} as a per-VM runtime directory",
+                            dir.display()
+                        );
+                        return Ok(Some((path, dir)));
+                    }
                 }
-            }
-            found.context("no state file recorded for the clone")?
-        };
+                Ok(None)
+            };
+        // The clone's pair must survive the SIGKILL (asserted below).
+        let (state_file, data_dir) =
+            artifacts_for(clone_pid)?.context("no state file recorded for the clone")?;
+        // The BASELINE's pair, captured now so the fixture's own teardown can be
+        // held to the same standard. It is torn down gracefully, so fcvm's
+        // `cleanup_vm` runs and BOTH of these must be GONE afterwards.
+        let base_artifacts = artifacts_for(base_pid)?;
 
         // THE FAST TEARDOWN: one signal to fcvm. Nothing else is signalled by us.
         send_signal(clone_pid, "KILL").context("SIGKILL to clone fcvm")?;
@@ -1801,13 +1837,35 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         let state_survived = state_file.exists();
         let data_survived = data_dir.is_dir();
 
-        // Clean up the rest of the fixture before asserting, so a failure does not also leak.
-        let _ = serve_child.kill().await;
-        let _ = base_child.kill().await;
-        common::kill_process(base_pid).await;
-        common::kill_process(serve_pid).await;
+        // Clean up the rest of the fixture before asserting, so a failure does not also
+        // leak. GRACEFULLY: this block used to be `serve_child.kill()` +
+        // `base_child.kill()` (both SIGKILL) followed by `kill_process()` calls against
+        // already-reaped PIDs, so fcvm's `cleanup_vm` never ran for the baseline or the
+        // serve and every run left behind the baseline's state file, its multi-GB
+        // reflinked `vm-disks/<vm_id>`, the serve's state file and its uffd socket.
+        // Proven by this test's OWN passing assertions below: SIGKILL => both artifacts
+        // survive. It reaped them for the clone and not for the fixture.
+        graceful_shutdown(&mut serve_child, serve_pid).await;
+        graceful_shutdown(&mut base_child, base_pid).await;
+        // AFTER the serve is dead, never before: `snapshot serve` holds memory.bin
+        // open and takes the snapshot-dir lock, so removing the directory under a
+        // live UFFD server pulls files out from under it. The tag is unique per run
+        // (`unique_names`), so nothing ever overwrote it and each run left a guest-RAM
+        // memory.bin (default --mem 1024 MiB) + vmstate + a reflinked disk behind.
+        // ONLY this tag: the baseline may also have populated the image-keyed SYSTEM
+        // startup-snapshot cache, which is shared and intended to persist.
+        let snapshot_delete = common::delete_snapshot(&snapshot_name).await;
+        let snapshot_leaked = common::snapshot_exists(&snapshot_name);
         std::fs::remove_file(&state_file).ok();
         std::fs::remove_dir_all(&data_dir).ok();
+
+        let base_leak = base_artifacts
+            .as_ref()
+            .map(|(s, d)| (s.exists(), d.is_dir()));
+        if let Some((s, d)) = &base_artifacts {
+            std::fs::remove_file(s).ok();
+            std::fs::remove_dir_all(d).ok();
+        }
 
         assert!(
             survivors.is_empty(),
@@ -1836,6 +1894,40 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
              copy of the golden rootfs, so a harness that does not reap it leaks disk without \
              leaking a process — invisible to every stray-VM guard.",
             data_dir.display()
+        );
+
+        // ...and the FIXTURE is held to the same standard as the thing under test.
+        // The baseline is torn down with SIGTERM, so `cleanup_vm` runs and both of
+        // its artifacts must be gone. With the old `Child::kill()` teardown they
+        // both survived — by this test's own state_survived/data_survived logic —
+        // and every run leaked a state file plus a multi-GB reflinked rootfs.
+        if let (Some((s, d)), Some((s_left, d_left))) = (&base_artifacts, base_leak) {
+            assert!(
+                !s_left && !d_left,
+                "the BASELINE VM's teardown leaked: state_file_left={} ({}) \
+                 data_dir_left={} ({}). It must be shut down with SIGTERM so fcvm's \
+                 cleanup_vm runs; Child::kill() is SIGKILL and cleanup_vm cannot \
+                 survive it.",
+                s_left,
+                s.display(),
+                d_left,
+                d.display()
+            );
+        }
+
+        // Each run creates a uniquely-tagged snapshot (`unique_names`), so without an
+        // explicit delete they accumulate one guest-RAM memory.bin + vmstate +
+        // reflinked disk per run. `let _ = delete_snapshot(...)` alone would swallow a
+        // failed delete and reinstate the leak, which is the reasoning
+        // bench/chromium/reqbench.py applies to rmtree ("never ignore_errors=True").
+        snapshot_delete.with_context(|| format!("deleting snapshot {}", snapshot_name))?;
+        assert!(
+            !snapshot_leaked,
+            "leaked snapshot {} — this test creates a uniquely-tagged memory+disk \
+             snapshot per run, so without an explicit delete they accumulate one per \
+             run. Bounded only by `make clean-test-data`, and the CI counter that \
+             prints snapshot entries does not gate the run.",
+            snapshot_name
         );
 
         println!("test_bench_fast_teardown_leaks_nothing_clone PASSED");

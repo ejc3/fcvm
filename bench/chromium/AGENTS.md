@@ -91,8 +91,13 @@ nothing. Every rule below exists because one of them broke.
   site-isolation-off while actively rendering. RSS counts each shared page once per
   process, and the baseline runs 10–11 processes vs 5. Use PSS.
 - **PNG encoding, not rasterization, dominates screenshot cost** (Chromium devs
-  profiled it; CDP's `optimizeForSpeed` exists for this). JPEG q80 measured −40%
-  screenshot, −21% whole request in-VM.
+  profiled it; CDP's `optimizeForSpeed` exists for this). JPEG q80 measured
+  −28.8% on the screenshot STAGE (−52.9 ms, CI −63.8…−44.8) and −8.3% on the
+  whole request (−65.8 ms, CI −83.1…−42.6), n=12, `corrected.json` ->
+  `screenshot_format`. This line used to read "−40% screenshot, −21% whole
+  request"; both figures are contradicted by the record run and REVIEW.md marks
+  the −21% claim **REFUTED AS STATED**. The screenshot is only ~18% of the
+  request, which is why a −29% stage win is an −8% request win.
 - **`--deterministic-mode` is a trap on aarch64** — it bundles
   `--disable-skia-runtime-opts`, disabling NEON in exactly the raster/encode path
   you care about. Take its sub-flags selectively.
@@ -197,37 +202,66 @@ cost that design would have removed, and it must be reported rather than quietly
 dropped. `render.py`'s `connect` stage — `/json/list` + TCP + the RFC 6455 upgrade —
 is what to look at.
 
-**These are scavenged from existing logs, NOT a benchmark.** They are here so the
-number is not lost and so a proper measurement has something to disagree with. All
-three are the *in-guest* connect to `127.0.0.1:9222`, so they exclude the host↔guest
-hop that the chosen design adds; a host-driven connect over fcvm port forwarding
-will be **larger** than every figure below.
+**The only auditable figure is the primary cell of the record run.** It is
+`corrected.json` -> `primary_cell.stages.r_connect_ms`:
 
-| Source | n | p50 | p90 | max |
-|---|---|---|---|---|
-| host container, no VM (`scratchpad/cb/*.jsonl`) | 1332 | 3.5 ms | 10.4 ms | 15.4 ms |
-| restored clone, quiet box (`scratchpad/cb/vmlogs/clone-*.log`) | 104 | 10.7 ms | 13.8 ms | 15.4 ms |
-| restored clone, under benchmark load (`results/20260808-corrected/requests/*.log`) | 1138 | 19.1 ms | 30.5 ms | 39.2 ms |
+| Source | n | median | 95% CI |
+|---|---|---|---|
+| restored clone, primary cell, one request at a time (`corrected.json`) | 12 | 16.7 ms | 16.4–16.9 ms |
 
-The single `connect_ms=13.3` sample that has been quoted around this work is one
-draw from row 2 (`clone-base-png-medium-1.log`) — roughly its p85, and **not** a
-container-local figure. Do not cite it as a point estimate.
+That is the *in-guest* connect to `127.0.0.1:9222`, so it excludes the host↔guest
+hop the chosen design adds; a host-driven connect over fcvm port forwarding will
+be **larger**.
 
-Note the load sensitivity: p50 nearly doubles from quiet box to loaded box. Any
-per-request CDP handshake number is only meaningful with the concurrency stated
-next to it. `results/…` rows exclude the `url=noop` drift-control probe, which
-prints a hardcoded `connect_ms=0.0`.
+**Three scavenged rows were deleted from this table on 2026-08-08.** They quoted
+a host-container p50 of 3.5 ms (n=1332), a quiet-box clone p50 of 10.7 ms
+(n=104), and a loaded-box p50 of 19.1 ms (n=1138), and concluded "p50 nearly
+doubles from quiet box to loaded box". None of the three is auditable from this
+repo: the first two cite `scratchpad/`, which `git ls-tree` shows is not in the
+tree at all, and the third cites a `requests/*.log` directory under a `results/`
+path that `.gitignore` excludes — so all three violate this file's own
+Deliverables rule 3 ("every figure traceable to a raw record"), and the only
+comparative claim in the block rested entirely on the two uncommitted ones. The
+19.1 ms figure ALSO sat unreconciled next to REVIEW.md's 16.7 ms (16.4–16.9) for
+the same stage in the same PR — two point estimates of one quantity, the exact
+defect the `snapshot-load` entry below was written about. They are different
+populations (all cells and concurrencies under load, vs the primary cell one at a
+time), which is a fine explanation that neither document was making. If the
+load-sensitivity claim matters, re-measure it and commit the record.
+
+`results/…` figures exclude the `url=noop` drift-control probe, which prints a
+hardcoded `connect_ms=0.0`. Any per-request CDP handshake number is only
+meaningful with the concurrency stated next to it.
 
 ## The request-optimized path (CDP direct + fast teardown)
 
-The measured 573 ms request breaks into ~145 ms of request-INDEPENDENT process
-startup, ~226 ms of actual render, and ~154 ms of teardown that runs AFTER the
-screenshot already exists. The hypervisor restore is **~6 ms** — the single
-`snapshot-load` figure from the reference table above; this line used to say 4 ms
-and the table 5.8 ms, which was two point estimates of one quantity disagreeing
-by 45% with no interval between them. Two changes attack the two non-render
-parts; they are separate arms in `reqbench.py` so they can be attributed
-separately.
+Every figure below is `corrected.json` -> `primary_cell.stages`, n=12, cell
+`rootless-proxy`/`uffd-4k`/`medium`/JPEG q80, with its 95% CI:
+
+- **request-independent startup ~305 ms** — restore 52.9 (52.0–54.0) + fcvm exec
+  handshake 28.0 (27.0–29.5) + guest command start 224.5 (217.0–232.0).
+- **render ~356 ms** — CDP handshake 16.7 (16.4–16.9) + page load 204.0
+  (196.6–207.3) + screenshot 133.8 (120.8–144.2) + DOM 1.8 (1.6–2.1).
+- **teardown 175.1 ms (150.4–194.9)**, entirely AFTER the artifact exists.
+- **total 890.6 ms (869.6–928.9)**; artifact 730.1 (708.4–741.1).
+
+So startup is ~34% and teardown ~20% of wall clock — both attackable, which is
+the design argument. Two changes attack the two non-render parts; they are
+separate arms in `reqbench.py` so they can be attributed separately.
+
+*This paragraph used to read "the measured 573 ms request breaks into ~145 ms of
+request-INDEPENDENT process startup, ~226 ms of actual render, and ~154 ms of
+teardown". Three defects: `git grep 573` found exactly two hits — this line and a
+comment in `reqbench.py` citing this line, a circular citation and not evidence;
+145 + 226 + 154 = 525, forty-eight milliseconds short of 573, unattributed and
+unmentioned; and REVIEW.md L3 says "Quote only from `20260808-corrected`", whose
+primary cell is 890.6 ms total, not 573. No committed artifact on this branch
+produces 573 ms.*
+
+The hypervisor restore is **~6 ms** — the single `snapshot-load` figure from the
+reference table above; this line used to say 4 ms and the table 5.8 ms, which was
+two point estimates of one quantity disagreeing by 45% with no interval between
+them.
 
 **Chromium's CDP endpoint IS the request server.** Do not wrap it. An earlier
 design put a resident Python server in the guest speaking a bespoke JSON protocol
@@ -249,8 +283,15 @@ podman-only reproduction (no VM). Each fails SILENTLY.
 `podman build` prints `HEALTHCHECK is not supported for OCI image format and will
 be ignored` as a *warning* and succeeds. The image then has no healthcheck, fcvm's
 health gate never sees one, and the golden snapshot triggers on the wrong
-condition. **Build with `--format docker`.** Verify:
-`podman inspect <img> --format '{{json .HealthCheck}}'` must print the Test array.
+condition. **Build with `--format docker`.** Verify with a command that FAILS —
+"must print the Test array" is an instruction to a human, inside a block designed
+to be pasted, and it exits 0 either way. This is the check `reqbench.sh` already
+gates on, so there is one gate to keep correct rather than two:
+
+```bash
+podman image inspect <img> --format '{{json .HealthCheck}}' \
+  | grep -q cdp_health || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
+```
 
 **2. `--remote-debugging-address=0.0.0.0` IS IGNORED by chromium 151.0.7922.71
 (Debian bookworm arm64).** The flag is present in `/proc/<pid>/cmdline` and
@@ -403,6 +444,15 @@ this list now points at it rather than contradicting it.
   quote a burst figure as throughput.
 - "7.9 vs 5.3 req/GB" (slope without intercept) — **REPLACED** (REVIEW.md row 4).
 - ~70 ms of the 310 ms file-vs-UFFD gap — **RESOLVED** (REVIEW.md row 5).
+- "JPEG q80 −21% per request" — **REFUTED AS STATED** (REVIEW.md, SURVIVED table).
+  The screenshot-STAGE win is real (−28.8%); the whole-request win is −8.3%. This
+  list omitted the claim entirely while the Chromium-findings section above kept
+  publishing the refuted number, which is precisely the disagreement the preamble
+  above says this list exists to end.
+- every figure from the `reqbench` CDP A/B — **WITHDRAWN IN FULL** (REVIEW.md,
+  "The CDP-path A/B"). `exec 565 ms`, `cdp 384 ms`, `cdp-fast 372 ms`,
+  `PART 1 −180.5 ms`, `reclaim CPU 0.00 ms`, the `+610.4 ms` machine cost and the
+  `pasta 704 ms` straggler are all withdrawn; do not quote any of them.
 
 `REVIEW.md` is the ledger of what holds and what doesn't. **Update it every run.**
 

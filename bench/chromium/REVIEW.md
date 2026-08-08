@@ -27,11 +27,23 @@ harness defect that caused it is fixed in this PR with a regression test.
 | "Early response converts teardown from latency into throughput cost" — REFUTED | The refutation rested on the two rows above (the machine-cost figure and the pasta straggler). Both are withdrawn, so the refutation is withdrawn with them. The premise returns to **untested**, not to supported. |
 | `n` for every CDP arm | The harness aborted the whole run on any per-rep exception (`run_exec_request` had a bare `proc.wait(timeout=...)`), and a dropped rep produced no record. So the denominators are not auditable from the artifact. |
 
-**Availability gate for the re-run.** Per AGENTS.md's amplification discipline: at
-least **200 CDP requests per backend at 0 failures** before any CDP latency figure
-is quoted. At 0/200 the CP upper bound is 1.5%, which is the first point at which
+**Availability gate for the re-run.** Per the two-sided Clopper-Pearson convention
+used throughout this file: at least **200 CDP requests per backend at 0 failures**
+before any CDP latency figure is quoted. At 0/200 the CP upper bound is 1.8%
+(`reqanalyze.clopper_pearson(0, 200)` -> [0.000%, 1.828%]); n=200 is where the
+zero-failure upper bound first falls below 2%, which is the first point at which
 "we do not drop requests" is a defensible statement rather than a hope. Today the
 observed rates are ~1 in 60 (file) and ~1 in 10 (UFFD), so this gate fails loudly.
+
+*(This said **1.5%** and attributed the gate to "AGENTS.md's amplification
+discipline". 1.5% is the ONE-sided bound, `1 - 0.05**(1/200) = 1.487%`, i.e. 22%
+tighter than the data supports and inconsistent with the convention this file
+declares four paragraphs below; and AGENTS.md's only amplification passage is the
+ANGLE parity trap — it contains no availability gate, so the attribution was
+invented. Six of this file's seven bounds reproduce exactly against
+`reqanalyze.clopper_pearson`; this was the sole outlier, and
+`DocLint.test_every_binomial_bound_matches_reqanalyze_clopper_pearson` now
+recomputes every one of them.)*
 
 **Root cause of the `WsClosed` drops: still undetermined.** `render.py`'s
 `_recv_until` discarded any bytes the peer coalesced past the `\r\n\r\n` of the
@@ -44,7 +56,7 @@ it is the only arm that fails.
 
 **"0 failures" is not a 0% failure rate.** Every success count in this file is
 exact-binomial bounded, not a guarantee: **0/426 is [0, 0.86%]**, **0/462 is
-[0, 0.79%]**, and the single timeout at the `minor`-4K cell is **1/459 = 0.22%
+[0, 0.80%]**, and the single timeout at the `minor`-4K cell is **1/459 = 0.22%
 [0.006%, 1.21%]** (Clopper-Pearson, 95%, two-sided; `reqanalyze.clopper_pearson`
 computes these). Quote the interval whenever the count is used to support a
 claim about reliability.
@@ -63,7 +75,7 @@ change mid-run (sha256 in `hostinfo.json`).
 |---|---|---|
 | 1 | "fcvm marginal memory beats a warm container pool (129 vs 151 MiB)" | **SUPPORTED, but much smaller than claimed, and only for some backends.** On a matched cgroup basis: file-backed **143.5 ± 0.4** vs pool **156.5 ± 5.0** MiB/req — an 8% win, not a comfortable one. UFFD copy-mode **loses** (257.8 ± 1.1). UFFD `minor` wins clearly (132.5 ± 1.0 at 4K; **34.7 ± 0.4** with hugepages). |
 | 2 | any egress-mode *ordering* | **STILL NOT SUPPORTED.** The confound is gone (drift term −68.8 ± 51.9 ms/h, n.s.) and within-run SE is now 8.4 ms, but run-to-run shifts reach 52 ms and the IPv6 modes swap rank. Only "the two IPv4 rootless modes are fastest" reproduces; total spread ~110 ms of ~800 ms. |
-| 3 | "16 clones sustain 5.5–6.3 req/s" | **SUPERSEDED.** Throughput, file-backed N=16, sustained phase: **7.26 rps**, 462/462 completed. That is the throughput figure. *Burst figures are NOT throughput and must not be quoted as such* (see the binding requirement below); for completeness the burst cell, with the burst as the experimental unit (5 bursts/cell), came out at 6.44 requests-per-burst-window (CI 6.37–6.70) file-backed and 7.39 (7.16–7.67) hugepage-minor — i.e. the burst *understates* capacity, which is why leading with it was the original defect. |
+| 3 | "16 clones sustain 5.5–6.3 req/s" | **SUPERSEDED.** Throughput, file-backed N=16, sustained phase: **7.3 rps** — 462 completions in 63.6 s, a **SINGLE** sustained window per cell, so n=1 window and no run-to-run rate interval is derivable from the data as collected (the burst cells are replicated 5x and do carry CIs). all 462 launched requests completed — 0/462 incomplete, CP 95% [0, 0.80%]. *Burst figures are NOT throughput and must not be quoted as such* (see the binding requirement below); for completeness the burst cell, with the burst as the experimental unit (5 bursts/cell), came out at 6.4 req/s measured **within** the burst window (CI 6.4–6.7) file-backed and 7.4 (7.2–7.7) hugepage-minor — i.e. the burst *understates* capacity, which is why leading with it was the original defect. |
 | 4 | "7.9 vs 5.3 req/GB" (slope without intercept) | **REPLACED.** Slopes now carry intercepts and SEs and req/GiB is quoted at concrete N. At N=8: hugepage-minor 27.7, minor-4K 7.5, file-4K 7.0, pool 5.5, copy-4K 3.9. |
 | 5 | ~70 ms of the file-vs-UFFD gap unattributable at `RUST_LOG=info` | **RESOLVED.** At debug the exec retry ladder logged **0.0 ms cumulative retry wait in all 426 requests** (max 0.0) — the quantization is absent, not merely smaller. |
 
@@ -83,8 +95,11 @@ change mid-run (sha256 in `hostinfo.json`).
   concurrent request** (MemAvailable basis 29.1 ± 1.1) — 4.5x better than the warm container pool
   and 7.4x better than UFFD copy-mode. At 4K: 132.5 ± 1.0.
 - **`minor` buys memory, not rate.** At a sustained 8 rps the 4K `minor` cell needed 165 s to
-  drain 459 requests (2.78 rps achieved, p50 1224 ms, 1 request timed out) while file-backed held
-  7.26 rps with 462/462 complete. The serve process is the bottleneck.
+  drain 459 requests (2.8 rps achieved, p50 1224 ms, 1 request timed out — 1/459 = 0.22%
+  [0.006%, 1.21%]) while file-backed held 7.3 rps with 462/462 complete. Both rates come from a
+  SINGLE window per cell, so neither carries a run-to-run interval; the 2.6x gap is far larger
+  than any plausible one-window spread, which is why the *direction* is quoted and the third
+  significant figure is not. The serve process is the bottleneck.
 - **End-to-end request, measured end to end in one run** (not composed): artifact **730.0 ms**
   (708.4–741.0), total **890.6 ms** (869.6–929.0).
 - **The guest-side exec cost is attributed by measurement.** An interleaved shell-only control

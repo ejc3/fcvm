@@ -19,7 +19,11 @@ Every rule here exists because of a defect listed in bench/chromium/AGENTS.md:
     differently censored and their difference is not a like-for-like comparison.
     Each arm therefore reports attempted/failed with an exact (Clopper-Pearson)
     binomial interval, and any arm that dropped a request is marked
-    `publishable: false`. "0 failures" is not a 0% rate: 0/426 is [0, 0.70%].
+    `publishable: false`. "0 failures" is not a 0% rate: 0/426 is [0, 0.86%].
+    (This line said 0.70% while `clopper_pearson`'s own docstring 80 lines below
+    said 0.86% for the same k/n — two point estimates of one quantity disagreeing
+    inside one file, which is defect 6's cousin and exactly what the AGENTS.md
+    `snapshot-load` entry was written about. The function computes 0.862%.)
   * THE LEAK CHECK RUNS OVER EVERY ATTEMPT, NOT OVER THE SUCCESSES. A request
     that failed is exactly the one whose teardown is most likely to have leaked,
     and filtering it out reported `all_gone: 27/27 confirmed` on a set containing
@@ -144,10 +148,38 @@ def hodges_lehmann_shift(a, b, iters=20000, seed=999):
     return d, boots[int(0.025 * iters)], boots[int(0.975 * iters) - 1]
 
 
+def failure_label(r: dict) -> str:
+    """The failure string an operator needs, wherever the producer put it.
+
+    `r.get("error", f"rc={r.get('rc')}")` alone reported every CDP drop as
+    `rc=None`: `run_cdp_request` nests the whole cdpdrive result under `render`,
+    and on a clean `ok: false` (cdpdrive returning rather than raising) the top
+    level carried no `error` at all. The producer now lifts the label, but the
+    analyzer is the PUBLICATION GATE reading a JSONL artifact that outlives the
+    producer, so it reads both and prefers the top level.
+    """
+    return (
+        r.get("error")
+        or (r.get("render") or {}).get("error")
+        or f"rc={r.get('rc')}"
+    )
+
+
+def failure_class(r: dict) -> str:
+    """Transport / readiness / render, wherever the producer put it."""
+    return (
+        r.get("failure_class")
+        or (r.get("render") or {}).get("failure_class")
+        or "unknown"
+    )
+
+
 def main_with(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("jsonl", nargs="+")
     ap.add_argument("--json-out", default="")
+    ap.add_argument("--no-gate", action="store_true",
+                    help="exit 0 even when this run is unpublishable (exploratory only)")
     args = ap.parse_args(argv)
 
     recs, metas = load(args.jsonl)
@@ -166,10 +198,9 @@ def main_with(argv=None):
     print(f"\n  records: {len(recs)}  warmup DISCARDED: {len(warm)}  "
           f"measured: {len(live)}  ok: {len(ok)}  failed: {len(bad)}")
     if bad:
-        seen = {}
+        seen: dict = {}
         for r in bad:
-            seen.setdefault(r.get("error", f"rc={r.get('rc')}"), 0)
-            seen[r.get("error", f"rc={r.get('rc')}")] += 1
+            seen[failure_label(r)] = seen.get(failure_label(r), 0) + 1
         for k, v in sorted(seen.items(), key=lambda kv: -kv[1]):
             print(f"    FAILURE x{v}: {k}")
 
@@ -206,10 +237,25 @@ def main_with(argv=None):
         print(f"  {a:9s} {n_att - n_bad}/{n_att} completed   "
               f"failure {100 * n_bad / n_att if n_att else 0:.1f}% "
               f"[{100 * lo:.2f}%, {100 * hi:.2f}%] 95% CP{note}")
+        # A transport drop, a readiness exhaustion and a render error are three
+        # different defects and must not share one bucket in the artifact. This is
+        # what makes REVIEW.md's "200 CDP requests per backend at 0 failures" gate
+        # checkable from the analyzer's own output instead of by hand-reading
+        # jsonl — and `failure_class` was, until now, written by cdpdrive and read
+        # by nothing at all.
+        classes: dict = {}
+        for r in attempted[a]:
+            if not r.get("ok"):
+                c = failure_class(r)
+                classes[c] = classes.get(c, 0) + 1
+        if classes:
+            print("            failure classes: "
+                  + ", ".join(f"{k}={v}" for k, v in sorted(classes.items())))
         out["arms"].setdefault(a, {}).update(
             attempted=n_att, failed=n_bad,
             failure_rate=(n_bad / n_att) if n_att else None,
             failure_rate_ci=[lo, hi], publishable=pub,
+            failure_classes=classes,
         )
     if any_unpublishable:
         print("  Arms are DIFFERENTLY CENSORED, so a cross-arm delta below is not a")
@@ -288,7 +334,13 @@ def main_with(argv=None):
 
     # ---- 4. CDP stage decomposition (the per-request connect cost this design ADDS)
     print("\n" + "-" * 78)
-    print("CDP ARMS: per-request stage decomposition (host -> clone over forward-localhost)")
+    # NOT "forward-localhost". That flag is GUEST -> HOST (bench/chromium/AGENTS.md,
+    # src/cli/args.rs: "Enables containers to reach host-only services via
+    # localhost"), so it cannot carry this path in this direction — and pointing it
+    # at the CDP port HIJACKS the guest's own loopback listener. What is actually
+    # measured is `--publish <relay>:<relay>` to guest eth0, then entry.sh's socat
+    # to guest loopback 9222. reqbench.sh never passes --forward-localhost.
+    print("CDP ARMS: per-request stage decomposition (host -> --publish -> guest relay)")
     print("-" * 78)
     stage_keys = ["resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms", "connect_total_ms",
                   "navigate_ms", "screenshot_ms", "total_ms"]
@@ -333,6 +385,7 @@ def main_with(argv=None):
     print("\n" + "-" * 78)
     print("TEARDOWN -- three numbers, deliberately not summed into one")
     print("-" * 78)
+    any_unconfirmed_teardown = False
     for a in arms:
         # `attempted`, NOT `by`: see the module docstring. A failed request's
         # teardown is the one most likely to have leaked.
@@ -410,22 +463,57 @@ def main_with(argv=None):
                     out["arms"][a]["reclaim_cpu_ms_by_child"].setdefault(cname, {})[
                         "lower_bound"] = dict(zip(("median", "lo", "hi", "n"), m))
 
+        # CLASSIFY ON True, NOT ON False. `ag.count(False)` drove the warning
+        # gate while `len(ag)` drove the denominator, so a null or an absent
+        # `all_gone` landed in the denominator and OUT of the gate: 27 confirmed
+        # + 2 null + 1 missing printed `all_gone: 27/30 confirmed` with no
+        # warning and no per-rep dump — the numerator and denominator disagreeing
+        # by three while the report reads clean. Exactly the failure mode this
+        # section exists to prevent (see the module docstring). Today's producer
+        # cannot emit a non-bool here, but the analyzer is the publication gate
+        # for an artifact that outlives the producer.
         ag = [t.get("all_gone") for t in td]
-        leaked = ag.count(False)
-        print(f"    all_gone: {ag.count(True)}/{len(ag)} confirmed"
-              + (f"  ** {leaked} NOT CONFIRMED GONE **" if leaked else ""))
-        out["arms"][a]["all_gone_confirmed"] = [ag.count(True), len(ag)]
-        if leaked:
+        confirmed = ag.count(True)
+        unconfirmed = len(ag) - confirmed
+        print(f"    all_gone: {confirmed}/{len(ag)} confirmed"
+              + (f"  ** {unconfirmed} NOT CONFIRMED GONE **" if unconfirmed else ""))
+        out["arms"][a]["all_gone_confirmed"] = [confirmed, len(ag)]
+        # Kept separate so "we watched it survive" is distinguishable from "we
+        # have no evidence either way".
+        out["arms"][a]["all_gone_no_evidence"] = sum(
+            1 for x in ag if x is not True and x is not False)
+        if unconfirmed:
+            any_unconfirmed_teardown = True
             for r in attempted[a]:
                 t = r.get("teardown") or {}
-                if t.get("all_gone") is False:
+                if t.get("all_gone") is not True:
                     print(f"      rep {r.get('rep')} ok={r.get('ok')} "
+                          f"all_gone={t.get('all_gone')!r} "
                           f"survivors={t.get('survivors') or t.get('children')}")
 
+    out["publishable"] = not (any_unpublishable or any_unconfirmed_teardown)
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump(out, f, indent=2, default=str)
         print(f"\nwrote {args.json_out}")
+
+    # GATE, do not merely narrate. This returned 0 on every path: an unpublishable
+    # arm, an unconfirmed teardown and a detected drift all exited 0 while stdout
+    # said ** DO NOT PUBLISH THIS ARM'S LATENCY **. Measured end to end: a run with
+    # 10% cdp transport censoring printed the banner and exited 0. A benchmark
+    # harness that exits 0 on a run it has itself marked DO NOT PUBLISH will
+    # eventually have those numbers quoted by someone who only checked the exit
+    # code.
+    if not out["publishable"]:
+        why = []
+        if any_unpublishable:
+            why.append("an arm dropped requests")
+        if any_unconfirmed_teardown:
+            why.append("a teardown was not confirmed gone")
+        print(f"\nUNPUBLISHABLE RUN ({'; '.join(why)}). Exiting 5.")
+        print("Pass --no-gate to keep an exploratory run at exit 0.")
+        if not args.no_gate:
+            return 5
     return 0
 
 
