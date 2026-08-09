@@ -1,0 +1,33 @@
+{
+  "run_attempt": 1,
+  "jobs": [
+    {
+      "id": 1001,
+      "name": "Host-Root-arm64-SnapshotEnabled",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "test-root", "status": "completed", "conclusion": "cancelled"},
+        {"name": "Upload test logs", "status": "completed", "conclusion": "skipped"}
+      ]
+    },
+    {
+      "id": 1002,
+      "name": "Summary",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "Fail if any gating job did not succeed", "status": "completed", "conclusion": "failure"},
+        {"name": "Complete job", "status": "completed", "conclusion": "success"}
+      ]
+    }
+  ],
+  "logs": {
+    "1001": {
+      "status": "available",
+      "text": "2026-08-09T01:21:37Z ##[error]The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled.\n"
+    }
+  }
+}

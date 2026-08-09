@@ -237,6 +237,77 @@ jobs:
             echo "ok=false" >> $GITHUB_OUTPUT
           fi
 
+  # A runner disappearing is not a code failure. Classify the completed CI run
+  # before ci-fix checks out or builds its head, rerun failed jobs once when the
+  # evidence is exclusively infrastructural, and keep Claude out of that path.
+  classify-ci-failure:
+    needs: safety-check
+    if: |
+      needs.safety-check.outputs.eligible == 'true' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.name == 'CI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    concurrency:
+      group: claude-infra-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+      cancel-in-progress: false
+    outputs:
+      classification: ${{ steps.classify.outputs.classification }}
+      rerun: ${{ steps.classify.outputs.rerun }}
+    steps:
+      # workflow_run is privileged. The classifier must come from the trusted
+      # default branch, never from the failed head whose logs it is inspecting.
+      - name: Check out trusted classifier
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: fcvm
+
+      - name: Classify failed jobs
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          RESULT=$(python3 fcvm/scripts/classify_ci_failure.py \
+            --repository "$REPO" \
+            --run-id "$FAILED_RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT")
+          printf '%s\n' "$RESULT" | jq .
+          CLASSIFICATION=$(printf '%s\n' "$RESULT" | jq -er \
+            '.classification | select(. == "infrastructure" or . == "not_infrastructure")')
+          RERUN=$(printf '%s\n' "$RESULT" | jq -er \
+            'if .rerun_failed_jobs == true then "true" elif .rerun_failed_jobs == false then "false" else empty end')
+          echo "classification=$CLASSIFICATION" >> "$GITHUB_OUTPUT"
+          echo "rerun=$RERUN" >> "$GITHUB_OUTPUT"
+
+      - name: Rerun failed infrastructure jobs once
+        if: steps.classify.outputs.rerun == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          RUN=$(gh api "repos/$REPO/actions/runs/$FAILED_RUN_ID")
+          CURRENT_ATTEMPT=$(printf '%s\n' "$RUN" | jq -er '.run_attempt')
+          CURRENT_STATUS=$(printf '%s\n' "$RUN" | jq -er '.status')
+          if [ "$CURRENT_ATTEMPT" != "1" ] || [ "$CURRENT_STATUS" != "completed" ]; then
+            echo "::notice::Run $FAILED_RUN_ID is already attempt $CURRENT_ATTEMPT/$CURRENT_STATUS; not rerunning"
+            exit 0
+          fi
+          gh run rerun "$FAILED_RUN_ID" --failed --repo "$REPO"
+
   # Review PRs from org members, auto-fix medium/critical issues
   review:
     needs: safety-check
@@ -482,9 +553,10 @@ jobs:
 
   # Auto-fix CI failures
   ci-fix:
-    needs: safety-check
+    needs: [safety-check, classify-ci-failure]
     if: |
       needs.safety-check.outputs.eligible == 'true' &&
+      needs.classify-ci-failure.outputs.classification != 'infrastructure' &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.conclusion == 'failure' &&

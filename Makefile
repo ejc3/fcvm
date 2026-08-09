@@ -192,7 +192,7 @@ CONTAINER_RUN_BASE := podman run --rm --privileged \
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
 .PHONY: all help build clean clean-test-data check-disk \
-	test test-unit test-fast test-all test-root test-packaging fuzz \
+	test test-unit test-fast test-all test-root test-packaging test-ci-infrastructure fuzz \
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
@@ -217,6 +217,7 @@ help:
 	@echo "  test-all           + slow VM tests (rootless, no sudo)"
 	@echo "  test-root, test    + privileged tests (bridged, pjdfstest, sudo)"
 	@echo "  test-fc-mock       Run tests with fc-mock (no KVM required)"
+	@echo "  test-ci-infrastructure  Deterministic runner-failure classifier fixtures"
 	@echo "  fuzz               Seeded lifecycle chaos fuzz (SEEDS=N|list OPS=M, defaults 1/10)"
 	@echo ""
 	@echo "Test (container):"
@@ -646,6 +647,9 @@ analyze-chromium-request:
 test-chromium-request:
 	@python3 -m unittest discover -s bench/chromium -p 'test_reqbench.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
+
+test-ci-infrastructure:
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_ci_infrastructure.py'
 
 bench: build
 	@echo "==> Running benchmarks..."

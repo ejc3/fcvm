@@ -1,0 +1,33 @@
+{
+  "run_attempt": 2,
+  "jobs": [
+    {
+      "id": 5001,
+      "name": "Host-x64",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "test-root", "status": "completed", "conclusion": "cancelled"},
+        {"name": "Complete job", "status": "completed", "conclusion": "success"}
+      ]
+    },
+    {
+      "id": 5002,
+      "name": "Summary",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "Fail if any gating job did not succeed", "status": "completed", "conclusion": "failure"},
+        {"name": "Complete job", "status": "completed", "conclusion": "success"}
+      ]
+    }
+  ],
+  "logs": {
+    "5001": {
+      "status": "available",
+      "text": "##[error]The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled.\n"
+    }
+  }
+}
