@@ -128,9 +128,9 @@ cmd_golden() {
     log "golden: cold boot with CDP published on $CDP_PORT -> snapshot $TAG"
     $SUDO "$FCVM" snapshots delete -f "$TAG" >/dev/null 2>&1 || true
     local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
-    # --publish carries host -> guest; socat inside the container carries
-    # host -> guest-published port -> DNAT -> guest-loopback, the hop Chromium
-    # refuses to make itself. Clones inherit port_mappings from the snapshot
+    # --publish carries host -> guest; fc-agent DNATs the published port to
+    # guest loopback (fc-agent/src/network.rs::publish_to_loopback), the hop
+    # Chromium refuses to make itself. Clones inherit port_mappings from the snapshot
     # metadata (src/commands/snapshot.rs:1070), which is what makes a restored
     # clone drivable at all.
     # NO --health-check URL: leaving it unset is what makes fcvm consult the
