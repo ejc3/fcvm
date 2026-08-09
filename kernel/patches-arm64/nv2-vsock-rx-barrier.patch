@@ -37,7 +37,7 @@ Signed-off-by: fcvm <fcvm@localhost>
  
 +#ifdef CONFIG_ARM64
 +	/*
-+	 * Under nested virtualization (NV2), ensure L2s writes to the
++	 * Under nested virtualization (NV2), ensure L2's writes to the
 +	 * virtqueue are visible before we read. See kvm_nested_sync_hwstate().
 +	 */
 +	dsb(sy);

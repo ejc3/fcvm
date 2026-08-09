@@ -412,9 +412,16 @@ except OSError as e:
     // cannot appear in the argv fcvm echoes into the stderr this test captures.
     const NESTED_MARKER: &str = "NESTED_SUCCESS_INNER_VM_WORKS";
 
-    let inner_cmd = r#"
+    let inner_snapshot_env = std::env::var("FCVM_NO_SNAPSHOT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|_| "export FCVM_NO_SNAPSHOT=1")
+        .unwrap_or("");
+    let inner_cmd = format!(
+        r#"
         export PATH=/opt/fcvm:/mnt/fcvm-btrfs/bin:$PATH
         export HOME=/root
+        {inner_snapshot_env}
         # Load tun kernel module (needed for TAP device creation)
         modprobe tun 2>/dev/null || true
         mkdir -p /dev/net
@@ -428,7 +435,8 @@ except OSError as e:
             --network bridged \
             --cmd "printf '%s_%s\n' NESTED_SUCCESS INNER_VM_WORKS" \
             public.ecr.aws/nginx/nginx:alpine
-    "#;
+    "#
+    );
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
@@ -439,7 +447,7 @@ except OSError as e:
             "--",
             "sh",
             "-c",
-            inner_cmd,
+            inner_cmd.as_str(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
