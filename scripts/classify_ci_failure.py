@@ -31,6 +31,9 @@ RUNNER_SHUTDOWN_SENTINEL = (
 DERIVATIVE_JOB = "Summary"
 DERIVATIVE_STEP = "Fail if any gating job did not succeed"
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+GH_ESCAPE_REFUSAL = (
+    "the response contains terminal escape sequences; pass --allow-escape-sequences"
+)
 
 
 class InputError(RuntimeError):
@@ -168,14 +171,19 @@ def _fetch_jobs(repository: str, run_id: int, run_attempt: int) -> list[dict[str
 
 
 def _fetch_log(repository: str, job_id: int) -> dict[str, Any]:
-    result = _run_gh(
-        [
-            "api",
-            "--include",
-            "--allow-escape-sequences",
-            f"repos/{repository}/actions/jobs/{job_id}/logs",
-        ]
-    )
+    endpoint = f"repos/{repository}/actions/jobs/{job_id}/logs"
+    # gh <= 2.96 has no --allow-escape-sequences option and emits captured API
+    # output directly. gh >= 2.97 first refuses a response containing terminal
+    # escapes and tells the caller to opt in. Start with the command every version
+    # accepts, then use the newer option only after this exact CLI has advertised
+    # it. The log stays in a subprocess pipe and is never rendered to a terminal.
+    # Any other failure, including a changed refusal shape or a failed retry,
+    # remains unavailable and therefore classifies fail-closed.
+    result = _run_gh(["api", "--include", endpoint])
+    if result.returncode != 0 and GH_ESCAPE_REFUSAL in result.stderr:
+        result = _run_gh(
+            ["api", "--include", "--allow-escape-sequences", endpoint]
+        )
     if result.returncode == 0:
         return {"status": "available", "text": result.stdout}
 
