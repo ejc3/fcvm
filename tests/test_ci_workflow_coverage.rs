@@ -44,6 +44,13 @@ fn triggers(workflow: &Value) -> &Value {
         .expect("workflow has no `on:` block — cannot evaluate trigger coverage")
 }
 
+fn workflow_job<'a>(workflow: &'a Value, name: &str) -> &'a Value {
+    workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get(name))
+        .unwrap_or_else(|| panic!("workflow has no `{name}` job"))
+}
+
 /// A base-branch filter on `pull_request` silently excludes stacked PRs.
 #[test]
 fn ci_runs_on_pull_requests_regardless_of_base_branch() {
@@ -346,6 +353,238 @@ fn summary_fails_when_a_gating_job_fails() {
             "`summary` inspects `needs.*.result` but never checks for `{state}`, so a {state} \
              gating job still yields a green Summary. Each non-success terminal state must be \
              checked on its own, not as one arm of an `||` that a later edit can halve."
+        );
+    }
+}
+
+/// The infrastructure classifier decides whether a failed CI run is retried or
+/// handed to a secret-bearing code fixer. Its fixture suite must execute in the
+/// ordinary pull-request gate, not remain a manual-only Make target.
+#[test]
+fn ci_runs_infrastructure_classifier_fixtures_on_ubuntu() {
+    let ci = parse_workflow("ci.yml");
+    let lint = workflow_job(&ci, "lint");
+
+    assert_eq!(
+        lint.get("runs-on").and_then(Value::as_str),
+        Some("ubuntu-latest"),
+        "the classifier fixtures must run on a GitHub-hosted Ubuntu runner"
+    );
+
+    let steps = lint
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("ci.yml `lint` job has no steps");
+    let fixture_step = steps
+        .iter()
+        .find(|step| {
+            step.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|run| run.trim() == "make test-ci-infrastructure")
+        })
+        .expect(
+            "ci.yml `lint` never runs `make test-ci-infrastructure`; the privileged CI verdict gate has no fixture coverage in CI",
+        );
+    assert_eq!(
+        fixture_step
+            .get("working-directory")
+            .and_then(Value::as_str),
+        Some("fcvm"),
+        "the classifier fixture step must run from the checked-out repository"
+    );
+    assert_ne!(
+        fixture_step
+            .get("continue-on-error")
+            .and_then(Value::as_bool),
+        Some(true),
+        "classifier fixture failures must fail the lint gate"
+    );
+}
+
+/// Infrastructure retries must be bounded, trusted, and mutually exclusive
+/// with the secret-bearing Claude fixer.
+///
+/// `workflow_run` executes with repository secrets even when the failed run
+/// came from a pull request. The classifier therefore checks out only the
+/// default branch and inspects the failed run through the API. Its output must
+/// gate ci-fix so an infrastructure-only failure cannot both rerun and ask
+/// Claude to edit code.
+#[test]
+fn claude_infrastructure_retry_is_trusted_bounded_and_gates_ci_fix() {
+    let claude = parse_workflow("claude.yml");
+    let classifier = workflow_job(&claude, "classify-ci-failure");
+
+    assert_eq!(
+        classifier.get("needs").and_then(Value::as_str),
+        Some("safety-check"),
+        "the infrastructure classifier must inherit the centralized eligibility gate"
+    );
+    let condition = classifier
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("classify-ci-failure has no job condition");
+    for required in [
+        "needs.safety-check.outputs.eligible == 'true'",
+        "github.event_name == 'workflow_run'",
+        "github.event.workflow_run.head_repository.full_name == github.repository",
+        "github.event.workflow_run.conclusion == 'failure'",
+        "github.event.workflow_run.name == 'CI'",
+    ] {
+        assert!(
+            condition.contains(required),
+            "classify-ci-failure is missing its `{required}` trust/failure gate"
+        );
+    }
+
+    let permissions = classifier
+        .get("permissions")
+        .expect("classify-ci-failure has no explicit token permissions");
+    assert_eq!(
+        permissions.get("actions").and_then(Value::as_str),
+        Some("write"),
+        "rerunning failed jobs requires an explicitly scoped actions:write token"
+    );
+    assert_eq!(
+        permissions.get("contents").and_then(Value::as_str),
+        Some("read"),
+        "the trusted classifier checkout needs contents:read and nothing broader"
+    );
+    let concurrency = classifier
+        .get("concurrency")
+        .expect("classify-ci-failure has no duplicate-delivery serialization");
+    let group = concurrency
+        .get("group")
+        .and_then(Value::as_str)
+        .expect("classify-ci-failure concurrency has no group");
+    for identity in [
+        "github.event.workflow_run.id",
+        "github.event.workflow_run.run_attempt",
+    ] {
+        assert!(
+            group.contains(identity),
+            "classifier concurrency does not include `{identity}`"
+        );
+    }
+    assert_eq!(
+        concurrency
+            .get("cancel-in-progress")
+            .and_then(Value::as_bool),
+        Some(false),
+        "duplicate classifier deliveries must serialize instead of cancelling mid-rerun"
+    );
+
+    let steps = classifier
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("classify-ci-failure has no steps");
+    let checkout = steps
+        .iter()
+        .find(|step| {
+            step.get("uses")
+                .and_then(Value::as_str)
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+        })
+        .expect("classify-ci-failure never checks out its classifier");
+    let checkout_with = checkout
+        .get("with")
+        .expect("classifier checkout has no `with:` configuration");
+    assert_eq!(
+        checkout_with.get("ref").and_then(Value::as_str),
+        Some("${{ github.event.repository.default_branch }}"),
+        "a privileged workflow_run job must execute the classifier from the trusted default branch"
+    );
+    assert_eq!(
+        checkout_with
+            .get("persist-credentials")
+            .and_then(Value::as_bool),
+        Some(false),
+        "the classifier checkout must not persist its actions:write credential"
+    );
+    assert!(
+        steps.iter().all(|step| {
+            step.get("uses").and_then(Value::as_str) != Some("actions/create-github-app-token@v3")
+        }),
+        "the classifier should use its narrowly scoped GITHUB_TOKEN, not mint an app token"
+    );
+    for run in steps
+        .iter()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+    {
+        assert!(
+            !run.contains("${{ github.event"),
+            "event fields must enter classifier shell through env:, never expression interpolation"
+        );
+    }
+
+    let classify_step = steps
+        .iter()
+        .find(|step| step.get("id").and_then(Value::as_str) == Some("classify"))
+        .expect("classify-ci-failure has no `classify` output step");
+    assert!(
+        classify_step
+            .get("run")
+            .and_then(Value::as_str)
+            .is_some_and(|run| run.contains("scripts/classify_ci_failure.py")),
+        "the workflow must call the deterministic classifier"
+    );
+
+    let rerun_step = steps
+        .iter()
+        .find(|step| {
+            step.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.contains("Rerun failed infrastructure"))
+        })
+        .expect("classify-ci-failure has no bounded rerun step");
+    let rerun_condition = rerun_step
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("the rerun step is unconditional");
+    assert!(
+        rerun_condition.contains("steps.classify.outputs.rerun == 'true'"),
+        "the rerun step must be disabled for genuine and second-attempt failures"
+    );
+    let rerun = rerun_step
+        .get("run")
+        .and_then(Value::as_str)
+        .expect("the rerun step has no command");
+    for required in [
+        "CURRENT_ATTEMPT",
+        "CURRENT_STATUS",
+        "gh run rerun",
+        "--failed",
+    ] {
+        assert!(
+            rerun.contains(required),
+            "the rerun step is missing its `{required}` one-shot invariant"
+        );
+    }
+
+    let ci_fix = workflow_job(&claude, "ci-fix");
+    let needs: Vec<&str> = ci_fix
+        .get("needs")
+        .and_then(Value::as_sequence)
+        .expect("ci-fix.needs must include both safety and classification gates")
+        .iter()
+        .map(|need| need.as_str().expect("ci-fix.needs entry is not a string"))
+        .collect();
+    for required in ["safety-check", "classify-ci-failure"] {
+        assert!(
+            needs.contains(&required),
+            "ci-fix no longer waits for `{required}`"
+        );
+    }
+    let ci_fix_condition = ci_fix
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("ci-fix has no job condition");
+    for required in [
+        "needs.classify-ci-failure.outputs.classification != 'infrastructure'",
+        "github.event.workflow_run.name == 'CI'",
+    ] {
+        assert!(
+            ci_fix_condition.contains(required),
+            "ci-fix is missing its `{required}` classification/workflow gate"
         );
     }
 }
