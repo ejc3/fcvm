@@ -25,4 +25,14 @@
 # broke: the kernel SIGKILLs this process the moment `sudo` dies. It is kernel-enforced,
 # so it holds in the case that leaked here — a SIGKILL where no userspace cleanup,
 # Drop impl or signal handler gets to run.
+
+# Host test recipes provide a unique absolute XDG_CONFIG_HOME containing the
+# current worktree's embedded config. sudo also sets SUDO_USER, and fcvm normally
+# gives that user's ~/.config precedence over XDG; remove only that lookup hint
+# for hermetic test runs so another worktree cannot replace the config between
+# setup and VM launch. Normal invocations without XDG_CONFIG_HOME are unchanged.
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+	unset SUDO_USER
+fi
+
 exec setpriv --pdeathsig KILL "$@"
