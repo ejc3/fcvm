@@ -31,6 +31,16 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn hermetic_git(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0");
+    command
+}
+
 /// Extract `compute_hash()` verbatim from the real script and run it against a
 /// fixture tree. `create_user_data` (its only helper call) is stubbed so this
 /// exercises the kernel-input behaviour in isolation.
@@ -54,6 +64,18 @@ fn try_compute_hash(fixture: &Path) -> (bool, String, String) {
 }
 
 fn try_compute_hash_for_commit(fixture: &Path, source_commit: &str) -> (bool, String, String) {
+    try_compute_hash_with_dirs(
+        &fixture.join("kernel"),
+        &fixture.join("scripts"),
+        source_commit,
+    )
+}
+
+fn try_compute_hash_with_dirs(
+    kernel_dir: &Path,
+    script_dir: &Path,
+    source_commit: &str,
+) -> (bool, String, String) {
     let script = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh"))
         .expect("read scripts/build-ami.sh");
 
@@ -82,8 +104,8 @@ fn try_compute_hash_for_commit(fixture: &Path, source_commit: &str) -> (bool, St
     let out = Command::new("bash")
         .arg("-c")
         .arg(&program)
-        .env("KERNEL_DIR", fixture.join("kernel"))
-        .env("SCRIPT_DIR", fixture.join("scripts"))
+        .env("KERNEL_DIR", kernel_dir)
+        .env("SCRIPT_DIR", script_dir)
         .env("SOURCE_COMMIT", source_commit)
         .output()
         .expect("run bash");
@@ -92,6 +114,74 @@ fn try_compute_hash_for_commit(fixture: &Path, source_commit: &str) -> (bool, St
         String::from_utf8_lossy(&out.stdout).trim().to_string(),
         String::from_utf8_lossy(&out.stderr).trim().to_string(),
     )
+}
+
+/// Test repositories must not inherit the machine's Git policy. In particular, a developer's
+/// signing requirement, hooks, or init template cannot change whether fixture commits work or
+/// what bytes enter the fixture repository.
+#[test]
+fn ami_git_fixture_ignores_hostile_global_configuration() {
+    let hostile_home = tempfile::tempdir().expect("hostile Git home");
+    let hooks = hostile_home.path().join("hooks");
+    let template = hostile_home.path().join("template");
+    std::fs::create_dir_all(&hooks).expect("create hostile hooks directory");
+    std::fs::create_dir_all(&template).expect("create hostile template directory");
+    let pre_commit = hooks.join("pre-commit");
+    std::fs::write(&pre_commit, "#!/bin/sh\nexit 86\n").expect("write hostile pre-commit hook");
+    std::fs::set_permissions(
+        &pre_commit,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("make hostile pre-commit hook executable");
+    std::fs::write(template.join("global-template-sentinel"), "leaked\n")
+        .expect("write hostile template sentinel");
+    std::fs::write(
+        hostile_home.path().join(".gitconfig"),
+        format!(
+            "[commit]\n\tgpgSign = true\n[core]\n\thooksPath = {}\n[init]\n\ttemplateDir = {}\n",
+            hooks.display(),
+            template.display()
+        ),
+    )
+    .expect("write hostile global Git configuration");
+
+    let repo = tempfile::tempdir().expect("hermetic Git repository");
+    for args in [
+        ["init", "-q"].as_slice(),
+        ["config", "user.email", "test@example.invalid"].as_slice(),
+        ["config", "user.name", "fcvm test"].as_slice(),
+    ] {
+        let output = hermetic_git(repo.path())
+            .env("HOME", hostile_home.path())
+            .args(args)
+            .output()
+            .expect("run hermetic fixture Git setup");
+        assert!(
+            output.status.success(),
+            "hermetic git {args:?} inherited global configuration: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        !repo.path().join(".git/global-template-sentinel").exists(),
+        "fixture git init copied the developer's global init template"
+    );
+    std::fs::write(repo.path().join("fixture"), "fixture\n").expect("write fixture input");
+    for args in [
+        ["add", "fixture"].as_slice(),
+        ["commit", "-qm", "fixture commit"].as_slice(),
+    ] {
+        let output = hermetic_git(repo.path())
+            .env("HOME", hostile_home.path())
+            .args(args)
+            .output()
+            .expect("run hermetic fixture Git command");
+        assert!(
+            output.status.success(),
+            "fixture git {args:?} inherited signing or hook policy: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn render_user_data(source_commit: &str) -> String {
@@ -112,6 +202,7 @@ fn render_user_data(source_commit: &str) -> String {
         .arg("-c")
         .arg(program)
         .env("SOURCE_COMMIT", source_commit)
+        .env("FCVM_SOURCE_REMOTE", "https://github.com/ejc3/fcvm.git")
         .output()
         .expect("render AMI user data");
     assert!(
@@ -120,6 +211,66 @@ fn render_user_data(source_commit: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("user data is UTF-8")
+}
+
+fn verify_source_commit_fetchable(
+    repo: &Path,
+    commit: &str,
+    remote: &Path,
+) -> std::process::Output {
+    let script = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh"))
+        .expect("read scripts/build-ami.sh");
+    let start = script
+        .find("verify_source_commit_fetchable()")
+        .expect("build-ami.sh has no source-commit reachability check");
+    let rest = &script[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("verify_source_commit_fetchable() has no closing brace")
+        + 2;
+    let function = &rest[..end];
+    let program = format!(
+        "set -uo pipefail\n{function}\nverify_source_commit_fetchable \"$REPO\" \"$COMMIT\" \"$REMOTE\"\n"
+    );
+    Command::new("bash")
+        .arg("-c")
+        .arg(program)
+        .env("REPO", repo)
+        .env("COMMIT", commit)
+        .env("REMOTE", remote)
+        .output()
+        .expect("run source-commit reachability check")
+}
+
+fn run_ami_main_to_reachability_gate(repo: &Path, trace: &Path) -> std::process::Output {
+    let script = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh"))
+        .expect("read scripts/build-ami.sh");
+    let start = script
+        .find("main()")
+        .expect("build-ami.sh has no main() reachability wiring");
+    let rest = &script[start..];
+    let end = rest.find("\n}\n").expect("main() has no closing brace") + 2;
+    let main = &rest[..end];
+    let program = format!(
+        "set -euo pipefail\n\
+         REGION=test-region\n\
+         KERNEL_DIR=\"$REPO/kernel\"\n\
+         FCVM_SOURCE_REMOTE=test-remote\n\
+         compute_pinned_hash() {{ printf 'fixturehash\\n'; }}\n\
+         check_existing_ami() {{ printf 'None\\n'; }}\n\
+         verify_source_commit_fetchable() {{ printf V >>\"$TRACE\"; return 1; }}\n\
+         aws() {{ return 0; }}\n\
+         get_base_ami() {{ printf B >>\"$TRACE\"; return 1; }}\n\
+         {main}\n\
+         main\n"
+    );
+    Command::new("bash")
+        .arg("-c")
+        .arg(program)
+        .env("REPO", repo)
+        .env("TRACE", trace)
+        .output()
+        .expect("run AMI main through the pre-launch reachability gate")
 }
 
 fn materialize_pinned_tree(repo: &Path, commit: &str, destination: &Path) -> std::process::Output {
@@ -420,6 +571,37 @@ fn ami_hash_changes_when_the_disk_guard_installer_changes() {
     );
 }
 
+/// `KERNEL_DIR` identifies the source checkout, while `SCRIPT_DIR` identifies the script tree
+/// whose bytes are validated and provisioned. Keep the digest rooted at `SCRIPT_DIR` too: reading
+/// the same basenames from `dirname(KERNEL_DIR)/scripts` can otherwise authenticate one tree and
+/// hash another.
+#[test]
+fn ami_hash_reads_disk_guard_bytes_from_script_dir() {
+    let kernel_tree = make_fixture();
+    let script_tree = make_fixture();
+    let run = || {
+        let (ok, hash, error) = try_compute_hash_with_dirs(
+            &kernel_tree.path().join("kernel"),
+            &script_tree.path().join("scripts"),
+            TEST_SOURCE_COMMIT,
+        );
+        assert!(ok, "split-root compute_hash failed: {error}");
+        hash
+    };
+
+    let base = run();
+    std::fs::write(
+        script_tree.path().join("scripts/runner-disk-preflight.sh"),
+        "#!/bin/sh\n# changed SCRIPT_DIR guard\n",
+    )
+    .expect("mutate SCRIPT_DIR disk guard");
+    let mutated = run();
+    assert_ne!(
+        base, mutated,
+        "compute_hash validated SCRIPT_DIR but digested the disk guard from the kernel checkout"
+    );
+}
+
 #[test]
 fn ami_hash_refuses_a_missing_privileged_target_pruner() {
     let fx = make_fixture();
@@ -462,10 +644,13 @@ fn ami_user_data_fetches_the_exact_hashed_source_commit() {
     let user_data = render_user_data(source_commit);
     assert!(
         user_data.contains(&format!("FCVM_SOURCE_COMMIT=\"{source_commit}\""))
+            && user_data.contains("FCVM_SOURCE_REMOTE=\"https://github.com/ejc3/fcvm.git\"",)
+            && user_data.contains("git -C /tmp/fcvm remote add origin \"$FCVM_SOURCE_REMOTE\"")
             && user_data
                 .contains("git -C /tmp/fcvm fetch --depth 1 origin \"$FCVM_SOURCE_COMMIT\"")
             && user_data.contains("/tmp/fcvm/scripts/install-runner-disk-guard.sh /tmp/fcvm")
-            && !user_data.contains("__FCVM_SOURCE_COMMIT__"),
+            && !user_data.contains("__FCVM_SOURCE_COMMIT__")
+            && !user_data.contains("__FCVM_SOURCE_REMOTE__"),
         "rendered AMI user data is not pinned to {source_commit}:\n{user_data}"
     );
     assert!(
@@ -489,12 +674,128 @@ fn ami_user_data_fetches_the_exact_hashed_source_commit() {
     );
 }
 
+/// The cloud builder fetches the selected source commit from a separate repository. Verify the
+/// exact fetch before launching EC2 so an unpushed local commit fails locally instead of failing
+/// minutes later in cloud-init after an instance has already been allocated.
+#[test]
+fn ami_build_refuses_a_source_commit_the_remote_cannot_fetch() {
+    let remote = tempfile::tempdir().expect("bare source remote");
+    let output = hermetic_git(remote.path())
+        .args(["init", "--bare", "-q"])
+        .output()
+        .expect("initialize bare source remote");
+    assert!(
+        output.status.success(),
+        "bare remote init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let source = tempfile::tempdir().expect("source repository");
+    for args in [
+        ["init", "-q"].as_slice(),
+        ["config", "user.email", "test@example.invalid"].as_slice(),
+        ["config", "user.name", "fcvm test"].as_slice(),
+    ] {
+        let output = hermetic_git(source.path())
+            .args(args)
+            .output()
+            .expect("configure source repository");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::write(source.path().join("source.rs"), b"revision one\n")
+        .expect("write first source revision");
+    for args in [
+        ["add", "source.rs"].as_slice(),
+        ["commit", "-qm", "first source revision"].as_slice(),
+    ] {
+        let output = hermetic_git(source.path())
+            .args(args)
+            .output()
+            .expect("commit first source revision");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let remote_path = remote.path().to_string_lossy().into_owned();
+    let output = hermetic_git(source.path())
+        .args(["remote", "add", "origin", &remote_path])
+        .output()
+        .expect("add source remote");
+    assert!(output.status.success());
+    let output = hermetic_git(source.path())
+        .args(["push", "-q", "origin", "HEAD:refs/heads/main"])
+        .output()
+        .expect("push first source revision");
+    assert!(
+        output.status.success(),
+        "first source push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::fs::write(source.path().join("source.rs"), b"revision two\n")
+        .expect("write unpushed source revision");
+    let output = hermetic_git(source.path())
+        .args(["commit", "-qam", "unpushed source revision"])
+        .output()
+        .expect("commit unpushed source revision");
+    assert!(output.status.success());
+    let output = hermetic_git(source.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("resolve unpushed source revision");
+    assert!(output.status.success());
+    let unpushed_commit = String::from_utf8(output.stdout)
+        .expect("source commit is UTF-8")
+        .trim()
+        .to_string();
+
+    let rejected = verify_source_commit_fetchable(source.path(), &unpushed_commit, remote.path());
+    assert!(
+        !rejected.status.success()
+            && String::from_utf8_lossy(&rejected.stderr).contains("not fetchable"),
+        "unreachable source commit was allowed to launch an AMI build: status={:?} stderr={}",
+        rejected.status,
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    let output = hermetic_git(source.path())
+        .args(["push", "-q", "origin", "HEAD:refs/heads/main"])
+        .output()
+        .expect("push second source revision");
+    assert!(output.status.success());
+    let accepted = verify_source_commit_fetchable(source.path(), &unpushed_commit, remote.path());
+    assert!(
+        accepted.status.success(),
+        "fetchable source commit was rejected: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let trace = source.path().join("main-gate.trace");
+    let main = run_ami_main_to_reachability_gate(source.path(), &trace);
+    assert!(
+        !main.status.success(),
+        "AMI main ignored the failing pre-launch reachability gate"
+    );
+    assert_eq!(
+        std::fs::read(&trace).expect("read AMI main gate trace"),
+        b"V",
+        "AMI main reached builder allocation before validating the source commit"
+    );
+}
+
 /// Hash inputs must come from the same immutable tree the builder fetches, not from dirty
 /// working-tree bytes merely labelled with HEAD. Two commits differing only in otherwise-unlisted
-/// host-tool source prove the key binds the exact commit fetched and compiled by user data; an
-/// uncommitted helper mutation proves the archive wins. Mutating build-ami.sh itself must fail
-/// because that running function generates part of the hash and cannot safely disagree with the
-/// pinned script.
+/// host-tool source prove that pinned commit identity enters the key: user data fetches and compiles
+/// the entire commit even though `compute_hash` does not digest every Rust source individually.
+/// Uncommitted mutations under both archived path roots prove the archive wins. Mutating
+/// build-ami.sh itself must fail because that running function generates part of the hash and cannot
+/// safely disagree with the pinned script.
 #[test]
 fn ami_hash_materializes_the_pinned_tree_and_rejects_a_dirty_provisioner() {
     let fx = make_fixture();
@@ -505,16 +806,18 @@ fn ami_hash_materializes_the_pinned_tree_and_rejects_a_dirty_provisioner() {
         ["add", "."].as_slice(),
         ["commit", "-qm", "fixture"].as_slice(),
     ] {
-        let status = Command::new("git")
+        let output = hermetic_git(fx.path())
             .args(args)
-            .current_dir(fx.path())
-            .status()
+            .output()
             .expect("run fixture git command");
-        assert!(status.success(), "git {args:?} failed: {status:?}");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let commit_output = Command::new("git")
+    let commit_output = hermetic_git(fx.path())
         .args(["rev-parse", "HEAD"])
-        .current_dir(fx.path())
         .output()
         .expect("resolve fixture commit");
     assert!(commit_output.status.success());
@@ -548,16 +851,18 @@ fn ami_hash_materializes_the_pinned_tree_and_rejects_a_dirty_provisioner() {
         ["add", "src/setup/kernel.rs"].as_slice(),
         ["commit", "-qm", "second provisioned host-tool source"].as_slice(),
     ] {
-        let status = Command::new("git")
+        let output = hermetic_git(fx.path())
             .args(args)
-            .current_dir(fx.path())
-            .status()
+            .output()
             .expect("commit second hashed fixture revision");
-        assert!(status.success(), "git {args:?} failed: {status:?}");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let commit_output = Command::new("git")
+    let commit_output = hermetic_git(fx.path())
         .args(["rev-parse", "HEAD"])
-        .current_dir(fx.path())
         .output()
         .expect("resolve second fixture commit");
     assert!(commit_output.status.success());
@@ -581,12 +886,15 @@ fn ami_hash_materializes_the_pinned_tree_and_rejects_a_dirty_provisioner() {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
             && first_hash_text != second_hash_text,
-        "compute_pinned_hash ignored an otherwise-unlisted host-tool source change even though AMI user data fetches and compiles the new commit: first={first_hash_text:?} second={second_hash_text:?}"
+        "the pinned commit identity did not enter the AMI key even though user data fetches and compiles that complete commit: first={first_hash_text:?} second={second_hash_text:?}"
     );
 
     let helper = fx.path().join("scripts/prune-cargo-target.sh");
     let pinned_helper = std::fs::read(&helper).expect("read pinned helper");
     std::fs::write(&helper, b"dirty helper bytes\n").expect("dirty helper");
+    let passt_builder = fx.path().join("scripts/build-passt.sh");
+    let pinned_passt_builder = std::fs::read(&passt_builder).expect("read pinned passt builder");
+    std::fs::write(&passt_builder, b"dirty passt builder bytes\n").expect("dirty passt builder");
     let archived = tempfile::tempdir().expect("archived source tree");
     let output = materialize_pinned_tree(fx.path(), &second_commit, archived.path());
     assert!(
@@ -598,6 +906,11 @@ fn ami_hash_materializes_the_pinned_tree_and_rejects_a_dirty_provisioner() {
         std::fs::read(archived.path().join("scripts/prune-cargo-target.sh")).unwrap(),
         pinned_helper,
         "pinned source tree copied dirty working-tree helper bytes"
+    );
+    assert_eq!(
+        std::fs::read(archived.path().join("scripts/build-passt.sh")).unwrap(),
+        pinned_passt_builder,
+        "pinned source tree copied dirty SCRIPT_DIR bytes"
     );
     let direct_archived_hash = run_compute_hash_for_commit(archived.path(), &second_commit);
     assert_eq!(

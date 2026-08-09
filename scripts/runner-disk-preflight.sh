@@ -262,7 +262,7 @@ stage_test_logs() {
 # must never be a candidate. Reclaim retires the old namespace before
 # truncating bytes, so the next Cargo wrapper publishes a fresh generation.
 stage_target_dirs() {
-  local runner_root= btrfs_target_root=
+  local runner_root='' btrfs_target_root=''
 
   # One privileged process enumerates every root, atomically opens and locks
   # candidates as it discovers them, retains those fds until all enumeration
@@ -281,6 +281,7 @@ stage_target_dirs() {
 
   "${SUDO[@]}" env \
     -u FCVM_PRUNE_TEST_SYNC_SOCKET \
+    -u FCVM_PRUNE_TEST_AFTER_RELEASE_SOCKET \
     -u FCVM_PRUNE_TEST_FAIL_AFTER_FINGERPRINTS \
     "$TARGET_PRUNE_HELPER" \
     "$TARGET_CUTOFF" "$DRY_RUN" "$runner_root" "$btrfs_target_root"

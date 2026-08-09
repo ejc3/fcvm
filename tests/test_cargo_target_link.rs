@@ -161,6 +161,13 @@ impl ChildGuard {
         self.0 = None;
         Ok(status)
     }
+
+    fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.0
+            .take()
+            .expect("child already reaped")
+            .wait_with_output()
+    }
 }
 
 impl Drop for ChildGuard {
@@ -941,6 +948,175 @@ fn target_pruner_cleans_only_the_locked_object_after_directory_replacement() {
     );
 }
 
+/// Once one candidate has been fully inspected and reclaimed, its exclusive lease no longer
+/// protects any pending decision. Release that lease immediately while retaining later candidate
+/// leases, so a slow sibling cannot unnecessarily block Cargo on an already completed target.
+fn assert_target_pruner_releases_each_completed_candidate_lease(fail_reclaim: bool) {
+    let root = tempfile::tempdir().expect("target root");
+    let first = root.path().join("candidate-a");
+    let second = root.path().join("candidate-b");
+    for candidate in [&first, &second] {
+        std::fs::create_dir(candidate).expect("create candidate");
+        let payload = candidate.join("old-payload");
+        std::fs::write(&payload, b"old payload").expect("write old payload");
+        age_file(&payload);
+    }
+
+    let signals = tempfile::tempdir().expect("release sync socket directory");
+    let socket_path = signals.path().join("released.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("bind candidate-release sync socket");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    let expected_releases = if fail_reclaim { 1 } else { 2 };
+    let sync = std::thread::spawn(move || {
+        let _signals = signals;
+        for index in 0..expected_releases {
+            let (mut channel, _) = listener.accept().expect("accept candidate-release sync");
+            let mut path = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                channel
+                    .read_exact(&mut byte)
+                    .expect("read released candidate path");
+                if byte == [0] {
+                    break;
+                }
+                path.push(byte[0]);
+            }
+            if index == 0 {
+                let path = PathBuf::from(String::from_utf8(path).expect("candidate path is UTF-8"));
+                ready_tx
+                    .send(path)
+                    .expect("signal first released candidate");
+                continue_rx.recv().expect("wait for candidate lease probes");
+            }
+            channel.write_all(b"C").expect("release target helper");
+        }
+    });
+
+    let mut helper_command = Command::new(repo_root().join("scripts/prune-cargo-target.sh"));
+    helper_command
+        .args([
+            std::ffi::OsStr::new("1 day ago"),
+            std::ffi::OsStr::new("0"),
+            std::ffi::OsStr::new(""),
+            root.path().as_os_str(),
+        ])
+        .env("FCVM_PRUNE_TEST_AFTER_RELEASE_SOCKET", &socket_path);
+    if fail_reclaim {
+        helper_command.env("FCVM_PRUNE_TEST_FAIL_AFTER_FINGERPRINTS", "1");
+    }
+    let helper = ChildGuard(Some(
+        helper_command
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn release-synchronized target helper"),
+    ));
+
+    let released = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("helper did not announce a released candidate lease");
+    let retained = if released == first { &second } else { &first };
+    assert!(
+        released == first || released == second,
+        "helper announced an unknown candidate path: {released:?}"
+    );
+    let released_probe = Command::new("flock")
+        .args(["-x", "-n", "-E", "42"])
+        .arg(&released)
+        .arg("/bin/true")
+        .status()
+        .expect("probe released candidate lease");
+    assert!(
+        released_probe.success(),
+        "completed candidate still held its exclusive lease: {released:?} {released_probe:?}"
+    );
+    let retained_probe = Command::new("flock")
+        .args(["-x", "-n", "-E", "42"])
+        .arg(retained)
+        .arg("/bin/true")
+        .status()
+        .expect("probe retained candidate lease");
+    assert_eq!(
+        retained_probe.code(),
+        Some(42),
+        "later candidate was unlocked before its safety checks and reclaim: {retained:?} \
+         {retained_probe:?}"
+    );
+
+    continue_tx.send(()).expect("continue target helper");
+    let output = helper.wait_with_output().expect("wait for target helper");
+    let status = output.status;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    sync.join().expect("join candidate-release sync peer");
+    if fail_reclaim {
+        assert_eq!(
+            status.code(),
+            Some(49),
+            "injected reclaim failure did not propagate after releasing its lease: {status:?}"
+        );
+    } else {
+        assert!(status.success(), "target helper failed: {status:?}");
+    }
+    let mut duration_paths = HashSet::new();
+    for line in stderr.lines() {
+        let Some((_, metric)) = line.split_once("candidate lease released after ") else {
+            continue;
+        };
+        let (seconds, path) = metric
+            .split_once("s: ")
+            .unwrap_or_else(|| panic!("malformed candidate lease duration metric: {line}"));
+        let seconds: f64 = seconds.parse().unwrap_or_else(|error| {
+            panic!("invalid candidate lease duration {seconds:?}: {error}")
+        });
+        assert!(
+            seconds.is_finite() && seconds >= 0.0,
+            "candidate lease duration is not finite and nonnegative: {line}"
+        );
+        let path = PathBuf::from(path);
+        assert!(
+            path == first || path == second,
+            "duration metric named an unknown candidate: {line}"
+        );
+        assert!(
+            duration_paths.insert(path),
+            "candidate emitted more than one lease duration metric: {line}"
+        );
+    }
+    assert_eq!(
+        duration_paths.len(),
+        expected_releases,
+        "target helper did not report exactly one lease duration for each completed candidate:\n{stderr}"
+    );
+    for candidate in [&first, &second] {
+        let length = std::fs::metadata(candidate.join("old-payload"))
+            .expect("stat candidate payload")
+            .len();
+        if fail_reclaim {
+            assert_eq!(
+                length, 11,
+                "failed reclaim changed a candidate payload: {candidate:?}"
+            );
+        } else {
+            assert_eq!(
+                length, 0,
+                "candidate payload was not reclaimed: {candidate:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn target_pruner_releases_each_completed_candidate_lease() {
+    assert_target_pruner_releases_each_completed_candidate_lease(false);
+}
+
+#[test]
+fn target_pruner_releases_the_failed_candidate_lease() {
+    assert_target_pruner_releases_each_completed_candidate_lease(true);
+}
+
 /// A FIFO in the candidate namespace is not a directory and must be skipped without ever
 /// blocking in open(2). The outer timeout is an assertion boundary: rc=124 would be a failure,
 /// not a retry or an accepted outcome.
@@ -1377,9 +1553,31 @@ fn run_cargo_fixture_build(project: &Path, btrfs_root: &Path) -> std::process::O
         .args(["cargo", "build", "--offline", "--verbose"])
         .env("BTRFS_ROOT", btrfs_root)
         .env("CARGO_TARGET_DIR", "target")
+        .env("RUSTC_WRAPPER", project.join(".fcvm-rustc-wrapper.sh"))
+        .env("FCVM_RUSTC_LOG", project.join(".fcvm-rustc-invocations"))
         .current_dir(project)
         .output()
         .expect("build Cargo cache fixture through target lease")
+}
+
+fn assert_fixture_crates_compiled(project: &Path, diagnostics: &str) {
+    let invocations = std::fs::read_to_string(project.join(".fcvm-rustc-invocations"))
+        .unwrap_or_else(|error| panic!("read fixture rustc invocations: {error}; {diagnostics}"));
+    let crates: Vec<_> = invocations.lines().collect();
+    for expected in ["cache_helper", "cache_fixture"] {
+        assert!(
+            crates.contains(&expected),
+            "rustc was not invoked for {expected} after cache invalidation; crates={crates:?}\n{diagnostics}"
+        );
+    }
+}
+
+fn clear_fixture_compile_log(project: &Path) {
+    match std::fs::remove_file(project.join(".fcvm-rustc-invocations")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("clear fixture rustc invocations: {error}"),
+    }
 }
 
 fn run_direct_target_pruner(
@@ -1468,6 +1666,24 @@ fn target_pruner_invalidates_cargo_before_reclaiming_hardlinked_payloads() {
         "pub fn message() -> &'static str { \"dependency-value\" }\n",
     )
     .expect("write helper source");
+    let rustc_wrapper = project.path().join(".fcvm-rustc-wrapper.sh");
+    std::fs::write(
+        &rustc_wrapper,
+        "#!/bin/sh\n\
+         rustc=$1\n\
+         shift\n\
+         previous=\n\
+         for argument do\n\
+             if [ \"$previous\" = --crate-name ]; then\n\
+                 printf '%s\\n' \"$argument\" >>\"$FCVM_RUSTC_LOG\"\n\
+             fi\n\
+             previous=$argument\n\
+         done\n\
+         exec \"$rustc\" \"$@\"\n",
+    )
+    .expect("write fixture rustc wrapper");
+    std::fs::set_permissions(&rustc_wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("make fixture rustc wrapper executable");
 
     let first = run_cargo_fixture_build(project.path(), target_root.path());
     assert!(
@@ -1476,6 +1692,13 @@ fn target_pruner_invalidates_cargo_before_reclaiming_hardlinked_payloads() {
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr)
     );
+    let first_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_fixture_crates_compiled(project.path(), &first_text);
+    clear_fixture_compile_log(project.path());
     let first_generation = std::fs::canonicalize(project.path().join("target"))
         .expect("resolve first managed Cargo generation");
     let binary = first_generation.join("debug/cache-fixture");
@@ -1536,11 +1759,11 @@ fn target_pruner_invalidates_cargo_before_reclaiming_hardlinked_payloads() {
         String::from_utf8_lossy(&rebuilt_after_interruption.stderr)
     );
     assert!(
-        rebuilt_after_interruption.status.success()
-            && rebuilt_text.contains("Compiling cache-helper")
-            && rebuilt_text.contains("Compiling cache-fixture"),
+        rebuilt_after_interruption.status.success(),
         "Cargo accepted a cache after its durable fingerprints were invalidated:\n{rebuilt_text}"
     );
+    assert_fixture_crates_compiled(project.path(), &rebuilt_text);
+    clear_fixture_compile_log(project.path());
 
     let second_generation = std::fs::canonicalize(project.path().join("target"))
         .expect("resolve second managed Cargo generation");
@@ -1605,11 +1828,10 @@ fn target_pruner_invalidates_cargo_before_reclaiming_hardlinked_payloads() {
         String::from_utf8_lossy(&rebuilt.stderr)
     );
     assert!(
-        rebuilt.status.success()
-            && rebuilt_text.contains("Compiling cache-helper")
-            && rebuilt_text.contains("Compiling cache-fixture"),
+        rebuilt.status.success(),
         "Cargo did not rebuild reclaimed hardlinked outputs:\n{rebuilt_text}"
     );
+    assert_fixture_crates_compiled(project.path(), &rebuilt_text);
     let third_generation = std::fs::canonicalize(project.path().join("target"))
         .expect("resolve third managed Cargo generation");
     assert_ne!(
@@ -2030,10 +2252,133 @@ fn disk_preflight_shell_scripts_parse() {
             repo_root().join("scripts/runner-disk-preflight.sh"),
             repo_root().join("scripts/prune-cargo-target.sh"),
             repo_root().join("scripts/install-runner-disk-guard.sh"),
+            repo_root().join("scripts/cargo-target-lib.sh"),
+            repo_root().join("scripts/cargo-target-link.sh"),
+            repo_root().join("scripts/cargo-target-run.sh"),
+            repo_root().join("scripts/run_fuse_pipe_tests.sh"),
         ])
         .status()
         .expect("run bash syntax check for disk-preflight scripts");
     assert!(status.success(), "disk-preflight shell syntax is invalid");
+}
+
+#[test]
+fn disk_preflight_initializes_candidate_roots_without_sc1007() {
+    let source = std::fs::read_to_string(repo_root().join("scripts/runner-disk-preflight.sh"))
+        .expect("read runner disk preflight");
+    let stage = source
+        .split_once("stage_target_dirs() {")
+        .expect("stage_target_dirs function is missing")
+        .1
+        .split_once("\n}")
+        .expect("stage_target_dirs function is unterminated")
+        .0;
+    let declaration = stage
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("local runner_root"))
+        .expect("stage_target_dirs does not declare its candidate roots");
+    assert_eq!(
+        declaration, "local runner_root='' btrfs_target_root=''",
+        "candidate-root locals must use explicit empty assignments accepted by ShellCheck SC1007"
+    );
+}
+
+#[test]
+fn cargo_target_wrappers_share_one_retirement_protocol() {
+    let library = std::fs::read_to_string(repo_root().join("scripts/cargo-target-lib.sh"))
+        .expect("read shared cargo-target library");
+    assert!(
+        library.contains("target_is_retired()")
+            && library.contains("user.fcvm.retired")
+            && library.contains("unsupported retired-generation marker"),
+        "shared cargo-target library does not own the retirement protocol"
+    );
+    for wrapper in [
+        "scripts/cargo-target-link.sh",
+        "scripts/cargo-target-run.sh",
+    ] {
+        let source = std::fs::read_to_string(repo_root().join(wrapper))
+            .unwrap_or_else(|error| panic!("read {wrapper}: {error}"));
+        assert!(
+            source.contains("cargo-target-lib.sh") && !source.contains("target_is_retired()"),
+            "{wrapper} does not source the shared retirement protocol exactly once"
+        );
+    }
+}
+
+/// `sudo` resets the environment on the privileged half of the fuse-pipe
+/// sweep. Run the real orchestration script with an environment-clearing sudo
+/// shim and observe the Cargo process, proving both managed-target variables
+/// cross that boundary as values rather than merely appearing in source text.
+#[test]
+fn fuse_pipe_privileged_cargo_preserves_target_protocol_environment() {
+    let fixture = tempfile::tempdir().expect("fuse-pipe environment fixture");
+    let shims = fixture.path().join("bin");
+    let log_dir = fixture.path().join("logs");
+    let cargo_target = fixture.path().join("cargo-target");
+    let btrfs_root = fixture.path().join("btrfs-root");
+    let observed = fixture.path().join("cargo-environment.log");
+    for directory in [&shims, &log_dir, &cargo_target, &btrfs_root] {
+        std::fs::create_dir_all(directory).expect("create fuse-pipe fixture directory");
+    }
+
+    for (name, source) in [
+        ("make", "#!/bin/sh\nexit 0\n"),
+        (
+            "cargo",
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$*\" \"${CARGO_TARGET_DIR-unset}\" \"${BTRFS_ROOT-unset}\" >>\"$FCVM_TEST_LOG\"\n",
+        ),
+        (
+            "sudo",
+            "#!/bin/sh\nexec /usr/bin/env -i PATH=\"$PATH\" FCVM_TEST_LOG=\"$FCVM_TEST_LOG\" \"$@\"\n",
+        ),
+    ] {
+        let path = shims.join(name);
+        std::fs::write(&path, source).expect("write fuse-pipe command shim");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fuse-pipe command shim executable");
+    }
+
+    let inherited_path = std::env::var_os("PATH").expect("PATH is set");
+    let mut path = shims.into_os_string();
+    path.push(":");
+    path.push(inherited_path);
+    let output = Command::new(repo_root().join("scripts/run_fuse_pipe_tests.sh"))
+        .env("PATH", path)
+        .env("FCVM_TEST_LOG", &observed)
+        .env("LOG_DIR", &log_dir)
+        .env("STEP_TIMEOUT", "5")
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("BTRFS_ROOT", &btrfs_root)
+        .output()
+        .expect("run real fuse-pipe orchestration with command shims");
+    assert!(
+        output.status.success(),
+        "fuse-pipe orchestration failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let observed = std::fs::read_to_string(&observed).expect("read observed Cargo environment");
+    for test_name in ["stress", "pjdfstest_matrix"] {
+        let expected_prefix = format!("test -p fuse-pipe --test {test_name} -- --nocapture|");
+        let line = observed
+            .lines()
+            .find(|line| line.starts_with(&expected_prefix))
+            .unwrap_or_else(|| {
+                panic!("privileged {test_name} Cargo command was not observed:\n{observed}")
+            });
+        assert_eq!(
+            line,
+            format!(
+                "test -p fuse-pipe --test {test_name} -- --nocapture|{}|{}",
+                cargo_target.display(),
+                btrfs_root.display()
+            ),
+            "privileged {test_name} lost the managed-target environment through sudo"
+        );
+    }
 }
 
 /// Exercise the shared installer into a DESTDIR and verify both contents and modes. A string
@@ -2273,6 +2618,20 @@ fn persistent_runner_entrypoints_route_cargo_through_the_lease() {
                 .count()
                 == 4,
         "fuse-pipe runner does not set up and lease all four Cargo test invocations"
+    );
+    assert_eq!(
+        fuse_runner
+            .matches("CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\"")
+            .count(),
+        2,
+        "both privileged fuse-pipe Cargo runs must preserve CARGO_TARGET_DIR through sudo"
+    );
+    assert_eq!(
+        fuse_runner
+            .matches("BTRFS_ROOT=\"${BTRFS_ROOT:-/mnt/fcvm-btrfs}\"")
+            .count(),
+        2,
+        "both privileged fuse-pipe Cargo runs must preserve BTRFS_ROOT through sudo"
     );
 
     for path in ["scripts/build-ami.sh", "scripts/fcvm-init.sh"] {

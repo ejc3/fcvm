@@ -6,6 +6,36 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-west-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
+FCVM_SOURCE_REMOTE="${FCVM_SOURCE_REMOTE:-https://github.com/ejc3/fcvm.git}"
+
+# Prove the cloud builder can perform the exact fetch rendered below before an
+# EC2 instance is allocated. A local HEAD can identify a perfectly valid but
+# unpushed commit; materializing it locally is not evidence that the separate
+# builder can fetch it. Use a fresh object database so the local checkout's
+# existing object cannot make this probe pass vacuously.
+verify_source_commit_fetchable() {
+  local repo_root="$1"
+  local source_commit="$2"
+  local source_remote="$3"
+  local fetch_probe
+
+  if [[ ! $source_commit =~ ^[0-9a-f]{40}$ ]] || \
+    ! git -C "$repo_root" cat-file -e "$source_commit^{commit}"; then
+    echo "ERROR: invalid local fcvm source commit: $source_commit" >&2
+    return 1
+  fi
+
+  fetch_probe="$(mktemp -d)" || return 1
+  if ! git -C "$fetch_probe" init --quiet || \
+    ! git -C "$fetch_probe" fetch --quiet --depth 1 \
+      "$source_remote" "$source_commit"; then
+    rm -rf -- "$fetch_probe"
+    echo "ERROR: fcvm source commit $source_commit is not fetchable from $source_remote;" >&2
+    echo "       push the commit before launching the AMI builder." >&2
+    return 1
+  fi
+  rm -rf -- "$fetch_probe"
+}
 
 # Materialize exactly the Git tree the AMI builder will fetch. Hashing the
 # caller's working-tree bytes and pinning only HEAD can otherwise label an AMI
@@ -127,13 +157,13 @@ compute_hash() {
   # produced if a read fails.
   local disk_guard_digests
   if ! disk_guard_digests=$(
-    cd "$repo_root" &&
+    cd "$SCRIPT_DIR" &&
       sha256sum \
-        scripts/runner-disk-preflight.sh \
-        scripts/prune-cargo-target.sh \
-        scripts/install-runner-disk-guard.sh \
-        scripts/runner-disk-guard.service \
-        scripts/runner-disk-guard.timer
+        runner-disk-preflight.sh \
+        prune-cargo-target.sh \
+        install-runner-disk-guard.sh \
+        runner-disk-guard.service \
+        runner-disk-guard.timer
   ); then
     echo "ERROR: cannot digest every disk-guard AMI input" >&2
     return 1
@@ -198,7 +228,9 @@ create_user_data() {
     echo "ERROR: invalid fcvm source commit for AMI user data: $source_commit" >&2
     return 1
   fi
-  sed "s/__FCVM_SOURCE_COMMIT__/$source_commit/g" << 'USERDATA'
+  sed \
+    -e "s/__FCVM_SOURCE_COMMIT__/$source_commit/g" \
+    -e "s#__FCVM_SOURCE_REMOTE__#$FCVM_SOURCE_REMOTE#g" << 'USERDATA'
 #!/bin/bash
 exec > >(tee /var/log/ami-build.log) 2>&1
 set -euxo pipefail
@@ -270,8 +302,9 @@ sudo -u ubuntu env HOME=/home/ubuntu bash -c \
 # moving main here allowed a merge during instance boot to install a different
 # disk-guard protocol than the one compute_hash read.
 FCVM_SOURCE_COMMIT="__FCVM_SOURCE_COMMIT__"
+FCVM_SOURCE_REMOTE="__FCVM_SOURCE_REMOTE__"
 git init /tmp/fcvm
-git -C /tmp/fcvm remote add origin https://github.com/ejc3/fcvm.git
+git -C /tmp/fcvm remote add origin "$FCVM_SOURCE_REMOTE"
 git -C /tmp/fcvm fetch --depth 1 origin "$FCVM_SOURCE_COMMIT"
 git -C /tmp/fcvm checkout --detach FETCH_HEAD
 git clone --depth 1 https://github.com/ejc3/fuse-backend-rs.git /tmp/fuse-backend-rs
@@ -442,6 +475,11 @@ main() {
     echo "ami_id=$existing" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "cached=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     exit 0
+  fi
+
+  if ! verify_source_commit_fetchable \
+    "$repo_root" "$source_commit" "$FCVM_SOURCE_REMOTE"; then
+    exit 1
   fi
 
   echo "No cached AMI, building..."

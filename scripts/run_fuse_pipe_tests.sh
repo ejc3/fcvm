@@ -54,8 +54,11 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 run_step "stress" sudo env STRESS_WORKERS="${STRESS_WORKERS:-4}" STRESS_OPS="${STRESS_OPS:-1000}" \
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" BTRFS_ROOT="${BTRFS_ROOT:-/mnt/fcvm-btrfs}" \
     "${CARGO_RUNNER}" cargo test -p fuse-pipe --test stress -- --nocapture || die "stress test failed"
 
-run_step "pjdfstest-matrix" sudo "${CARGO_RUNNER}" cargo test -p fuse-pipe --test pjdfstest_matrix -- --nocapture || die "pjdfstest_matrix failed"
+run_step "pjdfstest-matrix" sudo env CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" \
+    BTRFS_ROOT="${BTRFS_ROOT:-/mnt/fcvm-btrfs}" \
+    "${CARGO_RUNNER}" cargo test -p fuse-pipe --test pjdfstest_matrix -- --nocapture || die "pjdfstest_matrix failed"
 
 echo -e "\n==> ALL TESTS PASSED" | tee -a "${LOG_FILE}"

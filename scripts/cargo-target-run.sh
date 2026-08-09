@@ -18,27 +18,10 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 
 target="${CARGO_TARGET_DIR:-target}"
-link_script="$(cd "$(dirname "$0")" && pwd -P)/cargo-target-link.sh"
-
-target_is_retired() {
-	local fd="$1" rc=0
-	/usr/bin/python3 -c '
-import errno
-import os
-import sys
-
-try:
-    value = os.getxattr(sys.argv[1], b"user.fcvm.retired")
-except OSError as error:
-    if error.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)):
-        raise SystemExit(3)
-    raise
-if value != b"v1":
-    print(f"unsupported retired-generation marker: {value!r}", file=sys.stderr)
-    raise SystemExit(4)
-' "/proc/$$/fd/$fd" || rc=$?
-	return "$rc"
-}
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/cargo-target-lib.sh
+. "$script_dir/cargo-target-lib.sh"
+link_script="$script_dir/cargo-target-link.sh"
 
 while :; do
 	# cargo-target-link.sh takes this same checkout-directory lock exclusively

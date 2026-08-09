@@ -30,6 +30,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 
 cutoff, dry_run_text, runner_root, btrfs_target_root = sys.argv[1:]
 if dry_run_text not in ("0", "1"):
@@ -182,7 +183,12 @@ def add_candidate(path, fd, candidates, managed):
     except OSError:
         os.close(fd)
         raise
-    candidates.append({"path": path, "fd": fd, "state": "locked"})
+    candidates.append({
+        "path": path,
+        "fd": fd,
+        "state": "locked",
+        "locked_at_ns": time.monotonic_ns(),
+    })
 
 
 def enumerate_runner_root(path, candidates):
@@ -467,6 +473,20 @@ def synchronize_test_after_enumeration():
             raise RuntimeError("test synchronization peer closed before continuation")
 
 
+def synchronize_test_after_candidate_release(path):
+    # runner-disk-preflight clears this direct-test control at its privilege
+    # boundary. It proves the completed inode is unlocked while later retained
+    # candidates remain exclusively leased.
+    endpoint = os.environ.get("FCVM_PRUNE_TEST_AFTER_RELEASE_SOCKET")
+    if not endpoint:
+        return
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.connect(endpoint)
+        channel.sendall(os.fsencode(path) + b"\0")
+        if channel.recv(1) != b"C":
+            raise RuntimeError("candidate-release test peer closed before continuation")
+
+
 candidates = []
 try:
     # No pruning occurs until every supplied root has been traversed and all
@@ -520,11 +540,12 @@ for candidate in candidates:
     if candidate["state"] == "busy":
         log(f"  keeping (concurrent cargo holds target lease): {path}")
         continue
-    if candidate["active"]:
-        log(f"  keeping (active within cutoff): {path}")
-        continue
 
     try:
+        if candidate["active"]:
+            log(f"  keeping (active within cutoff): {path}")
+            continue
+
         # Rewalk under the retained exclusive lease immediately before reclaim.
         # The second census detects activity, topology, or mount changes before
         # the first fingerprint is invalidated.
@@ -553,6 +574,16 @@ for candidate in candidates:
     except BaseException as error:
         log(f"ERROR: target cleanup failed for {path}: {error}")
         raise SystemExit(49)
+    finally:
+        # Enumeration and the global first census intentionally retain every
+        # candidate lock. Once the current second census/reclaim decision
+        # is complete, later work no longer depends on its lease. Release it on
+        # success, keep, dry-run, and failure paths alike.
+        candidate["fd"] = None
+        os.close(fd)
+        held_ns = time.monotonic_ns() - candidate["locked_at_ns"]
+        log(f"  candidate lease released after {held_ns / 1_000_000_000:.3f}s: {path}")
+        synchronize_test_after_candidate_release(path)
 
 log(
     f"[idle cargo target dirs] considered {considered} per-worktree targets; "
