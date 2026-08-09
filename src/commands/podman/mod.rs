@@ -246,6 +246,35 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         );
     }
 
+    // --publish now DNATs each published guest port to 127.0.0.1 inside the guest,
+    // and --forward-localhost BINDS 127.0.0.1:<port> there as a relay to the host.
+    // Overlap turns the published port into a reflector: an external client reaches
+    // the HOST's service on that port and never touches the guest. It returns a
+    // successful response from the wrong machine rather than an error, so it cannot
+    // be left to be discovered at runtime. The overlap is on the GUEST port, which
+    // is the second field of --publish.
+    {
+        let forwarded: std::collections::HashSet<u16> =
+            args.forward_localhost.iter().copied().collect();
+        for spec in &args.publish {
+            let Ok(pm) = crate::network::PortMapping::parse(spec) else {
+                continue; // invalid specs are reported by the parser itself
+            };
+            if forwarded.contains(&pm.guest_port) {
+                bail!(
+                    "--publish {spec} and --forward-localhost {} both claim guest port {}. \
+                     --publish makes that port reach the guest's 127.0.0.1:{}, which is exactly \
+                     where --forward-localhost binds its relay to the host — so the published \
+                     port would answer with the HOST's service instead of the guest's. \
+                     Use different ports.",
+                    pm.guest_port,
+                    pm.guest_port,
+                    pm.guest_port
+                );
+            }
+        }
+    }
+
     // Disallow --setup when running as root
     // Root users should run `fcvm setup` explicitly
     if args.setup && nix::unistd::geteuid().is_root() {

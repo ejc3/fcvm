@@ -42,7 +42,9 @@ pub async fn run() -> Result<()> {
     system::save_proxy_settings(&plan);
 
     // Always, for every published port: a guest service that binds loopback only
-    // is otherwise unreachable, and the caller cannot tell which kind it is.
+    // is otherwise unreachable, and the caller cannot tell which kind it is —
+    // chromium accepts --remote-debugging-address=0.0.0.0 and binds 127.0.0.1
+    // anyway. Installed once, here, before the container starts.
     network::publish_to_loopback(&plan.published_guest_ports);
 
     if !plan.forward_localhost.is_empty() {

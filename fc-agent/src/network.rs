@@ -560,6 +560,12 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
     }
 }
 
+/// Guest-side port of the transparent egress proxy (`proxy.rs::PROXY_LISTEN_PORT`).
+///
+/// Kept in sync deliberately rather than imported, so the compiler points here if
+/// that constant moves: this list is a SECURITY exclusion, not a convenience.
+const EGRESS_PROXY_PORT: u16 = 12345;
+
 /// Make every published guest port reachable even when the service binds
 /// 127.0.0.1 only.
 ///
@@ -579,6 +585,47 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
 /// guest — an extra process per clone, in the byte path, on the one arm that
 /// dropped connections.
 ///
+/// # Why it is unconditional
+///
+/// Rewriting the destination breaks one case: a service bound to the guest's OWN
+/// address (`10.0.2.100:P`), whose socket stops matching. Netfilter can express
+/// the exception — `-m socket --nowildcard -j RETURN` — but the shipped guest
+/// kernel cannot run it. Measured in the guest (Kata 6.12.47, iptables 1.8.10 nft):
+///
+/// ```text
+/// # iptables -t nat -A PREROUTING -p tcp --dport N -m socket -j RETURN
+/// Warning: Extension socket revision 0 not supported, missing kernel module?
+/// RULE_APPEND failed (No such file or directory): rule in chain PREROUTING
+/// # modprobe xt_socket
+/// FATAL: Module xt_socket not found in directory /lib/modules/6.12.47
+/// ```
+///
+/// `/lib/modules` in the guest holds the ROOTFS's module tree, not the running
+/// kernel's, so no netfilter match can be loaded at runtime — the Kata kernel is
+/// built-in-only from here. Inferring the exception in userspace instead (poll
+/// `/proc/net/tcp`, add/remove the rule as listeners change) was written and
+/// rejected: there is no "safe" moment to decide, because the address a service
+/// will bind does not exist until it binds, so every such design has a window.
+///
+/// The exception is also close to unreachable HERE. The guest netns has exactly
+/// one external interface with exactly one IPv4 address (measured: `eth0`
+/// `10.0.2.100/24` plus `lo`), so binding it and binding the wildcard are
+/// equivalent — a specific bind exists to EXCLUDE other interfaces and there are
+/// none. The hostname resolves to nothing (`/etc/hosts` has only `127.0.0.1
+/// localhost`), so `InetAddress.getLocalHost()` and friends throw rather than
+/// returning the guest address. No listener in this repo binds a specific
+/// non-loopback address.
+///
+/// # Known limits
+///
+/// - **TCP only.** `--publish X:P/udp` to a loopback-bound UDP service stays
+///   unreachable.
+/// - **`127.0.0.1` exactly.** A service on another `127.0.0.0/8` address
+///   (`127.0.1.1`, which Debian's hostname convention and Akka/Pekko produce)
+///   is not matched by this rewrite. It is unreachable, exactly as before.
+/// - **A service bound to `10.0.2.100:P` loses `--publish`.** See above for why
+///   that is not reachable in practice.
+///
 /// # Why DNAT works HERE and not in `setup_localhost_forwarding`
 ///
 /// That function documents that DNAT is unusable for guest -> host, because the
@@ -588,82 +635,207 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
 /// conntrack rewrites the reply's source back to the original destination before
 /// it leaves. Nothing downstream ever sees a loopback source address.
 ///
-/// `route_localnet` is required: without it the kernel drops a packet routed to
-/// 127.0.0.0/8 that arrived on a non-loopback interface (martian source). fcvm
-/// already relies on the same switch for host-side port forwarding — see
-/// `src/network/portmap.rs::enable_route_localnet`.
-///
 /// # Security
 ///
-/// This widens nothing that `--publish` did not already open. The port is
-/// reachable exactly when the operator published it, and the microVM boundary is
-/// what guards ingress: reaching the guest at all means going through fcvm's
-/// per-VM forwarding. A failure here is logged and never fatal — the VM still
-/// boots and a `0.0.0.0` service still works.
+/// `route_localnet=1` is what makes a loopback destination routable for a packet
+/// that arrived on `eth0` — and on its own it does that for the guest's ENTIRE
+/// loopback listener set, not just the published ports. That is strictly wider
+/// than `--publish` and is NOT acceptable on the strength of "the microVM guards
+/// ingress", so `install_loopback_containment` closes it: anything arriving on
+/// `eth0` addressed to `127.0.0.0/8` is dropped unless conntrack says WE
+/// translated it. Only deliberately published ports get through.
+///
+/// The egress proxy's own port is excluded from publishing entirely. It listens
+/// on `127.0.0.1:12345` inside the guest and relays through the host, and a
+/// published DNAT would hand external clients a host-side `connect()` with no
+/// destination validation and no timeout.
 pub fn publish_to_loopback(ports: &[String]) {
-    if ports.is_empty() {
+    let mut wanted: Vec<u16> = Vec::new();
+    for spec in ports {
+        match spec.parse::<u16>() {
+            Ok(EGRESS_PROXY_PORT) => eprintln!(
+                "[fc-agent] WARNING: refusing to publish port {EGRESS_PROXY_PORT} to guest \
+                 loopback — it is the transparent egress proxy's listener, and exposing it \
+                 would let an external client drive host-side connections. Publish a \
+                 different guest port."
+            ),
+            Ok(p) => wanted.push(p),
+            Err(e) => eprintln!("[fc-agent] WARNING: invalid published port '{spec}': {e}"),
+        }
+    }
+    if wanted.is_empty() {
         return;
     }
 
-    // Martian-source guard. `all` is not sufficient on its own for every kernel
-    // config, so set the interface too; failures are logged, not fatal.
-    for key in [
-        "net.ipv4.conf.all.route_localnet",
-        "net.ipv4.conf.eth0.route_localnet",
-    ] {
-        match std::process::Command::new("sysctl")
-            .arg("-w")
-            .arg(format!("{key}=1"))
-            .output()
-        {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => eprintln!(
-                "[fc-agent] WARNING: {key}=1 failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
+    enable_route_localnet();
+
+    // BEFORE the DNATs, so there is no window in which route_localnet is on and
+    // the containment is not.
+    install_loopback_containment();
+
+    for port in wanted {
+        match run_iptables(&loopback_dnat_args("-A", port)) {
+            Ok(()) => eprintln!("[fc-agent] published port {port} also reaches 127.0.0.1:{port}"),
+            Err(e) => eprintln!(
+                "[fc-agent] WARNING: DNAT for published port {port} failed: {e}. A service \
+                 bound to 127.0.0.1:{port} will not be reachable."
             ),
-            Err(e) => eprintln!("[fc-agent] WARNING: could not run sysctl for {key}: {e}"),
         }
     }
+}
 
-    for port_str in ports {
-        let port: u16 = match port_str.parse() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[fc-agent] WARNING: invalid published port '{port_str}': {e}");
-                continue;
-            }
-        };
+/// `iptables -w -t nat <op> PREROUTING -p tcp --dport P -j DNAT --to 127.0.0.1:P`.
+///
+/// PREROUTING so the rewrite happens before the routing decision, which is what
+/// lets 127.0.0.1 be a valid destination for a packet that arrived on eth0.
+/// `-w` takes the xtables lock rather than racing another caller.
+fn loopback_dnat_args(op: &str, port: u16) -> Vec<String> {
+    vec![
+        "-w".into(),
+        "-t".into(),
+        "nat".into(),
+        op.into(),
+        "PREROUTING".into(),
+        "-p".into(),
+        "tcp".into(),
+        "--dport".into(),
+        port.to_string(),
+        "-j".into(),
+        "DNAT".into(),
+        "--to-destination".into(),
+        format!("127.0.0.1:{port}"),
+    ]
+}
 
-        // PREROUTING so the rewrite happens before the routing decision, which is
-        // what lets 127.0.0.1 become a valid destination for a packet that arrived
-        // on eth0. -w takes the xtables lock rather than racing another caller.
-        let out = std::process::Command::new("iptables")
-            .args([
-                "-w",
-                "-t",
-                "nat",
-                "-A",
-                "PREROUTING",
-                "-p",
-                "tcp",
-                "--dport",
-                &port.to_string(),
-                "-j",
-                "DNAT",
-                "--to-destination",
-                &format!("127.0.0.1:{port}"),
-            ])
-            .output();
+/// Drop anything arriving on `eth0` for `127.0.0.0/8` that we did not translate.
+///
+/// `route_localnet` is per-interface, not per-port: switching it on makes every
+/// loopback listener in the guest reachable from the L2 segment, which is much
+/// more than `--publish` opened. `-m conntrack ! --ctstate DNAT` distinguishes the
+/// packets our PREROUTING rules rewrote (conntrack records the translation) from
+/// ones an attacker addressed to `127.0.0.1` directly. `xt_conntrack` IS built
+/// into the Kata kernel — verified in the guest, unlike `xt_socket`.
+///
+/// Scoped to `-i eth0`: locally-generated traffic re-enters on `lo` and is never
+/// matched, so guest-internal loopback use and the egress proxy's `nat OUTPUT`
+/// REDIRECT are untouched.
+fn install_loopback_containment() {
+    let args = containment_args("-A");
+    match run_iptables(&args) {
+        Ok(()) => eprintln!(
+            "[fc-agent] loopback containment installed: only DNAT'd connections reach 127.0.0.0/8 \
+             from eth0"
+        ),
+        Err(e) => eprintln!(
+            "[fc-agent] WARNING: could not install loopback containment ({e}). route_localnet is \
+             on, so every guest loopback listener — not just published ports — is reachable from \
+             the guest's network segment."
+        ),
+    }
+}
 
-        match out {
-            Ok(o) if o.status.success() => {
-                eprintln!("[fc-agent] published port {port} also reaches 127.0.0.1:{port}")
-            }
-            Ok(o) => eprintln!(
-                "[fc-agent] WARNING: DNAT for published port {port} failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ),
-            Err(e) => eprintln!("[fc-agent] WARNING: could not run iptables for port {port}: {e}"),
-        }
+fn containment_args(op: &str) -> Vec<String> {
+    vec![
+        "-w".into(),
+        op.into(),
+        "INPUT".into(),
+        "-i".into(),
+        "eth0".into(),
+        "-d".into(),
+        "127.0.0.0/8".into(),
+        "-m".into(),
+        "conntrack".into(),
+        "!".into(),
+        "--ctstate".into(),
+        "DNAT".into(),
+        "-j".into(),
+        "DROP".into(),
+    ]
+}
+
+fn run_iptables(args: &[String]) -> Result<(), String> {
+    match std::process::Command::new("iptables").args(args).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Without this the kernel treats a packet routed to 127.0.0.0/8 that arrived on
+/// a non-loopback interface as a martian source and drops it.
+///
+/// `eth0` only, deliberately. `all` would also cover interfaces created LATER —
+/// a bridge a nested workload brings up — which is broader than anything
+/// `--publish` implies, and the containment rule above is scoped to `eth0`.
+fn enable_route_localnet() {
+    let key = "net.ipv4.conf.eth0.route_localnet";
+    match std::process::Command::new("sysctl")
+        .arg("-w")
+        .arg(format!("{key}=1"))
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => eprintln!(
+            "[fc-agent] WARNING: {key}=1 failed: {}. Published ports will not reach a \
+             loopback-bound service.",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("[fc-agent] WARNING: could not run sysctl for {key}: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod loopback_publish_tests {
+    use super::*;
+
+    /// The command that gets run IS the feature; a typo here is invisible until a
+    /// VM silently fails to publish.
+    #[test]
+    fn dnat_rewrites_only_the_destination_and_keeps_the_port() {
+        assert_eq!(
+            loopback_dnat_args("-A", 9222).join(" "),
+            "-w -t nat -A PREROUTING -p tcp --dport 9222 -j DNAT --to-destination 127.0.0.1:9222"
+        );
+        // The source is never touched: conntrack un-NATs the reply, so nothing
+        // downstream (pasta's L4 translation, the bridged veth) sees a loopback
+        // source. See setup_localhost_forwarding for why the reverse direction
+        // cannot do this.
+        let args = loopback_dnat_args("-A", 9222).join(" ");
+        assert!(
+            !args.contains("--to-source") && !args.contains("SNAT"),
+            "{args}"
+        );
+    }
+
+    /// Containment is the difference between "published ports reach loopback" and
+    /// "the guest's whole loopback surface is on the wire". Without `! --ctstate
+    /// DNAT` the rule would drop the published traffic too; without `-i eth0` it
+    /// would break guest-internal loopback.
+    #[test]
+    fn containment_drops_only_untranslated_wire_traffic() {
+        let args = containment_args("-A").join(" ");
+        assert_eq!(
+            args,
+            "-w -A INPUT -i eth0 -d 127.0.0.0/8 -m conntrack ! --ctstate DNAT -j DROP"
+        );
+        assert!(
+            args.contains("! --ctstate DNAT"),
+            "must let OUR translations through: {args}"
+        );
+        assert!(
+            args.contains("-i eth0"),
+            "must not touch locally-generated loopback: {args}"
+        );
+    }
+
+    /// The egress proxy listens on 127.0.0.1:12345 in the guest and relays via the
+    /// host. Publishing it hands an external client a host-side connect() with no
+    /// destination validation and no timeout, so it must never get a DNAT.
+    #[test]
+    fn the_egress_proxy_port_is_never_published() {
+        assert_eq!(
+            EGRESS_PROXY_PORT, 12345,
+            "must track proxy.rs::PROXY_LISTEN_PORT; if that moved, this exclusion is dead"
+        );
     }
 }
