@@ -298,8 +298,7 @@ impl SnapshotManager {
             .await
             .context("reading snapshot metadata")?;
 
-        let config: SnapshotConfig =
-            serde_json::from_slice(&metadata_json).context("parsing snapshot metadata")?;
+        let config = parse_snapshot_config(name, &metadata_json)?;
         let generation = SnapshotGeneration::from_config(&config, &metadata_json);
 
         Ok((config, generation))
@@ -395,6 +394,31 @@ impl SnapshotManager {
     }
 }
 
+fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotConfig> {
+    let value: serde_json::Value =
+        serde_json::from_slice(metadata_json).context("parsing snapshot metadata JSON")?;
+    let object = value.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "snapshot '{name}' has unsupported metadata schema: config.json must contain an object; delete and recreate the snapshot"
+        )
+    })?;
+    let missing_or_null: Vec<&str> = ["generation_id", "snapshot_type", "kind"]
+        .into_iter()
+        .filter(|field| object.get(*field).map_or(true, serde_json::Value::is_null))
+        .collect();
+    if !missing_or_null.is_empty() {
+        anyhow::bail!(
+            "snapshot '{name}' has unsupported metadata schema (required fields missing or null: {}); delete and recreate the snapshot",
+            missing_or_null.join(", ")
+        );
+    }
+    serde_json::from_value(value).with_context(|| {
+        format!(
+            "snapshot '{name}' metadata is incompatible with this fcvm build; delete and recreate the snapshot"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +449,70 @@ mod tests {
         assert!(manager.delete_snapshot("../outside").await.is_err());
         assert!(outside.join("marker").exists());
         assert!(manager.load_snapshot("../outside").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn old_snapshot_schema_is_rejected_with_recreation_instructions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshots = temp_dir.path().join("snapshots");
+        let manager = SnapshotManager::new(snapshots.clone());
+        for (name, config, rejected_fields) in [
+            (
+                "missing-all",
+                serde_json::json!({"name": "missing-all", "vm_id": "vm-old"}),
+                "generation_id, snapshot_type, kind",
+            ),
+            (
+                "missing-generation",
+                serde_json::json!({
+                    "name": "missing-generation", "vm_id": "vm-old",
+                    "snapshot_type": "User", "kind": "Full"
+                }),
+                "generation_id",
+            ),
+            (
+                "missing-type",
+                serde_json::json!({
+                    "name": "missing-type", "vm_id": "vm-old",
+                    "generation_id": uuid::Uuid::nil(), "kind": "Full"
+                }),
+                "snapshot_type",
+            ),
+            (
+                "missing-kind",
+                serde_json::json!({
+                    "name": "missing-kind", "vm_id": "vm-old",
+                    "generation_id": uuid::Uuid::nil(), "snapshot_type": "User"
+                }),
+                "kind",
+            ),
+            (
+                "null-generation",
+                serde_json::json!({
+                    "name": "null-generation", "vm_id": "vm-old",
+                    "generation_id": null, "snapshot_type": "User", "kind": "Full"
+                }),
+                "generation_id",
+            ),
+        ] {
+            let snapshot_dir = snapshots.join(name);
+            tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+            tokio::fs::write(
+                snapshot_dir.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let error = manager
+                .load_snapshot(name)
+                .await
+                .expect_err("old schemas must fail closed instead of inventing defaults");
+            let message = format!("{error:#}");
+            assert!(message.contains("unsupported metadata schema"), "{message}");
+            assert!(message.contains(rejected_fields), "{message}");
+            assert!(message.contains("delete and recreate"), "{message}");
+        }
     }
 
     #[test]

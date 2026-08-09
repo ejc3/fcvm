@@ -456,7 +456,7 @@ async fn stop_test_child(child: &mut tokio::process::Child, process: &PinnedProc
     let term_result = process.signal(libc::SIGTERM);
     if let Ok(waited) = tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
         waited.context("waiting for fixture child after SIGTERM")?;
-        term_result?;
+        ignore_esrch_after_confirmed_exit(term_result)?;
         return Ok(());
     }
 
@@ -464,8 +464,8 @@ async fn stop_test_child(child: &mut tokio::process::Child, process: &PinnedProc
     match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
         Ok(waited) => {
             waited.context("waiting for fixture child after SIGKILL")?;
-            term_result?;
-            kill_result?;
+            ignore_esrch_after_confirmed_exit(term_result)?;
+            ignore_esrch_after_confirmed_exit(kill_result)?;
             Ok(())
         }
         Err(_) => anyhow::bail!(
@@ -474,6 +474,45 @@ async fn stop_test_child(child: &mut tokio::process::Child, process: &PinnedProc
             process.start
         ),
     }
+}
+
+fn ignore_esrch_after_confirmed_exit(signal_result: Result<()>) -> Result<()> {
+    match signal_result {
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.raw_os_error() == Some(libc::ESRCH))
+            }) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+#[test]
+fn confirmed_exit_ignores_only_pidfd_esrch() {
+    let esrch = Err(anyhow::Error::new(std::io::Error::from_raw_os_error(
+        libc::ESRCH,
+    )))
+    .context("sending SIGTERM through pidfd");
+    ignore_esrch_after_confirmed_exit(esrch).expect("ESRCH means the pinned child is gone");
+
+    let eperm = Err(anyhow::Error::new(std::io::Error::from_raw_os_error(
+        libc::EPERM,
+    )))
+    .context("sending SIGTERM through pidfd");
+    let error = ignore_esrch_after_confirmed_exit(eperm)
+        .expect_err("non-ESRCH signal failures must remain visible");
+    assert!(
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.raw_os_error() == Some(libc::EPERM))
+        }),
+        "unexpected error: {error:#}"
+    );
 }
 
 /// Remove only a previously deserialized clone's exact paths after a failed
@@ -1450,7 +1489,7 @@ async fn test_lifecycle_interleave_cancellation_wins_before_lifecycle_ready_clai
 /// 1. wait for `restore.pre_resume reached` and all three exact clone artifacts;
 /// 2. prove the state still has no PID, deliver SIGTERM, and require fcvm's
 ///    signal-handler log while the failpoint remains held;
-/// 3. release the failpoint, require an orderly bounded exit, and require the
+/// 3. release the failpoint, require a bounded non-success exit, and require the
 ///    exact `state/<vm_id>.json`, `.json.lock`, and `vm-disks/<vm_id>` paths to
 ///    be gone.
 ///
@@ -1621,8 +1660,8 @@ async fn test_lifecycle_interleave_snapshot_run_sigterm_before_resume_cleans_exa
                 )
             })?;
         anyhow::ensure!(
-            clone_status.success(),
-            "signal-owned clone exited unsuccessfully ({clone_status:?}); log tail:\n{}",
+            !clone_status.success(),
+            "an interrupted clone setup reported success ({clone_status:?}); log tail:\n{}",
             log_tail(&clone_log, 60)
         );
         wait_for_marker(
@@ -1633,6 +1672,14 @@ async fn test_lifecycle_interleave_snapshot_run_sigterm_before_resume_cleans_exa
         )
         .await
         .context("waiting for the log consumer to drain the cleanup completion record")?;
+        wait_for_marker(
+            &clone_log,
+            "interrupted by signal during clone setup",
+            released_at,
+            Duration::from_secs(10),
+        )
+        .await
+        .context("waiting for the explicit interrupted-setup diagnostic")?;
         wait_for_artifacts_removed(&artifacts, Duration::from_secs(15)).await?;
 
         Ok(())

@@ -349,7 +349,10 @@ guard_quiet() {
     log "load=$la vm-processes=$fc"
     local load_busy=0 load_whole load_fraction
     load_whole=${la%%.*}
-    load_fraction=${la#*.}
+    case "$la" in
+        *.*) load_fraction=${la#*.} ;;
+        *) load_fraction="" ;;
+    esac
     load_fraction=${load_fraction//0/}
     if [ "$load_whole" -gt 2 ] || {
         [ "$load_whole" -eq 2 ] && [ -n "$load_fraction" ];

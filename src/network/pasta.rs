@@ -883,6 +883,7 @@ impl PastaNetwork {
     async fn wait_for_port_forwarding_until(&self, deadline: std::time::Instant) -> Result<()> {
         use tokio::net::TcpStream;
 
+        let readiness_budget = deadline.saturating_duration_since(std::time::Instant::now());
         let loopback = self.loopback_ip.as_deref().unwrap_or("127.0.0.1");
 
         for mapping in &self.port_mappings {
@@ -899,7 +900,7 @@ impl PastaNetwork {
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    anyhow::bail!("pasta port forward not ready within 5s: {}", addr);
+                    return Err(port_forward_deadline_error(&addr, readiness_budget));
                 }
                 match tokio::time::timeout(remaining, TcpStream::connect(&addr)).await {
                     Ok(Ok(_)) => {
@@ -910,15 +911,12 @@ impl PastaNetwork {
                         let remaining =
                             deadline.saturating_duration_since(std::time::Instant::now());
                         if remaining.is_zero() {
-                            anyhow::bail!("pasta port forward not ready within 5s: {}", addr);
+                            return Err(port_forward_deadline_error(&addr, readiness_budget));
                         }
                         tokio::time::sleep(remaining.min(std::time::Duration::from_millis(50)))
                             .await;
                     }
-                    Err(_) => anyhow::bail!(
-                        "pasta port forward connect exceeded the 5s readiness deadline: {}",
-                        addr
-                    ),
+                    Err(_) => return Err(port_forward_deadline_error(&addr, readiness_budget)),
                 }
             }
         }
@@ -932,6 +930,12 @@ impl PastaNetwork {
         )
         .await
     }
+}
+
+fn port_forward_deadline_error(addr: &str, budget: std::time::Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "pasta port forward not ready within caller readiness budget {budget:?}: {addr}"
+    )
 }
 
 #[async_trait::async_trait]
@@ -1277,6 +1281,31 @@ mod tests {
             error.to_string().contains("namespace holder PID"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn port_forward_deadline_reports_the_callers_budget() {
+        let error =
+            port_forward_deadline_error("127.0.0.1:9222", std::time::Duration::from_millis(37));
+        assert_eq!(
+            error.to_string(),
+            "pasta port forward not ready within caller readiness budget 37ms: 127.0.0.1:9222"
+        );
+        assert!(!error.to_string().contains("5s"));
+    }
+
+    #[tokio::test]
+    async fn expired_port_forward_deadline_reports_zero_caller_budget() {
+        let mapping = PortMapping::parse("9222:9222").unwrap();
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap0".to_string(), vec![mapping]);
+        let error = net
+            .wait_for_port_forwarding_until(
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            )
+            .await
+            .expect_err("an expired caller deadline must fail immediately");
+        assert!(error.to_string().contains("budget 0ns"), "{error:#}");
+        assert!(!error.to_string().contains("5s"));
     }
 
     /// Batch lines are exactly the heredoc body, in order, one per line.

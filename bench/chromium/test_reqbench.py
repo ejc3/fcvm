@@ -2934,6 +2934,48 @@ printf 'before=%s count=%s after=%s\n' "$before" "$count" "$after"
             self.assertFalse(os.path.exists(marker), "the measurement driver ran after refusal")
             self.assertIn("FATAL: no measurements were taken", r.stderr)
 
+    def test_quiet_guard_treats_integer_and_decimal_limit_equally(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = os.path.join(d, "ps.txt")
+            loadavg = os.path.join(d, "loadavg")
+            open(fixture, "w").close()
+            env, binx = self._env(
+                d, ALLOW_BUSY="0", PS_FIXTURE=fixture, LOADAVG_FILE=loadavg,
+            )
+            self._write(os.path.join(binx, "ps"), '#!/bin/bash\ncat "$PS_FIXTURE"\n')
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+for load in 2 2.0; do
+    printf '%s 0 0 1/1 1\n' "$load" > "$LOADAVG_FILE"
+    guard_quiet
+    printf '%s=quiet\n' "$load"
+done
+printf '2.1 0 0 1/1 1\n' > "$LOADAVG_FILE"
+if guard_quiet; then
+    printf '2.1=quiet\n'
+else
+    printf '2.1=busy:%s\n' "$?"
+fi
+for load in 2.0001 3; do
+    printf '%s 0 0 1/1 1\n' "$load" > "$LOADAVG_FILE"
+    if guard_quiet; then
+        printf '%s=quiet\n' "$load"
+    else
+        printf '%s=busy:%s\n' "$load" "$?"
+    fi
+done
+'''
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "2=quiet", "2.0=quiet", "2.1=busy:3",
+                "2.0001=busy:3", "3=busy:3",
+            ])
+
     def test_target_id_waits_for_readiness_and_skips_devtools_pages(self):
         """RED BEFORE THE FIX: `target_id` was a SINGLE-SHOT urlopen with
         `2>/dev/null || true`, and `start_clone` returns as soon as the state file

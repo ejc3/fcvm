@@ -1742,7 +1742,7 @@ async fn cmd_snapshot_run_inner(
             .cleanup_failed(&state_manager)
             .await
             .context("cleaning cancelled clone setup")?;
-        return Ok(());
+        anyhow::bail!("interrupted by signal during clone setup");
     }
     let setup_result: Result<(
         Box<dyn crate::hypervisor::Hypervisor>,
