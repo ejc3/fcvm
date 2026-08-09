@@ -686,14 +686,19 @@ pub fn publish_to_loopback(ports: &[String]) {
     //     today, converting a working --publish into a refused one)
     if !install_loopback_containment() {
         eprintln!(
-            "[fc-agent] NOT publishing ports to loopback: without the containment rule,              enabling route_localnet would expose every guest loopback listener — not just              the published ports — to the guest's network segment. Published ports still              reach services bound to 0.0.0.0 or the guest address, exactly as before."
+            "[fc-agent] NOT publishing ports to loopback: without the containment rule, \
+             enabling route_localnet would expose every guest loopback listener — not just \
+             the published ports — to the guest's network segment. Published ports still \
+             reach services bound to 0.0.0.0 or the guest address, exactly as before."
         );
         return;
     }
 
     if !enable_route_localnet() {
         eprintln!(
-            "[fc-agent] NOT publishing ports to loopback: route_localnet is off, so a packet              routed to 127.0.0.0/8 from eth0 is dropped as a martian source. Adding the DNATs              anyway would break published ports that work today."
+            "[fc-agent] NOT publishing ports to loopback: route_localnet is off, so a packet \
+             routed to 127.0.0.0/8 from eth0 is dropped as a martian source. Adding the DNATs \
+             anyway would break published ports that work today."
         );
         return;
     }
