@@ -337,20 +337,62 @@ prune_target_dir() {
 # Stage 3: cargo/nextest build artifacts. Deleting one costs a rebuild, never
 # correctness. Each per-worktree child is considered independently; the
 # cargo-target parent is only a namespace and must never be a candidate.
+collect_target_candidates() {
+  local -n output="$1"
+  local root="$2" candidate find_fd find_pid rc
+  local batch=()
+  shift 2
+
+  # Capture the process-substitution PID immediately, drain its NUL-delimited
+  # output, and wait for its real status before exposing any candidates.  This
+  # uses only a pipe: disk cleanup must not depend on spare /tmp capacity or
+  # leave a manifest behind if the runner is cancelled mid-preflight.
+  if ! exec {find_fd}< <("${SUDO[@]}" find "$root" "$@" -print0); then
+    log "ERROR: cannot start cargo target enumeration under $root"
+    return 1
+  fi
+  find_pid=$!
+  while IFS= read -r -d '' -u "$find_fd" candidate; do
+    batch+=("$candidate")
+  done
+  if ! exec {find_fd}<&-; then
+    wait "$find_pid" || true
+    log "ERROR: cannot close cargo target enumeration pipe for $root"
+    return 1
+  fi
+  if wait "$find_pid"; then
+    output+=("${batch[@]}")
+    return 0
+  else
+    rc=$?
+    log "ERROR: cannot enumerate cargo target dirs under $root (find rc=$rc)"
+    return 1
+  fi
+}
+
 stage_target_dirs() {
   local candidates=() d count=0
+
+  # Enumerate every root successfully before touching any target.  A find in a
+  # process substitution has no status the parent while-loop can inspect, so a
+  # permission or I/O failure there used to look like an empty/successful root.
+  # collect_target_candidates explicitly waits for each producer and only then
+  # appends its batch; reject either failure rather than pruning a partial view
+  # of the runner.
   # Runner work-dir checkouts live at _work/<repo>/<repo>/target. -type d
   # skips the target→btrfs symlink the Makefile creates; that case is the
   # per-worktree child enumeration below.
   if dir_exists "$RUNNER_WORK_ROOT"; then
-    while IFS= read -r -d '' d; do
-      candidates+=("$d")
-    done < <("${SUDO[@]}" find "$RUNNER_WORK_ROOT" -mindepth 3 -maxdepth 3 -type d -name target -print0)
+    if ! collect_target_candidates candidates "$RUNNER_WORK_ROOT" \
+      -mindepth 3 -maxdepth 3 -type d -name target; then
+      return 1
+    fi
   fi
   if dir_exists "$BTRFS_ROOT/cargo-target"; then
-    while IFS= read -r -d '' d; do
-      candidates+=("$d")
-    done < <("${SUDO[@]}" find "$BTRFS_ROOT/cargo-target" -mindepth 1 -maxdepth 1 -type d -print0)
+    if ! collect_target_candidates candidates "$BTRFS_ROOT/cargo-target" \
+      -mindepth 1 -maxdepth 1 -type d; then
+      return 1
+    fi
   fi
   if ((${#candidates[@]} == 0)); then
     log "no cargo target dirs found"

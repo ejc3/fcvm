@@ -460,6 +460,103 @@ exit "$rc"
     );
 }
 
+/// Both target roots must be completely enumerated before cleanup begins.
+/// Bash does not propagate a process substitution's exit status to the parent
+/// `while` loop, so the old implementation treated a failing `find` as an
+/// empty root, pruned candidates from the other root, and exited successfully.
+///
+/// A PATH-local shim makes either enumeration fail deterministically, including
+/// when this test binary runs as root (where filesystem permissions cannot
+/// reliably force `find` to fail). The surviving artifacts prove the script
+/// rejects the partial view before deleting anything.
+#[test]
+fn target_pruner_fails_closed_when_either_target_root_cannot_be_enumerated() {
+    for fail_runner_root in [true, false] {
+        let btrfs = tempfile::tempdir().expect("btrfs root");
+        let runner_work = tempfile::tempdir().expect("runner work root");
+        let runner_target = runner_work.path().join("project/project/target");
+        let btrfs_target = btrfs.path().join("cargo-target/worktree");
+        std::fs::create_dir_all(&runner_target).expect("create runner target");
+        std::fs::create_dir_all(&btrfs_target).expect("create btrfs target");
+
+        let runner_payload = runner_target.join("old-runner-artifact");
+        let btrfs_payload = btrfs_target.join("old-btrfs-artifact");
+        std::fs::write(&runner_payload, b"runner").expect("write runner artifact");
+        std::fs::write(&btrfs_payload, b"btrfs").expect("write btrfs artifact");
+        age_file(&runner_payload);
+        age_file(&btrfs_payload);
+
+        let (failed_root, partial_candidate) = if fail_runner_root {
+            (runner_work.path().to_path_buf(), runner_target.clone())
+        } else {
+            (btrfs.path().join("cargo-target"), btrfs_target.clone())
+        };
+
+        let shim_dir = tempfile::tempdir().expect("find shim dir");
+        let shim = shim_dir.path().join("find");
+        std::fs::write(
+            &shim,
+            r#"#!/usr/bin/env bash
+is_enumeration=0
+for arg in "$@"; do
+    [[ $arg == -print0 ]] && is_enumeration=1
+done
+if [[ ${1:-} == "$FAIL_TARGET_ENUM_ROOT" ]] && ((is_enumeration)); then
+    printf '%s\0' "$FAIL_TARGET_ENUM_CANDIDATE"
+    printf 'forced target enumeration failure: %s\n' "$1" >&2
+    exit 73
+fi
+exec /usr/bin/find "$@"
+"#,
+        )
+        .expect("write find shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("make find shim executable");
+        let path = format!(
+            "{}:{}",
+            shim_dir.path().display(),
+            std::env::var("PATH").expect("PATH")
+        );
+
+        let out = Command::new(repo_root().join("scripts/runner-disk-preflight.sh"))
+            .arg("--target-dirs-only")
+            .env("BTRFS_ROOT", btrfs.path())
+            .env("RUNNER_WORK_ROOT", runner_work.path())
+            .env("TARGET_AGE_DAYS", "1")
+            .env("FAIL_TARGET_ENUM_ROOT", &failed_root)
+            .env("FAIL_TARGET_ENUM_CANDIDATE", &partial_candidate)
+            .env("PATH", path)
+            .output()
+            .expect("run target-dir preflight with find shim");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert!(
+            !out.status.success(),
+            "reported success after target enumeration failed for {failed_root:?}:\n{text}"
+        );
+        assert!(
+            text.contains("forced target enumeration failure")
+                && text.contains("cannot enumerate cargo target dirs under")
+                && text.contains("find rc=73")
+                && text.contains(failed_root.to_string_lossy().as_ref()),
+            "failure did not preserve find's error and identify the incomplete root \
+             {failed_root:?}:\n{text}"
+        );
+        assert!(
+            runner_payload.exists() && btrfs_payload.exists(),
+            "pruner deleted from a partial target view after {failed_root:?} could not be \
+             enumerated: runner_exists={} btrfs_exists={}\n{text}",
+            runner_payload.exists(),
+            btrfs_payload.exists()
+        );
+    }
+}
+
 /// All recipe-level Cargo executions must expand through the lease wrapper.
 /// Keeping the override in one variable makes this enforceable, while the raw
 /// command check catches one-off recipes that bypass `$(CARGO)`.
