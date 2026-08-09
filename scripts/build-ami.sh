@@ -9,9 +9,73 @@ KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 
 # Compute build hash (from kernel config + patches + boot_args + passt build inputs)
 compute_hash() {
-  local repo_root="$(dirname "$KERNEL_DIR")"
+  local repo_root
+  repo_root="$(dirname "$KERNEL_DIR")"
+
+  # FAIL CLOSED. Every read below used to be `2>/dev/null` with its failure
+  # discarded, and `hash=$(compute_hash)` does NOT inherit errexit inside the
+  # command substitution — so a missing glob, an unreadable patch or a dangling
+  # symlink produced a valid-looking hash computed over FEWER inputs. That is the
+  # stale-AMI bug this function exists to prevent, wearing a different hat:
+  # check_existing_ami would match an image built from a different kernel.
+  local -a host_patches=()
+  local p
+  shopt -s nullglob
+  for p in "$KERNEL_DIR/patches-arm64/"*.patch; do
+    case "$p" in *.vm.patch) continue ;; esac
+    host_patches+=("$p")
+  done
+  shopt -u nullglob
+  if [ ${#host_patches[@]} -eq 0 ]; then
+    echo "ERROR: no host-kernel patches matched $KERNEL_DIR/patches-arm64/*.patch;" >&2
+    echo "       the AMI cache key would silently omit them." >&2
+    return 1
+  fi
+
+  # Only the host kernel this AMI bakes. rootfs-config.toml carries eight
+  # kernel_version assignments, so a bare grep also invalidated the key whenever
+  # an unrelated profile (btrfs.arm64, nested.amd64, ...) changed, forcing a full
+  # EC2 rebuild. The builder always selects [kernel_profiles.nested.arm64.host_kernel]
+  # on ARM64. Resolved HERE, not inside the `{ ... } | sha256sum` group below,
+  # because `exit` inside that group leaves only the subshell — sha256sum would
+  # still hash the partial input and emit a plausible key.
+  local host_kernel_version
+  if ! host_kernel_version=$(awk '
+      /^\[/ { in_section = ($0 == "[kernel_profiles.nested.arm64.host_kernel]") }
+      in_section && /^kernel_version[[:space:]]*=/ { print; found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' "$repo_root/rootfs-config.toml"); then
+    echo "ERROR: [kernel_profiles.nested.arm64.host_kernel] has no kernel_version;" >&2
+    echo "       the AMI cache key cannot identify the host kernel." >&2
+    return 1
+  fi
+
+  local f
+  for f in "$KERNEL_DIR/nested.conf" "$repo_root/rootfs-config.toml" \
+    "$SCRIPT_DIR/build-passt.sh" "$SCRIPT_DIR/runner-disk-preflight.sh" \
+    "$SCRIPT_DIR/runner-disk-guard.service" "$SCRIPT_DIR/runner-disk-guard.timer" \
+    "${host_patches[@]}"; do
+    if [ ! -r "$f" ]; then
+      echo "ERROR: AMI cache key input is missing or unreadable: $f" >&2
+      return 1
+    fi
+  done
+
   {
-    cat "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null
+    cat "$KERNEL_DIR/nested.conf"
+    # The HOST kernel baked into this AMI is built from the arm64 patch set —
+    # [kernel_profiles.nested.arm64.host_kernel] build_inputs is
+    # "kernel/patches-arm64/*.patch" — NOT kernel/patches. Only two of those nine
+    # are symlinks into kernel/patches; the other seven (nv2-vsock-cache-sync,
+    # nv2-vsock-rx-barrier, wfx-stopped-exit, the psci-debug set) were invisible
+    # to this hash, so changing one produced an identical AMI hash and the
+    # builder reused a stale image carrying the OLD host kernel.
+    # `.vm.patch` is excluded to match compute_host_kernel_sha in
+    # src/setup/kernel.rs, which applies those only to the guest kernel.
+    cat "${host_patches[@]}"
+    # kernel_version is part of the host kernel's identity but was never read,
+    # so a pure version bump left the AMI hash unchanged.
+    printf '%s\n' "$host_kernel_version"
     # Include boot_args from config to invalidate cache when they change
     grep -E '^boot_args\s*=' "$repo_root/rootfs-config.toml" 2>/dev/null || true
     # Include the passt build inputs so a pin or patch change rebuilds the AMI
@@ -272,7 +336,10 @@ wait_for_build() {
 # Main
 main() {
   local hash
-  hash=$(compute_hash)
+  if ! hash=$(compute_hash); then
+    echo "ERROR: cannot compute the AMI cache key; refusing to reuse or tag an AMI" >&2
+    exit 1
+  fi
   echo "Build hash: $hash"
 
   # Check cache
