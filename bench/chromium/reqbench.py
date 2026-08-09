@@ -961,10 +961,30 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         or len(image_id) != 71
         or not image_id.startswith("sha256:")
         or any(character not in "0123456789abcdef" for character in image_id[7:])
-        or image_id != image
+    ):
+        raise RuntimeError(f"snapshot provenance {provenance_path} has invalid image_id")
+    image_digest = provenance.get("image_digest")
+    if image_digest != "" and (
+        not isinstance(image_digest, str)
+        or len(image_digest) != 71
+        or not image_digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in image_digest[7:])
+    ):
+        raise RuntimeError(f"snapshot provenance {provenance_path} has invalid image_digest")
+    image_cache_key = provenance.get("image_cache_key")
+    if (
+        not isinstance(image_cache_key, str)
+        or len(image_cache_key) != 64
+        or any(character not in "0123456789abcdef" for character in image_cache_key)
+    ):
+        raise RuntimeError(f"snapshot provenance {provenance_path} has invalid image_cache_key")
+    image_disk_path = metadata.get("image_disk_path")
+    if (
+        not isinstance(image_disk_path, str)
+        or not os.path.basename(image_disk_path).startswith(image_cache_key + ".")
     ):
         raise RuntimeError(
-            f"snapshot provenance {provenance_path} has invalid/mismatched image_id"
+            f"snapshot config {path} image disk does not match provenance cache key"
         )
     creator_fcvm_sha256 = provenance.get("creator_fcvm_sha256")
     creator_runtime_bundle_sha256 = provenance.get(
@@ -990,6 +1010,8 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         "vm_id": vm_id,
         "image": image,
         "image_id": image_id,
+        "image_digest": image_digest,
+        "image_cache_key": image_cache_key,
         "creator_fcvm_sha256": creator_fcvm_sha256,
         "creator_runtime_bundle_sha256": creator_runtime_bundle_sha256,
         "source_revision": source_revision,

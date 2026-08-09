@@ -2594,6 +2594,7 @@ class ReqbenchShell(unittest.TestCase):
     def _write_fake_fcvm(self, d):
         fcvm = os.path.join(d, "fcvm")
         self._write(fcvm, "#!/bin/bash\nexit 0\n")
+        self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
         return fcvm
 
     def test_concurrent_identical_runtime_install_is_atomic(self):
@@ -2662,6 +2663,10 @@ exec /usr/bin/cp "$@"
                 cwd=bundles[0], capture_output=True, text=True, timeout=10,
             )
             self.assertEqual(verified.returncode, 0, verified.stderr)
+            with open(os.path.join(bundles[0], "MANIFEST.sha256")) as f:
+                manifest_names = [line.split()[-1] for line in f]
+            self.assertIn("fc-agent", manifest_names)
+            self.assertTrue(os.access(os.path.join(bundles[0], "fc-agent"), os.X_OK))
 
     def test_generated_run_id_survives_staged_reexec(self):
         """The outer shell generates the ID once and explicitly passes it in."""
@@ -2725,6 +2730,105 @@ esac
             got = self._read_if_exists(seen, "<no invocation>")
             self.assertIn("FCVM_NO_SNAPSHOT=1", got,
                           f"the assignment did not survive sudo: {got}\n{r.stderr[-800:]}")
+
+    def test_golden_fails_when_fcvm_exits_before_readiness(self):
+        """A dead cold-boot child is attributed immediately, not after 300s."""
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, REQBENCH_STAGED="1")
+            fcvm = os.path.join(d, "fcvm")
+            self._write(fcvm, "#!/bin/bash\nexit 42\n")
+            self._write(os.path.join(binx, "podman"), '''#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+    exit 0
+fi
+exit 1
+''')
+            result = subprocess.run(
+                [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("golden: fcvm exited before readiness (rc=42)", result.stderr)
+            self.assertNotIn("BOOT TIMEOUT", result.stderr)
+
+    def _golden_image_identity_fixture(self, d, snapshot_cache_key):
+        env, binx = self._env(d, DATA_ROOT=d)
+        argv = os.path.join(d, "fcvm-argv.log")
+        pid_file = os.path.join(d, "golden.pid")
+        digest = "a" * 64
+        image_id = "b" * 64
+        fcvm = os.path.join(d, "fcvm")
+        self._write(fcvm, f'''#!/bin/bash
+echo "$*" >> {argv}
+case "$1 $2" in
+  "snapshots delete") exit 0 ;;
+  "podman run")
+      echo $$ > {pid_file}
+      echo CHROMIUM_BENCH_READY
+      exec sleep 30
+      ;;
+  "ls --json")
+      pid=$(cat {pid_file})
+      cat <<EOF
+[{{"name":"cb-req-g-{self.RUN_ID}","pid":$pid,"vm_id":"vm-11111111111111111111111111111111","health_status":"healthy"}}]
+EOF
+      ;;
+  "snapshot create")
+      mkdir -p "$DATA_ROOT/snapshots/$TAG"
+      : > "$DATA_ROOT/snapshots/$TAG.lock"
+      cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
+{{"created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"}}}}
+EOF
+      ;;
+esac
+''')
+        self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
+        self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{{"Digest":"sha256:{digest}","Id":"{image_id}"}}]'
+    exit 0
+fi
+exit 1
+''')
+        result = subprocess.run(
+            [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+            capture_output=True, text=True, timeout=60,
+        )
+        return result, self._read_if_exists(argv), digest, image_id
+
+    def test_golden_launches_local_tag_and_commits_exact_content_identity(self):
+        """fcvm needs the local tag to attach its content-addressed image disk."""
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, digest, image_id = self._golden_image_identity_fixture(
+                d, "a" * 64,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            podman_run = next(
+                line for line in argv.splitlines() if line.startswith("podman run ")
+            )
+            self.assertTrue(
+                podman_run.endswith(" localhost/chromium-bench-req"), podman_run,
+            )
+            self.assertNotIn(image_id, podman_run)
+            with open(os.path.join(
+                d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
+            )) as source:
+                provenance = json.load(source)
+            self.assertEqual(provenance["image"], "localhost/chromium-bench-req")
+            self.assertEqual(provenance["image_id"], "sha256:" + image_id)
+            self.assertEqual(provenance["image_digest"], "sha256:" + digest)
+            self.assertEqual(provenance["image_cache_key"], digest)
+
+    def test_golden_rejects_a_tag_repointed_before_fcvm_resolved_it(self):
+        """The snapshot disk key must match the harness's atomic image inspect."""
+        with tempfile.TemporaryDirectory() as d:
+            result, _argv, digest, _image_id = self._golden_image_identity_fixture(
+                d, "c" * 64,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("the image tag changed during golden creation", result.stderr)
+            self.assertIn(digest, result.stderr)
 
     def _run_stub(self, d, backend, analyzer_rc=0, sudo_env_reset=False):
         env, binx = self._env(d, BACKEND=backend, REPS="1", WARMUP="0")

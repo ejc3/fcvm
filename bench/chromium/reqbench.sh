@@ -20,6 +20,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REQBENCH_SOURCE_REPO:-$(cd "$HERE/../.." && pwd)}"
 FCVM="${FCVM:-$REPO/target/release/fcvm}"
+if [ -z "${FC_AGENT:-}" ]; then
+    if [ -x "$(dirname "$FCVM")/fc-agent" ]; then
+        FC_AGENT="$(dirname "$FCVM")/fc-agent"
+    else
+        FC_AGENT="$REPO/target/aarch64-unknown-linux-musl/release/fc-agent"
+    fi
+fi
 # rootless needs no sudo. SUDO is kept as a hook only so the same script can be
 # pointed at a root-only mode later without rewriting every call site.
 SUDO="${SUDO:-}"
@@ -65,19 +72,21 @@ QUIET_GUARD_VM_PROCESSES=""
 # request code used by this invocation are the bytes named by its manifest.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${REQBENCH_STAGED:-0}" != 1 ]; then
     [ -x "$FCVM" ] || { echo "fcvm binary is not executable: $FCVM" >&2; exit 2; }
+    [ -x "$FC_AGENT" ] || { echo "fc-agent binary is not executable: $FC_AGENT" >&2; exit 2; }
     source_revision_before=$(git -C "$REPO" rev-parse HEAD)
     mkdir -p "$RESULTS/runtime"
     stage_dir=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
     for source in reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py; do
         cp --reflink=auto "$HERE/$source" "$stage_dir/$source"
     done
+    cp --reflink=auto "$FC_AGENT" "$stage_dir/fc-agent"
     cp --reflink=auto "$FCVM" "$stage_dir/fcvm"
-    chmod 0555 "$stage_dir/fcvm" "$stage_dir/reqbench.sh" \
+    chmod 0555 "$stage_dir/fcvm" "$stage_dir/fc-agent" "$stage_dir/reqbench.sh" \
         "$stage_dir/reqbench.py" "$stage_dir/reqanalyze.py" \
         "$stage_dir/cdpdrive.py" "$stage_dir/render.py"
     (
         cd "$stage_dir"
-        sha256sum fcvm reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py \
+        sha256sum fcvm fc-agent reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py \
             > MANIFEST.sha256
     )
     bundle_hash=$(sha256sum "$stage_dir/MANIFEST.sha256" | cut -d' ' -f1)
@@ -108,6 +117,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${REQBENCH_STAGED:-0}" != 1 ]; then
         REQBENCH_SOURCE_REVISION="$source_revision" \
         REQBENCH_RUNTIME_BUNDLE="$bundle_dir" \
         FCVM="$bundle_dir/fcvm" \
+        FC_AGENT="$bundle_dir/fc-agent" \
         SUDO="$SUDO" \
         IMAGE="$IMAGE" \
         CDP_PORT="$CDP_PORT" \
@@ -238,6 +248,20 @@ stop_tracked() {
     wait "$pid" 2>/dev/null || :
     untrack "$pid"
     return "$forced"
+}
+
+# `$pid` is our unreaped shell child, so its numeric PID cannot be reused until
+# wait(2) below. Detecting the zombie through /proc therefore closes the gap
+# where a failed fcvm child could leave a phase polling for five minutes for
+# state that will never appear.
+BACKGROUND_CHILD_RC=""
+background_child_exited() {
+    local pid="$1" rc=0
+    process_identity "$pid" >/dev/null && return 1
+    wait "$pid" || rc=$?
+    untrack "$pid"
+    BACKGROUND_CHILD_RC="$rc"
+    return 0
 }
 
 CLEANUP_RAN=0
@@ -412,11 +436,31 @@ cmd_build() {
 cmd_golden() {
     log "golden: cold boot with CDP published on $CDP_PORT -> snapshot $TAG"
     $SUDO "$FCVM" snapshots delete -f "$TAG" >/dev/null 2>&1 || true
-    local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log" image_id source_vm_id
-    image_id=$(podman image inspect "$IMAGE" --format '{{.Id}}') \
+    local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
+    local image_record image_digest image_id image_cache_key source_vm_id
+    # One inspect binds the mutable tag's manifest digest and immutable image ID
+    # to the same observation. fcvm performs the same atomic resolution before
+    # exporting by ID; the cache-path check committed with the snapshot below
+    # detects a tag replacement between these two observations and fails closed.
+    image_record=$(podman image inspect "$IMAGE") \
         || { log "golden: cannot identify benchmark image $IMAGE"; return 1; }
-    [ -n "$image_id" ] \
-        || { log "golden: benchmark image $IMAGE has an empty content ID"; return 1; }
+    image_digest=$(jq -r '.[0].Digest // "" | select(type == "string")' \
+        <<<"$image_record") \
+        || { log "golden: benchmark image $IMAGE has invalid digest metadata"; return 1; }
+    image_id=$(jq -er '.[0].Id | select(type == "string" and length > 0)' \
+        <<<"$image_record") \
+        || { log "golden: benchmark image $IMAGE has no content ID"; return 1; }
+    image_id="sha256:${image_id#sha256:}"
+    [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
+        || { log "golden: benchmark image $IMAGE has invalid content ID $image_id"; return 1; }
+    if [ -n "$image_digest" ]; then
+        image_digest="sha256:${image_digest#sha256:}"
+        [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { log "golden: benchmark image $IMAGE has invalid digest $image_digest"; return 1; }
+        image_cache_key="${image_digest#sha256:}"
+    else
+        image_cache_key="${image_id#sha256:}"
+    fi
     # --publish carries host -> guest; fc-agent DNATs the published port to
     # guest loopback (fc-agent/src/network.rs::publish_to_loopback), the hop
     # Chromium refuses to make itself. Clones inherit port_mappings from the snapshot
@@ -436,13 +480,18 @@ cmd_golden() {
     # anyone uses the documented root-mode hook.
     $SUDO env FCVM_NO_SNAPSHOT=1 RUST_LOG="$FCVM_LOG" "$FCVM" podman run --name "$name" \
         --cpu "$CPU" --mem "$MEM" --network "$NETMODE" --publish "$CDP_PORT:$CDP_PORT" \
-        "$image_id" >"$lf" 2>&1 &
+        "$IMAGE" >"$lf" 2>&1 &
     # Capture the handle IMMEDIATELY. The BOOT TIMEOUT path below fires before any
     # state file exists, so `$!` is the ONLY way to reach this VM at that point.
     local vm_bg=$!
     track "$vm_bg"
     local t0=$SECONDS pid=""
     until grep -q CHROMIUM_BENCH_READY "$lf" 2>/dev/null; do
+        if background_child_exited "$vm_bg"; then
+            log "golden: fcvm exited before readiness (rc=$BACKGROUND_CHILD_RC)"
+            tail -20 "$lf" >&2
+            return 1
+        fi
         [ $((SECONDS-t0)) -lt 300 ] || { log "golden: BOOT TIMEOUT"; tail -20 "$lf" >&2; return 1; }
         sleep 1
     done
@@ -458,6 +507,11 @@ cmd_golden() {
     t0=$SECONDS
     until [ "$($SUDO "$FCVM" ls --json --pid "$pid" | python3 -c \
               'import json,sys; print(json.load(sys.stdin)[0].get("health_status",""))')" = healthy ]; do
+        if background_child_exited "$vm_bg"; then
+            log "golden: fcvm exited before the health gate (rc=$BACKGROUND_CHILD_RC)"
+            tail -20 "$lf" >&2
+            return 1
+        fi
         [ $((SECONDS-t0)) -lt 300 ] || { log "golden: HEALTH TIMEOUT"; tail -20 "$lf" >&2; return 1; }
         sleep 1
     done
@@ -471,13 +525,15 @@ cmd_golden() {
     # its generation, so a recreated tag cannot inherit stale provenance.
     $SUDO python3 - "$DATA_ROOT/snapshots/$TAG/config.json" \
         "$DATA_ROOT/snapshots/$TAG/reqbench-provenance.json" \
-        "$DATA_ROOT/snapshots/$TAG.lock" "$IMAGE" "$image_id" "$source_vm_id" \
+        "$DATA_ROOT/snapshots/$TAG.lock" "$IMAGE" "$image_id" "$image_digest" \
+        "$image_cache_key" "$source_vm_id" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
         "${REQBENCH_SOURCE_REVISION:-}" <<'PY'
 import fcntl, json, os, sys, tempfile
 (
-    config_path, output_path, lock_path, image_label, image_id, source_vm_id,
+    config_path, output_path, lock_path, image_label, image_id, image_digest,
+    image_cache_key, source_vm_id,
     fcvm_sha256, runtime_bundle_sha256, source_revision,
 ) = sys.argv[1:]
 lock = open(lock_path, "a+")
@@ -485,9 +541,17 @@ fcntl.flock(lock, fcntl.LOCK_SH)
 with open(config_path) as source:
     config = json.load(source)
 metadata = config.get("metadata") or {}
-if metadata.get("image") != image_id:
+if metadata.get("image") != image_label:
     raise SystemExit(
-        f"snapshot image {metadata.get('image')!r} does not match immutable {image_id!r}"
+        f"snapshot image {metadata.get('image')!r} does not match label {image_label!r}"
+    )
+image_disk_path = metadata.get("image_disk_path")
+if not isinstance(image_disk_path, str) or not image_disk_path:
+    raise SystemExit("snapshot has no content-addressed image disk path")
+if not os.path.basename(image_disk_path).startswith(image_cache_key + "."):
+    raise SystemExit(
+        f"snapshot image disk {image_disk_path!r} does not match inspected "
+        f"cache key {image_cache_key!r}; the image tag changed during golden creation"
     )
 if config.get("vm_id") != source_vm_id:
     raise SystemExit(
@@ -497,9 +561,11 @@ if config.get("vm_id") != source_vm_id:
 record = {
     "snapshot_created_at": config.get("created_at"),
     "snapshot_vm_id": config.get("vm_id"),
-    "image": image_id,
+    "image": image_label,
     "image_label": image_label,
     "image_id": image_id,
+    "image_digest": image_digest,
+    "image_cache_key": image_cache_key,
     "creator_fcvm_sha256": fcvm_sha256,
     "creator_runtime_bundle_sha256": runtime_bundle_sha256,
     "source_revision": source_revision,
@@ -752,7 +818,7 @@ cmd_run() {
         "${backend_args[@]}" --url "$URL" \
         --out-dir "$RESULTS" --reps "${REPS:-10}" --warmup "${WARMUP:-2}" \
         --cdp-port "$CDP_PORT" --fcvm "$FCVM" --rust-log "$FCVM_LOG" \
-        --image "$image_id" --image-id "$image_id" --snapshot-name "$TAG" \
+        --image "$IMAGE" --image-id "$image_id" --snapshot-name "$TAG" \
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
         --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" &
