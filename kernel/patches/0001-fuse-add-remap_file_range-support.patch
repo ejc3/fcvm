@@ -149,7 +149,8 @@ index 676fd9856bfbf..1a47c623a0868 100644
 @@ -3178,6 +3303,7 @@ static const struct file_operations fuse_file_operations = {
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
- 	.setlease	= generic_setlease,
+-	.setlease	= generic_setlease,
++	.setlease	= generic_setlease,
 +	.remap_file_range = fuse_remap_file_range,
  };
  
