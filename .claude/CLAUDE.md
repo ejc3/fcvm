@@ -240,13 +240,14 @@ sudo cargo test ...
 
 If the Makefile is missing a target or broken, **fix the Makefile** - don't work around it.
 
-### Raw `cargo` runs a SIBLING WORKTREE's test binary — this is why the rule exists
+### Never share `CARGO_TARGET_DIR` across worktrees
 
-The environment exports `CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target`, **shared by every
-worktree**. `Makefile:160` overrides it (`export CARGO_TARGET_DIR := target`), so anything run
-through `make` gets a per-worktree `./target`. A raw `cargo test` does not — it inherits the
-shared directory, and two worktrees building the same package produce the *same* test-binary
-path. Cargo then considers it fresh and runs whatever the other worktree built.
+The Makefile owns Cargo target routing. It sets `CARGO_TARGET_DIR=target`, and
+`cargo-target-link` maps that path to a directory unique to the current worktree. The obsolete
+shell-profile export of `/mnt/fcvm-btrfs/cargo-target` was removed; do not restore it or export
+any other target directory shared by multiple worktrees. Two worktrees building the same
+package can produce the same test-binary path, so a shared target lets Cargo consider a sibling
+worktree's binary fresh and run code from the wrong checkout.
 
 Observed 2026-08-08 while verifying two stacked PRs: `cargo test --test
 test_ci_workflow_coverage` in worktree A printed a test that exists **only in worktree B** and
@@ -259,9 +260,9 @@ test result: ok. 4 passed                                     <- summary_fails n
 ```
 
 Red/green verification is worthless under these conditions: "it went red" and "it went green"
-may both be reports about code you are not editing. Use `make test-unit FILTER=<pattern>`. If
-you must invoke cargo directly, set an explicit per-worktree `CARGO_TARGET_DIR` — and confirm
-the `Running .../deps/<binary>` line points inside it before believing any result.
+may both be reports about code you are not editing. Use the appropriate Make target. Before
+believing a result, confirm `readlink -f target` resolves to this worktree's unique target
+directory and the `Running .../deps/<binary>` line points beneath it.
 
 ## NEVER ROUTE AROUND BUILD PROCESSES
 

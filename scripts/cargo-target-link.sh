@@ -63,12 +63,22 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 
 if [ -d "$BTRFS_ROOT" ]; then
 	mkdir -p "$WT_TARGET" || { echo "ERROR: cannot create $WT_TARGET" >&2; exit 1; }
+	# The disk pruner locks this directory exclusively.  Hold its shared lease
+	# while wiring or populating it so setup cannot race cleanup before the Cargo
+	# wrapper takes over the same lease.
+	exec {wt_target_lease_fd}<"$WT_TARGET"
+	flock -s "$wt_target_lease_fd"
 	if [ -L target ] && [ "$(readlink target)" != "$WT_TARGET" ]; then
 		echo "==> Repointing shared target/ → $WT_TARGET (per-worktree)"
 		rm -f target
 	fi
 	if ! [ -L target ]; then
 		if [ -d target ]; then
+			# A Cargo process from an earlier invocation can still be using the
+			# local target while btrfs comes online.  Take the directory lease
+			# exclusively before migrating and removing that old lock inode.
+			exec {local_target_lease_fd}<target
+			flock -x "$local_target_lease_fd"
 			echo "==> Moving existing target/ to $WT_TARGET..."
 			# Never `rm -rf` the source on a partial move. A full volume, a
 			# permission error, or a plain `target/*` glob (which skips
