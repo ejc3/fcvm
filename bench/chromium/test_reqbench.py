@@ -27,7 +27,6 @@ import threading
 import time
 import unittest
 import urllib.request
-import warnings
 from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1528,48 +1527,46 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                 data_root, "snapshots", f"{self.SNAPSHOT}.lock",
             )
             begin_contender = threading.Event()
-            nonblocking_attempt_finished = threading.Event()
-            blocked_by_main = threading.Event()
-            acquired_while_main_active = threading.Event()
-            main_return_observed = threading.Event()
-            acquired_before_main_return = threading.Event()
-            exclusive_acquired = threading.Event()
+            first_attempt_finished = threading.Event()
+            retry_after_main_return = threading.Event()
+            retry_finished = threading.Event()
+            main_returned = threading.Event()
+            first_attempt = []
+            retry_attempt = []
             contender_errors = []
+
+            def try_exclusive(contender_lock):
+                try:
+                    fcntl.flock(
+                        contender_lock,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    return "blocked"
+                fcntl.flock(contender_lock, fcntl.LOCK_UN)
+                return "acquired"
 
             def contend_for_generation():
                 try:
                     if not begin_contender.wait(timeout=5):
-                        contender_errors.append("request never released contender")
-                        nonblocking_attempt_finished.set()
-                        return
+                        raise AssertionError("request never released contender")
                     with open(lock_path, "a+") as contender_lock:
-                        try:
-                            fcntl.flock(
-                                contender_lock,
-                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        first_attempt.append(try_exclusive(contender_lock))
+                        first_attempt_finished.set()
+                        if not retry_after_main_return.wait(timeout=5):
+                            raise AssertionError(
+                                "caller never released post-main retry",
                             )
-                        except BlockingIOError:
-                            blocked_by_main.set()
-                        else:
-                            acquired_while_main_active.set()
-                            if not main_return_observed.is_set():
-                                acquired_before_main_return.set()
-                            exclusive_acquired.set()
-                            return
-                        finally:
-                            nonblocking_attempt_finished.set()
-                        fcntl.flock(contender_lock, fcntl.LOCK_EX)
-                        if not main_return_observed.is_set():
-                            acquired_before_main_return.set()
-                        exclusive_acquired.set()
+                        retry_attempt.append(try_exclusive(contender_lock))
                 except BaseException as error:  # keep thread failures observable
                     contender_errors.append(repr(error))
-                    nonblocking_attempt_finished.set()
+                finally:
+                    first_attempt_finished.set()
+                    retry_finished.set()
 
             contender = threading.Thread(
                 target=contend_for_generation,
                 name="snapshot-generation-exclusive-contender",
-                daemon=True,
             )
             contender.start()
 
@@ -1587,11 +1584,10 @@ class SnapshotGenerationIdentity(unittest.TestCase):
 
             def run_exec(_args, rep):
                 begin_contender.set()
-                completed = nonblocking_attempt_finished.wait(timeout=5)
+                completed = first_attempt_finished.wait(timeout=5)
                 request_observations.append({
                     "attempt_completed": completed,
-                    "blocked": blocked_by_main.is_set(),
-                    "acquired": exclusive_acquired.is_set(),
+                    "result": first_attempt[0] if first_attempt else None,
                 })
                 return record("exec", rep)
 
@@ -1611,7 +1607,6 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                 "command_text": reqbench.command_text,
                 "pending_signal": reqbench._pending_harness_signal,
                 "argv": sys.argv,
-                "profile": sys.getprofile(),
                 "sigint": signal.getsignal(signal.SIGINT),
                 "sigterm": signal.getsignal(signal.SIGTERM),
             }
@@ -1627,10 +1622,7 @@ class SnapshotGenerationIdentity(unittest.TestCase):
             saved_env = {key: os.environ.get(key) for key in env_updates}
             out_dir = os.path.join(data_root, "results")
             rc = None
-
-            def observe_main_return(frame, event, _arg):
-                if event == "return" and frame.f_code is reqbench.main.__code__:
-                    main_return_observed.set()
+            retry_completed = False
 
             exact_hashes = {
                 os.path.realpath(fcvm): "c" * 64,
@@ -1650,7 +1642,6 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                 reqbench.harness_sha256 = lambda: "f" * 64
                 reqbench.command_text = lambda _argv: "fcvm fixture"
                 reqbench._pending_harness_signal = 0
-                sys.setprofile(observe_main_return)
                 sys.argv = [
                     "reqbench.py",
                     "--snapshot-tag", self.SNAPSHOT,
@@ -1672,19 +1663,14 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                     "--out-dir", out_dir,
                     "--run-id", "1" * 32,
                 ]
-                # The CLI process exits after main. Calling it in-process makes
-                # unittest report the function's deliberate frame-lifetime
-                # close as a ResourceWarning; the lock ordering assertions below
-                # directly verify that close instead.
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message=r"unclosed file .*reused-tag\.lock",
-                        category=ResourceWarning,
-                    )
-                    rc = reqbench.main()
+                rc = reqbench.main()
+                main_returned.set()
+                retry_after_main_return.set()
+                retry_completed = retry_finished.wait(timeout=5)
             finally:
                 begin_contender.set()
+                retry_after_main_return.set()
+                contender.join(timeout=5)
                 reqbench.HERE = saved["HERE"]
                 reqbench.run_exec_request = saved["run_exec_request"]
                 reqbench.run_noop_request = saved["run_noop_request"]
@@ -1694,7 +1680,6 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                 reqbench.command_text = saved["command_text"]
                 reqbench._pending_harness_signal = saved["pending_signal"]
                 sys.argv = saved["argv"]
-                sys.setprofile(saved["profile"])
                 signal.signal(signal.SIGINT, saved["sigint"])
                 signal.signal(signal.SIGTERM, saved["sigterm"])
                 for key, value in saved_env.items():
@@ -1703,22 +1688,16 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                     else:
                         os.environ[key] = value
 
-            acquired_after_main = exclusive_acquired.wait(timeout=5)
-            contender.join(timeout=5)
             self.assertEqual(rc, 0)
             self.assertEqual(contender_errors, [])
             self.assertEqual(request_observations, [{
                 "attempt_completed": True,
-                "blocked": True,
-                "acquired": False,
+                "result": "blocked",
             }])
-            self.assertFalse(acquired_while_main_active.is_set())
-            self.assertTrue(main_return_observed.is_set())
-            self.assertFalse(acquired_before_main_return.is_set())
-            self.assertTrue(
-                acquired_after_main,
-                "exclusive lock did not acquire after reqbench.main returned",
-            )
+            self.assertEqual(first_attempt, ["blocked"])
+            self.assertTrue(main_returned.is_set())
+            self.assertTrue(retry_completed)
+            self.assertEqual(retry_attempt, ["acquired"])
             self.assertFalse(contender.is_alive())
             with open(os.path.join(out_dir, "reqbench.jsonl")) as source:
                 records = [json.loads(line) for line in source]
