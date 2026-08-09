@@ -1,0 +1,36 @@
+{
+  "run_attempt": 1,
+  "jobs": [
+    {
+      "id": 2001,
+      "name": "Container-x64",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "Run actions/checkout@v7", "status": "completed", "conclusion": "success"},
+        {"name": "Clean test data", "status": "in_progress", "conclusion": null},
+        {"name": "container-test-unit", "status": "pending", "conclusion": null},
+        {"name": "Post Run actions/checkout@v7", "status": "pending", "conclusion": null}
+      ]
+    },
+    {
+      "id": 2002,
+      "name": "Summary",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "Fail if any gating job did not succeed", "status": "completed", "conclusion": "failure"},
+        {"name": "Complete job", "status": "completed", "conclusion": "success"}
+      ]
+    }
+  ],
+  "logs": {
+    "2001": {
+      "status": "missing_blob",
+      "http_status": 404,
+      "error_code": "BlobNotFound"
+    }
+  }
+}

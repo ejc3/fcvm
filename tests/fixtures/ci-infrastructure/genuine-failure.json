@@ -1,0 +1,28 @@
+{
+  "run_attempt": 1,
+  "jobs": [
+    {
+      "id": 3001,
+      "name": "Lint",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "Clippy", "status": "completed", "conclusion": "failure"},
+        {"name": "Complete job", "status": "completed", "conclusion": "success"}
+      ]
+    },
+    {
+      "id": 3002,
+      "name": "Summary",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "Fail if any gating job did not succeed", "status": "completed", "conclusion": "failure"},
+        {"name": "Complete job", "status": "completed", "conclusion": "success"}
+      ]
+    }
+  ],
+  "logs": {}
+}
