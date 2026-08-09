@@ -19,6 +19,7 @@ import json
 import os
 import random
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -119,6 +120,155 @@ def kill_tree(p):
         p.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+
+
+def write_graceful_clone_stub(path, state_path, data_dir, name, term_path):
+    """Write a VM-free fcvm shape that performs exact cleanup on SIGTERM."""
+    quoted_state = shlex.quote(state_path)
+    quoted_data = shlex.quote(data_dir)
+    quoted_term = shlex.quote(term_path)
+    script = f"""#!/bin/bash
+python3 -c 'import ctypes,signal,time; ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL); time.sleep(300)' &
+child=$!
+cleanup() {{
+    kill -TERM "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+    rm -f {quoted_state} {quoted_state}.lock
+    rmdir {quoted_data}
+    printf 'SIGTERM\\n' > {quoted_term}
+    exit 0
+}}
+trap cleanup TERM INT
+mkdir -p {quoted_data}
+read -r proc_stat < /proc/$$/stat
+proc_stat=${{proc_stat##*) }}
+read -ra proc_fields <<< "$proc_stat"
+start=${{proc_fields[19]}}
+cat > {quoted_state}.tmp <<EOF
+{{"vm_id":"{os.path.basename(state_path)[:-5]}","name":"{name}","pid":$$,"pid_start_time":$start,"lifecycle_ready":true,"config":{{"network":{{"loopback_ip":"127.0.0.1"}}}}}}
+EOF
+mv {quoted_state}.tmp {quoted_state}
+: > {quoted_state}.lock
+wait "$child"
+"""
+    with open(path, "w") as output:
+        output.write(script)
+    os.chmod(path, 0o755)
+
+
+class CloneSpawnSignalMask(unittest.TestCase):
+    """Every clone must be able to receive the graceful teardown signal.
+
+    RED BEFORE THE FIX: all three request arms blocked SIGINT and SIGTERM before
+    Popen.  The mask survives exec, so normal teardown always spent its whole
+    timeout and killed fcvm without letting fcvm remove state or disk artifacts.
+    """
+
+    def test_shared_spawn_unblocks_child_and_restores_calling_thread_mask(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "mask.log")
+            code = (
+                "import json,signal,time;"
+                "print(json.dumps(sorted(int(s) for s in "
+                "signal.pthread_sigmask(signal.SIG_BLOCK,set()))),flush=True);"
+                "time.sleep(300)"
+            )
+            old_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, reqbench.TERMINATION_SIGNALS
+            )
+            proc = None
+            try:
+                proc = reqbench.spawn_clone_process(
+                    [sys.executable, "-c", code], log, dict(os.environ)
+                )
+                current = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                self.assertTrue(reqbench.TERMINATION_SIGNALS.issubset(current))
+                deadline = time.monotonic() + 2
+                blocked = None
+                while time.monotonic() < deadline:
+                    try:
+                        with open(log) as source:
+                            line = source.readline()
+                        if line:
+                            blocked = set(json.loads(line))
+                            break
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(0.005)
+                self.assertIsNotNone(blocked, "spawned child never reported its mask")
+                self.assertTrue(
+                    blocked.isdisjoint(int(item) for item in reqbench.TERMINATION_SIGNALS),
+                    blocked,
+                )
+                proc.terminate()
+                self.assertEqual(proc.wait(timeout=2), -signal.SIGTERM)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+
+    def test_all_request_arms_use_the_shared_spawn_boundary(self):
+        for request in (
+            reqbench.run_cdp_request,
+            reqbench.run_noop_request,
+            reqbench.run_exec_request,
+        ):
+            with self.subTest(request=request.__name__):
+                self.assertIn("spawn_clone_process", request.__code__.co_names)
+                self.assertNotIn("Popen", request.__code__.co_names)
+
+    def test_normal_request_receives_sigterm_and_cleans_exact_artifacts(self):
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            os.makedirs(state_dir)
+            vm_id = "vm-22222222222222222222222222222222"
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            data_dir = os.path.join(d, "vm-disks", vm_id)
+            term_path = os.path.join(d, "term-received")
+            stub = os.path.join(d, "fcvm-stub")
+            write_graceful_clone_stub(
+                stub,
+                state_path,
+                data_dir,
+                "rb-test-run-0-noop",
+                term_path,
+            )
+
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(8)
+            args = argparse.Namespace(
+                fcvm=stub,
+                out_dir=d,
+                snapshot_tag="",
+                serve_pid=1,
+                rust_log="off",
+                timeout=5.0,
+                teardown_timeout=2.0,
+                cdp_port=listener.getsockname()[1],
+                state_dir=state_dir,
+                data_root=d,
+                run_id="test-run",
+            )
+            saved_pending = reqbench._pending_harness_signal
+            reqbench._pending_harness_signal = 0
+            try:
+                record = reqbench.run_noop_request(args, 0)
+            finally:
+                reqbench._pending_harness_signal = saved_pending
+                listener.close()
+
+            self.assertTrue(record["ok"], record)
+            self.assertNotIn("timed_out", record["teardown"])
+            self.assertTrue(record["teardown"]["all_gone"])
+            self.assertTrue(record["teardown"]["disk_cleanup_verified"])
+            self.assertTrue(os.path.exists(term_path))
+            self.assertFalse(os.path.lexists(state_path))
+            self.assertFalse(os.path.lexists(state_path + ".lock"))
+            self.assertFalse(os.path.lexists(data_dir))
 
 
 class TeardownFastReapGuard(unittest.TestCase):

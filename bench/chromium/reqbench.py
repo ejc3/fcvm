@@ -106,6 +106,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from urllib.parse import urlparse, urlunparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -338,7 +339,7 @@ def abort_frozen_owner(
 
 
 SAMPLE_PERIOD_S = 0.0002
-SPAWN_SIGNALS = {signal.SIGINT, signal.SIGTERM}
+TERMINATION_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 
 
 def sample_all_until_gone(
@@ -1786,6 +1787,32 @@ def clone_ws_url(supplied: str, endpoint: str) -> str:
     return urlunparse(u._replace(netloc=endpoint))
 
 
+def spawn_clone_process(cmd: list[str], log: str, env: dict) -> subprocess.Popen:
+    """Spawn fcvm with INT/TERM deliverable in the child.
+
+    A signal mask is inherited across both fork and exec.  The harness signal
+    handler only records a pending interruption, so it is safe to unblock these
+    signals around Popen: ownership is published before any recorded signal is
+    raised at a request boundary.  Restore the calling thread's exact mask for
+    direct unit-test callers; main itself runs with both signals unblocked.
+    """
+    previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
+    try:
+        with open(log, "wb") as lf:
+            # stdout/stderr to a FILE, never a pipe we do not drain: an undrained
+            # 64 KB pipe blocks fcvm's writer and stalls everything behind it
+            # (AGENTS.md "Pipe Buffer Deadlock in Tests").
+            return subprocess.Popen(
+                cmd,
+                stdout=lf,
+                stderr=lf,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 def run_cdp_request(args, rep: int, fast: bool) -> dict:
     import cdpdrive
 
@@ -1806,22 +1833,12 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
     try:
         pre_spawn_state_paths = state_path_baseline(args.state_dir)
         raise_if_harness_interrupted()
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, SPAWN_SIGNALS)
-        spawn_complete = False
-        with open(log, "wb") as lf:
-            # stdout/stderr to a FILE, never a pipe we do not drain: an undrained
-            # 64 KB pipe blocks fcvm's writer and stalls everything behind it
-            # (AGENTS.md "Pipe Buffer Deadlock in Tests").
-            proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
+        proc = spawn_clone_process(cmd, log, env)
         fcvm_pid = proc.pid
-        spawn_complete = True
 
         state_path = data_dir = None
         try:
             fcvm_start_time = spawned_process_start_time(proc)
-            # Pending INT/TERM is delivered only after both process object and
-            # exact PID are published to this teardown scope.
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             deadline = t_spawn + args.timeout
             t = time.monotonic()
             state_path, state = find_state(
@@ -1930,8 +1947,6 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
                     except RuntimeError as data_error:
                         rec["state_error"] = str(data_error)
     finally:
-        if "previous_mask" in locals() and not spawn_complete:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         watch.close()
 
     if fast:
@@ -2043,15 +2058,10 @@ def run_noop_request(args, rep: int) -> dict:
     try:
         pre_spawn_state_paths = state_path_baseline(args.state_dir)
         raise_if_harness_interrupted()
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, SPAWN_SIGNALS)
-        spawn_complete = False
-        with open(log, "wb") as lf:
-            proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
+        proc = spawn_clone_process(cmd, log, env)
         fcvm_pid = proc.pid
-        spawn_complete = True
         try:
             fcvm_start_time = spawned_process_start_time(proc)
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             deadline = t_spawn + args.timeout
             t = time.monotonic()
             state_path, state = find_state(
@@ -2113,8 +2123,6 @@ def run_noop_request(args, rep: int) -> dict:
                     except RuntimeError as data_error:
                         rec["state_error"] = str(data_error)
     finally:
-        if "previous_mask" in locals() and not spawn_complete:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         watch.close()
     rec.setdefault("blocking_ms", (time.monotonic() - t_spawn) * 1000)
     try:
@@ -2174,15 +2182,8 @@ def run_exec_request(args, rep: int) -> dict:
     try:
         pre_spawn_state_paths = state_path_baseline(args.state_dir)
         raise_if_harness_interrupted()
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, SPAWN_SIGNALS)
-        spawn_mask_restored = False
-        with open(log, "wb") as lf:
-            proc = subprocess.Popen(
-                cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env
-            )
+        proc = spawn_clone_process(cmd, log, env)
         fcvm_start_time = spawned_process_start_time(proc)
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        spawn_mask_restored = True
         deadline = t0 + args.timeout
         state_path, state = find_state(
             args.state_dir,
@@ -2225,9 +2226,6 @@ def run_exec_request(args, rep: int) -> dict:
             )
         os.kill(proc.pid, signal.SIGCONT)
     except BaseException as request_error:
-        if "previous_mask" in locals() and not spawn_mask_restored:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-            spawn_mask_restored = True
         if (
             proc is not None
             and state_path is None
@@ -2517,6 +2515,12 @@ def run_exec_request(args, rep: int) -> dict:
 
 
 def main() -> int:
+    """Run one schedule and release every whole-run resource on every exit."""
+    with ExitStack() as resources:
+        return main_with_resources(resources)
+
+
+def main_with_resources(resources: ExitStack) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--serve-pid", type=int, default=0,
                    help="UFFD serve pid (omit when using --snapshot-tag)")
@@ -2549,6 +2553,9 @@ def main() -> int:
     args = p.parse_args()
     signal.signal(signal.SIGINT, record_harness_interrupt)
     signal.signal(signal.SIGTERM, record_harness_interrupt)
+    # The harness owns these handlers.  Do not inherit a caller's blocked mask:
+    # every clone and the harness itself must be able to observe shutdown.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
     args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
 
     # EXACTLY ONE backend. With neither flag `clone_backend_args` returned
@@ -2576,7 +2583,7 @@ def main() -> int:
         args.data_root, "snapshots", f"{snapshot_name}.lock"
     )
     try:
-        snapshot_lock = open(snapshot_lock_path, "a+")
+        snapshot_lock = resources.enter_context(open(snapshot_lock_path, "a+"))
         fcntl.flock(snapshot_lock, fcntl.LOCK_SH)
         snapshot = snapshot_generation(args.data_root, snapshot_name)
     except RuntimeError as error:
