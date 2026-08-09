@@ -33,6 +33,17 @@ fn repo_root() -> PathBuf {
 /// fixture tree. `create_user_data` (its only helper call) is stubbed so this
 /// exercises the kernel-input behaviour in isolation.
 fn run_compute_hash(fixture: &Path) -> String {
+    let (ok, out, err) = try_compute_hash(fixture);
+    assert!(ok, "compute_hash failed: {err}");
+    assert!(
+        !out.is_empty(),
+        "compute_hash produced no output — every comparison below would be vacuously equal"
+    );
+    out
+}
+
+/// Same, but hands back the exit status so the fail-closed cases can assert on it.
+fn try_compute_hash(fixture: &Path) -> (bool, String, String) {
     let script = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh"))
         .expect("read scripts/build-ami.sh");
 
@@ -46,33 +57,30 @@ fn run_compute_hash(fixture: &Path) -> String {
         + 2;
     let func = &rest[..end];
 
+    // Paths go through the ENVIRONMENT, never interpolated into shell source: a
+    // TMPDIR containing whitespace or a metacharacter would otherwise split these
+    // assignments, the helper would hash no fixture inputs at all, and every
+    // mutation test below would compare two copies of the empty-stream digest.
     let program = format!(
         "set -u\n\
-         KERNEL_DIR={fx}/kernel\n\
-         SCRIPT_DIR={fx}/scripts\n\
          create_user_data() {{ printf 'stub-user-data'; }}\n\
          {func}\n\
          compute_hash\n",
-        fx = fixture.display(),
         func = func
     );
 
     let out = Command::new("bash")
         .arg("-c")
         .arg(&program)
+        .env("KERNEL_DIR", fixture.join("kernel"))
+        .env("SCRIPT_DIR", fixture.join("scripts"))
         .output()
         .expect("run bash");
-    assert!(
+    (
         out.status.success(),
-        "compute_hash failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(
-        !hash.is_empty(),
-        "compute_hash produced no output — every comparison below would be vacuously equal"
-    );
-    hash
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
 }
 
 /// Build a minimal tree with the layout `compute_hash` reads.
@@ -104,9 +112,16 @@ fn make_fixture() -> tempfile::TempDir {
         "kernel/patches-arm64/mmfr4-override.vm.patch",
         "guest only\n",
     );
+    // Two kernel_version assignments on purpose: only the host_kernel one may
+    // move the hash. A bare grep would pick up both and churn the key whenever an
+    // unrelated profile changed.
     w(
         "rootfs-config.toml",
-        "boot_args = \"kvm-arm.mode=nested\"\nkernel_version = \"6.18.3\"\n",
+        "boot_args = \"kvm-arm.mode=nested\"\n\
+         [kernel_profiles.btrfs.arm64]\n\
+         kernel_version = \"6.16.1\"\n\
+         [kernel_profiles.nested.arm64.host_kernel]\n\
+         kernel_version = \"6.18.3\"\n",
     );
     w("scripts/build-passt.sh", "#!/bin/sh\n");
     w("scripts/passt-0001.patch", "passt\n");
@@ -196,5 +211,69 @@ fn ami_hash_ignores_guest_only_vm_patches() {
         base, mutated,
         "a *.vm.patch is applied only to the GUEST kernel (see compute_host_kernel_sha in \
          src/setup/kernel.rs, which excludes them), so it must not invalidate the host AMI"
+    );
+}
+
+/// A cache key computed over FEWER inputs than intended is the stale-AMI bug in
+/// disguise: it looks valid, `check_existing_ami` matches it, and the builder
+/// hands back an image carrying a different kernel.
+///
+/// `hash=$(compute_hash)` does not inherit `errexit` inside the command
+/// substitution, so every read has to police itself. These pin that.
+#[test]
+fn ami_hash_refuses_to_compute_when_an_input_is_unreadable() {
+    let fx = make_fixture();
+    let patch = fx
+        .path()
+        .join("kernel/patches-arm64/nv2-vsock-cache-sync.patch");
+
+    // A dangling symlink is the realistic shape: the patch set carries symlinks
+    // into kernel/patches, and a rename on the other side leaves exactly this.
+    std::fs::remove_file(&patch).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/gone.patch", &patch).unwrap();
+
+    let (ok, out, err) = try_compute_hash(fx.path());
+    assert!(
+        !ok,
+        "compute_hash SUCCEEDED with an unreadable host-kernel patch, returning {out:?}. That \
+         key omits a patch the host kernel is built from — for the two nv2-vsock-* patches that \
+         means reusing an AMI whose kernel lacks the DSB cache-coherency fix. stderr: {err}"
+    );
+}
+
+#[test]
+fn ami_hash_refuses_to_compute_when_no_host_patches_match() {
+    let fx = make_fixture();
+    for e in std::fs::read_dir(fx.path().join("kernel/patches-arm64")).unwrap() {
+        std::fs::remove_file(e.unwrap().path()).unwrap();
+    }
+    let (ok, out, err) = try_compute_hash(fx.path());
+    assert!(
+        !ok,
+        "compute_hash SUCCEEDED with no host-kernel patches at all, returning {out:?} — a key \
+         computed over an empty patch set, which matches nothing that was ever built. \
+         stderr: {err}"
+    );
+}
+
+/// The key must identify the HOST kernel, not every kernel in the file.
+/// rootfs-config.toml carries eight `kernel_version` assignments; a bare grep
+/// churned the key — and forced a full EC2 rebuild — whenever an unrelated
+/// profile moved.
+#[test]
+fn ami_hash_ignores_unrelated_kernel_profiles() {
+    let fx = make_fixture();
+    let base = run_compute_hash(fx.path());
+
+    let cfg = fx.path().join("rootfs-config.toml");
+    let original = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, original.replace("6.16.1", "6.17.9")).unwrap();
+    let mutated = run_compute_hash(fx.path());
+
+    assert_eq!(
+        base, mutated,
+        "bumping [kernel_profiles.btrfs.arm64] moved the AMI hash. That profile cannot affect \
+         the host kernel baked into this AMI, so the change only costs a full EC2 rebuild for \
+         nothing"
     );
 }
