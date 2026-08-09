@@ -235,9 +235,7 @@ fn ensure_config_exists() {
             // for a marker string, so tests atomically regenerate every stale schema.
             std::fs::read_to_string(&config_path)
                 .ok()
-                .and_then(|content| {
-                    toml::from_str::<fcvm::setup::rootfs::Plan>(&content).ok()
-                })
+                .and_then(|content| toml::from_str::<fcvm::setup::rootfs::Plan>(&content).ok())
                 .is_none()
         } else {
             true
