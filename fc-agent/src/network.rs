@@ -560,11 +560,13 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
     }
 }
 
-/// Guest-side port of the transparent egress proxy (`proxy.rs::PROXY_LISTEN_PORT`).
+/// Guest-side port of the transparent egress proxy.
 ///
-/// Kept in sync deliberately rather than imported, so the compiler points here if
-/// that constant moves: this list is a SECURITY exclusion, not a convenience.
-const EGRESS_PROXY_PORT: u16 = 12345;
+/// IMPORTED, not repeated. An independent literal is a check that cannot fire:
+/// move the proxy's listener and the exclusion — and every test asserting on it —
+/// stays pointed at the old port while remaining green, which is exactly how the
+/// real listener becomes publishable.
+use crate::proxy::PROXY_LISTEN_PORT as EGRESS_PROXY_PORT;
 
 /// Make every published guest port reachable even when the service binds
 /// 127.0.0.1 only.
@@ -667,11 +669,34 @@ pub fn publish_to_loopback(ports: &[String]) {
         return;
     }
 
-    enable_route_localnet();
+    // ORDER IS LOAD-BEARING, and this is the only order with no exposed window.
+    //
+    // Containment FIRST: it is inert while route_localnet is off (nothing routes
+    // to 127/8 from eth0 yet), so installing it early costs nothing and means the
+    // sysctl never turns on exposure that is not already fenced. Doing it the
+    // other way round leaves every guest loopback listener reachable for the
+    // duration of one iptables call — and leaves it that way permanently if the
+    // containment call then fails.
+    //
+    // Each step is also a PREREQUISITE for the next, so a failure aborts instead
+    // of continuing into a half-configured state:
+    //   - no containment  -> do not enable route_localnet (would expose everything)
+    //   - no route_localnet -> do not add DNATs (127/8 destinations are dropped as
+    //     martian, so the rules would break even wildcard-bound services that work
+    //     today, converting a working --publish into a refused one)
+    if !install_loopback_containment() {
+        eprintln!(
+            "[fc-agent] NOT publishing ports to loopback: without the containment rule,              enabling route_localnet would expose every guest loopback listener — not just              the published ports — to the guest's network segment. Published ports still              reach services bound to 0.0.0.0 or the guest address, exactly as before."
+        );
+        return;
+    }
 
-    // BEFORE the DNATs, so there is no window in which route_localnet is on and
-    // the containment is not.
-    install_loopback_containment();
+    if !enable_route_localnet() {
+        eprintln!(
+            "[fc-agent] NOT publishing ports to loopback: route_localnet is off, so a packet              routed to 127.0.0.0/8 from eth0 is dropped as a martian source. Adding the DNATs              anyway would break published ports that work today."
+        );
+        return;
+    }
 
     for port in wanted {
         match run_iptables(&loopback_dnat_args("-A", port)) {
@@ -719,18 +744,19 @@ fn loopback_dnat_args(op: &str, port: u16) -> Vec<String> {
 /// Scoped to `-i eth0`: locally-generated traffic re-enters on `lo` and is never
 /// matched, so guest-internal loopback use and the egress proxy's `nat OUTPUT`
 /// REDIRECT are untouched.
-fn install_loopback_containment() {
-    let args = containment_args("-A");
-    match run_iptables(&args) {
-        Ok(()) => eprintln!(
-            "[fc-agent] loopback containment installed: only DNAT'd connections reach 127.0.0.0/8 \
-             from eth0"
-        ),
-        Err(e) => eprintln!(
-            "[fc-agent] WARNING: could not install loopback containment ({e}). route_localnet is \
-             on, so every guest loopback listener — not just published ports — is reachable from \
-             the guest's network segment."
-        ),
+fn install_loopback_containment() -> bool {
+    match run_iptables(&containment_args("-A")) {
+        Ok(()) => {
+            eprintln!(
+                "[fc-agent] loopback containment installed: only DNAT'd connections reach \
+                 127.0.0.0/8 from eth0"
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: could not install loopback containment: {e}");
+            false
+        }
     }
 }
 
@@ -767,20 +793,25 @@ fn run_iptables(args: &[String]) -> Result<(), String> {
 /// `eth0` only, deliberately. `all` would also cover interfaces created LATER —
 /// a bridge a nested workload brings up — which is broader than anything
 /// `--publish` implies, and the containment rule above is scoped to `eth0`.
-fn enable_route_localnet() {
+fn enable_route_localnet() -> bool {
     let key = "net.ipv4.conf.eth0.route_localnet";
     match std::process::Command::new("sysctl")
         .arg("-w")
         .arg(format!("{key}=1"))
         .output()
     {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => eprintln!(
-            "[fc-agent] WARNING: {key}=1 failed: {}. Published ports will not reach a \
-             loopback-bound service.",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => eprintln!("[fc-agent] WARNING: could not run sysctl for {key}: {e}"),
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            eprintln!(
+                "[fc-agent] WARNING: {key}=1 failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: could not run sysctl for {key}: {e}");
+            false
+        }
     }
 }
 

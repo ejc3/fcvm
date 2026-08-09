@@ -137,7 +137,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--serve-pid", type=int, required=True)
     ap.add_argument("--n", type=int, default=5)
-    ap.add_argument("--cdp-port", type=int, default=9223)
+    ap.add_argument("--cdp-port", type=int, default=9222)
     ap.add_argument("--fcvm", default=os.path.join(HERE, "..", "..", "target", "release", "fcvm"))
     ap.add_argument("--data-root", default="/mnt/fcvm-btrfs")
     ap.add_argument("--out", default="")

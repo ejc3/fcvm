@@ -288,3 +288,42 @@ fn test_publish_colliding_with_forward_localhost_is_rejected() -> Result<()> {
     );
     Ok(())
 }
+
+/// The collision guard must not over-reach. `published_guest_ports` carries TCP
+/// mappings alone and the `--forward-localhost` relay is a TCP listener, so
+/// `--publish H:G/udp` next to `--forward-localhost G` shares a port NUMBER
+/// without sharing a socket — there is no reflector, and rejecting it would break
+/// a combination that works today.
+#[test]
+fn test_udp_publish_does_not_collide_with_forward_localhost() -> Result<()> {
+    println!("\ntest_udp_publish_does_not_collide_with_forward_localhost");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let out = Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            &format!("udpok-{}", std::process::id()),
+            "--network",
+            "rootless",
+            "--publish",
+            "18081:1422/udp",
+            "--forward-localhost",
+            "1422",
+            common::TEST_IMAGE,
+            "true",
+        ])
+        .output()
+        .context("spawning fcvm")?;
+    let msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    anyhow::ensure!(
+        !msg.contains("both claim guest port"),
+        "a UDP publish was rejected as colliding with --forward-localhost, but only TCP \
+         mappings are DNAT'd and the relay is TCP — there is no shared socket. Got:\n{msg}"
+    );
+    Ok(())
+}

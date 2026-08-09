@@ -33,12 +33,13 @@ import os
 import sys
 import urllib.request
 
-# Deliberately the RELAY port, not Chromium's 9222. The health gate is the
-# golden-snapshot trigger, so whatever it accepts is what gets frozen. Probing
-# through the relay makes "healthy" mean "reachable the way the host will
-# actually reach it" — a snapshot taken while the relay was down would fan out
-# clones that are warm and completely undrivable.
-CDP_HOST = os.environ.get("BENCH_CDP_HEALTH_HOST", "127.0.0.1:9223")
+# Chromium's own DevTools port. There is no relay any more: fcvm DNATs every
+# published port to the guest's 127.0.0.1, so the host reaches Chromium directly
+# (fc-agent/src/network.rs::publish_to_loopback). This probe is the container
+# HEALTHCHECK, and the HEALTHCHECK is what triggers fcvm's golden snapshot — if
+# it points at a dead port, `reqbench.sh golden` waits out its full 300s and
+# never snapshots.
+CDP_HOST = os.environ.get("BENCH_CDP_HEALTH_HOST", "127.0.0.1:9222")
 READY_FILE = os.environ.get("BENCH_READY_FILE", "/run/bench-ready")
 TIMEOUT = float(os.environ.get("BENCH_CDP_HEALTH_TIMEOUT", "3"))
 

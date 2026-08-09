@@ -260,7 +260,11 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             let Ok(pm) = crate::network::PortMapping::parse(spec) else {
                 continue; // invalid specs are reported by the parser itself
             };
-            if forwarded.contains(&pm.guest_port) {
+            // TCP only: published_guest_ports carries TCP mappings alone, and the
+            // --forward-localhost relay is a TCP listener, so `--publish H:G/udp`
+            // alongside `--forward-localhost G` shares a port NUMBER without ever
+            // sharing a socket. Rejecting it would regress a valid combination.
+            if pm.proto == crate::network::Protocol::Tcp && forwarded.contains(&pm.guest_port) {
                 bail!(
                     "--publish {spec} and --forward-localhost {} both claim guest port {}. \
                      --publish makes that port reach the guest's 127.0.0.1:{}, which is exactly \
