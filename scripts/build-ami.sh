@@ -7,10 +7,67 @@ REGION="${AWS_REGION:-us-west-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 
+# Materialize exactly the Git tree the AMI builder will fetch. Hashing the
+# caller's working-tree bytes and pinning only HEAD can otherwise label an AMI
+# with a key for dirty/smudged files that never reach the builder. The running
+# provisioning script is checked too: it defines create_user_data(), so it must
+# be byte-identical to the pinned tree before its output can enter the key.
+materialize_pinned_source_tree() {
+  local repo_root="$1"
+  local source_commit="$2"
+  local destination="$3"
+
+  if ! git -C "$repo_root" archive --format=tar "$source_commit" | \
+    tar -xf - -C "$destination"; then
+    echo "ERROR: cannot materialize fcvm source commit $source_commit" >&2
+    return 1
+  fi
+  if ! cmp -s -- \
+    "$repo_root/scripts/build-ami.sh" \
+    "$destination/scripts/build-ami.sh"; then
+    echo "ERROR: scripts/build-ami.sh differs from pinned commit $source_commit;" >&2
+    echo "       refusing to hash bytes the AMI builder will not provision." >&2
+    return 1
+  fi
+}
+
+# Compute from the immutable tree the remote builder will fetch. Keeping the
+# materialization and KERNEL_DIR/SCRIPT_DIR rebinding in one function makes it
+# behaviorally testable and prevents main from accidentally hashing the caller
+# worktree again during a later refactor.
+compute_pinned_hash() {
+  local repo_root="$1"
+  local source_commit="$2"
+  local source_tree hash
+
+  source_tree="$(mktemp -d)" || return 1
+  if ! materialize_pinned_source_tree "$repo_root" "$source_commit" "$source_tree"; then
+    rm -rf -- "$source_tree"
+    return 1
+  fi
+
+  # Bash functions resolve dynamically scoped locals, so compute_hash and
+  # create_user_data read only the archived commit.
+  local KERNEL_DIR="$source_tree/kernel"
+  local SCRIPT_DIR="$source_tree/scripts"
+  if ! hash=$(compute_hash "$source_commit"); then
+    rm -rf -- "$source_tree"
+    return 1
+  fi
+  rm -rf -- "$source_tree"
+  printf '%s\n' "$hash"
+}
+
 # Compute build hash (from kernel config + patches + boot_args + passt build inputs)
 compute_hash() {
+  local source_commit="$1"
   local repo_root
   repo_root="$(dirname "$KERNEL_DIR")"
+
+  if [[ ! $source_commit =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: invalid fcvm source commit for AMI cache key: $source_commit" >&2
+    return 1
+  fi
 
   # FAIL CLOSED. Every read below used to be `2>/dev/null` with its failure
   # discarded, and `hash=$(compute_hash)` does NOT inherit errexit inside the
@@ -52,7 +109,9 @@ compute_hash() {
 
   local f
   for f in "$KERNEL_DIR/nested.conf" "$repo_root/rootfs-config.toml" \
-    "$SCRIPT_DIR/build-passt.sh" "$SCRIPT_DIR/runner-disk-preflight.sh" \
+    "$SCRIPT_DIR/build-passt.sh" "$SCRIPT_DIR/install-runner-disk-guard.sh" \
+    "$SCRIPT_DIR/runner-disk-preflight.sh" \
+    "$SCRIPT_DIR/prune-cargo-target.sh" \
     "$SCRIPT_DIR/runner-disk-guard.service" "$SCRIPT_DIR/runner-disk-guard.timer" \
     "${host_patches[@]}"; do
     if [ ! -r "$f" ]; then
@@ -60,6 +119,25 @@ compute_hash() {
       return 1
     fi
   done
+
+  # Frame every baked disk-guard input independently. Raw concatenation makes
+  # `ab` + `cd` indistinguishable from `abc` + `d`, and a failed cat inside the
+  # larger hash pipeline can be masked by a later successful command. sha256sum
+  # emits a name-tagged digest for each file and fails before any cache key is
+  # produced if a read fails.
+  local disk_guard_digests
+  if ! disk_guard_digests=$(
+    cd "$repo_root" &&
+      sha256sum \
+        scripts/runner-disk-preflight.sh \
+        scripts/prune-cargo-target.sh \
+        scripts/install-runner-disk-guard.sh \
+        scripts/runner-disk-guard.service \
+        scripts/runner-disk-guard.timer
+  ); then
+    echo "ERROR: cannot digest every disk-guard AMI input" >&2
+    return 1
+  fi
 
   {
     cat "$KERNEL_DIR/nested.conf"
@@ -84,12 +162,12 @@ compute_hash() {
     # Include the disk guard's script and units: they are baked into the AMI,
     # so a change to them must produce a new AMI rather than silently reusing
     # one without the fix.
-    cat "$SCRIPT_DIR/runner-disk-preflight.sh" \
-      "$SCRIPT_DIR/runner-disk-guard.service" "$SCRIPT_DIR/runner-disk-guard.timer" 2>/dev/null
-    # Include the provisioning script itself. Without this, editing the AMI's
-    # user-data changes nothing the hash can see, so the cached AMI is reused
-    # and the edit never reaches a runner.
-    create_user_data
+    printf '%s\n' "$disk_guard_digests"
+    # Include the exact rendered provisioning script, including the immutable
+    # source commit it fetches and compiles. Hashing a placeholder commit let a
+    # host-tool change outside the selective inputs above reuse an AMI built
+    # from an older checkout even though a cache miss would build the new one.
+    create_user_data "$source_commit"
   } | sha256sum | cut -c1-12
 }
 
@@ -115,7 +193,12 @@ get_base_ami() {
 
 # Create user data script for AMI builder
 create_user_data() {
-  cat << 'USERDATA'
+  local source_commit="$1"
+  if [[ ! $source_commit =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: invalid fcvm source commit for AMI user data: $source_commit" >&2
+    return 1
+  fi
+  sed "s/__FCVM_SOURCE_COMMIT__/$source_commit/g" << 'USERDATA'
 #!/bin/bash
 exec > >(tee /var/log/ami-build.log) 2>&1
 set -euxo pipefail
@@ -172,23 +255,31 @@ apt-get install -y build-essential bc bison flex libssl-dev \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
   skopeo busybox-static cpio zstd autoconf automake libtool \
-  nfs-kernel-server libseccomp-dev
+  nfs-kernel-server libseccomp-dev python3 util-linux
 
 # Node.js 22.x
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
-# Rust (set HOME for cloud-init context)
-export HOME=/root
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source /root/.cargo/env
+# Rust belongs to the runner user. The Makefile deliberately rejects host
+# builds as root because they leave root-owned target artifacts behind.
+sudo -u ubuntu env HOME=/home/ubuntu bash -c \
+  'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
 
-# Clone fcvm and its dependencies
-git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm
+# Fetch the exact checkout whose inputs produced this AMI's cache key. Cloning
+# moving main here allowed a merge during instance boot to install a different
+# disk-guard protocol than the one compute_hash read.
+FCVM_SOURCE_COMMIT="__FCVM_SOURCE_COMMIT__"
+git init /tmp/fcvm
+git -C /tmp/fcvm remote add origin https://github.com/ejc3/fcvm.git
+git -C /tmp/fcvm fetch --depth 1 origin "$FCVM_SOURCE_COMMIT"
+git -C /tmp/fcvm checkout --detach FETCH_HEAD
 git clone --depth 1 https://github.com/ejc3/fuse-backend-rs.git /tmp/fuse-backend-rs
 git clone --depth 1 https://github.com/ejc3/fuser.git /tmp/fuser
+chown -R ubuntu:ubuntu /tmp/fcvm /tmp/fuse-backend-rs /tmp/fuser
+sudo -u ubuntu env HOME=/home/ubuntu bash -c \
+  'source "$HOME/.cargo/env"; cd /tmp/fcvm; make build-host-tools'
 cd /tmp/fcvm
-cargo build --release
 
 # Build pasta/passt from the repo's pinned source so the AMI matches CI
 # (scripts/build-passt.sh owns the pin and the local patches).
@@ -201,9 +292,6 @@ cp rootfs-config.toml /root/.config/fcvm/
 # Build and install kernel using fcvm setup
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nested --region us-west-1
 ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
-
-# Rust for ubuntu user (separate from root's rust used for build)
-sudo -u ubuntu bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
 
 # Firecracker
 FIRECRACKER_VERSION="v1.14.0"
@@ -236,9 +324,7 @@ chown -R ubuntu:ubuntu /opt/actions-runner
 # preflight step cannot rescue it — this cleans caches out-of-band and, if the
 # hard floor still cannot be met, stops the runner service so the box goes
 # offline and gets replaced instead of poisoning jobs.
-install -m 755 /tmp/fcvm/scripts/runner-disk-preflight.sh /usr/local/bin/runner-disk-preflight.sh
-install -m 644 /tmp/fcvm/scripts/runner-disk-guard.service /etc/systemd/system/runner-disk-guard.service
-install -m 644 /tmp/fcvm/scripts/runner-disk-guard.timer /etc/systemd/system/runner-disk-guard.timer
+/tmp/fcvm/scripts/install-runner-disk-guard.sh /tmp/fcvm
 systemctl enable runner-disk-guard.timer
 
 # Clean up
@@ -335,8 +421,15 @@ wait_for_build() {
 
 # Main
 main() {
-  local hash
-  if ! hash=$(compute_hash); then
+  local hash repo_root source_commit
+  repo_root="$(dirname "$KERNEL_DIR")"
+  if ! source_commit="$(git -C "$repo_root" rev-parse HEAD)" || \
+    [[ ! $source_commit =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: cannot identify the exact fcvm source commit for AMI provisioning" >&2
+    exit 1
+  fi
+
+  if ! hash=$(compute_pinned_hash "$repo_root" "$source_commit"); then
     echo "ERROR: cannot compute the AMI cache key; refusing to reuse or tag an AMI" >&2
     exit 1
   fi
@@ -369,7 +462,7 @@ main() {
 
   # Create user data
   user_data_file=$(mktemp)
-  create_user_data > "$user_data_file"
+  create_user_data "$source_commit" > "$user_data_file"
 
   # Launch instance - try spot first, fall back to on-demand
   echo "Trying spot instance..."

@@ -1,14 +1,12 @@
 SHELL := /bin/bash
 
-# Guard: never run make as root on the host (except clean). Running cargo
+# Guard: never run make as root on the host. Running build plumbing
 # as root leaves root-owned files in target/ that break subsequent user builds
 # with BrokenPipe errors from nextest finding stale binaries.
 # Skip this guard inside containers (where root is normal).
 ifeq ($(shell id -u),0)
-ifeq ($(filter clean,$(MAKECMDGOALS)),)
 ifeq ($(wildcard /.dockerenv /run/.containerenv),)
 $(error Do not run make as root. Use 'make test-root' as your normal user — it uses sudo only for the test runner)
-endif
 endif
 endif
 
@@ -148,6 +146,7 @@ endif
 # owns the derivation and the symlink, and is the ONLY place that computes the path.
 # Overridable so tests/test_cargo_target_link.rs can point it at a temp dir.
 BTRFS_ROOT ?= /mnt/fcvm-btrfs
+export BTRFS_ROOT
 MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Base test command
@@ -202,7 +201,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
 	lint fmt update-dependency ssh test-serve-sdk
 
@@ -386,6 +385,12 @@ build: cargo-target-link
 	@# Sync embedded config to user config dir (config is embedded at compile time)
 	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
+# Host-native tools used by the kernel-builder AMI/workflow. Unlike `build`,
+# this does not require a musl Rust target for the guest agent.
+build-host-tools: cargo-target-link
+	@echo "==> Building host-native fcvm and fc-agent..."
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm -p fc-agent
+
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-mock
@@ -399,7 +404,9 @@ test-packaging: build
 	./scripts/test-packaging.sh target/release/fcvm
 
 clean:
-	sudo rm -rf target/*
+	@# Publish an empty namespace; the disk guard safely reclaims the retired
+	@# generation without unlinking dentries that may be foreign mountpoints.
+	@BTRFS_ROOT="$(BTRFS_ROOT)" "$(MAKEFILE_DIR)scripts/cargo-target-link.sh" --rotate
 
 # Run-only targets (no setup deps, used by container)
 _test-unit: cargo-target-link

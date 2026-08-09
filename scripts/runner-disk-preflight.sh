@@ -33,8 +33,10 @@
 #   1. podman system prune (rootless + root storage) — images/containers/
 #      volumes are re-pulled or re-built on demand.
 #   2. /tmp/fcvm-test-logs entries older than LOG_AGE_DAYS.
-#   3. cargo/nextest target dirs (runner _work checkouts and each child of
-#      /mnt/fcvm-btrfs/cargo-target/) with no activity for TARGET_AGE_DAYS.
+#   3. managed cargo/nextest generations under /mnt/fcvm-btrfs/cargo-target/
+#      with no activity for TARGET_AGE_DAYS. Pre-protocol real target dirs in
+#      runner _work are reported but retained because they cannot be atomically
+#      rotated without renaming a possibly-mounted dentry.
 #   4. content-addressed caches on /mnt/fcvm-btrfs (image-cache entries,
 #      snapshot dirs, kernel/rootfs/initrd/firecracker assets) idle for
 #      CACHE_AGE_DAYS, plus core dumps older than LOG_AGE_DAYS.
@@ -49,6 +51,9 @@
 # *.lock files (unlinking a lock file a process holds leaves two "owners" of
 # the same critical section — the ABA locking bug class AGENTS.md bans).
 set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+TARGET_PRUNE_HELPER="$SCRIPT_DIR/prune-cargo-target.sh"
 
 MIN_FREE_GB="${MIN_FREE_GB:-15}"
 HARD_FLOOR_GB="${HARD_FLOOR_GB:-5}"
@@ -252,161 +257,33 @@ stage_test_logs() {
     delete_candidates "stale test logs (>${LOG_AGE_DAYS}d)"
 }
 
-# Was any cargo artifact used since the cutoff?  Directory timestamps cannot be
-# used: merely enumerating a directory updates its atime.  This intentionally
-# examines files recursively, just like recently_used().
-target_recently_used() {
-  recently_used "$1" "$TARGET_CUTOFF"
-}
-
-# Prune one target while holding its directory inode exclusively.  Every Cargo
-# invocation from the Makefile holds a shared flock on that exact inode for its
-# whole process lifetime.  The first activity check is a cheap candidate gate;
-# the second, under the exclusive lease, closes the age-check -> delete race.
-prune_target_dir() {
-  local d="$1" lease_fd rc=0 before_id locked_id size
-
-  if target_recently_used "$d"; then
-    log "  keeping (active within ${TARGET_AGE_DAYS}d): $d"
-    return 0
-  fi
-  if ((DRY_RUN)); then
-    size="$("${SUDO[@]}" du -sb -- "$d" | awk '{print $1}')" || return 1
-    log "  would empty: $d ($(human "$size")); retaining the leased directory"
-    return 0
-  fi
-
-  # Opening the directory itself avoids a separate lock-file creation race and
-  # also covers targets left by older checkouts.  Never unlink this directory:
-  # its inode is the lock object.
-  if ! exec {lease_fd}<"$d"; then
-    log "  WARNING: cannot open target lease $d; keeping it"
-    return 0
-  fi
-  flock -n -x -E 42 "$lease_fd" || rc=$?
-  if ((rc != 0)); then
-    exec {lease_fd}<&-
-    if ((rc == 42)); then
-      log "  keeping (concurrent cargo holds target lease): $d"
-      return 0
-    fi
-    log "ERROR: locking target $d failed (rc=$rc)"
-    return 1
-  fi
-
-  # Fail closed if another cleanup implementation replaced the pathname while
-  # this process opened it.  Current fcvm cleanup never does so; it retains the
-  # directory specifically to keep this identity stable.
-  before_id="$(stat -Lc '%d:%i' -- "$d")" || {
-    exec {lease_fd}<&-
-    log "  keeping (target vanished before identity check): $d"
-    return 0
-  }
-  locked_id="$(stat -Lc '%d:%i' -- "/proc/$$/fd/$lease_fd")" || {
-    exec {lease_fd}<&-
-    log "ERROR: cannot identify locked target $d"
-    return 1
-  }
-  if [[ $before_id != "$locked_id" ]]; then
-    exec {lease_fd}<&-
-    log "  keeping (target path was replaced during lease acquisition): $d"
-    return 0
-  fi
-
-  if target_recently_used "$d"; then
-    exec {lease_fd}<&-
-    log "  keeping (became active before exclusive lease): $d"
-    return 0
-  fi
-
-  size="$("${SUDO[@]}" du -sb -- "$d" | awk '{print $1}')" || {
-    exec {lease_fd}<&-
-    return 1
-  }
-  # `-exec` keeps enumeration and deletion in one status-bearing command; a
-  # process-substitution loop would silently lose find(1)'s exit status and
-  # could report a permission failure as successful cleanup.
-  "${SUDO[@]}" find "$d" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || {
-    exec {lease_fd}<&-
-    return 1
-  }
-  exec {lease_fd}<&-
-  log "  emptied: $d ($(human "$size")); retained target directory"
-}
-
-# Stage 3: cargo/nextest build artifacts. Deleting one costs a rebuild, never
-# correctness. Each per-worktree child is considered independently; the
-# cargo-target parent is only a namespace and must never be a candidate.
-collect_target_candidates() {
-  local -n output="$1"
-  local root="$2" candidate find_fd find_pid rc
-  local batch=()
-  shift 2
-
-  # Capture the process-substitution PID immediately, drain its NUL-delimited
-  # output, and wait for its real status before exposing any candidates.  This
-  # uses only a pipe: disk cleanup must not depend on spare /tmp capacity or
-  # leave a manifest behind if the runner is cancelled mid-preflight.
-  if ! exec {find_fd}< <("${SUDO[@]}" find "$root" "$@" -print0); then
-    log "ERROR: cannot start cargo target enumeration under $root"
-    return 1
-  fi
-  find_pid=$!
-  while IFS= read -r -d '' -u "$find_fd" candidate; do
-    batch+=("$candidate")
-  done
-  if ! exec {find_fd}<&-; then
-    wait "$find_pid" || true
-    log "ERROR: cannot close cargo target enumeration pipe for $root"
-    return 1
-  fi
-  if wait "$find_pid"; then
-    output+=("${batch[@]}")
-    return 0
-  else
-    rc=$?
-    log "ERROR: cannot enumerate cargo target dirs under $root (find rc=$rc)"
-    return 1
-  fi
-}
-
+# Stage 3: cargo/nextest build payloads. Each managed physical generation is
+# considered independently; the cargo-target parent is only a namespace and
+# must never be a candidate. Reclaim retires the old namespace before
+# truncating bytes, so the next Cargo wrapper publishes a fresh generation.
 stage_target_dirs() {
-  local candidates=() d count=0
+  local runner_root= btrfs_target_root=
 
-  # Enumerate every root successfully before touching any target.  A find in a
-  # process substitution has no status the parent while-loop can inspect, so a
-  # permission or I/O failure there used to look like an empty/successful root.
-  # collect_target_candidates explicitly waits for each producer and only then
-  # appends its batch; reject either failure rather than pruning a partial view
-  # of the runner.
-  # Runner work-dir checkouts live at _work/<repo>/<repo>/target. -type d
-  # skips the target→btrfs symlink the Makefile creates; that case is the
-  # per-worktree child enumeration below.
+  # One privileged process enumerates every root, atomically opens and locks
+  # candidates as it discovers them, retains those fds until all enumeration
+  # has succeeded, and only then validates/reclaims. A pathname or dev:ino passed
+  # between two processes has an unavoidable replacement/ABA gap.
   if dir_exists "$RUNNER_WORK_ROOT"; then
-    if ! collect_target_candidates candidates "$RUNNER_WORK_ROOT" \
-      -mindepth 3 -maxdepth 3 -type d -name target; then
-      return 1
-    fi
+    runner_root="$RUNNER_WORK_ROOT"
   fi
   if dir_exists "$BTRFS_ROOT/cargo-target"; then
-    if ! collect_target_candidates candidates "$BTRFS_ROOT/cargo-target" \
-      -mindepth 1 -maxdepth 1 -type d; then
-      return 1
-    fi
+    btrfs_target_root="$BTRFS_ROOT/cargo-target"
   fi
-  if ((${#candidates[@]} == 0)); then
+  if [[ -z $runner_root && -z $btrfs_target_root ]]; then
     log "no cargo target dirs found"
     return 0
   fi
-  for d in "${candidates[@]}"; do
-    if ! prune_target_dir "$d"; then
-      return 1
-    fi
-    count=$((count + 1))
-  done
-  # Per-target logs report exact apparent sizes.  This summary deliberately
-  # reports candidates rather than pretending btrfs reflinked bytes equal df.
-  log "[idle cargo target dirs (>${TARGET_AGE_DAYS}d)] considered $count per-worktree targets; directories retained"
+
+  "${SUDO[@]}" env \
+    -u FCVM_PRUNE_TEST_SYNC_SOCKET \
+    -u FCVM_PRUNE_TEST_FAIL_AFTER_FINGERPRINTS \
+    "$TARGET_PRUNE_HELPER" \
+    "$TARGET_CUTOFF" "$DRY_RUN" "$runner_root" "$btrfs_target_root"
 }
 
 # Stage 4a helper: content-addressed image-cache entries
