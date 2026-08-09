@@ -19,3 +19,6 @@ failpoint = { path = "../failpoint" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
