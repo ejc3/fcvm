@@ -77,11 +77,10 @@ class WsClient:
         coalesced into the same segment as the 101 response were DROPPED — and
         `__init__` then reset `self._buf = b""`, discarding them a second time.
         The next `_recv_exact(2)` would start reading in the middle of a frame,
-        the header parse would desync, and the symptom is precisely
+        the header parse would desync, and the symptom can surface as
         `WsClosed("connection closed mid-frame")`. This is a free correctness fix
-        for a failure mode the CDP arm reports at 1.7%/10.0% and the exec arm
-        (which speaks guest loopback with no socat relay in the path) never hits;
-        it is a variable removed, NOT a diagnosis of that drop.
+        that was hypothesized during a withdrawn, non-comparable request-path
+        A/B; it is a variable removed, NOT a diagnosis of those records.
         """
         data = self._buf
         self._buf = b""

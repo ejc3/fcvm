@@ -19,15 +19,189 @@ use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
 };
-use crate::storage::SnapshotManager;
+use crate::storage::{validate_snapshot_name, SnapshotGeneration, SnapshotManager};
 use crate::uffd::{UffdBacking, UffdServer};
-use crate::volume::VolumeConfig;
+use crate::volume::{SpawnedVolumes, VolumeConfig};
 
 use super::common::{
     MemoryBackend, RestoreParams, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT,
     VSOCK_STATUS_PORT, VSOCK_TTY_PORT,
 };
 use super::podman::{run_output_listener, run_status_listener};
+
+const SNAPSHOT_LINEAGE_RETRY_LIMIT: usize = 64;
+
+fn record_snapshot_lineage_retry(retries: &mut usize) -> Result<()> {
+    *retries += 1;
+    anyhow::ensure!(
+        *retries < SNAPSHOT_LINEAGE_RETRY_LIMIT,
+        "snapshot lineage did not stabilize after {} lock acquisitions; retry after concurrent snapshot creators finish",
+        SNAPSHOT_LINEAGE_RETRY_LIMIT
+    );
+    Ok(())
+}
+
+/// Resources acquired before a restored VMM is handed to the normal lifecycle.
+///
+/// Snapshot setup is deliberately transactional.  Every fallible setup step
+/// writes its ownership here, and every error is routed through
+/// [`CloneSetupResources::cleanup_failed`].  That prevents a new `?` in the
+/// setup sequence from silently detaching a listener, proxy, UFFD server, or
+/// partially-created network while deleting the state/data that identifies it.
+struct CloneSetupResources {
+    vm_id: String,
+    data_dir: PathBuf,
+    volume_servers: Option<SpawnedVolumes>,
+    tty_cancel: tokio_util::sync::CancellationToken,
+    tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
+    output_handle: Option<tokio::task::JoinHandle<Vec<(String, String)>>>,
+    egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
+    network: Option<Box<dyn NetworkManager>>,
+    implicit_uffd_cancel: tokio_util::sync::CancellationToken,
+    implicit_uffd_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    status_handle: Option<tokio::task::JoinHandle<()>>,
+    bootplan_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CloneSetupResources {
+    fn new(vm_id: String, data_dir: PathBuf) -> Self {
+        Self {
+            vm_id,
+            data_dir,
+            volume_servers: None,
+            tty_cancel: tokio_util::sync::CancellationToken::new(),
+            tty_handle: None,
+            output_handle: None,
+            egress_proxy_handle: None,
+            network: None,
+            implicit_uffd_cancel: tokio_util::sync::CancellationToken::new(),
+            implicit_uffd_handle: None,
+            status_handle: None,
+            bootplan_handle: None,
+        }
+    }
+
+    fn network_mut(&mut self) -> &mut dyn NetworkManager {
+        self.network
+            .as_deref_mut()
+            .expect("network is stored before use")
+    }
+
+    /// Stop and join every in-process owner before removing host/network/disk
+    /// state.  Returning from this method is the barrier that makes it safe for
+    /// the caller to propagate the setup error.
+    async fn cleanup_failed(&mut self, state_manager: &StateManager) -> Result<()> {
+        let mut errors = Vec::new();
+        self.tty_cancel.cancel();
+        self.implicit_uffd_cancel.cancel();
+
+        if let Some(network) = self.network.as_mut() {
+            network.start_kill_processes();
+        }
+        if let Some(handle) = self.status_handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.bootplan_handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.output_handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.egress_proxy_handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(volumes) = self.volume_servers.as_ref() {
+            for handle in &volumes.handles {
+                handle.abort();
+            }
+        }
+
+        // Join aborted async tasks so none can recreate a socket after the
+        // runtime directory is removed.  The implicit UFFD task is cancelled,
+        // not aborted: its own shutdown removes the listening socket and drains
+        // any admitted handler after the restore helper has killed its VMM.
+        if let Some(handle) = self.status_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.bootplan_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.output_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.egress_proxy_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(volumes) = self.volume_servers.as_mut() {
+            for handle in volumes.handles.drain(..) {
+                let _ = handle.await;
+            }
+        }
+        if let Some(handle) = self.implicit_uffd_handle.take() {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!(
+                    "implicit UFFD server failed during clone setup: {error:#}"
+                )),
+                Err(error) => errors.push(format!(
+                    "joining implicit UFFD server during failed clone setup: {error:#}"
+                )),
+            }
+        }
+
+        if let Some(handle) = self.tty_handle.take() {
+            match tokio::task::spawn_blocking(move || handle.join()).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(error))) => errors.push(format!(
+                    "TTY listener failed during clone setup cleanup: {error:#}"
+                )),
+                Ok(Err(_)) => {
+                    errors.push("TTY listener panicked during clone setup cleanup".to_string())
+                }
+                Err(error) => errors.push(format!("joining TTY listener cleanup task: {error:#}")),
+            }
+        }
+
+        if let Some(network) = self.network.as_mut() {
+            if let Err(error) = network.cleanup().await {
+                errors.push(format!(
+                    "cleaning network after failed clone setup: {error:#}"
+                ));
+            }
+        }
+
+        // NFS cleanup is idempotent and must run even if setup failed halfway
+        // through exportfs. Data is removed only after all socket owners are
+        // joined; state is the final deletion, so a disk-removal failure keeps
+        // its identifying pointer instead of creating an unattributed orphan.
+        crate::commands::podman::cleanup_nfs_exports(&self.vm_id).await;
+        let mut data_removed = true;
+        match tokio::fs::remove_dir_all(&self.data_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                data_removed = false;
+                errors.push(format!(
+                    "removing runtime directory after failed clone setup {}: {error:#}",
+                    self.data_dir.display()
+                ));
+            }
+        }
+        if data_removed {
+            if let Err(error) = state_manager.delete_state(&self.vm_id).await {
+                errors.push(format!(
+                    "deleting state after failed clone setup: {error:#}"
+                ));
+            }
+        }
+        if errors.is_empty() {
+            info!(vm_id = %self.vm_id, "clone setup cleanup complete");
+            Ok(())
+        } else {
+            bail!("{}", errors.join("; "))
+        }
+    }
+}
 
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
@@ -83,6 +257,60 @@ async fn snapshot_restore_runtime_config(
     }
 
     config
+}
+
+/// Wait for the restored guest's output channel, which is the final fc-agent
+/// rebind handshake before health monitoring may begin.
+///
+/// A dropped sender, an exited VMM, or a failed liveness query is a restore
+/// failure, not a reason to continue. Returning those errors through the
+/// caller's shared verification/cleanup path keeps `lifecycle_ready` false.
+async fn wait_for_restored_output<F>(
+    vm_id: &str,
+    output_connected_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    cancel: &tokio_util::sync::CancellationToken,
+    liveness_interval: &mut tokio::time::Interval,
+    mut try_wait: F,
+) -> Result<bool>
+where
+    F: FnMut() -> Result<Option<std::process::ExitStatus>>,
+{
+    loop {
+        tokio::select! {
+            result = &mut *output_connected_rx => {
+                match result {
+                    Ok(()) => {
+                        info!(vm_id = %vm_id, "fc-agent output connected, exec server ready");
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        bail!(
+                            "fc-agent output listener ended before the restored guest connected: {error}"
+                        );
+                    }
+                }
+            }
+            _ = liveness_interval.tick() => {
+                match try_wait() {
+                    Ok(Some(status)) => {
+                        bail!(
+                            "VM exited before fc-agent output connected (status: {status})"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(error).context(
+                            "checking VM liveness before fc-agent output connected"
+                        );
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                info!(vm_id = %vm_id, "shutdown requested while waiting for fc-agent output");
+                return Ok(false);
+            }
+        }
+    }
 }
 
 /// Load the VM state targeted by `snapshot create` (selected via --name or --pid).
@@ -144,6 +372,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| truncate_id(&vm_state.vm_id, 8).to_string())
     });
+    validate_snapshot_name(&snapshot_name)?;
 
     // Connect to running VM
     let socket_path = paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock");
@@ -206,33 +435,58 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         snapshot_config.kind = crate::storage::SnapshotKind::DiskOnly;
     }
 
-    // Acquire the per-snapshot lock (exclusive) BEFORE the per-VM lock — same order as
-    // create_podman_snapshot. Re-creating an existing tag atomically swaps the snapshot
-    // directory; restores of this snapshot hold the same lock shared, so a concurrent
-    // `fcvm snapshot run --snapshot <tag>` can never pair one generation's disk.raw with
-    // another generation's memory.bin.
+    // Snapshot generation locks are acquired BEFORE the per-VM lock. The target is held
+    // exclusive through its atomic replacement, and a distinct diff parent is held shared
+    // through the base copy/merge. Both locks are acquired in canonical path order so two
+    // creates with inverse target/parent relationships cannot deadlock.
     tokio::fs::create_dir_all(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
-    let _snapshot_lock = super::common::acquire_snapshot_dir_lock(&snapshot_dir, true).await?;
+    let mut expected_parent_name = vm_state.config.snapshot_name.clone();
+    let mut lineage_retries = 0;
+    let (_generation_locks, _vm_lock, parent_dir) = loop {
+        if let Some(name) = expected_parent_name.as_deref() {
+            validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
+        }
+        let expected_parent_dir = expected_parent_name
+            .as_ref()
+            .map(|name| paths::snapshot_dir().join(name));
+        let generation_locks = super::common::acquire_snapshot_create_generation_locks(
+            &snapshot_dir,
+            expected_parent_dir.as_deref(),
+        )
+        .await?;
 
-    // Acquire per-VM lock BEFORE reading the parent snapshot key.
-    // Without this, a concurrent startup snapshot can complete between our state read
-    // and the actual Firecracker snapshot — resetting the KVM dirty bitmap while we
-    // hold a stale parent reference. The merged result would be missing all boot-time
-    // memory changes, causing kernel panics on clone restore.
-    let _vm_lock = super::common::acquire_vm_snapshot_lock(&vm_disk_path).await?;
+        // Serialize dirty-bitmap resets, then re-read both the selected VM identity and its
+        // lineage. The selector may now resolve to a replacement VM, or a snapshot that won
+        // the VM lock first may have advanced snapshot_name while we acquired generation
+        // locks. Neither stale observation is safe to use.
+        let vm_lock = super::common::acquire_vm_snapshot_lock(&vm_disk_path).await?;
+        let fresh_state = load_snapshot_create_target(&state_manager, &args)
+            .await
+            .context("re-reading VM state under lock")?;
+        super::common::validate_snapshot_vm_identity(&vm_state, &fresh_state)?;
+        if let Some(name) = fresh_state.config.snapshot_name.as_deref() {
+            validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
+        }
+        if fresh_state.config.snapshot_name != expected_parent_name {
+            record_snapshot_lineage_retry(&mut lineage_retries)?;
+            info!(
+                vm_id = %vm_state.vm_id,
+                retry = lineage_retries,
+                retry_limit = SNAPSHOT_LINEAGE_RETRY_LIMIT,
+                expected_parent = ?expected_parent_name,
+                current_parent = ?fresh_state.config.snapshot_name,
+                "snapshot lineage advanced while acquiring locks; retrying"
+            );
+            expected_parent_name = fresh_state.config.snapshot_name;
+            drop(vm_lock);
+            drop(generation_locks);
+            continue;
+        }
 
-    // Re-read state under lock to get the current parent snapshot key.
-    // The startup snapshot may have updated snapshot_name since our initial read.
-    let fresh_state = load_snapshot_create_target(&state_manager, &args)
-        .await
-        .context("re-reading VM state under lock")?;
-    let parent_dir = fresh_state
-        .config
-        .snapshot_name
-        .as_ref()
-        .map(|name| paths::snapshot_dir().join(name));
+        break (generation_locks, vm_lock, expected_parent_dir);
+    };
 
     if args.disk_only {
         // Disk-only: no vCPU pause, no memory dump — fsfreeze the guest over the
@@ -373,12 +627,26 @@ fn ensure_not_disk_only(kind: crate::storage::SnapshotKind, command: &str) -> Re
 
 /// Serve snapshot memory (foreground)
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
+    validate_snapshot_name(&args.snapshot_name)?;
     info!(
         "Starting memory server for snapshot: {}",
         args.snapshot_name
     );
 
-    // Load snapshot configuration
+    // Hold this generation for the server's whole lifetime.  A UFFD server keeps
+    // serving the memory inode it opened at startup; allowing the tag to be
+    // deleted/recreated underneath it would make its public snapshot name point
+    // at a different disk/memory generation than the bytes it actually serves.
+    tokio::fs::create_dir_all(paths::snapshot_dir())
+        .await
+        .context("creating snapshot directory")?;
+    let _snapshot_generation_lock = super::common::acquire_snapshot_dir_lock(
+        &paths::snapshot_dir().join(&args.snapshot_name),
+        false,
+    )
+    .await?;
+
+    // Load snapshot configuration while holding the generation lock.
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     let snapshot_config = snapshot_manager
         .load_snapshot(&args.snapshot_name)
@@ -705,6 +973,28 @@ fn volume_state_from_snapshot(
 ///
 /// This is public so podman.rs can call it directly for cache hits.
 pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
+    cmd_snapshot_run_attempt(args).await.result
+}
+
+/// Result of a restore together with the identity of the exact snapshot
+/// generation it loaded.  Podman cache invalidation needs this identity after
+/// the shared generation lease is released so it cannot delete a replacement
+/// installed under the same tag.
+pub(crate) struct SnapshotRunAttempt {
+    pub(crate) result: Result<()>,
+    pub(crate) generation: Option<SnapshotGeneration>,
+}
+
+pub(crate) async fn cmd_snapshot_run_attempt(args: SnapshotRunArgs) -> SnapshotRunAttempt {
+    let mut generation = None;
+    let result = cmd_snapshot_run_inner(args, &mut generation).await;
+    SnapshotRunAttempt { result, generation }
+}
+
+async fn cmd_snapshot_run_inner(
+    args: SnapshotRunArgs,
+    attempted_generation: &mut Option<SnapshotGeneration>,
+) -> Result<()> {
     // Determine mode and get snapshot name
     let (snapshot_name, serve_pid, uffd_socket, serve_uffd_mode) = match (&args.pid, &args.snapshot)
     {
@@ -765,6 +1055,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             anyhow::bail!("Cannot specify both --pid and --snapshot");
         }
     };
+    validate_snapshot_name(&snapshot_name)?;
     let use_uffd = uffd_socket.is_some();
 
     let state_manager = StateManager::new(paths::state_dir());
@@ -786,10 +1077,32 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Load snapshot configuration
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-    let snapshot_config = snapshot_manager
-        .load_snapshot(&snapshot_name)
+    let (snapshot_config, snapshot_generation) = snapshot_manager
+        .load_snapshot_with_generation(&snapshot_name)
         .await
         .context("loading snapshot configuration")?;
+    *attempted_generation = Some(snapshot_generation);
+
+    // Construct signal streams synchronously before either restore path can
+    // allocate clone state.  Installing them inside a spawned task leaves the
+    // process's default SIGTERM disposition live until that task first polls.
+    let lifecycle_gate = super::common::LifecycleReadyGate::new();
+    let cancel = lifecycle_gate.cancellation_token();
+    let signal_gate = lifecycle_gate.clone();
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                signal_gate.cancel();
+                info!("received SIGTERM, shutting down VM");
+            }
+            _ = sigint.recv() => {
+                signal_gate.cancel();
+                info!("received SIGINT, shutting down VM");
+            }
+        }
+    });
     // The --pid (UFFD) and --snapshot (direct memory restore) paths both resume
     // from a memory image; a disk-only tag has none — it cold-boots a fresh VM
     // from the captured disk instead. Dispatch to that path before any
@@ -801,6 +1114,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             snapshot_config,
             args,
             snapshot_shared_lock,
+            lifecycle_gate,
         )
         .await;
     }
@@ -862,9 +1176,31 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
-    tokio::fs::create_dir_all(&data_dir)
+    let mut setup = CloneSetupResources::new(vm_id.clone(), data_dir.clone());
+
+    // Every fallible operation after setup ownership begins must use this
+    // funnel.  It waits for the complete teardown transaction before returning
+    // the original error, and reports a cleanup failure as additional context.
+    macro_rules! setup_try {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let error = match setup.cleanup_failed(&state_manager).await {
+                        Ok(()) => error,
+                        Err(cleanup_error) => error.context(format!(
+                            "clone setup cleanup also failed: {cleanup_error:#}"
+                        )),
+                    };
+                    return Err(error);
+                }
+            }
+        };
+    }
+
+    setup_try!(tokio::fs::create_dir_all(&data_dir)
         .await
-        .context("creating VM data directory")?;
+        .context("creating VM data directory"));
 
     let socket_path = data_dir.join("firecracker.sock");
 
@@ -933,13 +1269,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
-    let volume_servers = crate::volume::spawn_volume_servers_with_tables(
+    setup.volume_servers = Some(setup_try!(crate::volume::spawn_volume_servers_with_tables(
         &volume_configs,
         &clone_vsock_base,
         &inode_tables,
     )
     .await
-    .context("spawning VolumeServers for clone")?;
+    .context("spawning VolumeServers for clone")));
 
     // Setup TTY/output socket paths (inherited from snapshot metadata)
     let tty_mode = snapshot_config.metadata.tty;
@@ -950,14 +1286,27 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // For TTY mode, we spawn a blocking thread that handles the TTY I/O
     // This must be set up BEFORE VM starts so we're ready to accept connection
-    let tty_handle = if tty_mode {
+    if tty_mode {
         let socket_path = tty_socket_path.clone();
-        Some(std::thread::spawn(move || {
-            super::tty::run_tty_session(&socket_path, true, interactive)
-        }))
-    } else {
-        None
-    };
+        let tty_cancel = setup.tty_cancel.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        setup.tty_handle = Some(std::thread::spawn(move || {
+            super::tty::run_tty_session_cancellable(
+                &socket_path,
+                true,
+                interactive,
+                tty_cancel,
+                Some(ready_tx),
+            )
+        }));
+        let tty_ready =
+            tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(5)))
+                .await
+                .context("joining clone TTY listener readiness wait")
+                .and_then(|result| result.context("waiting for clone TTY listener readiness"))
+                .and_then(|result| result.map_err(anyhow::Error::msg));
+        setup_try!(tty_ready);
+    }
 
     // For non-TTY mode, use async output listener.
     // The reconnect_notify is fired after restore_from_snapshot() to signal the output
@@ -966,11 +1315,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
     // Channel to know when fc-agent's output connection arrives (gates health monitor)
     let (output_connected_tx, mut output_connected_rx) = tokio::sync::oneshot::channel();
-    let output_handle = if !tty_mode {
+    if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         let reconnect = output_reconnect.clone();
-        Some(tokio::spawn(async move {
+        setup.output_handle = Some(tokio::spawn(async move {
             match run_output_listener(
                 &socket_path,
                 &vm_id_clone,
@@ -987,25 +1336,21 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     Vec::new()
                 }
             }
-        }))
-    } else {
-        None
-    };
+        }));
+    }
 
     // Network mode inherited from snapshot metadata
     let network_mode = snapshot_config.metadata.network_mode;
 
     // Start egress proxy for rootless mode only
-    let _egress_proxy_handle = if matches!(network_mode, FcNetworkMode::Rootless) {
+    if matches!(network_mode, FcNetworkMode::Rootless) {
         let socket_path = clone_vsock_base.clone();
-        Some(tokio::spawn(async move {
+        setup.egress_proxy_handle = Some(tokio::spawn(async move {
             if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
                 tracing::warn!("Egress proxy error: {}", e);
             }
-        }))
-    } else {
-        None
-    };
+        }));
+    }
 
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
@@ -1018,11 +1363,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if matches!(network_mode, FcNetworkMode::Bridged | FcNetworkMode::Routed)
         && !nix::unistd::geteuid().is_root()
     {
-        bail!(
+        setup_try!(Err(anyhow::anyhow!(
             "Bridged/routed networking requires root. Either:\n  \
              - Run with sudo: sudo fcvm snapshot run ...\n  \
              - Use rootless mode (create baseline with --network rootless)"
-        );
+        )));
     }
     // Rootless with sudo is pointless - bridged would be faster
     if matches!(network_mode, FcNetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
@@ -1033,7 +1378,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     }
 
     // Setup networking based on mode - reuse guest_ip from snapshot if available
-    let mut network: Box<dyn NetworkManager> = match network_mode {
+    let network: Box<dyn NetworkManager> = match network_mode {
         FcNetworkMode::Bridged => {
             let mut net =
                 BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
@@ -1057,13 +1402,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 net =
                     net.with_forward_localhost(snapshot_config.metadata.forward_localhost.clone());
             }
-            net.preflight_check()
-                .context("routed mode preflight check failed")?;
+            setup_try!(net
+                .preflight_check()
+                .context("routed mode preflight check failed"));
             if !port_mappings.is_empty() {
-                let loopback_ip = state_manager
+                let loopback_ip = setup_try!(state_manager
                     .allocate_loopback_ip(&mut vm_state)
                     .await
-                    .context("allocating loopback IP for routed clone")?;
+                    .context("allocating loopback IP for routed clone"));
                 net = net.with_loopback_ip(loopback_ip);
             }
             Box::new(net)
@@ -1071,10 +1417,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         FcNetworkMode::Rootless => {
             // For rootless mode, allocate loopback IP atomically with state persistence
             // This prevents race conditions when starting multiple clones concurrently
-            let loopback_ip = state_manager
+            let loopback_ip = setup_try!(state_manager
                 .allocate_loopback_ip(&mut vm_state)
                 .await
-                .context("allocating loopback IP")?;
+                .context("allocating loopback IP"));
 
             // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict
@@ -1088,26 +1434,20 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // network.setup() may fail partway through (it tears nothing down itself),
     // so any error from here until the restore_from_snapshot error handler below
     // must run network.cleanup() to remove partially-created host network state.
-    let network_config = match network.setup().await.context("setting up network") {
-        Ok(config) => config,
-        Err(e) => {
-            if let Err(cleanup_err) = network.cleanup().await {
-                warn!(
-                    "failed to cleanup network after setup error: {}",
-                    cleanup_err
-                );
-            }
-            return Err(e);
-        }
-    };
+    setup.network = Some(network);
+    let network_config = setup_try!(setup
+        .network_mut()
+        .setup()
+        .await
+        .context("setting up network"));
 
     // For routed mode clones: the snapshot's guest IPv6 (baked into boot params) is shared
     // across all clones. After restore, fc-agent will be told to swap it to the unique
     // per-clone vm_ipv6. Store the new vm_ipv6 so the exec reconfigure command can use it.
-    let clone_ipv6_swap: Option<(String, String)> = if let Some(routed_net) =
-        network
-            .as_any()
-            .downcast_ref::<crate::network::RoutedNetwork>()
+    let clone_ipv6_swap: Option<(String, String)> = if let Some(routed_net) = setup
+        .network_mut()
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
     {
         match (&saved_network.guest_ipv6, routed_net.vm_ipv6()) {
             (Some(old), Some(new)) if old != new => {
@@ -1148,7 +1488,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // with the guest IP like a baseline VM.
     vm_state.config.nfs_shares = snapshot_config.metadata.nfs_shares.clone();
     if !vm_state.config.nfs_shares.is_empty() {
-        let bridged_veth_ip = network
+        let bridged_veth_ip = setup
+            .network_mut()
             .as_any()
             .downcast_ref::<BridgedNetwork>()
             .and_then(|net| net.veth_inner_ip().map(str::to_string));
@@ -1159,32 +1500,20 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 // A malformed exports entry would fail exportfs cryptically and
                 // hang the guest's hard mount — fail fast and clean like the
                 // other pre-restore error paths.
-                if let Err(cleanup_err) = network.cleanup().await {
-                    warn!(
-                        "failed to cleanup network after NFS client error: {}",
-                        cleanup_err
-                    );
-                }
-                anyhow::bail!("no client IP available for NFS exports of restored VM");
+                setup_try!(Err(anyhow::anyhow!(
+                    "no client IP available for NFS exports of restored VM"
+                )));
+                unreachable!("setup_try returns on error")
             }
         };
-        if let Err(e) = crate::commands::podman::setup_nfs_exports(
+        setup_try!(crate::commands::podman::setup_nfs_exports(
             &vm_id,
             &vm_state.config.nfs_shares,
             &client_spec,
             insecure,
         )
         .await
-        .context("re-creating NFS exports for restored VM")
-        {
-            if let Err(cleanup_err) = network.cleanup().await {
-                warn!(
-                    "failed to cleanup network after NFS export error: {}",
-                    cleanup_err
-                );
-            }
-            return Err(e);
-        }
+        .context("re-creating NFS exports for restored VM"));
     }
 
     info!(
@@ -1219,7 +1548,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // When restoring from cache (no explicit serve process), start an implicit in-process
     // UFFD server as a background tokio task.
     let hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
-    let implicit_uffd_cancel = tokio_util::sync::CancellationToken::new();
 
     // Which VMM created this snapshot — restore must use the same backend (the memory image
     // format is VMM-specific). Cloud Hypervisor restores from its own `ch/` subdir via
@@ -1242,12 +1570,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // the range at mmap time, failing an unservable restore with ENOMEM instead of
         // letting a running guest SIGBUS.
         if hugepages {
-            crate::uffd::preflight_clone_hugepages(
+            setup_try!(crate::uffd::preflight_clone_hugepages(
                 args.mem.unwrap_or(snapshot_config.metadata.memory_mib) as usize,
-            )?;
+            ));
         }
         let mode = serve_uffd_mode.as_deref().unwrap_or("copy");
-        match UffdBacking::parse_mode(mode, hugepages)? {
+        match setup_try!(UffdBacking::parse_mode(mode, hugepages)) {
             UffdBacking::Copy => MemoryBackend::Uffd {
                 socket_path: uffd_socket_path.clone(),
             },
@@ -1263,14 +1591,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             let reason = if hugepages {
                 // Same admission logic as the serve-process path above: refuse to spawn a
                 // hugepage clone the pool cannot hold at its CoW worst case.
-                crate::uffd::preflight_clone_hugepages(
+                setup_try!(crate::uffd::preflight_clone_hugepages(
                     args.mem.unwrap_or(snapshot_config.metadata.memory_mib) as usize,
-                )?;
+                ));
                 "hugepages require UFFD"
             } else {
                 "FCVM_FORCE_UFFD"
             };
-            let backing = UffdBacking::from_env(hugepages)?;
+            let backing = setup_try!(UffdBacking::from_env(hugepages));
             info!(
                 reason = %reason,
                 mode = backing.name(),
@@ -1288,55 +1616,50 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             // which measured 109 bytes in CI against `sun_path`'s 107 — every hugepage test
             // failed on BOTH arches, because hugepages force UFFD and so are the only tests
             // that build this path at all.
-            let server = match UffdServer::new(
+            let server = setup_try!(UffdServer::new(
                 "implicit".to_string(),
                 &snapshot_config.memory_path,
                 &data_dir,
                 backing,
             )
             .await
-            .context("creating implicit UFFD server")
-            {
-                Ok(server) => server,
-                Err(e) => {
-                    if let Err(cleanup_err) = network.cleanup().await {
-                        warn!(
-                            "failed to cleanup network after setup error: {}",
-                            cleanup_err
-                        );
-                    }
-                    crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
-                    return Err(e);
-                }
-            };
+            .context("creating implicit UFFD server"));
             let implicit_socket_path = server.socket_path().to_path_buf();
             info!(
                 socket = %implicit_socket_path.display(),
                 "implicit UFFD server socket"
             );
 
-            let cancel = implicit_uffd_cancel.clone();
-            tokio::spawn(async move {
-                if let Err(e) = server.run(cancel).await {
-                    tracing::error!(target: "uffd", error = ?e, "implicit UFFD server error");
-                }
-            });
+            let implicit_cancel = setup.implicit_uffd_cancel.clone();
+            setup.implicit_uffd_handle = Some(tokio::spawn(async move {
+                server
+                    .run(implicit_cancel)
+                    .await
+                    .context("running implicit UFFD server")
+            }));
 
+            let mut bound = false;
             for i in 0..100 {
                 if implicit_socket_path.exists() {
+                    bound = true;
+                    break;
+                }
+                if setup
+                    .implicit_uffd_handle
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
                     break;
                 }
                 if i == 99 {
-                    if let Err(cleanup_err) = network.cleanup().await {
-                        warn!(
-                            "failed to cleanup network after setup error: {}",
-                            cleanup_err
-                        );
-                    }
-                    crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
-                    bail!("implicit UFFD server did not bind socket within 5s");
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !bound {
+                setup_try!(Err(anyhow::anyhow!(
+                    "implicit UFFD server did not bind socket within 5s"
+                )));
             }
 
             match backing {
@@ -1390,7 +1713,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let status_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_STATUS_PORT);
-    let status_handle = {
+    setup.status_handle = Some({
         let socket_path = status_socket_path.clone();
         let runtime_dir = data_dir.clone();
         let vm_id_clone = vm_id.clone();
@@ -1410,7 +1733,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 warn!("Status listener error: {}", e);
             }
         })
-    };
+    });
 
     let restore_params = RestoreParams {
         vm_id: &vm_id,
@@ -1430,50 +1753,58 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // status listener, network) is already live, so "client arrives before the
     // restored guest ever runs" becomes deterministic.
     failpoint::hit_async("restore.pre_resume").await;
+    if cancel.is_cancelled() {
+        info!(vm_id = %vm_id, "shutdown requested before snapshot restore started");
+        drop(snapshot_shared_lock);
+        setup
+            .cleanup_failed(&state_manager)
+            .await
+            .context("cleaning cancelled clone setup")?;
+        anyhow::bail!("interrupted by signal during clone setup");
+    }
     let setup_result: Result<(
         Box<dyn crate::hypervisor::Hypervisor>,
         Option<tokio::process::Child>,
     )> = if is_ch {
-        async {
-            // Serve the restore-epoch over the boot-plan vsock port BEFORE the restore
-            // resumes the VM, so the restored guest's watcher can run handle_clone_restore
-            // (reconnect output/exec vsock + clock sync) as soon as it resumes. The
-            // listener task runs detached for the clone's (process) lifetime.
-            // Unique per restore (see new_restore_epoch): a wall-clock epoch
-            // repeats when a snapshot of a restored VM is itself restored within
-            // the same second, leaving the guest's watcher deaf to the restore.
-            let restore_epoch = super::common::new_restore_epoch();
-            let mut latest = serde_json::json!({
-                "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch,
-            });
-            if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
-                latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
-            }
-            let bootplan_socket = format!(
-                "{}_{}",
-                clone_vsock_base.display(),
-                super::common::VSOCK_BOOTPLAN_PORT
-            );
-            super::podman::spawn_bootplan_listener(&bootplan_socket, &latest)
-                .context("spawning CH restore boot-plan listener")?;
-            let (backend, holder) = super::common::restore_from_snapshot_ch(
-                restore_params,
-                network.as_mut(),
-                &state_manager,
-                &mut vm_state,
-            )
-            .await?;
-            Ok((
+        // Serve the restore-epoch over the boot-plan vsock port BEFORE the restore
+        // resumes the VM, so the restored guest's watcher can reconnect its vsock
+        // channels immediately. The handle stays in the setup transaction until
+        // ownership transfers to the normal lifecycle below.
+        let restore_epoch = super::common::new_restore_epoch();
+        let mut latest = serde_json::json!({
+            "host-time": chrono::Utc::now().timestamp().to_string(),
+            "restore-epoch": restore_epoch,
+        });
+        if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
+            latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
+        }
+        let bootplan_socket = format!(
+            "{}_{}",
+            clone_vsock_base.display(),
+            super::common::VSOCK_BOOTPLAN_PORT
+        );
+        setup.bootplan_handle = Some(setup_try!(super::podman::spawn_bootplan_listener(
+            &bootplan_socket,
+            &latest
+        )
+        .context("spawning CH restore boot-plan listener")));
+        super::common::restore_from_snapshot_ch(
+            restore_params,
+            setup.network_mut(),
+            &state_manager,
+            &mut vm_state,
+        )
+        .await
+        .map(|(backend, holder)| {
+            (
                 Box::new(backend) as Box<dyn crate::hypervisor::Hypervisor>,
                 holder,
-            ))
-        }
-        .await
+            )
+        })
     } else {
         super::common::restore_from_snapshot(
             restore_params,
-            network.as_mut(),
+            setup.network_mut(),
             &state_manager,
             &mut vm_state,
         )
@@ -1486,48 +1817,26 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // of this clone.
     drop(snapshot_shared_lock);
 
-    // If setup failed, cleanup all resources before propagating error
-    if let Err(e) = setup_result {
-        warn!("Clone setup failed, cleaning up resources");
+    let (mut vm_manager, mut holder_child) = setup_try!(setup_result);
 
-        // Stop implicit UFFD server if running
-        implicit_uffd_cancel.cancel();
-
-        // Abort VolumeServer tasks
-        for handle in volume_servers.handles {
-            handle.abort();
-        }
-
-        // Cleanup network
-        if let Err(cleanup_err) = network.cleanup().await {
-            warn!(
-                "failed to cleanup network after setup error: {}",
-                cleanup_err
-            );
-        }
-
-        // Remove the NFS exports created for this VM (no-op without NFS)
-        crate::commands::podman::cleanup_nfs_exports(&vm_id).await;
-
-        // Cleanup data directory
-        if data_dir.exists() {
-            if let Err(cleanup_err) = tokio::fs::remove_dir_all(&data_dir).await {
-                warn!(
-                    "failed to cleanup data_dir after setup error: {}",
-                    cleanup_err
-                );
-            }
-        }
-
-        // Cleanup state file
-        if let Err(cleanup_err) = state_manager.delete_state(&vm_id).await {
-            warn!("failed to cleanup state after setup error: {}", cleanup_err);
-        }
-
-        return Err(e);
-    }
-
-    let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+    // The VMM is now owned by the normal lifecycle. Move every companion out of
+    // the setup transaction exactly once; failed setup never reaches this point.
+    let mut network = setup.network.take().expect("restored VM owns its network");
+    let volume_servers = setup
+        .volume_servers
+        .take()
+        .expect("restored VM owns its volume servers");
+    let mut tty_handle = setup.tty_handle.take();
+    let tty_cancel = setup.tty_cancel.clone();
+    let output_handle = setup.output_handle.take();
+    let mut egress_proxy_handle = setup.egress_proxy_handle.take();
+    let implicit_uffd_cancel = setup.implicit_uffd_cancel.clone();
+    let mut implicit_uffd_handle = setup.implicit_uffd_handle.take();
+    let status_handle = setup
+        .status_handle
+        .take()
+        .expect("restored VM owns its status listener");
+    let mut bootplan_handle = setup.bootplan_handle.take();
 
     // Disable swap for Firecracker if requested via --no-swap
     if args.no_swap {
@@ -1574,53 +1883,79 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // ready, exec error) still reaches the cleanup below. Returning early here would
         // leak the network namespace, state file, loopback IP, and data directory that only
         // cleanup_vm removes.
-        let exec_result: Result<i32> = async {
-            // Parse command using shell_words (same as --cmd in podman run)
-            let cmd_args: Vec<String> = shell_words::split(exec_cmd)
-                .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
+        let ready_result = match lifecycle_gate.publish(&state_manager, &mut vm_state).await {
+            Ok(super::common::LifecycleReadyOutcome::Published) => Ok(()),
+            Ok(super::common::LifecycleReadyOutcome::Cancelled) => Err(anyhow::anyhow!(
+                "clone --exec interrupted by shutdown signal before lifecycle readiness"
+            )),
+            Err(error) => Err(error),
+        };
+        let exec_result: Result<i32> = match ready_result {
+            Err(error) => Err(error),
+            Ok(()) => tokio::select! {
+                result = async {
+                // Parse command using shell_words (same as --cmd in podman run)
+                let cmd_args: Vec<String> = shell_words::split(exec_cmd)
+                    .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
 
-            // Wait for the vsock socket to be connectable. After a restore the
-            // socket virtually always exists already (Firecracker binds it during
-            // load_snapshot), so probe immediately and back off from 1ms — the old
-            // fixed 10ms interval burned most of an interval per clone --exec.
-            let vsock_socket = data_dir.join("vsock.sock");
-            let poll_start = std::time::Instant::now();
-            const MAX_VSOCK_WAIT: Duration = Duration::from_millis(5000);
-            const VSOCK_POLL_MAX_INTERVAL: Duration = Duration::from_millis(10);
+                // Wait for the vsock socket to be connectable. After a restore the
+                // socket virtually always exists already (Firecracker binds it during
+                // load_snapshot), so probe immediately and back off from 1ms — the old
+                // fixed 10ms interval burned most of an interval per clone --exec.
+                let vsock_socket = data_dir.join("vsock.sock");
+                let poll_start = std::time::Instant::now();
+                const MAX_VSOCK_WAIT: Duration = Duration::from_millis(5000);
+                const VSOCK_POLL_MAX_INTERVAL: Duration = Duration::from_millis(10);
 
-            let mut vsock_poll_interval = Duration::from_millis(1);
-            loop {
-                if poll_start.elapsed() > MAX_VSOCK_WAIT {
-                    bail!("vsock socket not ready after {:?}", poll_start.elapsed());
-                }
-
-                // Check if socket exists and is connectable
-                if vsock_socket.exists() {
-                    if let Ok(_stream) = std::os::unix::net::UnixStream::connect(&vsock_socket) {
-                        debug!("vsock socket ready after {:?}", poll_start.elapsed());
-                        break;
+                let mut vsock_poll_interval = Duration::from_millis(1);
+                loop {
+                    if poll_start.elapsed() > MAX_VSOCK_WAIT {
+                        bail!("vsock socket not ready after {:?}", poll_start.elapsed());
                     }
-                }
 
-                tokio::time::sleep(vsock_poll_interval).await;
-                vsock_poll_interval = (vsock_poll_interval * 2).min(VSOCK_POLL_MAX_INTERVAL);
-            }
-            crate::commands::exec::run_exec_in_vm(
-                &vsock_socket,
-                &cmd_args,
-                true, // in_container
-                &vm_id,
-            )
-            .await
-        }
-        .await;
+                    // Check if socket exists and is connectable
+                    if vsock_socket.exists() {
+                        if let Ok(_stream) = std::os::unix::net::UnixStream::connect(&vsock_socket) {
+                            debug!("vsock socket ready after {:?}", poll_start.elapsed());
+                            break;
+                        }
+                    }
+
+                    tokio::time::sleep(vsock_poll_interval).await;
+                    vsock_poll_interval = (vsock_poll_interval * 2).min(VSOCK_POLL_MAX_INTERVAL);
+                }
+                crate::commands::exec::run_exec_in_vm(
+                    &vsock_socket,
+                    &cmd_args,
+                    true, // in_container
+                    &vm_id,
+                )
+                .await
+                } => result,
+                _ = cancel.cancelled() => {
+                    info!("shutdown requested while clone --exec was running");
+                    Err(anyhow::anyhow!("clone --exec interrupted by shutdown signal"))
+                }
+            },
+        };
+        let exec_interrupted = cancel.is_cancelled();
 
         // Cleanup resources (exec path has no health monitor)
         info!(result = ?exec_result, "exec finished, cleaning up");
 
         // Stop implicit UFFD server if running (hugepage cache restore)
         implicit_uffd_cancel.cancel();
+        tty_cancel.cancel();
         status_handle.abort();
+        let _ = status_handle.await;
+        if let Some(handle) = egress_proxy_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = bootplan_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         super::common::cleanup_vm(
             super::common::CleanupContext {
@@ -1638,6 +1973,28 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             &state_manager,
         )
         .await;
+
+        if let Some(handle) = implicit_uffd_handle.take() {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(error = %error, "implicit UFFD server failed"),
+                Err(error) => {
+                    warn!(error = %error, "implicit UFFD server task did not join cleanly")
+                }
+            }
+        }
+        if let Some(handle) = tty_handle.take() {
+            match tokio::task::spawn_blocking(move || handle.join()).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(error))) => warn!(error = %error, "TTY listener cleanup failed"),
+                Ok(Err(_)) => warn!("TTY listener panicked during cleanup"),
+                Err(error) => warn!(error = %error, "could not join TTY cleanup task"),
+            }
+        }
+
+        if exec_interrupted {
+            return Ok(());
+        }
 
         // Propagate exec errors only after cleanup has run
         let exit_code = exec_result?;
@@ -1675,7 +2032,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // falcon all resume simultaneously) and fc-agent's MMDS poll + restore handler
     // can take minutes. Proceeding early causes exec failures; waiting is correct.
     // But poll VM liveness to avoid hanging forever if Firecracker crashes.
-    if !tty_mode {
+    let output_handshake_result = if !tty_mode {
         // First liveness check at 250ms, then every 5s: restore_from_snapshot no
         // longer sleeps post-resume (its old 200ms crash-window moved here, off
         // the hot path), so a VM that dies right after resume is still diagnosed
@@ -1685,107 +2042,100 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             tokio::time::Instant::now() + std::time::Duration::from_millis(250),
             std::time::Duration::from_secs(5),
         );
-        let mut output_connected = false;
-        loop {
-            tokio::select! {
-                result = &mut output_connected_rx => {
-                    match result {
-                        Ok(()) => {
-                            info!(vm_id = %vm_id, "fc-agent output connected, exec server ready");
-                            output_connected = true;
-                        }
-                        Err(_) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
-                    }
+        wait_for_restored_output(
+            &vm_id,
+            &mut output_connected_rx,
+            &cancel,
+            &mut liveness_interval,
+            || vm_manager.try_wait(),
+        )
+        .await
+    } else {
+        Ok(false)
+    };
+    let output_connected = matches!(&output_handshake_result, Ok(true));
+
+    // Dead-serial detection: the output vsock reconnecting proves the guest
+    // and its virtio transport are alive, but the serial console can still
+    // be dead if the snapshot was captured with UART TX bytes in flight —
+    // the restored guest's 8250 driver then waits forever for a TX
+    // interrupt the re-created serial device never delivers, and every log
+    // line from the VM silently disappears. A healthy restored fc-agent
+    // always prints restore-progress lines BEFORE reconnecting output, so
+    // zero console lines shortly after this point is proof of a poisoned
+    // snapshot. One loud error naming the snapshot instead of a trail of
+    // mystery test failures. The mid-TX-UART diagnosis is Firecracker-only
+    // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
+    // console, so they get a backend-neutral missing-console error.
+    if output_connected {
+        let console_lines = vm_manager.console_line_counter();
+        let backend = vm_manager.backend();
+        let snapshot_name = snapshot_name.clone();
+        let vm_id = vm_id.clone();
+        // 30s, not a few seconds: a freshly restored VM can be CPU-starved for a
+        // while (see the untimed output-connect wait above), and fc-agent's
+        // console gate releases up to ~500ms after WarmStart. A poisoned
+        // snapshot's serial is dead FOREVER, so a generous window costs nothing.
+        // Cancel-aware so it can't fire after the VM is torn down.
+        let watchdog_cancel = health_cancel_token.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if console_lines.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                _ = liveness_interval.tick() => {
-                    match vm_manager.try_wait() {
-                        Ok(Some(status)) => {
-                            warn!(vm_id = %vm_id, ?status, "VM exited before fc-agent connected");
-                            break;
-                        }
-                        Ok(None) => {} // still running
-                        Err(e) => {
-                            warn!(vm_id = %vm_id, error = %e, "VM liveness check failed");
-                            break;
-                        }
-                    }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    _ = watchdog_cancel.cancelled() => return,
                 }
             }
-        }
-        // Dead-serial detection: the output vsock reconnecting proves the guest
-        // and its virtio transport are alive, but the serial console can still
-        // be dead if the snapshot was captured with UART TX bytes in flight —
-        // the restored guest's 8250 driver then waits forever for a TX
-        // interrupt the re-created serial device never delivers, and every log
-        // line from the VM silently disappears. A healthy restored fc-agent
-        // always prints restore-progress lines BEFORE reconnecting output, so
-        // zero console lines shortly after this point is proof of a poisoned
-        // snapshot. One loud error naming the snapshot instead of a trail of
-        // mystery test failures. The mid-TX-UART diagnosis is Firecracker-only
-        // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
-        // console, so they get a backend-neutral missing-console error.
-        if output_connected {
-            let console_lines = vm_manager.console_line_counter();
-            let backend = vm_manager.backend();
-            let snapshot_name = snapshot_name.clone();
-            let vm_id = vm_id.clone();
-            // 30s, not a few seconds: a freshly restored VM can be CPU-starved for a
-            // while (see the untimed output-connect wait above), and fc-agent's
-            // console gate releases up to ~500ms after WarmStart. A poisoned
-            // snapshot's serial is dead FOREVER, so a generous window costs nothing.
-            // Cancel-aware so it can't fire after the VM is torn down.
-            let watchdog_cancel = health_cancel_token.clone();
-            tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                loop {
-                    if console_lines.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                        return;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                        _ = watchdog_cancel.cancelled() => return,
-                    }
-                }
-                match backend {
-                    crate::hypervisor::Backend::Firecracker => tracing::error!(
-                        vm_id = %vm_id,
-                        snapshot = %snapshot_name,
-                        "fc-agent's output vsock reconnected after restore but NO serial \
-                         console line arrived within 30s — snapshot '{}' almost certainly \
-                         captured the guest UART mid-transmit and every restore of it will \
-                         have a dead serial console. Recreate the snapshot.",
-                        snapshot_name
-                    ),
-                    crate::hypervisor::Backend::CloudHypervisor => tracing::error!(
-                        vm_id = %vm_id,
-                        snapshot = %snapshot_name,
-                        "fc-agent's output vsock reconnected after restore but NO console \
-                         output arrived within 30s — restores of snapshot '{}' come up with \
-                         a dead guest console. Recreate the snapshot.",
-                        snapshot_name
-                    ),
-                }
-            });
-        }
+            match backend {
+                crate::hypervisor::Backend::Firecracker => tracing::error!(
+                    vm_id = %vm_id,
+                    snapshot = %snapshot_name,
+                    "fc-agent's output vsock reconnected after restore but NO serial \
+                     console line arrived within 30s — snapshot '{}' almost certainly \
+                     captured the guest UART mid-transmit and every restore of it will \
+                     have a dead serial console. Recreate the snapshot.",
+                    snapshot_name
+                ),
+                crate::hypervisor::Backend::CloudHypervisor => tracing::error!(
+                    vm_id = %vm_id,
+                    snapshot = %snapshot_name,
+                    "fc-agent's output vsock reconnected after restore but NO console \
+                     output arrived within 30s — restores of snapshot '{}' come up with \
+                     a dead guest console. Recreate the snapshot.",
+                    snapshot_name
+                ),
+            }
+        });
     }
 
     // Verify pasta's L2 forwarding path is ready before starting health monitor.
     // After snapshot restore, pasta may not have learned the guest's MAC yet.
-    // This pings the guest to trigger ARP resolution, then probes each forwarded
-    // port to confirm end-to-end forwarding works.
+    // Readiness requires ARP neighbor resolution, then probes each forwarded TCP
+    // port to confirm end-to-end forwarding works. ICMP echo is unrelated to a
+    // published TCP service and may legitimately be disabled by the guest.
     //
     // On failure (the VM crashed during the wait above, or pasta's port probe timed out)
     // skip the monitor/wait section and fall through to the shared cleanup below before
     // propagating the error — returning early here would leak the network namespace,
     // state file, loopback IP, and data directory that only cleanup_vm removes.
-    let verify_result = network
-        .verify_port_forwarding()
-        .await
-        .context("port forwarding verification failed after snapshot restore");
+    let verify_result = match output_handshake_result {
+        Err(error) => Err(error),
+        Ok(_) => tokio::select! {
+            result = network.verify_port_forwarding() => {
+                result.context("port forwarding verification failed after snapshot restore")
+            }
+            _ = cancel.cancelled() => {
+                info!(vm_id = %vm_id, "shutdown requested before port forwarding verification completed");
+                Ok(())
+            }
+        },
+    };
 
     // Track container exit code (from TTY mode)
     let mut container_exit_code: Option<i32> = None;
@@ -1793,6 +2143,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // failure signal a caller sees for a clone whose memory could not be served.
     let mut clone_failure: Option<String> = None;
     let mut health_monitor_handle = None;
+    let mut lifecycle_ready_result: Result<()> = Ok(());
+    let mut lifecycle_cancelled = false;
 
     if verify_result.is_ok() {
         // Spawn health monitor task with startup snapshot trigger support
@@ -1803,19 +2155,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             Some(health_cancel_token.clone()),
             startup_tx,
         ));
-
-        // Setup signal handlers with cancellation token
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-            tokio::select! {
-                _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
-                _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }
-            }
-            cancel_clone.cancel();
-        });
 
         // Get disk path for startup snapshot creation
         let disk_path = data_dir.join("disks/rootfs.raw");
@@ -1836,23 +2175,42 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // Only served clones need this — a file-backed restore owns its memory outright,
         // so `serve_pid` is None and no watch exists.
         let mut serve_watch = match serve_pid {
-            Some(pid) => crate::utils::ProcessWatch::open(pid)
-                .with_context(|| format!("watching memory server PID {pid}"))?,
+            Some(pid) => match crate::utils::ProcessWatch::open(pid) {
+                Ok(Some(watch)) => Some(watch),
+                Ok(None) => {
+                    clone_failure = Some(format!(
+                        "its memory server (PID {pid}) was already gone before this clone \
+                         started; its unfaulted pages can never be served"
+                    ));
+                    None
+                }
+                Err(error) => {
+                    clone_failure = Some(format!(
+                        "fcvm could not watch its memory server (PID {pid}): {error}"
+                    ));
+                    None
+                }
+            },
             None => None,
         };
-        if serve_pid.is_some() && serve_watch.is_none() {
-            // Already gone before we even started: the clone is restored but nothing can
-            // serve the pages it has not touched yet. Refuse now rather than hand back a
-            // VM that will freeze on its first unserved fault.
-            bail!(
-                "memory server PID {} was already gone before this clone started; its \
-                 unfaulted pages can never be served",
-                serve_pid.unwrap_or(0)
-            );
+
+        // This is the final publication barrier for ordinary restored clones: setup
+        // ownership has transferred, the signal streams and companion listeners exist,
+        // the serial watchdog is armed when applicable, the health monitor is running,
+        // and any serve-process pidfd has been pinned. A cancellation observed before
+        // this point deliberately leaves lifecycle_ready=false while cleanup runs.
+        if clone_failure.is_none() {
+            match lifecycle_gate.publish(&state_manager, &mut vm_state).await {
+                Ok(super::common::LifecycleReadyOutcome::Published) => {}
+                Ok(super::common::LifecycleReadyOutcome::Cancelled) => {
+                    lifecycle_cancelled = true;
+                }
+                Err(error) => lifecycle_ready_result = Err(error),
+            }
         }
 
         // Wait for cancellation, VM exit, memory-server death, or startup snapshot trigger
-        loop {
+        while clone_failure.is_none() && lifecycle_ready_result.is_ok() && !lifecycle_cancelled {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     container_exit_code = None;
@@ -2014,7 +2372,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         vmm_exit_failure(&status)
                     };
                     // If in TTY mode, get exit code from TTY handle
-                    if let Some(handle) = tty_handle {
+                    if let Some(handle) = tty_handle.take() {
                         container_exit_code = handle.join().ok().and_then(|r| r.ok());
                         info!(container_exit_code = ?container_exit_code, "TTY container exit code");
                     } else {
@@ -2129,8 +2487,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Stop implicit UFFD server if running
     implicit_uffd_cancel.cancel();
+    tty_cancel.cancel();
     // The status listener never exits on its own (no idle timeout) — abort it.
     status_handle.abort();
+    let _ = status_handle.await;
+    if let Some(handle) = egress_proxy_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = bootplan_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
 
     // Cleanup common resources
     super::common::cleanup_vm(
@@ -2150,8 +2518,27 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     )
     .await;
 
+    if let Some(handle) = implicit_uffd_handle.take() {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(error = %error, "implicit UFFD server failed"),
+            Err(error) => {
+                warn!(error = %error, "implicit UFFD server task did not join cleanly")
+            }
+        }
+    }
+    if let Some(handle) = tty_handle.take() {
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(error))) => warn!(error = %error, "TTY listener cleanup failed"),
+            Ok(Err(_)) => warn!("TTY listener panicked during cleanup"),
+            Err(error) => warn!(error = %error, "could not join TTY cleanup task"),
+        }
+    }
+
     // Propagate post-restore verification failure only after cleanup has run
     verify_result?;
+    lifecycle_ready_result?;
 
     // A clone whose VMM died under us is a FAILED clone, not a finished one. Reporting it
     // only in the log would leave the caller — a benchmark harness, a request router, a
@@ -2431,7 +2818,9 @@ async fn cmd_snapshot_run_disk_only(
     snapshot_config: crate::storage::SnapshotConfig,
     args: SnapshotRunArgs,
     dir_lock: std::fs::File,
+    lifecycle_gate: super::common::LifecycleReadyGate,
 ) -> Result<()> {
+    let cancel = lifecycle_gate.cancellation_token();
     let meta = &snapshot_config.metadata;
 
     // Flags the cold-boot path doesn't implement yet: fail loud, never silently drop.
@@ -2484,19 +2873,6 @@ async fn cmd_snapshot_run_disk_only(
         "cold-booting disk-only clone"
     );
 
-    // SIGTERM/SIGINT → cancellation, mirroring `fcvm podman run`.
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        tokio::select! {
-            _ = sigterm.recv() => info!("received SIGTERM, shutting down clone"),
-            _ = sigint.recv() => info!("received SIGINT, shutting down clone"),
-        }
-        cancel_clone.cancel();
-    });
-
     // Box::pin breaks the static async cycle: prepare_vm can call back into
     // cmd_snapshot_run (snapshot-cache restore), which dispatches here.
     let Some(mut ctx) = Box::pin(super::podman::prepare_vm(run_args)).await? else {
@@ -2510,6 +2886,24 @@ async fn cmd_snapshot_run_disk_only(
         info!("shutdown requested during clone setup, cleaning up");
         super::podman::cleanup_vm_context(ctx).await;
         bail!("interrupted by signal during clone setup");
+    }
+
+    // This path bypasses cmd_podman_run, so publish the same readiness barrier here
+    // after prepare_vm has installed the VMM, holder, network helpers, and listeners.
+    // cmd_snapshot_run installed the signal streams synchronously before dispatching.
+    match lifecycle_gate
+        .publish(&ctx.state_manager, &mut ctx.vm_state)
+        .await
+    {
+        Ok(super::common::LifecycleReadyOutcome::Published) => {}
+        Ok(super::common::LifecycleReadyOutcome::Cancelled) => {
+            super::podman::cleanup_vm_context(ctx).await;
+            bail!("interrupted by signal during clone setup");
+        }
+        Err(error) => {
+            super::podman::cleanup_vm_context(ctx).await;
+            return Err(error);
+        }
     }
 
     let result = super::podman::run_vm_loop(&mut ctx, cancel).await;
@@ -2573,6 +2967,21 @@ mod tests {
     use super::*;
     use crate::storage::snapshot::SnapshotVolumeConfig;
     use crate::storage::SnapshotKind;
+
+    #[test]
+    fn snapshot_lineage_retries_are_bounded() {
+        let mut retries = 0;
+        for _ in 1..SNAPSHOT_LINEAGE_RETRY_LIMIT {
+            record_snapshot_lineage_retry(&mut retries).unwrap();
+        }
+        let error = record_snapshot_lineage_retry(&mut retries)
+            .expect_err("continuously-changing lineage must not wait forever");
+        assert_eq!(retries, SNAPSHOT_LINEAGE_RETRY_LIMIT);
+        assert!(
+            error.to_string().contains("did not stabilize after 64"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     /// The synthesized RunArgs must carry the recorded boot-plan metadata:
     /// kernel profile (a btrfs disk needs a btrfs kernel), image mode + device
@@ -2770,5 +3179,79 @@ mod tests {
             Some(PathBuf::from("/opt/firecracker-profile"))
         );
         assert_eq!(runtime.firecracker_args, Some("--enable-nv2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn restored_output_sender_drop_fails_the_handshake() {
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        drop(sender);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut liveness = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+
+        let error = wait_for_restored_output(
+            "vm-test",
+            &mut receiver,
+            &cancel,
+            &mut liveness,
+            || -> Result<Option<std::process::ExitStatus>> {
+                panic!("liveness must not be polled before an already-dropped sender")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("output listener ended before the restored guest connected"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_output_handshake_fails_when_vmm_already_exited() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (_sender, mut receiver) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut liveness =
+            tokio::time::interval_at(tokio::time::Instant::now(), Duration::from_secs(1));
+
+        let error =
+            wait_for_restored_output("vm-test", &mut receiver, &cancel, &mut liveness, || {
+                Ok(Some(std::process::ExitStatus::from_raw(1 << 8)))
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("VM exited before fc-agent output connected"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_output_handshake_fails_when_vmm_liveness_check_errors() {
+        let (_sender, mut receiver) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut liveness =
+            tokio::time::interval_at(tokio::time::Instant::now(), Duration::from_secs(1));
+
+        let error =
+            wait_for_restored_output("vm-test", &mut receiver, &cancel, &mut liveness, || {
+                Err(anyhow::anyhow!("pidfd unavailable"))
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checking VM liveness before fc-agent output connected"),
+            "unexpected error: {error:#}"
+        );
+        assert!(format!("{error:#}").contains("pidfd unavailable"));
     }
 }

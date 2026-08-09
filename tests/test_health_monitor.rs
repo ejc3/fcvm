@@ -50,6 +50,7 @@ async fn test_health_monitor_behaviors() {
         exit_code: None,
         pid: Some(4194305), // Non-existent PID (above /proc/sys/kernel/pid_max)
         pid_start_time: None,
+        lifecycle_ready: false,
         holder_pid: None,
         vsock_epoch: 0,
         created_at: now,

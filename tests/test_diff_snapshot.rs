@@ -356,6 +356,14 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
 
     println!("  Waiting for clone to become healthy...");
     common::poll_health_by_pid(clone_pid, 120).await?;
+    let clone_state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .load_state_by_pid(clone_pid)
+        .await
+        .context("loading restored clone state")?;
+    assert!(
+        clone_state.lifecycle_ready,
+        "full-memory clone must publish lifecycle readiness after restore supervision is installed"
+    );
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
     // Step 4: Create user snapshot from clone (should use parent lineage)

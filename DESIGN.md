@@ -221,6 +221,109 @@ impl VmManager {
 
 Three implementations based on execution mode.
 
+#### Eligible published TCP ports reach guest loopback
+
+**Location**: `fc-agent/src/network.rs::publish_to_loopback`
+
+`--publish` delivers a packet to the guest's external interface. A guest service
+listening on `0.0.0.0` receives it; one listening on `127.0.0.1` does not. fcvm
+therefore DNATs each eligible published TCP port to `127.0.0.1:<port>` inside the
+guest when containment, `route_localnet`, and that port's DNAT setup succeed.
+Port 12345 is ineligible because it is fcvm's egress proxy, and a TCP port also
+given to `--forward-localhost` is rejected before boot. A setup failure leaves
+the existing wildcard- and guest-address publication path unchanged and logs
+that loopback-only listeners are not reachable.
+
+```text
+host:P --publish--> guest eth0:P --DNAT--> 127.0.0.1:P --> the listener
+```
+
+**Why unconditional.** The rewrite breaks one case — a service bound to the
+guest's own address (`10.0.2.100:P`), whose socket stops matching. Netfilter can
+express the exception, `-m socket --nowildcard -j RETURN`, and the shipped guest
+kernel **cannot run it**: Kata 6.12.47 has no `xt_socket`, and `/lib/modules`
+holds the rootfs's module tree rather than the running kernel's, so no netfilter
+match can be loaded at runtime. Inferring the exception in userspace (poll
+`/proc/net/tcp`, add and remove the rule as listeners change) was written and
+rejected — there is no safe moment to decide, because the address a service will
+bind does not exist until it binds, so every such design has a window.
+
+The exception is also close to unreachable here. The guest netns has exactly one
+external interface with one IPv4 address (`eth0 10.0.2.100/24`, plus `lo`), so
+binding it and binding the wildcard are equivalent; a specific bind exists to
+EXCLUDE other interfaces and there are none. The hostname resolves to nothing
+(`/etc/hosts` carries only `127.0.0.1 localhost`), so `InetAddress.getLocalHost()`
+throws rather than yielding the guest address. No listener in this repo binds a
+specific non-loopback address.
+
+**Known limits**: TCP only (a published UDP port to a loopback service stays
+unreachable); `127.0.0.1` exactly, so a service on `127.0.1.1` — Debian's
+hostname convention, and Akka/Pekko's default — is not matched; and a service
+bound to `10.0.2.100:P` loses `--publish`.
+
+Two further details that are not obvious:
+
+- **`route_localnet=1` is required.** Without it the kernel treats a packet
+  routed to `127.0.0.0/8` that arrived on a non-loopback interface as a martian
+  source and drops it. fcvm already depends on the same switch host-side —
+  `src/network/portmap.rs::enable_route_localnet`. It is set on `eth0` only, not
+  `all`: `all` would also cover interfaces a nested workload creates later.
+- **This direction works where the reverse does not.** `setup_localhost_forwarding`
+  (guest → host) documents that DNAT is unusable there, because the DNAT'd packet
+  keeps its `127.0.0.1` **source** and pasta's L4 translation cannot carry a
+  loopback source out through the TAP. Here only the **destination** becomes
+  loopback; conntrack rewrites the reply's source back to the original
+  destination, so nothing downstream ever sees a loopback source.
+
+The container inherits this for free: fc-agent always runs it with
+`--network=host` (`fc-agent/src/container.rs:1203`), so container loopback *is*
+guest loopback.
+
+**Why it exists.** Chromium's DevTools endpoint ignores
+`--remote-debugging-address`: measured on chromium 151.0.7922.71 (Debian bookworm
+arm64), with the flag confirmed in `/proc/<pid>/cmdline`, `/proc/net/tcp` shows
+`0100007F:2406` (`127.0.0.1:9222`) and nothing else. Before this, the only way in
+was a userspace relay process running inside every clone, in the byte path — and
+the direct DNAT removes that process and hop. A prior request-path A/B that
+reported connection drops was withdrawn because its arms were not comparable;
+it does not establish that the relay caused those failures.
+
+##### Containing `route_localnet`
+
+`route_localnet` is per-interface, **not** per-port. Switching it on makes the
+guest's *entire* loopback listener set reachable from the guest's network
+segment, not merely the published ports — measurably: a frame addressed to
+`127.0.0.1:7777` for an unpublished, un-DNAT'd listener is answered with the
+sysctl on and dropped with it off. That is strictly wider than what `--publish`
+opened, and "the microVM guards ingress" does not justify it.
+
+`install_loopback_containment` closes the gap:
+
+```text
+iptables -I INPUT 1 -i eth0 -d 127.0.0.0/8 -m conntrack ! --ctstate DNAT -j DROP
+```
+
+Conntrack records whether a connection's destination was translated, so this
+admits exactly the packets our PREROUTING rules rewrote and drops anything an
+attacker addressed to `127.0.0.1` directly. `xt_conntrack` **is** built into the
+Kata kernel — verified in the guest, unlike `xt_socket`. Scoped to `-i eth0`, so
+locally-generated traffic (which re-enters on `lo`) is untouched, including the
+egress proxy's `nat OUTPUT` REDIRECT. The rule is inserted at position 1 because
+an earlier terminating ACCEPT would bypass an appended security rule.
+
+##### Ports that must not be published
+
+- **`12345` — the transparent egress proxy** (`fc-agent/src/proxy.rs::PROXY_LISTEN_PORT`)
+  listens on guest `127.0.0.1:12345` and relays out through a host-side
+  `TcpStream::connect` that validates no destination and sets no timeout.
+  DNAT'ing it would hand external clients that relay, so `publish_to_loopback`
+  refuses the port and warns.
+- **Any port also given to `--forward-localhost`.** That flag binds a relay on
+  guest `127.0.0.1:<port>` pointing at the host, so publishing the same guest
+  port makes the published port answer with the **host's** service instead of the
+  guest's — a successful response from the wrong machine, not an error. Rejected
+  at argument-parse time in `src/commands/podman/mod.rs`.
+
 #### Rootless Networking (`pasta.rs`)
 
 Uses `pasta` (from the passt project) for L4 splice-based networking.

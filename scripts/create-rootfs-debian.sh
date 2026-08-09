@@ -18,13 +18,13 @@ echo "[rootfs] target: ${OUT_DIR}"
 
 build_with_mmdebstrap() {
   echo "[rootfs] using mmdebstrap (rootless)"
-  mmdebstrap --variant=minbase "${SUITE}" "${OUT_DIR}"     "deb http://deb.debian.org/debian ${SUITE} main"     --include=systemd,podman,conmon,crun,fuse-overlayfs,iproute2,curl,jq
+  mmdebstrap --variant=minbase "${SUITE}" "${OUT_DIR}"     "deb http://deb.debian.org/debian ${SUITE} main"     --include=systemd,podman,conmon,crun,fuse-overlayfs,iproute2,iptables,procps,curl,jq
 }
 
 build_with_debootstrap() {
   echo "[rootfs] using debootstrap (requires sudo)"
   sudo debootstrap --variant=minbase "${SUITE}" "${OUT_DIR}" http://deb.debian.org/debian
-  sudo chroot "${OUT_DIR}" /bin/sh -c "apt-get update && apt-get install -y podman conmon crun fuse-overlayfs iproute2 curl jq"
+  sudo chroot "${OUT_DIR}" /bin/sh -c "apt-get update && apt-get install -y podman conmon crun fuse-overlayfs iproute2 iptables procps curl jq"
 }
 
 if command -v mmdebstrap >/dev/null 2>&1; then

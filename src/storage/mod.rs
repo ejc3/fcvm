@@ -4,7 +4,7 @@ pub mod volume;
 
 pub use disk::{DiskConfig, DiskManager};
 pub use snapshot::{
-    SnapshotConfig, SnapshotExtraDisk, SnapshotKind, SnapshotManager, SnapshotMetadata,
-    SnapshotType, SnapshotVolumeConfig,
+    validate_snapshot_name, SnapshotConfig, SnapshotExtraDisk, SnapshotGeneration, SnapshotKind,
+    SnapshotManager, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
 };
 pub use volume::{VolumeManager, VolumeMount};

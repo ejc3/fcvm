@@ -12,9 +12,14 @@ There is no pytest in this repo, so this is stdlib `unittest` only.
 """
 
 import argparse
+import fcntl
+import hashlib
 import io
 import json
 import os
+import random
+import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -117,6 +122,155 @@ def kill_tree(p):
         pass
 
 
+def write_graceful_clone_stub(path, state_path, data_dir, name, term_path):
+    """Write a VM-free fcvm shape that performs exact cleanup on SIGTERM."""
+    quoted_state = shlex.quote(state_path)
+    quoted_data = shlex.quote(data_dir)
+    quoted_term = shlex.quote(term_path)
+    script = f"""#!/bin/bash
+python3 -c 'import ctypes,signal,time; ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL); time.sleep(300)' &
+child=$!
+cleanup() {{
+    kill -TERM "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+    rm -f {quoted_state} {quoted_state}.lock
+    rmdir {quoted_data}
+    printf 'SIGTERM\\n' > {quoted_term}
+    exit 0
+}}
+trap cleanup TERM INT
+mkdir -p {quoted_data}
+read -r proc_stat < /proc/$$/stat
+proc_stat=${{proc_stat##*) }}
+read -ra proc_fields <<< "$proc_stat"
+start=${{proc_fields[19]}}
+cat > {quoted_state}.tmp <<EOF
+{{"vm_id":"{os.path.basename(state_path)[:-5]}","name":"{name}","pid":$$,"pid_start_time":$start,"lifecycle_ready":true,"config":{{"network":{{"loopback_ip":"127.0.0.1"}}}}}}
+EOF
+mv {quoted_state}.tmp {quoted_state}
+: > {quoted_state}.lock
+wait "$child"
+"""
+    with open(path, "w") as output:
+        output.write(script)
+    os.chmod(path, 0o755)
+
+
+class CloneSpawnSignalMask(unittest.TestCase):
+    """Every clone must be able to receive the graceful teardown signal.
+
+    RED BEFORE THE FIX: all three request arms blocked SIGINT and SIGTERM before
+    Popen.  The mask survives exec, so normal teardown always spent its whole
+    timeout and killed fcvm without letting fcvm remove state or disk artifacts.
+    """
+
+    def test_shared_spawn_unblocks_child_and_restores_calling_thread_mask(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "mask.log")
+            code = (
+                "import json,signal,time;"
+                "print(json.dumps(sorted(int(s) for s in "
+                "signal.pthread_sigmask(signal.SIG_BLOCK,set()))),flush=True);"
+                "time.sleep(300)"
+            )
+            old_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, reqbench.TERMINATION_SIGNALS
+            )
+            proc = None
+            try:
+                proc = reqbench.spawn_clone_process(
+                    [sys.executable, "-c", code], log, dict(os.environ)
+                )
+                current = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                self.assertTrue(reqbench.TERMINATION_SIGNALS.issubset(current))
+                deadline = time.monotonic() + 2
+                blocked = None
+                while time.monotonic() < deadline:
+                    try:
+                        with open(log) as source:
+                            line = source.readline()
+                        if line:
+                            blocked = set(json.loads(line))
+                            break
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(0.005)
+                self.assertIsNotNone(blocked, "spawned child never reported its mask")
+                self.assertTrue(
+                    blocked.isdisjoint(int(item) for item in reqbench.TERMINATION_SIGNALS),
+                    blocked,
+                )
+                proc.terminate()
+                self.assertEqual(proc.wait(timeout=2), -signal.SIGTERM)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+
+    def test_all_request_arms_use_the_shared_spawn_boundary(self):
+        for request in (
+            reqbench.run_cdp_request,
+            reqbench.run_noop_request,
+            reqbench.run_exec_request,
+        ):
+            with self.subTest(request=request.__name__):
+                self.assertIn("spawn_clone_process", request.__code__.co_names)
+                self.assertNotIn("Popen", request.__code__.co_names)
+
+    def test_normal_request_receives_sigterm_and_cleans_exact_artifacts(self):
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            os.makedirs(state_dir)
+            vm_id = "vm-22222222222222222222222222222222"
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            data_dir = os.path.join(d, "vm-disks", vm_id)
+            term_path = os.path.join(d, "term-received")
+            stub = os.path.join(d, "fcvm-stub")
+            write_graceful_clone_stub(
+                stub,
+                state_path,
+                data_dir,
+                "rb-test-run-0-noop",
+                term_path,
+            )
+
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(8)
+            args = argparse.Namespace(
+                fcvm=stub,
+                out_dir=d,
+                snapshot_tag="",
+                serve_pid=1,
+                rust_log="off",
+                timeout=5.0,
+                teardown_timeout=2.0,
+                cdp_port=listener.getsockname()[1],
+                state_dir=state_dir,
+                data_root=d,
+                run_id="test-run",
+            )
+            saved_pending = reqbench._pending_harness_signal
+            reqbench._pending_harness_signal = 0
+            try:
+                record = reqbench.run_noop_request(args, 0)
+            finally:
+                reqbench._pending_harness_signal = saved_pending
+                listener.close()
+
+            self.assertTrue(record["ok"], record)
+            self.assertNotIn("timed_out", record["teardown"])
+            self.assertTrue(record["teardown"]["all_gone"])
+            self.assertTrue(record["teardown"]["disk_cleanup_verified"])
+            self.assertTrue(os.path.exists(term_path))
+            self.assertFalse(os.path.lexists(state_path))
+            self.assertFalse(os.path.lexists(state_path + ".lock"))
+            self.assertFalse(os.path.lexists(data_dir))
+
+
 class TeardownFastReapGuard(unittest.TestCase):
     """teardown_fast must NOT delete the tracking record of a VM it failed to kill.
 
@@ -127,15 +281,47 @@ class TeardownFastReapGuard(unittest.TestCase):
     with the survivor still in /proc afterwards.
     """
 
+    def test_failed_parent_pin_never_signals_the_numeric_pid(self):
+        """A failed pidfd pin leaves no process identity safe to signal."""
+        with tempfile.TemporaryDirectory() as d:
+            vm_id = "vm-11111111111111111111111111111111"
+            state = os.path.join(d, f"{vm_id}.json")
+            data = os.path.join(d, "vm-disks", vm_id)
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            os.makedirs(data)
+
+            real_pidfd_open = reqbench.pidfd_open
+            real_kill = reqbench.os.kill
+            signalled = []
+
+            def record_kill(pid, sig):
+                signalled.append((pid, sig))
+                raise AssertionError("an unpinned numeric PID was signalled")
+
+            reqbench.pidfd_open = lambda _pid: None
+            reqbench.os.kill = record_kill
+            try:
+                with self.assertRaises(reqbench.SurvivedTeardown) as cm:
+                    reqbench.teardown_fast(424242, d, state, data, 0.01)
+            finally:
+                reqbench.pidfd_open = real_pidfd_open
+                reqbench.os.kill = real_kill
+
+            self.assertEqual(signalled, [])
+            self.assertIs(cm.exception.teardown["all_gone"], False)
+            self.assertTrue(os.path.exists(state))
+            self.assertTrue(os.path.isdir(data))
+
     def test_survivor_blocks_the_reap_and_raises(self):
         with tempfile.TemporaryDirectory() as d:
-            state = os.path.join(d, "vm-test.json")
+            state = os.path.join(d, "vm-11111111111111111111111111111111.json")
             # Shaped exactly as production builds it — `<data_root>/vm-disks/<vm_id>`
             # — because `reap_disk` now refuses anything that is not strictly below
             # a `vm-disks` root (see ReapDiskPathGuard).
-            data = os.path.join(d, "vm-disks", "vm-test")
+            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
-                json.dump({"vm_id": "vm-test", "pid": 1}, f)
+                json.dump({"vm_id": "vm-11111111111111111111111111111111", "pid": 1}, f)
             os.makedirs(os.path.join(data, "disks"))
 
             # A parent whose child does NOT inherit a pdeathsig: killing the parent
@@ -149,7 +335,7 @@ class TeardownFastReapGuard(unittest.TestCase):
                 self.assertTrue(reqbench.children_of(p.pid), "bash never forked its child")
 
                 with self.assertRaises(reqbench.SurvivedTeardown) as cm:
-                    reqbench.teardown_fast(p.pid, state, data, 0.3)
+                    reqbench.teardown_fast(p.pid, d, state, data, 0.3)
 
                 self.assertIn("NOT reaped", str(cm.exception))
                 self.assertTrue(
@@ -175,15 +361,18 @@ class TeardownFastReapGuard(unittest.TestCase):
     def test_clean_teardown_still_reaps_both_artifacts(self):
         """The guard must not disarm the reap on the normal path."""
         with tempfile.TemporaryDirectory() as d:
-            state = os.path.join(d, "vm-test.json")
-            data = os.path.join(d, "vm-disks", "vm-test")
+            state = os.path.join(d, "vm-11111111111111111111111111111111.json")
+            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
-                json.dump({"vm_id": "vm-test"}, f)
+                json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
+            with open(state + ".lock", "w") as f:
+                f.write("")
             with open(state + ".lock", "w") as f:
                 f.write("")
             os.makedirs(data)
-            p = subprocess.Popen(["sleep", "300"])
-            out = reqbench.teardown_fast(p.pid, state, data, 5.0)
+            p = spawn_pdeathsig_parent(["sleep", "300"])
+            wait_for_child(p.pid)
+            out = reqbench.teardown_fast(p.pid, d, state, data, 5.0)
             p.wait(timeout=5)
             self.assertTrue(out["all_gone"])
             self.assertFalse(os.path.exists(state))
@@ -204,26 +393,31 @@ class TeardownFastReapGuard(unittest.TestCase):
         `git grep disk_errors` found no reader anywhere in the harness.
         """
         with tempfile.TemporaryDirectory() as d:
-            state = os.path.join(d, "vm-test.json")
-            data = os.path.join(d, "vm-disks", "vm-test")
+            state = os.path.join(d, "vm-11111111111111111111111111111111.json")
+            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
-                json.dump({"vm_id": "vm-test"}, f)
+                json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
+            with open(state + ".lock", "w") as f:
+                f.write("")
             os.makedirs(data)
             real = shutil.rmtree
 
             def boom(*_a, **_k):
                 raise PermissionError(1, "Operation not permitted")
 
-            p = subprocess.Popen(["sleep", "300"])
+            p = spawn_pdeathsig_parent(["sleep", "300"])
+            wait_for_child(p.pid)
             shutil.rmtree = boom
             try:
                 with self.assertRaises(reqbench.SurvivedTeardown) as cm:
-                    reqbench.teardown_fast(p.pid, state, data, 5.0)
+                    reqbench.teardown_fast(p.pid, d, state, data, 5.0)
             finally:
                 shutil.rmtree = real
                 p.wait(timeout=5)
             self.assertIn("could not reap", str(cm.exception))
             self.assertTrue(os.path.isdir(data), "the un-reaped dir is still there")
+            self.assertTrue(os.path.exists(state), "failed disk reap must retain its state")
+            self.assertTrue(os.path.exists(state + ".lock"), "failed disk reap must retain its lock")
             self.assertTrue(cm.exception.teardown.get("disk_errors"))
             self.assertIn(data, cm.exception.teardown.get("disk_reap_failed", []))
 
@@ -244,13 +438,15 @@ class ReapDiskPathGuard(unittest.TestCase):
     def test_an_empty_vm_id_does_not_wipe_the_shared_disk_root(self):
         with tempfile.TemporaryDirectory() as root:
             disks = os.path.join(root, "vm-disks")
-            os.makedirs(os.path.join(disks, "vm-a"))
-            os.makedirs(os.path.join(disks, "vm-b"))
+            vm_a = "vm-44444444444444444444444444444444"
+            vm_b = "vm-55555555555555555555555555555555"
+            os.makedirs(os.path.join(disks, vm_a))
+            os.makedirs(os.path.join(disks, vm_b))
             out: dict = {}
-            reaped = reqbench.reap_disk(out, "", os.path.join(disks, ""))
-            self.assertTrue(os.path.isdir(os.path.join(disks, "vm-a")),
+            reaped = reqbench.reap_disk(out, root, "", os.path.join(disks, ""))
+            self.assertTrue(os.path.isdir(os.path.join(disks, vm_a)),
                             "another VM's disks were deleted")
-            self.assertTrue(os.path.isdir(os.path.join(disks, "vm-b")),
+            self.assertTrue(os.path.isdir(os.path.join(disks, vm_b)),
                             "another VM's disks were deleted")
             self.assertEqual(reaped, [])
             self.assertTrue(any("vm-disks" in e for e in out.get("disk_errors", [])),
@@ -259,12 +455,21 @@ class ReapDiskPathGuard(unittest.TestCase):
     def test_a_real_per_vm_dir_is_still_reaped(self):
         """The guard must not disarm the ordinary reap."""
         with tempfile.TemporaryDirectory() as root:
-            dd = os.path.join(root, "vm-disks", "vm-a", "disks")
+            vm_id = "vm-44444444444444444444444444444444"
+            state = os.path.join(root, f"{vm_id}.json")
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            dd = os.path.join(root, "vm-disks", vm_id, "disks")
             os.makedirs(dd)
             out: dict = {}
-            reaped = reqbench.reap_disk(out, "", os.path.join(root, "vm-disks", "vm-a"))
-            self.assertEqual(reaped, [os.path.join(root, "vm-disks", "vm-a")])
-            self.assertFalse(os.path.isdir(os.path.join(root, "vm-disks", "vm-a")))
+            reaped = reqbench.reap_disk(
+                out, root, state, os.path.join(root, "vm-disks", vm_id)
+            )
+            self.assertEqual(
+                reaped,
+                [os.path.join(root, "vm-disks", vm_id), state],
+            )
+            self.assertFalse(os.path.isdir(os.path.join(root, "vm-disks", vm_id)))
             self.assertNotIn("disk_errors", out)
 
 
@@ -290,15 +495,20 @@ class TeardownNormalLeakVerdict(unittest.TestCase):
                 reqbench.teardown_normal(p, p.pid, 0.4)
             self.assertTrue(cm.exception.teardown.get("survivors"))
             # ...and the survivor was SIGKILLed rather than left on the box.
+            def alive(pid):
+                state = reqbench.proc_stat_fields(pid)
+                return state is not None and state[0] not in ("Z", "X", "x")
+
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                if all(reqbench.proc_stat_fields(k) is None
-                       or reqbench.proc_stat_fields(k)[0] in ("Z", "X", "x") for k in kids):
+                if not any(alive(k) for k in kids):
                     break
                 time.sleep(0.01)
-            alive = [k for k in kids if reqbench.proc_stat_fields(k) is not None
-                     and reqbench.proc_stat_fields(k)[0] not in ("Z", "X", "x")]
-            self.assertEqual(alive, [], "the survivor must be killed before we abort")
+            self.assertEqual(
+                [k for k in kids if alive(k)],
+                [],
+                "the survivor must be killed before we abort",
+            )
         finally:
             kill_tree(p)
 
@@ -315,6 +525,105 @@ class TeardownNormalLeakVerdict(unittest.TestCase):
         self.assertIs(out.get("timed_out"), True, "SIGTERM was ignored; this must time out")
         self.assertTrue(out["all_gone"],
                         f"pdeathsig child died with its parent, but all_gone={out['all_gone']}")
+
+    def test_on_disk_leftovers_are_reaped_but_still_abort_the_run(self):
+        """A clean process tree does not excuse leaked clone state.
+
+        This models a noop clone killed after the first null-PID state save but
+        before fcvm's post-resume owner save. RED BEFORE THE FIX: normal teardown
+        returned ``all_gone: true`` and left both paths forever; the sweeper
+        refuses null-PID states.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            vm_id = "vm-11111111111111111111111111111111"
+            state = os.path.join(d, "state", f"{vm_id}.json")
+            data = os.path.join(d, "vm-disks", vm_id)
+            os.makedirs(os.path.dirname(state))
+            os.makedirs(data)
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id, "pid": None}, f)
+            with open(state + ".lock", "w") as f:
+                f.write("")
+            p = spawn_pdeathsig_parent(["sleep", "300"])
+            wait_for_child(p.pid)
+            with self.assertRaises(reqbench.SurvivedTeardown) as cm:
+                reqbench.teardown_normal(
+                    p,
+                    p.pid,
+                    2.0,
+                    d,
+                    state,
+                    data,
+                    verify_disk_cleanup=True,
+                )
+            self.assertFalse(cm.exception.teardown["disk_cleanup_verified"])
+            self.assertFalse(os.path.exists(state))
+            self.assertFalse(os.path.exists(state + ".lock"))
+            self.assertFalse(os.path.exists(data))
+            self.assertIn("left on-disk state", str(cm.exception))
+
+
+class TeardownAttributionFailure(unittest.TestCase):
+    def _artifacts(self, root):
+        vm_id = "vm-11111111111111111111111111111111"
+        state = os.path.join(root, f"{vm_id}.json")
+        data = os.path.join(root, "vm-disks", vm_id)
+        with open(state, "w") as f:
+            json.dump({"vm_id": vm_id}, f)
+        os.makedirs(data)
+        return state, data
+
+    def _invoke(self, mode, proc, root, state, data):
+        if mode == "fast":
+            return reqbench.teardown_fast(proc.pid, root, state, data, 1.0)
+        return reqbench.teardown_normal(
+            proc, proc.pid, 1.0, root, state, data
+        )
+
+    def test_capture_error_kills_exact_owner_and_retains_disk(self):
+        real_capture = reqbench.freeze_and_capture_children
+        try:
+            for mode in ("fast", "normal"):
+                with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+                    state, data = self._artifacts(d)
+                    proc = spawn_pdeathsig_parent(["sleep", "300"])
+                    wait_for_child(proc.pid)
+
+                    def fail_capture(_pid):
+                        raise RuntimeError("injected procfs attribution failure")
+
+                    reqbench.freeze_and_capture_children = fail_capture
+                    try:
+                        with self.assertRaises(reqbench.SurvivedTeardown) as cm:
+                            self._invoke(mode, proc, d, state, data)
+                        proc.wait(timeout=5)
+                    finally:
+                        kill_tree(proc)
+                    self.assertIs(
+                        cm.exception.teardown["child_attribution_established"], False
+                    )
+                    self.assertTrue(os.path.exists(state))
+                    self.assertTrue(os.path.isdir(data))
+        finally:
+            reqbench.freeze_and_capture_children = real_capture
+
+    def test_empty_child_set_is_never_a_vacuous_success(self):
+        for mode in ("fast", "normal"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+                state, data = self._artifacts(d)
+                proc = subprocess.Popen(["sleep", "300"])
+                try:
+                    with self.assertRaises(reqbench.SurvivedTeardown) as cm:
+                        self._invoke(mode, proc, d, state, data)
+                    proc.wait(timeout=5)
+                finally:
+                    kill_tree(proc)
+                self.assertIn("no completely pinned child set", str(cm.exception))
+                self.assertIs(
+                    cm.exception.teardown["child_attribution_established"], False
+                )
+                self.assertTrue(os.path.exists(state))
+                self.assertTrue(os.path.isdir(data))
 
 
 class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
@@ -335,14 +644,20 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             state_dir = os.path.join(d, "state")
             os.makedirs(state_dir)
             stub = os.path.join(d, "fcvm-stub")
+            child_ready = os.path.join(d, "child-ready")
             with open(stub, "w") as f:
                 f.write(
                     "#!/bin/bash\n"
-                    f"cat > {state_dir}/vm-red.json <<EOF\n"
-                    '{"vm_id": "vm-red", "pid": $$, '
-                    '"config": {"network": {"loopback_ip": "127.0.0.1"}}}\n'
+                    f"python3 -c 'import ctypes,signal,time; ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); open(\"{child_ready}\", \"w\").close(); time.sleep(600)' &\n"
+                    f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
+                    "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                    "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                    f"cat > {state_dir}/vm-22222222222222222222222222222222.json <<EOF\n"
+                    '{"vm_id": "vm-22222222222222222222222222222222", "name": "rb-test-run-0-fast", "pid": $$, '
+                    '"pid_start_time": $start, "lifecycle_ready": true, "config": {"network": {"loopback_ip": "127.0.0.1"}}}\n'
                     "EOF\n"
-                    "exec sleep 600\n"
+                    f": > {state_dir}/vm-22222222222222222222222222222222.json.lock\n"
+                    "wait\n"
                 )
             os.chmod(stub, 0o755)
             # A listener so wait_port succeeds without a VM.
@@ -361,7 +676,7 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=10.0, teardown_timeout=5.0, cdp_port=port,
-                state_dir=state_dir, data_root=d, ws_url="",
+                state_dir=state_dir, data_root=d, ws_url="", run_id="test-run",
             )
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
@@ -372,6 +687,94 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertIn("WsClosed", rec.get("error", ""))
             self.assertEqual(rec.get("failure_class"), "transport")
             self.assertEqual(rec.get("failure_stage"), "navigate")
+
+    def test_cdp_response_waits_for_lifecycle_ready_before_fast_teardown(self):
+        """A serving port is not yet permission to tear down clone setup."""
+        import cdpdrive
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            vm_id = "vm-22222222222222222222222222222222"
+            data_dir = os.path.join(d, "vm-disks", vm_id)
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            os.makedirs(state_dir)
+            os.makedirs(data_dir)
+            child_ready = os.path.join(d, "child-ready")
+            owner_wait_entered = os.path.join(d, "owner-wait-entered")
+            owner_wait_release = os.path.join(d, "owner-wait-release")
+            stub = os.path.join(d, "fcvm-stub")
+
+            server = socket.socket()
+            server.bind(("127.0.0.1", 0))
+            server.listen(8)
+            port = server.getsockname()[1]
+            name = "rb-test-run-0-fast"
+            initial = json.dumps({
+                "vm_id": vm_id,
+                "name": name,
+                "pid": "PID",
+                "pid_start_time": "START",
+                "lifecycle_ready": False,
+                "config": {"network": {"loopback_ip": "127.0.0.1"}},
+            })
+            ready = json.dumps({
+                "vm_id": vm_id,
+                "name": name,
+                "pid": "PID",
+                "pid_start_time": "START",
+                "lifecycle_ready": True,
+                "config": {"network": {"loopback_ip": "127.0.0.1"}},
+            })
+            with open(stub, "w") as f:
+                f.write(
+                    "#!/bin/bash\n"
+                    f"python3 -c 'import ctypes,signal,time; ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); open(\"{child_ready}\", \"w\").close(); time.sleep(600)' &\n"
+                    f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
+                    "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                    "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                    f"printf '%s\\n' '{initial}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}\n"
+                    f": > {state_path}.lock\n"
+                    f"( while [ ! -e {owner_wait_entered} ] && [ ! -e {owner_wait_release} ]; do sleep 0.01; done; "
+                    f"if [ -e {owner_wait_entered} ]; then sleep 0.25; "
+                    f"printf '%s\\n' '{ready}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}.tmp; "
+                    f"mv {state_path}.tmp {state_path}; fi ) &\n"
+                    "wait\n"
+                )
+            os.chmod(stub, 0o755)
+
+            real_drive = cdpdrive.drive
+            real_wait_state_owned = reqbench.wait_state_owned
+            cdpdrive.drive = lambda _args: {"ok": True, "stages": {}}
+            owner_wait_calls = []
+
+            def mark_owner_wait(*call_args, **call_kwargs):
+                owner_wait_calls.append(True)
+                open(owner_wait_entered, "w").close()
+                return real_wait_state_owned(*call_args, **call_kwargs)
+
+            reqbench.wait_state_owned = mark_owner_wait
+            args = argparse.Namespace(
+                fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off",
+                timeout=5.0, teardown_timeout=5.0, cdp_port=port,
+                state_dir=state_dir, data_root=d, ws_url="", run_id="test-run",
+            )
+            try:
+                rec = reqbench.run_cdp_request(args, 0, fast=True)
+            finally:
+                open(owner_wait_release, "w").close()
+                cdpdrive.drive = real_drive
+                reqbench.wait_state_owned = real_wait_state_owned
+                server.close()
+
+            self.assertTrue(rec["ok"])
+            self.assertEqual(owner_wait_calls, [True])
+            self.assertTrue(os.path.exists(owner_wait_entered))
+            self.assertGreaterEqual(rec["state_owner_wait_ms"], 150.0, rec)
+            self.assertTrue(rec["teardown"]["all_gone"])
+            self.assertFalse(os.path.lexists(state_path))
+            self.assertFalse(os.path.lexists(data_dir))
 
 
 class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
@@ -392,7 +795,7 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
     def test_a_surviving_child_blocks_the_reap_and_raises(self):
         with tempfile.TemporaryDirectory() as d:
             state_dir = os.path.join(d, "state")
-            disks = os.path.join(d, "vm-disks", "vm-red")
+            disks = os.path.join(d, "vm-disks", "vm-22222222222222222222222222222222")
             os.makedirs(state_dir)
             os.makedirs(disks)
             marker = os.path.join(disks, "rootfs.raw")
@@ -402,10 +805,13 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
             with open(stub, "w") as f:
                 f.write(
                     "#!/bin/bash\n"
-                    f"cat > {state_dir}/vm-red.json <<EOF\n"
-                    '{"vm_id": "vm-red", "pid": $$}\n'
+                    "sleep 300 &\n"     # UNARMED child: survives parent SIGKILL
+                    "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                    "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                    f"cat > {state_dir}/vm-22222222222222222222222222222222.json <<EOF\n"
+                    '{"vm_id": "vm-22222222222222222222222222222222", "name": "rb-test-run-0-exec", "pid": $$, "pid_start_time": $start, "lifecycle_ready": true}\n'
                     "EOF\n"
-                    "sleep 300 &\n"     # UNARMED child: no pdeathsig, survives the kill
+                    f": > {state_dir}/vm-22222222222222222222222222222222.json.lock\n"
                     "wait\n"
                 )
             os.chmod(stub, 0o755)
@@ -413,17 +819,21 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=0.6, teardown_timeout=0.4,
-                state_dir=state_dir, data_root=d,
+                state_dir=state_dir, data_root=d, run_id="test-run",
             )
-            with self.assertRaises(reqbench.SurvivedTeardown) as cm:
-                reqbench.run_exec_request(args, 0)
-            rec = cm.exception.record
+            try:
+                returned = reqbench.run_exec_request(args, 0)
+            except reqbench.SurvivedTeardown as error:
+                cm = error
+            else:
+                self.fail(f"live-child exec teardown returned instead of aborting: {returned}")
+            rec = cm.record
             try:
                 self.assertTrue(rec.get("survivors"), f"no survivor list in {rec}")
                 self.assertIs(rec.get("disk_reap_skipped"), True)
                 self.assertTrue(os.path.exists(marker),
                                 "rootfs of a live child must NOT be reaped")
-                self.assertTrue(os.path.exists(os.path.join(state_dir, "vm-red.json")),
+                self.assertTrue(os.path.exists(os.path.join(state_dir, "vm-22222222222222222222222222222222.json")),
                                 "the state file is the only record that child is ours")
             finally:
                 for pid in rec.get("survivors", {}):
@@ -443,20 +853,79 @@ class TeardownFastCpuAccounting(unittest.TestCase):
     """
 
     def test_control_window_does_not_measure_our_own_spin(self):
-        p = subprocess.Popen(["sleep", "300"])
+        from unittest import mock
+
+        p = spawn_pdeathsig_parent(["sleep", "300"])
+        wait_for_child(p.pid)
         before = self_cpu_ms()
-        out = reqbench.teardown_fast(p.pid, "", "", 5.0)
+        calls = []
+        real_machine = reqbench.machine_cpu_ms
+        real_self = reqbench.self_cpu_ms
+
+        def machine_counter():
+            calls.append("machine")
+            return real_machine()
+
+        def self_counter():
+            calls.append("self")
+            return real_self()
+
+        with (
+            mock.patch.object(reqbench, "machine_cpu_ms", side_effect=machine_counter),
+            mock.patch.object(reqbench, "self_cpu_ms", side_effect=self_counter),
+        ):
+            out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
         spent = self_cpu_ms() - before
         p.wait(timeout=5)
+        self.assertEqual(
+            calls,
+            ["machine", "self", "self", "machine"] * 2,
+            "each host-wide counter window must strictly enclose its harness window",
+        )
         # 50 ms of control window: a spin would put >=45 ms of user time in it.
-        # The whole call (control + reclaim sampling) must stay well under that.
+        # The harness counter advances in 10 ms jiffies here, so compare to the
+        # measured wall window rather than demanding a sub-tick absolute 5 ms.
         self.assertLess(
             out["control_harness_cpu_ms"],
-            5.0,
+            0.5 * out["control_wall_ms"],
             f"control window burned {out['control_harness_cpu_ms']:.1f} ms of OUR cpu "
             f"(total call {spent:.1f} ms) — it is spinning, so control_busy_cores "
             f"({out['control_busy_cores']:.2f}) is ambient + the harness",
         )
+        self.assertGreaterEqual(out["control_busy_cores"], 0.0)
+        self.assertLessEqual(
+            out["control_busy_cores_lo"], out["control_busy_cores"]
+        )
+        self.assertLessEqual(
+            out["control_busy_cores"], out["control_busy_cores_hi"]
+        )
+        self.assertEqual(
+            out["machine_cpu_source"],
+            "/proc/stat:busy(user,nice,system,irq,softirq,steal)",
+        )
+        self.assertEqual(out["harness_cpu_source"], "/proc/self/stat:utime+stime")
+
+    def test_cpu_residual_clamps_only_within_declared_resolution(self):
+        uncertainty = reqbench.CPU_RESIDUAL_UNCERTAINTY_MS
+        within = reqbench.bounded_cpu_residual(0.0, uncertainty / 2)
+        self.assertLess(within["raw_ms"], 0.0)
+        self.assertEqual(within["point_ms"], 0.0)
+        self.assertEqual(within["lo_ms"], 0.0)
+        self.assertGreater(within["hi_ms"], 0.0)
+        self.assertIs(within["clamped"], True)
+
+        normal = reqbench.bounded_cpu_residual(30.0, 10.0)
+        self.assertEqual(normal["raw_ms"], 20.0)
+        self.assertEqual(normal["point_ms"], 20.0)
+        self.assertLessEqual(normal["lo_ms"], normal["point_ms"])
+        self.assertLessEqual(normal["point_ms"], normal["hi_ms"])
+        self.assertIs(normal["clamped"], False)
+
+    def test_cpu_residual_rejects_an_impossible_negative_delta(self):
+        with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
+            reqbench.bounded_cpu_residual(
+                0.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 10.0
+            )
 
     def test_reclaim_sampler_does_not_burn_a_core(self):
         """The RECLAIM window must not spin either — the control window is only half.
@@ -473,7 +942,7 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         """
         p = subprocess.Popen(["bash", "-c", "sleep 0.6 & wait"])
         wait_for_child(p.pid)
-        out = reqbench.teardown_fast(p.pid, "", "", 5.0)
+        out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
         p.wait(timeout=5)
         self.assertGreater(out["reap_wall_ms"], 300, "the child must outlive the kill")
         self.assertIn("sample_period_s", out, "the residual bias must be quantifiable")
@@ -500,7 +969,7 @@ class TeardownFastCpuAccounting(unittest.TestCase):
             while not reqbench.children_of(p.pid) and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(reqbench.children_of(p.pid), "child never appeared")
-            out = reqbench.teardown_fast(p.pid, "", "", 10.0)
+            out = reqbench.teardown_fast(p.pid, "", "", "", 10.0)
         finally:
             kill_tree(p)
         self.assertTrue(out["all_gone"], "the pdeathsig child should have died with its parent")
@@ -549,7 +1018,7 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 # (correctly) refuses to reap and raises. The partial record it
                 # carries is what this test inspects.
                 with self.assertRaises(reqbench.SurvivedTeardown) as cm:
-                    reqbench.teardown_fast(p.pid, "", "", 1.0)
+                    reqbench.teardown_fast(p.pid, "", "", "", 1.0)
                 out = cm.exception.teardown
                 missing = [n for n, c in out["per_child_cpu"].items()
                            if c["cpu_final_ms"] is None]
@@ -584,7 +1053,12 @@ class FindStateIsEventDriven(unittest.TestCase):
                 time.sleep(0.4)
                 tmp = target + ".tmp"
                 with open(tmp, "w") as f:
-                    json.dump({"vm_id": "vm-mine", "pid": 123456, "name": "mine"}, f)
+                    json.dump({
+                        "vm_id": "vm-mine",
+                        "pid": 123456,
+                        "pid_start_time": 789,
+                        "name": "mine",
+                    }, f)
                 os.rename(tmp, target)
 
             watch = reqbench.DirWatch(d)  # registered BEFORE the writer starts
@@ -592,7 +1066,13 @@ class FindStateIsEventDriven(unittest.TestCase):
             th.start()
             t0 = time.monotonic()
             c0 = self_cpu_ms()
-            path, st = reqbench.find_state(d, 123456, time.monotonic() + 10, watch)
+            path, st = reqbench.find_state(
+                d,
+                123456,
+                time.monotonic() + 10,
+                watch,
+                fcvm_start_time=789,
+            )
             wall_ms = (time.monotonic() - t0) * 1000
             cpu_ms = self_cpu_ms() - c0
             th.join()
@@ -626,6 +1106,284 @@ class FindStateIsEventDriven(unittest.TestCase):
             # ...and a pid-only scan still finds nothing, which is the bug's shape.
             self.assertEqual(reqbench.scan_state(d, 4242)[0], None)
 
+    def test_pre_spawn_null_state_is_never_adopted_or_reaped(self):
+        """A refused clone cannot inherit debris with the same requested name."""
+        with tempfile.TemporaryDirectory() as d:
+            vm_id = "vm-66666666666666666666666666666666"
+            state_path = os.path.join(d, f"{vm_id}.json")
+            data_dir = os.path.join(d, "vm-disks", vm_id)
+            name = "rb-reused-run-0-noop"
+            os.makedirs(data_dir)
+            with open(state_path, "w") as f:
+                json.dump({"vm_id": vm_id, "pid": None, "name": name}, f)
+            with open(state_path + ".lock", "w") as f:
+                f.write("")
+
+            before_spawn = reqbench.state_path_baseline(d)
+            path, state = reqbench.scan_state(
+                d,
+                4242,
+                name,
+                123456,
+                before_spawn,
+            )
+            self.assertIsNone(path)
+            self.assertIsNone(state)
+
+            out = {}
+            self.assertEqual(
+                reqbench.reap_disk(
+                    out,
+                    d,
+                    state_path,
+                    data_dir,
+                    (4242, 123456),
+                ),
+                [],
+            )
+            self.assertTrue(os.path.exists(state_path))
+            self.assertTrue(os.path.isdir(data_dir))
+            self.assertIn("exact state identity", " ".join(out["disk_errors"]))
+
+            # A genuinely new null-PID path published after the baseline remains
+            # discoverable for diagnostics; the old path never becomes eligible.
+            new_vm_id = "vm-77777777777777777777777777777777"
+            new_path = os.path.join(d, f"{new_vm_id}.json")
+            with open(new_path, "w") as f:
+                json.dump({"vm_id": new_vm_id, "pid": None, "name": name}, f)
+            self.assertEqual(
+                reqbench.scan_state(
+                    d, 4242, name, 123456, before_spawn
+                )[0],
+                new_path,
+            )
+
+    def test_refused_clone_retains_pre_spawn_same_name_state(self):
+        """The recovery path must not feed stale paths into teardown."""
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            vm_id = "vm-99999999999999999999999999999999"
+            name = "rb-reused-run-0-noop"
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            data_dir = os.path.join(d, "vm-disks", vm_id)
+            os.makedirs(state_dir)
+            os.makedirs(data_dir)
+            with open(state_path, "w") as f:
+                json.dump({"vm_id": vm_id, "pid": None, "name": name}, f)
+            with open(state_path + ".lock", "w") as f:
+                f.write("")
+            stub = os.path.join(d, "refused-fcvm")
+            with open(stub, "w") as f:
+                f.write("#!/bin/bash\nexit 42\n")
+            os.chmod(stub, 0o755)
+            args = argparse.Namespace(
+                fcvm=stub,
+                out_dir=d,
+                snapshot_tag="",
+                serve_pid=1,
+                rust_log="off",
+                timeout=2.0,
+                teardown_timeout=0.1,
+                cdp_port=9222,
+                state_dir=state_dir,
+                data_root=d,
+                run_id="reused-run",
+            )
+
+            with self.assertRaises(reqbench.SurvivedTeardown) as raised:
+                reqbench.run_noop_request(args, 0)
+            record = raised.exception.record
+            self.assertFalse(record["ok"])
+            self.assertIsNot(
+                record["teardown"].get("disk_cleanup_verified"), True
+            )
+            self.assertNotIn("recovered_state_by_name", record)
+            self.assertTrue(os.path.exists(state_path))
+            self.assertTrue(os.path.isdir(data_dir))
+
+    def test_reused_pid_with_wrong_start_time_never_owns_or_reaps_state(self):
+        """The same numeric PID is not the process identity."""
+        with tempfile.TemporaryDirectory() as d:
+            p = subprocess.Popen(["sleep", "300"])
+            try:
+                start_time = reqbench.proc_stat_fields(p.pid)[3]
+                vm_id = "vm-88888888888888888888888888888888"
+                name = "rb-reused-pid-0-fast"
+                state_path = os.path.join(d, f"{vm_id}.json")
+                data_dir = os.path.join(d, "vm-disks", vm_id)
+                os.makedirs(data_dir)
+                with open(state_path, "w") as f:
+                    json.dump(
+                        {
+                            "vm_id": vm_id,
+                            "name": name,
+                            "pid": p.pid,
+                            "pid_start_time": start_time + 1,
+                            "lifecycle_ready": True,
+                        },
+                        f,
+                    )
+                with open(state_path + ".lock", "w") as f:
+                    f.write("")
+
+                self.assertIsNone(
+                    reqbench.scan_state(
+                        d,
+                        p.pid,
+                        name,
+                        start_time,
+                        frozenset(),
+                        allow_unowned=False,
+                    )[0]
+                )
+                watch = reqbench.DirWatch(d)
+                try:
+                    with self.assertRaisesRegex(TimeoutError, "never recorded"):
+                        reqbench.wait_state_owned(
+                            state_path,
+                            p.pid,
+                            time.monotonic(),
+                            watch,
+                            p,
+                            start_time,
+                            name,
+                        )
+                finally:
+                    watch.close()
+
+                out = {}
+                self.assertEqual(
+                    reqbench.reap_disk(
+                        out, d, state_path, data_dir, (p.pid, start_time)
+                    ),
+                    [],
+                )
+                self.assertTrue(os.path.exists(state_path))
+                self.assertTrue(os.path.isdir(data_dir))
+                self.assertIn("expected exact owner", " ".join(out["disk_errors"]))
+            finally:
+                p.kill()
+                p.wait(timeout=5)
+
+    def test_waits_for_post_resume_owner_without_polling_or_early_teardown(self):
+        """Port readiness can precede the state file's owner-PID update."""
+        with tempfile.TemporaryDirectory() as d:
+            state_path = os.path.join(d, "vm-x.json")
+            p = subprocess.Popen(["sleep", "300"])
+            start_time = reqbench.proc_stat_fields(p.pid)[3]
+            with open(state_path, "w") as f:
+                json.dump({"vm_id": "vm-x", "pid": None, "name": "rb-x"}, f)
+            watch = reqbench.DirWatch(d)
+
+            def claim_state():
+                time.sleep(0.2)
+                tmp = state_path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({
+                        "vm_id": "vm-x", "pid": p.pid, "name": "rb-x",
+                        "pid_start_time": start_time,
+                        "lifecycle_ready": True,
+                    }, f)
+                os.rename(tmp, state_path)
+
+            th = threading.Thread(target=claim_state)
+            th.start()
+            t0 = time.monotonic()
+            try:
+                state = reqbench.wait_state_owned(
+                    state_path,
+                    p.pid,
+                    time.monotonic() + 5,
+                    watch,
+                    p,
+                    start_time,
+                    "rb-x",
+                )
+            finally:
+                watch.close()
+                th.join()
+                p.kill()
+                p.wait(timeout=5)
+            self.assertEqual(state["pid"], p.pid)
+            self.assertGreater(time.monotonic() - t0, 0.15)
+
+    def test_process_exit_interrupts_owner_wait_immediately(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_path = os.path.join(d, "vm-x.json")
+            with open(state_path, "w") as f:
+                json.dump({"vm_id": "vm-x", "pid": None, "name": "rb-x"}, f)
+            watch = reqbench.DirWatch(d)
+            p = subprocess.Popen(["true"])
+            start_time = reqbench.proc_stat_fields(p.pid)[3]
+            p.wait(timeout=5)
+            t0 = time.monotonic()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "before claiming state"):
+                    reqbench.wait_state_owned(
+                        state_path,
+                        p.pid,
+                        time.monotonic() + 30,
+                        watch,
+                        p,
+                        start_time,
+                        "rb-x",
+                    )
+            finally:
+                watch.close()
+            self.assertLess(time.monotonic() - t0, 0.5)
+
+
+class WaitPortAttributesEarlyCloneExit(unittest.TestCase):
+    def test_exited_clone_fails_immediately_with_log_tail(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "clone.log")
+            with open(log, "wb") as f:
+                p = subprocess.Popen(
+                    [sys.executable, "-c", "print('clone admission refused')"],
+                    stdout=f,
+                    stderr=f,
+                )
+                p.wait(timeout=5)
+            t0 = time.monotonic()
+            with self.assertRaises(RuntimeError) as cm:
+                reqbench.wait_port(
+                    "127.0.0.1:9", time.monotonic() + 30, p, log
+                )
+            self.assertLess(time.monotonic() - t0, 0.5)
+            self.assertIn("exited with status 0", str(cm.exception))
+            self.assertIn("clone admission refused", str(cm.exception))
+
+    def test_listener_that_opens_after_deadline_is_not_accepted(self):
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "clone.log")
+            with open(log, "w") as f:
+                f.write("clone still starting\n")
+            proc = subprocess.Popen(["sleep", "5"])
+            server = socket.socket()
+            server.bind(("127.0.0.1", 0))
+            endpoint = f"127.0.0.1:{server.getsockname()[1]}"
+
+            def listen_late():
+                time.sleep(0.15)
+                server.listen(1)
+
+            thread = threading.Thread(target=listen_late)
+            thread.start()
+            started = time.monotonic()
+            try:
+                with self.assertRaises(TimeoutError):
+                    reqbench.wait_port(
+                        endpoint, time.monotonic() + 0.05, proc, log
+                    )
+            finally:
+                thread.join()
+                server.close()
+                proc.kill()
+                proc.wait(timeout=5)
+            self.assertLess(time.monotonic() - started, 0.4)
+
 
 class WsUrlPrewiring(unittest.TestCase):
     """A prewired --ws-url must be re-hosted onto THIS clone's endpoint.
@@ -658,14 +1416,29 @@ class ExecArmTimeout(unittest.TestCase):
     def test_timeout_is_recorded_and_the_child_is_killed(self):
         with tempfile.TemporaryDirectory() as d:
             stub = os.path.join(d, "fcvm-stub")
+            child_ready = os.path.join(d, "exec-child-ready")
+            state = os.path.join(d, "vm-33333333333333333333333333333333.json")
+            data = os.path.join(d, "vm-disks", "vm-33333333333333333333333333333333")
+            os.makedirs(data)
             with open(stub, "w") as f:
-                f.write("#!/bin/bash\nexec sleep 600\n")
+                f.write(
+                    "#!/bin/bash\n"
+                    f"python3 -c 'import ctypes,signal,time; ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); open(\"{child_ready}\", \"w\").close(); time.sleep(600)' &\n"
+                    f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
+                    "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                    "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                    f"cat > {state} <<EOF\n"
+                    '{"vm_id": "vm-33333333333333333333333333333333", "name": "rb-test-run-0-exec", "pid": $$, "pid_start_time": $start, "lifecycle_ready": true}\n'
+                    "EOF\n"
+                    f": > {state}.lock\n"
+                    "wait\n"
+                )
             os.chmod(stub, 0o755)
             args = argparse.Namespace(
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=0.3, teardown_timeout=0.2,
-                state_dir=d, data_root=d,
+                state_dir=d, data_root=d, run_id="test-run",
             )
             before = set(reqbench.children_of(os.getpid()))
             rec = reqbench.run_exec_request(args, 0)  # must NOT raise
@@ -849,6 +1622,300 @@ class CdpDriveResolveThrottling(unittest.TestCase):
                            "resolve_ms is separable from a first-try one")
 
 
+class SnapshotGenerationIdentity(unittest.TestCase):
+    """A reusable tag is never the identity of benchmark evidence."""
+
+    SNAPSHOT = "reused-tag"
+    VM_ID = "vm-11111111111111111111111111111111"
+    IMAGE_CACHE_KEY = "a" * 64
+
+    @classmethod
+    def _write_generation(cls, data_root, generation_id):
+        snapshot_dir = os.path.join(data_root, "snapshots", cls.SNAPSHOT)
+        os.makedirs(snapshot_dir, exist_ok=True)
+        config = {
+            "generation_id": generation_id,
+            "created_at": "2026-08-09T00:00:00Z",
+            "vm_id": cls.VM_ID,
+            "metadata": {
+                "image": "localhost/chromium-bench-req",
+                "image_disk_path": (
+                    f"/image-cache/{cls.IMAGE_CACHE_KEY}.storage-v2.img"
+                ),
+                "vcpu": 2,
+                "memory_mib": 1024,
+                "network_mode": "rootless",
+                "port_mappings": [{
+                    "host_ip": None,
+                    "host_port": 9222,
+                    "guest_port": 9222,
+                    "proto": "tcp",
+                }],
+            },
+        }
+        config_json = (
+            json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        config_sha256 = hashlib.sha256(config_json).hexdigest()
+        config_path = os.path.join(snapshot_dir, "config.json")
+        with open(config_path, "wb") as target:
+            target.write(config_json)
+        provenance = {
+            "snapshot_generation_id": generation_id,
+            "snapshot_config_sha256": config_sha256,
+            "snapshot_created_at": config["created_at"],
+            "snapshot_vm_id": config["vm_id"],
+            "image": config["metadata"]["image"],
+            "image_id": "sha256:" + "b" * 64,
+            "image_digest": "sha256:" + cls.IMAGE_CACHE_KEY,
+            "image_cache_key": cls.IMAGE_CACHE_KEY,
+            "creator_fcvm_sha256": "c" * 64,
+            "creator_runtime_bundle_sha256": "d" * 64,
+            "source_revision": "e" * 40,
+        }
+        with open(
+            os.path.join(snapshot_dir, "reqbench-provenance.json"), "w"
+        ) as target:
+            json.dump(provenance, target)
+        return config_path, config_sha256
+
+    def test_exact_generation_and_config_digest_load(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            generation_id = "11111111-1111-4111-8111-111111111111"
+            _path, config_sha256 = self._write_generation(
+                data_root, generation_id,
+            )
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertEqual(generation["generation_id"], generation_id)
+            self.assertEqual(generation["config_sha256"], config_sha256)
+
+    def test_recreated_tag_rejects_the_previous_generation_provenance(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            config_path, _digest = self._write_generation(
+                data_root, "11111111-1111-4111-8111-111111111111",
+            )
+            with open(config_path) as source:
+                replacement = json.load(source)
+            replacement["generation_id"] = (
+                "22222222-2222-4222-8222-222222222222"
+            )
+            with open(config_path, "w") as target:
+                json.dump(replacement, target, sort_keys=True)
+                target.write("\n")
+            with self.assertRaisesRegex(RuntimeError, "snapshot_generation_id"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_in_place_config_change_rejects_the_previous_digest(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            config_path, _digest = self._write_generation(
+                data_root, "11111111-1111-4111-8111-111111111111",
+            )
+            with open(config_path, "ab") as target:
+                target.write(b" ")
+            with self.assertRaisesRegex(RuntimeError, "snapshot_config_sha256"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_main_holds_the_generation_lease_through_the_full_schedule(self):
+        """An exclusive tag replacement waits until reqbench.main returns."""
+        with tempfile.TemporaryDirectory() as data_root:
+            self._write_generation(
+                data_root, "11111111-1111-4111-8111-111111111111",
+            )
+            runtime_bundle = os.path.join(data_root, "runtime")
+            os.makedirs(runtime_bundle)
+            manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+            with open(manifest_path, "w") as target:
+                target.write("sealed runtime fixture\n")
+            fcvm = os.path.join(runtime_bundle, "fcvm")
+            with open(fcvm, "w") as target:
+                target.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fcvm, 0o755)
+
+            lock_path = os.path.join(
+                data_root, "snapshots", f"{self.SNAPSHOT}.lock",
+            )
+            begin_contender = threading.Event()
+            first_attempt_finished = threading.Event()
+            retry_after_main_return = threading.Event()
+            retry_finished = threading.Event()
+            main_returned = threading.Event()
+            first_attempt = []
+            retry_attempt = []
+            contender_errors = []
+
+            def try_exclusive(contender_lock):
+                try:
+                    fcntl.flock(
+                        contender_lock,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    return "blocked"
+                fcntl.flock(contender_lock, fcntl.LOCK_UN)
+                return "acquired"
+
+            def contend_for_generation():
+                try:
+                    if not begin_contender.wait(timeout=5):
+                        raise AssertionError("request never released contender")
+                    with open(lock_path, "a+") as contender_lock:
+                        first_attempt.append(try_exclusive(contender_lock))
+                        first_attempt_finished.set()
+                        if not retry_after_main_return.wait(timeout=5):
+                            raise AssertionError(
+                                "caller never released post-main retry",
+                            )
+                        retry_attempt.append(try_exclusive(contender_lock))
+                except BaseException as error:  # keep thread failures observable
+                    contender_errors.append(repr(error))
+                finally:
+                    first_attempt_finished.set()
+                    retry_finished.set()
+
+            contender = threading.Thread(
+                target=contend_for_generation,
+                name="snapshot-generation-exclusive-contender",
+            )
+            contender.start()
+
+            request_observations = []
+
+            def record(arm, rep):
+                return {
+                    "arm": arm,
+                    "rep": rep,
+                    "ok": True,
+                    "blocking_ms": 1.0,
+                    "wall_ms": 1.0,
+                    "teardown": {},
+                }
+
+            def run_exec(_args, rep):
+                begin_contender.set()
+                completed = first_attempt_finished.wait(timeout=5)
+                request_observations.append({
+                    "attempt_completed": completed,
+                    "result": first_attempt[0] if first_attempt else None,
+                })
+                return record("exec", rep)
+
+            def run_noop(_args, rep):
+                return record("noop", rep)
+
+            def run_cdp(_args, rep, fast):
+                return record("cdp-fast" if fast else "cdp", rep)
+
+            saved = {
+                "HERE": reqbench.HERE,
+                "run_exec_request": reqbench.run_exec_request,
+                "run_noop_request": reqbench.run_noop_request,
+                "run_cdp_request": reqbench.run_cdp_request,
+                "sha256_file": reqbench.sha256_file,
+                "harness_sha256": reqbench.harness_sha256,
+                "command_text": reqbench.command_text,
+                "pending_signal": reqbench._pending_harness_signal,
+                "argv": sys.argv,
+                "sigint": signal.getsignal(signal.SIGINT),
+                "sigterm": signal.getsignal(signal.SIGTERM),
+            }
+            env_updates = {
+                "REQBENCH_RUNTIME_BUNDLE": runtime_bundle,
+                "REQBENCH_SOURCE_REVISION": "e" * 40,
+                "REQBENCH_GUARD_LOADAVG1": "0.1",
+                "REQBENCH_GUARD_VM_PROCESSES": "0",
+                "REQBENCH_QUIET_LOADAVG1_LIMIT": "2.0",
+                "REQBENCH_QUIET_GUARD": "1",
+                "ALLOW_BUSY": "0",
+            }
+            saved_env = {key: os.environ.get(key) for key in env_updates}
+            out_dir = os.path.join(data_root, "results")
+            rc = None
+            retry_completed = False
+
+            exact_hashes = {
+                os.path.realpath(fcvm): "c" * 64,
+                os.path.realpath(manifest_path): "d" * 64,
+            }
+
+            def fixture_sha256(path):
+                return exact_hashes[os.path.realpath(path)]
+
+            try:
+                os.environ.update(env_updates)
+                reqbench.HERE = runtime_bundle
+                reqbench.run_exec_request = run_exec
+                reqbench.run_noop_request = run_noop
+                reqbench.run_cdp_request = run_cdp
+                reqbench.sha256_file = fixture_sha256
+                reqbench.harness_sha256 = lambda: "f" * 64
+                reqbench.command_text = lambda _argv: "fcvm fixture"
+                reqbench._pending_harness_signal = 0
+                sys.argv = [
+                    "reqbench.py",
+                    "--snapshot-tag", self.SNAPSHOT,
+                    "--snapshot-name", self.SNAPSHOT,
+                    "--url", "http://fixture/medium.html",
+                    # The recorded shuffle puts exec last for this seed, so the
+                    # rejected exclusive attempt occurs at the end of the real
+                    # schedule rather than only at its first request.
+                    "--arms", "cdp-fast,noop,exec",
+                    "--reps", "1",
+                    "--warmup", "0",
+                    "--image", "localhost/chromium-bench-req",
+                    "--image-id", "sha256:" + "b" * 64,
+                    "--network-mode", "rootless",
+                    "--cpu", "2",
+                    "--memory-mib", "1024",
+                    "--fcvm", fcvm,
+                    "--data-root", data_root,
+                    "--out-dir", out_dir,
+                    "--run-id", "1" * 32,
+                ]
+                rc = reqbench.main()
+                main_returned.set()
+                retry_after_main_return.set()
+                retry_completed = retry_finished.wait(timeout=5)
+            finally:
+                begin_contender.set()
+                retry_after_main_return.set()
+                contender.join(timeout=5)
+                reqbench.HERE = saved["HERE"]
+                reqbench.run_exec_request = saved["run_exec_request"]
+                reqbench.run_noop_request = saved["run_noop_request"]
+                reqbench.run_cdp_request = saved["run_cdp_request"]
+                reqbench.sha256_file = saved["sha256_file"]
+                reqbench.harness_sha256 = saved["harness_sha256"]
+                reqbench.command_text = saved["command_text"]
+                reqbench._pending_harness_signal = saved["pending_signal"]
+                sys.argv = saved["argv"]
+                signal.signal(signal.SIGINT, saved["sigint"])
+                signal.signal(signal.SIGTERM, saved["sigterm"])
+                for key, value in saved_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(contender_errors, [])
+            self.assertEqual(request_observations, [{
+                "attempt_completed": True,
+                "result": "blocked",
+            }])
+            self.assertEqual(first_attempt, ["blocked"])
+            self.assertTrue(main_returned.is_set())
+            self.assertTrue(retry_completed)
+            self.assertEqual(retry_attempt, ["acquired"])
+            self.assertFalse(contender.is_alive())
+            with open(os.path.join(out_dir, "reqbench.jsonl")) as source:
+                records = [json.loads(line) for line in source]
+            self.assertEqual(records[0]["kind"], "meta")
+            self.assertEqual(
+                {record["arm"] for record in records[1:]},
+                {"exec", "cdp-fast", "noop"},
+            )
+
+
 class AnalyzerAvailability(unittest.TestCase):
     """Failed requests must be counted per arm, and must not hide a leak.
 
@@ -862,37 +1929,769 @@ class AnalyzerAvailability(unittest.TestCase):
     """
 
     def _synthetic(self, path):
-        with open(path, "w") as f:
-            f.write(json.dumps({"kind": "meta", "seed": 1, "arms": ["exec", "cdp"]}) + "\n")
-            for i in range(30):
-                f.write(json.dumps({
-                    "arm": "exec", "rep": i, "ok": True,
-                    "blocking_ms": 565.0, "wall_ms": 565.0,
-                }) + "\n")
-            for i in range(27):
-                f.write(json.dumps({
-                    "arm": "cdp", "rep": i, "ok": True,
-                    "blocking_ms": 384.0, "wall_ms": 455.0,
-                    "teardown": {"mode": "fast", "all_gone": True,
-                                 "reap_wall_ms": 63.0, "teardown_total_ms": 70.0},
-                }) + "\n")
-            # THE PRODUCER'S SHAPE, not a convenient one: run_cdp_request nests
-            # the whole cdpdrive result under `render` and lifts the label to the
-            # top level. The old fixture wrote `error` at the top level ONLY, a
-            # schema nothing emitted, so the analyzer test was green against a
-            # record the harness never produces.
-            for i in range(27, 30):
-                f.write(json.dumps({
-                    "arm": "cdp", "rep": i, "ok": False,
+        self._write_clean_backend(path, "file", 6, 384.0)
+        with open(path) as source:
+            rows = [json.loads(line) for line in source]
+        failed = 0
+        for row in rows:
+            if row.get("arm") != "cdp" or row.get("warmup") or failed == 3:
+                continue
+            row.update({
+                "ok": False,
+                "error": "WsClosed: connection closed mid-frame",
+                "failure_class": "transport",
+                "failure_stage": "navigate",
+                "blocking_ms": 5250.0,
+                "wall_ms": 5300.0,
+                "render": {
+                    "ok": False,
                     "error": "WsClosed: connection closed mid-frame",
-                    "failure_class": "transport", "failure_stage": "navigate",
-                    "blocking_ms": 5250.0, "wall_ms": 5300.0,
-                    "render": {"ok": False,
-                               "error": "WsClosed: connection closed mid-frame",
-                               "failure_class": "transport", "stage": "navigate"},
-                    "teardown": {"mode": "fast", "all_gone": False,
-                                 "reap_wall_ms": 60000.0, "teardown_total_ms": 60000.0},
-                }) + "\n")
+                    "failure_class": "transport",
+                    "stage": "navigate",
+                },
+            })
+            row["teardown"].update({
+                "all_gone": False,
+                "disk_cleanup_verified": False,
+                "survivors": {"firecracker": 1234},
+            })
+            failed += 1
+        with open(path, "w") as target:
+            for row in rows:
+                target.write(json.dumps(row) + "\n")
+
+    @staticmethod
+    def _write_clean_backend(
+        path,
+        backend,
+        measured,
+        blocking_ms,
+        noop_values=None,
+        **cell_overrides,
+    ):
+        if noop_values is None:
+            noop_values = (50.0,) * measured
+        if len(noop_values) != measured:
+            raise ValueError("noop_values must contain one value per measured repetition")
+        arms = ["exec", "cdp", "cdp-fast", "noop"]
+        warmup = 2
+        seed = 1
+        run_id = "fixture-" + os.path.basename(path).replace(".", "-")
+        meta = {
+            "kind": "meta", "run_id": run_id, "seed": seed, "backend": backend,
+            "uffd_mode": "file" if backend == "file" else "copy",
+            "arms": arms, "reps": measured, "warmup": warmup,
+            "url": "http://fixture/medium.html", "format": "jpeg", "quality": 80,
+            "image": "localhost/chromium-bench-req",
+            "image_id": "sha256:" + "d" * 64, "snapshot": f"snapshot-{backend}",
+            "snapshot_generation_id": (
+                "11111111-1111-4111-8111-111111111111"
+                if backend == "file"
+                else "22222222-2222-4222-8222-222222222222"
+            ),
+            "snapshot_config_sha256": ("6" if backend == "file" else "7") * 64,
+            "snapshot_created_at": "2026-08-09T00:00:00Z",
+            "snapshot_vm_id": "vm-" + ("e" if backend == "file" else "f") * 32,
+            "fcvm_sha256": "a" * 64, "harness_sha256": "c" * 64,
+            "runtime_bundle_sha256": "8" * 64,
+            "source_revision": "b" * 40,
+            "cdp_port": 9222, "network_mode": "rootless", "cpu": 2,
+            "port_mappings": [{
+                "host_ip": None, "host_port": 9222, "guest_port": 9222,
+                "proto": "tcp",
+            }],
+            "memory_mib": 1024,
+            "rust_log": "fcvm=debug", "ws_url_prewired": False,
+            "allow_busy": False, "quiet_guard_passed": True,
+            "quiet_guard_loadavg1": 0.1, "quiet_vm_processes": 0,
+            "quiet_loadavg1_limit": 2.0,
+            "host_boot_id": "00000000-0000-0000-0000-000000000001",
+            "host_kernel_release": "6.18.0-fixture", "host_machine": "aarch64",
+            "loadavg": ["0.1", "0.1", "0.1"], "started": 1.0,
+        }
+        meta.update(cell_overrides)
+        schedule = []
+        rng = random.Random(seed)
+        for rep in range(warmup + measured):
+            order = list(arms)
+            rng.shuffle(order)
+            schedule.extend((rep, arm, rep < warmup) for arm in order)
+        with open(path, "w") as f:
+            f.write(json.dumps(meta) + "\n")
+            for rep, arm, is_warmup in schedule:
+                value = (
+                    50.0 if is_warmup and arm == "noop"
+                    else noop_values[rep - warmup] if arm == "noop"
+                    else blocking_ms
+                )
+                mode = "fast" if arm == "cdp-fast" else arm if arm == "exec" else "normal"
+                record = {
+                    "arm": arm,
+                    "rep": rep,
+                    "warmup": is_warmup,
+                    "run_id": run_id,
+                    "record_id": f"{run_id}:{arm}:{rep}:{int(is_warmup)}",
+                    "ok": True,
+                    "blocking_ms": value,
+                    "wall_ms": value + 1,
+                    "loadavg1": 0.1,
+                    "teardown": {
+                        "mode": mode,
+                        "all_gone": True,
+                        "disk_cleanup_verified": True,
+                        "child_attribution_established": True,
+                        "teardown_total_ms": 1.0,
+                    },
+                }
+                if arm.startswith("cdp"):
+                    record["state_to_port_ms"] = 0.1
+                    record["spawn_to_port_ms"] = 1.0
+                    record["endpoint"] = "127.0.0.2:9222"
+                    record["render"] = {
+                        "ok": True,
+                        "url": meta["url"],
+                        "format": meta["format"],
+                        "cdp_host": "127.0.0.2:9222",
+                        "idle_timeout": 0,
+                        "target_prewired": False,
+                        "stages": {
+                            "resolve_ms": 0.1, "tcp_ms": 0.08,
+                            "upgrade_ms": 0.1, "enable_ms": 0.1,
+                            "connect_total_ms": 0.4, "navigate_ms": 1.0,
+                            "idle_ms": 0.0, "screenshot_ms": 1.0,
+                            "decode_ms": 0.1, "nav_timing_ms": 0.1,
+                            "total_ms": value,
+                        },
+                        "image_bytes": 1024,
+                        "image_sha256": "9" * 64,
+                        "width": 800,
+                        "height": 600,
+                        "quality": 80,
+                        "nav": {
+                            "dns_ms": 0.0, "connect_ms": 0.0,
+                            "tls_ms": 0.0, "ttfb_ms": 0.1,
+                            "resp_ms": 0.1, "load_ms": 1.0,
+                        },
+                    }
+                if arm == "cdp-fast":
+                    machine_resolution = 10.0
+                    harness_resolution = 10.0
+                    uncertainty = (
+                        6 * machine_resolution + 2 * harness_resolution
+                    )
+                    machine_raw = 10.0 - 1.0
+                    machine_net = max(0.0, machine_raw)
+                    machine_lo = max(0.0, machine_raw - uncertainty)
+                    machine_hi = max(0.0, machine_raw + uncertainty)
+                    control_raw = 5.0 - 1.0
+                    control_net = max(0.0, control_raw)
+                    control_lo = max(0.0, control_raw - uncertainty)
+                    control_hi = max(0.0, control_raw + uncertainty)
+                    control_wall = 50.0
+                    control_rate = control_net / control_wall
+                    control_rate_lo = control_lo / control_wall
+                    control_rate_hi = control_hi / control_wall
+                    machine_window = 10.0
+                    record["teardown"].update({
+                        "accounting_version": "post-terminal-ambient-v2",
+                        "reap_wall_ms": 1.0,
+                        "machine_cpu_ms": 10.0,
+                        "harness_cpu_ms": 1.0,
+                        "machine_cpu_window_ms": machine_window,
+                        "machine_cpu_ms_raw": machine_raw,
+                        "machine_cpu_ms_net": machine_net,
+                        "machine_cpu_ms_net_lo": machine_lo,
+                        "machine_cpu_ms_net_hi": machine_hi,
+                        "machine_cpu_ms_subtraction_clamped": False,
+                        "machine_cpu_ms_excess": (
+                            machine_net - control_rate * machine_window
+                        ),
+                        "machine_cpu_ms_excess_lo": (
+                            machine_lo - control_rate_hi * machine_window
+                        ),
+                        "machine_cpu_ms_excess_hi": (
+                            machine_hi - control_rate_lo * machine_window
+                        ),
+                        "control_machine_cpu_ms": 5.0,
+                        "control_harness_cpu_ms": 1.0,
+                        "control_wall_ms": control_wall,
+                        "control_target_ms": 50.0,
+                        "control_cpu_ms_raw": control_raw,
+                        "control_cpu_ms_net": control_net,
+                        "control_cpu_ms_net_lo": control_lo,
+                        "control_cpu_ms_net_hi": control_hi,
+                        "control_cpu_ms_subtraction_clamped": False,
+                        "control_busy_cores": control_rate,
+                        "control_busy_cores_lo": control_rate_lo,
+                        "control_busy_cores_hi": control_rate_hi,
+                        "cpu_residual_uncertainty_ms": uncertainty,
+                        "machine_cpu_source": (
+                            "/proc/stat:busy(user,nice,system,irq,softirq,steal)"
+                        ),
+                        "machine_cpu_resolution_ms": machine_resolution,
+                        "harness_cpu_source": "/proc/self/stat:utime+stime",
+                        "harness_cpu_resolution_ms": harness_resolution,
+                        "sample_period_s": 0.0002,
+                        "tick_ms": 10.0,
+                        "per_child_cpu": {
+                            "fcvm": {"reclaim_cpu_ms": 0.0, "complete": True}
+                        },
+                    })
+                elif arm == "exec":
+                    record.update({
+                        "rc": 0,
+                        "timed_out": False,
+                        "render_total_ms": max(0.0, value - 1.0),
+                    })
+                elif arm == "noop":
+                    record["spawn_to_port_ms"] = value
+                f.write(json.dumps(record) + "\n")
+
+    @staticmethod
+    def _fast_median_ci(xs, *_args, **_kwargs):
+        values = sorted(float(x) for x in xs if x is not None)
+        if not values:
+            return None, None, None, 0
+        return reqanalyze.statistics.median(values), values[0], values[-1], len(values)
+
+    @staticmethod
+    def _fast_shift(a, b, *_args, **_kwargs):
+        if not a or not b:
+            return None, None, None
+        delta = reqanalyze.statistics.median(b) - reqanalyze.statistics.median(a)
+        return delta, delta, delta
+
+    def _run_gate_fixture(self, argv):
+        # The production bootstrap remains covered elsewhere. These tests target
+        # input partitioning and gate truth, so avoid tens of millions of random
+        # resamples over deliberately constant 200-record fixtures.
+        from unittest import mock
+        with (
+            mock.patch.object(reqanalyze, "median_ci", self._fast_median_ci),
+            mock.patch.object(reqanalyze, "hodges_lehmann_shift", self._fast_shift),
+        ):
+            return reqanalyze.main_with(argv)
+
+    @staticmethod
+    def _metadata_errors(path_or_paths):
+        paths = (
+            [path_or_paths]
+            if isinstance(path_or_paths, (str, os.PathLike))
+            else list(path_or_paths)
+        )
+        return [
+            error
+            for dataset in reqanalyze.load(paths)
+            for error in dataset["metadata_errors"]
+        ]
+
+    @staticmethod
+    def _mutate_record(path, arm, mutation, *, warmup=False):
+        with open(path) as source:
+            rows = [json.loads(line) for line in source]
+        record = next(
+            row for row in rows
+            if row.get("arm") == arm and row.get("warmup") is warmup
+        )
+        mutation(record)
+        with open(path, "w") as target:
+            for row in rows:
+                target.write(json.dumps(row) + "\n")
+        return record
+
+    def test_strict_json_rejects_duplicate_keys_constants_and_non_objects(self):
+        cases = {
+            "duplicate-key": ('{"kind":"meta","kind":"meta"}\n', "duplicate JSON key"),
+            "nan": ("NaN\n", "non-standard JSON numeric constant NaN"),
+            "infinity": ("Infinity\n", "non-standard JSON numeric constant Infinity"),
+            "negative-infinity": (
+                "-Infinity\n", "non-standard JSON numeric constant -Infinity"
+            ),
+            "array": ("[]\n", "JSONL value must be an object"),
+            "null": ("null\n", "JSONL value must be an object"),
+            "string": ('"not an object"\n', "JSONL value must be an object"),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            for name, (contents, expected) in cases.items():
+                with self.subTest(name=name):
+                    src = os.path.join(d, f"{name}.jsonl")
+                    with open(src, "w") as target:
+                        target.write(contents)
+                    errors = self._metadata_errors(src)
+                    self.assertTrue(
+                        any(expected in error for error in errors),
+                        errors,
+                    )
+
+    def test_empty_jsonl_is_an_explicit_gate_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "empty.jsonl")
+            with open(src, "w") as target:
+                target.write("\n  \n")
+            errors = self._metadata_errors(src)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("empty JSONL has no metadata or records", errors[0])
+
+    def test_duplicate_and_symlink_inputs_cannot_double_the_sample(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            alias = os.path.join(d, "alias.jsonl")
+            self._write_clean_backend(src, "file", 6, 384.0)
+            os.symlink(src, alias)
+            for paths in ([src, src], [src, alias]):
+                with self.subTest(paths=paths):
+                    datasets = reqanalyze.load(paths)
+                    errors = [
+                        error
+                        for dataset in datasets
+                        for error in dataset["metadata_errors"]
+                    ]
+                    self.assertTrue(
+                        any("duplicate input" in error for error in errors),
+                        errors,
+                    )
+                    valid_records = sum(
+                        len(dataset["records"])
+                        for dataset in datasets
+                        if not dataset["metadata_errors"]
+                    )
+                    self.assertEqual(valid_records, 32)
+
+    def test_analysis_output_cannot_alias_an_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            self._write_clean_backend(src, "file", 6, 384.0)
+            before = reqbench.sha256_file(src)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = self._run_gate_fixture(["--json-out", src, src])
+            self.assertEqual(rc, 5)
+            self.assertEqual(reqbench.sha256_file(src), before)
+            self.assertIn("aliases protected artifact", stdout.getvalue())
+
+    def test_analysis_output_cannot_alias_the_analyzer_source(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            analyzer_copy = os.path.join(d, "reqanalyze-copy.py")
+            self._write_clean_backend(src, "file", 6, 384.0)
+            shutil.copyfile(reqanalyze.__file__, analyzer_copy)
+            before = reqbench.sha256_file(analyzer_copy)
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(reqanalyze, "__file__", analyzer_copy),
+                mock.patch.dict(
+                    os.environ,
+                    {reqanalyze.ANALYZER_SOURCE_PATH_ENV: analyzer_copy},
+                ),
+                redirect_stdout(stdout),
+            ):
+                rc = self._run_gate_fixture(
+                    ["--json-out", analyzer_copy, src]
+                )
+            self.assertEqual(rc, 5)
+            self.assertEqual(reqbench.sha256_file(analyzer_copy), before)
+            self.assertIn("aliases protected artifact", stdout.getvalue())
+
+    def test_inherited_sealed_fd_must_be_the_executing_analyzer(self):
+        import fcntl
+        import hashlib
+
+        decoy = b"print('this is not reqanalyze')\n"
+        fd = os.memfd_create("reqanalyze-decoy", flags=os.MFD_ALLOW_SEALING)
+        try:
+            os.write(fd, decoy)
+            fcntl.fcntl(
+                fd,
+                fcntl.F_ADD_SEALS,
+                fcntl.F_SEAL_SEAL
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_WRITE,
+            )
+            env = dict(os.environ)
+            env[reqanalyze.SEALED_ANALYZER_FD_ENV] = str(fd)
+            env["REQANALYZE_EXPECTED_SHA256"] = hashlib.sha256(decoy).hexdigest()
+            result = subprocess.run(
+                [sys.executable, reqanalyze.__file__],
+                env=env,
+                pass_fds=(fd,),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.close(fd)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "sealed analyzer descriptor does not identify the executing source",
+            result.stderr,
+        )
+
+    def test_failed_warmup_still_gates_availability_and_teardown(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "analysis.json")
+            self._write_clean_backend(src, "file", 6, 384.0)
+
+            def fail_warmup(record):
+                record.update({
+                    "ok": False,
+                    "error": "warmup transport failure",
+                    "failure_class": "transport",
+                    "render": {
+                        "ok": False,
+                        "error": "warmup transport failure",
+                        "failure_class": "transport",
+                        "stage": "navigate",
+                    },
+                })
+                record["teardown"].update({
+                    "all_gone": False,
+                    "disk_cleanup_verified": False,
+                    "survivors": {"firecracker": 1234},
+                })
+
+            failed = self._mutate_record(
+                src, "cdp", fail_warmup, warmup=True
+            )
+            self.assertIs(failed["warmup"], True)
+            with redirect_stdout(io.StringIO()):
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as result_file:
+                result = json.load(result_file)
+            cdp = result["arms"]["cdp"]
+            self.assertEqual(cdp["attempted"], 8)
+            self.assertEqual(cdp["failed"], 1)
+            self.assertEqual(cdp["all_gone_confirmed"], [7, 8])
+            self.assertEqual(cdp["disk_cleanup_confirmed"], [7, 8])
+            self.assertIs(result["gate"]["availability"]["passed"], False)
+            self.assertIs(result["gate"]["teardown"]["passed"], False)
+            self.assertEqual(rc, 5)
+
+    def test_wide_drift_ci_crossing_zero_fails_equivalence(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "analysis.json")
+            self._write_clean_backend(src, "file", 6, 384.0)
+            with (
+                mock.patch.object(reqanalyze, "median_ci", self._fast_median_ci),
+                mock.patch.object(
+                    reqanalyze,
+                    "hodges_lehmann_shift",
+                    return_value=(0.0, -25.0, 25.0),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc = reqanalyze.main_with(["--json-out", dst, src])
+            with open(dst) as result_file:
+                result = json.load(result_file)
+            drift = result["gate"]["baseline_drift"]
+            self.assertEqual(drift["ci"], [-25.0, 25.0])
+            self.assertIs(drift["significant"], False)
+            self.assertIs(drift["passed"], False)
+            self.assertIn("baseline drift", " ".join(result["gate"]["reasons"]))
+            self.assertEqual(rc, 5)
+
+    def test_arm_cross_field_contradictions_are_rejected(self):
+        cases = (
+            (
+                "wall-before-response", "noop",
+                lambda record: record.__setitem__(
+                    "wall_ms", record["blocking_ms"] - 1
+                ),
+                "wall_ms < blocking_ms",
+            ),
+            (
+                "exec-timeout", "exec",
+                lambda record: record.__setitem__("timed_out", True),
+                "successful exec did not exit cleanly",
+            ),
+            (
+                "cdp-host", "cdp",
+                lambda record: record["render"].__setitem__(
+                    "cdp_host", "127.0.0.3:9222"
+                ),
+                "CDP render cdp_host",
+            ),
+            (
+                "teardown-mode", "cdp-fast",
+                lambda record: record["teardown"].__setitem__("mode", "normal"),
+                "expected 'fast'",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for name, arm, mutation, expected in cases:
+                with self.subTest(name=name):
+                    src = os.path.join(d, f"{name}.jsonl")
+                    self._write_clean_backend(src, "file", 6, 384.0)
+                    self.assertEqual(self._metadata_errors(src), [])
+                    self._mutate_record(src, arm, mutation)
+                    errors = self._metadata_errors(src)
+                    self.assertTrue(
+                        any(expected in error for error in errors),
+                        errors,
+                    )
+
+    def test_invalid_optional_teardown_numerics_are_rejected(self):
+        cases = (
+            (
+                "boolean-signal", "cdp",
+                lambda record: record["teardown"].__setitem__("signal_ms", True),
+                "invalid signal_ms=True",
+            ),
+            (
+                "string-excess", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "machine_cpu_ms_excess", "1.0"
+                ),
+                "invalid machine_cpu_ms_excess='1.0'",
+            ),
+            (
+                "negative-child-cpu", "cdp-fast",
+                lambda record: record["teardown"]["per_child_cpu"]["fcvm"].__setitem__(
+                    "cpu_before_ms", -1.0
+                ),
+                "invalid cpu_before_ms=-1.0",
+            ),
+            (
+                "negative-control-rate", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "control_busy_cores", -0.1
+                ),
+                "invalid control_busy_cores=-0.1",
+            ),
+            (
+                "missing-control-raw", "cdp-fast",
+                lambda record: record["teardown"].pop("control_cpu_ms_raw"),
+                "no finite control_cpu_ms_raw",
+            ),
+            (
+                "contradictory-control-net", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "control_cpu_ms_net", 5.0
+                ),
+                "control_cpu_ms_net=5.0 does not match derived",
+            ),
+            (
+                "contradictory-control-bound", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "control_busy_cores_hi", 0.01
+                ),
+                "control_busy_cores_hi=0.01 does not match derived",
+            ),
+            (
+                "contradictory-clamp", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "machine_cpu_ms_subtraction_clamped", True
+                ),
+                "clamp classification contradicts",
+            ),
+            (
+                "stale-accounting-version", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "accounting_version", "post-terminal-ambient-v1"
+                ),
+                "stale accounting semantics",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for name, arm, mutation, expected in cases:
+                with self.subTest(name=name):
+                    src = os.path.join(d, f"{name}.jsonl")
+                    self._write_clean_backend(src, "file", 6, 384.0)
+                    self._mutate_record(src, arm, mutation)
+                    errors = self._metadata_errors(src)
+                    self.assertTrue(
+                        any(expected in error for error in errors),
+                        errors,
+                    )
+
+    def test_in_resolution_negative_control_is_transparent_and_valid(self):
+        def clamp_control(record):
+            teardown = record["teardown"]
+            uncertainty = teardown["cpu_residual_uncertainty_ms"]
+            teardown["control_machine_cpu_ms"] = 0.0
+            teardown["control_harness_cpu_ms"] = 10.0
+            teardown["control_cpu_ms_raw"] = -10.0
+            teardown["control_cpu_ms_net"] = 0.0
+            teardown["control_cpu_ms_net_lo"] = 0.0
+            teardown["control_cpu_ms_net_hi"] = uncertainty - 10.0
+            teardown["control_cpu_ms_subtraction_clamped"] = True
+            teardown["control_busy_cores"] = 0.0
+            teardown["control_busy_cores_lo"] = 0.0
+            teardown["control_busy_cores_hi"] = (
+                (uncertainty - 10.0) / teardown["control_wall_ms"]
+            )
+            machine_window = teardown["machine_cpu_window_ms"]
+            teardown["machine_cpu_ms_excess"] = teardown["machine_cpu_ms_net"]
+            teardown["machine_cpu_ms_excess_lo"] = (
+                teardown["machine_cpu_ms_net_lo"]
+                - teardown["control_busy_cores_hi"] * machine_window
+            )
+            teardown["machine_cpu_ms_excess_hi"] = (
+                teardown["machine_cpu_ms_net_hi"]
+            )
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "clamped-control.jsonl")
+            self._write_clean_backend(src, "file", 6, 384.0)
+            self._mutate_record(src, "cdp-fast", clamp_control)
+            self.assertEqual(self._metadata_errors(src), [])
+
+    def test_accounting_resolution_and_window_are_bound_to_raw_evidence(self):
+        def recompute(teardown):
+            uncertainty = 6 * teardown["machine_cpu_resolution_ms"] + 2 * (
+                teardown["harness_cpu_resolution_ms"]
+            )
+            teardown["cpu_residual_uncertainty_ms"] = uncertainty
+            for prefix, machine_field, harness_field in (
+                ("machine_cpu_ms", "machine_cpu_ms", "harness_cpu_ms"),
+                (
+                    "control_cpu_ms",
+                    "control_machine_cpu_ms",
+                    "control_harness_cpu_ms",
+                ),
+            ):
+                raw = teardown[machine_field] - teardown[harness_field]
+                teardown[f"{prefix}_raw"] = raw
+                teardown[f"{prefix}_net"] = max(0.0, raw)
+                teardown[f"{prefix}_net_lo"] = max(0.0, raw - uncertainty)
+                teardown[f"{prefix}_net_hi"] = max(0.0, raw + uncertainty)
+                teardown[f"{prefix}_subtraction_clamped"] = raw < 0.0
+            control_wall = teardown["control_wall_ms"]
+            teardown["control_busy_cores"] = (
+                teardown["control_cpu_ms_net"] / control_wall
+            )
+            teardown["control_busy_cores_lo"] = (
+                teardown["control_cpu_ms_net_lo"] / control_wall
+            )
+            teardown["control_busy_cores_hi"] = (
+                teardown["control_cpu_ms_net_hi"] / control_wall
+            )
+            machine_window = teardown["machine_cpu_window_ms"]
+            teardown["machine_cpu_ms_excess"] = (
+                teardown["machine_cpu_ms_net"]
+                - teardown["control_busy_cores"] * machine_window
+            )
+            teardown["machine_cpu_ms_excess_lo"] = (
+                teardown["machine_cpu_ms_net_lo"]
+                - teardown["control_busy_cores_hi"] * machine_window
+            )
+            teardown["machine_cpu_ms_excess_hi"] = (
+                teardown["machine_cpu_ms_net_hi"]
+                - teardown["control_busy_cores_lo"] * machine_window
+            )
+
+        def forge_narrow_resolution(record):
+            teardown = record["teardown"]
+            teardown["machine_cpu_resolution_ms"] = 0.001
+            teardown["harness_cpu_resolution_ms"] = 0.001
+            recompute(teardown)
+
+        def forge_short_machine_window(record):
+            teardown = record["teardown"]
+            teardown["machine_cpu_window_ms"] = teardown["reap_wall_ms"] / 2
+            recompute(teardown)
+
+        def forge_short_control_window(record):
+            teardown = record["teardown"]
+            teardown["control_wall_ms"] = teardown["control_target_ms"] / 2
+            recompute(teardown)
+
+        cases = (
+            (
+                "forged-resolution",
+                forge_narrow_resolution,
+                "machine_cpu_resolution_ms=0.001 does not match derived 10.0",
+            ),
+            (
+                "short-machine-window",
+                forge_short_machine_window,
+                "machine CPU window does not enclose reap_wall_ms",
+            ),
+            (
+                "short-control-window",
+                forge_short_control_window,
+                "control window ended before its declared target",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for name, mutation, expected in cases:
+                with self.subTest(name=name):
+                    src = os.path.join(d, f"{name}.jsonl")
+                    self._write_clean_backend(src, "file", 6, 384.0)
+                    self._mutate_record(src, "cdp-fast", mutation)
+                    errors = self._metadata_errors(src)
+                    self.assertTrue(
+                        any(expected in error for error in errors), errors
+                    )
+
+    def test_busy_host_evidence_and_allow_busy_override_gate_publication(self):
+        cases = (
+            ("start-load", {"loadavg": ["2.1", "0.1", "0.1"]}, "host loadavg1"),
+            ("guard-load", {"quiet_guard_loadavg1": 2.1}, "guard-time loadavg1"),
+            ("allow-busy", {"allow_busy": True}, "used ALLOW_BUSY"),
+            (
+                "bad-limit-type",
+                {"quiet_loadavg1_limit": "2.0"},
+                "no valid quiet_loadavg1_limit",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for name, overrides, expected in cases:
+                with self.subTest(name=name):
+                    src = os.path.join(d, f"{name}.jsonl")
+                    self._write_clean_backend(
+                        src, "file", 6, 384.0, **overrides
+                    )
+                    errors = self._metadata_errors(src)
+                    self.assertTrue(
+                        any(expected in error for error in errors),
+                        errors,
+                    )
+
+    def test_port_host_ip_must_be_canonical(self):
+        with tempfile.TemporaryDirectory() as d:
+            canonical = os.path.join(d, "canonical.jsonl")
+            noncanonical = os.path.join(d, "noncanonical.jsonl")
+            self._write_clean_backend(
+                canonical,
+                "file",
+                6,
+                384.0,
+                port_mappings=[{
+                    "host_ip": "127.0.0.1",
+                    "host_port": 9222,
+                    "guest_port": 9222,
+                    "proto": "tcp",
+                }],
+            )
+            self.assertEqual(self._metadata_errors(canonical), [])
+            cell = reqanalyze.load([canonical])[0]["cell"]
+            self.assertEqual(cell["port_mappings"][0]["host_ip"], "127.0.0.1")
+
+            self._write_clean_backend(
+                noncanonical,
+                "file",
+                6,
+                384.0,
+                port_mappings=[{
+                    "host_ip": "2001:0db8::1",
+                    "host_port": 9222,
+                    "guest_port": 9222,
+                    "proto": "tcp",
+                }],
+            )
+            errors = self._metadata_errors(noncanonical)
+            self.assertTrue(
+                any("no valid port_mappings" in error for error in errors),
+                errors,
+            )
 
     def test_failed_records_are_counted_per_arm_and_gate_publication(self):
         with tempfile.TemporaryDirectory() as d:
@@ -902,8 +2701,9 @@ class AnalyzerAvailability(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 reqanalyze.main_with(["--json-out", dst, src])
-            out = json.load(open(dst))
-            self.assertEqual(out["arms"]["cdp"]["attempted"], 30)
+            with open(dst) as result_file:
+                out = json.load(result_file)
+            self.assertEqual(out["arms"]["cdp"]["attempted"], 8)
             self.assertEqual(out["arms"]["cdp"]["failed"], 3)
             self.assertEqual(out["arms"]["exec"]["failed"], 0)
             self.assertIn("failure_rate_ci", out["arms"]["cdp"])
@@ -919,9 +2719,10 @@ class AnalyzerAvailability(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 reqanalyze.main_with(["--json-out", dst, src])
-            out = json.load(open(dst))
+            with open(dst) as result_file:
+                out = json.load(result_file)
             self.assertEqual(
-                out["arms"]["cdp"]["all_gone_confirmed"], [27, 30],
+                out["arms"]["cdp"]["all_gone_confirmed"], [5, 8],
                 "the 3 failed reps' teardowns must be examined, not filtered out",
             )
             self.assertIn("NOT CONFIRMED GONE", buf.getvalue())
@@ -931,9 +2732,9 @@ class AnalyzerAvailability(unittest.TestCase):
 
         RED BEFORE THE FIX: the CDP stage table printed under
             CDP ARMS: per-request stage decomposition (host -> clone over forward-localhost)
-        The harness never passes `--forward-localhost` — reqbench.sh publishes the
-        RELAY port (`--publish 9223:9223`) and entry.sh's socat carries guest
-        eth0 -> guest loopback. a55d25d4 claimed to have fixed the direction
+        The harness never passes `--forward-localhost` — reqbench.sh publishes
+        port 9222 and fc-agent DNATs it from guest eth0 to guest loopback.
+        a55d25d4 claimed to have fixed the direction
         "in the right direction" everywhere; `git show` proves it never touched
         this line, which was then the only place in bench/chromium still asserting
         the wrong one.
@@ -947,7 +2748,7 @@ class AnalyzerAvailability(unittest.TestCase):
             text = buf.getvalue()
             self.assertNotIn("forward-localhost", text)
             self.assertIn("publish", text)
-            self.assertIn("relay", text)
+            self.assertIn("guest loopback", text)
 
     def test_a_null_all_gone_is_not_counted_as_confirmed(self):
         """`ag.count(False)` treats null and absent as CONFIRMED GONE.
@@ -963,38 +2764,30 @@ class AnalyzerAvailability(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "r.jsonl")
             dst = os.path.join(d, "r.json")
-            with open(src, "w") as f:
-                f.write(json.dumps({"kind": "meta", "seed": 1}) + "\n")
-                for i in range(27):
-                    f.write(json.dumps({
-                        "arm": "cdp", "rep": i, "ok": True,
-                        "blocking_ms": 384.0, "wall_ms": 455.0,
-                        "teardown": {"mode": "fast", "all_gone": True,
-                                     "reap_wall_ms": 63.0, "teardown_total_ms": 70.0},
-                    }) + "\n")
-                for i in (27, 28):
-                    f.write(json.dumps({
-                        "arm": "cdp", "rep": i, "ok": True,
-                        "blocking_ms": 384.0, "wall_ms": 455.0,
-                        "teardown": {"mode": "fast", "all_gone": None,
-                                     "reap_wall_ms": 63.0, "teardown_total_ms": 70.0},
-                    }) + "\n")
-                f.write(json.dumps({
-                    "arm": "cdp", "rep": 29, "ok": True,
-                    "blocking_ms": 384.0, "wall_ms": 455.0,
-                    "teardown": {"mode": "fast",
-                                 "reap_wall_ms": 63.0, "teardown_total_ms": 70.0},
-                }) + "\n")
+            self._write_clean_backend(src, "file", 6, 384.0)
+            with open(src) as source:
+                rows = [json.loads(line) for line in source]
+            targets = [
+                row for row in rows
+                if row.get("arm") == "cdp" and row.get("warmup") is False
+            ][:3]
+            targets[0]["teardown"]["all_gone"] = None
+            targets[1]["teardown"]["all_gone"] = None
+            targets[2]["teardown"].pop("all_gone")
+            with open(src, "w") as target:
+                for row in rows:
+                    target.write(json.dumps(row) + "\n")
             buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = reqanalyze.main_with(["--json-out", dst, src, "--no-gate"])
+                rc = self._run_gate_fixture(["--json-out", dst, src, "--no-gate"])
             text = buf.getvalue()
             self.assertIn("** 3 NOT CONFIRMED GONE **", text)
-            for rep in (27, 28, 29):
+            for row in targets:
+                rep = row["rep"]
                 self.assertIn(f"rep {rep}", text, f"rep {rep} must appear in the dump")
             with open(dst) as f:
                 out = json.load(f)
-            self.assertEqual(out["arms"]["cdp"]["all_gone_confirmed"], [27, 30])
+            self.assertEqual(out["arms"]["cdp"]["all_gone_confirmed"], [5, 8])
             self.assertEqual(out["arms"]["cdp"]["all_gone_no_evidence"], 3)
             self.assertEqual(rc, 0, "--no-gate was passed")
 
@@ -1011,19 +2804,10 @@ class AnalyzerAvailability(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "r.jsonl")
             dst = os.path.join(d, "r.json")
-            with open(src, "w") as f:
-                f.write(json.dumps({"kind": "meta", "seed": 1}) + "\n")
-                for i in range(3):
-                    f.write(json.dumps({
-                        "arm": "cdp", "rep": i, "ok": False,
-                        "blocking_ms": 5250.0, "wall_ms": 5300.0,
-                        "render": {"ok": False,
-                                   "error": "WsClosed: connection closed mid-frame",
-                                   "failure_class": "transport", "stage": "navigate"},
-                    }) + "\n")
+            self._synthetic(src)
             buf = io.StringIO()
             with redirect_stdout(buf):
-                reqanalyze.main_with(["--json-out", dst, src, "--no-gate"])
+                self._run_gate_fixture(["--json-out", dst, src, "--no-gate"])
             text = buf.getvalue()
             self.assertIn("WsClosed", text)
             self.assertNotIn("rc=None", text)
@@ -1048,29 +2832,238 @@ class AnalyzerAvailability(unittest.TestCase):
         quoted by someone who only checked the exit code."""
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "r.jsonl")
-            self._synthetic(src)
+            self._write_clean_backend(src, "file", 200, 384.0)
+            with open(src) as source:
+                rows = [json.loads(line) for line in source]
+            for row in rows:
+                if row.get("arm") == "cdp" and row.get("warmup") is False:
+                    row["ok"] = False
+                    row["error"] = "WsClosed: connection closed mid-frame"
+                    row["failure_class"] = "transport"
+                    row["render"] = {
+                        "ok": False,
+                        "error": row["error"],
+                        "failure_class": "transport",
+                        "stage": "navigate",
+                    }
+                    break
+            with open(src, "w") as target:
+                for row in rows:
+                    target.write(json.dumps(row) + "\n")
             buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = reqanalyze.main_with([src])
+                rc = self._run_gate_fixture([src])
             self.assertIn("DO NOT PUBLISH", buf.getvalue())
             self.assertNotEqual(rc, 0, "the run must gate, not merely narrate")
 
-    def test_a_clean_run_still_exits_zero(self):
+    def test_199_measured_cdp_attempts_fail_the_backend_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(src, "file", 199, 384.0)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as f:
+                out = json.load(f)
+            sample = out["gate"]["cdp_sample_size"]
+            self.assertEqual(sample["measured_non_warmup_attempts_per_arm"]["cdp"], 199)
+            self.assertIs(sample["passed"], False)
+            self.assertIs(out["publishable"], False)
+            self.assertIn("199/200", " ".join(out["gate"]["reasons"]))
+            self.assertEqual(rc, 5, buf.getvalue())
+
+    def test_200_measured_cdp_attempts_pass_the_backend_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(src, "file", 200, 384.0)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as f:
+                out = json.load(f)
+            self.assertEqual(
+                out["gate"]["cdp_sample_size"]
+                ["measured_non_warmup_attempts_per_arm"]["cdp"],
+                200,
+            )
+            self.assertIs(out["publishable"], True, out["gate"])
+            self.assertIs(out["gate"]["passed"], True)
+            self.assertEqual(rc, 0, buf.getvalue())
+
+    def test_two_backend_inputs_are_analyzed_without_pooling(self):
+        with tempfile.TemporaryDirectory() as d:
+            file_src = os.path.join(d, "file.jsonl")
+            uffd_src = os.path.join(d, "uffd.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(file_src, "file", 200, 100.0)
+            self._write_clean_backend(uffd_src, "uffd", 200, 900.0)
+            with redirect_stdout(io.StringIO()):
+                rc = self._run_gate_fixture(
+                    ["--json-out", dst, file_src, uffd_src]
+                )
+            with open(dst) as f:
+                out = json.load(f)
+            self.assertEqual(set(out["backends"]), {"file", "uffd"})
+            self.assertEqual(out["backends"]["file"]["sources"], [file_src])
+            self.assertEqual(out["backends"]["uffd"]["sources"], [uffd_src])
+            for backend in ("file", "uffd"):
+                count = out["backends"][backend]["gate"]["cdp_sample_size"][
+                    "measured_non_warmup_attempts_per_arm"
+                ]["cdp"]
+                self.assertEqual(count, 200, f"{backend} was pooled with the other backend")
+            self.assertEqual(out["backends"]["file"]["arms"]["cdp"]
+                             ["blocking_ms"]["median"], 100.0)
+            self.assertEqual(out["backends"]["uffd"]["arms"]["cdp"]
+                             ["blocking_ms"]["median"], 900.0)
+            self.assertIs(out["publishable"], True)
+            self.assertEqual(rc, 0)
+
+    def test_detected_drift_fails_even_when_no_gate_overrides_exit_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(
+                src, "uffd", 200, 384.0,
+                noop_values=(10.0,) * 100 + (100.0,) * 100,
+            )
+            with redirect_stdout(io.StringIO()):
+                gated_rc = self._run_gate_fixture(["--json-out", dst, src])
+            self.assertEqual(gated_rc, 5)
+
+            with redirect_stdout(io.StringIO()):
+                override_rc = self._run_gate_fixture(
+                    ["--json-out", dst, "--no-gate", src]
+                )
+            with open(dst) as f:
+                out = json.load(f)
+            self.assertIs(out["gate"]["baseline_drift"]["significant"], True)
+            self.assertIs(out["gate"]["baseline_drift"]["passed"], False)
+            self.assertIn("baseline drift", " ".join(out["gate"]["reasons"]))
+            self.assertIs(out["publishable"], False)
+            self.assertIs(out["gate"]["passed"], False)
+            self.assertIs(out["gate"]["exit_code_overridden"], True)
+            self.assertEqual(override_rc, 0)
+
+    def test_missing_noop_control_fails_publication(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(src, "file", 200, 384.0)
+            with open(src) as f:
+                rows = [json.loads(line) for line in f]
+            with open(src, "w") as f:
+                for row in rows:
+                    if row.get("arm") != "noop":
+                        f.write(json.dumps(row) + "\n")
+            with redirect_stdout(io.StringIO()):
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as f:
+                out = json.load(f)
+            self.assertIs(out["gate"]["baseline_drift"]["evaluated"], False)
+            self.assertIs(out["gate"]["baseline_drift"]["passed"], False)
+            self.assertIn("0/6", " ".join(out["gate"]["reasons"]))
+            self.assertIs(out["publishable"], False)
+            self.assertEqual(rc, 5)
+
+    def test_recreated_tag_with_same_legacy_identity_never_pools(self):
+        """The exact generation and config digest, not tag/time/VM, define a cell."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            first = os.path.join(d, "first.jsonl")
+            second = os.path.join(d, "second.jsonl")
+            self._write_clean_backend(
+                first, "file", 100, 100.0,
+                snapshot="same-reused-tag",
+                snapshot_created_at="2026-08-09T00:00:00Z",
+                snapshot_vm_id="vm-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                snapshot_generation_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                snapshot_config_sha256="1" * 64,
+            )
+            self._write_clean_backend(
+                second, "file", 100, 900.0,
+                snapshot="same-reused-tag",
+                snapshot_created_at="2026-08-09T00:00:00Z",
+                snapshot_vm_id="vm-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                snapshot_generation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                snapshot_config_sha256="2" * 64,
+            )
+            with open(src, "wb") as out, open(first, "rb") as a, open(second, "rb") as b:
+                out.write(a.read())
+                out.write(b.read())
+            dst = os.path.join(d, "r.json")
+            with redirect_stdout(io.StringIO()):
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as f:
+                result = json.load(f)
+            self.assertEqual(len(result["backends"]), 2)
+            counts = sorted(
+                cell["gate"]["cdp_sample_size"]
+                ["measured_non_warmup_attempts_per_arm"]["cdp"]
+                for cell in result["backends"].values()
+            )
+            self.assertEqual(counts, [100, 100])
+            self.assertTrue(all(key.startswith("file:") for key in result["backends"]))
+            self.assertIs(result["publishable"], False)
+            self.assertEqual(rc, 5)
+
+    def test_same_backend_files_with_different_quality_never_pool(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.jsonl")
+            b = os.path.join(d, "b.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(a, "uffd", 100, 100.0, quality=75)
+            self._write_clean_backend(b, "uffd", 100, 900.0, quality=90)
+            with redirect_stdout(io.StringIO()):
+                rc = self._run_gate_fixture(["--json-out", dst, a, b])
+            with open(dst) as f:
+                result = json.load(f)
+            self.assertEqual(len(result["backends"]), 2)
+            self.assertEqual(
+                {cell["cell"]["quality"] for cell in result["backends"].values()},
+                {75, 90},
+            )
+            self.assertIs(result["publishable"], False)
+            self.assertEqual(rc, 5)
+
+    def test_metric_provenance_names_record_and_governing_meta_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(src, "file", 200, 384.0)
+            with redirect_stdout(io.StringIO()):
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as f:
+                result = json.load(f)
+            refs = result["arms"]["cdp"]["blocking_ms"]["provenance"]
+            self.assertEqual(refs[0]["path"], src)
+            self.assertEqual(refs[0]["meta_line"], 1)
+            with open(src) as source:
+                expected_lines = [
+                    line_no
+                    for line_no, line in enumerate(source, 1)
+                    if line_no > 1
+                    and (record := json.loads(line)).get("arm") == "cdp"
+                    and record.get("warmup") is False
+                ]
+            self.assertEqual(
+                refs[0]["record_lines"],
+                reqanalyze._line_ranges(expected_lines),
+            )
+            self.assertEqual(refs[0]["n"], 200)
+            self.assertEqual(refs[0]["sha256"], reqbench.sha256_file(src))
+            self.assertEqual(rc, 0)
+
+    def test_record_before_metadata_is_rejected_with_its_line(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "r.jsonl")
             with open(src, "w") as f:
-                f.write(json.dumps({"kind": "meta", "seed": 1}) + "\n")
-                for i in range(10):
-                    f.write(json.dumps({
-                        "arm": "cdp", "rep": i, "ok": True,
-                        "blocking_ms": 384.0, "wall_ms": 455.0,
-                        "teardown": {"mode": "fast", "all_gone": True,
-                                     "reap_wall_ms": 63.0, "teardown_total_ms": 70.0},
-                    }) + "\n")
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                rc = reqanalyze.main_with([src])
-            self.assertEqual(rc, 0, buf.getvalue())
+                f.write(json.dumps({"arm": "cdp", "rep": 0, "ok": True}) + "\n")
+            datasets = reqanalyze.load([src])
+            self.assertEqual(len(datasets), 1)
+            self.assertIn(f"{src}:1", datasets[0]["metadata_errors"][0])
+            self.assertEqual(datasets[0]["records"][0]["_source"]["meta_line"], None)
 
     def test_per_child_cpu_is_reported_by_name_not_pooled(self):
         """Pooling across children medians a straggler away.
@@ -1082,32 +3075,39 @@ class AnalyzerAvailability(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "r.jsonl")
             dst = os.path.join(d, "r.json")
-            with open(src, "w") as f:
-                f.write(json.dumps({"kind": "meta", "seed": 1}) + "\n")
-                for i in range(5):
-                    f.write(json.dumps({
-                        "arm": "cdp-fast", "rep": i, "ok": True,
-                        "blocking_ms": 372.0, "wall_ms": 1065.0,
-                        "teardown": {
-                            "mode": "fast", "all_gone": True, "tick_ms": 10.0,
-                            "reap_wall_ms": 634.0, "teardown_total_ms": 640.0,
-                            "per_child_cpu": {
-                                "firecracker": {"reclaim_cpu_ms": 110.0, "complete": True,
-                                                "below_resolution": False,
-                                                "reclaim_cpu_ms_hi": 130.0},
-                                "sleep": {"reclaim_cpu_ms": 0.0, "complete": True,
-                                          "below_resolution": True,
-                                          "reclaim_cpu_ms_hi": 20.0},
-                                "pasta": {"reclaim_cpu_ms": 0.0, "complete": True,
-                                          "below_resolution": True,
-                                          "reclaim_cpu_ms_hi": 20.0},
-                            },
-                        },
-                    }) + "\n")
+            self._write_clean_backend(src, "file", 6, 372.0)
+            with open(src) as source:
+                rows = [json.loads(line) for line in source]
+            for record in rows:
+                if record.get("arm") != "cdp-fast":
+                    continue
+                record["teardown"]["tick_ms"] = 10.0
+                record["teardown"]["per_child_cpu"] = {
+                    "fcvm": {
+                        "reclaim_cpu_ms": 0.0, "complete": True,
+                        "below_resolution": True, "reclaim_cpu_ms_hi": 20.0,
+                    },
+                    "firecracker": {
+                        "reclaim_cpu_ms": 110.0, "complete": True,
+                        "below_resolution": False, "reclaim_cpu_ms_hi": 130.0,
+                    },
+                    "sleep": {
+                        "reclaim_cpu_ms": 0.0, "complete": True,
+                        "below_resolution": True, "reclaim_cpu_ms_hi": 20.0,
+                    },
+                    "pasta": {
+                        "reclaim_cpu_ms": 0.0, "complete": True,
+                        "below_resolution": True, "reclaim_cpu_ms_hi": 20.0,
+                    },
+                }
+            with open(src, "w") as target:
+                for row in rows:
+                    target.write(json.dumps(row) + "\n")
             buf = io.StringIO()
             with redirect_stdout(buf):
-                reqanalyze.main_with(["--json-out", dst, src])
-            out = json.load(open(dst))
+                self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as result_file:
+                out = json.load(result_file)
             per_child = out["arms"]["cdp-fast"]["reclaim_cpu_ms_by_child"]
             self.assertIn("firecracker", per_child)
             self.assertIn("pasta", per_child)
@@ -1139,10 +3139,10 @@ class TeardownProbeGuards(unittest.TestCase):
         import teardown_probe
 
         with tempfile.TemporaryDirectory() as d:
-            state = os.path.join(d, "vm-test.json")
-            data = os.path.join(d, "vm-disks", "vm-test")
+            state = os.path.join(d, "vm-11111111111111111111111111111111.json")
+            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
-                json.dump({"vm_id": "vm-test"}, f)
+                json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
             os.makedirs(data)
             p = subprocess.Popen(["bash", "-c", "sleep 300 & wait"])
             kids = wait_for_child(p.pid)
@@ -1174,10 +3174,10 @@ class TeardownProbeGuards(unittest.TestCase):
         import teardown_probe
 
         with tempfile.TemporaryDirectory() as d:
-            state = os.path.join(d, "vm-test.json")
-            data = os.path.join(d, "vm-disks", "vm-test")
+            state = os.path.join(d, "vm-11111111111111111111111111111111.json")
+            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
-                json.dump({"vm_id": "vm-test"}, f)
+                json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
             os.makedirs(data)
             row = {"rep": 0, "gone_ms": {"firecracker:1": 12.0}}
             leaked = teardown_probe.reap_rep(row, {"firecracker:1": 1}, state, data)
@@ -1220,13 +3220,13 @@ class TeardownProbeGuards(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             state_dir = os.path.join(d, "state")
             os.makedirs(state_dir)
-            os.makedirs(os.path.join(d, "vm-disks", "vm-red"))
+            os.makedirs(os.path.join(d, "vm-disks", "vm-22222222222222222222222222222222"))
             stub = os.path.join(d, "fcvm-stub")
             with open(stub, "w") as f:
                 f.write(
                     "#!/bin/bash\n"
                     f"cat > {state_dir}/vm-$$.json <<EOF\n"
-                    '{"vm_id": "vm-red", "pid": $$, '
+                    '{"vm_id": "vm-22222222222222222222222222222222", "pid": $$, '
                     '"config": {"network": {"loopback_ip": "127.0.0.1"}}}\n'
                     "EOF\n"
                     "exec sleep 600\n"
@@ -1292,6 +3292,7 @@ class ReqbenchShell(unittest.TestCase):
     """
 
     SH = os.path.join(HERE, "reqbench.sh")
+    RUN_ID = "0" * 32
 
     def _env(self, d, **extra):
         binx = os.path.join(d, "bin")
@@ -1302,7 +3303,7 @@ class ReqbenchShell(unittest.TestCase):
             RESULTS=os.path.join(d, "results"),
             STATE_DIR=os.path.join(d, "state"),
             ALLOW_BUSY="1",
-            RUNID="test",
+            RUNID=self.RUN_ID,
         )
         env.update(extra)
         os.makedirs(env["STATE_DIR"], exist_ok=True)
@@ -1312,6 +3313,112 @@ class ReqbenchShell(unittest.TestCase):
         with open(path, "w") as f:
             f.write(body)
         os.chmod(path, 0o755)
+
+    def _read_if_exists(self, path, default=""):
+        if not os.path.exists(path):
+            return default
+        with open(path) as f:
+            return f.read()
+
+    def _write_fake_fcvm(self, d):
+        fcvm = os.path.join(d, "fcvm")
+        self._write(fcvm, "#!/bin/bash\nexit 0\n")
+        self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
+        return fcvm
+
+    def test_concurrent_identical_runtime_install_is_atomic(self):
+        """Two stagers publish one verified bundle and leave no temp tree.
+
+        The cp shim is a barrier at the last copied input. Both invocations have
+        therefore completed their private staging directories before either can
+        acquire the install lock; this exercises the existing-bundle side of the
+        race deterministically rather than relying on scheduler timing.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d)
+            barrier = os.path.join(d, "copy-barrier")
+            os.makedirs(barrier)
+            self._write(os.path.join(binx, "cp"), r'''#!/bin/bash
+destination="${!#}"
+case "$destination" in
+  */.stage.*/fcvm)
+    touch "$COPY_BARRIER/$$"
+    deadline=$((SECONDS + 10))
+    while [ "$(find "$COPY_BARRIER" -maxdepth 1 -type f | wc -l)" -lt 2 ]; do
+      [ "$SECONDS" -lt "$deadline" ] || exit 90
+      sleep 0.01
+    done
+    ;;
+esac
+exec /usr/bin/cp "$@"
+''')
+            env.update(FCVM=self._write_fake_fcvm(d), COPY_BARRIER=barrier)
+            first_env = dict(env, TAG="stage-race-a")
+            second_env = dict(env, TAG="stage-race-b")
+            first = subprocess.Popen(
+                [self.SH, "not-a-command"], env=first_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            second = subprocess.Popen(
+                [self.SH, "not-a-command"], env=second_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                first_out, first_err = first.communicate(timeout=30)
+                second_out, second_err = second.communicate(timeout=30)
+            finally:
+                for process in (first, second):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+
+            self.assertEqual(first.returncode, 2, first_out + first_err)
+            self.assertEqual(second.returncode, 2, second_out + second_err)
+            runtime = os.path.join(env["RESULTS"], "runtime")
+            stage_dirs = [
+                os.path.join(root, name)
+                for root, dirs, _files in os.walk(runtime)
+                for name in dirs
+                if name.startswith(".stage.")
+            ]
+            self.assertEqual(stage_dirs, [], f"staging directories leaked: {stage_dirs}")
+            bundles = [
+                entry.path for entry in os.scandir(runtime)
+                if entry.is_dir(follow_symlinks=False)
+            ]
+            self.assertEqual(len(bundles), 1, f"runtime entries: {os.listdir(runtime)}")
+            verified = subprocess.run(
+                ["sha256sum", "--check", "--status", "MANIFEST.sha256"],
+                cwd=bundles[0], capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            with open(os.path.join(bundles[0], "MANIFEST.sha256")) as f:
+                manifest_names = [line.split()[-1] for line in f]
+            self.assertIn("fc-agent", manifest_names)
+            self.assertTrue(os.access(os.path.join(bundles[0], "fc-agent"), os.X_OK))
+
+    def test_generated_run_id_survives_staged_reexec(self):
+        """The outer shell generates the ID once and explicitly passes it in."""
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d)
+            env.pop("RUNID")
+            capture = os.path.join(d, "staged-env.txt")
+            self._write(os.path.join(binx, "bash"), f'''#!/bin/bash
+printf '%s\n%s\n' "$RUNID" "$REQBENCH_RUNTIME_BUNDLE" > {capture}
+exec /bin/bash "$@"
+''')
+            env["FCVM"] = self._write_fake_fcvm(d)
+            result = subprocess.run(
+                [self.SH, "not-a-command"], env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            run_id, bundle = self._read_if_exists(capture).splitlines()
+            self.assertEqual(len(run_id), 32, run_id)
+            self.assertTrue(all(c in "0123456789abcdef" for c in run_id), run_id)
+            self.assertTrue(os.path.samefile(bundle, os.path.join(
+                env["RESULTS"], "runtime", os.path.basename(bundle),
+            )))
 
     def test_fcvm_no_snapshot_survives_sudo(self):
         """RED BEFORE THE FIX: `FCVM_NO_SNAPSHOT=1 $SUDO env RUST_LOG=... fcvm ...`
@@ -1334,41 +3441,307 @@ class ReqbenchShell(unittest.TestCase):
 case "$1 $2" in
   "podman run")
       echo "FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}
-      echo CHROMIUM_BENCH_READY; sleep 30 ;;
+      echo $$ > {d}/golden.pid
+      echo CHROMIUM_BENCH_READY; exec sleep 30 ;;
   "snapshot create") echo created ;;
   "snapshots delete") ;;
   "ls --json")
+      pid=$(cat {d}/golden.pid)
       if [ "$3" = "--pid" ]; then
-          echo '[{{"pid": 4242, "health_status": "healthy"}}]'
+          echo "[{{\"pid\": $pid, \"vm_id\": \"vm-11111111111111111111111111111111\", \"health_status\": \"healthy\"}}]"
       else
-          echo '[{{"name": "cb-req-g-test", "pid": 4242}}]'
+          echo "[{{\"name\": \"cb-req-g-{self.RUN_ID}\", \"pid\": $pid}}]"
       fi ;;
 esac
 """)
             r = subprocess.run([self.SH, "golden"], env=dict(env, SUDO="sudo", FCVM=fcvm),
                                capture_output=True, text=True, timeout=120)
-            got = open(seen).read() if os.path.exists(seen) else "<no invocation>"
+            got = self._read_if_exists(seen, "<no invocation>")
             self.assertIn("FCVM_NO_SNAPSHOT=1", got,
                           f"the assignment did not survive sudo: {got}\n{r.stderr[-800:]}")
 
-    def _run_stub(self, d, backend):
+    def test_golden_fails_when_fcvm_exits_before_readiness(self):
+        """A dead cold-boot child is attributed immediately, not after 300s."""
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, REQBENCH_STAGED="1")
+            fcvm = os.path.join(d, "fcvm")
+            self._write(fcvm, "#!/bin/bash\nexit 42\n")
+            self._write(os.path.join(binx, "podman"), '''#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+    exit 0
+fi
+exit 1
+''')
+            result = subprocess.run(
+                [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("golden: fcvm exited before readiness (rc=42)", result.stderr)
+            self.assertNotIn("BOOT TIMEOUT", result.stderr)
+
+    def _golden_image_identity_fixture(self, d, snapshot_cache_key):
+        env, binx = self._env(d, DATA_ROOT=d)
+        argv = os.path.join(d, "fcvm-argv.log")
+        pid_file = os.path.join(d, "golden.pid")
+        digest = "a" * 64
+        image_id = "b" * 64
+        fcvm = os.path.join(d, "fcvm")
+        self._write(fcvm, f'''#!/bin/bash
+echo "$*" >> {argv}
+case "$1 $2" in
+  "snapshots delete") exit 0 ;;
+  "podman run")
+      echo $$ > {pid_file}
+      echo CHROMIUM_BENCH_READY
+      exec sleep 30
+      ;;
+  "ls --json")
+      pid=$(cat {pid_file})
+      cat <<EOF
+[{{"name":"cb-req-g-{self.RUN_ID}","pid":$pid,"vm_id":"vm-11111111111111111111111111111111","health_status":"healthy"}}]
+EOF
+      ;;
+  "snapshot create")
+      mkdir -p "$DATA_ROOT/snapshots/$TAG"
+      : > "$DATA_ROOT/snapshots/$TAG.lock"
+      cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
+{{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"}}}}
+EOF
+      ;;
+esac
+''')
+        self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
+        self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{{"Digest":"sha256:{digest}","Id":"{image_id}"}}]'
+    exit 0
+fi
+exit 1
+''')
+        result = subprocess.run(
+            [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+            capture_output=True, text=True, timeout=60,
+        )
+        return result, self._read_if_exists(argv), digest, image_id
+
+    def test_golden_launches_local_tag_and_commits_exact_content_identity(self):
+        """fcvm needs the local tag to attach its content-addressed image disk."""
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, digest, image_id = self._golden_image_identity_fixture(
+                d, "a" * 64,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            podman_run = next(
+                line for line in argv.splitlines() if line.startswith("podman run ")
+            )
+            self.assertTrue(
+                podman_run.endswith(" localhost/chromium-bench-req"), podman_run,
+            )
+            self.assertNotIn(image_id, podman_run)
+            with open(os.path.join(
+                d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
+            )) as source:
+                provenance = json.load(source)
+            self.assertEqual(provenance["image"], "localhost/chromium-bench-req")
+            self.assertEqual(provenance["image_id"], "sha256:" + image_id)
+            self.assertEqual(provenance["image_digest"], "sha256:" + digest)
+            self.assertEqual(provenance["image_cache_key"], digest)
+            self.assertEqual(
+                provenance["snapshot_generation_id"],
+                "12345678-1234-4234-8234-123456789abc",
+            )
+            config_path = os.path.join(
+                d, "snapshots", "cb-req-golden", "config.json",
+            )
+            with open(config_path, "rb") as source:
+                self.assertEqual(
+                    provenance["snapshot_config_sha256"],
+                    hashlib.sha256(source.read()).hexdigest(),
+                )
+
+    def test_golden_rejects_a_tag_repointed_before_fcvm_resolved_it(self):
+        """The snapshot disk key must match the harness's atomic image inspect."""
+        with tempfile.TemporaryDirectory() as d:
+            result, _argv, digest, _image_id = self._golden_image_identity_fixture(
+                d, "c" * 64,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("the image tag changed during golden creation", result.stderr)
+            self.assertIn(digest, result.stderr)
+
+    def _run_stub(self, d, backend, analyzer_rc=0, sudo_env_reset=False):
         env, binx = self._env(d, BACKEND=backend, REPS="1", WARMUP="0")
+        provenance_dir = os.path.join(d, "snapshots", "cb-req-golden")
+        os.makedirs(provenance_dir, exist_ok=True)
+        with open(os.path.join(provenance_dir, "reqbench-provenance.json"), "w") as f:
+            json.dump({"image_id": "sha256:" + "1" * 64}, f)
         argv = os.path.join(d, "argv.log")
         pyargv = os.path.join(d, "pyargv.log")
+        driver_env = os.path.join(d, "driver-env.log")
         fcvm = os.path.join(d, "fcvm")
         self._write(fcvm, f"""#!/bin/bash
 echo "$@" >> {argv}
 if [ "$1 $2" = "snapshot serve" ]; then
-    echo "Serve PID: $$"; echo "Waiting for VMs"; sleep 30
+    echo "Serve PID: $$"; echo "Waiting for VMs"; exec sleep 30
 fi
 """)
         self._write(os.path.join(binx, "python3"),
-                    f'#!/bin/bash\necho "$@" >> {pyargv}\nexit 0\n')
-        r = subprocess.run([self.SH, "run"], env=dict(env, FCVM=fcvm),
+                    f'''#!/bin/bash
+echo "$@" >> {pyargv}
+case "$1" in
+  *reqbench.py)
+      printf '%s\n%s\n' "${{REQBENCH_RUNTIME_BUNDLE:-<unset>}}" \
+          "${{REQBENCH_SOURCE_REVISION:-<unset>}}" > {driver_env}
+      ;;
+  *reqanalyze.py) exit {analyzer_rc} ;;
+esac
+exit 0
+''')
+        self._write(os.path.join(binx, "podman"),
+                    '#!/bin/bash\necho sha256:test-image\n')
+        sudo = ""
+        if sudo_env_reset:
+            sudo = "sudo"
+            self._write(os.path.join(binx, "sudo"),
+                        '#!/bin/bash\nexec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
+        r = subprocess.run([self.SH, "run"], env=dict(env, FCVM=fcvm, SUDO=sudo),
                            capture_output=True, text=True, timeout=180)
         return (r,
-                open(argv).read() if os.path.exists(argv) else "",
-                open(pyargv).read() if os.path.exists(pyargv) else "")
+                self._read_if_exists(argv),
+                self._read_if_exists(pyargv))
+
+    def test_run_provenance_survives_sudo_env_reset(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, _argv, pyargv = self._run_stub(d, "file", sudo_env_reset=True)
+            self.assertEqual(r.returncode, 0, f"{pyargv}\n{r.stderr[-1200:]}")
+            runtime_bundle, source_revision = self._read_if_exists(
+                os.path.join(d, "driver-env.log")
+            ).splitlines()
+            self.assertNotEqual(runtime_bundle, "<unset>")
+            self.assertTrue(os.path.samefile(runtime_bundle, os.path.join(
+                d, "results", "runtime", os.path.basename(runtime_bundle),
+            )))
+            expected_revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=HERE, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(source_revision, expected_revision)
+
+    def test_live_non_child_is_retained_after_term_and_kill(self):
+        """A failed exact-owner stop is an error, never a successful untrack."""
+        with tempfile.TemporaryDirectory() as d:
+            sleeper = subprocess.Popen(["sleep", "300"])
+            kill_log = os.path.join(d, "kills.log")
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+mock_sudo() {{
+    if [ "${{1:-}}" = kill ]; then
+        printf '%s\n' "$*" >> "$KILL_LOG"
+        return 0
+    fi
+    "$@"
+}}
+SUDO=mock_sudo
+sleep() {{ SECONDS=$((SECONDS + 20)); }}
+track "$TARGET_PID"
+set +e
+stop_tracked "$TARGET_PID" 0
+rc=$?
+set -e
+tracked=no
+tracked_entry "$TARGET_PID" >/dev/null && tracked=yes
+live=no
+process_matches "$(tracked_entry "$TARGET_PID")" && live=yes
+printf 'rc=%s tracked=%s live=%s\n' "$rc" "$tracked" "$live"
+[ "$rc" -eq 2 ] && [ "$tracked" = yes ] && [ "$live" = yes ]
+'''
+            try:
+                env, _binx = self._env(
+                    d, TARGET_PID=str(sleeper.pid), KILL_LOG=kill_log,
+                )
+                result = subprocess.run(
+                    ["bash", "-c", script], env=env,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "rc=2 tracked=yes live=yes")
+                signals = self._read_if_exists(kill_log).splitlines()
+                self.assertEqual(signals, [
+                    f"kill -TERM {sleeper.pid}",
+                    f"kill -KILL {sleeper.pid}",
+                ])
+            finally:
+                sleeper.kill()
+                sleeper.wait(timeout=5)
+
+    def test_empty_cleanup_has_no_synthetic_process(self):
+        """An empty tracked-process array must stay empty under set -u."""
+        with tempfile.TemporaryDirectory() as d:
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+CLEANUP_PIDS=()
+set +e
+cleanup
+rc=$?
+set -e
+printf 'rc=%s count=%s\n' "$rc" "${{#CLEANUP_PIDS[@]}}"
+'''
+            env, _binx = self._env(d)
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "rc=0 count=0")
+            self.assertNotIn("survived SIGKILL", result.stderr)
+
+    def test_track_replaces_a_reused_pid_identity_before_stopping_it(self):
+        """A stale starttime must not make the new process invisible to cleanup."""
+        with tempfile.TemporaryDirectory() as d:
+            identity = os.path.join(d, "identity")
+            kill_log = os.path.join(d, "kills.log")
+            with open(identity, "w") as f:
+                f.write("111\n")
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+process_identity() {{ cat "$IDENTITY_FILE"; }}
+mock_sudo() {{
+    printf '%s\n' "$*" >> "$KILL_LOG"
+    printf '333\n' > "$IDENTITY_FILE"
+}}
+SUDO=mock_sudo
+track 424242
+printf '222\n' > "$IDENTITY_FILE"
+track 424242
+before=$(tracked_entry 424242)
+count=${{#CLEANUP_PIDS[@]}}
+stop_tracked 424242 0
+if tracked_entry 424242 >/dev/null; then after=present; else after=gone; fi
+printf 'before=%s count=%s after=%s\n' "$before" "$count" "$after"
+'''
+            env, _binx = self._env(
+                d, IDENTITY_FILE=identity, KILL_LOG=kill_log,
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(), "before=424242:222 count=1 after=gone"
+            )
+            self.assertEqual(
+                self._read_if_exists(kill_log).splitlines(),
+                ["kill -TERM 424242"],
+            )
 
     def test_backend_file_runs_without_a_uffd_serve(self):
         """RED BEFORE THE FIX: `cmd_run` hardcoded `snapshot serve` + `--serve-pid`
@@ -1389,6 +3762,103 @@ fi
             self.assertIn("snapshot serve", argv, f"{argv}\n{r.stderr[-800:]}")
             self.assertIn("--serve-pid", pyargv, pyargv)
             self.assertNotIn("--snapshot-tag", pyargv, pyargv)
+
+    def test_analyzer_rejection_fails_the_driver(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, _argv, pyargv = self._run_stub(d, "file", analyzer_rc=5)
+            self.assertEqual(r.returncode, 5, f"stdout={r.stdout}\nstderr={r.stderr}")
+            self.assertIn("reqbench.py", pyargv, pyargv)
+            self.assertIn("reqanalyze.py", pyargv, pyargv)
+            self.assertIn("gated run exit 5", r.stderr)
+
+    def test_vm_process_count_uses_comm_prefixes_and_ignores_zombies(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = os.path.join(d, "ps.txt")
+            with open(fixture, "w") as f:
+                f.write(
+                    "S fcvm\n"
+                    "S firecracker-def\n"
+                    "S cloud-hypervis\n"
+                    "Z fcvm\n"
+                    "S codex\n"
+                    "S tmux: server\n"
+                )
+            env, binx = self._env(d, PS_FIXTURE=fixture)
+            self._write(os.path.join(binx, "ps"), '#!/bin/bash\ncat "$PS_FIXTURE"\n')
+            r = subprocess.run(
+                ["bash", "-c", f"source {self.SH}; vm_process_count"],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "3", r.stdout)
+
+    def test_busy_guard_returns_three_before_starting_measurements(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = os.path.join(d, "ps.txt")
+            loadavg = os.path.join(d, "loadavg")
+            marker = os.path.join(d, "python-called")
+            with open(fixture, "w") as f:
+                f.write("S fcvm\n")
+            with open(loadavg, "w") as f:
+                f.write("0.01 0.01 0.01 1/1 1\n")
+            env, binx = self._env(
+                d, ALLOW_BUSY="0", PS_FIXTURE=fixture, LOADAVG_FILE=loadavg,
+            )
+            self._write(os.path.join(binx, "ps"), '#!/bin/bash\ncat "$PS_FIXTURE"\n')
+            self._write(os.path.join(binx, "python3"),
+                        f'#!/bin/bash\ntouch {marker}\n')
+            r = subprocess.run(
+                [self.SH, "run"], env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 3, f"stdout={r.stdout}\nstderr={r.stderr}")
+            self.assertFalse(os.path.exists(marker), "the measurement driver ran after refusal")
+            self.assertIn("FATAL: no measurements were taken", r.stderr)
+
+    def test_quiet_guard_treats_integer_and_decimal_limit_equally(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = os.path.join(d, "ps.txt")
+            loadavg = os.path.join(d, "loadavg")
+            open(fixture, "w").close()
+            env, binx = self._env(
+                d, ALLOW_BUSY="0", PS_FIXTURE=fixture, LOADAVG_FILE=loadavg,
+            )
+            self._write(os.path.join(binx, "ps"), '#!/bin/bash\ncat "$PS_FIXTURE"\n')
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+for load in 2 2.0; do
+    printf '%s 0 0 1/1 1\n' "$load" > "$LOADAVG_FILE"
+    if guard_quiet; then
+        printf '%s=quiet\n' "$load"
+    else
+        printf '%s=busy:%s\n' "$load" "$?"
+        exit 1
+    fi
+done
+printf '2.1 0 0 1/1 1\n' > "$LOADAVG_FILE"
+if guard_quiet; then
+    printf '2.1=quiet\n'
+else
+    printf '2.1=busy:%s\n' "$?"
+fi
+for load in 2.0001 3; do
+    printf '%s 0 0 1/1 1\n' "$load" > "$LOADAVG_FILE"
+    if guard_quiet; then
+        printf '%s=quiet\n' "$load"
+    else
+        printf '%s=busy:%s\n' "$load" "$?"
+    fi
+done
+'''
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "2=quiet", "2.0=quiet", "2.1=busy:3",
+                "2.0001=busy:3", "3=busy:3",
+            ])
 
     def test_target_id_waits_for_readiness_and_skips_devtools_pages(self):
         """RED BEFORE THE FIX: `target_id` was a SINGLE-SHOT urlopen with

@@ -156,8 +156,7 @@ fn require_peer_pidfd_support() -> Result<()> {
 /// Only reachable when [`peer_pidfd`] fails on a kernel that passed the startup probe, i.e.
 /// file-descriptor exhaustion. `SO_PEERCRED` needs no fd, so it still works there. This is
 /// the one place in the server that signals a bare PID; it is justified only because the
-/// alternative (drop the connection) releases a possibly in-flight userfaultfd and corrupts
-/// that guest with certainty.
+/// alternative can abandon an in-flight clone whose future memory faults will remain frozen.
 fn kill_unpinned_peer(stream: &UnixStream, vm_id: &str) {
     let Ok(cred) = stream.peer_cred() else {
         error!(
@@ -219,6 +218,19 @@ struct PeerVmm {
     pidfd: OwnedFd,
 }
 
+/// A non-owning view that lets Tokio register [`PeerVmm::pidfd`] without duplicating it.
+///
+/// `AsyncFd` only needs `AsRawFd`, but this toolchain does not implement that trait for
+/// `&OwnedFd`. The `PeerVmm` borrowed by the handler outlives this wrapper, so the raw fd
+/// remains valid until `AsyncFd` is dropped.
+struct PidfdRef<'a>(&'a OwnedFd);
+
+impl AsRawFd for PidfdRef<'_> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 impl PeerVmm {
     /// Pin the process that opened `stream`, atomically.
     ///
@@ -272,8 +284,8 @@ impl PeerVmm {
     /// SIGKILL the VMM. Returns whether the signal was delivered.
     ///
     /// SIGKILL, not SIGTERM: a VMM whose memory this server can no longer serve must not get
-    /// to run *any* more guest instructions, and a graceful shutdown would let the guest keep
-    /// executing (on zero pages) while it drains.
+    /// to run *any* more guest instructions. A graceful shutdown can wedge as soon as it
+    /// touches an unserved page and would no longer provide a bounded terminal outcome.
     fn kill_now(&self, reason: &str) -> bool {
         // SAFETY: pidfd_send_signal(2) on an owned pidfd; no siginfo override, no flags.
         let rc = unsafe {
@@ -291,8 +303,8 @@ impl PeerVmm {
                 peer_pid = self.pid,
                 reason = %reason,
                 "KILLED the clone's VMM: its guest memory can no longer be served, and a \
-                 surviving VMM would run on zero-filled pages (silent corruption). The clone \
-                 is now dead and its `fcvm snapshot run` exits non-zero."
+                 surviving VMM would wedge permanently on future page faults. The clone is \
+                 now dead and its `fcvm snapshot run` exits non-zero."
             );
             return true;
         }
@@ -571,9 +583,9 @@ impl UffdServer {
                                     // clone — both vCPUs parked in wchan=handle_userfault 30s after
                                     // its server died, with no exit code, no signal and no log.
                                     //
-                                    // A frozen clone is not milder than a corrupt one: it holds its
-                                    // memory, its loopback port and its disk indefinitely while
-                                    // looking alive. SO_PEERPIDFD is probed at startup, so the only
+                                    // A frozen clone holds its memory, its loopback port and its
+                                    // disk indefinitely while looking alive. SO_PEERPIDFD is
+                                    // probed at startup, so the only
                                     // way here is fd exhaustion mid-flight; the unpinned PID from
                                     // SO_PEERCRED is then the only handle left, and a vanishingly
                                     // unlikely mis-signal beats a CERTAIN wedge.
@@ -665,7 +677,7 @@ impl UffdServer {
         }
 
         // Stop accepting new connections, but keep serving page faults for VMs that are
-        // already connected until each one closes its uffd (i.e. its Firecracker exits).
+        // already connected until each Firecracker exit is observed through its pidfd.
         // Aborting the handlers here would close the uffds while those VMs are still
         // running. Firecracker holds its OWN uffd reference for the VM's lifetime, so the
         // kernel never falls through to zero-fill; those guests would WEDGE instead, both
@@ -703,19 +715,18 @@ impl Drop for UffdServer {
 /// Serve one admitted clone, and KILL its VMM if serving fails at any point.
 ///
 /// This is the whole fail-closed contract in one place. Before it, a handler error was only
-/// logged: the clone's userfaultfd closed with the guest still running, the kernel began
-/// resolving that guest's faults with zero pages, and the only trace was a log line asking a
-/// human to "kill the affected clone". A request service cannot depend on someone reading a
-/// log — the corrupted guest happily answers requests with garbage. Now the failure is
-/// converted into the one state a caller cannot miss: a dead VMM, which makes the clone's
-/// `fcvm snapshot run` exit non-zero (see `vmm_exit_failure` in `commands/snapshot.rs`).
+/// logged while the guest remained alive. Firecracker retains its UFFD reference, so future
+/// faults then freeze permanently with no in-band error. A request service cannot depend on
+/// someone reading a log or noticing that silent wedge. Now the failure is converted into the
+/// one state a caller cannot miss: a dead VMM, which makes the clone's `fcvm snapshot run`
+/// exit non-zero (see `vmm_exit_failure` in `commands/snapshot.rs`).
 async fn serve_clone_fail_closed(
     vm_id: &str,
     stream: UnixStream,
     source: Arc<PageSource>,
     peer: PeerVmm,
 ) {
-    match serve_clone(vm_id, stream, source).await {
+    match serve_clone(vm_id, stream, source, &peer).await {
         Ok(()) => info!(
             target: "uffd",
             vm_id = %vm_id,
@@ -743,9 +754,15 @@ async fn serve_clone_fail_closed(
 /// have the same remedy: the handshake can fail with the clone's userfaultfd already in
 /// flight (COPY mode sends the fd and the mappings in ONE message, so a malformed message
 /// means we hold an fd we cannot use), and the fault handler can fail after serving for
-/// hours. In both cases the uffd ends up closed while the guest is alive, which the kernel
-/// turns into zero-filled pages.
-async fn serve_clone(vm_id: &str, stream: UnixStream, source: Arc<PageSource>) -> Result<()> {
+/// hours. In both cases this handler can no longer serve the guest while Firecracker still
+/// holds its UFFD reference, so future faults freeze until the fail-closed caller kills the
+/// VMM.
+async fn serve_clone(
+    vm_id: &str,
+    stream: UnixStream,
+    source: Arc<PageSource>,
+    peer: &PeerVmm,
+) -> Result<()> {
     let (uffd, mappings) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(stream, &source))
         .await
         .map_err(|_| anyhow!("UFFD handshake did not complete within {HANDSHAKE_TIMEOUT:?}"))?
@@ -759,7 +776,7 @@ async fn serve_clone(vm_id: &str, stream: UnixStream, source: Arc<PageSource>) -
         mappings.len()
     );
 
-    handle_vm_page_faults(vm_id.to_string(), uffd, mappings, source).await
+    handle_vm_page_faults(vm_id.to_string(), uffd, mappings, source, peer).await
 }
 
 /// Whether a UFFDIO_ZEROPAGE error means the range (or part of it) is already populated.
@@ -900,12 +917,31 @@ fn continue_page(
     Ok(ContinueOutcome::Resolved)
 }
 
+async fn wait_for_peer_vmm_exit(
+    async_peer_pidfd: &AsyncFd<PidfdRef<'_>>,
+    vm_id: &str,
+    peer_pid: u32,
+) -> Result<()> {
+    let _peer_ready = async_peer_pidfd
+        .readable()
+        .await
+        .context("waiting for peer VMM exit")?;
+    info!(
+        target: "uffd",
+        vm_id,
+        peer_pid,
+        "peer VMM exited; stopping page-fault handler"
+    );
+    Ok(())
+}
+
 /// Handle page faults for a single VM
 async fn handle_vm_page_faults(
     vm_id: String,
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
     source: Arc<PageSource>,
+    peer: &PeerVmm,
 ) -> Result<()> {
     // Derive page size from mappings (all regions use the same page size)
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
@@ -927,6 +963,14 @@ async fn handle_vm_page_faults(
 
     // Wrap UFFD in AsyncFd for tokio integration
     let async_uffd = AsyncFd::new(uffd).context("creating AsyncFd for UFFD")?;
+    // Firecracker keeps its own UFFD reference for the VMM's lifetime, and this handler
+    // owns another one. Consequently, a normal VMM exit does not make OUR UFFD readable
+    // or close it: without a separate lifetime signal this task parks forever, retaining
+    // both fds and the server's admitted-clone slot. The pidfd already pins the exact VMM
+    // process, so wait on that same handle alongside page faults. A pidfd stays readable
+    // after exit, which also closes the race where the VMM dies before this registration.
+    let async_peer_pidfd = AsyncFd::new(PidfdRef(&peer.pidfd))
+        .context("registering peer VMM pidfd with the reactor")?;
 
     let mut fault_count = 0u64;
     let start_time = std::time::Instant::now();
@@ -950,22 +994,42 @@ async fn handle_vm_page_faults(
         // Wait for UFFD to be readable — but never park indefinitely while resolved-later
         // faults are waiting, because no new event will ever arrive for THEM.
         let maybe_guard = if pending_continues.is_empty() {
-            match async_uffd.readable().await {
-                Ok(guard) => Some(guard),
-                Err(e) => {
-                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
-                    return Err(e.into());
+            tokio::select! {
+                // If both descriptors become ready while the VMM is exiting, its pidfd is
+                // authoritative: this is an ordinary end of life, not a UFFD-service
+                // failure that should enter the fail-closed kill path.
+                biased;
+                peer_exit = wait_for_peer_vmm_exit(&async_peer_pidfd, &vm_id, peer.pid) => {
+                    peer_exit?;
+                    return Ok(());
+                }
+                uffd_ready = async_uffd.readable() => match uffd_ready {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
+                        return Err(e.into());
+                    }
                 }
             }
         } else {
-            match tokio::time::timeout(CONTINUE_RETRY_DELAY, async_uffd.readable()).await {
-                Ok(Ok(guard)) => Some(guard),
-                Ok(Err(e)) => {
-                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
-                    return Err(e.into());
+            tokio::select! {
+                biased;
+                peer_exit = wait_for_peer_vmm_exit(&async_peer_pidfd, &vm_id, peer.pid) => {
+                    peer_exit?;
+                    return Ok(());
                 }
-                // Timeout: no new events. Fall through and retry the parked faults.
-                Err(_) => None,
+                uffd_ready = tokio::time::timeout(
+                    CONTINUE_RETRY_DELAY,
+                    async_uffd.readable(),
+                ) => match uffd_ready {
+                    Ok(Ok(guard)) => Some(guard),
+                    Ok(Err(e)) => {
+                        error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
+                        return Err(e.into());
+                    }
+                    // Timeout: no new events. Fall through and retry the parked faults.
+                    Err(_) => None,
+                }
             }
         };
 
@@ -2190,7 +2254,7 @@ mod tests {
 
     // =========================================================================
     // FAIL CLOSED: a clone whose faults cannot be served must end up DEAD, not
-    // running on zero-filled memory.
+    // silently wedged on frozen page faults.
     // =========================================================================
 
     /// Spawn a harmless long-lived process to stand in for a clone's VMM.
@@ -2233,8 +2297,7 @@ mod tests {
                     let _ = victim.wait();
                     panic!(
                         "the clone's VMM is STILL RUNNING after its UFFD service failed — \
-                         it would keep executing on zero-filled guest memory (the exact \
-                         silent corruption this fail-closed path exists to prevent)"
+                         future guest faults would remain frozen, silently wedging the clone"
                     );
                 }
                 None => tokio::time::sleep(Duration::from_millis(10)).await,
@@ -2325,7 +2388,7 @@ mod tests {
 
     /// The headline regression: when the page-fault handler fails, the clone's VMM is
     /// KILLED. Before this, the handler merely logged that the VM "should be killed" and
-    /// left it running on zero-filled memory.
+    /// left it alive to wedge on its next unserved page fault.
     ///
     /// The failure injected is a real one from `drain_events`: a fault at an address the
     /// handshake's mappings do not cover, which is unresolvable by construction.
@@ -2380,10 +2443,10 @@ mod tests {
         client
             .send_with_fd(mappings.as_bytes(), uffd.as_raw_fd())
             .expect("sending mappings + uffd the way Firecracker does");
-        // Drop OUR uffd handle: the server's received copy is the only thing keeping the
-        // context alive, exactly as in production where Firecracker closes its own copy.
-        // When the handler drops it, the pending fault resolves with a zero page — which is
-        // precisely the corruption this whole mechanism exists to stop a guest from using.
+        // This stand-in deliberately drops the client copy, unlike production Firecracker,
+        // which retains it. That makes the server's received fd the final reference so the
+        // blocked test thread can terminate after the handler fails; production instead
+        // leaves the corresponding fault frozen until the VMM is killed.
         drop(uffd);
         std::io::stdout().flush().ok();
 
@@ -2396,8 +2459,9 @@ mod tests {
 
         assert_vmm_was_killed(victim).await;
 
-        // The fault resolved as a zero page once the uffd closed — the corruption the kill
-        // prevents the guest from acting on.
+        // Because the test deliberately closed the final UFFD reference, its synthetic fault
+        // resolves as zero. Production Firecracker retains a reference and would remain
+        // frozen instead; in both cases the VMM kill is the required terminal outcome.
         assert_eq!(toucher.join().unwrap(), 0);
         unsafe { libc::munmap(guest, 4096) };
         drop(client);

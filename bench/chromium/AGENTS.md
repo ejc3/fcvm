@@ -303,10 +303,14 @@ then RESET** — which reads exactly like the Host-header rejection everyone war
 about, and is not it. Do not spend an hour on Host headers: check
 `/proc/net/tcp` inside the container FIRST.
 
-**3. `--publish` cannot work on its own, and `--forward-localhost` DOES NOT DO
-WHAT ITS NAME SUGGESTS.** Since Chromium binds guest loopback and fcvm runs guest
-containers `--network=host` (`fc-agent/src/container.rs`), `--publish 9222:9222`
-forwards to the guest's eth0 address where nothing listens.
+**3. Eligible `--publish` TCP ports reach guest loopback directly.** Since
+Chromium binds guest loopback and fcvm runs guest containers `--network=host`
+(`fc-agent/src/container.rs`), fc-agent DNATs the published guest port to
+`127.0.0.1:<port>` after installing a first-position INPUT containment rule and
+enabling `route_localnet` on `eth0`. See
+`fc-agent/src/network.rs::publish_to_loopback`. Port 12345 is excluded, a port
+also given to `--forward-localhost` is rejected, and failed safety setup leaves
+loopback-only listeners unavailable rather than widening guest ingress.
 
 **`--forward-localhost` is GUEST -> HOST, not host -> guest.** This was written
 here the wrong way round on 2026-08-08 and cost a full golden-snapshot build to
@@ -324,17 +328,19 @@ to the host, finds nothing, and the container exits 1. Observed symptom:
 host loopback peer=10.0.2.100:<port>` repeating, then
 `ERROR: chromium-cdp not answering ... after 300 tries`.
 
-**There is NO fcvm feature today that exposes a guest-LOOPBACK port to the host.**
-Not routed, not rootless, not bridged. Adding one is a real fcvm change with its
-own PR and review; it must not be faked in a bench harness.
-
-The way that works today, measured, is a relay inside the container plus ordinary
-`--publish`:
+The current request path has no benchmark-owned relay:
 
 | Hop | Mechanism | Cost |
 |---|---|---|
-| host -> guest eth0:9223 | `--publish 9223:9223`; clones inherit `port_mappings` from snapshot metadata (`src/commands/snapshot.rs:1001/1051/1070`) | measured in `port_wait_ms`, 0.12 ms |
-| guest eth0:9223 -> guest loopback:9222 | `socat TCP-LISTEN:9223,fork` in `entry.sh` | **2.0 MiB PSS**, 0.59% of container PSS |
+| host -> published guest port | `--publish 9222:9222`; clones inherit `port_mappings` from snapshot metadata | measured by `cdpdrive` as `tcp_ms` |
+| guest external interface -> guest loopback:9222 | fc-agent PREROUTING DNAT plus `route_localnet` | included in the successful TCP connection above |
+
+The deleted `socat TCP-LISTEN:9223,fork` relay was one process and one byte-path
+hop per clone. Do not reuse the old 0.12 ms `port_wait_ms` as an ingress cost:
+that timer started only after the restored VM's final PID state save. A later
+harness change moved its boundary before network setup and restore, so the same
+field then clustered near 50 ms. Use one stable spawn-to-first-connect boundary
+for readiness and `tcp_ms` for a successful connection.
 
 Verified working on `--network rootless` (no root needed). `reqbench.sh` defaults
 to rootless for this reason.

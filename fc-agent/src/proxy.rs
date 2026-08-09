@@ -54,7 +54,11 @@ pub async fn wait_for_egress_gen(
 }
 
 /// Guest-side iptables REDIRECT target port.
-const PROXY_LISTEN_PORT: u16 = 12345;
+///
+/// `pub(crate)` because network.rs must EXCLUDE it from `--publish`: a DNAT to
+/// this port hands external clients the host-side relay. Importing it rather
+/// than repeating the literal means moving this value moves the exclusion too.
+pub(crate) const PROXY_LISTEN_PORT: u16 = 12345;
 
 /// Linux SO_ORIGINAL_DST constant (from linux/netfilter_ipv4.h).
 const SO_ORIGINAL_DST: libc::c_int = 80;

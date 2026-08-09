@@ -16,6 +16,66 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 
+async fn force_reap(child: &mut tokio::process::Child, pid: u32, label: &str) -> Result<()> {
+    // `start_kill` can race a natural exit. Either way, `wait` is authoritative and reaps
+    // the direct child; only a bounded failure to reap is an error here.
+    let _ = child.start_kill();
+    tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .with_context(|| format!("{label} PID {pid} could not be reaped after SIGKILL"))?
+        .with_context(|| format!("reaping SIGKILLed {label} PID {pid}"))?;
+    Ok(())
+}
+
+async fn terminate_and_reap(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    label: &str,
+) -> Result<std::process::ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+
+    match nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    ) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(e) => {
+            if let Err(cleanup_error) = force_reap(child, pid, label).await {
+                return Err(cleanup_error.context(format!(
+                    "could not SIGTERM {label} PID {pid}: {e}; forced cleanup also failed"
+                )));
+            }
+            anyhow::bail!("could not SIGTERM {label} PID {pid}: {e}; SIGKILLed and reaped it");
+        }
+    }
+
+    match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
+        Ok(status) => status.with_context(|| format!("reaping {label} PID {pid}")),
+        Err(_) => match force_reap(child, pid, label).await {
+            Ok(()) => anyhow::bail!(
+                "{label} PID {pid} did not exit within 60s after SIGTERM; SIGKILLed and reaped it"
+            ),
+            Err(cleanup_error) => Err(cleanup_error.context(format!(
+                "{label} PID {pid} did not exit within 60s after SIGTERM"
+            ))),
+        },
+    }
+}
+
+fn ensure_path_absent(path: &std::path::Path, label: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("checking {label} {}", path.display())),
+        Ok(metadata) => anyhow::bail!(
+            "{label} still exists after cleanup: {} ({:?})",
+            path.display(),
+            metadata.file_type()
+        ),
+    }
+}
+
 /// Full snapshot/clone workflow test with rootless networking (10 clones)
 #[tokio::test]
 async fn test_snapshot_clone_rootless_10() -> Result<()> {
@@ -1479,6 +1539,12 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 #[tokio::test]
 async fn test_clone_port_forward_rootless() -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-rootless");
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut clone: Option<(tokio::process::Child, u32)> = None;
+    let mut serve_state_path = None;
+    let mut serve_socket_path = None;
+    let mut snapshot_created = false;
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Clone Port Forwarding Test (rootless)                     ║");
@@ -1490,145 +1556,226 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     let host_port = common::find_available_high_port().context("finding available port")?;
     let publish_arg = format!("{}:80", host_port);
 
-    // Step 1: Start baseline VM with nginx (rootless) and port forwarding
-    println!(
-        "Step 1: Starting baseline VM with nginx (rootless, --publish {})...",
-        publish_arg
-    );
-    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &[
-            "podman",
-            "run",
-            "--name",
-            &baseline_name,
-            "--network",
-            "rootless",
-            "--publish",
-            &publish_arg,
-            "--health-check",
-            "http://localhost:80",
-            common::TEST_IMAGE,
-        ],
-        &baseline_name,
-    )
-    .await
-    .context("spawning baseline VM")?;
-
-    println!("  Waiting for baseline VM to become healthy...");
-    common::poll_health_by_pid(baseline_pid, 90).await?;
-    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
-
-    // Step 2: Create snapshot
-    println!("\nStep 2: Creating snapshot...");
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "snapshot",
-            "create",
-            "--pid",
-            &baseline_pid.to_string(),
-            "--tag",
-            &snapshot_name,
-        ])
-        .output()
-        .await
-        .context("running snapshot create")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Snapshot creation failed: {}", stderr);
-    }
-    println!("  ✓ Snapshot created");
-
-    // Kill baseline - we only need the snapshot for clones
-    common::kill_process(baseline_pid).await;
-    println!("  Killed baseline VM (only need snapshot)");
-
-    // Step 3: Start memory server
-    println!("\nStep 3: Starting memory server...");
-    let (_serve_child, serve_pid) =
-        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+    let verdict: Result<()> = async {
+        // Step 1: Start baseline VM with nginx (rootless) and port forwarding.
+        println!(
+            "Step 1: Starting baseline VM with nginx (rootless, --publish {})...",
+            publish_arg
+        );
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    "--network",
+                    "rootless",
+                    "--publish",
+                    &publish_arg,
+                    "--health-check",
+                    "http://localhost:80",
+                    common::TEST_IMAGE,
+                ],
+                &baseline_name,
+            )
             .await
-            .context("spawning memory server")?;
+            .context("spawning baseline VM")?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
 
-    // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
-    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+        println!("  Waiting for baseline VM to become healthy...");
+        common::poll_health(baseline_child, 90).await?;
+        println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
 
-    // Step 4: Spawn clone (port forwarding + network mode inherited from snapshot)
-    println!("\nStep 4: Spawning clone (ports inherited from snapshot)...");
-    let serve_pid_str = serve_pid.to_string();
-    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &[
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid_str,
-            "--name",
-            &clone_name,
-        ],
-        &clone_name,
-    )
-    .await
-    .context("spawning clone with port forward")?;
+        // A published TCP service does not depend on ICMP echo. Snapshot this
+        // legitimate guest policy so the restore readiness gate must prove ARP/L2
+        // resolution and the forwarded TCP path itself, rather than requiring an
+        // unrelated ping reply.
+        common::exec_in_vm(
+            *baseline_pid,
+            &["sysctl", "-w", "net.ipv4.icmp_echo_ignore_all=1"],
+        )
+        .await
+        .context("disabling guest ICMP echo before snapshot")?;
 
-    // Wait for clone to become healthy
-    println!("  Waiting for clone to become healthy...");
-    common::poll_health_by_pid(clone_pid, 120).await?;
-    println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+        // Step 2: Create snapshot.
+        println!("\nStep 2: Creating snapshot...");
+        let output = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &baseline_pid.to_string(),
+                "--tag",
+                &snapshot_name,
+            ])
+            .output()
+            .await
+            .context("running snapshot create")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "snapshot creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        snapshot_created = true;
+        println!("  ✓ Snapshot created");
 
-    // Step 5: Test port forwarding via loopback IP
-    println!("\nStep 5: Testing port forwarding...");
+        let baseline_status =
+            terminate_and_reap(baseline_child, *baseline_pid, "baseline VM").await?;
+        anyhow::ensure!(
+            baseline_status.success(),
+            "baseline VM did not shut down cleanly: {baseline_status}"
+        );
+        baseline = None;
+        println!("  Stopped and reaped baseline VM (only need snapshot)");
 
-    // Get clone's loopback IP from state (rootless uses 127.x.y.z)
-    let loopback_ip = common::get_loopback_ip(clone_pid).await?;
+        // Step 3: Start memory server.
+        println!("\nStep 3: Starting memory server...");
+        serve = Some(
+            common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+                .await
+                .context("spawning memory server")?,
+        );
+        let (_, serve_pid) = serve.as_ref().unwrap();
+        common::poll_serve_ready(&snapshot_name, *serve_pid, 30).await?;
+        common::poll_serve_state_by_pid(*serve_pid, 30).await?;
 
-    println!("  Clone loopback IP: {}", loopback_ip);
+        // Capture the exact artifacts owned by this serve process. Cleanup asserts these
+        // identities disappear after the direct child is reaped; it never scans or broadly
+        // deletes state belonging to another test.
+        let state_manager = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+        let serve_state = state_manager
+            .load_state_by_pid(*serve_pid)
+            .await
+            .context("loading memory server state")?;
+        anyhow::ensure!(
+            serve_state.config.process_type == Some(fcvm::state::ProcessType::Serve)
+                && serve_state.config.snapshot_name.as_deref() == Some(snapshot_name.as_str()),
+            "PID {} did not resolve to this test's memory server state",
+            serve_pid
+        );
+        let serve_start_time = serve_state
+            .pid_start_time
+            .context("memory server state has no process start time")?;
+        serve_state_path =
+            Some(fcvm::paths::state_dir().join(format!("{}.json", serve_state.vm_id)));
+        serve_socket_path = Some(fcvm::uffd::UffdServer::socket_path_for(
+            &fcvm::paths::data_dir(),
+            &snapshot_name,
+            *serve_pid,
+            serve_start_time,
+        ));
+        println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
-    // Test: Access via loopback IP and forwarded port
-    // verify_port_forwarding() confirmed the L2 channel is ready, so the first
-    // request through the forward must succeed.
-    println!(
-        "  Testing access via loopback {}:{}...",
-        loopback_ip, host_port
-    );
-    let loopback_check =
-        common::curl_check_with_diag(&loopback_ip, host_port, 10, Some(clone_pid)).await;
-    let loopback_works = loopback_check.success && loopback_check.body_len > 0;
-    if loopback_works {
+        // Step 4: Spawn clone (port forwarding + network mode inherited from snapshot).
+        println!("\nStep 4: Spawning clone (ports inherited from snapshot)...");
+        let serve_pid_str = serve_pid.to_string();
+        clone = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_str,
+                    "--name",
+                    &clone_name,
+                ],
+                &clone_name,
+            )
+            .await
+            .context("spawning clone with port forward")?,
+        );
+        let (clone_child, clone_pid) = clone.as_mut().unwrap();
+
+        println!("  Waiting for clone to become healthy...");
+        common::poll_health(clone_child, 120).await?;
+        println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+        let icmp_policy = common::exec_in_vm(
+            *clone_pid,
+            &["cat", "/proc/sys/net/ipv4/icmp_echo_ignore_all"],
+        )
+        .await
+        .context("reading restored clone ICMP policy")?;
+        anyhow::ensure!(
+            icmp_policy.trim() == "1",
+            "restored clone no longer ignores ICMP echo, so this test cannot prove TCP \
+             readiness is independent of ping; got {icmp_policy:?}"
+        );
+
+        // Step 5: Test port forwarding via loopback IP.
+        println!("\nStep 5: Testing port forwarding...");
+        let loopback_ip = common::get_loopback_ip(*clone_pid).await?;
+        println!("  Clone loopback IP: {}", loopback_ip);
+        println!(
+            "  Testing access via loopback {}:{}...",
+            loopback_ip, host_port
+        );
+        let loopback_check =
+            common::curl_check_with_diag(&loopback_ip, host_port, 10, Some(*clone_pid)).await;
+        anyhow::ensure!(
+            loopback_check.success && loopback_check.body_len > 0,
+            "rootless clone port forwarding failed: {}",
+            loopback_check.error
+        );
         println!(
             "    Loopback access: ✓ OK ({} bytes)",
             loopback_check.body_len
         );
-    } else {
-        println!("    Loopback access: ✗ FAIL ({})", loopback_check.error);
+
+        Ok(())
+    }
+    .await;
+
+    // Cleanup runs after every outcome. Direct child handles are reaped so a zombie cannot
+    // make PID-only cleanup look complete while its owner has not finished deleting state.
+    println!("\nCleaning up...");
+    let mut cleanup_errors = Vec::new();
+    for (entry, label) in [(&mut clone, "clone"), (&mut serve, "memory server")] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
+    }
+    if let Some((mut child, pid)) = baseline.take() {
+        if let Err(e) = terminate_and_reap(&mut child, pid, "baseline VM").await {
+            cleanup_errors.push(format!("baseline VM: {e:#}"));
+        }
     }
 
-    // Cleanup
-    println!("\nCleaning up...");
-    common::kill_process(clone_pid).await;
-    println!("  Killed clone");
-    common::kill_process(serve_pid).await;
-    println!("  Killed memory server");
-
-    // Results
-    println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║                         RESULTS                               ║");
-    println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!(
-        "║  Loopback port forward: {}                                    ║",
-        if loopback_works {
-            "✓ PASSED"
-        } else {
-            "✗ FAILED"
+    if let Some(path) = &serve_state_path {
+        if let Err(e) = ensure_path_absent(path, "memory server state after child reap") {
+            cleanup_errors.push(format!("{e:#}"));
         }
-    );
-    println!("╚═══════════════════════════════════════════════════════════════╝");
+    }
+    if let Some(path) = &serve_socket_path {
+        if let Err(e) = ensure_path_absent(path, "memory server socket after child reap") {
+            cleanup_errors.push(format!("{e:#}"));
+        }
+    }
 
-    if loopback_works {
+    if snapshot_created {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {e:#}"));
+        } else if let Err(e) = ensure_path_absent(
+            &fcvm::paths::snapshot_dir().join(&snapshot_name),
+            "snapshot after production-backed deletion",
+        ) {
+            cleanup_errors.push(format!("{e:#}"));
+        }
+    }
+
+    if cleanup_errors.is_empty() {
+        verdict?;
         println!("\n✅ ROOTLESS CLONE PORT FORWARDING TEST PASSED!");
         Ok(())
     } else {
-        anyhow::bail!("Rootless clone port forwarding test failed")
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+        }
     }
 }
 
@@ -2449,6 +2596,239 @@ async fn a_clone_dies_when_its_memory_server_dies() -> Result<()> {
     common::kill_process(baseline_pid).await;
     let _ = baseline_child.start_kill();
     Ok(())
+}
+
+/// An exited clone must release the memory server's concurrency slot.
+///
+/// Firecracker keeps a reference to its userfaultfd, but the server owns a separate copy.
+/// The server therefore cannot learn that Firecracker exited by waiting for its own UFFD:
+/// that descriptor remains open and quiet forever. Before the handler also watched the
+/// already-pinned VMM pidfd, every completed clone leaked one handler, one UFFD, one pidfd,
+/// and one admitted-clone slot. A long-lived server eventually refused all new work even
+/// though it had no live clones.
+///
+/// A cap of one makes that production failure deterministic: reap one real restored clone,
+/// then immediately require a second real clone to become healthy through the same server.
+#[tokio::test]
+async fn an_exited_clone_returns_its_server_slot() -> Result<()> {
+    /// Wait for an exact server lifecycle event without adding a timing delay or retrying
+    /// the operation under test. The inotify watch is installed before the first content
+    /// check, so a write racing setup is observed either in the file or as an event.
+    async fn wait_for_log_marker(
+        log_path: &std::path::Path,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: inotify_init1 returns a fresh owned fd on success.
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error()).context("creating inotify instance");
+        }
+        // SAFETY: `raw` is a fresh valid fd owned by this function.
+        let inotify = unsafe { OwnedFd::from_raw_fd(raw) };
+        let c_path = CString::new(log_path.as_os_str().as_bytes())
+            .context("log path contains an interior NUL")?;
+        // SAFETY: `inotify` and `c_path` are live for the call; the kernel copies the path.
+        let watch = unsafe {
+            libc::inotify_add_watch(
+                inotify.as_raw_fd(),
+                c_path.as_ptr(),
+                libc::IN_MODIFY | libc::IN_CLOSE_WRITE,
+            )
+        };
+        if watch < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("watching test log {}", log_path.display()));
+        }
+
+        let async_inotify = tokio::io::unix::AsyncFd::new(inotify)
+            .context("registering test-log inotify fd with the reactor")?;
+        let wait = async {
+            loop {
+                let contents = tokio::fs::read_to_string(log_path)
+                    .await
+                    .with_context(|| format!("reading test log {}", log_path.display()))?;
+                if contents.contains(marker) {
+                    return Ok(());
+                }
+
+                let mut ready = async_inotify
+                    .readable()
+                    .await
+                    .context("waiting for test-log modification")?;
+                match ready.try_io(|fd| {
+                    let mut events = [0u8; 4096];
+                    // SAFETY: `events` is writable for its full length and the inotify fd
+                    // is valid. O_NONBLOCK turns an empty queue into EAGAIN.
+                    let read = unsafe {
+                        libc::read(fd.as_raw_fd(), events.as_mut_ptr().cast(), events.len())
+                    };
+                    if read < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    Ok(result) => result.context("reading test-log inotify events")?,
+                    // Readiness was consumed by another reactor turn; await the next real
+                    // file event rather than spinning or sleeping.
+                    Err(_) => continue,
+                }
+            }
+        };
+
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(result) => result,
+            Err(_) => {
+                let contents = tokio::fs::read_to_string(log_path)
+                    .await
+                    .unwrap_or_default();
+                let tail = contents
+                    .lines()
+                    .rev()
+                    .take(30)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                anyhow::bail!(
+                    "marker {marker:?} did not appear in {} within {timeout:?}\n--- log tail ---\n{tail}",
+                    log_path.display()
+                )
+            }
+        }
+    }
+
+    let (baseline_name, first_clone_name, snapshot_name, _) =
+        common::unique_names("uffd-slot-exit");
+    let second_clone_name = format!("{first_clone_name}-next");
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut first_clone: Option<(tokio::process::Child, u32)> = None;
+    let mut second_clone: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_created = false;
+
+    let verdict: Result<()> = async {
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    common::TEST_IMAGE,
+                ],
+                &baseline_name,
+            )
+            .await?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
+        common::poll_health(baseline_child, 120).await?;
+        common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
+        snapshot_created = true;
+
+        let (serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_env_and_log_path(
+            &["snapshot", "serve", &snapshot_name],
+            &[("FCVM_UFFD_MAX_CLONES", "1")],
+        )
+        .await?;
+        serve = Some((serve_child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+        let serve_pid_string = serve_pid.to_string();
+        first_clone = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &first_clone_name,
+                ],
+                &first_clone_name,
+            )
+            .await?,
+        );
+        let (first_child, first_pid) = first_clone.as_mut().unwrap();
+        common::poll_health(first_child, 120).await?;
+
+        let first_status = terminate_and_reap(first_child, *first_pid, "first clone").await?;
+        anyhow::ensure!(
+            first_status.success(),
+            "first clone did not shut down cleanly: {first_status}"
+        );
+        first_clone = None;
+
+        // The outer fcvm process can finish reaping Firecracker before the server task is
+        // scheduled to consume pidfd readiness. Sequence on the server's completed-task
+        // event, emitted only after SlotGuard dropped, so this is deterministic under load.
+        // This waits for the root-cause fix; it does not delay or retry the second clone.
+        wait_for_log_marker(
+            &serve_log,
+            "VM exited active_vms=0",
+            Duration::from_secs(30),
+        )
+        .await?;
+
+        second_clone = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &second_clone_name,
+                ],
+                &second_clone_name,
+            )
+            .await?,
+        );
+        let (second_child, _) = second_clone.as_mut().unwrap();
+        common::poll_health(second_child, 120)
+            .await
+            .context("second clone was not admitted after the first clone exited")?;
+
+        Ok(())
+    }
+    .await;
+
+    // Run cleanup after either outcome. PR_SET_PDEATHSIG prevents process leaks after the
+    // whole test exits, but it cannot reap these direct children or delete the snapshot.
+    let mut cleanup_errors = Vec::new();
+    for (entry, label) in [
+        (&mut second_clone, "second clone"),
+        (&mut first_clone, "first clone"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
+    }
+    if snapshot_created {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {e:#}"));
+        }
+    }
+
+    if cleanup_errors.is_empty() {
+        verdict
+    } else {
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+        }
+    }
 }
 
 /// A panicking clone handler must not permanently consume a concurrency slot.

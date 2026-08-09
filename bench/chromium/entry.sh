@@ -6,13 +6,13 @@
 # -> touch the ready file (which the container HEALTHCHECK gates on) -> print the
 # READY marker -> hold the browser open.
 #
-# REQUEST PATH: there is NOTHING of ours on it. Chromium's own DevTools Protocol
-# endpoint IS the request server -- it is a fully specified, already-implemented
-# protocol that returns the screenshot as base64 in the CDP response. The host
-# opens a WebSocket straight to the page target and sends Page.navigate +
-# Page.captureScreenshot. No resident interpreter, no bespoke wire format, and
-# nothing of ours that a snapshot restore could invalidate: Chromium's listener
-# is an ordinary in-guest TCP socket, not a virtio-vsock socket, so the
+# REQUEST PATH: there is no benchmark-owned userspace relay or request server.
+# Chromium's own DevTools Protocol endpoint is the request server -- it is a
+# fully specified, already-implemented protocol that returns the screenshot as
+# base64 in the CDP response. The host opens a WebSocket through fcvm's published
+# TCP path and fc-agent's PREROUTING DNAT to the page target, then sends
+# Page.navigate + Page.captureScreenshot. Chromium's listener is an ordinary
+# in-guest TCP socket, not a virtio-vsock socket, so the
 # VIRTIO_VSOCK_EVENT_TRANSPORT_RESET that a restore raises does not touch it.
 #
 # The pageserver and render.py remain in the image but are OFF the request path:
@@ -151,7 +151,8 @@ fi
 #                          GUEST's 127.0.0.1:<port> and dials the host gateway 10.0.2.2),
 #                          so pointing it at 9222 HIJACKS Chromium's own loopback CDP port
 #                          and breaks the readiness probe below. Ingress comes from the
-#                          socat relay + ordinary --publish; see the CDP RELAY block.
+#                          ordinary --publish: fcvm DNATs a published port to guest
+#                          127.0.0.1, so no relay is needed. See publish_to_loopback.
 #                          The flag stays because it is free and correct-in-intent: if a
 #                          future Chromium honours it, the wildcard bind becomes available
 #                          without another archaeology session. Re-verify /proc/net/tcp
@@ -199,31 +200,18 @@ CHROME_PID=$!
 wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp
 
 # ---------------------------------------------------------------------------
-# CDP RELAY. The one process this design adds to a clone, and the reason it is
-# needed is measured, not assumed:
+# NO RELAY. Chromium binds guest loopback only (it ignores
+# --remote-debugging-address; see the flag block above), and fcvm now DNATs each
+# eligible published TCP port to 127.0.0.1 inside the guest — so
+# `--publish 9222:9222` reaches Chromium directly. See
+# fc-agent/src/network.rs::publish_to_loopback and
+# DESIGN.md "Eligible published TCP ports reach guest loopback".
 #
-#   Chromium 151.0.7922.71 (Debian bookworm arm64) IGNORES
-#   --remote-debugging-address. The flag is in /proc/<pid>/cmdline; /proc/net/tcp
-#   shows 0100007F:2406 (127.0.0.1:9222) and nothing else, in the same container
-#   where the page server's 00000000:1F40 proves a wildcard bind works. It is
-#   the browser, not our flags, and not a Host-header rejection.
-#
-#   fcvm cannot bridge that gap either: --forward-localhost runs GUEST -> HOST
-#   (fc-agent/src/network.rs:479 dials 10.0.2.2), so aiming it at 9222 hijacks
-#   the guest's own loopback CDP port and breaks the readiness probe above.
-#
-# socat is deliberately the smallest thing that closes the gap: it copies bytes,
-# it does not parse, re-encode or re-frame CDP, so the wire protocol the host
-# speaks is byte-identical to the in-guest arm's. `fork` gives one short-lived
-# child per connection; the listener is what is resident in the snapshot.
-RELAY_PORT="${BENCH_CDP_RELAY_PORT:-9223}"
-echo "chromium-bench: starting CDP relay 0.0.0.0:$RELAY_PORT -> 127.0.0.1:$CDP_PORT"
-socat TCP-LISTEN:"$RELAY_PORT",fork,reuseaddr,bind=0.0.0.0 \
-      TCP:127.0.0.1:"$CDP_PORT" &
-RELAY_PID=$!
-# Prove the relay end to end BEFORE the warm marker, so the health gate (and
-# therefore the golden snapshot) cannot fire on a browser the host cannot reach.
-wait_http "http://127.0.0.1:$RELAY_PORT/json/version" 100 cdp-relay
+# The deleted socat relay was one process and one byte-path hop per clone. The
+# earlier request-path A/B that reported connection drops was withdrawn because
+# its arms were not comparable; it is not evidence that the relay caused those
+# failures.
+# ---------------------------------------------------------------------------
 
 echo "chromium-bench: warming renderer"
 python3 /opt/bench/render.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
@@ -234,11 +222,31 @@ python3 /opt/bench/render.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
 # trigger for the golden snapshot — cannot fire on a browser that is merely
 # listening. "Healthy" therefore means "warm and provably able to screenshot".
 touch "$READY_FILE"
-echo "CHROMIUM_BENCH_READY cdp=$CDP_ADDR:$CDP_PORT relay=0.0.0.0:$RELAY_PORT pages=http://127.0.0.1:$HTTP_PORT"
+echo "CHROMIUM_BENCH_READY cdp=127.0.0.1:$CDP_PORT pages=http://127.0.0.1:$HTTP_PORT"
 
 # Hold the warm browser. wait exits with chromium's status if it dies, so the
 # container stops instead of hiding a dead browser behind sleep infinity. As
 # PID 1 this shell gets no default signal handlers — without the trap a
 # `podman stop` SIGTERM is dropped and teardown eats the 10s SIGKILL fallback.
-trap 'kill "$CHROME_PID" "$RELAY_PID" 2>/dev/null; exit 0' TERM INT
+cleanup_chromium() {
+    # Disable re-entry while this handler waits and reaps.
+    trap - TERM INT
+    kill "$CHROME_PID" 2>/dev/null || true
+
+    # POSIX sh has no timed wait. A reaped timer bounds Chromium's TERM grace
+    # period without polling a zombie (for which kill -0 remains true).
+    (
+        sleep 5
+        if kill -0 "$CHROME_PID" 2>/dev/null; then
+            echo "chromium-bench: Chromium ignored TERM for 5s; sending KILL" >&2
+            kill -KILL "$CHROME_PID" 2>/dev/null || true
+        fi
+    ) &
+    killer_pid=$!
+    wait "$CHROME_PID" 2>/dev/null || true
+    kill "$killer_pid" 2>/dev/null || true
+    wait "$killer_pid" 2>/dev/null || true
+    exit 0
+}
+trap cleanup_chromium TERM INT
 wait "$CHROME_PID"

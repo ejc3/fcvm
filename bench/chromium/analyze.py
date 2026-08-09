@@ -162,14 +162,15 @@ def load_jsonl(path):
     out = []
     if not os.path.exists(path):
         return out
-    for line in open(path):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
+    with open(path) as source:
+        for line in source:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
     return out
 
 

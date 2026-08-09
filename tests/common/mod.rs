@@ -1650,16 +1650,13 @@ pub fn snapshot_exists(snapshot_key: &str) -> bool {
 
 /// Delete a snapshot by key (for test cleanup)
 ///
-/// Removes both the snapshot directory and its lock file.
+/// Uses the production generation lock so cleanup cannot race a creator or
+/// restore. The lock inode deliberately remains after deletion: unlinking a
+/// held lock would let another process enter through a newly-created inode.
 pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
-    let snapshot_path = fcvm::paths::snapshot_dir().join(snapshot_key);
-    if snapshot_path.exists() {
-        tokio::fs::remove_dir_all(&snapshot_path).await?;
-    }
-    // Also delete lock file
-    let lock_path = snapshot_path.with_extension("lock");
-    let _ = tokio::fs::remove_file(&lock_path).await;
-    Ok(())
+    fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+        .delete_snapshot(snapshot_key)
+        .await
 }
 
 /// Get the startup snapshot key for a base key

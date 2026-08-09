@@ -197,7 +197,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-chromium bench-clone-latency \
+	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
 	lint fmt update-dependency ssh test-serve-sdk
 
 all: build
@@ -252,6 +252,9 @@ help:
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
+	@echo "  bench-chromium-request  Run the gated request benchmark (PHASE=, BACKEND=, REPS=, WARMUP=, RESULTS=)"
+	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
+	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
 	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
@@ -618,6 +621,31 @@ test-serve-sdk: build
 bench-chromium: build
 	@echo "==> Running Chromium shared-nothing benchmark..."
 	@bash bench/chromium/bench.sh run
+
+# Request-optimized Chromium benchmark. The driver invokes reqanalyze.py after
+# every run and propagates its publication-gate status, so a Make success means
+# both the producer and analyzer accepted the result.
+PHASE ?= run
+BACKEND ?= uffd
+REPS ?= 200
+WARMUP ?= 2
+ifndef RESULTS
+RESULTS := $(CURDIR)/bench/chromium/results/reqbench-$(shell date +%Y%m%d-%H%M%S)-$(BACKEND)
+endif
+
+bench-chromium-request: build
+	@echo "==> Running gated Chromium request benchmark ($(BACKEND), $(REPS) measured attempts per arm)..."
+	@BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
+		bash bench/chromium/reqbench.sh "$(PHASE)"
+
+analyze-chromium-request:
+	@test -f "$(RESULTS)/reqbench.jsonl" || { echo "ERROR: no $(RESULTS)/reqbench.jsonl" >&2; exit 2; }
+	@python3 bench/chromium/reqanalyze.py --json-out "$(RESULTS)/analysis.json" \
+		"$(RESULTS)/reqbench.jsonl"
+
+test-chromium-request:
+	@python3 -m unittest discover -s bench/chromium -p 'test_reqbench.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
 
 bench: build
 	@echo "==> Running benchmarks..."

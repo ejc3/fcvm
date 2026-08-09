@@ -87,7 +87,8 @@ def reap_rep(row: dict, named: dict, sp, data_dir) -> bool:
                 except (ProcessLookupError, PermissionError):
                     pass
         return True
-    reaped = reap_disk(row, sp, data_dir)
+    data_root = os.path.dirname(os.path.dirname(data_dir)) if data_dir else ""
+    reaped = reap_disk(row, data_root, sp, data_dir)
     if reaped:
         row["disk_reaped"] = reaped
     for err in row.get("disk_errors", []):
@@ -137,7 +138,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--serve-pid", type=int, required=True)
     ap.add_argument("--n", type=int, default=5)
-    ap.add_argument("--cdp-port", type=int, default=9223)
+    ap.add_argument("--cdp-port", type=int, default=9222)
     ap.add_argument("--fcvm", default=os.path.join(HERE, "..", "..", "target", "release", "fcvm"))
     ap.add_argument("--data-root", default="/mnt/fcvm-btrfs")
     ap.add_argument("--out", default="")
