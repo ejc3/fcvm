@@ -1,7 +1,10 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -10,6 +13,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "classify_ci_failure.py"
 FIXTURES = ROOT / "tests" / "fixtures" / "ci-infrastructure"
+STRAY_GUARD = ROOT / "scripts" / "ci-stray-vm-guard.sh"
 
 CLASSIFIER_SPEC = importlib.util.spec_from_file_location(
     "classify_ci_failure", SCRIPT
@@ -152,6 +156,100 @@ class CiInfrastructureClassificationTests(unittest.TestCase):
         self.assertEqual(result["run_attempt"], 2)
         self.assertEqual(result["classification"], "infrastructure")
         self.assertFalse(result["rerun_failed_jobs"])
+
+
+class StrayVmGuardTests(unittest.TestCase):
+    def run_guard(
+        self,
+        ps_output: str,
+        *,
+        hang_ps: bool = False,
+        outer_timeout: float = 5,
+    ) -> tuple[subprocess.CompletedProcess[str], Path, str, float]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        bin_dir = root / "bin"
+        log_dir = root / "logs"
+        bin_dir.mkdir()
+        log_dir.mkdir()
+        ps_calls = root / "ps-calls"
+
+        fake_ps = bin_dir / "ps"
+        fake_ps.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$*\" >>\"$MOCK_PS_CALLS\"\n"
+            "case \"$*\" in\n"
+            "  *args*|*cmdline*|*command*) exit 93 ;;\n"
+            "esac\n"
+            "if [ \"${MOCK_PS_HANG:-0}\" = 1 ]; then exec sleep 30; fi\n"
+            "printf '%s' \"${MOCK_PS_OUTPUT:-}\"\n"
+        )
+        fake_ps.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{bin_dir}:{env['PATH']}",
+                "FCVM_TEST_LOG_DIR": str(log_dir),
+                "FCVM_GUARD_SCAN_TIMEOUT_SECONDS": "1",
+                "MOCK_PS_CALLS": str(ps_calls),
+                "MOCK_PS_HANG": "1" if hang_ps else "0",
+                "MOCK_PS_OUTPUT": ps_output,
+            }
+        )
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(STRAY_GUARD), "post", "--dry-run"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=outer_timeout,
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+        return result, log_dir, ps_calls.read_text() if ps_calls.exists() else "", elapsed
+
+    def test_enumerates_every_thread_without_reading_command_lines(self) -> None:
+        # ps columns: TGID TID PPID STATE COMM. The leader is already a zombie,
+        # but its vCPU sibling is blocked in D state and still owns KVM resources.
+        output = (
+            "100 100 1 Z firecracker-def\n"
+            "100 101 1 D fc_vcpu 0\n"
+            "100 102 1 S fc_vcpu 1\n"
+            "200 200 1 S unrelated\n"
+        )
+
+        result, log_dir, ps_calls, _elapsed = self.run_guard(output)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotRegex(ps_calls, r"args|cmdline|command")
+        self.assertRegex(result.stdout, r"100\s+101")
+        self.assertIn("fc_vcpu 0", result.stdout)
+        self.assertRegex(result.stdout, r"100\s+102")
+        self.assertTrue((log_dir / "stray-vm-guard-post.log").is_file())
+        thread_report = log_dir / "stray-vm-threads-post-before.tsv"
+        self.assertTrue(thread_report.is_file())
+        self.assertIn("100\t101\t1\tD\tfc_vcpu 0", thread_report.read_text())
+
+    def test_scan_timeout_is_bounded_and_still_emits_artifacts(self) -> None:
+        result, log_dir, ps_calls, elapsed = self.run_guard("", hang_ps=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 4)
+        self.assertNotRegex(ps_calls, r"args|cmdline|command")
+        self.assertIn("timed out", result.stdout.lower())
+        self.assertTrue((log_dir / "stray-vm-guard-post.log").is_file())
+        self.assertTrue((log_dir / "stray-vm-threads-post-before.tsv").is_file())
+
+    def test_zero_target_scan_still_emits_diagnostics(self) -> None:
+        result, log_dir, _ps_calls, _elapsed = self.run_guard("")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("0 stray process group", result.stdout)
+        self.assertTrue((log_dir / "stray-vm-guard-post.log").is_file())
+        self.assertTrue((log_dir / "stray-vm-threads-post-before.tsv").is_file())
 
 
 if __name__ == "__main__":
