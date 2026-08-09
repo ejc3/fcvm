@@ -53,7 +53,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     python3 \
     fonts-dejavu-core \
-    socat \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial
 
 # Belt-and-braces half of the getenv/setenv workaround documented at length in
@@ -76,8 +75,7 @@ RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py \
      /opt/bench/cdp_health.py
 
 # The request path IS Chromium's DevTools Protocol endpoint -- no wrapper of
-# ours parses, re-encodes or re-frames a single CDP message. But reaching it
-# from the host needs ONE relay hop, and that is a MEASURED cost, not a detail:
+# ours parses, re-encodes or re-frames a single CDP message:
 #
 #   Chromium IGNORES --remote-debugging-address on this build (151.0.7922.71,
 #   Debian bookworm arm64). Verified, not assumed: the flag is present in
@@ -85,19 +83,14 @@ RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py \
 #   and nothing else -- in the same container where the page server's
 #   00000000:1F40 proves a wildcard bind works fine. It is Chromium, not us.
 #
-#   fcvm has NO feature that exposes a guest-LOOPBACK port to the host.
-#   --forward-localhost runs the other way (guest -> host: "enables containers
-#   to reach host-only services via localhost", src/cli/args.rs; the guest relay
-#   dials 10.0.2.2 at fc-agent/src/network.rs:479). Pointing it at 9222 does not
-#   just fail to help -- it HIJACKS the guest's own 127.0.0.1:9222 and breaks
-#   Chromium's readiness probe.
+#   fcvm publishes eligible TCP ports through fc-agent's PREROUTING DNAT to
+#   guest loopback. `--publish 9222:9222` therefore reaches Chromium directly.
+#   `--forward-localhost` remains the opposite direction (guest -> host) and
+#   cannot be combined with the same guest port.
 #
-# So: socat bridges guest-wildcard 9223 -> guest-loopback 9222, and fcvm's
-# --publish 9223:9223 carries host -> guest (clones inherit port_mappings from
-# snapshot metadata, src/commands/snapshot.rs:1001/1051/1070). socat is ~1 MB
-# resident and is the ONLY process this design adds to a clone; its cost is
-# reported rather than waved away.
-EXPOSE 9223
+# Clones inherit the published port from snapshot metadata. There is no
+# benchmark-owned relay or request server in the guest byte path.
+EXPOSE 9222
 
 # fcvm's health gate is the golden-snapshot trigger. With no `--health-check`
 # URL, `Healthy` = container running AND podman's HEALTHCHECK healthy

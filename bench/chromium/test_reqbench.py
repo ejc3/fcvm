@@ -2832,6 +2832,28 @@ printf 'rc=%s tracked=%s live=%s\n' "$rc" "$tracked" "$live"
                 sleeper.kill()
                 sleeper.wait(timeout=5)
 
+    def test_empty_cleanup_has_no_synthetic_process(self):
+        """An empty tracked-process array must stay empty under set -u."""
+        with tempfile.TemporaryDirectory() as d:
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+CLEANUP_PIDS=()
+set +e
+cleanup
+rc=$?
+set -e
+printf 'rc=%s count=%s\n' "$rc" "${{#CLEANUP_PIDS[@]}}"
+'''
+            env, _binx = self._env(d)
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "rc=0 count=0")
+            self.assertNotIn("survived SIGKILL", result.stderr)
+
     def test_track_replaces_a_reused_pid_identity_before_stopping_it(self):
         """A stale starttime must not make the new process invisible to cleanup."""
         with tempfile.TemporaryDirectory() as d:

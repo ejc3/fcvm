@@ -172,7 +172,7 @@ track() {
     local pid="${1:-}" existing start kept=()
     [ -n "$pid" ] || return 0
     start=$(process_identity "$pid") || return 0
-    for existing in "${CLEANUP_PIDS[@]:-}"; do
+    for existing in "${CLEANUP_PIDS[@]}"; do
         [ -n "$existing" ] || continue
         # A numeric PID may now identify a later process. Drop every older
         # identity for that number before recording the process we just read;
@@ -189,7 +189,7 @@ track() {
 
 untrack() {
     local remove="$1" entry kept=()
-    for entry in "${CLEANUP_PIDS[@]:-}"; do
+    for entry in "${CLEANUP_PIDS[@]}"; do
         [ "${entry%%:*}" = "$remove" ] || kept+=("$entry")
     done
     CLEANUP_PIDS=("${kept[@]}")
@@ -197,7 +197,7 @@ untrack() {
 
 tracked_entry() {
     local wanted="$1" entry
-    for entry in "${CLEANUP_PIDS[@]:-}"; do
+    for entry in "${CLEANUP_PIDS[@]}"; do
         [ "${entry%%:*}" = "$wanted" ] && { printf '%s\n' "$entry"; return 0; }
     done
     return 1
@@ -254,7 +254,7 @@ cleanup() {
         stop_tracked "$ACTIVE_DRIVER_BG" 180
         ACTIVE_DRIVER_BG=""
     fi
-    for entry in "${CLEANUP_PIDS[@]:-}"; do
+    for entry in "${CLEANUP_PIDS[@]}"; do
         pid=${entry%%:*}
         process_matches "$entry" && $SUDO kill -TERM "$pid" 2>/dev/null
     done
@@ -272,7 +272,7 @@ cleanup() {
         CLEANUP_PIDS=("${remaining[@]}")
         [ "${#CLEANUP_PIDS[@]}" -eq 0 ] || sleep 0.05
     done
-    for entry in "${CLEANUP_PIDS[@]:-}"; do
+    for entry in "${CLEANUP_PIDS[@]}"; do
         pid=${entry%%:*}
         process_matches "$entry" && $SUDO kill -KILL "$pid" 2>/dev/null
     done
@@ -290,7 +290,7 @@ cleanup() {
         CLEANUP_PIDS=("${remaining[@]}")
         [ "${#CLEANUP_PIDS[@]}" -eq 0 ] || sleep 0.05
     done
-    for entry in "${CLEANUP_PIDS[@]:-}"; do
+    for entry in "${CLEANUP_PIDS[@]}"; do
         log "ERROR: tracked process ${entry%%:*} survived SIGKILL; retaining its state and disk"
         cleanup_failed=1
     done
