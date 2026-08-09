@@ -12,11 +12,13 @@ There is no pytest in this repo, so this is stdlib `unittest` only.
 """
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
 import os
 import random
+import signal
 import shutil
 import subprocess
 import sys
@@ -25,6 +27,7 @@ import threading
 import time
 import unittest
 import urllib.request
+import warnings
 from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1504,6 +1507,226 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                 target.write(b" ")
             with self.assertRaisesRegex(RuntimeError, "snapshot_config_sha256"):
                 reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_main_holds_the_generation_lease_through_the_full_schedule(self):
+        """An exclusive tag replacement waits until reqbench.main returns."""
+        with tempfile.TemporaryDirectory() as data_root:
+            self._write_generation(
+                data_root, "11111111-1111-4111-8111-111111111111",
+            )
+            runtime_bundle = os.path.join(data_root, "runtime")
+            os.makedirs(runtime_bundle)
+            manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+            with open(manifest_path, "w") as target:
+                target.write("sealed runtime fixture\n")
+            fcvm = os.path.join(runtime_bundle, "fcvm")
+            with open(fcvm, "w") as target:
+                target.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fcvm, 0o755)
+
+            lock_path = os.path.join(
+                data_root, "snapshots", f"{self.SNAPSHOT}.lock",
+            )
+            begin_contender = threading.Event()
+            nonblocking_attempt_finished = threading.Event()
+            blocked_by_main = threading.Event()
+            acquired_while_main_active = threading.Event()
+            main_return_observed = threading.Event()
+            acquired_before_main_return = threading.Event()
+            exclusive_acquired = threading.Event()
+            contender_errors = []
+
+            def contend_for_generation():
+                try:
+                    if not begin_contender.wait(timeout=5):
+                        contender_errors.append("request never released contender")
+                        nonblocking_attempt_finished.set()
+                        return
+                    with open(lock_path, "a+") as contender_lock:
+                        try:
+                            fcntl.flock(
+                                contender_lock,
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                        except BlockingIOError:
+                            blocked_by_main.set()
+                        else:
+                            acquired_while_main_active.set()
+                            if not main_return_observed.is_set():
+                                acquired_before_main_return.set()
+                            exclusive_acquired.set()
+                            return
+                        finally:
+                            nonblocking_attempt_finished.set()
+                        fcntl.flock(contender_lock, fcntl.LOCK_EX)
+                        if not main_return_observed.is_set():
+                            acquired_before_main_return.set()
+                        exclusive_acquired.set()
+                except BaseException as error:  # keep thread failures observable
+                    contender_errors.append(repr(error))
+                    nonblocking_attempt_finished.set()
+
+            contender = threading.Thread(
+                target=contend_for_generation,
+                name="snapshot-generation-exclusive-contender",
+                daemon=True,
+            )
+            contender.start()
+
+            request_observations = []
+
+            def record(arm, rep):
+                return {
+                    "arm": arm,
+                    "rep": rep,
+                    "ok": True,
+                    "blocking_ms": 1.0,
+                    "wall_ms": 1.0,
+                    "teardown": {},
+                }
+
+            def run_exec(_args, rep):
+                begin_contender.set()
+                completed = nonblocking_attempt_finished.wait(timeout=5)
+                request_observations.append({
+                    "attempt_completed": completed,
+                    "blocked": blocked_by_main.is_set(),
+                    "acquired": exclusive_acquired.is_set(),
+                })
+                return record("exec", rep)
+
+            def run_noop(_args, rep):
+                return record("noop", rep)
+
+            def run_cdp(_args, rep, fast):
+                return record("cdp-fast" if fast else "cdp", rep)
+
+            saved = {
+                "HERE": reqbench.HERE,
+                "run_exec_request": reqbench.run_exec_request,
+                "run_noop_request": reqbench.run_noop_request,
+                "run_cdp_request": reqbench.run_cdp_request,
+                "sha256_file": reqbench.sha256_file,
+                "harness_sha256": reqbench.harness_sha256,
+                "command_text": reqbench.command_text,
+                "pending_signal": reqbench._pending_harness_signal,
+                "argv": sys.argv,
+                "profile": sys.getprofile(),
+                "sigint": signal.getsignal(signal.SIGINT),
+                "sigterm": signal.getsignal(signal.SIGTERM),
+            }
+            env_updates = {
+                "REQBENCH_RUNTIME_BUNDLE": runtime_bundle,
+                "REQBENCH_SOURCE_REVISION": "e" * 40,
+                "REQBENCH_GUARD_LOADAVG1": "0.1",
+                "REQBENCH_GUARD_VM_PROCESSES": "0",
+                "REQBENCH_QUIET_LOADAVG1_LIMIT": "2.0",
+                "REQBENCH_QUIET_GUARD": "1",
+                "ALLOW_BUSY": "0",
+            }
+            saved_env = {key: os.environ.get(key) for key in env_updates}
+            out_dir = os.path.join(data_root, "results")
+            rc = None
+
+            def observe_main_return(frame, event, _arg):
+                if event == "return" and frame.f_code is reqbench.main.__code__:
+                    main_return_observed.set()
+
+            exact_hashes = {
+                os.path.realpath(fcvm): "c" * 64,
+                os.path.realpath(manifest_path): "d" * 64,
+            }
+
+            def fixture_sha256(path):
+                return exact_hashes[os.path.realpath(path)]
+
+            try:
+                os.environ.update(env_updates)
+                reqbench.HERE = runtime_bundle
+                reqbench.run_exec_request = run_exec
+                reqbench.run_noop_request = run_noop
+                reqbench.run_cdp_request = run_cdp
+                reqbench.sha256_file = fixture_sha256
+                reqbench.harness_sha256 = lambda: "f" * 64
+                reqbench.command_text = lambda _argv: "fcvm fixture"
+                reqbench._pending_harness_signal = 0
+                sys.setprofile(observe_main_return)
+                sys.argv = [
+                    "reqbench.py",
+                    "--snapshot-tag", self.SNAPSHOT,
+                    "--snapshot-name", self.SNAPSHOT,
+                    "--url", "http://fixture/medium.html",
+                    # The recorded shuffle puts exec last for this seed, so the
+                    # rejected exclusive attempt occurs at the end of the real
+                    # schedule rather than only at its first request.
+                    "--arms", "cdp-fast,noop,exec",
+                    "--reps", "1",
+                    "--warmup", "0",
+                    "--image", "localhost/chromium-bench-req",
+                    "--image-id", "sha256:" + "b" * 64,
+                    "--network-mode", "rootless",
+                    "--cpu", "2",
+                    "--memory-mib", "1024",
+                    "--fcvm", fcvm,
+                    "--data-root", data_root,
+                    "--out-dir", out_dir,
+                    "--run-id", "1" * 32,
+                ]
+                # The CLI process exits after main. Calling it in-process makes
+                # unittest report the function's deliberate frame-lifetime
+                # close as a ResourceWarning; the lock ordering assertions below
+                # directly verify that close instead.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r"unclosed file .*reused-tag\.lock",
+                        category=ResourceWarning,
+                    )
+                    rc = reqbench.main()
+            finally:
+                begin_contender.set()
+                reqbench.HERE = saved["HERE"]
+                reqbench.run_exec_request = saved["run_exec_request"]
+                reqbench.run_noop_request = saved["run_noop_request"]
+                reqbench.run_cdp_request = saved["run_cdp_request"]
+                reqbench.sha256_file = saved["sha256_file"]
+                reqbench.harness_sha256 = saved["harness_sha256"]
+                reqbench.command_text = saved["command_text"]
+                reqbench._pending_harness_signal = saved["pending_signal"]
+                sys.argv = saved["argv"]
+                sys.setprofile(saved["profile"])
+                signal.signal(signal.SIGINT, saved["sigint"])
+                signal.signal(signal.SIGTERM, saved["sigterm"])
+                for key, value in saved_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+            acquired_after_main = exclusive_acquired.wait(timeout=5)
+            contender.join(timeout=5)
+            self.assertEqual(rc, 0)
+            self.assertEqual(contender_errors, [])
+            self.assertEqual(request_observations, [{
+                "attempt_completed": True,
+                "blocked": True,
+                "acquired": False,
+            }])
+            self.assertFalse(acquired_while_main_active.is_set())
+            self.assertTrue(main_return_observed.is_set())
+            self.assertFalse(acquired_before_main_return.is_set())
+            self.assertTrue(
+                acquired_after_main,
+                "exclusive lock did not acquire after reqbench.main returned",
+            )
+            self.assertFalse(contender.is_alive())
+            with open(os.path.join(out_dir, "reqbench.jsonl")) as source:
+                records = [json.loads(line) for line in source]
+            self.assertEqual(records[0]["kind"], "meta")
+            self.assertEqual(
+                {record["arm"] for record in records[1:]},
+                {"exec", "cdp-fast", "noop"},
+            )
 
 
 class AnalyzerAvailability(unittest.TestCase):
