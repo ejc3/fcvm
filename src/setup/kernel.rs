@@ -609,6 +609,46 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Shared shell fragment for publishing a complete kernel-source archive.
+///
+/// VM and host builds deliberately use the same protocol so a cancelled setup
+/// cannot leave either build path permanently pinned to a partial tarball.
+fn kernel_source_cache_shell() -> &'static str {
+    r#"# A valid final-name tarball is a commit marker. Never remove or write it
+# while downloading: stage into a unique sibling, validate the entire archive,
+# then replace the marker atomically. A setup process killed during curl leaves
+# the prior marker untouched, and the next run validates and retries it.
+validate_kernel_tarball() {
+    tar -tJf "$1" >/dev/null 2>&1
+}
+
+if ! validate_kernel_tarball "$KERNEL_TARBALL"; then
+    if [[ -f "$KERNEL_TARBALL" ]]; then
+        echo "Cached kernel source archive is incomplete; replacing it..."
+    fi
+    echo "Downloading kernel source..."
+    KERNEL_TARBALL_TEMP=$(mktemp "${KERNEL_TARBALL}.downloading.XXXXXX")
+    cleanup_kernel_tarball_temp() {
+        if [[ -n "${KERNEL_TARBALL_TEMP:-}" ]]; then
+            rm -f -- "$KERNEL_TARBALL_TEMP"
+        fi
+    }
+    trap cleanup_kernel_tarball_temp EXIT
+
+    if ! curl -fSL "$KERNEL_URL" -o "$KERNEL_TARBALL_TEMP"; then
+        echo "ERROR: Failed to download kernel source" >&2
+        exit 1
+    fi
+    if ! validate_kernel_tarball "$KERNEL_TARBALL_TEMP"; then
+        echo "ERROR: Downloaded kernel source is not a complete tar.xz archive" >&2
+        exit 1
+    fi
+
+    mv -f -- "$KERNEL_TARBALL_TEMP" "$KERNEL_TARBALL"
+    KERNEL_TARBALL_TEMP=""
+fi"#
+}
+
 /// Generate VM kernel build script dynamically from profile config.
 ///
 /// The script is written to a temp file and executed. This allows us to:
@@ -695,10 +735,7 @@ cd "$BUILD_DIR"
 KERNEL_TARBALL="linux-${{KERNEL_VERSION}}.tar.xz"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${{KERNEL_MAJOR}}.x/${{KERNEL_TARBALL}}"
 
-if [[ ! -f "$KERNEL_TARBALL" ]]; then
-    echo "Downloading kernel source..."
-    curl -fSL "$KERNEL_URL" -o "$KERNEL_TARBALL"
-fi
+{kernel_source_cache}
 
 # Check if source exists and has matching SHA
 if [[ -d "$SOURCE_DIR" ]]; then
@@ -806,6 +843,7 @@ fi"#
         },
         kernel_arch = kernel_arch,
         kernel_image = kernel_image,
+        kernel_source_cache = kernel_source_cache_shell(),
         base_config_url = base_config_url,
         kernel_config_line = kernel_config
             .as_ref()
@@ -953,10 +991,7 @@ cd "$BUILD_DIR"
 KERNEL_TARBALL="linux-${{KERNEL_VERSION}}.tar.xz"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${{KERNEL_MAJOR}}.x/${{KERNEL_TARBALL}}"
 
-if [[ ! -f "$KERNEL_TARBALL" ]]; then
-    echo "Downloading kernel source..."
-    curl -fSL "$KERNEL_URL" -o "$KERNEL_TARBALL"
-fi
+{kernel_source_cache}
 
 # Check if source exists and has matching SHA
 if [[ -d "$SOURCE_DIR" ]]; then
@@ -1033,6 +1068,7 @@ echo "  sudo reboot"
         kernel_version = kernel_version,
         kernel_major = kernel_major,
         sha = sha,
+        kernel_source_cache = kernel_source_cache_shell(),
         patches_dir_line = patches_dir
             .as_ref()
             .map(|p| format!("PATCHES_DIR=\"{}\"", p.display()))
@@ -2178,6 +2214,125 @@ async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn vm_kernel_build_replaces_interrupted_cached_source_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build_dir = tmp.path().join("build");
+        let fixture_dir = tmp.path().join("fixture");
+        let fixture_source = fixture_dir.join("linux-1.2.3");
+        let fake_bin = tmp.path().join("bin");
+        let output = tmp.path().join("output/vmlinux.bin");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::create_dir_all(&fixture_source).unwrap();
+        std::fs::create_dir_all(&fake_bin).unwrap();
+
+        // Model a setup process killed while curl was still writing the old
+        // final-name cache entry. The old implementation saw this file,
+        // skipped the download, and handed truncated bytes directly to tar.
+        let cached_tarball = build_dir.join("linux-1.2.3.tar.xz");
+        std::fs::write(&cached_tarball, b"interrupted kernel download").unwrap();
+
+        std::fs::write(fixture_source.join("README"), b"kernel source fixture\n").unwrap();
+        let valid_tarball = tmp.path().join("valid-linux-1.2.3.tar.xz");
+        let tar_status = std::process::Command::new("tar")
+            .args(["-cJf"])
+            .arg(&valid_tarball)
+            .arg("-C")
+            .arg(&fixture_dir)
+            .arg("linux-1.2.3")
+            .status()
+            .unwrap();
+        assert!(
+            tar_status.success(),
+            "creating kernel source fixture failed"
+        );
+
+        write_executable(
+            &fake_bin.join("curl"),
+            r#"#!/bin/bash
+set -euo pipefail
+url=""
+output=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) output="$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+if [[ "$url" == *.tar.xz ]]; then
+    # The invalid final-name entry remains the cache's old commit marker until
+    # the complete staging archive atomically replaces it. Removing it first
+    # could race another builder that has just published a valid archive.
+    grep -Fq 'interrupted kernel download' "$FCVM_TEST_CACHED_TARBALL"
+    cp "$FCVM_TEST_KERNEL_TARBALL" "$output"
+else
+    printf 'CONFIG_FUSE_FS=y\n' >"$output"
+fi
+"#,
+        );
+        write_executable(
+            &fake_bin.join("make"),
+            r#"#!/bin/bash
+set -euo pipefail
+mkdir -p arch/arm64/boot
+printf 'complete kernel image\n' >vmlinux
+cp vmlinux arch/arm64/boot/Image
+"#,
+        );
+
+        let profile = KernelProfile {
+            kernel_version: "1.2.3".to_string(),
+            base_config_url: Some("https://fixture.invalid/base.config".to_string()),
+            patches_dir: Some(String::new()),
+            ..Default::default()
+        };
+        let script = generate_vm_kernel_build_script(
+            &profile,
+            "fixture",
+            "0123456789ab",
+            &output,
+            tmp.path(),
+        )
+        .unwrap();
+        let script_path = tmp.path().join("kernel-build.sh");
+        write_executable(&script_path, &script);
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let status = std::process::Command::new(&script_path)
+            .env("BUILD_DIR", &build_dir)
+            .env("FCVM_TEST_CACHED_TARBALL", &cached_tarball)
+            .env("FCVM_TEST_KERNEL_TARBALL", &valid_tarball)
+            .env(
+                "PATH",
+                format!("{}:{}", fake_bin.display(), path.to_string_lossy()),
+            )
+            .output()
+            .unwrap();
+
+        assert!(
+            status.status.success(),
+            "generated kernel build did not recover from the interrupted archive\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete kernel image\n");
+        assert!(
+            std::process::Command::new("xz")
+                .arg("-t")
+                .arg(&cached_tarball)
+                .status()
+                .unwrap()
+                .success(),
+            "the final cache entry must be a complete xz stream"
+        );
+    }
 
     fn profile_with_inputs(build_inputs: Vec<String>) -> KernelProfile {
         KernelProfile {
