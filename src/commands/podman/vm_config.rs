@@ -582,8 +582,8 @@ fn guest_reachable_ntp(ip: &std::net::IpAddr) -> bool {
 ///
 /// The guest cannot read the host's chrony.conf — nothing mounts the host's /etc into
 /// a VM — so the boot plan carries the servers instead. Resolution happens here, on
-/// the host, for the same reason proxy URLs are resolved here: the guest adds each
-/// one with `chronyc add server <addr>`, and an address needs no guest-side DNS.
+/// the host, for the same reason proxy URLs are resolved here: the guest writes each
+/// one as a `server <addr>` directive in chrony.conf, and an address needs no guest-side DNS.
 ///
 /// This is a blocking lookup on the launch path, so it was measured rather than
 /// assumed: 0.2-0.5ms warm and 5.5ms on the first (cold-resolver) call on a c7g box

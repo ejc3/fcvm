@@ -439,8 +439,8 @@ pub struct MmdsRuntime {
     pub host_time: String,
     /// The host's NTP servers, already resolved to addresses, for the guest's chronyd.
     ///
-    /// Resolved host-side for the same reason proxies are: the guest configures them
-    /// through `chronyc add server`, which takes an address, and shipping addresses
+    /// Resolved host-side for the same reason proxies are: the guest writes them
+    /// into chrony.conf as `server <addr>` directives, and shipping addresses
     /// means the guest needs no DNS of its own to end up with real sources.
     pub ntp_servers: Vec<String>,
 }
