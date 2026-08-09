@@ -150,7 +150,10 @@ endif
 # shell source: a checkout path containing a quote would otherwise break make, and
 # a crafted path could inject shell syntax at expansion time. The basename is also
 # sanitized to [A-Za-z0-9._-] so it cannot introduce path separators.
-CARGO_TARGET_BTRFS := /mnt/fcvm-btrfs/cargo-target/$(shell \
+# Overridable ONLY so tests/test_cargo_target_link.rs can point the recipe below at
+# a temp dir instead of the real volume. Nothing else in this Makefile reads it.
+BTRFS_ROOT ?= /mnt/fcvm-btrfs
+CARGO_TARGET_BTRFS := $(BTRFS_ROOT)/cargo-target/$(shell \
 	p=$$(pwd -P); \
 	name=$$(printf '%s' "$$(basename "$$p")" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'); \
 	hash=$$(printf '%s' "$$p" | sha256sum | cut -c1-8); \
@@ -295,9 +298,9 @@ cargo-target-link:
 	@# another worktree built. Observed 2026-08-08: a run in worktree A listed a
 	@# test that exists only in worktree B and silently omitted the one under
 	@# test, which makes red/green verification meaningless.
-	@if [ -d /mnt/fcvm-btrfs ]; then \
+	@if [ -d $(BTRFS_ROOT) ]; then \
 		WT_TARGET="$(CARGO_TARGET_BTRFS)"; \
-		mkdir -p "$$WT_TARGET"; \
+		mkdir -p "$$WT_TARGET" || { echo "ERROR: cannot create $$WT_TARGET"; exit 1; }; \
 		if [ -L target ] && [ "$$(readlink target)" != "$$WT_TARGET" ]; then \
 			echo "==> Repointing shared target/ → $$WT_TARGET (per-worktree)"; \
 			rm -f target; \
@@ -311,6 +314,33 @@ cargo-target-link:
 			ln -s "$$WT_TARGET" target; \
 			echo "==> Symlinked target/ → $$WT_TARGET"; \
 		fi; \
+	else \
+		echo "==> NOTE: $(BTRFS_ROOT) is not a directory; build artifacts stay on the root filesystem"; \
+	fi
+	@# Self-heal a DANGLING link. The block above only runs when $(BTRFS_ROOT) is
+	@# present, and it trusts an existing symlink without checking that it still
+	@# resolves — but the volume is ephemeral (scripts/runner-disk-preflight.sh
+	@# prunes idle cargo-target dirs, and a runner can come back with the volume
+	@# reset) while the checkout persists across jobs. Cargo does not create the
+	@# directory through a dangling link: it renames a tempdir onto the path, which
+	@# fails on an existing symlink with `Not a directory (os error 20)`. That took
+	@# out Host-arm64 on every open PR on 2026-08-08. `~/.cargo` right below already
+	@# self-heals for exactly this reason.
+	@if [ -L target ] && ! [ -d target ]; then \
+		TGT=$$(readlink target); \
+		echo "==> target/ → $$TGT is dangling (volume reset?); recreating"; \
+		mkdir -p "$$TGT" 2>/dev/null || { \
+			echo "==> WARNING: cannot recreate $$TGT; using a local target/ on the root filesystem"; \
+			rm -f target; \
+		}; \
+	fi
+	@# Fail closed. Every build/test recipe runs cargo with CARGO_TARGET_DIR=target,
+	@# so leaving it unusable turns into an opaque cargo error several steps later.
+	@[ -e target ] || mkdir -p target
+	@if [ ! -d target ]; then \
+		echo "ERROR: target exists but is not a usable directory:"; \
+		ls -ld target; \
+		exit 1; \
 	fi
 
 
