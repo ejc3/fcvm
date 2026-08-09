@@ -853,21 +853,79 @@ class TeardownFastCpuAccounting(unittest.TestCase):
     """
 
     def test_control_window_does_not_measure_our_own_spin(self):
+        from unittest import mock
+
         p = spawn_pdeathsig_parent(["sleep", "300"])
         wait_for_child(p.pid)
         before = self_cpu_ms()
-        out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
+        calls = []
+        real_machine = reqbench.machine_cpu_ms
+        real_self = reqbench.self_cpu_ms
+
+        def machine_counter():
+            calls.append("machine")
+            return real_machine()
+
+        def self_counter():
+            calls.append("self")
+            return real_self()
+
+        with (
+            mock.patch.object(reqbench, "machine_cpu_ms", side_effect=machine_counter),
+            mock.patch.object(reqbench, "self_cpu_ms", side_effect=self_counter),
+        ):
+            out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
         spent = self_cpu_ms() - before
         p.wait(timeout=5)
+        self.assertEqual(
+            calls,
+            ["machine", "self", "self", "machine"] * 2,
+            "each host-wide counter window must strictly enclose its harness window",
+        )
         # 50 ms of control window: a spin would put >=45 ms of user time in it.
-        # The whole call (control + reclaim sampling) must stay well under that.
+        # The harness counter advances in 10 ms jiffies here, so compare to the
+        # measured wall window rather than demanding a sub-tick absolute 5 ms.
         self.assertLess(
             out["control_harness_cpu_ms"],
-            5.0,
+            0.5 * out["control_wall_ms"],
             f"control window burned {out['control_harness_cpu_ms']:.1f} ms of OUR cpu "
             f"(total call {spent:.1f} ms) — it is spinning, so control_busy_cores "
             f"({out['control_busy_cores']:.2f}) is ambient + the harness",
         )
+        self.assertGreaterEqual(out["control_busy_cores"], 0.0)
+        self.assertLessEqual(
+            out["control_busy_cores_lo"], out["control_busy_cores"]
+        )
+        self.assertLessEqual(
+            out["control_busy_cores"], out["control_busy_cores_hi"]
+        )
+        self.assertEqual(
+            out["machine_cpu_source"],
+            "/proc/stat:busy(user,nice,system,irq,softirq,steal)",
+        )
+        self.assertEqual(out["harness_cpu_source"], "/proc/self/stat:utime+stime")
+
+    def test_cpu_residual_clamps_only_within_declared_resolution(self):
+        uncertainty = reqbench.CPU_RESIDUAL_UNCERTAINTY_MS
+        within = reqbench.bounded_cpu_residual(0.0, uncertainty / 2)
+        self.assertLess(within["raw_ms"], 0.0)
+        self.assertEqual(within["point_ms"], 0.0)
+        self.assertEqual(within["lo_ms"], 0.0)
+        self.assertGreater(within["hi_ms"], 0.0)
+        self.assertIs(within["clamped"], True)
+
+        normal = reqbench.bounded_cpu_residual(30.0, 10.0)
+        self.assertEqual(normal["raw_ms"], 20.0)
+        self.assertEqual(normal["point_ms"], 20.0)
+        self.assertLessEqual(normal["lo_ms"], normal["point_ms"])
+        self.assertLessEqual(normal["point_ms"], normal["hi_ms"])
+        self.assertIs(normal["clamped"], False)
+
+    def test_cpu_residual_rejects_an_impossible_negative_delta(self):
+        with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
+            reqbench.bounded_cpu_residual(
+                0.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 10.0
+            )
 
     def test_reclaim_sampler_does_not_burn_a_core(self):
         """The RECLAIM window must not spin either — the control window is only half.
@@ -2016,14 +2074,63 @@ class AnalyzerAvailability(unittest.TestCase):
                         },
                     }
                 if arm == "cdp-fast":
+                    machine_resolution = 10.0
+                    harness_resolution = 10.0
+                    uncertainty = (
+                        6 * machine_resolution + 2 * harness_resolution
+                    )
+                    machine_raw = 10.0 - 1.0
+                    machine_net = max(0.0, machine_raw)
+                    machine_lo = max(0.0, machine_raw - uncertainty)
+                    machine_hi = max(0.0, machine_raw + uncertainty)
+                    control_raw = 5.0 - 1.0
+                    control_net = max(0.0, control_raw)
+                    control_lo = max(0.0, control_raw - uncertainty)
+                    control_hi = max(0.0, control_raw + uncertainty)
+                    control_wall = 50.0
+                    control_rate = control_net / control_wall
+                    control_rate_lo = control_lo / control_wall
+                    control_rate_hi = control_hi / control_wall
+                    machine_window = 10.0
                     record["teardown"].update({
-                        "accounting_version": "post-terminal-ambient-v1",
+                        "accounting_version": "post-terminal-ambient-v2",
                         "reap_wall_ms": 1.0,
-                        "machine_cpu_ms": 1.0,
-                        "harness_cpu_ms": 0.0,
-                        "machine_cpu_ms_excess": 1.0,
-                        "control_busy_cores": 0.0,
-                        "control_harness_cpu_ms": 0.0,
+                        "machine_cpu_ms": 10.0,
+                        "harness_cpu_ms": 1.0,
+                        "machine_cpu_window_ms": machine_window,
+                        "machine_cpu_ms_raw": machine_raw,
+                        "machine_cpu_ms_net": machine_net,
+                        "machine_cpu_ms_net_lo": machine_lo,
+                        "machine_cpu_ms_net_hi": machine_hi,
+                        "machine_cpu_ms_subtraction_clamped": False,
+                        "machine_cpu_ms_excess": (
+                            machine_net - control_rate * machine_window
+                        ),
+                        "machine_cpu_ms_excess_lo": (
+                            machine_lo - control_rate_hi * machine_window
+                        ),
+                        "machine_cpu_ms_excess_hi": (
+                            machine_hi - control_rate_lo * machine_window
+                        ),
+                        "control_machine_cpu_ms": 5.0,
+                        "control_harness_cpu_ms": 1.0,
+                        "control_wall_ms": control_wall,
+                        "control_target_ms": 50.0,
+                        "control_cpu_ms_raw": control_raw,
+                        "control_cpu_ms_net": control_net,
+                        "control_cpu_ms_net_lo": control_lo,
+                        "control_cpu_ms_net_hi": control_hi,
+                        "control_cpu_ms_subtraction_clamped": False,
+                        "control_busy_cores": control_rate,
+                        "control_busy_cores_lo": control_rate_lo,
+                        "control_busy_cores_hi": control_rate_hi,
+                        "cpu_residual_uncertainty_ms": uncertainty,
+                        "machine_cpu_source": (
+                            "/proc/stat:busy(user,nice,system,irq,softirq,steal)"
+                        ),
+                        "machine_cpu_resolution_ms": machine_resolution,
+                        "harness_cpu_source": "/proc/self/stat:utime+stime",
+                        "harness_cpu_resolution_ms": harness_resolution,
                         "sample_period_s": 0.0002,
                         "tick_ms": 10.0,
                         "per_child_cpu": {
@@ -2351,6 +2458,46 @@ class AnalyzerAvailability(unittest.TestCase):
                 ),
                 "invalid cpu_before_ms=-1.0",
             ),
+            (
+                "negative-control-rate", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "control_busy_cores", -0.1
+                ),
+                "invalid control_busy_cores=-0.1",
+            ),
+            (
+                "missing-control-raw", "cdp-fast",
+                lambda record: record["teardown"].pop("control_cpu_ms_raw"),
+                "no finite control_cpu_ms_raw",
+            ),
+            (
+                "contradictory-control-net", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "control_cpu_ms_net", 5.0
+                ),
+                "control_cpu_ms_net=5.0 does not match derived",
+            ),
+            (
+                "contradictory-control-bound", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "control_busy_cores_hi", 0.01
+                ),
+                "control_busy_cores_hi=0.01 does not match derived",
+            ),
+            (
+                "contradictory-clamp", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "machine_cpu_ms_subtraction_clamped", True
+                ),
+                "clamp classification contradicts",
+            ),
+            (
+                "stale-accounting-version", "cdp-fast",
+                lambda record: record["teardown"].__setitem__(
+                    "accounting_version", "post-terminal-ambient-v1"
+                ),
+                "stale accounting semantics",
+            ),
         )
         with tempfile.TemporaryDirectory() as d:
             for name, arm, mutation, expected in cases:
@@ -2362,6 +2509,126 @@ class AnalyzerAvailability(unittest.TestCase):
                     self.assertTrue(
                         any(expected in error for error in errors),
                         errors,
+                    )
+
+    def test_in_resolution_negative_control_is_transparent_and_valid(self):
+        def clamp_control(record):
+            teardown = record["teardown"]
+            uncertainty = teardown["cpu_residual_uncertainty_ms"]
+            teardown["control_machine_cpu_ms"] = 0.0
+            teardown["control_harness_cpu_ms"] = 10.0
+            teardown["control_cpu_ms_raw"] = -10.0
+            teardown["control_cpu_ms_net"] = 0.0
+            teardown["control_cpu_ms_net_lo"] = 0.0
+            teardown["control_cpu_ms_net_hi"] = uncertainty - 10.0
+            teardown["control_cpu_ms_subtraction_clamped"] = True
+            teardown["control_busy_cores"] = 0.0
+            teardown["control_busy_cores_lo"] = 0.0
+            teardown["control_busy_cores_hi"] = (
+                (uncertainty - 10.0) / teardown["control_wall_ms"]
+            )
+            machine_window = teardown["machine_cpu_window_ms"]
+            teardown["machine_cpu_ms_excess"] = teardown["machine_cpu_ms_net"]
+            teardown["machine_cpu_ms_excess_lo"] = (
+                teardown["machine_cpu_ms_net_lo"]
+                - teardown["control_busy_cores_hi"] * machine_window
+            )
+            teardown["machine_cpu_ms_excess_hi"] = (
+                teardown["machine_cpu_ms_net_hi"]
+            )
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "clamped-control.jsonl")
+            self._write_clean_backend(src, "file", 6, 384.0)
+            self._mutate_record(src, "cdp-fast", clamp_control)
+            self.assertEqual(self._metadata_errors(src), [])
+
+    def test_accounting_resolution_and_window_are_bound_to_raw_evidence(self):
+        def recompute(teardown):
+            uncertainty = 6 * teardown["machine_cpu_resolution_ms"] + 2 * (
+                teardown["harness_cpu_resolution_ms"]
+            )
+            teardown["cpu_residual_uncertainty_ms"] = uncertainty
+            for prefix, machine_field, harness_field in (
+                ("machine_cpu_ms", "machine_cpu_ms", "harness_cpu_ms"),
+                (
+                    "control_cpu_ms",
+                    "control_machine_cpu_ms",
+                    "control_harness_cpu_ms",
+                ),
+            ):
+                raw = teardown[machine_field] - teardown[harness_field]
+                teardown[f"{prefix}_raw"] = raw
+                teardown[f"{prefix}_net"] = max(0.0, raw)
+                teardown[f"{prefix}_net_lo"] = max(0.0, raw - uncertainty)
+                teardown[f"{prefix}_net_hi"] = max(0.0, raw + uncertainty)
+                teardown[f"{prefix}_subtraction_clamped"] = raw < 0.0
+            control_wall = teardown["control_wall_ms"]
+            teardown["control_busy_cores"] = (
+                teardown["control_cpu_ms_net"] / control_wall
+            )
+            teardown["control_busy_cores_lo"] = (
+                teardown["control_cpu_ms_net_lo"] / control_wall
+            )
+            teardown["control_busy_cores_hi"] = (
+                teardown["control_cpu_ms_net_hi"] / control_wall
+            )
+            machine_window = teardown["machine_cpu_window_ms"]
+            teardown["machine_cpu_ms_excess"] = (
+                teardown["machine_cpu_ms_net"]
+                - teardown["control_busy_cores"] * machine_window
+            )
+            teardown["machine_cpu_ms_excess_lo"] = (
+                teardown["machine_cpu_ms_net_lo"]
+                - teardown["control_busy_cores_hi"] * machine_window
+            )
+            teardown["machine_cpu_ms_excess_hi"] = (
+                teardown["machine_cpu_ms_net_hi"]
+                - teardown["control_busy_cores_lo"] * machine_window
+            )
+
+        def forge_narrow_resolution(record):
+            teardown = record["teardown"]
+            teardown["machine_cpu_resolution_ms"] = 0.001
+            teardown["harness_cpu_resolution_ms"] = 0.001
+            recompute(teardown)
+
+        def forge_short_machine_window(record):
+            teardown = record["teardown"]
+            teardown["machine_cpu_window_ms"] = teardown["reap_wall_ms"] / 2
+            recompute(teardown)
+
+        def forge_short_control_window(record):
+            teardown = record["teardown"]
+            teardown["control_wall_ms"] = teardown["control_target_ms"] / 2
+            recompute(teardown)
+
+        cases = (
+            (
+                "forged-resolution",
+                forge_narrow_resolution,
+                "machine_cpu_resolution_ms=0.001 does not match derived 10.0",
+            ),
+            (
+                "short-machine-window",
+                forge_short_machine_window,
+                "machine CPU window does not enclose reap_wall_ms",
+            ),
+            (
+                "short-control-window",
+                forge_short_control_window,
+                "control window ended before its declared target",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for name, mutation, expected in cases:
+                with self.subTest(name=name):
+                    src = os.path.join(d, f"{name}.jsonl")
+                    self._write_clean_backend(src, "file", 6, 384.0)
+                    self._mutate_record(src, "cdp-fast", mutation)
+                    errors = self._metadata_errors(src)
+                    self.assertTrue(
+                        any(expected in error for error in errors), errors
                     )
 
     def test_busy_host_evidence_and_allow_busy_override_gate_publication(self):

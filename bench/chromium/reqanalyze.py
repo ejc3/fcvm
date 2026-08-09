@@ -52,7 +52,7 @@ MIN_CDP_ATTEMPTS_PER_BACKEND = 200
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
-ANALYZER_SCHEMA_VERSION = 3
+ANALYZER_SCHEMA_VERSION = 4
 SEALED_ANALYZER_FD_ENV = "REQANALYZE_SEALED_FD"
 ANALYZER_SOURCE_PATH_ENV = "REQANALYZE_SOURCE_PATH"
 
@@ -581,19 +581,40 @@ def _validate_schedule(dataset):
             for metric in (
                 "signal_ms", "reap_wall_ms", "fcvm_exit_ms",
                 "teardown_total_ms", "disk_reap_ms", "machine_cpu_ms",
-                "harness_cpu_ms", "control_busy_cores",
-                "control_harness_cpu_ms", "sample_period_s", "tick_ms",
+                "harness_cpu_ms", "machine_cpu_window_ms",
+                "machine_cpu_ms_net", "machine_cpu_ms_net_lo",
+                "machine_cpu_ms_net_hi", "control_machine_cpu_ms",
+                "control_harness_cpu_ms", "control_wall_ms", "control_target_ms",
+                "control_cpu_ms_net", "control_cpu_ms_net_lo",
+                "control_cpu_ms_net_hi", "control_busy_cores",
+                "control_busy_cores_lo", "control_busy_cores_hi",
+                "cpu_residual_uncertainty_ms", "machine_cpu_resolution_ms",
+                "harness_cpu_resolution_ms", "sample_period_s", "tick_ms",
             ):
                 value = teardown.get(metric)
                 if value is not None and not finite_nonnegative(value):
                     errors.append(
                         f"{rlabel} teardown has invalid {metric}={value!r}"
                     )
-            excess = teardown.get("machine_cpu_ms_excess")
-            if excess is not None and not finite_number(excess):
-                errors.append(
-                    f"{rlabel} teardown has invalid machine_cpu_ms_excess={excess!r}"
-                )
+            for metric in (
+                "machine_cpu_ms_raw", "control_cpu_ms_raw",
+                "machine_cpu_ms_excess", "machine_cpu_ms_excess_lo",
+                "machine_cpu_ms_excess_hi",
+            ):
+                value = teardown.get(metric)
+                if value is not None and not finite_number(value):
+                    errors.append(
+                        f"{rlabel} teardown has invalid {metric}={value!r}"
+                    )
+            for field in (
+                "machine_cpu_ms_subtraction_clamped",
+                "control_cpu_ms_subtraction_clamped",
+            ):
+                value = teardown.get(field)
+                if value is not None and not isinstance(value, bool):
+                    errors.append(
+                        f"{rlabel} teardown has invalid {field}={value!r}"
+                    )
             processes = teardown.get("per_child_cpu")
             if processes is not None:
                 if not isinstance(processes, dict):
@@ -724,24 +745,194 @@ def _validate_schedule(dataset):
                                     f"{rlabel} CDP render has invalid nav.{field}"
                                 )
                 if arm == "cdp-fast" and isinstance(teardown, dict):
-                    if teardown.get("accounting_version") != "post-terminal-ambient-v1":
+                    if teardown.get("accounting_version") != "post-terminal-ambient-v2":
                         errors.append(f"{rlabel} fast teardown has stale accounting semantics")
-                    for metric in ("reap_wall_ms", "teardown_total_ms"):
-                        if not finite_nonnegative(teardown.get(metric)):
-                            errors.append(f"{rlabel} fast teardown has no valid {metric}")
                     for metric in (
-                        "machine_cpu_ms", "harness_cpu_ms",
-                        "control_busy_cores",
-                        "control_harness_cpu_ms", "sample_period_s", "tick_ms",
+                        "reap_wall_ms", "teardown_total_ms", "machine_cpu_ms",
+                        "harness_cpu_ms", "machine_cpu_window_ms",
+                        "machine_cpu_ms_net", "machine_cpu_ms_net_lo",
+                        "machine_cpu_ms_net_hi", "control_machine_cpu_ms",
+                        "control_harness_cpu_ms", "control_wall_ms", "control_target_ms",
+                        "control_cpu_ms_net", "control_cpu_ms_net_lo",
+                        "control_cpu_ms_net_hi", "control_busy_cores",
+                        "control_busy_cores_lo", "control_busy_cores_hi",
+                        "cpu_residual_uncertainty_ms", "machine_cpu_resolution_ms",
+                        "harness_cpu_resolution_ms", "sample_period_s", "tick_ms",
                     ):
                         if not finite_nonnegative(teardown.get(metric)):
                             errors.append(
                                 f"{rlabel} fast teardown has no valid {metric}"
                             )
-                    if not finite_number(teardown.get("machine_cpu_ms_excess")):
-                        errors.append(
-                            f"{rlabel} fast teardown has no finite machine_cpu_ms_excess"
+                    for metric in (
+                        "machine_cpu_window_ms", "control_wall_ms", "control_target_ms",
+                        "cpu_residual_uncertainty_ms", "machine_cpu_resolution_ms",
+                        "harness_cpu_resolution_ms", "sample_period_s", "tick_ms",
+                    ):
+                        if not finite_positive(teardown.get(metric)):
+                            errors.append(
+                                f"{rlabel} fast teardown has no positive {metric}"
+                            )
+                    for metric in (
+                        "machine_cpu_ms_raw", "control_cpu_ms_raw",
+                        "machine_cpu_ms_excess", "machine_cpu_ms_excess_lo",
+                        "machine_cpu_ms_excess_hi",
+                    ):
+                        if not finite_number(teardown.get(metric)):
+                            errors.append(
+                                f"{rlabel} fast teardown has no finite {metric}"
+                            )
+                    if teardown.get("machine_cpu_source") != (
+                        "/proc/stat:busy(user,nice,system,irq,softirq,steal)"
+                    ):
+                        errors.append(f"{rlabel} fast teardown has wrong machine CPU source")
+                    if teardown.get("harness_cpu_source") != (
+                        "/proc/self/stat:utime+stime"
+                    ):
+                        errors.append(f"{rlabel} fast teardown has wrong harness CPU source")
+                    for field in (
+                        "machine_cpu_ms_subtraction_clamped",
+                        "control_cpu_ms_subtraction_clamped",
+                    ):
+                        if not isinstance(teardown.get(field), bool):
+                            errors.append(f"{rlabel} fast teardown has no valid {field}")
+
+                    def close_enough(field, expected):
+                        actual = teardown.get(field)
+                        if not finite_number(actual) or not math.isclose(
+                            actual, expected, rel_tol=1e-9, abs_tol=1e-6
+                        ):
+                            errors.append(
+                                f"{rlabel} fast teardown {field}={actual!r} "
+                                f"does not match derived {expected!r}"
+                            )
+
+                    machine_resolution = teardown.get("machine_cpu_resolution_ms")
+                    harness_resolution = teardown.get("harness_cpu_resolution_ms")
+                    if finite_positive(machine_resolution) and finite_positive(
+                        harness_resolution
+                    ):
+                        tick_ms = teardown.get("tick_ms")
+                        if finite_positive(tick_ms):
+                            close_enough("machine_cpu_resolution_ms", tick_ms)
+                            close_enough("harness_cpu_resolution_ms", tick_ms)
+                        uncertainty = (
+                            6 * machine_resolution + 2 * harness_resolution
                         )
+                        close_enough("cpu_residual_uncertainty_ms", uncertainty)
+
+                        def validate_residual(prefix, machine_field, harness_field):
+                            machine = teardown.get(machine_field)
+                            harness = teardown.get(harness_field)
+                            if not (
+                                finite_nonnegative(machine)
+                                and finite_nonnegative(harness)
+                            ):
+                                return
+                            raw = machine - harness
+                            close_enough(f"{prefix}_raw", raw)
+                            close_enough(f"{prefix}_net", max(0.0, raw))
+                            close_enough(
+                                f"{prefix}_net_lo", max(0.0, raw - uncertainty)
+                            )
+                            close_enough(
+                                f"{prefix}_net_hi", max(0.0, raw + uncertainty)
+                            )
+                            clamped = teardown.get(f"{prefix}_subtraction_clamped")
+                            if clamped is not (raw < 0.0):
+                                errors.append(
+                                    f"{rlabel} fast teardown {prefix} clamp "
+                                    "classification contradicts its raw residual"
+                                )
+                            if raw < -uncertainty - 1e-6:
+                                errors.append(
+                                    f"{rlabel} fast teardown {prefix} raw residual "
+                                    "exceeds its negative counter-resolution bound"
+                                )
+
+                        validate_residual(
+                            "machine_cpu_ms", "machine_cpu_ms", "harness_cpu_ms"
+                        )
+                        validate_residual(
+                            "control_cpu_ms",
+                            "control_machine_cpu_ms",
+                            "control_harness_cpu_ms",
+                        )
+
+                        control_wall = teardown.get("control_wall_ms")
+                        control_target = teardown.get("control_target_ms")
+                        if finite_positive(control_target):
+                            close_enough("control_target_ms", 50.0)
+                        if (
+                            finite_positive(control_wall)
+                            and finite_positive(control_target)
+                            and control_wall + 1e-6 < control_target
+                        ):
+                            errors.append(
+                                f"{rlabel} fast teardown control window ended "
+                                "before its declared target"
+                            )
+                        machine_window = teardown.get("machine_cpu_window_ms")
+                        reap_wall = teardown.get("reap_wall_ms")
+                        if (
+                            finite_positive(machine_window)
+                            and finite_nonnegative(reap_wall)
+                            and machine_window + 1e-6 < reap_wall
+                        ):
+                            errors.append(
+                                f"{rlabel} fast teardown machine CPU window does "
+                                "not enclose reap_wall_ms"
+                            )
+                        control_net = teardown.get("control_cpu_ms_net")
+                        control_lo = teardown.get("control_cpu_ms_net_lo")
+                        control_hi = teardown.get("control_cpu_ms_net_hi")
+                        machine_net = teardown.get("machine_cpu_ms_net")
+                        machine_lo = teardown.get("machine_cpu_ms_net_lo")
+                        machine_hi = teardown.get("machine_cpu_ms_net_hi")
+                        if (
+                            finite_positive(control_wall)
+                            and all(
+                                finite_nonnegative(value)
+                                for value in (control_net, control_lo, control_hi)
+                            )
+                        ):
+                            control_rate = control_net / control_wall
+                            control_rate_lo = control_lo / control_wall
+                            control_rate_hi = control_hi / control_wall
+                            close_enough("control_busy_cores", control_rate)
+                            close_enough("control_busy_cores_lo", control_rate_lo)
+                            close_enough("control_busy_cores_hi", control_rate_hi)
+                            if (
+                                finite_positive(machine_window)
+                                and all(
+                                    finite_nonnegative(value)
+                                    for value in (machine_net, machine_lo, machine_hi)
+                                )
+                            ):
+                                close_enough(
+                                    "machine_cpu_ms_excess",
+                                    machine_net - control_rate * machine_window,
+                                )
+                                close_enough(
+                                    "machine_cpu_ms_excess_lo",
+                                    machine_lo - control_rate_hi * machine_window,
+                                )
+                                close_enough(
+                                    "machine_cpu_ms_excess_hi",
+                                    machine_hi - control_rate_lo * machine_window,
+                                )
+                                excess = teardown.get("machine_cpu_ms_excess")
+                                excess_lo = teardown.get("machine_cpu_ms_excess_lo")
+                                excess_hi = teardown.get("machine_cpu_ms_excess_hi")
+                                if (
+                                    finite_number(excess)
+                                    and finite_number(excess_lo)
+                                    and finite_number(excess_hi)
+                                    and not excess_lo <= excess <= excess_hi
+                                ):
+                                    errors.append(
+                                        f"{rlabel} fast teardown excess point lies "
+                                        "outside its quantization interval"
+                                    )
                     processes = teardown.get("per_child_cpu")
                     if not isinstance(processes, dict) or not processes:
                         errors.append(f"{rlabel} fast teardown has no per-process CPU data")
@@ -1510,28 +1701,60 @@ def analyze_backend(
 
         # machine_cpu_ms_excess uses an adjacent POST-TERMINAL ambient control, so
         # the control cannot contain the live VM CPU absent from the reclaim window.
-        # The version gate rejects older pre-kill controls; harness CPU is subtracted
-        # from both windows.
+        # V2 nests the six-field /proc/stat interval around the two-field harness
+        # interval and retains their deliberately conservative quantization bounds.
         mc = [t.get("machine_cpu_ms_excess") for t in ok_td
               if t.get("machine_cpu_ms_excess") is not None
               and t.get("harness_cpu_ms") is not None
-              and t.get("accounting_version") == "post-terminal-ambient-v1"]
+              and t.get("accounting_version") == "post-terminal-ambient-v2"]
         stale = [t for t in ok_td if t.get("machine_cpu_ms_excess") is not None
-                 and t.get("accounting_version") != "post-terminal-ambient-v1"]
+                 and t.get("accounting_version") != "post-terminal-ambient-v2"]
         if stale:
             print(f"    machine_cpu_excess WITHHELD on {len(stale)} record(s): "
                   "their ambient-control semantics are stale")
         if mc:
+            mc_lo = [
+                t.get("machine_cpu_ms_excess_lo")
+                for t in ok_td
+                if t.get("accounting_version") == "post-terminal-ambient-v2"
+                and isinstance(t.get("machine_cpu_ms_excess_lo"), (int, float))
+                and not isinstance(t.get("machine_cpu_ms_excess_lo"), bool)
+                and math.isfinite(t.get("machine_cpu_ms_excess_lo"))
+            ]
+            mc_hi = [
+                t.get("machine_cpu_ms_excess_hi")
+                for t in ok_td
+                if t.get("accounting_version") == "post-terminal-ambient-v2"
+                and isinstance(t.get("machine_cpu_ms_excess_hi"), (int, float))
+                and not isinstance(t.get("machine_cpu_ms_excess_hi"), bool)
+                and math.isfinite(t.get("machine_cpu_ms_excess_hi"))
+            ]
             print(f"    machine_cpu_excess {fmt(*median_ci(mc))}   "
-                  f"(whole-machine busy jiffies over reclaim, ambient AND harness subtracted)")
+                  "(/proc/stat busy CPU; ambient and harness subtracted; "
+                  "per-record quantization bounds retained)")
+            if mc_lo and mc_hi:
+                print(
+                    "    counter envelope    "
+                    f"lo {fmt(*median_ci(mc_lo))}  hi {fmt(*median_ci(mc_hi))}"
+                )
             out["arms"][a]["machine_cpu_ms_excess"] = metric_summary(
                 by[a],
                 lambda r: (
                     (r.get("teardown") or {}).get("machine_cpu_ms_excess")
                     if (r.get("teardown") or {}).get("accounting_version")
-                    == "post-terminal-ambient-v1"
+                    == "post-terminal-ambient-v2"
                     else None
                 ),
+            )
+            out["arms"][a]["machine_cpu_ms_excess_lo"] = metric_summary(
+                by[a], lambda r: (r.get("teardown") or {}).get(
+                    "machine_cpu_ms_excess_lo"
+                )
+            )
+            out["arms"][a]["machine_cpu_ms_excess_hi"] = metric_summary(
+                by[a], lambda r: (r.get("teardown") or {}).get(
+                    "machine_cpu_ms_excess_hi"
+                )
             )
 
         # PER CHILD, keyed by comm. Pooling loses the straggler: the median of

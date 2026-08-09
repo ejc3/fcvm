@@ -78,10 +78,15 @@ whether it caught the `Z` state (`zombie_seen`); when it did, the CPU figure is
 COMPLETE, and when it did not (the parent's reaper won the race) the figure is a
 LOWER BOUND and is labelled as one. Never averaged together.
 
-Whole-machine `/proc/stat` busy-jiffy deltas are recorded over the reclaim window
-and against a post-terminal ambient control. A pre-kill control includes the
-still-running VM's ordinary CPU and subtracts work absent from reclaim, so that
-older accounting was withdrawn.
+Whole-machine `/proc/stat` busy-jiffy deltas are recorded over a window that
+encloses the reclaim, then compared with an adjacent post-terminal ambient
+control. The harness's own `/proc/<pid>/stat` delta is subtracted from both
+windows so the sampler cannot charge itself to reclaim. Those are coarse,
+independently quantized counters: raw values and their conservative interval are
+retained with every record, and a point is constrained to zero only when the raw
+negative lies inside that interval. A pre-kill control includes the still-running
+VM's ordinary CPU and subtracts work absent from reclaim, so that older accounting
+was withdrawn.
 
 At saturation that CPU competes with new requests. A latency win is not a
 capacity win, and this harness deliberately makes it impossible to report one as
@@ -113,6 +118,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
+MACHINE_CPU_RESOLUTION_MS = 1000.0 / CLK_TCK
+HARNESS_CPU_RESOLUTION_MS = 1000.0 / CLK_TCK
+# /proc/stat busy is the sum of six separately quantized fields; harness CPU is
+# the sum of two. A difference of their deltas therefore carries at most eight
+# counter quanta of uncertainty. The interval is intentionally broad instead of
+# pretending a 50 ms control supports sub-jiffy precision.
+CPU_RESIDUAL_UNCERTAINTY_MS = (
+    6 * MACHINE_CPU_RESOLUTION_MS + 2 * HARNESS_CPU_RESOLUTION_MS
+)
+MACHINE_CPU_SOURCE = "/proc/stat:busy(user,nice,system,irq,softirq,steal)"
+HARNESS_CPU_SOURCE = "/proc/self/stat:utime+stime"
+CONTROL_WINDOW_S = 0.05
 
 
 # ---------------------------------------------------------------- procfs utils
@@ -137,19 +154,19 @@ def proc_stat_fields(pid: int):
         return None
 
 
-def machine_busy_jiffies():
-    """Non-idle jiffies from /proc/stat's aggregate line."""
+def machine_cpu_ms() -> float:
+    """Non-idle CPU milliseconds from /proc/stat's aggregate line."""
     with open("/proc/stat") as f:
         parts = f.readline().split()
-    # guest/guest_nice (fields 9/10) are already included in user/nice. Summing
-    # them again double-counts exactly the VM CPU this benchmark is measuring.
-    vals = [int(x) for x in parts[1:9]]
-    idle = vals[3] + vals[4]  # idle + iowait
-    return sum(vals) - idle, sum(vals)
+    # guest/guest_nice are already included in user/nice. Only the first eight
+    # counters are independent; remove idle+iowait to leave six busy fields.
+    values = [int(value) for value in parts[1:9]]
+    busy_jiffies = sum(values) - values[3] - values[4]
+    return busy_jiffies * 1000.0 / CLK_TCK
 
 
 def self_cpu_ms() -> float:
-    """This harness's OWN cpu (utime+stime), in ms.
+    """This harness's own utime+stime, in ms.
 
     Subtracted from BOTH accounting windows so the sampler's own load cancels by
     construction instead of being attributed to kernel reclaim. Without this the
@@ -157,8 +174,39 @@ def self_cpu_ms() -> float:
     and the subtraction removes work that was never done in the window it is
     subtracted from.
     """
-    s = proc_stat_fields(os.getpid())
-    return (s[1] + s[2]) * 1000.0 / CLK_TCK if s else 0.0
+    fields = proc_stat_fields(os.getpid())
+    return (
+        (fields[1] + fields[2]) * 1000.0 / CLK_TCK
+        if fields is not None
+        else 0.0
+    )
+
+
+def bounded_cpu_residual(machine_ms: float, harness_ms: float) -> dict:
+    """Constrain M-H only within the counters' declared resolution.
+
+    Both inputs are deltas of cumulative counters, so each contributes two
+    endpoint errors. Machine reads enclose harness reads; a raw residual below
+    the resulting negative tolerance is therefore internally impossible and
+    invalidates the measurement instead of being hidden by a clamp.
+    """
+    raw_ms = machine_ms - harness_ms
+    uncertainty_ms = CPU_RESIDUAL_UNCERTAINTY_MS
+    if raw_ms < -uncertainty_ms:
+        raise RuntimeError(
+            "host CPU delta is smaller than enclosed harness CPU delta: "
+            f"machine={machine_ms:.6f}ms harness={harness_ms:.6f}ms "
+            f"raw={raw_ms:.6f}ms tolerance={uncertainty_ms:.6f}ms"
+        )
+    point_ms = max(0.0, raw_ms)
+    return {
+        "raw_ms": raw_ms,
+        "point_ms": point_ms,
+        "lo_ms": max(0.0, raw_ms - uncertainty_ms),
+        "hi_ms": max(0.0, raw_ms + uncertainty_ms),
+        "uncertainty_ms": uncertainty_ms,
+        "clamped": raw_ms < 0.0,
+    }
 
 
 def children_of(pid: int) -> list[int]:
@@ -1315,8 +1363,9 @@ def measure_fast_reap(
             raise RuntimeError(
                 f"cannot capture pre-kill CPU/starttime for pinned processes {missing_pre}"
             )
+        machine_t0 = time.monotonic()
+        machine0 = machine_cpu_ms()
         self0 = self_cpu_ms()
-        busy0, _ = machine_busy_jiffies()
         t_kill = time.monotonic()
         try:
             os.kill(fcvm_pid, signal.SIGKILL)
@@ -1344,35 +1393,37 @@ def measure_fast_reap(
                 if fd is not None and fd not in ready
             }
         t_gone = time.monotonic()
-        busy1, _ = machine_busy_jiffies()
         self_ms = self_cpu_ms() - self0
+        machine1 = machine_cpu_ms()
+        machine_window_ms = (time.monotonic() - machine_t0) * 1000.0
 
         # Measure ambient load only after the exact VM process set is terminal.
         # A pre-kill control contains the still-running VM's ordinary CPU and
         # subtracts work that is absent from the reclaim window.
-        ctl_self0 = self_cpu_ms()
-        ctl_busy0, _ = machine_busy_jiffies()
         ctl_t0 = time.monotonic()
-        time.sleep(0.05)
-        ctl_busy1, _ = machine_busy_jiffies()
-        ctl_dt = time.monotonic() - ctl_t0
+        ctl_machine0 = machine_cpu_ms()
+        ctl_self0 = self_cpu_ms()
+        time.sleep(CONTROL_WINDOW_S)
         ctl_self_ms = self_cpu_ms() - ctl_self0
-        ctl_busy_ms = (ctl_busy1 - ctl_busy0) * 1000.0 / CLK_TCK
-        ctl_rate = (
-            (ctl_busy_ms - ctl_self_ms) / 1000.0 / ctl_dt
-            if ctl_dt > 0
-            else 0.0
-        )
+        ctl_machine_ms = machine_cpu_ms() - ctl_machine0
+        ctl_wall_ms = (time.monotonic() - ctl_t0) * 1000.0
+        if ctl_wall_ms <= 0.0:
+            raise RuntimeError("ambient control window was not positive")
+        reclaim_cpu = bounded_cpu_residual(machine1 - machine0, self_ms)
+        control_cpu = bounded_cpu_residual(ctl_machine_ms, ctl_self_ms)
         return {
             "all_gone": all_gone,
-            "busy0": busy0,
-            "busy1": busy1,
             "cpu": cpu,
-            "ctl_rate": ctl_rate,
+            "ctl_machine_ms": ctl_machine_ms,
             "ctl_self_ms": ctl_self_ms,
+            "ctl_wall_ms": ctl_wall_ms,
+            "control_cpu": control_cpu,
             "live_exact": live_exact,
+            "machine_ms": machine1 - machine0,
+            "machine_window_ms": machine_window_ms,
             "parent_live": parent_live,
             "pre": pre,
+            "reclaim_cpu": reclaim_cpu,
             "sample_period_s": sample_period_s,
             "self_ms": self_ms,
             "signal_ms": signal_ms,
@@ -1408,7 +1459,7 @@ def teardown_fast(
     """
     out: dict = {
         "mode": "fast",
-        "accounting_version": "post-terminal-ambient-v1",
+        "accounting_version": "post-terminal-ambient-v2",
     }
 
     parent_fd = None
@@ -1469,12 +1520,15 @@ def teardown_fast(
         ) from error
 
     all_gone = measured["all_gone"]
-    busy0 = measured["busy0"]
-    busy1 = measured["busy1"]
     cpu = measured["cpu"]
-    ctl_rate = measured["ctl_rate"]
+    ctl_machine_ms = measured["ctl_machine_ms"]
     ctl_self_ms = measured["ctl_self_ms"]
+    ctl_wall_ms = measured["ctl_wall_ms"]
+    control_cpu = measured["control_cpu"]
+    machine_cpu_ms = measured["machine_ms"]
+    machine_window_ms = measured["machine_window_ms"]
     pre = measured["pre"]
+    reclaim_cpu = measured["reclaim_cpu"]
     sample_period_s = measured["sample_period_s"]
     self_ms = measured["self_ms"]
     t_gone = measured["t_gone"]
@@ -1482,14 +1536,42 @@ def teardown_fast(
     out["signal_ms"] = measured["signal_ms"]
 
     window_s = t_gone - t_kill
-    machine_cpu_ms = (busy1 - busy0) * 1000.0 / CLK_TCK
+    ctl_rate = control_cpu["point_ms"] / ctl_wall_ms
+    ctl_rate_lo = control_cpu["lo_ms"] / ctl_wall_ms
+    ctl_rate_hi = control_cpu["hi_ms"] / ctl_wall_ms
+    excess_ms = reclaim_cpu["point_ms"] - ctl_rate * machine_window_ms
+    excess_lo_ms = reclaim_cpu["lo_ms"] - ctl_rate_hi * machine_window_ms
+    excess_hi_ms = reclaim_cpu["hi_ms"] - ctl_rate_lo * machine_window_ms
     out["reap_wall_ms"] = window_s * 1000
     out["all_gone"] = all_gone
     out["machine_cpu_ms"] = machine_cpu_ms
     out["harness_cpu_ms"] = self_ms
-    out["machine_cpu_ms_excess"] = (machine_cpu_ms - self_ms) - ctl_rate * window_s * 1000
-    out["control_busy_cores"] = ctl_rate
+    out["machine_cpu_window_ms"] = machine_window_ms
+    out["machine_cpu_ms_raw"] = reclaim_cpu["raw_ms"]
+    out["machine_cpu_ms_net"] = reclaim_cpu["point_ms"]
+    out["machine_cpu_ms_net_lo"] = reclaim_cpu["lo_ms"]
+    out["machine_cpu_ms_net_hi"] = reclaim_cpu["hi_ms"]
+    out["machine_cpu_ms_subtraction_clamped"] = reclaim_cpu["clamped"]
+    out["machine_cpu_ms_excess"] = excess_ms
+    out["machine_cpu_ms_excess_lo"] = excess_lo_ms
+    out["machine_cpu_ms_excess_hi"] = excess_hi_ms
+    out["control_machine_cpu_ms"] = ctl_machine_ms
     out["control_harness_cpu_ms"] = ctl_self_ms
+    out["control_wall_ms"] = ctl_wall_ms
+    out["control_target_ms"] = CONTROL_WINDOW_S * 1000.0
+    out["control_cpu_ms_raw"] = control_cpu["raw_ms"]
+    out["control_cpu_ms_net"] = control_cpu["point_ms"]
+    out["control_cpu_ms_net_lo"] = control_cpu["lo_ms"]
+    out["control_cpu_ms_net_hi"] = control_cpu["hi_ms"]
+    out["control_cpu_ms_subtraction_clamped"] = control_cpu["clamped"]
+    out["control_busy_cores"] = ctl_rate
+    out["control_busy_cores_lo"] = ctl_rate_lo
+    out["control_busy_cores_hi"] = ctl_rate_hi
+    out["cpu_residual_uncertainty_ms"] = reclaim_cpu["uncertainty_ms"]
+    out["machine_cpu_source"] = MACHINE_CPU_SOURCE
+    out["machine_cpu_resolution_ms"] = MACHINE_CPU_RESOLUTION_MS
+    out["harness_cpu_source"] = HARNESS_CPU_SOURCE
+    out["harness_cpu_resolution_ms"] = HARNESS_CPU_RESOLUTION_MS
     # Both accounting windows now sleep, so the subtraction is between like and
     # like. The sampler's residual duty cycle is bounded by this period and is
     # recorded rather than argued about.
