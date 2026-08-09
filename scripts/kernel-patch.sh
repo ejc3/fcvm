@@ -29,68 +29,93 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 error() { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
-info() { echo -e "${GREEN}==>${NC} $*"; }
+info() { echo -e "${GREEN}==>${NC} $*" >&2; }
 warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
+
+# Resolve the config architecture, with an override for validating another
+# architecture's patch set from the current host.
+get_config_arch() {
+    local machine_arch="${KERNEL_PATCH_ARCH:-$(uname -m)}"
+
+    case "$machine_arch" in
+        aarch64|arm64) printf '%s\n' "arm64" ;;
+        x86_64|amd64) printf '%s\n' "amd64" ;;
+        *) error "Unsupported architecture: $machine_arch" ;;
+    esac
+}
 
 # Get kernel version from config
 get_kernel_version() {
     local profile="$1"
     local config_file="$REPO_ROOT/rootfs-config.toml"
+    local config_arch version
 
     if [[ ! -f "$config_file" ]]; then
         error "Config file not found: $config_file"
     fi
 
-    # Extract kernel version for the profile
-    # This is a simple grep - for complex configs, use a proper TOML parser
-    # Same arch scoping as get_patches_dir: profile tables are arch-suffixed, and
-    # a bare -A20 spans both the .amd64 and .arm64 blocks.
-    local carch="amd64"
-    [[ "$(uname -m)" == "aarch64" ]] && carch="arm64"
-    sed -n "/^\\[kernel_profiles\\.$profile\\.$carch\\]/,/^\\[/p" "$config_file" | \
-        grep -m1 '^kernel_version' | \
-        sed 's/.*=.*"\([^"]*\)".*/\1/' || \
-        error "Could not find kernel_version for profile '$profile'"
+    config_arch=$(get_config_arch)
+
+    # Match the exact architecture-specific TOML section. Treating the section
+    # name as a grep regex makes its brackets a character class and silently
+    # returns an empty version.
+    version=$(awk -v section="[kernel_profiles.${profile}.${config_arch}]" '
+        $0 == section { in_section = 1; next }
+        in_section && /^\[/ { exit }
+        in_section && /^[[:space:]]*kernel_version[[:space:]]*=/ {
+            value = $0
+            sub(/^[^=]*=[[:space:]]*"/, "", value)
+            sub(/"[[:space:]]*$/, "", value)
+            print value
+            exit
+        }
+    ' "$config_file")
+
+    [[ -n "$version" ]] || error \
+        "Could not find kernel_version in [kernel_profiles.${profile}.${config_arch}]"
+    printf '%s\n' "$version"
 }
 
 # Get patches directory for profile
 get_patches_dir() {
     local profile="$1"
     local config_file="$REPO_ROOT/rootfs-config.toml"
+    local config_arch declared
+
+    if [[ ! -f "$config_file" ]]; then
+        error "Config file not found: $config_file"
+    fi
+
+    config_arch=$(get_config_arch)
 
     # A profile may name its own patches_dir, and the Rust build reads it
     # (src/setup/kernel.rs). This helper has to agree, or it edits and validates
     # a different set of patches than the one that actually gets built.
-    #
-    # Profile tables are arch-suffixed ([kernel_profiles.<name>.amd64]), so match
-    # the name followed by either "]" or ".".
-    # Scope to the current arch's table: grep -A20 on a bare profile name spans
-    # both the .amd64 and .arm64 blocks and would read the wrong one.
-    local carch="amd64"
-    [[ "$(uname -m)" == "aarch64" ]] && carch="arm64"
-    local block
-    block=$(sed -n "/^\\[kernel_profiles\\.$profile\\.$carch\\]/,/^\\[/p" "$config_file" 2>/dev/null || true)
-    if grep -q '^patches_dir' <<< "$block"; then
-        local declared
-        declared=$(grep -m1 '^patches_dir' <<< "$block" | sed 's/.*=.*"\([^"]*\)".*/\1/')
+    if declared=$(awk -v section="[kernel_profiles.${profile}.${config_arch}]" '
+        $0 == section { in_section = 1; next }
+        in_section && /^\[/ { exit 1 }
+        in_section && /^[[:space:]]*patches_dir[[:space:]]*=/ {
+            value = $0
+            sub(/^[^=]*=[[:space:]]*"/, "", value)
+            sub(/"[[:space:]]*$/, "", value)
+            print value
+            found = 1
+            exit
+        }
+        END { if (!found) exit 1 }
+    ' "$config_file"); then
         # An empty string means the profile deliberately applies no patches.
         [[ -z "$declared" ]] && return
-        echo "$REPO_ROOT/$declared"
+        printf '%s\n' "$REPO_ROOT/$declared"
         return
     fi
 
-    # Check for arch-specific patches first
-    local arch=$(uname -m)
-    if [[ "$arch" == "aarch64" ]]; then
-        local patches_dir="$REPO_ROOT/kernel/patches-arm64"
-        if [[ -d "$patches_dir" ]]; then
-            echo "$patches_dir"
-            return
-        fi
+    # Preserve the legacy default for profiles without an explicit directory.
+    if [[ "$config_arch" == "arm64" && -d "$REPO_ROOT/kernel/patches-arm64" ]]; then
+        printf '%s\n' "$REPO_ROOT/kernel/patches-arm64"
+    else
+        printf '%s\n' "$REPO_ROOT/kernel/patches"
     fi
-
-    # Fall back to generic patches
-    echo "$REPO_ROOT/kernel/patches"
 }
 
 # Download and extract kernel source
@@ -109,7 +134,7 @@ setup_kernel_source() {
 
     if [[ ! -f "$tarball" ]]; then
         info "Downloading kernel source..."
-        curl -L -o "$tarball" "$url" || error "Failed to download kernel"
+        curl -fL -o "$tarball" "$url" || error "Failed to download kernel"
     fi
 
     if [[ ! -d "linux-${version}" ]]; then

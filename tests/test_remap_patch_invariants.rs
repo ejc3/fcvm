@@ -19,10 +19,13 @@
 
 use std::path::PathBuf;
 
-fn patch_text() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("kernel/patches/0001-fuse-add-remap_file_range-support.patch");
+fn repo_file(path: &str) -> String {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+}
+
+fn patch_text() -> String {
+    repo_file("kernel/patches/0001-fuse-add-remap_file_range-support.patch")
 }
 
 /// The clone length must be derived from the REQUEST, not from the 32-bit reply.
@@ -82,5 +85,87 @@ fn remap_patch_does_not_size_the_destination_from_outarg() {
          instead of the request-derived `effective` length, which truncates any \
          clone above 4 GiB:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// Dedupe has different validation and metadata semantics from clone. Until the
+/// FUSE protocol implements those semantics, the kernel callback must reject it
+/// before generic preparation or any destination mutation.
+#[test]
+fn remap_patch_rejects_dedupe_before_preparation_or_mutation() {
+    let patch = patch_text();
+    let reject = patch
+        .find("if (remap_flags & REMAP_FILE_DEDUP)")
+        .expect("remap patch must explicitly reject REMAP_FILE_DEDUP");
+    let prepare = patch
+        .find("generic_remap_file_range_prep")
+        .expect("remap patch must use generic remap preparation");
+
+    assert!(
+        reject < prepare,
+        "REMAP_FILE_DEDUP must be rejected before generic preparation can mutate \
+         destination metadata"
+    );
+}
+
+/// `vfs_clone_file_range()` does not run the generic preparation helper for a
+/// filesystem callback. The callback therefore owns canonical two-inode
+/// locking and generic range validation/preparation.
+#[test]
+fn remap_patch_prepares_the_range_under_canonical_two_inode_locking() {
+    let patch = patch_text();
+    let lock = patch
+        .find("lock_two_nondirectories(inode_in, inode_out)")
+        .expect("remap patch must acquire the canonical two-inode lock");
+    let prepare = patch
+        .find("generic_remap_file_range_prep(file_in, pos_in, file_out, pos_out,")
+        .expect("remap patch must prepare and validate the caller's range");
+    let unlock = patch
+        .find("unlock_two_nondirectories(inode_in, inode_out)")
+        .expect("remap patch must release the canonical two-inode lock");
+
+    assert!(
+        lock < prepare && prepare < unlock,
+        "generic remap preparation must run while both inodes are locked"
+    );
+    assert!(
+        patch[prepare..unlock].contains("&len, remap_flags)"),
+        "generic remap preparation must be allowed to adjust the concrete request length"
+    );
+    assert!(
+        !patch.lines().any(|line| {
+            line.starts_with('+')
+                && (line.contains("inode_lock(inode_in)")
+                    || line.contains("inode_lock(inode_out)"))
+        }),
+        "separate source/destination inode locks leave a source-change race; use \
+         lock_two_nondirectories()"
+    );
+}
+
+/// This VM test explicitly boots the patched nested profile on btrfs. Once
+/// those preconditions are met, ENOSYS means the promised end-to-end backend
+/// path is broken and must fail rather than silently pass as a skip.
+#[test]
+fn nested_profile_remap_test_does_not_skip_enosys() {
+    let test = repo_file("tests/test_remap_file_range.rs");
+
+    assert!(
+        !test.contains("code == 38"),
+        "the nested-profile VM remap test still treats ENOSYS (exit 38) as a \
+         skip, so CI can pass without exercising FICLONE end to end"
+    );
+}
+
+/// These profiles are user-deployable. Linux 7.0.14 reached EOL on 2026-06-27,
+/// so retaining that pin would ship an unsupported kernel rather than preserve
+/// a test-only reproduction target.
+#[test]
+fn deployable_kernel_profiles_do_not_pin_eol_7_0_14() {
+    let config = repo_file("rootfs-config.toml");
+
+    assert!(
+        !config.contains("kernel_version = \"7.0.14\""),
+        "rootfs-config.toml still pins deployable profiles to EOL Linux 7.0.14"
     );
 }

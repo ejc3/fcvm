@@ -103,10 +103,8 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
     );
 
     // Wait for completion. This single budget covers the whole VM lifecycle (cold
-    // bridged boot, pre-start snapshot pause, in-guest image/container startup, the
-    // test script, and shutdown), so keep it just under the 600s nextest
-    // slow-timeout for VM tests — under heavy parallel snapshot I/O the container
-    // start alone has been observed to take several minutes.
+    // bridged boot, in-guest image/container startup, the test script, and
+    // shutdown), so keep it just under the 600s nextest slow-timeout for VM tests.
     let timeout = std::time::Duration::from_secs(570);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
@@ -135,15 +133,6 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
 
     if !exit_status.success() {
         let code = exit_status.code().unwrap_or(-1);
-        // Exit code 95 = EOPNOTSUPP, 38 = ENOSYS
-        // Exit code 1 = cp --reflink=always returns 1 when reflink not supported
-        if code == 95 || code == 38 || code == 1 {
-            eprintln!(
-                "SKIP: {} - kernel or filesystem doesn't support FUSE remap_file_range (exit={})",
-                test_name, code
-            );
-            return Ok(());
-        }
         anyhow::bail!(
             "{} failed: exit={} ({:.1}s)",
             test_name,

@@ -3,7 +3,7 @@ Subject: [PATCH] fuse: add remap_file_range support for FICLONE
 
 Enables FICLONE/reflink through FUSE, which fuse-pipe volumes rely on.
 
-Rebased onto 7.0: upstream commit "fuse: add setlease file operation"
+Rebased onto 7.1: upstream commit "fuse: add setlease file operation"
 added .setlease to fuse_file_operations at the same site this patch adds
 .remap_file_range, so the struct hunk needed new context. Both entries
 belong; neither replaces the other.
@@ -14,7 +14,7 @@ diff --git a/fs/fuse/file.c b/fs/fuse/file.c
 index 676fd9856bfbf..1a47c623a0868 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3158,6 +3158,136 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3158,6 +3158,131 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  	return ret;
  }
  
@@ -44,55 +44,50 @@ index 676fd9856bfbf..1a47c623a0868 100644
 +	loff_t err;
 +	loff_t end_in, end_out;
 +	loff_t effective;
-+	bool is_unstable;
++	bool is_unstable = false;
 +
 +	if (fc->no_remap_file_range)
++		return -EOPNOTSUPP;
++
++	/* Dedupe needs data comparison and must not modify the destination. */
++	if (remap_flags & REMAP_FILE_DEDUP)
 +		return -EOPNOTSUPP;
 +
 +	if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
 +		return -EXDEV;
 +
++	lock_two_nondirectories(inode_in, inode_out);
++
++	/* Refresh EOF before generic preparation expands a whole-file clone. */
 +	if (len == 0) {
-+		/*
-+		 * FICLONE: the whole source from pos_in is cloned. Refresh the
-+		 * source size so the post-clone attribute update below records
-+		 * the real cloned extent.
-+		 */
 +		err = fuse_update_attributes(inode_in, file_in, STATX_SIZE);
 +		if (err)
-+			return err;
-+		effective = i_size_read(inode_in) - pos_in;
-+		if (effective < 0)
-+			effective = 0;
-+		/*
-+		 * Send the CONCRETE length, not the 0 that means "to EOF". The
-+		 * kernel is about to cache `effective` for the destination; if the
-+		 * request still said 0, a concurrent extend of the source between
-+		 * this size read and the server handling the remap would clone a
-+		 * different extent than the size we cache, poisoning it exactly as
-+		 * the u32 truncation did.
-+		 */
-+		inarg.len = effective;
-+		end_in = LLONG_MAX;
-+		end_out = LLONG_MAX;
-+	} else {
-+		effective = len;
-+		end_in = pos_in + len - 1;
-+		end_out = pos_out + len - 1;
++			goto out;
 +	}
 +
-+	is_unstable = (!fc->writeback_cache) &&
-+		      (len == 0 || (pos_out + len) > inode_out->i_size);
++	/*
++	 * The VFS does not prepare a filesystem's remap callback. Do it while
++	 * both inodes are locked so the source cannot change between expanding
++	 * a zero-length FICLONE to EOF and issuing the userspace request.
++	 */
++	err = generic_remap_file_range_prep(file_in, pos_in, file_out, pos_out,
++					    &len, remap_flags);
++	if (err || len == 0)
++		goto out;
 +
-+	inode_lock(inode_in);
++	/*
++	 * Send the prepared, concrete length. Besides removing the source-size
++	 * race, this is the request-derived length used for the inode update:
++	 * fuse_write_out.size is only 32 bits and saturates above 4 GiB.
++	 */
++	effective = len;
++	inarg.len = effective;
++	end_in = pos_in + effective - 1;
++	end_out = pos_out + effective - 1;
++	is_unstable = !fc->writeback_cache &&
++		      pos_out + effective > i_size_read(inode_out);
++
 +	err = fuse_writeback_range(inode_in, pos_in, end_in);
-+	inode_unlock(inode_in);
-+	if (err)
-+		return err;
-+
-+	inode_lock(inode_out);
-+
-+	err = file_modified(file_out);
 +	if (err)
 +		goto out;
 +
@@ -142,7 +137,7 @@ index 676fd9856bfbf..1a47c623a0868 100644
 +	if (is_unstable)
 +		clear_bit(FUSE_I_SIZE_UNSTABLE, &fi_out->state);
 +
-+	inode_unlock(inode_out);
++	unlock_two_nondirectories(inode_in, inode_out);
 +	file_accessed(file_in);
 +	fuse_flush_time_update(inode_out);
 +
@@ -151,7 +146,7 @@ index 676fd9856bfbf..1a47c623a0868 100644
  static const struct file_operations fuse_file_operations = {
  	.llseek		= fuse_file_llseek,
  	.read_iter	= fuse_file_read_iter,
-@@ -3178,6 +3299,7 @@ static const struct file_operations fuse_file_operations = {
+@@ -3178,6 +3303,7 @@ static const struct file_operations fuse_file_operations = {
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
  	.setlease	= generic_setlease,
