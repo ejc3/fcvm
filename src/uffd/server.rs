@@ -917,6 +917,24 @@ fn continue_page(
     Ok(ContinueOutcome::Resolved)
 }
 
+async fn wait_for_peer_vmm_exit(
+    async_peer_pidfd: &AsyncFd<PidfdRef<'_>>,
+    vm_id: &str,
+    peer_pid: u32,
+) -> Result<()> {
+    let _peer_ready = async_peer_pidfd
+        .readable()
+        .await
+        .context("waiting for peer VMM exit")?;
+    info!(
+        target: "uffd",
+        vm_id,
+        peer_pid,
+        "peer VMM exited; stopping page-fault handler"
+    );
+    Ok(())
+}
+
 /// Handle page faults for a single VM
 async fn handle_vm_page_faults(
     vm_id: String,
@@ -981,14 +999,8 @@ async fn handle_vm_page_faults(
                 // authoritative: this is an ordinary end of life, not a UFFD-service
                 // failure that should enter the fail-closed kill path.
                 biased;
-                peer_ready = async_peer_pidfd.readable() => {
-                    let _peer_ready = peer_ready.context("waiting for peer VMM exit")?;
-                    info!(
-                        target: "uffd",
-                        vm_id = %vm_id,
-                        peer_pid = peer.pid,
-                        "peer VMM exited; stopping page-fault handler"
-                    );
+                peer_exit = wait_for_peer_vmm_exit(&async_peer_pidfd, &vm_id, peer.pid) => {
+                    peer_exit?;
                     return Ok(());
                 }
                 uffd_ready = async_uffd.readable() => match uffd_ready {
@@ -1002,14 +1014,8 @@ async fn handle_vm_page_faults(
         } else {
             tokio::select! {
                 biased;
-                peer_ready = async_peer_pidfd.readable() => {
-                    let _peer_ready = peer_ready.context("waiting for peer VMM exit")?;
-                    info!(
-                        target: "uffd",
-                        vm_id = %vm_id,
-                        peer_pid = peer.pid,
-                        "peer VMM exited; stopping page-fault handler"
-                    );
+                peer_exit = wait_for_peer_vmm_exit(&async_peer_pidfd, &vm_id, peer.pid) => {
+                    peer_exit?;
                     return Ok(());
                 }
                 uffd_ready = tokio::time::timeout(

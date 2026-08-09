@@ -29,6 +29,18 @@ use super::common::{
 };
 use super::podman::{run_output_listener, run_status_listener};
 
+const SNAPSHOT_LINEAGE_RETRY_LIMIT: usize = 64;
+
+fn record_snapshot_lineage_retry(retries: &mut usize) -> Result<()> {
+    *retries += 1;
+    anyhow::ensure!(
+        *retries < SNAPSHOT_LINEAGE_RETRY_LIMIT,
+        "snapshot lineage did not stabilize after {} lock acquisitions; retry after concurrent snapshot creators finish",
+        SNAPSHOT_LINEAGE_RETRY_LIMIT
+    );
+    Ok(())
+}
+
 /// Resources acquired before a restored VMM is handed to the normal lifecycle.
 ///
 /// Snapshot setup is deliberately transactional.  Every fallible setup step
@@ -431,6 +443,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await
         .context("creating snapshot directory")?;
     let mut expected_parent_name = vm_state.config.snapshot_name.clone();
+    let mut lineage_retries = 0;
     let (_generation_locks, _vm_lock, parent_dir) = loop {
         if let Some(name) = expected_parent_name.as_deref() {
             validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
@@ -457,8 +470,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
         }
         if fresh_state.config.snapshot_name != expected_parent_name {
+            record_snapshot_lineage_retry(&mut lineage_retries)?;
             info!(
                 vm_id = %vm_state.vm_id,
+                retry = lineage_retries,
+                retry_limit = SNAPSHOT_LINEAGE_RETRY_LIMIT,
                 expected_parent = ?expected_parent_name,
                 current_parent = ?fresh_state.config.snapshot_name,
                 "snapshot lineage advanced while acquiring locks; retrying"
@@ -1283,10 +1299,12 @@ async fn cmd_snapshot_run_inner(
                 Some(ready_tx),
             )
         }));
-        let tty_ready = ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .context("waiting for clone TTY listener readiness")
-            .and_then(|result| result.map_err(anyhow::Error::msg));
+        let tty_ready =
+            tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(5)))
+                .await
+                .context("joining clone TTY listener readiness wait")
+                .and_then(|result| result.context("waiting for clone TTY listener readiness"))
+                .and_then(|result| result.map_err(anyhow::Error::msg));
         setup_try!(tty_ready);
     }
 
@@ -2949,6 +2967,21 @@ mod tests {
     use super::*;
     use crate::storage::snapshot::SnapshotVolumeConfig;
     use crate::storage::SnapshotKind;
+
+    #[test]
+    fn snapshot_lineage_retries_are_bounded() {
+        let mut retries = 0;
+        for _ in 1..SNAPSHOT_LINEAGE_RETRY_LIMIT {
+            record_snapshot_lineage_retry(&mut retries).unwrap();
+        }
+        let error = record_snapshot_lineage_retry(&mut retries)
+            .expect_err("continuously-changing lineage must not wait forever");
+        assert_eq!(retries, SNAPSHOT_LINEAGE_RETRY_LIMIT);
+        assert!(
+            error.to_string().contains("did not stabilize after 64"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     /// The synthesized RunArgs must carry the recorded boot-plan metadata:
     /// kernel profile (a btrfs disk needs a btrfs kernel), image mode + device

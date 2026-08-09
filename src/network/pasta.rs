@@ -1175,6 +1175,14 @@ impl NetworkManager for PastaNetwork {
                 .await
                 .context("ping exceeded pasta's 5s readiness deadline")?
                 .context("running ping via nsenter in namespace")?;
+            if !ping.status.success() {
+                debug!(
+                    guest_ip = GUEST_IP,
+                    status = ?ping.status.code(),
+                    stderr = %String::from_utf8_lossy(&ping.stderr).trim(),
+                    "ARP-triggering ping did not receive a reply"
+                );
+            }
 
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {

@@ -2365,6 +2365,8 @@ pub async fn acquire_snapshot_dir_lock(
     let lock_path = snapshot_sibling(snapshot_dir, "lock");
     let lock_file = std::fs::File::create(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
+    let wait_started = std::time::Instant::now();
+    let mut next_info_log = std::time::Duration::from_secs(5);
     loop {
         // Fully-qualified fs2 calls: std::fs::File now has inherent try_lock_*
         // methods with a different error type, and inherent methods win over
@@ -2378,6 +2380,16 @@ pub async fn acquire_snapshot_dir_lock(
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 debug!(lock = %lock_path.display(), "waiting for per-snapshot lock");
+                let elapsed = wait_started.elapsed();
+                if elapsed >= next_info_log {
+                    info!(
+                        lock = %lock_path.display(),
+                        exclusive,
+                        waited_ms = elapsed.as_millis(),
+                        "still waiting for snapshot generation lock held by another command"
+                    );
+                    next_info_log = elapsed + std::time::Duration::from_secs(5);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(e) => {

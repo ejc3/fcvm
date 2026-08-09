@@ -378,6 +378,14 @@ impl FirecrackerConfig {
                 (parts[0], parts.get(1).copied().unwrap_or(""))
             })
             .collect();
+        let mut seen_guest_ports = std::collections::HashSet::new();
+        let published_guest_ports = self
+            .port_mappings
+            .iter()
+            .filter(|mapping| matches!(mapping.proto, crate::network::Protocol::Tcp))
+            .filter(|mapping| seen_guest_ports.insert(mapping.guest_port))
+            .map(|mapping| mapping.guest_port.to_string())
+            .collect::<Vec<_>>();
 
         serde_json::json!({
             "latest": {
@@ -402,9 +410,7 @@ impl FirecrackerConfig {
                     // case: it ignores --remote-debugging-address and binds
                     // 127.0.0.1:9222 regardless, so without this the only way in was a
                     // userspace relay inside the guest.
-                    "published_guest_ports": self.port_mappings.iter()
-                        .filter(|m| matches!(m.proto, crate::network::Protocol::Tcp))
-                        .map(|m| m.guest_port.to_string()).collect::<Vec<_>>(),
+                    "published_guest_ports": published_guest_ports,
                     "egress_proxy": matches!(self.network_mode, NetworkMode::Rootless),
                     "interactive": self.interactive,
                     "tty": self.tty,
@@ -676,5 +682,54 @@ mod tests {
             proto: crate::network::types::Protocol::Tcp,
         }];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn mmds_publishes_each_tcp_guest_port_once() {
+        let mut config = test_config();
+        config.port_mappings = vec![
+            crate::network::PortMapping {
+                host_ip: None,
+                host_port: 8080,
+                guest_port: 80,
+                proto: crate::network::types::Protocol::Tcp,
+            },
+            crate::network::PortMapping {
+                host_ip: None,
+                host_port: 8081,
+                guest_port: 80,
+                proto: crate::network::types::Protocol::Tcp,
+            },
+            crate::network::PortMapping {
+                host_ip: None,
+                host_port: 8082,
+                guest_port: 80,
+                proto: crate::network::types::Protocol::Udp,
+            },
+            crate::network::PortMapping {
+                host_ip: None,
+                host_port: 8083,
+                guest_port: 81,
+                proto: crate::network::types::Protocol::Tcp,
+            },
+        ];
+        let plan = config.to_mmds_json(MmdsRuntime {
+            volumes: vec![],
+            extra_disks: vec![],
+            nfs_mounts: vec![],
+            image_device: None,
+            http_proxy: None,
+            https_proxy: None,
+            no_proxy: None,
+            subuid_start: None,
+            subuid_count: None,
+            host_time: "0".to_string(),
+            ntp_servers: vec![],
+        });
+
+        assert_eq!(
+            plan.pointer("/latest/container-plan/published_guest_ports"),
+            Some(&serde_json::json!(["80", "81"]))
+        );
     }
 }

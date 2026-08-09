@@ -1300,7 +1300,7 @@ def analyze_backend(
     print("-" * 78)
     noop = by.get("noop", [])
     drifted = False
-    if len(noop) >= 6:
+    if len(noop) >= MIN_NOOP_ATTEMPTS:
         noop_sorted = sorted(noop, key=lambda r: r["rep"])
         half = len(noop_sorted) // 2
         f = [r["blocking_ms"] for r in noop_sorted[:half]]

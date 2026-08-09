@@ -548,6 +548,7 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             os.makedirs(state_dir)
             os.makedirs(data_dir)
             child_ready = os.path.join(d, "child-ready")
+            owner_wait_entered = os.path.join(d, "owner-wait-entered")
             stub = os.path.join(d, "fcvm-stub")
 
             server = socket.socket()
@@ -580,13 +581,22 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                     "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
                     f"printf '%s\\n' '{initial}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}\n"
                     f": > {state_path}.lock\n"
-                    f"( sleep 0.25; printf '%s\\n' '{ready}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}.tmp; mv {state_path}.tmp {state_path} ) &\n"
+                    f"( while [ ! -e {owner_wait_entered} ]; do sleep 0.01; done; sleep 0.25; "
+                    f"printf '%s\\n' '{ready}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}.tmp; "
+                    f"mv {state_path}.tmp {state_path} ) &\n"
                     "wait\n"
                 )
             os.chmod(stub, 0o755)
 
             real_drive = cdpdrive.drive
+            real_wait_state_owned = reqbench.wait_state_owned
             cdpdrive.drive = lambda _args: {"ok": True, "stages": {}}
+
+            def mark_owner_wait(*call_args, **call_kwargs):
+                open(owner_wait_entered, "w").close()
+                return real_wait_state_owned(*call_args, **call_kwargs)
+
+            reqbench.wait_state_owned = mark_owner_wait
             args = argparse.Namespace(
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
@@ -596,10 +606,13 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
             finally:
+                open(owner_wait_entered, "a").close()
                 cdpdrive.drive = real_drive
+                reqbench.wait_state_owned = real_wait_state_owned
                 server.close()
 
             self.assertTrue(rec["ok"])
+            self.assertTrue(os.path.exists(owner_wait_entered))
             self.assertGreaterEqual(rec["state_owner_wait_ms"], 150.0, rec)
             self.assertTrue(rec["teardown"]["all_gone"])
             self.assertFalse(os.path.lexists(state_path))
