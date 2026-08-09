@@ -899,15 +899,24 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
     """Authoritative generation and runtime shape for a snapshot tag.
 
     A tag can be deleted and recreated. Pooling on the tag alone would merge
-    records from different memory/disk generations, so the metadata also carries
-    the snapshot's creation timestamp and source VM UUID from config.json.
+    records from different memory/disk generations, so the exact generation UUID
+    and the digest of the config.json bytes are both load-bearing identities.
     """
     path = os.path.join(data_root, "snapshots", snapshot_name, "config.json")
     try:
-        with open(path) as f:
-            config = json.load(f)
+        with open(path, "rb") as f:
+            config_json = f.read()
+        config = json.loads(config_json)
     except (OSError, ValueError) as error:
         raise RuntimeError(f"cannot identify snapshot generation from {path}: {error}")
+    generation_id = config.get("generation_id")
+    try:
+        canonical_generation_id = str(uuid.UUID(generation_id))
+    except (AttributeError, TypeError, ValueError):
+        raise RuntimeError(f"snapshot config {path} has invalid generation_id")
+    if canonical_generation_id != generation_id:
+        raise RuntimeError(f"snapshot config {path} has non-canonical generation_id")
+    config_sha256 = hashlib.sha256(config_json).hexdigest()
     created_at = config.get("created_at")
     vm_id = config.get("vm_id")
     if not isinstance(created_at, str) or not created_at:
@@ -945,6 +954,8 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
             "recreate the golden snapshot with reqbench.sh golden"
         )
     expected_provenance = {
+        "snapshot_generation_id": generation_id,
+        "snapshot_config_sha256": config_sha256,
         "snapshot_created_at": created_at,
         "snapshot_vm_id": vm_id,
         "image": image,
@@ -1006,6 +1017,8 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
             )
 
     return {
+        "generation_id": generation_id,
+        "config_sha256": config_sha256,
         "created_at": created_at,
         "vm_id": vm_id,
         "image": image,
@@ -2570,6 +2583,9 @@ def main() -> int:
         p.error(str(error))
     except OSError as error:
         p.error(f"cannot hold snapshot generation lock {snapshot_lock_path}: {error}")
+    # Keep snapshot_lock referenced until main returns. Creators/deleters need
+    # this lock exclusively, so every request below consumes the same installed
+    # generation whose UUID and exact config digest were just recorded.
 
     declared_shape = {
         "image": args.image,
@@ -2684,6 +2700,8 @@ def main() -> int:
             "harness_sha256": harness_sha256(),
             "runtime_bundle_sha256": current_runtime_bundle_sha256,
             "snapshot": snapshot_name,
+            "snapshot_generation_id": snapshot["generation_id"],
+            "snapshot_config_sha256": snapshot["config_sha256"],
             "snapshot_created_at": snapshot["created_at"],
             "snapshot_vm_id": snapshot["vm_id"],
             "image": snapshot["image"],

@@ -530,7 +530,7 @@ cmd_golden() {
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
         "${REQBENCH_SOURCE_REVISION:-}" <<'PY'
-import fcntl, json, os, sys, tempfile
+import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
     image_cache_key, source_vm_id,
@@ -538,8 +538,17 @@ import fcntl, json, os, sys, tempfile
 ) = sys.argv[1:]
 lock = open(lock_path, "a+")
 fcntl.flock(lock, fcntl.LOCK_SH)
-with open(config_path) as source:
-    config = json.load(source)
+with open(config_path, "rb") as source:
+    config_json = source.read()
+config = json.loads(config_json)
+generation_id = config.get("generation_id")
+try:
+    canonical_generation_id = str(uuid.UUID(generation_id))
+except (AttributeError, TypeError, ValueError):
+    raise SystemExit(f"snapshot has invalid generation_id {generation_id!r}")
+if canonical_generation_id != generation_id:
+    raise SystemExit(f"snapshot has non-canonical generation_id {generation_id!r}")
+config_sha256 = hashlib.sha256(config_json).hexdigest()
 metadata = config.get("metadata") or {}
 if metadata.get("image") != image_label:
     raise SystemExit(
@@ -559,6 +568,8 @@ if config.get("vm_id") != source_vm_id:
         "the tag changed before provenance could be committed"
     )
 record = {
+    "snapshot_generation_id": generation_id,
+    "snapshot_config_sha256": config_sha256,
     "snapshot_created_at": config.get("created_at"),
     "snapshot_vm_id": config.get("vm_id"),
     "image": image_label,

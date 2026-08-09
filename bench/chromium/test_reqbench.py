@@ -12,6 +12,7 @@ There is no pytest in this repo, so this is stdlib `unittest` only.
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -549,6 +550,7 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             os.makedirs(data_dir)
             child_ready = os.path.join(d, "child-ready")
             owner_wait_entered = os.path.join(d, "owner-wait-entered")
+            owner_wait_release = os.path.join(d, "owner-wait-release")
             stub = os.path.join(d, "fcvm-stub")
 
             server = socket.socket()
@@ -581,9 +583,10 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                     "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
                     f"printf '%s\\n' '{initial}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}\n"
                     f": > {state_path}.lock\n"
-                    f"( while [ ! -e {owner_wait_entered} ]; do sleep 0.01; done; sleep 0.25; "
+                    f"( while [ ! -e {owner_wait_entered} ] && [ ! -e {owner_wait_release} ]; do sleep 0.01; done; "
+                    f"if [ -e {owner_wait_entered} ]; then sleep 0.25; "
                     f"printf '%s\\n' '{ready}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}.tmp; "
-                    f"mv {state_path}.tmp {state_path} ) &\n"
+                    f"mv {state_path}.tmp {state_path}; fi ) &\n"
                     "wait\n"
                 )
             os.chmod(stub, 0o755)
@@ -591,8 +594,10 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             real_drive = cdpdrive.drive
             real_wait_state_owned = reqbench.wait_state_owned
             cdpdrive.drive = lambda _args: {"ok": True, "stages": {}}
+            owner_wait_calls = []
 
             def mark_owner_wait(*call_args, **call_kwargs):
+                owner_wait_calls.append(True)
                 open(owner_wait_entered, "w").close()
                 return real_wait_state_owned(*call_args, **call_kwargs)
 
@@ -606,12 +611,13 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
             finally:
-                open(owner_wait_entered, "a").close()
+                open(owner_wait_release, "w").close()
                 cdpdrive.drive = real_drive
                 reqbench.wait_state_owned = real_wait_state_owned
                 server.close()
 
             self.assertTrue(rec["ok"])
+            self.assertEqual(owner_wait_calls, [True])
             self.assertTrue(os.path.exists(owner_wait_entered))
             self.assertGreaterEqual(rec["state_owner_wait_ms"], 150.0, rec)
             self.assertTrue(rec["teardown"]["all_gone"])
@@ -1406,6 +1412,100 @@ class CdpDriveResolveThrottling(unittest.TestCase):
                            "resolve_ms is separable from a first-try one")
 
 
+class SnapshotGenerationIdentity(unittest.TestCase):
+    """A reusable tag is never the identity of benchmark evidence."""
+
+    SNAPSHOT = "reused-tag"
+    VM_ID = "vm-11111111111111111111111111111111"
+    IMAGE_CACHE_KEY = "a" * 64
+
+    @classmethod
+    def _write_generation(cls, data_root, generation_id):
+        snapshot_dir = os.path.join(data_root, "snapshots", cls.SNAPSHOT)
+        os.makedirs(snapshot_dir, exist_ok=True)
+        config = {
+            "generation_id": generation_id,
+            "created_at": "2026-08-09T00:00:00Z",
+            "vm_id": cls.VM_ID,
+            "metadata": {
+                "image": "localhost/chromium-bench-req",
+                "image_disk_path": (
+                    f"/image-cache/{cls.IMAGE_CACHE_KEY}.storage-v2.img"
+                ),
+                "vcpu": 2,
+                "memory_mib": 1024,
+                "network_mode": "rootless",
+                "port_mappings": [{
+                    "host_ip": None,
+                    "host_port": 9222,
+                    "guest_port": 9222,
+                    "proto": "tcp",
+                }],
+            },
+        }
+        config_json = (
+            json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        config_sha256 = hashlib.sha256(config_json).hexdigest()
+        config_path = os.path.join(snapshot_dir, "config.json")
+        with open(config_path, "wb") as target:
+            target.write(config_json)
+        provenance = {
+            "snapshot_generation_id": generation_id,
+            "snapshot_config_sha256": config_sha256,
+            "snapshot_created_at": config["created_at"],
+            "snapshot_vm_id": config["vm_id"],
+            "image": config["metadata"]["image"],
+            "image_id": "sha256:" + "b" * 64,
+            "image_digest": "sha256:" + cls.IMAGE_CACHE_KEY,
+            "image_cache_key": cls.IMAGE_CACHE_KEY,
+            "creator_fcvm_sha256": "c" * 64,
+            "creator_runtime_bundle_sha256": "d" * 64,
+            "source_revision": "e" * 40,
+        }
+        with open(
+            os.path.join(snapshot_dir, "reqbench-provenance.json"), "w"
+        ) as target:
+            json.dump(provenance, target)
+        return config_path, config_sha256
+
+    def test_exact_generation_and_config_digest_load(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            generation_id = "11111111-1111-4111-8111-111111111111"
+            _path, config_sha256 = self._write_generation(
+                data_root, generation_id,
+            )
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertEqual(generation["generation_id"], generation_id)
+            self.assertEqual(generation["config_sha256"], config_sha256)
+
+    def test_recreated_tag_rejects_the_previous_generation_provenance(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            config_path, _digest = self._write_generation(
+                data_root, "11111111-1111-4111-8111-111111111111",
+            )
+            with open(config_path) as source:
+                replacement = json.load(source)
+            replacement["generation_id"] = (
+                "22222222-2222-4222-8222-222222222222"
+            )
+            with open(config_path, "w") as target:
+                json.dump(replacement, target, sort_keys=True)
+                target.write("\n")
+            with self.assertRaisesRegex(RuntimeError, "snapshot_generation_id"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_in_place_config_change_rejects_the_previous_digest(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            config_path, _digest = self._write_generation(
+                data_root, "11111111-1111-4111-8111-111111111111",
+            )
+            with open(config_path, "ab") as target:
+                target.write(b" ")
+            with self.assertRaisesRegex(RuntimeError, "snapshot_config_sha256"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+
 class AnalyzerAvailability(unittest.TestCase):
     """Failed requests must be counted per arm, and must not hide a leak.
 
@@ -1474,6 +1574,12 @@ class AnalyzerAvailability(unittest.TestCase):
             "url": "http://fixture/medium.html", "format": "jpeg", "quality": 80,
             "image": "localhost/chromium-bench-req",
             "image_id": "sha256:" + "d" * 64, "snapshot": f"snapshot-{backend}",
+            "snapshot_generation_id": (
+                "11111111-1111-4111-8111-111111111111"
+                if backend == "file"
+                else "22222222-2222-4222-8222-222222222222"
+            ),
+            "snapshot_config_sha256": ("6" if backend == "file" else "7") * 64,
             "snapshot_created_at": "2026-08-09T00:00:00Z",
             "snapshot_vm_id": "vm-" + ("e" if backend == "file" else "f") * 32,
             "fcvm_sha256": "a" * 64, "harness_sha256": "c" * 64,
@@ -2242,8 +2348,8 @@ class AnalyzerAvailability(unittest.TestCase):
             self.assertIs(out["publishable"], False)
             self.assertEqual(rc, 5)
 
-    def test_appended_metadata_segments_with_different_cells_never_pool(self):
-        """The nearest preceding metadata line governs each record."""
+    def test_recreated_tag_with_same_legacy_identity_never_pools(self):
+        """The exact generation and config digest, not tag/time/VM, define a cell."""
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "r.jsonl")
             first = os.path.join(d, "first.jsonl")
@@ -2253,12 +2359,16 @@ class AnalyzerAvailability(unittest.TestCase):
                 snapshot="same-reused-tag",
                 snapshot_created_at="2026-08-09T00:00:00Z",
                 snapshot_vm_id="vm-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                snapshot_generation_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                snapshot_config_sha256="1" * 64,
             )
             self._write_clean_backend(
                 second, "file", 100, 900.0,
                 snapshot="same-reused-tag",
-                snapshot_created_at="2026-08-09T01:00:00Z",
-                snapshot_vm_id="vm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                snapshot_created_at="2026-08-09T00:00:00Z",
+                snapshot_vm_id="vm-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                snapshot_generation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                snapshot_config_sha256="2" * 64,
             )
             with open(src, "wb") as out, open(first, "rb") as a, open(second, "rb") as b:
                 out.write(a.read())
@@ -2778,7 +2888,7 @@ EOF
       mkdir -p "$DATA_ROOT/snapshots/$TAG"
       : > "$DATA_ROOT/snapshots/$TAG.lock"
       cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
-{{"created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"}}}}
+{{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"}}}}
 EOF
       ;;
 esac
@@ -2819,6 +2929,18 @@ exit 1
             self.assertEqual(provenance["image_id"], "sha256:" + image_id)
             self.assertEqual(provenance["image_digest"], "sha256:" + digest)
             self.assertEqual(provenance["image_cache_key"], digest)
+            self.assertEqual(
+                provenance["snapshot_generation_id"],
+                "12345678-1234-4234-8234-123456789abc",
+            )
+            config_path = os.path.join(
+                d, "snapshots", "cb-req-golden", "config.json",
+            )
+            with open(config_path, "rb") as source:
+                self.assertEqual(
+                    provenance["snapshot_config_sha256"],
+                    hashlib.sha256(source.read()).hexdigest(),
+                )
 
     def test_golden_rejects_a_tag_repointed_before_fcvm_resolved_it(self):
         """The snapshot disk key must match the harness's atomic image inspect."""
@@ -3087,8 +3209,12 @@ source {self.SH!r}
 trap - EXIT INT TERM
 for load in 2 2.0; do
     printf '%s 0 0 1/1 1\n' "$load" > "$LOADAVG_FILE"
-    guard_quiet
-    printf '%s=quiet\n' "$load"
+    if guard_quiet; then
+        printf '%s=quiet\n' "$load"
+    else
+        printf '%s=busy:%s\n' "$load" "$?"
+        exit 1
+    fi
 done
 printf '2.1 0 0 1/1 1\n' > "$LOADAVG_FILE"
 if guard_quiet; then

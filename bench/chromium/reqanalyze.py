@@ -45,13 +45,14 @@ import random
 import statistics
 import sys
 import tempfile
+import uuid
 
 
 MIN_CDP_ATTEMPTS_PER_BACKEND = 200
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
-ANALYZER_SCHEMA_VERSION = 2
+ANALYZER_SCHEMA_VERSION = 3
 SEALED_ANALYZER_FD_ENV = "REQANALYZE_SEALED_FD"
 ANALYZER_SOURCE_PATH_ENV = "REQANALYZE_SOURCE_PATH"
 
@@ -68,6 +69,8 @@ CELL_FIELDS = (
     "image",
     "image_id",
     "snapshot",
+    "snapshot_generation_id",
+    "snapshot_config_sha256",
     "snapshot_created_at",
     "snapshot_vm_id",
     "fcvm_sha256",
@@ -170,7 +173,8 @@ def _cell_from_meta(meta, source):
     cell = {}
     string_fields = {
         "backend", "uffd_mode", "url", "format", "image", "image_id", "snapshot",
-        "snapshot_created_at", "snapshot_vm_id", "fcvm_sha256", "harness_sha256",
+        "snapshot_generation_id", "snapshot_config_sha256", "snapshot_created_at",
+        "snapshot_vm_id", "fcvm_sha256", "harness_sha256",
         "runtime_bundle_sha256", "source_revision", "network_mode", "rust_log", "host_boot_id",
         "host_kernel_release", "host_machine",
     }
@@ -293,10 +297,20 @@ def _cell_from_meta(meta, source):
         ]
         if len(identities) != len(set(identities)):
             errors.append(f"{source} metadata has duplicate port mappings")
-    for field in ("fcvm_sha256", "harness_sha256", "runtime_bundle_sha256"):
+    for field in (
+        "snapshot_config_sha256", "fcvm_sha256", "harness_sha256",
+        "runtime_bundle_sha256",
+    ):
         value = cell.get(field, "")
         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
             errors.append(f"{source} metadata has invalid {field}")
+    snapshot_generation_id = cell.get("snapshot_generation_id", "")
+    try:
+        canonical_generation_id = str(uuid.UUID(snapshot_generation_id))
+    except (AttributeError, ValueError):
+        canonical_generation_id = ""
+    if canonical_generation_id != snapshot_generation_id:
+        errors.append(f"{source} metadata has invalid snapshot_generation_id")
     revision = cell.get("source_revision", "")
     if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
         errors.append(f"{source} metadata has invalid source_revision")
