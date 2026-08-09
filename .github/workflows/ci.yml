@@ -107,6 +107,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+      - name: Test CI infrastructure classifier
+        working-directory: fcvm
+        run: make test-ci-infrastructure
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.93.0

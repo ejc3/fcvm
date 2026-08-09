@@ -357,6 +357,50 @@ fn summary_fails_when_a_gating_job_fails() {
     }
 }
 
+/// The infrastructure classifier decides whether a failed CI run is retried or
+/// handed to a secret-bearing code fixer. Its fixture suite must execute in the
+/// ordinary pull-request gate, not remain a manual-only Make target.
+#[test]
+fn ci_runs_infrastructure_classifier_fixtures_on_ubuntu() {
+    let ci = parse_workflow("ci.yml");
+    let lint = workflow_job(&ci, "lint");
+
+    assert_eq!(
+        lint.get("runs-on").and_then(Value::as_str),
+        Some("ubuntu-latest"),
+        "the classifier fixtures must run on a GitHub-hosted Ubuntu runner"
+    );
+
+    let steps = lint
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("ci.yml `lint` job has no steps");
+    let fixture_step = steps
+        .iter()
+        .find(|step| {
+            step.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|run| run.trim() == "make test-ci-infrastructure")
+        })
+        .expect(
+            "ci.yml `lint` never runs `make test-ci-infrastructure`; the privileged CI verdict gate has no fixture coverage in CI",
+        );
+    assert_eq!(
+        fixture_step
+            .get("working-directory")
+            .and_then(Value::as_str),
+        Some("fcvm"),
+        "the classifier fixture step must run from the checked-out repository"
+    );
+    assert_ne!(
+        fixture_step
+            .get("continue-on-error")
+            .and_then(Value::as_bool),
+        Some(true),
+        "classifier fixture failures must fail the lint gate"
+    );
+}
+
 /// Infrastructure retries must be bounded, trusted, and mutually exclusive
 /// with the secret-bearing Claude fixer.
 ///
