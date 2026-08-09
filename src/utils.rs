@@ -52,17 +52,6 @@ impl DirWatch {
         Ok(Self { async_fd, inotify })
     }
 
-    /// [`next_event`](Self::next_event) over an optional watch: a `None` watch
-    /// (inotify init failed — e.g. `fs.inotify.max_user_instances` exhausted by
-    /// many concurrent fcvm processes) never completes, so a `select!` caller
-    /// degrades to its safety-tick/deadline arms instead of failing hard.
-    pub async fn next_event_opt(watch: &mut Option<Self>) -> anyhow::Result<()> {
-        match watch {
-            Some(w) => w.next_event().await,
-            None => std::future::pending().await,
-        }
-    }
-
     /// Wait until at least one filesystem event has been consumed.
     ///
     /// Drains everything currently queued (the event batch is only a wakeup —
@@ -82,6 +71,32 @@ impl DirWatch {
                 }
                 Err(e) => return Err(anyhow::anyhow!("reading inotify events: {e}")),
             }
+        }
+    }
+}
+
+/// Filesystem-event source used by readiness loops.
+///
+/// Keeping the wait loops generic over this tiny boundary lets their rare
+/// inotify-unavailable and inotify-read-error paths be driven deterministically
+/// in unit tests. Production uses `Option<DirWatch>`: `None` is an unavailable
+/// watch whose event future never resolves, leaving the caller's safety tick and
+/// deadline as the correctness path.
+pub(crate) trait DirEventSource {
+    fn is_available(&self) -> bool;
+
+    async fn next_event(&mut self) -> anyhow::Result<()>;
+}
+
+impl DirEventSource for Option<DirWatch> {
+    fn is_available(&self) -> bool {
+        self.is_some()
+    }
+
+    async fn next_event(&mut self) -> anyhow::Result<()> {
+        match self {
+            Some(watch) => watch.next_event().await,
+            None => std::future::pending().await,
         }
     }
 }
@@ -763,6 +778,23 @@ pub fn install_namespace_pre_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dir_watch_consumes_event_queued_between_check_and_park() {
+        let dir = tempfile::tempdir().expect("create watched directory");
+        let appeared = dir.path().join("appeared");
+        let mut watch = DirWatch::new(dir.path()).expect("register directory watch");
+
+        // This is the readiness-loop ordering: watch first, condition check,
+        // then the producer wins immediately before `next_event()` is polled.
+        assert!(!appeared.exists());
+        std::fs::write(&appeared, b"ready").expect("publish watched file");
+
+        tokio::time::timeout(Duration::from_secs(1), watch.next_event())
+            .await
+            .expect("queued inotify event was lost")
+            .expect("consume queued inotify event");
+    }
 
     #[test]
     fn test_is_process_alive_current_process() {

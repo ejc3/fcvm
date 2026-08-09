@@ -141,6 +141,87 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
     Ok(metadata)
 }
 
+/// Why the restore-epoch watcher woke up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreEpochWake {
+    PollInterval,
+    TransportReset,
+    ResetSenderClosed,
+}
+
+/// Latching transport-reset wakeup plus the original periodic fallback.
+///
+/// `watch::Receiver::changed` observes a generation published before the wait
+/// future is created, which closes the check-to-park lost-wakeup window. Once
+/// the sender closes, the reset arm is permanently disarmed so a perpetually
+/// ready `changed()` error cannot spin the metadata fetch loop.
+struct RestoreEpochSchedule {
+    reset_rx: tokio::sync::watch::Receiver<u64>,
+    reset_armed: bool,
+    poll_interval: Duration,
+    fast_interval: Duration,
+    fast_until: Option<tokio::time::Instant>,
+}
+
+impl RestoreEpochSchedule {
+    const FAST_WINDOW: Duration = Duration::from_secs(1);
+
+    fn new(
+        transport: crate::bootplan::Transport,
+        reset_rx: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        let poll_interval = match transport {
+            crate::bootplan::Transport::Mmds => Duration::from_millis(50),
+            crate::bootplan::Transport::Vsock => Duration::from_millis(250),
+        };
+        // Post-reset fast cadence: MMDS gets are cheap local HTTP; vsock polls
+        // reopen the boot-plan connection, so keep them a bit gentler.
+        let fast_interval = match transport {
+            crate::bootplan::Transport::Mmds => Duration::from_millis(2),
+            crate::bootplan::Transport::Vsock => Duration::from_millis(10),
+        };
+        Self {
+            reset_rx,
+            reset_armed: true,
+            poll_interval,
+            fast_interval,
+            fast_until: None,
+        }
+    }
+
+    async fn wait(&mut self) -> RestoreEpochWake {
+        let interval = match self.fast_until {
+            Some(t) if tokio::time::Instant::now() < t => self.fast_interval,
+            _ => {
+                self.fast_until = None;
+                self.poll_interval
+            }
+        };
+
+        tokio::select! {
+            _ = sleep(interval) => RestoreEpochWake::PollInterval,
+            changed = self.reset_rx.changed(), if self.reset_armed => {
+                match changed {
+                    Ok(()) => {
+                        self.fast_until = Some(
+                            tokio::time::Instant::now() + Self::FAST_WINDOW
+                        );
+                        RestoreEpochWake::TransportReset
+                    }
+                    Err(_) => {
+                        self.reset_armed = false;
+                        RestoreEpochWake::ResetSenderClosed
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_fast_window(&mut self) {
+        self.fast_until = None;
+    }
+}
+
 /// Watch for restore-epoch changes and handle clone restore, over either transport.
 ///
 /// Firecracker polls MMDS; Cloud Hypervisor polls the host's boot-plan vsock port
@@ -168,46 +249,11 @@ pub async fn watch_restore_epoch(
     let mut egress_gen_at_last_stable: Option<u64> =
         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
 
-    let poll_interval = match transport {
-        crate::bootplan::Transport::Mmds => Duration::from_millis(50),
-        crate::bootplan::Transport::Vsock => Duration::from_millis(250),
-    };
-    // Post-reset fast cadence: MMDS gets are cheap local HTTP; vsock polls
-    // reopen the boot-plan connection, so keep them a bit gentler.
-    let fast_interval = match transport {
-        crate::bootplan::Transport::Mmds => Duration::from_millis(2),
-        crate::bootplan::Transport::Vsock => Duration::from_millis(10),
-    };
-    const FAST_WINDOW: Duration = Duration::from_secs(1);
-
-    let mut reset_rx = signals.vsock_reset_rx.clone();
-    // Once the watch sender is gone (writer task ended — shutdown), stop
-    // selecting on it so a closed channel can't busy-loop the watcher.
-    let mut reset_armed = true;
-    let mut fast_until: Option<tokio::time::Instant> = None;
+    let mut schedule = RestoreEpochSchedule::new(transport, signals.vsock_reset_rx.clone());
 
     loop {
-        let interval = match fast_until {
-            Some(t) if tokio::time::Instant::now() < t => fast_interval,
-            _ => {
-                fast_until = None;
-                poll_interval
-            }
-        };
-        tokio::select! {
-            _ = sleep(interval) => {}
-            changed = reset_rx.changed(), if reset_armed => {
-                match changed {
-                    Ok(()) => {
-                        eprintln!(
-                            "[fc-agent] vsock transport reset observed; fast-polling restore-epoch"
-                        );
-                        fast_until = Some(tokio::time::Instant::now() + FAST_WINDOW);
-                        // Fall through to an immediate fetch.
-                    }
-                    Err(_) => reset_armed = false,
-                }
-            }
+        if schedule.wait().await == RestoreEpochWake::TransportReset {
+            eprintln!("[fc-agent] vsock transport reset observed; fast-polling restore-epoch");
         }
 
         let metadata = match crate::bootplan::fetch_metadata(transport).await {
@@ -251,7 +297,7 @@ pub async fn watch_restore_epoch(
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
                     last_epoch = metadata.restore_epoch;
                     // Epoch found and handled — the fast window did its job.
-                    fast_until = None;
+                    schedule.clear_fast_window();
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
@@ -271,7 +317,7 @@ pub async fn watch_restore_epoch(
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
                     last_epoch = metadata.restore_epoch;
                     // Epoch found and handled — the fast window did its job.
-                    fast_until = None;
+                    schedule.clear_fast_window();
                 }
                 _ => {}
             }
@@ -312,4 +358,80 @@ pub async fn sync_clock_from_host() -> Result<()> {
         serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
     crate::bootplan::set_system_clock(&metadata.host_time).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::{poll_fn, Future};
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    async fn assert_pending_once<F>(mut future: Pin<&mut F>)
+    where
+        F: Future,
+    {
+        poll_fn(|cx| match future.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("future completed before its signal"),
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_reset_generation_published_before_park_wakes_immediately() {
+        let (reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let mut schedule = RestoreEpochSchedule::new(crate::bootplan::Transport::Mmds, reset_rx);
+
+        // Publish before `wait()` creates its `changed()` future. A one-shot
+        // notification would lose this edge; the retained watch generation must
+        // make the subsequent wait immediately ready.
+        reset_tx.send(1).expect("reset receiver remains alive");
+        let before = tokio::time::Instant::now();
+
+        assert_eq!(schedule.wait().await, RestoreEpochWake::TransportReset);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "fallback clock advanced"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_reset_sender_is_disarmed_instead_of_spinning() {
+        let (reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let mut schedule = RestoreEpochSchedule::new(crate::bootplan::Transport::Mmds, reset_rx);
+        drop(reset_tx);
+
+        assert_eq!(schedule.wait().await, RestoreEpochWake::ResetSenderClosed);
+
+        // `changed()` on a closed channel remains immediately ready forever.
+        // The second wait must use only the 50ms fallback, proving the closed
+        // arm was permanently removed from the select.
+        let mut next = Box::pin(schedule.wait());
+        assert_pending_once(next.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert_pending_once(next.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(next.await, RestoreEpochWake::PollInterval);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_transport_reset_uses_periodic_fallback() {
+        let (_reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let mut schedule = RestoreEpochSchedule::new(crate::bootplan::Transport::Mmds, reset_rx);
+        let before = tokio::time::Instant::now();
+
+        let mut wait = Box::pin(schedule.wait());
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert_eq!(wait.await, RestoreEpochWake::PollInterval);
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            Duration::from_millis(50)
+        );
+    }
 }

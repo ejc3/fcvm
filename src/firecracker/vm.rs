@@ -27,6 +27,25 @@ const STDERR_TAIL_LINES: usize = 10;
 /// only bounds the pathological case of an inherited, still-open pipe.
 const STDERR_EOF_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Connection probe boundary for the API-socket readiness state machine.
+///
+/// Production uses Tokio's Unix stream. Tests provide exact NotFound,
+/// ConnectionRefused, and ready sequences so every check-to-park interleave is
+/// exercised without scheduler timing or a retry loop.
+trait ApiSocketProbe {
+    async fn connect(&mut self, socket_path: &Path) -> std::io::Result<()>;
+}
+
+struct TokioApiSocketProbe;
+
+impl ApiSocketProbe for TokioApiSocketProbe {
+    async fn connect(&mut self, socket_path: &Path) -> std::io::Result<()> {
+        let stream = tokio::net::UnixStream::connect(socket_path).await?;
+        drop(stream);
+        Ok(())
+    }
+}
+
 /// Manages a Firecracker VM process
 ///
 /// IMPORTANT: PID Tracking Architecture
@@ -361,8 +380,6 @@ impl VmManager {
     /// connections, fail with its exit status and recent stderr output instead
     /// of timing out with a generic socket error.
     async fn wait_for_socket(&mut self) -> Result<()> {
-        use tokio::time::sleep;
-
         let mut watch =
             self.socket_path
                 .parent()
@@ -376,6 +393,17 @@ impl VmManager {
                         None
                     }
                 });
+        let mut probe = TokioApiSocketProbe;
+
+        self.wait_for_socket_with(&mut probe, &mut watch).await
+    }
+
+    async fn wait_for_socket_with<P, E>(&mut self, probe: &mut P, watch: &mut E) -> Result<()>
+    where
+        P: ApiSocketProbe,
+        E: crate::utils::DirEventSource,
+    {
+        use tokio::time::sleep;
 
         let deadline = tokio::time::Instant::now() + SOCKET_WAIT_TIMEOUT;
         loop {
@@ -386,12 +414,8 @@ impl VmManager {
             // forever, and skipping try_wait would spin out the whole deadline
             // and report a generic timeout instead of the exit status + stderr.
             let mut refused = false;
-            match tokio::net::UnixStream::connect(&self.socket_path).await {
-                Ok(stream) => {
-                    // Only probing readiness — drop the connection immediately.
-                    drop(stream);
-                    return Ok(());
-                }
+            match probe.connect(&self.socket_path).await {
+                Ok(()) => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Socket file not created yet — wait for a directory event below.
                 }
@@ -429,25 +453,24 @@ impl VmManager {
                 continue;
             }
 
-            match watch.as_mut() {
-                Some(w) => {
-                    tokio::select! {
-                        event = w.next_event() => {
-                            // Directory activity — loop re-probes the socket.
-                            // A (persistent) watch error degrades to the old
-                            // fixed cadence via this sleep, bounded by deadline.
-                            if event.is_err() {
-                                sleep(SOCKET_WAIT_RETRY_DELAY).await;
-                            }
-                        }
-                        _ = tokio::time::sleep_until(deadline) => {}
-                        _ = sleep(Duration::from_millis(100)) => {
-                            // Safety tick: re-check child liveness + socket
-                            // even if no event arrives.
+            if watch.is_available() {
+                tokio::select! {
+                    event = watch.next_event() => {
+                        // Directory activity — loop re-probes the socket.
+                        // A (persistent) watch error degrades to the old
+                        // fixed cadence via this sleep, bounded by deadline.
+                        if event.is_err() {
+                            sleep(SOCKET_WAIT_RETRY_DELAY).await;
                         }
                     }
+                    _ = tokio::time::sleep_until(deadline) => {}
+                    _ = sleep(Duration::from_millis(100)) => {
+                        // Safety tick: re-check child liveness + socket
+                        // even if no event arrives.
+                    }
                 }
-                None => sleep(SOCKET_WAIT_RETRY_DELAY).await,
+            } else {
+                sleep(SOCKET_WAIT_RETRY_DELAY).await;
             }
         }
 
@@ -612,7 +635,231 @@ impl Drop for VmManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::DirEventSource;
+    use std::future::{poll_fn, Future};
     use std::os::unix::fs::PermissionsExt;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    #[derive(Clone, Copy)]
+    enum ProbeStep {
+        Ready,
+        NotFound,
+        Refused,
+    }
+
+    struct ScriptedProbe {
+        steps: VecDeque<ProbeStep>,
+        repeat: Option<ProbeStep>,
+        calls: usize,
+    }
+
+    impl ScriptedProbe {
+        fn once(steps: impl IntoIterator<Item = ProbeStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                repeat: None,
+                calls: 0,
+            }
+        }
+
+        fn repeating(step: ProbeStep) -> Self {
+            Self {
+                steps: VecDeque::new(),
+                repeat: Some(step),
+                calls: 0,
+            }
+        }
+    }
+
+    impl ApiSocketProbe for ScriptedProbe {
+        async fn connect(&mut self, _socket_path: &Path) -> std::io::Result<()> {
+            self.calls += 1;
+            let step = self
+                .steps
+                .pop_front()
+                .or(self.repeat)
+                .expect("scripted API-socket probe exhausted");
+            match step {
+                ProbeStep::Ready => Ok(()),
+                ProbeStep::NotFound => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                ProbeStep::Refused => {
+                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                }
+            }
+        }
+    }
+
+    enum EventStep {
+        Wake,
+        ReadError,
+    }
+
+    struct ScriptedEvents {
+        steps: VecDeque<EventStep>,
+        calls: usize,
+    }
+
+    impl ScriptedEvents {
+        fn new(steps: impl IntoIterator<Item = EventStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl DirEventSource for ScriptedEvents {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn next_event(&mut self) -> anyhow::Result<()> {
+            self.calls += 1;
+            let step = self.steps.pop_front().expect("event script exhausted");
+            match step {
+                EventStep::Wake => Ok(()),
+                EventStep::ReadError => Err(anyhow!("injected inotify read failure")),
+            }
+        }
+    }
+
+    fn manager_with_live_child(socket_path: PathBuf) -> VmManager {
+        let mut command = Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = command.spawn().expect("spawn live child");
+
+        let mut vm = VmManager::new("wait-test".to_string(), socket_path, None);
+        vm.process = Some(child);
+        vm
+    }
+
+    async fn assert_pending_once<F>(mut future: Pin<&mut F>)
+    where
+        F: Future,
+    {
+        poll_fn(|cx| match future.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("future completed before its required signal"),
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_socket_event_queued_after_check_wakes_without_clock_fallback() {
+        let dir = tempfile::tempdir().expect("create socket directory");
+        let mut vm = manager_with_live_child(dir.path().join("api.sock"));
+        let mut probe = ScriptedProbe::once([ProbeStep::NotFound, ProbeStep::Ready]);
+        let mut events = ScriptedEvents::new([EventStep::Wake]);
+        let before = tokio::time::Instant::now();
+
+        vm.wait_for_socket_with(&mut probe, &mut events)
+            .await
+            .expect("queued directory event should trigger a second probe");
+
+        assert_eq!(probe.calls, 2);
+        assert_eq!(events.calls, 1);
+        assert_eq!(tokio::time::Instant::now(), before, "safety tick fired");
+        vm.kill().await.expect("stop live child");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_socket_unavailable_watch_uses_ten_millisecond_fallback() {
+        let dir = tempfile::tempdir().expect("create socket directory");
+        let mut vm = manager_with_live_child(dir.path().join("api.sock"));
+        let mut probe = ScriptedProbe::once([ProbeStep::NotFound, ProbeStep::Ready]);
+        let mut no_watch = None::<crate::utils::DirWatch>;
+        let before = tokio::time::Instant::now();
+
+        vm.wait_for_socket_with(&mut probe, &mut no_watch)
+            .await
+            .expect("poll fallback should re-probe without inotify");
+
+        assert_eq!(probe.calls, 2);
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            SOCKET_WAIT_RETRY_DELAY
+        );
+        vm.kill().await.expect("stop live child");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_socket_inotify_read_error_uses_ten_millisecond_fallback() {
+        let dir = tempfile::tempdir().expect("create socket directory");
+        let mut vm = manager_with_live_child(dir.path().join("api.sock"));
+        let mut probe = ScriptedProbe::once([ProbeStep::NotFound, ProbeStep::Ready]);
+        let mut events = ScriptedEvents::new([EventStep::ReadError]);
+        let before = tokio::time::Instant::now();
+
+        vm.wait_for_socket_with(&mut probe, &mut events)
+            .await
+            .expect("watch read failure should degrade to polling");
+
+        assert_eq!(probe.calls, 2);
+        assert_eq!(events.calls, 1);
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            SOCKET_WAIT_RETRY_DELAY
+        );
+        vm.kill().await.expect("stop live child");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_refusal_reports_child_exit_after_complete_stderr() {
+        let dir = tempfile::tempdir().expect("create socket directory");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 23")
+            .spawn()
+            .expect("spawn exited child");
+        let status = child.wait().await.expect("reap exited child");
+        assert_eq!(status.code(), Some(23));
+
+        let mut vm = VmManager::new(
+            "refused-test".to_string(),
+            dir.path().join("api.sock"),
+            None,
+        );
+        vm.process = Some(child);
+
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let (release_reader_tx, release_reader_rx) = tokio::sync::oneshot::channel();
+        let stderr_tail = Arc::clone(&vm.stderr_tail);
+        vm.stderr_reader = Some(tokio::spawn(async move {
+            let _ = reader_started_tx.send(());
+            let _ = release_reader_rx.await;
+            stderr_tail
+                .lock()
+                .expect("stderr tail lock")
+                .push_back("final stderr line".to_string());
+        }));
+        reader_started_rx.await.expect("stderr reader parked");
+
+        let mut probe = ScriptedProbe::repeating(ProbeStep::Refused);
+        let mut no_watch = None::<crate::utils::DirWatch>;
+        let mut wait = Box::pin(vm.wait_for_socket_with(&mut probe, &mut no_watch));
+
+        // The exited-child diagnosis must park on the reader. If the
+        // ECONNREFUSED branch skips liveness, or error formatting races EOF,
+        // this future either retries or completes here instead.
+        assert_pending_once(wait.as_mut()).await;
+        release_reader_tx.send(()).expect("release stderr reader");
+        let err = wait
+            .await
+            .expect_err("an exited child cannot become API-ready");
+        let message = format!("{err:#}");
+
+        assert_eq!(probe.calls, 1, "ECONNREFUSED skipped child liveness");
+        assert!(
+            message.contains("Firecracker exited with exit status: 23"),
+            "{message}"
+        );
+        assert!(message.contains("final stderr line"), "{message}");
+        assert!(!message.contains("socket not ready"), "{message}");
+    }
 
     /// A Firecracker process that exits before creating its API socket must fail
     /// `start()` with its exit status and stderr output, not the generic
