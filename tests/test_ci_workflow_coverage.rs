@@ -574,12 +574,17 @@ fn claude_infrastructure_retry_is_trusted_bounded_and_gates_ci_fix() {
             "ci-fix no longer waits for `{required}`"
         );
     }
-    assert!(
-        ci_fix
-            .get("if")
-            .and_then(Value::as_str)
-            .is_some_and(|condition| condition
-                .contains("needs.classify-ci-failure.outputs.classification != 'infrastructure'")),
-        "ci-fix must be suppressed for infrastructure-only failures"
-    );
+    let ci_fix_condition = ci_fix
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("ci-fix has no job condition");
+    for required in [
+        "needs.classify-ci-failure.outputs.classification != 'infrastructure'",
+        "github.event.workflow_run.name == 'CI'",
+    ] {
+        assert!(
+            ci_fix_condition.contains(required),
+            "ci-fix is missing its `{required}` classification/workflow gate"
+        );
+    }
 }

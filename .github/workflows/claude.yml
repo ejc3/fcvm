@@ -561,7 +561,7 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.conclusion == 'failure' &&
       !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
-      github.event.workflow_run.name != 'Claude Assistant'
+      github.event.workflow_run.name == 'CI'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
