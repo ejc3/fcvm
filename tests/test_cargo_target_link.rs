@@ -164,6 +164,20 @@ fn cargo_target_link_heals_when_btrfs_is_gone_entirely() {
          recipe depends on it:\n{out}"
     );
     assert_target_usable(work.path(), "btrfs root absent");
+
+    // And it must be a REAL local directory, not the stale link with its target
+    // recreated. `$BTRFS_ROOT` absent means the volume is unmounted; recreating
+    // the path underneath a mountpoint writes build artifacts to the small root
+    // filesystem while still looking like btrfs — the exact failure this whole
+    // indirection exists to avoid.
+    assert!(
+        std::fs::symlink_metadata(work.path().join("target"))
+            .expect("target must exist")
+            .file_type()
+            .is_dir(),
+        "target is still a symlink after the btrfs volume disappeared; artifacts would be \
+         written under the unmounted mountpoint {gone:?} — i.e. onto the root filesystem"
+    );
 }
 
 /// `target` occupied by a regular file cannot be silently ignored: cargo would

@@ -70,8 +70,24 @@ if [ -d "$BTRFS_ROOT" ]; then
 	if ! [ -L target ]; then
 		if [ -d target ]; then
 			echo "==> Moving existing target/ to $WT_TARGET..."
-			mv target/* "$WT_TARGET"/ 2>/dev/null || true
-			rm -rf target
+			# Never `rm -rf` the source on a partial move. A full volume, a
+			# permission error, or a plain `target/*` glob (which skips
+			# .rustc_info.json and other dotfiles) would otherwise discard build
+			# artifacts silently. Move everything, dotfiles included, and abort if
+			# any of it fails; `rmdir` then succeeds only if the move was complete.
+			shopt -s dotglob nullglob
+			entries=(target/*)
+			shopt -u dotglob nullglob
+			if [ ${#entries[@]} -gt 0 ]; then
+				mv -- "${entries[@]}" "$WT_TARGET"/ || {
+					echo "ERROR: could not migrate target/ to $WT_TARGET; leaving it in place" >&2
+					exit 1
+				}
+			fi
+			rmdir target || {
+				echo "ERROR: target/ is not empty after migration; leaving it in place" >&2
+				exit 1
+			}
 		fi
 		ln -s "$WT_TARGET" target
 		echo "==> Symlinked target/ → $WT_TARGET"
@@ -84,8 +100,17 @@ fi
 # false exactly when it does not resolve.
 if [ -L target ] && ! [ -d target ]; then
 	TGT="$(readlink target)"
-	echo "==> target/ → $TGT is dangling (volume reset?); recreating"
-	if ! mkdir -p "$TGT" 2>/dev/null; then
+	if ! [ -d "$BTRFS_ROOT" ]; then
+		# The VOLUME is gone, not just our directory on it. Recreating the path
+		# would silently write build artifacts under an unmounted mountpoint —
+		# i.e. onto the small root filesystem, the exact thing this indirection
+		# exists to avoid — while still looking like btrfs. Drop the link and let
+		# the fail-closed step below make a real local directory.
+		echo "==> WARNING: $BTRFS_ROOT is not mounted; using a local target/ on the root filesystem"
+		rm -f target
+	elif mkdir -p "$TGT" 2>/dev/null; then
+		echo "==> target/ → $TGT was dangling (pruned?); recreated"
+	else
 		echo "==> WARNING: cannot recreate $TGT; using a local target/ on the root filesystem"
 		rm -f target
 	fi
