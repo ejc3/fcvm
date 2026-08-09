@@ -107,6 +107,13 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
+    if let Err(error) =
+        super::common::publish_lifecycle_ready(&ctx.state_manager, &mut ctx.vm_state).await
+    {
+        cleanup_vm_context(ctx).await;
+        return Err(error);
+    }
+
     // Get actual PID from VM state (set during prepare_vm)
     let actual_pid = ctx
         .state_manager
@@ -169,35 +176,44 @@ fn is_snapshot_load_failure(err: &anyhow::Error) -> bool {
 /// Delete a cached snapshot that failed to load so the run can fall back to a
 /// fresh boot (which re-creates the snapshot with the current Firecracker).
 ///
-/// Takes the per-snapshot flock EXCLUSIVELY first: restores hold it shared for
-/// their whole duration, so this can never yank memory/vmstate/disk files out
-/// from under a concurrent clone of the same snapshot.
-async fn invalidate_unusable_snapshot(snapshot_key: &str, err: &anyhow::Error) {
+/// Invalidation takes the per-snapshot flock exclusively and revalidates the
+/// exact generation used by the failed restore.  A creator may install a new
+/// generation after the restore releases its shared lease but before this
+/// function gets the exclusive lease; that replacement must survive.
+async fn invalidate_unusable_snapshot(
+    snapshot_key: &str,
+    expected_generation: Option<&crate::storage::SnapshotGeneration>,
+    err: &anyhow::Error,
+) {
     warn!(
         snapshot_key = %snapshot_key,
         error = %format!("{err:#}"),
         "cached snapshot failed to load (incompatible Firecracker snapshot \
          format?); invalidating it and falling back to a fresh boot"
     );
-    let snapshot_path = paths::snapshot_dir().join(snapshot_key);
-    let _excl_lock = match super::common::acquire_snapshot_dir_lock(&snapshot_path, true).await {
-        Ok(lock) => lock,
-        Err(lock_err) => {
-            warn!(
-                snapshot_key = %snapshot_key,
-                error = %lock_err,
-                "could not lock unusable snapshot for deletion; leaving it in place"
-            );
-            return;
-        }
-    };
-    let manager = crate::storage::SnapshotManager::new(paths::snapshot_dir());
-    if let Err(delete_err) = manager.delete_snapshot(snapshot_key).await {
+    let Some(expected_generation) = expected_generation else {
         warn!(
             snapshot_key = %snapshot_key,
-            error = %delete_err,
-            "failed to delete unusable snapshot; the next run will hit it again"
+            "failed restore did not report its snapshot generation; refusing blind invalidation"
         );
+        return;
+    };
+
+    let manager = crate::storage::SnapshotManager::new(paths::snapshot_dir());
+    match manager
+        .delete_snapshot_if_generation(snapshot_key, expected_generation)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => info!(
+            snapshot_key = %snapshot_key,
+            "failed snapshot generation was already replaced; retaining current generation"
+        ),
+        Err(delete_err) => warn!(
+            snapshot_key = %snapshot_key,
+            error = %delete_err,
+            "failed to delete unusable snapshot; the next run may hit it again"
+        ),
     }
 }
 
@@ -500,10 +516,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 hugepages: Some(args.hugepages),
                 non_blocking_output: args.non_blocking_output,
             };
-            match super::snapshot::cmd_snapshot_run(snapshot_args).await {
+            let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
+            match attempt.result {
                 Ok(()) => return Ok(None),
                 Err(e) if is_snapshot_load_failure(&e) => {
-                    invalidate_unusable_snapshot(&startup_key, &e).await;
+                    invalidate_unusable_snapshot(&startup_key, attempt.generation.as_ref(), &e)
+                        .await;
                     // fall through to the pre-start check / fresh boot
                 }
                 Err(e) => return Err(e),
@@ -537,10 +555,11 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 hugepages: Some(args.hugepages),
                 non_blocking_output: args.non_blocking_output,
             };
-            match super::snapshot::cmd_snapshot_run(snapshot_args).await {
+            let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
+            match attempt.result {
                 Ok(()) => return Ok(None),
                 Err(e) if is_snapshot_load_failure(&e) => {
-                    invalidate_unusable_snapshot(&key, &e).await;
+                    invalidate_unusable_snapshot(&key, attempt.generation.as_ref(), &e).await;
                     // fall through to a fresh boot (which re-creates the snapshot)
                 }
                 Err(e) => return Err(e),
@@ -1615,16 +1634,22 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // setup phase is recorded instead of killing the process and leaving host network
     // state, the persisted VM state file, and the data directory behind. Shutdown is
     // deferred until setup finishes, then full cleanup runs below.
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
+    let lifecycle_gate = super::common::LifecycleReadyGate::new();
+    let cancel = lifecycle_gate.cancellation_token();
+    let signal_gate = lifecycle_gate.clone();
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {
-            _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
-            _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }
+            _ = sigterm.recv() => {
+                signal_gate.cancel();
+                info!("received SIGTERM, shutting down VM");
+            }
+            _ = sigint.recv() => {
+                signal_gate.cancel();
+                info!("received SIGINT, shutting down VM");
+            }
         }
-        cancel_clone.cancel();
     });
 
     let Some(mut ctx) = prepare_vm(args).await? else {
@@ -1637,6 +1662,24 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         info!("shutdown requested during VM setup, cleaning up");
         cleanup_vm_context(ctx).await;
         bail!("interrupted by signal during VM setup");
+    }
+
+    // PID/state are intentionally visible during setup, but exact child capture and
+    // external lifecycle actions wait for this atomic barrier. At this point the signal
+    // streams, VMM/holder/network children, and every companion listener are all owned.
+    match lifecycle_gate
+        .publish(&ctx.state_manager, &mut ctx.vm_state)
+        .await
+    {
+        Ok(super::common::LifecycleReadyOutcome::Published) => {}
+        Ok(super::common::LifecycleReadyOutcome::Cancelled) => {
+            cleanup_vm_context(ctx).await;
+            bail!("interrupted by signal during VM setup");
+        }
+        Err(error) => {
+            cleanup_vm_context(ctx).await;
+            return Err(error);
+        }
     }
 
     // Run the VM loop, then always clean up — even when the loop reports an error.

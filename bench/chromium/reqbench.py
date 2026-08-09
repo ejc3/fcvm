@@ -79,8 +79,9 @@ COMPLETE, and when it did not (the parent's reaper won the race) the figure is a
 LOWER BOUND and is labelled as one. Never averaged together.
 
 Whole-machine `/proc/stat` busy-jiffy deltas are recorded over the reclaim window
-AND over an equal-length control window taken immediately before the kill, so
-background load can be subtracted instead of silently inflating the attribution.
+and against a post-terminal ambient control. A pre-kill control includes the
+still-running VM's ordinary CPU and subtracts work absent from reclaim, so that
+older accounting was withdrawn.
 
 At saturation that CPU competes with new requests. A latency win is not a
 capacity win, and this harness deliberately makes it impossible to report one as
@@ -89,16 +90,22 @@ the other.
 
 import argparse
 import ctypes
+import errno
+import fcntl
 import hashlib
 import json
 import os
+import platform
 import random
 import select
+import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import urlparse, urlunparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -133,7 +140,9 @@ def machine_busy_jiffies():
     """Non-idle jiffies from /proc/stat's aggregate line."""
     with open("/proc/stat") as f:
         parts = f.readline().split()
-    vals = [int(x) for x in parts[1:11]]
+    # guest/guest_nice (fields 9/10) are already included in user/nice. Summing
+    # them again double-counts exactly the VM CPU this benchmark is measuring.
+    vals = [int(x) for x in parts[1:9]]
     idle = vals[3] + vals[4]  # idle + iowait
     return sum(vals) - idle, sum(vals)
 
@@ -166,6 +175,20 @@ def children_of(pid: int) -> list[int]:
     return out
 
 
+def children_of_frozen(pid: int) -> list[int]:
+    """Enumerate every direct child after ``pid`` has entered group stop.
+
+    This is a safety boundary, not a diagnostic best effort. Once the parent is
+    frozen it cannot fork another child, so any procfs read failure means we have
+    not proved the child set and must retain its state and disk.
+    """
+    children: set[int] = set()
+    for tid in os.listdir(f"/proc/{pid}/task"):
+        with open(f"/proc/{pid}/task/{tid}/children") as child_file:
+            children.update(int(value) for value in child_file.read().split())
+    return sorted(children)
+
+
 def proc_comm(pid: int) -> str:
     try:
         with open(f"/proc/{pid}/comm") as f:
@@ -187,11 +210,25 @@ def pidfd_open(pid: int):
     """
     fd = _libc.syscall(434, ctypes.c_int(pid), ctypes.c_uint(0))  # SYS_pidfd_open
     if fd < 0:
-        return None
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return None
+        raise OSError(error, os.strerror(error), f"pidfd_open({pid})")
     return fd
 
 
-def wait_pidfds(fds: list[int], timeout_s: float) -> bool:
+def pidfd_send_signal(fd: int, sig: int) -> None:
+    """Signal the exact process pinned by ``fd``; a recycled PID is irrelevant."""
+    result = _libc.syscall(
+        424, ctypes.c_int(fd), ctypes.c_int(sig), ctypes.c_void_p(), ctypes.c_uint(0)
+    )
+    if result < 0:
+        error = ctypes.get_errno()
+        if error != errno.ESRCH:
+            raise OSError(error, os.strerror(error), "pidfd_send_signal")
+
+
+def wait_pidfds(fds: list[int], timeout_s: float, interruptible: bool = False) -> bool:
     """Block until every pidfd is readable (process exited) or the deadline passes."""
     remaining = [fd for fd in fds if fd is not None]
     deadline = time.monotonic() + timeout_s
@@ -200,18 +237,115 @@ def wait_pidfds(fds: list[int], timeout_s: float) -> bool:
         poller.register(fd, select.POLLIN)
     while remaining:
         left = deadline - time.monotonic()
-        if left <= 0:
-            return False
-        for fd, _ev in poller.poll(left * 1000):
+        # The signal handler records an interrupt instead of raising from an
+        # arbitrary ownership handoff.  Poll in bounded slices so a requested
+        # shutdown reaches the request scope promptly; the scope then performs
+        # exact teardown before re-raising HarnessInterrupted.
+        ready = poller.poll(max(0.0, min(left, 0.1)) * 1000)
+        for fd, _ev in ready:
             poller.unregister(fd)
             remaining.remove(fd)
+        if not ready and deadline - time.monotonic() <= 0:
+            return False
+        if interruptible:
+            raise_if_harness_interrupted()
     return True
 
 
+def freeze_and_capture_children(pid: int) -> tuple[list[int], list[int | None]]:
+    """Freeze a live direct child, then capture its complete child set.
+
+    Reading ``/proc/<pid>/children`` after an exit loses the attribution, while
+    reading it from a running parent races a final fork.  SIGSTOP plus waitid is
+    the kernel synchronization point: once CLD_STOPPED is observed, this parent
+    can neither fork nor exit until the caller signals it again.  WNOWAIT leaves
+    ownership of the eventual exit status with ``subprocess.Popen``.
+    """
+    stop_sent = False
+    captured_fds: list[int | None] = []
+    try:
+        os.kill(pid, signal.SIGSTOP)
+        stop_sent = True
+    except ProcessLookupError as error:
+        raise RuntimeError(f"fcvm {pid} exited before child attribution") from error
+    try:
+        status = os.waitid(
+            os.P_PID,
+            pid,
+            os.WSTOPPED | os.WEXITED | os.WNOWAIT,
+        )
+        if status is None or status.si_code != os.CLD_STOPPED:
+            raise RuntimeError(
+                f"fcvm {pid} exited before it could be frozen for child attribution"
+            )
+        kids = children_of_frozen(pid)
+        for child in kids:
+            child_fd = pidfd_open(child)
+            captured_fds.append(child_fd)
+        return kids, captured_fds
+    except (ChildProcessError, OSError) as error:
+        raise RuntimeError(f"cannot establish child attribution for fcvm {pid}: {error}")
+    finally:
+        # Successful callers deliberately receive a stopped parent and choose
+        # TERM+CONT or KILL.  A failed capture must never strand the VM stopped.
+        if stop_sent and sys.exc_info()[0] is not None:
+            for fd in captured_fds:
+                if fd is not None:
+                    os.close(fd)
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+
+
+def close_pidfds(fds) -> None:
+    """Close every live pidfd exactly once."""
+    for fd in fds:
+        if fd is not None:
+            os.close(fd)
+
+
+def abort_frozen_owner(
+    pid: int,
+    parent_fd: int | None,
+    child_fds: list[int | None],
+    timeout_s: float = 10.0,
+) -> bool:
+    """Kill and await a frozen exact owner set without touching its disk."""
+    # SIGKILL wakes and terminates a stopped task. Never SIGCONT first: that
+    # would open a scheduler window in which the owner can fork an unpinned child.
+    # A missing parent pidfd is not permission to signal the numeric PID: the
+    # failed pin means the original process may already have exited and that
+    # number may now identify an unrelated process. Retain the disk and report
+    # the lifecycle proof as failed instead.
+    if parent_fd is not None:
+        try:
+            pidfd_send_signal(parent_fd, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    for child_fd in child_fds:
+        if child_fd is None:
+            continue
+        try:
+            pidfd_send_signal(child_fd, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    exact_set_gone = wait_pidfds(
+        [fd for fd in [parent_fd, *child_fds] if fd is not None],
+        timeout_s,
+    )
+    return parent_fd is not None and exact_set_gone
+
+
 SAMPLE_PERIOD_S = 0.0002
+SPAWN_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 
 
-def sample_all_until_gone(pids: dict, deadline: float) -> tuple[dict, float]:
+def sample_all_until_gone(
+    pids: dict,
+    initial_stats: dict,
+    deadline: float,
+) -> tuple[dict, float]:
     """Sample EVERY child's /proc/<pid>/stat concurrently until each one vanishes.
 
     Concurrently, not one at a time. The previous version was a per-child call
@@ -254,12 +388,21 @@ def sample_all_until_gone(pids: dict, deadline: float) -> tuple[dict, float]:
     reqanalyze prints the two populations separately, never averaged).
     """
     live = dict(pids)
-    last: dict = {}
+    last: dict = dict(initial_stats)
+    starttimes = {
+        name: fields[3] if fields is not None else None
+        for name, fields in initial_stats.items()
+    }
     zombie: dict = {name: False for name in pids}
     while live and time.monotonic() < deadline:
         for name, pid in list(live.items()):
             s = proc_stat_fields(pid)
-            if s is None:
+            # A pidfd pins lifetime, but procfs is addressed by the numeric PID.
+            # Once that number is reused, its counters belong to another process.
+            if s is None or (
+                starttimes.get(name) is not None
+                and s[3] != starttimes[name]
+            ):
                 del live[name]
                 continue
             last[name] = s
@@ -335,8 +478,34 @@ class DirWatch:
             self.fd = -1
 
 
-def scan_state(state_dir: str, fcvm_pid: int = 0, name: str = ""):
-    """One pass over the state dir. Matches on fcvm pid OR on VM name.
+def state_path_baseline(state_dir: str) -> frozenset[str]:
+    """Snapshot state paths that existed before a clone was spawned.
+
+    A clone first publishes a name-bearing state with a null PID.  Name alone
+    cannot distinguish that new record from debris left by an earlier refused
+    clone using the same run ID.  Callers take this snapshot after installing
+    the directory watch but before ``Popen`` and permanently exclude every path
+    in it from this clone's discovery and recovery scope.
+    """
+    try:
+        return frozenset(
+            os.path.join(state_dir, entry)
+            for entry in os.listdir(state_dir)
+            if entry.endswith(".json")
+        )
+    except OSError as error:
+        raise RuntimeError(f"cannot snapshot state directory {state_dir}: {error}")
+
+
+def scan_state(
+    state_dir: str,
+    fcvm_pid: int = 0,
+    name: str = "",
+    fcvm_start_time: int | None = None,
+    excluded_paths: frozenset[str] = frozenset(),
+    allow_unowned: bool = True,
+):
+    """One pass over the state dir, preferring the run-unique VM name.
 
     The name-keyed match is not a convenience: `allocate_loopback_ip` saves the
     state file while `vm_state.pid` is still null (the pid is only set POST-RESUME,
@@ -344,9 +513,8 @@ def scan_state(state_dir: str, fcvm_pid: int = 0, name: str = ""):
     namespace, volume servers, the restore itself — in which the file exists,
     Firecracker may already be running, and a pid-keyed scan returns nothing. The
     name IS set before the first save, so it is the only key that covers that
-    window. A state file left behind with `pid: null` is never removed by fcvm's
-    own sweeper either (`cleanup_stale_state` bails on a null pid), so recovering
-    it here is the difference between a reaped clone and a permanent leak.
+    window. Pre-spawn paths are excluded because name alone is discovery, not
+    ownership; destructive cleanup separately requires the exact PID start time.
     """
     try:
         names = os.listdir(state_dir)
@@ -356,17 +524,81 @@ def scan_state(state_dir: str, fcvm_pid: int = 0, name: str = ""):
         if not fname.endswith(".json"):
             continue
         path = os.path.join(state_dir, fname)
+        if path in excluded_paths:
+            continue
         try:
             with open(path) as f:
                 st = json.load(f)
         except (OSError, ValueError):
             continue
-        if (fcvm_pid and st.get("pid") == fcvm_pid) or (name and st.get("name") == name):
+        if name:
+            # A numeric PID can be reused while a stale state file still names
+            # its old owner.  When the caller has the run-unique name, require
+            # that identity and use the PID only to reject a state now owned by
+            # somebody else.  A null PID is the expected pre-resume shape.
+            if st.get("name") != name:
+                continue
+            owner = st.get("pid")
+            if owner is None and allow_unowned:
+                return path, st
+            if (
+                fcvm_pid
+                and fcvm_start_time is not None
+                and owner == fcvm_pid
+                and st.get("pid_start_time") == fcvm_start_time
+            ):
+                return path, st
+            continue
+        if (
+            fcvm_pid
+            and fcvm_start_time is not None
+            and st.get("pid") == fcvm_pid
+            and st.get("pid_start_time") == fcvm_start_time
+        ):
             return path, st
     return None, None
 
 
-def find_state(state_dir: str, fcvm_pid: int, deadline: float, watch=None, name: str = ""):
+def log_tail(path: str, limit: int = 4096) -> str:
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - limit))
+            return f.read().decode("utf8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def exited_before(proc: subprocess.Popen, milestone: str, log_path: str = "") -> RuntimeError:
+    rc = proc.poll()
+    tail = log_tail(log_path)
+    detail = f"; log tail: {tail}" if tail else ""
+    return RuntimeError(
+        f"clone process {proc.pid} exited with status {rc} before {milestone}{detail}"
+    )
+
+
+def spawned_process_start_time(proc: subprocess.Popen) -> int:
+    """Capture the immutable procfs identity of the process returned by Popen."""
+    fields = proc_stat_fields(proc.pid)
+    if fields is None:
+        raise exited_before(proc, "its process identity could be pinned")
+    return fields[3]
+
+
+def find_state(
+    state_dir: str,
+    fcvm_pid: int,
+    deadline: float,
+    watch=None,
+    name: str = "",
+    proc: subprocess.Popen | None = None,
+    log_path: str = "",
+    fcvm_start_time: int | None = None,
+    excluded_paths: frozenset[str] = frozenset(),
+):
     """Locate the clone's state file by fcvm PID (or name), EVENT-DRIVEN.
 
     Was a `while time.monotonic() < deadline:` loop with an `os.listdir` plus a
@@ -383,17 +615,166 @@ def find_state(state_dir: str, fcvm_pid: int, deadline: float, watch=None, name:
     own = watch is None
     if own:
         watch = DirWatch(state_dir)
+    pid_fd = pidfd_open(fcvm_pid) if proc is not None else None
+    poller = select.poll()
+    poller.register(watch.fd, select.POLLIN)
+    if pid_fd is not None:
+        poller.register(pid_fd, select.POLLIN)
     try:
         while True:
+            raise_if_harness_interrupted()
             watch.drain()
-            path, st = scan_state(state_dir, fcvm_pid, name)
+            path, st = scan_state(
+                state_dir,
+                fcvm_pid,
+                name,
+                fcvm_start_time,
+                excluded_paths,
+            )
             if st is not None:
                 return path, st
-            if not watch.wait(deadline - time.monotonic()):
+            if proc is not None and proc.poll() is not None:
+                raise exited_before(proc, "publishing its state file", log_path)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                watch.drain()
+                path, st = scan_state(
+                    state_dir,
+                    fcvm_pid,
+                    name,
+                    fcvm_start_time,
+                    excluded_paths,
+                )
+                if st is not None:
+                    return path, st
+                if proc is not None and proc.poll() is not None:
+                    raise exited_before(proc, "publishing its state file", log_path)
+                return None, None
+            timeout = min(remaining, 0.1)
+            if not poller.poll(timeout * 1000) and timeout == remaining:
+                watch.drain()
+                path, st = scan_state(
+                    state_dir,
+                    fcvm_pid,
+                    name,
+                    fcvm_start_time,
+                    excluded_paths,
+                )
+                if st is not None:
+                    return path, st
+                if proc is not None and proc.poll() is not None:
+                    raise exited_before(proc, "publishing its state file", log_path)
                 return None, None
     finally:
+        if pid_fd is not None:
+            os.close(pid_fd)
         if own:
             watch.close()
+
+
+def wait_state_owned(
+    state_path: str,
+    fcvm_pid: int,
+    deadline: float,
+    watch: DirWatch,
+    proc: subprocess.Popen,
+    fcvm_start_time: int,
+    expected_name: str = "",
+):
+    """Wait until the state records the spawned fcvm's exact process identity.
+
+    fcvm publishes the state by name before restore, while ``pid`` is still
+    null, then atomically replaces it after resume with the owner PID.  Killing
+    fcvm in that interval bypasses its signal handler and leaves an unsweepable
+    null-PID state file plus the clone disk.  The noop arm records port readiness
+    at the first successful connect, then waits here before beginning teardown.
+
+    Watch both the directory and the process pidfd.  A clone that exits before
+    claiming its state is a failure immediately, not a reason to consume the
+    rest of a 120-second benchmark deadline.
+    """
+    pid_fd = pidfd_open(fcvm_pid)
+    poller = select.poll()
+    poller.register(watch.fd, select.POLLIN)
+    if pid_fd is not None:
+        poller.register(pid_fd, select.POLLIN)
+    try:
+        while True:
+            raise_if_harness_interrupted()
+            watch.drain()
+            try:
+                with open(state_path) as f:
+                    state = json.load(f)
+            except (OSError, ValueError):
+                state = None
+            if (
+                state is not None
+                and state.get("pid") == fcvm_pid
+                and state.get("pid_start_time") == fcvm_start_time
+                and (not expected_name or state.get("name") == expected_name)
+                and state.get("lifecycle_ready") is True
+            ):
+                return state
+
+            rc = proc.poll()
+            if rc is not None:
+                raise exited_before(proc, f"claiming state {state_path}")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    with open(state_path) as f:
+                        final_state = json.load(f)
+                except (OSError, ValueError):
+                    final_state = None
+                if (
+                    final_state is not None
+                    and final_state.get("pid") == fcvm_pid
+                    and final_state.get("pid_start_time") == fcvm_start_time
+                    and (
+                        not expected_name
+                        or final_state.get("name") == expected_name
+                    )
+                    and final_state.get("lifecycle_ready") is True
+                ):
+                    return final_state
+                if proc.poll() is not None:
+                    raise exited_before(proc, f"claiming state {state_path}")
+                raise TimeoutError(
+                    f"state {state_path} never recorded ready owner "
+                    f"({fcvm_pid}, {fcvm_start_time})"
+                )
+            # pidfds are available on every supported fcvm host. Keep a bounded
+            # fallback only for platforms where Python cannot open one, so a
+            # process exit can never turn into a full-deadline wait.
+            timeout = min(remaining, 0.1)
+            if not poller.poll(timeout * 1000):
+                if timeout == remaining:
+                    try:
+                        with open(state_path) as f:
+                            final_state = json.load(f)
+                    except (OSError, ValueError):
+                        final_state = None
+                    if (
+                        final_state is not None
+                        and final_state.get("pid") == fcvm_pid
+                        and final_state.get("pid_start_time") == fcvm_start_time
+                        and (
+                            not expected_name
+                            or final_state.get("name") == expected_name
+                        )
+                        and final_state.get("lifecycle_ready") is True
+                    ):
+                        return final_state
+                    if proc.poll() is not None:
+                        raise exited_before(proc, f"claiming state {state_path}")
+                    raise TimeoutError(
+                        f"state {state_path} never recorded ready owner "
+                        f"({fcvm_pid}, {fcvm_start_time})"
+                    )
+    finally:
+        if pid_fd is not None:
+            os.close(pid_fd)
 
 
 def clone_cdp_endpoint(state: dict, port: int) -> str:
@@ -416,7 +797,20 @@ def clone_cdp_endpoint(state: dict, port: int) -> str:
     raise RuntimeError(f"no usable host-side IP in network config: {sorted(net)}")
 
 
-def wait_port(endpoint: str, deadline: float) -> float:
+def clone_data_dir(data_root: str, state: dict) -> str:
+    """Return the exact per-clone disk directory from a complete state record."""
+    vm_id = state.get("vm_id")
+    if not valid_vm_id(vm_id):
+        raise RuntimeError(f"clone state has an invalid vm_id: {vm_id!r}")
+    return os.path.join(data_root, "vm-disks", vm_id)
+
+
+def wait_port(
+    endpoint: str,
+    deadline: float,
+    proc: subprocess.Popen | None = None,
+    log_path: str = "",
+) -> float:
     """Retry-connect until the forwarded CDP port answers. Returns wait in ms.
 
     This is the readiness signal, and it is the minimum possible one: the first
@@ -429,14 +823,44 @@ def wait_port(endpoint: str, deadline: float) -> float:
     t0 = time.monotonic()
     delay = 0.001
     while True:
+        raise_if_harness_interrupted()
+        if proc is not None:
+            rc = proc.poll()
+            if rc is not None:
+                raise exited_before(proc, f"CDP port {endpoint} answered", log_path)
         try:
-            s = socket.create_connection((host, int(port)), 0.25)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if proc is not None and proc.poll() is not None:
+                    raise exited_before(
+                        proc, f"CDP port {endpoint} answered", log_path
+                    )
+                raise TimeoutError(f"CDP port {endpoint} never answered")
+            s = socket.create_connection(
+                (host, int(port)), min(0.25, remaining)
+            )
             s.close()
+            if time.monotonic() > deadline:
+                if proc is not None and proc.poll() is not None:
+                    raise exited_before(
+                        proc, f"CDP port {endpoint} answered", log_path
+                    )
+                raise TimeoutError(
+                    f"CDP port {endpoint} answered only after the deadline"
+                )
             return (time.monotonic() - t0) * 1000
         except OSError:
+            if proc is not None and proc.poll() is not None:
+                raise exited_before(proc, f"CDP port {endpoint} answered", log_path)
             if time.monotonic() >= deadline:
+                if proc is not None and proc.poll() is not None:
+                    raise exited_before(
+                        proc, f"CDP port {endpoint} answered", log_path
+                    )
                 raise TimeoutError(f"CDP port {endpoint} never answered")
-            time.sleep(delay)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(delay, remaining))
             delay = min(delay * 1.5, 0.02)
 
 
@@ -449,12 +873,183 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def harness_sha256() -> str:
+    """Content identity for every script that defines one request sample."""
+    h = hashlib.sha256()
+    h.update(b"fcvm-chromium-request-harness-v1\0")
+    for name in ("reqbench.py", "cdpdrive.py", "render.py", "reqbench.sh"):
+        encoded = name.encode()
+        h.update(len(encoded).to_bytes(4, "big"))
+        h.update(encoded)
+        with open(os.path.join(HERE, name), "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    return h.hexdigest()
+
+
 def command_text(argv: list[str]) -> str:
     """Best-effort provenance command; the binary hash remains authoritative."""
     try:
         return subprocess.check_output(argv, text=True, stderr=subprocess.DEVNULL).strip()
     except (OSError, subprocess.CalledProcessError):
         return ""
+
+
+def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
+    """Authoritative generation and runtime shape for a snapshot tag.
+
+    A tag can be deleted and recreated. Pooling on the tag alone would merge
+    records from different memory/disk generations, so the metadata also carries
+    the snapshot's creation timestamp and source VM UUID from config.json.
+    """
+    path = os.path.join(data_root, "snapshots", snapshot_name, "config.json")
+    try:
+        with open(path) as f:
+            config = json.load(f)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"cannot identify snapshot generation from {path}: {error}")
+    created_at = config.get("created_at")
+    vm_id = config.get("vm_id")
+    if not isinstance(created_at, str) or not created_at:
+        raise RuntimeError(f"snapshot config {path} has no created_at")
+    if not isinstance(vm_id, str) or not vm_id:
+        raise RuntimeError(f"snapshot config {path} has no vm_id")
+    metadata = config.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"snapshot config {path} has no metadata object")
+    image = metadata.get("image")
+    vcpu = metadata.get("vcpu")
+    memory_mib = metadata.get("memory_mib")
+    network_mode = metadata.get("network_mode")
+    port_mappings = metadata.get("port_mappings")
+    if not isinstance(image, str) or not image:
+        raise RuntimeError(f"snapshot config {path} has no image")
+    if not isinstance(vcpu, int) or isinstance(vcpu, bool) or vcpu <= 0:
+        raise RuntimeError(f"snapshot config {path} has no positive vcpu")
+    if not isinstance(memory_mib, int) or isinstance(memory_mib, bool) or memory_mib <= 0:
+        raise RuntimeError(f"snapshot config {path} has no positive memory_mib")
+    if network_mode not in ("rootless", "bridged", "routed"):
+        raise RuntimeError(f"snapshot config {path} has invalid network_mode {network_mode!r}")
+    if not isinstance(port_mappings, list):
+        raise RuntimeError(f"snapshot config {path} has no port_mappings list")
+
+    provenance_path = os.path.join(
+        data_root, "snapshots", snapshot_name, "reqbench-provenance.json"
+    )
+    try:
+        with open(provenance_path) as f:
+            provenance = json.load(f)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"cannot identify benchmark image content from {provenance_path}: {error}; "
+            "recreate the golden snapshot with reqbench.sh golden"
+        )
+    expected_provenance = {
+        "snapshot_created_at": created_at,
+        "snapshot_vm_id": vm_id,
+        "image": image,
+    }
+    for field, expected in expected_provenance.items():
+        if provenance.get(field) != expected:
+            raise RuntimeError(
+                f"snapshot provenance {provenance_path} has {field}="
+                f"{provenance.get(field)!r}, expected {expected!r}"
+            )
+    image_id = provenance.get("image_id")
+    if (
+        not isinstance(image_id, str)
+        or len(image_id) != 71
+        or not image_id.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in image_id[7:])
+        or image_id != image
+    ):
+        raise RuntimeError(
+            f"snapshot provenance {provenance_path} has invalid/mismatched image_id"
+        )
+    creator_fcvm_sha256 = provenance.get("creator_fcvm_sha256")
+    creator_runtime_bundle_sha256 = provenance.get(
+        "creator_runtime_bundle_sha256"
+    )
+    source_revision = provenance.get("source_revision")
+    for field, value, length in (
+        ("creator_fcvm_sha256", creator_fcvm_sha256, 64),
+        ("creator_runtime_bundle_sha256", creator_runtime_bundle_sha256, 64),
+        ("source_revision", source_revision, 40),
+    ):
+        if (
+            not isinstance(value, str)
+            or len(value) != length
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise RuntimeError(
+                f"snapshot provenance {provenance_path} has invalid {field}"
+            )
+
+    return {
+        "created_at": created_at,
+        "vm_id": vm_id,
+        "image": image,
+        "image_id": image_id,
+        "creator_fcvm_sha256": creator_fcvm_sha256,
+        "creator_runtime_bundle_sha256": creator_runtime_bundle_sha256,
+        "source_revision": source_revision,
+        "vcpu": vcpu,
+        "memory_mib": memory_mib,
+        "network_mode": network_mode,
+        "port_mappings": port_mappings,
+    }
+
+
+def serve_uffd_mode(state_dir: str, serve_pid: int, snapshot_name: str) -> str:
+    """Validate the exact live serve process and return its memory mode."""
+    actual = proc_stat_fields(serve_pid)
+    if actual is None:
+        raise RuntimeError(f"serve PID {serve_pid} is not running")
+    candidates = []
+    try:
+        names = os.listdir(state_dir)
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect serve state in {state_dir}: {error}")
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(state_dir, name)
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if state.get("pid") == serve_pid:
+            candidates.append((path, state))
+    exact = [
+        (path, state)
+        for path, state in candidates
+        if state.get("pid_start_time") == actual[3]
+    ]
+    if len(exact) != 1:
+        raise RuntimeError(
+            f"serve PID {serve_pid} has {len(exact)} state records with its exact "
+            f"start time {actual[3]}: {[path for path, _state in exact]!r}"
+        )
+    path, state = exact[0]
+    config = state.get("config") or {}
+    if config.get("process_type") != "serve":
+        raise RuntimeError(f"state {path} is not a snapshot serve process")
+    served_snapshot = config.get("snapshot_name")
+    if served_snapshot != snapshot_name:
+        raise RuntimeError(
+            f"serve PID {serve_pid} serves {served_snapshot!r}, not declared "
+            f"snapshot {snapshot_name!r}"
+        )
+    mode = config.get("uffd_mode")
+    if mode not in ("copy", "minor"):
+        raise RuntimeError(f"serve state {path} has invalid UFFD mode {mode!r}")
+    return mode
+
+
+def read_trimmed(path: str) -> str:
+    with open(path) as f:
+        return f.read().strip()
 
 
 # ------------------------------------------------------------------- teardown
@@ -474,8 +1069,55 @@ class SurvivedTeardown(RuntimeError):
         self.record: dict = {}
 
 
-def safe_vm_data_dir(data_dir: str) -> str:
-    """Return `data_dir` only if it is STRICTLY below a `vm-disks` root. Else "".
+class HarnessInterrupted(BaseException):
+    """A host signal that must unwind only after the active clone is reaped."""
+
+
+_pending_harness_signal = 0
+
+
+def record_harness_interrupt(signum, _frame):
+    """Record, but never asynchronously raise, INT/TERM.
+
+    Raising from a Python signal handler can land between Popen returning and
+    ownership publication, between request completion and teardown, or inside
+    the stopped-owner critical section.  Every one of those boundaries can
+    orphan a VM.  Recording makes signal delivery race-free: request waits poll
+    the flag, teardown runs with no asynchronous exception, and only an exact
+    terminal proof turns the pending signal back into HarnessInterrupted.
+    """
+    global _pending_harness_signal
+    if not _pending_harness_signal:
+        _pending_harness_signal = signum
+
+
+def raise_if_harness_interrupted() -> None:
+    if _pending_harness_signal:
+        raise HarnessInterrupted(f"received signal {_pending_harness_signal}")
+
+
+def valid_vm_id(vm_id) -> bool:
+    """Match the only VM identifier shape fcvm mints (`vm-` + UUID simple)."""
+    return (
+        isinstance(vm_id, str)
+        and len(vm_id) == 35
+        and vm_id.startswith("vm-")
+        and all(character in "0123456789abcdef" for character in vm_id[3:])
+    )
+
+
+def valid_snapshot_name(name) -> bool:
+    return (
+        isinstance(name, str)
+        and 1 <= len(name) <= 128
+        and name not in (".", "..")
+        and all(character.isascii() and (character.isalnum() or character in "-_.")
+                for character in name)
+    )
+
+
+def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
+    """Return an exact child of this run's trusted ``vm-disks`` root, else "".
 
     Every call site computes `os.path.join(data_root, "vm-disks", vm_id)` from a
     state file, and `state.get("vm_id", "")` is empty on a partially-written
@@ -490,16 +1132,37 @@ def safe_vm_data_dir(data_dir: str) -> str:
     Symlinks are resolved on both sides before comparing, so a `vm-disks/<id>`
     that points somewhere else cannot smuggle the deletion out of the tree.
     """
-    if not data_dir:
+    if not data_root or not state_path or not data_dir:
         return ""
-    real = os.path.realpath(data_dir)
-    head, tail = os.path.split(real)
-    if not tail or os.path.basename(head) != "vm-disks":
+    trusted = os.path.realpath(os.path.join(data_root, "vm-disks"))
+    raw = os.path.abspath(os.path.normpath(data_dir))
+    head, vm_id = os.path.split(raw)
+    expected = os.path.join(trusted, vm_id)
+    real = os.path.realpath(raw)
+    try:
+        contained = os.path.commonpath((trusted, real)) == trusted
+    except ValueError:
+        contained = False
+    if (
+        not valid_vm_id(vm_id)
+        or os.path.basename(state_path) != f"{vm_id}.json"
+        or os.path.realpath(head) != trusted
+        or os.path.islink(raw)
+        or real != expected
+        or not contained
+        or (os.path.lexists(raw) and not os.path.isdir(raw))
+    ):
         return ""
     return real
 
 
-def reap_disk(out: dict, state_path: str, data_dir: str) -> list:
+def reap_disk(
+    out: dict,
+    data_root: str,
+    state_path: str,
+    data_dir: str,
+    expected_owner: tuple[int, int] | None = None,
+) -> list:
     """Remove the clone's state file (+ its lock) and data dir. Errors are RECORDED.
 
     Never `ignore_errors=True`: a silently-failed rmtree reinstates the leak this
@@ -507,41 +1170,197 @@ def reap_disk(out: dict, state_path: str, data_dir: str) -> list:
     runs under SUDO, so EPERM has to surface.
     """
     reaped = []
+    state_lock = None
+    if expected_owner is not None:
+        # Manual cleanup is destructive and happens after the process has gone,
+        # when a numeric PID by itself can already name somebody else.  Serialize
+        # with fcvm's state writer, read without following symlinks, and require
+        # the exact (PID, procfs starttime) captured immediately after Popen.
+        # A fresh null-PID record may identify this spawn for diagnostics, but it
+        # is not enough authority to remove its disk.
+        lock_path = f"{state_path}.lock" if state_path else ""
+        try:
+            state_lock = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+            fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            state_fd = os.open(state_path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                if not stat.S_ISREG(os.fstat(state_fd).st_mode):
+                    raise RuntimeError("state path is not a regular file")
+                with os.fdopen(state_fd) as state_file:
+                    state_fd = -1
+                    persisted = json.load(state_file)
+            finally:
+                if state_fd >= 0:
+                    os.close(state_fd)
+            actual_owner = (persisted.get("pid"), persisted.get("pid_start_time"))
+            if actual_owner != expected_owner:
+                raise RuntimeError(
+                    f"state owner is {actual_owner}, expected exact owner "
+                    f"{expected_owner}"
+                )
+        except (OSError, ValueError, RuntimeError) as error:
+            if state_lock is not None:
+                try:
+                    fcntl.flock(state_lock, fcntl.LOCK_UN)
+                finally:
+                    os.close(state_lock)
+            out.setdefault("disk_errors", []).append(
+                f"{state_path}: refusing to remove without exact state identity: {error}"
+            )
+            return reaped
     if data_dir:
-        safe = safe_vm_data_dir(data_dir)
+        safe = safe_vm_data_dir(data_root, state_path, data_dir)
         if not safe:
             out.setdefault("disk_errors", []).append(
-                f"{data_dir}: refusing to remove — not strictly below a vm-disks root "
+                f"{data_dir}: refusing to remove — not an exact child of "
+                f"{os.path.join(data_root, 'vm-disks')} "
                 f"(an empty vm_id collapses to the SHARED disk root)"
             )
-            data_dir = ""
+            # The state file is the only durable pointer to the disk we just
+            # refused to touch.  Deleting it here would orphan that disk, so an
+            # unsafe target makes the entire reap a no-op.
+            if state_lock is not None:
+                fcntl.flock(state_lock, fcntl.LOCK_UN)
+                os.close(state_lock)
+            return reaped
         else:
             data_dir = safe
-    if state_path and os.path.exists(state_path):
-        try:
-            os.remove(state_path)
-            reaped.append(state_path)
-        except OSError as e:
-            out.setdefault("disk_errors", []).append(f"{state_path}: {e}")
-        # cleanup_stale_state removes `<vm_id>.json.lock` alongside the state file
-        # (src/state/manager.rs); it never runs under SIGKILL, so we remove it too.
-        lock = f"{state_path}.lock" if state_path else ""
-        if lock and os.path.exists(lock):
-            try:
-                os.remove(lock)
-                reaped.append(lock)
-            except OSError as e:
-                out.setdefault("disk_errors", []).append(f"{lock}: {e}")
+    # Remove the disk first.  If this fails, keep the state and lock as the only
+    # durable pointer to the still-allocated clone rather than orphaning it.
     if data_dir and os.path.isdir(data_dir):
         try:
             shutil.rmtree(data_dir)
             reaped.append(data_dir)
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{data_dir}: {e}")
+            if state_lock is not None:
+                fcntl.flock(state_lock, fcntl.LOCK_UN)
+                os.close(state_lock)
+            return reaped
+    if state_path and os.path.lexists(state_path):
+        try:
+            os.remove(state_path)
+            reaped.append(state_path)
+        except OSError as e:
+            out.setdefault("disk_errors", []).append(f"{state_path}: {e}")
+    # cleanup_stale_state removes `<vm_id>.json.lock` alongside the state file;
+    # it never runs under SIGKILL, so remove the lock independently. The state
+    # may already be gone while its lock remains, and that is still a leak.
+    lock = f"{state_path}.lock" if state_path else ""
+    if lock and os.path.lexists(lock):
+        if state_lock is not None:
+            fcntl.flock(state_lock, fcntl.LOCK_UN)
+            os.close(state_lock)
+            state_lock = None
+        try:
+            os.remove(lock)
+            reaped.append(lock)
+        except OSError as e:
+            out.setdefault("disk_errors", []).append(f"{lock}: {e}")
+    elif state_lock is not None:
+        fcntl.flock(state_lock, fcntl.LOCK_UN)
+        os.close(state_lock)
     return reaped
 
 
-def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: float) -> dict:
+def measure_fast_reap(
+    fcvm_pid: int,
+    parent_fd: int,
+    tracked: dict[str, int],
+    fds: dict[str, int | None],
+    timeout_s: float,
+) -> dict:
+    """Measure one fast reap while guaranteeing a stopped owner cannot escape."""
+    all_fds = [parent_fd, *fds.values()]
+    try:
+        pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
+        missing_pre = [name for name, fields in pre.items() if fields is None]
+        if missing_pre:
+            raise RuntimeError(
+                f"cannot capture pre-kill CPU/starttime for pinned processes {missing_pre}"
+            )
+        self0 = self_cpu_ms()
+        busy0, _ = machine_busy_jiffies()
+        t_kill = time.monotonic()
+        try:
+            os.kill(fcvm_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        signal_ms = (time.monotonic() - t_kill) * 1000
+
+        deadline = t_kill + timeout_s
+        cpu, sample_period_s = sample_all_until_gone(
+            tracked, pre, deadline
+        )
+        all_gone = wait_pidfds(all_fds, max(0.0, deadline - time.monotonic()))
+        live_exact: dict[str, int] = {}
+        parent_live = False
+        if not all_gone:
+            poller = select.poll()
+            for fd in all_fds:
+                if fd is not None:
+                    poller.register(fd, select.POLLIN)
+            ready = {fd for fd, _event in poller.poll(0)}
+            parent_live = parent_fd not in ready
+            live_exact = {
+                name: tracked[name]
+                for name, fd in fds.items()
+                if fd is not None and fd not in ready
+            }
+        t_gone = time.monotonic()
+        busy1, _ = machine_busy_jiffies()
+        self_ms = self_cpu_ms() - self0
+
+        # Measure ambient load only after the exact VM process set is terminal.
+        # A pre-kill control contains the still-running VM's ordinary CPU and
+        # subtracts work that is absent from the reclaim window.
+        ctl_self0 = self_cpu_ms()
+        ctl_busy0, _ = machine_busy_jiffies()
+        ctl_t0 = time.monotonic()
+        time.sleep(0.05)
+        ctl_busy1, _ = machine_busy_jiffies()
+        ctl_dt = time.monotonic() - ctl_t0
+        ctl_self_ms = self_cpu_ms() - ctl_self0
+        ctl_busy_ms = (ctl_busy1 - ctl_busy0) * 1000.0 / CLK_TCK
+        ctl_rate = (
+            (ctl_busy_ms - ctl_self_ms) / 1000.0 / ctl_dt
+            if ctl_dt > 0
+            else 0.0
+        )
+        return {
+            "all_gone": all_gone,
+            "busy0": busy0,
+            "busy1": busy1,
+            "cpu": cpu,
+            "ctl_rate": ctl_rate,
+            "ctl_self_ms": ctl_self_ms,
+            "live_exact": live_exact,
+            "parent_live": parent_live,
+            "pre": pre,
+            "sample_period_s": sample_period_s,
+            "self_ms": self_ms,
+            "signal_ms": signal_ms,
+            "t_gone": t_gone,
+            "t_kill": t_kill,
+        }
+    except BaseException:
+        # Any instrumentation error after SIGSTOP is a lifecycle failure. Make
+        # the exact owner set terminal, retain its durable disk pointer, and let
+        # the caller emit a structured abort instead of stranding a stopped VM.
+        abort_frozen_owner(fcvm_pid, parent_fd, list(fds.values()))
+        close_pidfds(all_fds)
+        raise
+
+
+def teardown_fast(
+    fcvm_pid: int,
+    data_root: str,
+    state_path: str,
+    data_dir: str,
+    timeout_s: float,
+    verify_disk_cleanup: bool = False,
+    expected_pid_start_time: int | None = None,
+) -> dict:
     """Concurrent SIGKILL via the pdeathsig chain, then synchronous on-disk reap.
 
     Raises `SurvivedTeardown` if any tracked child outlived the kill. That is not
@@ -551,73 +1370,80 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     box carrying an invisible ~1 GB tenant. Continuing the schedule after that is
     measuring contention, not the request path.
     """
-    out: dict = {"mode": "fast"}
+    out: dict = {
+        "mode": "fast",
+        "accounting_version": "post-terminal-ambient-v1",
+    }
 
-    kids = children_of(fcvm_pid)
-    # Keyed by comm, but a COLLISION MUST NOT DROP A CHILD. `{proc_comm(p): p for p
-    # in kids}` silently keeps only the last of any two children sharing a comm,
-    # and a child that is not in `tracked` is neither waited on nor CPU-accounted —
-    # it just does not exist as far as the leak check is concerned. fcvm's clone
-    # happens to have three distinct comms today (firecracker / sleep / pasta), so
-    # this never bit; that is luck, not a guarantee.
-    tracked: dict = {}
-    for p in kids:
-        base = proc_comm(p) or f"pid{p}"
-        key = base if base not in tracked else f"{base}#{p}"
-        tracked[key] = p
-    out["children"] = tracked
-    fds = {name: pidfd_open(pid) for name, pid in tracked.items()}
-
-    # Control window: same machine, same instant, no reclaim running. Gives the
-    # background busy rate to subtract, so ambient load is not attributed to us.
-    #
-    # It SLEEPS. It used to be `while time.monotonic() - ctl_t0 < 0.05: pass`,
-    # i.e. the "ambient" rate was measured while this thread held 100% of one
-    # core. Measured back to back on this box, same ambient load: the spinning
-    # version reported control_busy_cores 1.40 / 1.40 / 1.20 with 50.0 ms of the
-    # harness's OWN cpu inside a 50 ms window; the sleeping version reports
-    # 0.20 / 0.40 / 0.00 with 0.0 ms. That ~1.2-core inflation was then multiplied
-    # by the ENTIRE reclaim window — in which the harness spins only while a child
-    # is still alive — so the subtraction removed work that was never done there.
-    # Belt and braces: the harness's own CPU is measured over both windows and
-    # subtracted from each, so any residual self-load cancels by construction.
-    ctl_self0 = self_cpu_ms()
-    ctl_busy0, _ = machine_busy_jiffies()
-    ctl_t0 = time.monotonic()
-    time.sleep(0.05)
-    ctl_busy1, _ = machine_busy_jiffies()
-    ctl_dt = time.monotonic() - ctl_t0
-    ctl_self_ms = self_cpu_ms() - ctl_self0
-    ctl_busy_ms = (ctl_busy1 - ctl_busy0) * 1000.0 / CLK_TCK
-    ctl_rate = (ctl_busy_ms - ctl_self_ms) / 1000.0 / ctl_dt if ctl_dt > 0 else 0.0
-
-    # Sampled HERE, immediately before the kill — not before the control window.
-    # Spanning the control window made the delta absorb ~50 ms of the still-running
-    # VM's ordinary CPU and report it as reclaim.
-    pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
-
-    self0 = self_cpu_ms()
-    busy0, _ = machine_busy_jiffies()
-    t_kill = time.monotonic()
-    # ONE signal. The kernel fans SIGKILL out to firecracker, the namespace holder
-    # AND pasta in a single forget_original_parent() pass — concurrent by
-    # construction (all three carry PR_SET_PDEATHSIG; see the module docstring).
+    parent_fd = None
+    captured_fds: list[int | None] = []
     try:
-        os.kill(fcvm_pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    out["signal_ms"] = (time.monotonic() - t_kill) * 1000
+        parent_fd = pidfd_open(fcvm_pid)
+        if parent_fd is None:
+            raise RuntimeError(f"fcvm {fcvm_pid} exited before owner pinning")
+        kids, captured_fds = freeze_and_capture_children(fcvm_pid)
+        if not kids or any(fd is None for fd in captured_fds):
+            raise RuntimeError(
+                f"fcvm {fcvm_pid} has no completely pinned child set"
+            )
+    except (RuntimeError, OSError) as error:
+        terminal = abort_frozen_owner(fcvm_pid, parent_fd, captured_fds)
+        close_pidfds([parent_fd, *captured_fds])
+        out["child_attribution_established"] = False
+        out["all_gone"] = terminal
+        out["disk_reap_skipped"] = True
+        raise SurvivedTeardown(
+            f"fast teardown of fcvm {fcvm_pid} cannot prove its child set: {error}; "
+            f"state {state_path} and data {data_dir} NOT reaped",
+            out,
+        ) from error
+    out["child_attribution_established"] = True
+    try:
+        # Keyed by comm, but a collision must not drop a child.
+        tracked: dict = {}
+        for p in kids:
+            base = proc_comm(p) or f"pid{p}"
+            key = base if base not in tracked else f"{base}#{p}"
+            tracked[key] = p
+        out["children"] = tracked
+        captured_by_pid = dict(zip(kids, captured_fds))
+        fds = {name: captured_by_pid[pid] for name, pid in tracked.items()}
+        sampled = dict(tracked)
+        sampled["fcvm"] = fcvm_pid
+    except BaseException as error:
+        abort_frozen_owner(fcvm_pid, parent_fd, captured_fds)
+        close_pidfds([parent_fd, *captured_fds])
+        out["child_attribution_established"] = False
+        out["disk_reap_skipped"] = True
+        raise SurvivedTeardown(
+            f"fast teardown of fcvm {fcvm_pid} cannot pin its complete owner set: "
+            f"{error}; state {state_path} and data {data_dir} NOT reaped",
+            out,
+        ) from error
 
-    deadline = t_kill + timeout_s
-    cpu, sample_period_s = sample_all_until_gone(tracked, deadline)
-    all_gone = wait_pidfds(list(fds.values()), max(0.0, deadline - time.monotonic()))
-    t_gone = time.monotonic()
-    busy1, _ = machine_busy_jiffies()
-    self_ms = self_cpu_ms() - self0
+    try:
+        measured = measure_fast_reap(fcvm_pid, parent_fd, sampled, fds, timeout_s)
+    except BaseException as error:
+        out["disk_reap_skipped"] = True
+        out["measurement_error"] = f"{type(error).__name__}: {error}"
+        raise SurvivedTeardown(
+            f"fast teardown of fcvm {fcvm_pid} failed while its exact process set "
+            f"was pinned; state {state_path} and data {data_dir} NOT reaped: {error}",
+            out,
+        ) from error
 
-    for fd in fds.values():
-        if fd is not None:
-            os.close(fd)
+    all_gone = measured["all_gone"]
+    busy0 = measured["busy0"]
+    busy1 = measured["busy1"]
+    cpu = measured["cpu"]
+    ctl_rate = measured["ctl_rate"]
+    ctl_self_ms = measured["ctl_self_ms"]
+    pre = measured["pre"]
+    sample_period_s = measured["sample_period_s"]
+    self_ms = measured["self_ms"]
+    t_gone = measured["t_gone"]
+    t_kill = measured["t_kill"]
+    out["signal_ms"] = measured["signal_ms"]
 
     window_s = t_gone - t_kill
     machine_cpu_ms = (busy1 - busy0) * 1000.0 / CLK_TCK
@@ -640,7 +1466,7 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     tick_ms = 1000.0 / CLK_TCK
     out["tick_ms"] = tick_ms
     out["per_child_cpu"] = {}
-    for name, pid in tracked.items():
+    for name, pid in sampled.items():
         before = pre[name]
         base = (before[1] + before[2]) * 1000.0 / CLK_TCK if before else 0.0
         s = cpu[name]
@@ -662,29 +1488,48 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
         }
 
     if not all_gone:
-        survivors = {
-            name: pid for name, pid in tracked.items() if proc_stat_fields(pid) is not None
-        }
+        survivors = dict(measured["live_exact"])
+        if measured["parent_live"]:
+            survivors["fcvm"] = fcvm_pid
         out["survivors"] = survivors
         out["disk_reap_skipped"] = True
-        # Do NOT reap: the state file is the only record that these are ours.
-        # SIGKILL each survivor directly so the box is not left carrying them, then
-        # abort the schedule — a later rep measured next to a leaked microVM is not
-        # a measurement of this request path.
-        for pid in survivors.values():
+        for name in measured["live_exact"]:
+            fd = fds.get(name)
+            if fd is not None:
+                try:
+                    pidfd_send_signal(fd, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+        if measured["parent_live"]:
             try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                pidfd_send_signal(parent_fd, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
+        wait_pidfds([parent_fd, *fds.values()], 10.0)
+        close_pidfds([parent_fd, *fds.values()])
         out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
         raise SurvivedTeardown(
             f"fast teardown of fcvm {fcvm_pid} left {survivors} alive after "
             f"{timeout_s:.1f}s; state {state_path} and data {data_dir} NOT reaped",
             out,
         )
+    close_pidfds([parent_fd, *fds.values()])
 
     t_disk = time.monotonic()
-    reaped = reap_disk(out, state_path, data_dir)
+    if verify_disk_cleanup and (not state_path or not data_dir):
+        out["disk_cleanup_verified"] = False
+        out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
+        raise SurvivedTeardown(
+            f"fast teardown of fcvm {fcvm_pid} cannot verify on-disk cleanup "
+            f"without both exact paths: state={state_path!r} data={data_dir!r}",
+            out,
+        )
+    expected_owner = (
+        (fcvm_pid, expected_pid_start_time)
+        if expected_pid_start_time is not None
+        else None
+    )
+    reaped = reap_disk(out, data_root, state_path, data_dir, expected_owner)
     out["disk_reap_ms"] = (time.monotonic() - t_disk) * 1000
     out["disk_reaped"] = reaped
     # VERIFY ABSENCE, then gate. `reap_disk` recorded EPERM in `out["disk_errors"]`
@@ -697,7 +1542,8 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     # pid). `disk_reap_ms` is also a published per-arm median, computed over
     # records that included failed reaps.
     left = [p for p in (state_path, f"{state_path}.lock" if state_path else "", data_dir)
-            if p and os.path.exists(p)]
+            if p and os.path.lexists(p)]
+    out["disk_cleanup_verified"] = not left and not out.get("disk_errors")
     out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
     if left or out.get("disk_errors"):
         out["disk_reap_failed"] = left
@@ -709,7 +1555,16 @@ def teardown_fast(fcvm_pid: int, state_path: str, data_dir: str, timeout_s: floa
     return out
 
 
-def teardown_normal(proc: subprocess.Popen, fcvm_pid: int, timeout_s: float) -> dict:
+def teardown_normal(
+    proc: subprocess.Popen,
+    fcvm_pid: int,
+    timeout_s: float,
+    data_root: str = "",
+    state_path: str = "",
+    data_dir: str = "",
+    verify_disk_cleanup: bool = False,
+    expected_pid_start_time: int | None = None,
+) -> dict:
     """fcvm's own cleanup: SIGTERM, then await the full sequential unwind.
 
     kill -> holder kill -> network cleanup -> state delete -> FC log save ->
@@ -735,49 +1590,144 @@ def teardown_normal(proc: subprocess.Popen, fcvm_pid: int, timeout_s: float) -> 
     is why this file opened pidfds in the first place.
     """
     out: dict = {"mode": "normal"}
-    kids = children_of(fcvm_pid)
-    fds = [pidfd_open(p) for p in kids]
+    parent_fd = None
+    fds: list[int | None] = []
+    try:
+        parent_fd = pidfd_open(fcvm_pid)
+        if parent_fd is None:
+            raise RuntimeError(f"fcvm {fcvm_pid} exited before owner pinning")
+        kids, fds = freeze_and_capture_children(fcvm_pid)
+        if not kids or any(fd is None for fd in fds):
+            raise RuntimeError(
+                f"fcvm {fcvm_pid} has no completely pinned child set"
+            )
+    except (RuntimeError, OSError) as error:
+        terminal = abort_frozen_owner(fcvm_pid, parent_fd, fds)
+        close_pidfds([parent_fd, *fds])
+        out["child_attribution_established"] = False
+        out["all_gone"] = terminal
+        out["disk_reap_skipped"] = True
+        raise SurvivedTeardown(
+            f"normal teardown of fcvm {fcvm_pid} cannot prove its child set: {error}; "
+            f"state {state_path} and data {data_dir} NOT reaped",
+            out,
+        ) from error
+    out["child_attribution_established"] = True
     t0 = time.monotonic()
+
+    live = []
+    all_fds = [parent_fd, *fds]
     try:
-        os.kill(fcvm_pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        out["timed_out"] = True
+        # Queue TERM while the parent is stopped, then resume it. It cannot fork
+        # a new untracked child between attribution and signal delivery.
         try:
-            os.kill(fcvm_pid, signal.SIGKILL)
+            os.kill(fcvm_pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        proc.wait(timeout=10)
-    out["fcvm_exit_ms"] = (time.monotonic() - t0) * 1000
-    left = max(0.0, t0 + timeout_s - time.monotonic())
-    out["all_gone"] = wait_pidfds(fds, left if left > 0 else 0.5)
-    live = []
-    if not out["all_gone"]:
-        poller = select.poll()
-        for fd in fds:
-            if fd is not None:
-                poller.register(fd, select.POLLIN)
-        ready = {fd for fd, _ev in poller.poll(0)}
-        live = [p for p, fd in zip(kids, fds) if fd is not None and fd not in ready]
-        out["all_gone"] = not live
-    for fd in fds:
-        if fd is not None:
-            os.close(fd)
+        try:
+            os.kill(fcvm_pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            out["timed_out"] = True
+            try:
+                os.kill(fcvm_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    f"fcvm {fcvm_pid} survived SIGKILL for 10 seconds"
+                ) from error
+        out["fcvm_exit_ms"] = (time.monotonic() - t0) * 1000
+        left = max(0.0, t0 + timeout_s - time.monotonic())
+        out["all_gone"] = wait_pidfds(all_fds, left if left > 0 else 0.5)
+        if not out["all_gone"]:
+            poller = select.poll()
+            for fd in fds:
+                if fd is not None:
+                    poller.register(fd, select.POLLIN)
+            ready = {fd for fd, _ev in poller.poll(0)}
+            live = [
+                p for p, fd in zip(kids, fds)
+                if fd is not None and fd not in ready
+            ]
+            out["all_gone"] = not live
+    except BaseException as error:
+        terminal = abort_frozen_owner(fcvm_pid, parent_fd, fds)
+        out["all_gone"] = terminal
+        out["disk_reap_skipped"] = True
+        close_pidfds(all_fds)
+        raise SurvivedTeardown(
+            f"normal teardown of fcvm {fcvm_pid} failed before terminal ownership "
+            f"was proved; state {state_path} and data {data_dir} NOT reaped: {error}",
+            out,
+        ) from error
     out["reap_wall_ms"] = (time.monotonic() - t0) * 1000
     out["teardown_total_ms"] = out["reap_wall_ms"]
     if live:
         out["survivors"] = {p: proc_comm(p) for p in live}
-        for p in live:
+        for p, fd in zip(kids, fds):
+            if p not in live or fd is None:
+                continue
             try:
-                os.kill(p, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                pidfd_send_signal(fd, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
+        wait_pidfds(fds, 10.0)
+        close_pidfds(all_fds)
         raise SurvivedTeardown(
             f"normal teardown of fcvm {fcvm_pid} left {out['survivors']} alive after "
             f"{timeout_s:.1f}s",
+            out,
+        )
+    close_pidfds(all_fds)
+
+    # Process exit is not sufficient. In particular, killing a clone after its
+    # first state save but before the post-resume PID save used to leave a
+    # permanent null-PID state file and its reflinked disk while the record said
+    # `ok: true`. fcvm has exited, so no later cleanup can still be in flight.
+    if verify_disk_cleanup and (not state_path or not data_dir):
+        out["disk_cleanup_verified"] = False
+        out["teardown_total_ms"] = (time.monotonic() - t0) * 1000
+        raise SurvivedTeardown(
+            f"normal teardown of fcvm {fcvm_pid} cannot verify on-disk cleanup "
+            f"without both exact paths: state={state_path!r} data={data_dir!r}",
+            out,
+        )
+
+    expected = [
+        p
+        for p in (
+            state_path,
+            f"{state_path}.lock" if state_path else "",
+            data_dir,
+        )
+        if p
+    ]
+    left = [p for p in expected if os.path.lexists(p)]
+    out["disk_cleanup_verified"] = not left
+    if left:
+        out["disk_cleanup_left"] = left
+        t_disk = time.monotonic()
+        expected_owner = (
+            (fcvm_pid, expected_pid_start_time)
+            if expected_pid_start_time is not None
+            else None
+        )
+        out["disk_reaped"] = reap_disk(
+            out, data_root, state_path, data_dir, expected_owner
+        )
+        out["disk_reap_ms"] = (time.monotonic() - t_disk) * 1000
+        still_left = [p for p in expected if os.path.lexists(p)]
+        out["disk_reap_failed"] = still_left
+        out["teardown_total_ms"] = (time.monotonic() - t0) * 1000
+        raise SurvivedTeardown(
+            f"normal teardown of fcvm {fcvm_pid} left on-disk state {left}; "
+            f"exact-path reap left {still_left} and errors={out.get('disk_errors', [])}",
             out,
         )
     return out
@@ -804,7 +1754,7 @@ def clone_ws_url(supplied: str, endpoint: str) -> str:
 def run_cdp_request(args, rep: int, fast: bool) -> dict:
     import cdpdrive
 
-    name = f"rb-{os.getpid()}-{rep}-{'fast' if fast else 'norm'}"
+    name = f"rb-{args.run_id}-{rep}-{'fast' if fast else 'norm'}"
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": "cdp-fast" if fast else "cdp", "rep": rep, "name": name}
 
@@ -816,29 +1766,50 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
     # state file's creation and then block waiting for an event already past.
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
+    interrupted = None
+    fcvm_start_time = None
     try:
+        pre_spawn_state_paths = state_path_baseline(args.state_dir)
+        raise_if_harness_interrupted()
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, SPAWN_SIGNALS)
+        spawn_complete = False
         with open(log, "wb") as lf:
             # stdout/stderr to a FILE, never a pipe we do not drain: an undrained
             # 64 KB pipe blocks fcvm's writer and stalls everything behind it
             # (AGENTS.md "Pipe Buffer Deadlock in Tests").
             proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
         fcvm_pid = proc.pid
+        spawn_complete = True
 
         state_path = data_dir = None
         try:
+            fcvm_start_time = spawned_process_start_time(proc)
+            # Pending INT/TERM is delivered only after both process object and
+            # exact PID are published to this teardown scope.
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             deadline = t_spawn + args.timeout
             t = time.monotonic()
-            state_path, state = find_state(args.state_dir, fcvm_pid, deadline, watch, name)
+            state_path, state = find_state(
+                args.state_dir,
+                fcvm_pid,
+                deadline,
+                watch,
+                name,
+                proc,
+                log,
+                fcvm_start_time,
+                pre_spawn_state_paths,
+            )
             if state is None:
                 raise TimeoutError("clone state file never appeared")
             rec["discover_ms"] = (time.monotonic() - t) * 1000
             vm_id = state.get("vm_id", "")
-            data_dir = os.path.join(args.data_root, "vm-disks", vm_id)
+            data_dir = clone_data_dir(args.data_root, state)
             rec["vm_id"] = vm_id
 
             endpoint = clone_cdp_endpoint(state, args.cdp_port)
             rec["endpoint"] = endpoint
-            rec["state_to_port_ms"] = wait_port(endpoint, deadline)
+            rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
             ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
@@ -864,6 +1835,7 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
                 render_module=os.path.join(HERE, "render.py"),
             )
             result = cdpdrive.drive(drive_args)
+            raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
             if not rec["ok"]:
@@ -881,52 +1853,109 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
             # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
             # teardown, and none of it is latency the caller pays.
             rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
-        except Exception as e:
+            t_owned = time.monotonic()
+            state = wait_state_owned(
+                state_path,
+                fcvm_pid,
+                deadline,
+                watch,
+                proc,
+                fcvm_start_time,
+                name,
+            )
+            data_dir = clone_data_dir(args.data_root, state)
+            rec["state_owner_wait_ms"] = (time.monotonic() - t_owned) * 1000
+            rec["state_owner_pid"] = state.get("pid")
+        except BaseException as e:
             rec["ok"] = False
-            rec["error"] = f"{type(e).__name__}: {e}"
-            rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
-            if state_path is None:
+            rec["request_error"] = f"{type(e).__name__}: {e}"
+            rec["error"] = rec["request_error"]
+            if not isinstance(e, Exception):
+                interrupted = e
+            rec.setdefault("blocking_ms", (time.monotonic() - t_spawn) * 1000)
+            if state_path is None and fcvm_start_time is not None:
                 # find_state may have timed out while fcvm had ALREADY written the
                 # file (it is saved with `pid: null` until post-resume). Leaving
-                # state_path/data_dir as None here means teardown reaps nothing and
-                # the clone's disk artifacts leak permanently — nothing else ever
-                # removes a state file whose pid is null. Rescan by NAME once.
-                state_path, state = scan_state(args.state_dir, fcvm_pid, name)
+                # A newly published null-PID file is useful to verify graceful
+                # cleanup, but is never enough authority for manual deletion.
+                # Rescan by name while permanently excluding pre-spawn paths;
+                # reap_disk will require the exact PID start time if it remains.
+                state_path, state = scan_state(
+                    args.state_dir,
+                    fcvm_pid,
+                    name,
+                    fcvm_start_time,
+                    pre_spawn_state_paths,
+                )
                 if state is not None:
                     rec["recovered_state_by_name"] = True
                     rec["vm_id"] = state.get("vm_id", "")
-                    data_dir = os.path.join(args.data_root, "vm-disks", rec["vm_id"])
+                    try:
+                        data_dir = clone_data_dir(args.data_root, state)
+                    except RuntimeError as data_error:
+                        rec["state_error"] = str(data_error)
     finally:
+        if "previous_mask" in locals() and not spawn_complete:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         watch.close()
 
     if fast:
         try:
-            rec["teardown"] = teardown_fast(fcvm_pid, state_path, data_dir,
-                                            args.teardown_timeout)
+            rec["teardown"] = teardown_fast(
+                fcvm_pid,
+                args.data_root,
+                state_path,
+                data_dir,
+                args.teardown_timeout,
+                verify_disk_cleanup=True,
+                expected_pid_start_time=fcvm_start_time,
+            )
         except SurvivedTeardown as e:
             # The rep still gets a record, with the survivor list in it.
             rec["teardown"] = e.teardown
             rec["ok"] = False
+            rec["teardown_error"] = str(e)
+            if rec.get("request_error"):
+                rec["error"] = f"{rec['request_error']}; teardown: {e}"
+            else:
+                rec["error"] = f"{type(e).__name__}: {e}"
             rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
             rec["log"] = log
             e.record = rec
-            raise
+            raise e from interrupted
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
     else:
         try:
-            rec["teardown"] = teardown_normal(proc, fcvm_pid, args.teardown_timeout)
+            rec["teardown"] = teardown_normal(
+                proc,
+                fcvm_pid,
+                args.teardown_timeout,
+                args.data_root,
+                state_path,
+                data_dir,
+                verify_disk_cleanup=True,
+                expected_pid_start_time=fcvm_start_time,
+            )
         except SurvivedTeardown as e:
             rec["teardown"] = e.teardown
             rec["ok"] = False
+            rec["teardown_error"] = str(e)
+            if rec.get("request_error"):
+                rec["error"] = f"{rec['request_error']}; teardown: {e}"
+            else:
+                rec["error"] = f"{type(e).__name__}: {e}"
             rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
             rec["log"] = log
             e.record = rec
-            raise
+            raise e from interrupted
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
+    if interrupted is not None:
+        raise interrupted
+    raise_if_harness_interrupted()
     return rec
 
 
@@ -964,7 +1993,7 @@ def run_noop_request(args, rep: int) -> dict:
     spawn, snapshot restore, and fcvm's own teardown — so a machine that slows
     down over the run shows up here, in a series with no arm effect in it.
     """
-    name = f"rb-{os.getpid()}-{rep}-noop"
+    name = f"rb-{args.run_id}-{rep}-noop"
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": "noop", "rep": rep, "name": name}
     cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
@@ -973,120 +2002,457 @@ def run_noop_request(args, rep: int) -> dict:
     env = dict(os.environ, RUST_LOG=args.rust_log)
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
+    state_path = data_dir = None
+    interrupted = None
+    fcvm_start_time = None
     try:
+        pre_spawn_state_paths = state_path_baseline(args.state_dir)
+        raise_if_harness_interrupted()
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, SPAWN_SIGNALS)
+        spawn_complete = False
         with open(log, "wb") as lf:
             proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
         fcvm_pid = proc.pid
+        spawn_complete = True
         try:
+            fcvm_start_time = spawned_process_start_time(proc)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             deadline = t_spawn + args.timeout
             t = time.monotonic()
-            state_path, state = find_state(args.state_dir, fcvm_pid, deadline, watch, name)
+            state_path, state = find_state(
+                args.state_dir,
+                fcvm_pid,
+                deadline,
+                watch,
+                name,
+                proc,
+                log,
+                fcvm_start_time,
+                pre_spawn_state_paths,
+            )
             if state is None:
                 raise TimeoutError("clone state file never appeared")
             rec["discover_ms"] = (time.monotonic() - t) * 1000
             rec["vm_id"] = state.get("vm_id", "")
+            data_dir = clone_data_dir(args.data_root, state)
             endpoint = clone_cdp_endpoint(state, args.cdp_port)
-            rec["state_to_port_ms"] = wait_port(endpoint, deadline)
+            rec["endpoint"] = endpoint
+            rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
+            # This is the noop caller's response boundary. Waiting for fcvm to
+            # claim the state is teardown preparation and must not inflate it.
+            rec["blocking_ms"] = rec["spawn_to_port_ms"]
+            t_owned = time.monotonic()
+            state = wait_state_owned(
+                state_path,
+                fcvm_pid,
+                deadline,
+                watch,
+                proc,
+                fcvm_start_time,
+                name,
+            )
+            data_dir = clone_data_dir(args.data_root, state)
+            rec["state_owner_wait_ms"] = (time.monotonic() - t_owned) * 1000
+            rec["state_owner_pid"] = state.get("pid")
             rec["ok"] = True
-        except Exception as e:
+        except BaseException as e:
             rec["ok"] = False
-            rec["error"] = f"{type(e).__name__}: {e}"
+            rec["request_error"] = f"{type(e).__name__}: {e}"
+            rec["error"] = rec["request_error"]
+            if not isinstance(e, Exception):
+                interrupted = e
+            if state_path is None and fcvm_start_time is not None:
+                state_path, state = scan_state(
+                    args.state_dir,
+                    fcvm_pid,
+                    name,
+                    fcvm_start_time,
+                    pre_spawn_state_paths,
+                )
+                if state is not None:
+                    rec["recovered_state_by_name"] = True
+                    rec["vm_id"] = state.get("vm_id", "")
+                    try:
+                        data_dir = clone_data_dir(args.data_root, state)
+                    except RuntimeError as data_error:
+                        rec["state_error"] = str(data_error)
     finally:
+        if "previous_mask" in locals() and not spawn_complete:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         watch.close()
-    rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+    rec.setdefault("blocking_ms", (time.monotonic() - t_spawn) * 1000)
     try:
-        rec["teardown"] = teardown_normal(proc, fcvm_pid, args.teardown_timeout)
+        rec["teardown"] = teardown_normal(
+            proc,
+            fcvm_pid,
+            args.teardown_timeout,
+            args.data_root,
+            state_path,
+            data_dir,
+            verify_disk_cleanup=True,
+            expected_pid_start_time=fcvm_start_time,
+        )
     except SurvivedTeardown as e:
         rec["teardown"] = e.teardown
         rec["ok"] = False
+        rec["teardown_error"] = str(e)
+        if rec.get("request_error"):
+            rec["error"] = f"{rec['request_error']}; teardown: {e}"
+        else:
+            rec["error"] = f"{type(e).__name__}: {e}"
         rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
         rec["log"] = log
         e.record = rec
-        raise
+        raise e from interrupted
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
+    if interrupted is not None:
+        raise interrupted
+    raise_if_harness_interrupted()
     return rec
 
 
 def run_exec_request(args, rep: int) -> dict:
-    """Baseline arm: the existing per-request exec path, teardown fully awaited."""
-    name = f"rb-{os.getpid()}-{rep}-exec"
+    """Baseline arm, including verified process and on-disk teardown."""
+    name = f"rb-{args.run_id}-{rep}-exec"
     log = os.path.join(args.out_dir, f"{name}.log")
-    driver = (
-        f"python3 /opt/bench/render.py {args.url} --out-prefix /tmp/rb "
-        f"--format {args.format} --quality {args.quality}"
-    )
+    driver = shlex.join([
+        "python3", "/opt/bench/render.py", args.url,
+        "--out-prefix", "/tmp/rb",
+        "--format", args.format,
+        "--quality", str(args.quality),
+    ])
     cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap", "--exec", driver,
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
     rec: dict = {"arm": "exec", "rep": rep, "name": name, "timed_out": False}
     t0 = time.monotonic()
-    with open(log, "wb") as lf:
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env)
+    state_path = data_dir = None
+    proc = None
+    parent_fd = None
+    kids: list[int] = []
+    fds: list[int | None] = []
+    watch = DirWatch(args.state_dir)
+    fcvm_start_time = None
     try:
-        rc = proc.wait(timeout=args.timeout + args.teardown_timeout)
-    except subprocess.TimeoutExpired:
-        # This was a bare `proc.wait(timeout=...)` with no handler, so a single
-        # slow rep raised `TimeoutExpired` straight out of main() and killed the
-        # harness — leaving the spawned fcvm ORPHANED (Python installs no
-        # pdeathsig and reqbench is not a subreaper) with its Firecracker, holder,
-        # pasta, state file and vm-disks dir still live, into the next run's
-        # measurements. The exec arm was the only arm with this hole; the other two
-        # always reach a teardown call.
-        rec["timed_out"] = True
-        # CHILDREN FIRST, BEFORE THE KILL. This path used to SIGKILL fcvm, wait on
-        # fcvm ITSELF, and then unconditionally reap the state file and rmtree
-        # `vm-disks/<vm_id>` — deleting a live microVM's rootfs out from under it
-        # and destroying the only record that it is ours. Measured with a fake
-        # fcvm that forks an unarmed child:
-        #     reaped=['.../state/vm-red.json', '.../vm-disks/vm-red']
-        #     orphan child still alive=True   rootfs still on disk=False
-        # `children_of` MUST be captured before the signal: once fcvm dies,
-        # `/proc/<fcvm>/task/*/children` no longer exists and the survivors are
-        # unrecoverable. This is the same rule teardown_fast enforces.
-        kids = children_of(proc.pid)
-        fds = [pidfd_open(p) for p in kids]
+        pre_spawn_state_paths = state_path_baseline(args.state_dir)
+        raise_if_harness_interrupted()
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, SPAWN_SIGNALS)
+        spawn_mask_restored = False
+        with open(log, "wb") as lf:
+            proc = subprocess.Popen(
+                cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, env=env
+            )
+        fcvm_start_time = spawned_process_start_time(proc)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        spawn_mask_restored = True
+        deadline = t0 + args.timeout
+        state_path, state = find_state(
+            args.state_dir,
+            proc.pid,
+            deadline,
+            watch,
+            name,
+            proc,
+            log,
+            fcvm_start_time,
+            pre_spawn_state_paths,
+        )
+        if state is None:
+            raise TimeoutError("exec clone state file never appeared")
+        rec["vm_id"] = state.get("vm_id", "")
+        data_dir = clone_data_dir(args.data_root, state)
+        state = wait_state_owned(
+            state_path,
+            proc.pid,
+            deadline,
+            watch,
+            proc,
+            fcvm_start_time,
+            name,
+        )
+        data_dir = clone_data_dir(args.data_root, state)
+        rec["state_owner_pid"] = state.get("pid")
+        parent_fd = pidfd_open(proc.pid)
+        if parent_fd is None:
+            raise RuntimeError(f"cannot open pidfd for exec clone owner {proc.pid}")
+        # Pin the complete direct-child set while the owner is stopped. On a
+        # normal fcvm exit these are precisely the processes whose pdeathsig
+        # contract must make terminal; waiting on an empty list would be a
+        # vacuous lifecycle proof.
+        kids, fds = freeze_and_capture_children(proc.pid)
+        if not kids or any(fd is None for fd in fds):
+            abort_frozen_owner(proc.pid, parent_fd, fds)
+            raise RuntimeError(
+                f"exec clone owner {proc.pid} has no completely pinned child set"
+            )
+        os.kill(proc.pid, signal.SIGCONT)
+    except BaseException as request_error:
+        if "previous_mask" in locals() and not spawn_mask_restored:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            spawn_mask_restored = True
+        if (
+            proc is not None
+            and state_path is None
+            and fcvm_start_time is not None
+        ):
+            state_path, state = scan_state(
+                args.state_dir,
+                proc.pid,
+                name,
+                fcvm_start_time,
+                pre_spawn_state_paths,
+            )
+            if state is not None:
+                rec["recovered_state_by_name"] = True
+                rec["vm_id"] = state.get("vm_id", "")
+                try:
+                    data_dir = clone_data_dir(args.data_root, state)
+                except RuntimeError as data_error:
+                    rec["state_error"] = str(data_error)
+        rec["ok"] = False
+        rec["request_error"] = f"{type(request_error).__name__}: {request_error}"
+        rec["error"] = rec["request_error"]
+        if parent_fd is not None or fds:
+            terminal = abort_frozen_owner(proc.pid, parent_fd, fds)
+            close_pidfds([parent_fd, *fds])
+            teardown_error = SurvivedTeardown(
+                f"exec clone failed while establishing its exact owner set "
+                f"(terminal={terminal}); state {state_path} and data {data_dir} "
+                "NOT reaped",
+                {
+                    "mode": "exec",
+                    "all_gone": terminal,
+                    "child_attribution_established": False,
+                    "disk_reap_skipped": True,
+                },
+            )
+            rec["teardown"] = teardown_error.teardown
+            rec["teardown_error"] = str(teardown_error)
+            rec["error"] += f"; teardown: {teardown_error}"
+            rec["blocking_ms"] = rec["wall_ms"] = (
+                time.monotonic() - t0
+            ) * 1000
+            rec["log"] = log
+            teardown_error.record = rec
+            raise teardown_error from request_error
+        if proc is not None and proc.poll() is None:
+            try:
+                rec["teardown"] = teardown_normal(
+                    proc,
+                    proc.pid,
+                    args.teardown_timeout,
+                    args.data_root,
+                    state_path or "",
+                    data_dir or "",
+                    verify_disk_cleanup=True,
+                    expected_pid_start_time=fcvm_start_time,
+                )
+            except SurvivedTeardown as teardown_error:
+                rec["teardown"] = teardown_error.teardown
+                rec["teardown_error"] = str(teardown_error)
+                rec["error"] += f"; teardown: {teardown_error}"
+                rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
+                rec["log"] = log
+                teardown_error.record = rec
+                raise teardown_error from request_error
+        else:
+            teardown_error = SurvivedTeardown(
+                f"exec clone exited before child attribution; state {state_path} and "
+                f"data {data_dir} NOT reaped",
+                {"mode": "exec", "all_gone": False, "disk_reap_skipped": True},
+            )
+            rec["teardown"] = teardown_error.teardown
+            rec["teardown_error"] = str(teardown_error)
+            rec["error"] += f"; teardown: {teardown_error}"
+            rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
+            rec["log"] = log
+            teardown_error.record = rec
+            raise teardown_error from request_error
+        if not isinstance(request_error, Exception):
+            raise
+        rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
+        rec["log"] = log
+        return rec
+    finally:
+        watch.close()
+
+    wait_budget = max(0.0, deadline - time.monotonic())
+    interrupted = None
+    try:
+        exited = wait_pidfds([parent_fd], wait_budget, interruptible=True)
+    except HarnessInterrupted as interrupt:
+        interrupted = interrupt
+        rec["interrupted"] = True
+        exited = False
+    if not exited:
+        rec["timed_out"] = interrupted is None
         try:
-            os.kill(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            timeout_kids, timeout_fds = freeze_and_capture_children(proc.pid)
+        except RuntimeError as capture_error:
+            try:
+                pidfd_send_signal(parent_fd, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            wait_pidfds([parent_fd], args.teardown_timeout)
+            close_pidfds([parent_fd])
+            teardown = {
+                "mode": "exec",
+                "all_gone": False,
+                "child_attribution_established": False,
+                "disk_reap_skipped": True,
+            }
+            error = SurvivedTeardown(
+                f"exec clone timeout could not prove its child set: {capture_error}; "
+                f"state {state_path} and data {data_dir} NOT reaped",
+                teardown,
+            )
+            rec.update(
+                ok=False,
+                error=str(error),
+                teardown=teardown,
+                blocking_ms=(time.monotonic() - t0) * 1000,
+                wall_ms=(time.monotonic() - t0) * 1000,
+                log=log,
+            )
+            error.record = rec
+            raise error from capture_error
+        # No production child is allowed to appear after the state ownership
+        # barrier. A mismatch means the original attribution was incomplete;
+        # kill every exact handle, retain disk evidence, and fail closed.
+        if timeout_kids != kids or any(fd is None for fd in timeout_fds):
+            abort_frozen_owner(proc.pid, parent_fd, [*fds, *timeout_fds])
+            close_pidfds([parent_fd, *fds, *timeout_fds])
+            teardown = {
+                "mode": "exec",
+                "all_gone": False,
+                "child_attribution_established": False,
+                "disk_reap_skipped": True,
+                "initial_children": kids,
+                "timeout_children": timeout_kids,
+            }
+            error = SurvivedTeardown(
+                f"exec clone child set changed after ownership publication: "
+                f"{kids} -> {timeout_kids}; state {state_path} and data "
+                f"{data_dir} NOT reaped",
+                teardown,
+            )
+            rec.update(
+                ok=False,
+                error=str(error),
+                teardown=teardown,
+                blocking_ms=(time.monotonic() - t0) * 1000,
+                wall_ms=(time.monotonic() - t0) * 1000,
+                log=log,
+            )
+            error.record = rec
+            raise error
+        close_pidfds(timeout_fds)
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+            pidfd_send_signal(parent_fd, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
             pass
-        rc = -9
-        all_gone = wait_pidfds(fds, args.teardown_timeout)
+        if not wait_pidfds([parent_fd], args.teardown_timeout):
+            rec["parent_survived_kill"] = True
+            for fd in [parent_fd, *fds]:
+                if fd is not None:
+                    os.close(fd)
+            teardown = {
+                "mode": "exec",
+                "all_gone": False,
+                "disk_reap_skipped": True,
+                "parent_survived_kill": True,
+            }
+            error = SurvivedTeardown(
+                f"exec clone owner {proc.pid} survived SIGKILL; state {state_path} "
+                f"and data {data_dir} NOT reaped",
+                teardown,
+            )
+            rec.update(
+                ok=False,
+                error=str(error),
+                teardown=teardown,
+                blocking_ms=(time.monotonic() - t0) * 1000,
+                wall_ms=(time.monotonic() - t0) * 1000,
+                log=log,
+            )
+            error.record = rec
+            raise error
+    rc = proc.wait()
+    all_gone = wait_pidfds(fds, args.teardown_timeout)
+
+    teardown = {
+        "mode": "exec",
+        "all_gone": all_gone,
+        "child_attribution_established": True,
+    }
+    rec["teardown"] = teardown
+    if not all_gone:
+        poller = select.poll()
         for fd in fds:
             if fd is not None:
-                os.close(fd)
-        # The exec arm never resolves the clone's state file in the happy path, so
-        # find it now — by name, since the pid may never have been written.
-        sp, state = scan_state(args.state_dir, proc.pid, name)
-        dd = os.path.join(args.data_root, "vm-disks", state.get("vm_id", "")) if state else ""
-        rec["all_gone"] = all_gone
-        if not all_gone:
-            survivors = {p: proc_comm(p) for p in kids if proc_stat_fields(p) is not None}
-            rec["survivors"] = survivors
-            rec["disk_reap_skipped"] = True
-            rec["ok"] = False
-            rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
-            rec["rc"] = rc
-            rec["log"] = log
-            for pid in survivors:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            e = SurvivedTeardown(
-                f"exec-arm timeout left {survivors} alive; state {sp} and data {dd} "
-                f"NOT reaped",
-                rec,
+                poller.register(fd, select.POLLIN)
+        ready = {fd for fd, _event in poller.poll(0)}
+        survivors = {
+            p: proc_comm(p)
+            for p, fd in zip(kids, fds)
+            if fd is not None and fd not in ready
+        }
+        teardown["survivors"] = survivors
+        teardown["disk_reap_skipped"] = True
+        rec["survivors"] = survivors
+        rec["disk_reap_skipped"] = True
+        for pid, fd in zip(kids, fds):
+            if pid not in survivors or fd is None:
+                continue
+            try:
+                pidfd_send_signal(fd, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        wait_pidfds(fds, args.teardown_timeout)
+        close_pidfds([parent_fd, *fds])
+        error = SurvivedTeardown(
+            f"exec arm left {survivors} alive; state {state_path} and data {data_dir} "
+            "NOT reaped",
+            teardown,
+        )
+        rec.update(ok=False, error=str(error), log=log)
+        rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
+        error.record = rec
+        raise error
+    close_pidfds([parent_fd, *fds])
+
+    expected = [state_path, f"{state_path}.lock", data_dir]
+    left = [path for path in expected if path and os.path.lexists(path)]
+    teardown["disk_cleanup_verified"] = not left
+    if left:
+        teardown["disk_cleanup_left"] = left
+        teardown["disk_reaped"] = reap_disk(
+            rec,
+            args.data_root,
+            state_path,
+            data_dir,
+            (proc.pid, fcvm_start_time),
+        )
+        still_left = [path for path in expected if path and os.path.lexists(path)]
+        teardown["disk_reap_failed"] = still_left
+        teardown["disk_cleanup_verified"] = not still_left and not rec.get("disk_errors")
+        if (
+            still_left
+            or rec.get("disk_errors")
+            or (not rec["timed_out"] and interrupted is None)
+        ):
+            error = SurvivedTeardown(
+                f"exec arm left on-disk state {left}; exact-path reap left {still_left}",
+                teardown,
             )
-            e.record = rec
-            raise e
-        rec["reaped"] = reap_disk(rec, sp, dd)
+            rec.update(ok=False, error=str(error), log=log)
+            rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
+            error.record = rec
+            raise error
+
     wall = (time.monotonic() - t0) * 1000
     render_ms = None
     try:
@@ -1099,13 +2465,19 @@ def run_exec_request(args, rep: int) -> dict:
     except OSError:
         pass
     rec.update(
-        ok=(rc == 0),
+        ok=(rc == 0 and not rec["timed_out"]),
         # The exec arm has no separable "response in hand" instant that the host
         # can observe: fcvm returns only after its own teardown. blocking == wall
         # is not an approximation, it is the arm's defining property.
         blocking_ms=wall, wall_ms=wall,
         render_total_ms=render_ms, rc=rc, log=log,
     )
+    if not rec["ok"]:
+        reason = "timed out" if rec["timed_out"] else f"exited with status {rc}"
+        rec["error"] = f"exec clone {reason}: {log_tail(log)}"
+    if interrupted is not None:
+        raise interrupted
+    raise_if_harness_interrupted()
     return rec
 
 
@@ -1126,6 +2498,9 @@ def main() -> int:
     p.add_argument("--image", default="")
     p.add_argument("--image-id", default="")
     p.add_argument("--snapshot-name", default="")
+    p.add_argument("--network-mode", default="")
+    p.add_argument("--cpu", type=int, default=0)
+    p.add_argument("--memory-mib", type=int, default=0)
     p.add_argument("--ws-url", default="")
     p.add_argument("--fcvm", default=os.path.join(HERE, "..", "..", "target", "release", "fcvm"))
     p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
@@ -1134,7 +2509,12 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--teardown-timeout", type=float, default=60.0)
     p.add_argument("--rust-log", default="fcvm=debug")
+    p.add_argument("--run-id", default="",
+                   help="32-hex invocation identity (generated when omitted)")
     args = p.parse_args()
+    signal.signal(signal.SIGINT, record_harness_interrupt)
+    signal.signal(signal.SIGTERM, record_harness_interrupt)
+    args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
 
     # EXACTLY ONE backend. With neither flag `clone_backend_args` returned
     # `["--pid", "0"]` — a silently wrong invocation that would be recorded as
@@ -1145,10 +2525,104 @@ def main() -> int:
     if bool(args.serve_pid) == bool(args.snapshot_tag):
         p.error("give exactly one of --serve-pid (UFFD) or --snapshot-tag (FILE)")
 
+    snapshot_name = args.snapshot_name or args.snapshot_tag
+    if not snapshot_name:
+        p.error("--snapshot-name is required for an auditable UFFD run")
+    if not valid_snapshot_name(snapshot_name):
+        p.error(
+            "snapshot name must be 1..128 ASCII letters, digits, '-', '_', or '.', "
+            "excluding . and .."
+        )
+    if not args.image_id:
+        p.error("--image-id is required for an auditable run")
+    if not args.network_mode or args.cpu <= 0 or args.memory_mib <= 0:
+        p.error("--network-mode, positive --cpu, and positive --memory-mib are required")
+    snapshot_lock_path = os.path.join(
+        args.data_root, "snapshots", f"{snapshot_name}.lock"
+    )
+    try:
+        snapshot_lock = open(snapshot_lock_path, "a+")
+        fcntl.flock(snapshot_lock, fcntl.LOCK_SH)
+        snapshot = snapshot_generation(args.data_root, snapshot_name)
+    except RuntimeError as error:
+        p.error(str(error))
+    except OSError as error:
+        p.error(f"cannot hold snapshot generation lock {snapshot_lock_path}: {error}")
+
+    declared_shape = {
+        "image": args.image,
+        "image_id": args.image_id,
+        "network_mode": args.network_mode,
+        "vcpu": args.cpu,
+        "memory_mib": args.memory_mib,
+    }
+    for field, declared in declared_shape.items():
+        if declared != snapshot[field]:
+            p.error(
+                f"declared {field}={declared!r} does not match snapshot "
+                f"{snapshot_name} {field}={snapshot[field]!r}; recreate the golden "
+                "or use its actual shape"
+            )
+    cdp_mapping = any(
+        isinstance(mapping, dict)
+        and mapping.get("proto") == "tcp"
+        and mapping.get("host_port") == args.cdp_port
+        and mapping.get("guest_port") == args.cdp_port
+        for mapping in snapshot["port_mappings"]
+    )
+    if not cdp_mapping:
+        p.error(
+            f"snapshot {snapshot_name} does not publish TCP "
+            f"{args.cdp_port}:{args.cdp_port}: {snapshot['port_mappings']!r}"
+        )
+    try:
+        uffd_mode = (
+            serve_uffd_mode(args.state_dir, args.serve_pid, snapshot_name)
+            if args.serve_pid
+            else "file"
+        )
+    except RuntimeError as error:
+        p.error(str(error))
+
     args.fcvm = os.path.abspath(args.fcvm)
-    args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
+    runtime_bundle = os.environ.get("REQBENCH_RUNTIME_BUNDLE", "")
+    manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+    if os.path.realpath(runtime_bundle) != os.path.realpath(HERE):
+        p.error("reqbench.py must execute from reqbench.sh's staged runtime bundle")
+    if not os.path.isfile(manifest_path):
+        p.error(f"staged runtime manifest is missing: {manifest_path}")
+    current_fcvm_sha256 = sha256_file(args.fcvm)
+    current_runtime_bundle_sha256 = sha256_file(manifest_path)
+    current_source_revision = os.environ.get("REQBENCH_SOURCE_REVISION", "")
+    creator_identity = {
+        "creator_fcvm_sha256": current_fcvm_sha256,
+        "creator_runtime_bundle_sha256": current_runtime_bundle_sha256,
+        "source_revision": current_source_revision,
+    }
+    for field, current in creator_identity.items():
+        if snapshot[field] != current:
+            p.error(
+                f"snapshot {snapshot_name} was created with {field}="
+                f"{snapshot[field]!r}, current runtime is {current!r}; recreate "
+                "the golden with this staged runtime"
+            )
     os.makedirs(args.out_dir, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    allowed_arms = {"exec", "cdp", "cdp-fast", "noop"}
+    if not arms or len(set(arms)) != len(arms) or any(a not in allowed_arms for a in arms):
+        p.error(
+            "--arms must be a non-empty, duplicate-free subset of "
+            "exec,cdp,cdp-fast,noop"
+        )
+    if "noop" not in arms or "exec" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
+        p.error("publication runs require exec, noop, and at least one CDP arm")
+
+    args.run_id = args.run_id or uuid.uuid4().hex
+    if (
+        len(args.run_id) != 32
+        or any(character not in "0123456789abcdef" for character in args.run_id)
+    ):
+        p.error("--run-id must be exactly 32 lowercase hexadecimal characters")
 
     # Defect 2 of bench/chromium/AGENTS.md: interleave, never block. Arms are
     # shuffled request-by-request from a RECORDED seed so an arm's effect cannot
@@ -1163,28 +2637,60 @@ def main() -> int:
             schedule.append((rep, arm, rep < args.warmup))
 
     out_path = os.path.join(args.out_dir, "reqbench.jsonl")
+    run_id = args.run_id
+    try:
+        quiet_guard_loadavg1 = float(os.environ["REQBENCH_GUARD_LOADAVG1"])
+        quiet_guard_vm_processes = int(
+            os.environ["REQBENCH_GUARD_VM_PROCESSES"]
+        )
+        quiet_loadavg1_limit = float(
+            os.environ["REQBENCH_QUIET_LOADAVG1_LIMIT"]
+        )
+    except (KeyError, ValueError) as error:
+        p.error(f"quiet-host guard provenance is incomplete: {error}")
     with open(out_path, "a") as out:
         meta = {
-            "kind": "meta", "seed": args.seed,
+            "kind": "meta", "run_id": run_id, "seed": args.seed,
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
+            "uffd_mode": uffd_mode,
             "warmup": args.warmup, "url": args.url, "format": args.format,
-            "source_revision": command_text([
-                "git", "-C", os.path.abspath(os.path.join(HERE, "..", "..")),
-                "rev-parse", "HEAD",
-            ]),
+            "quality": args.quality,
+            "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,
-            "fcvm_sha256": sha256_file(args.fcvm),
+            "fcvm_sha256": current_fcvm_sha256,
             "fcvm_version": command_text([args.fcvm, "--version"]),
-            "snapshot": args.snapshot_name or args.snapshot_tag or f"serve-pid:{args.serve_pid}",
-            "image": args.image,
-            "image_id": args.image_id,
+            "harness_sha256": harness_sha256(),
+            "runtime_bundle_sha256": current_runtime_bundle_sha256,
+            "snapshot": snapshot_name,
+            "snapshot_created_at": snapshot["created_at"],
+            "snapshot_vm_id": snapshot["vm_id"],
+            "image": snapshot["image"],
+            "image_id": snapshot["image_id"],
             "cdp_port": args.cdp_port,
-            "loadavg": open("/proc/loadavg").read().split()[:3],
+            "port_mappings": snapshot["port_mappings"],
+            "network_mode": snapshot["network_mode"],
+            "cpu": snapshot["vcpu"],
+            "memory_mib": snapshot["memory_mib"],
+            "rust_log": args.rust_log,
+            "ws_url_prewired": bool(args.ws_url),
+            "allow_busy": os.environ.get("ALLOW_BUSY", "0") == "1",
+            "quiet_guard_passed": os.environ.get("REQBENCH_QUIET_GUARD") == "1",
+            "quiet_guard_loadavg1": quiet_guard_loadavg1,
+            "quiet_vm_processes": quiet_guard_vm_processes,
+            "quiet_loadavg1_limit": quiet_loadavg1_limit,
+            "host_boot_id": read_trimmed("/proc/sys/kernel/random/boot_id"),
+            "host_kernel_release": platform.release(),
+            "host_machine": platform.machine(),
+            "loadavg": read_trimmed("/proc/loadavg").split()[:3],
             "started": time.time(),
         }
         out.write(json.dumps(meta) + "\n")
         out.flush()
         for rep, arm, is_warmup in schedule:
+            # A signal delivered between attempts cannot own a process, so exit
+            # before spawning the next clone. Signals delivered during an
+            # attempt are re-raised only after that attempt's exact teardown.
+            raise_if_harness_interrupted()
             # Every rep records something, including the ones that blow up. A rep
             # that raises out of the loop used to take the whole run with it and
             # leave no trace in the artifact, so `n=` was the only evidence that
@@ -1199,13 +2705,22 @@ def main() -> int:
                 fatal = None
             except SurvivedTeardown as e:
                 rec = dict(e.record) or {"arm": arm, "rep": rep}
-                rec.update(ok=False, error=f"{type(e).__name__}: {e}")
+                request_error = rec.get("request_error") or rec.get("error")
+                rec["ok"] = False
+                rec["teardown_error"] = str(e)
+                rec["error"] = (
+                    f"{request_error}; teardown: {e}"
+                    if request_error
+                    else f"{type(e).__name__}: {e}"
+                )
                 fatal = e
             except Exception as e:  # noqa: BLE001 - record, then re-raise
                 rec = {"arm": arm, "rep": rep, "ok": False, "error": f"{type(e).__name__}: {e}"}
                 fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
-            rec["loadavg1"] = float(open("/proc/loadavg").read().split()[0])
+            rec["run_id"] = run_id
+            rec["record_id"] = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"
+            rec["loadavg1"] = float(read_trimmed("/proc/loadavg").split()[0])
             out.write(json.dumps(rec) + "\n")
             out.flush()
             print(

@@ -31,6 +31,12 @@ pub struct VmState {
     /// even though /proc/<pid> exists.
     #[serde(default)]
     pub pid_start_time: Option<u64>,
+    /// True only after the owning fcvm process has installed its signal/cancellation
+    /// handling and every long-lived child resource for this lifecycle. Observers that
+    /// need an exact process tree must wait for this publication barrier rather than
+    /// racing the earlier PID/state write performed during setup.
+    #[serde(default)]
+    pub lifecycle_ready: bool,
     /// Namespace holder PID for rootless networking (used for nsenter health checks)
     #[serde(default)]
     pub holder_pid: Option<u32>,
@@ -221,6 +227,7 @@ impl VmState {
             exit_code: None,
             pid: None,
             pid_start_time: None,
+            lifecycle_ready: false,
             holder_pid: None,
             vsock_epoch: 0,
             created_at: now,
@@ -325,6 +332,25 @@ mod tests {
         let roundtrip: VmState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(roundtrip.vsock_epoch, 7);
+    }
+
+    #[test]
+    fn test_lifecycle_ready_defaults_false_when_absent() {
+        let mut state = VmState::new("vm-old".to_string(), "alpine:latest".to_string(), 1, 128);
+        assert!(!state.lifecycle_ready);
+
+        let mut json: serde_json::Value = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("lifecycle_ready");
+        let loaded: VmState = serde_json::from_value(json).unwrap();
+        assert!(
+            !loaded.lifecycle_ready,
+            "a state file without the readiness barrier must fail closed"
+        );
+
+        state.lifecycle_ready = true;
+        let roundtrip: VmState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(roundtrip.lifecycle_ready);
     }
 
     #[test]

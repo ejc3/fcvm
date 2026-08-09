@@ -45,10 +45,6 @@ invented. Six of this file's seven bounds reproduce exactly against
 `DocLint.test_every_binomial_bound_matches_reqanalyze_clopper_pearson` now
 recomputes every one of them.)*
 
-**The earlier CDP-path availability A/B is withdrawn.** Its arms were not
-comparable, so its `file 1/60, UFFD 6/60, exec 0/66` counts must not be used to
-attribute failures to a transport component or to describe current behavior.
-
 **Root cause of the observed `WsClosed` records: undetermined.** `render.py`'s
 `_recv_until` discarded any bytes the peer coalesced past the `\r\n\r\n` of the
 101 response, which desyncs the very next frame header and surfaces as exactly

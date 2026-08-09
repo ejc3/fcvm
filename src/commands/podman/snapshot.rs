@@ -8,7 +8,7 @@ use crate::cli::RunArgs;
 use crate::hypervisor::firecracker::FirecrackerBackend;
 use crate::paths;
 use crate::state::VmState;
-use crate::storage::{SnapshotConfig, SnapshotManager, SnapshotType};
+use crate::storage::{validate_snapshot_name, SnapshotConfig, SnapshotManager, SnapshotType};
 use crate::volume::VolumeConfig;
 
 use super::types::SnapshotOutcome;
@@ -66,43 +66,59 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
 
-    // Per-snapshot lock (exclusive): prevents concurrent creation of the same key
-    // and blocks restores of this snapshot while it is being (re)created.
     tokio::fs::create_dir_all(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
-    let _snapshot_lock =
-        crate::commands::common::acquire_snapshot_dir_lock(&snapshot_dir, true).await?;
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let mut expected_parent_key = vm_state.config.snapshot_name.clone();
+    let (_generation_locks, _vm_lock, parent_snapshot_key) = loop {
+        if let Some(parent) = expected_parent_key.as_deref() {
+            validate_snapshot_name(parent).context("invalid parent snapshot name in VM state")?;
+        }
+        let expected_parent_dir = expected_parent_key
+            .as_ref()
+            .map(|key| paths::snapshot_dir().join(key));
+        let generation_locks = crate::commands::common::acquire_snapshot_create_generation_locks(
+            &snapshot_dir,
+            expected_parent_dir.as_deref(),
+        )
+        .await?;
 
-    // Double-check after lock (another process might have created it)
-    if snapshot_dir.join("config.json").exists() {
-        info!(snapshot_key = %snapshot_key, "Snapshot already exists (created by another process)");
-        return Ok(());
-    }
+        // Another VM process may have finished this content-addressed snapshot while we
+        // waited for its generation lock.
+        if snapshot_dir.join("config.json").exists() {
+            info!(snapshot_key = %snapshot_key, "Snapshot already exists (created by another process)");
+            return Ok(());
+        }
+
+        // Serialize dirty-bitmap resets, then ensure both the owning process identity and
+        // lineage still match the observations used to choose generation locks.
+        let vm_lock = crate::commands::common::acquire_vm_snapshot_lock(disk_path).await?;
+        let fresh_state = state_manager
+            .load_state(&vm_state.vm_id)
+            .await
+            .context("re-reading VM state under snapshot lock")?;
+        crate::commands::common::validate_snapshot_vm_identity(vm_state, &fresh_state)?;
+        if let Some(parent) = fresh_state.config.snapshot_name.as_deref() {
+            validate_snapshot_name(parent).context("invalid parent snapshot name in VM state")?;
+        }
+        if fresh_state.config.snapshot_name != expected_parent_key {
+            info!(
+                vm_id = %vm_state.vm_id,
+                expected_parent = ?expected_parent_key,
+                current_parent = ?fresh_state.config.snapshot_name,
+                "snapshot lineage advanced while acquiring locks; retrying"
+            );
+            expected_parent_key = fresh_state.config.snapshot_name;
+            drop(vm_lock);
+            drop(generation_locks);
+            continue;
+        }
+
+        break (generation_locks, vm_lock, expected_parent_key.clone());
+    };
 
     info!(snapshot_key = %snapshot_key, "Creating podman snapshot");
-
-    // Per-VM lock: serialize with external `fcvm snapshot create` calls.
-    let _vm_lock = crate::commands::common::acquire_vm_snapshot_lock(disk_path).await?;
-
-    // Resolve the diff parent UNDER the per-VM lock by re-reading the state file.
-    // The lock contract requires this: another process may have created a snapshot
-    // (resetting the KVM dirty bitmap) and updated snapshot_name since the caller's
-    // in-memory copy of the state was taken. Using that stale parent would merge a
-    // diff covering only post-reset writes onto an older base, silently dropping
-    // every page dirtied in between.
-    let state_manager = crate::state::StateManager::new(paths::state_dir());
-    let parent_snapshot_key = match state_manager.load_state(&vm_state.vm_id).await {
-        Ok(state) => state.config.snapshot_name,
-        Err(e) => {
-            tracing::warn!(
-                vm_id = %vm_state.vm_id,
-                error = %e,
-                "could not re-read VM state under snapshot lock; creating full snapshot"
-            );
-            None
-        }
-    };
 
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;

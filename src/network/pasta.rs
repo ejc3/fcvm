@@ -42,6 +42,25 @@ const PASTA_STDERR_TAIL_LINES: usize = 20;
 /// case of an inherited, still-open pipe.
 const PASTA_STDERR_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Whether `ip neigh show` proves that the bridge resolved the guest's MAC.
+///
+/// ICMP echo is not the readiness contract: a guest may deliberately ignore
+/// echo requests while serving published TCP ports.  The ping in the restore
+/// probe is only an ARP trigger.  A neighbour entry with a link-layer address
+/// is the evidence that the L2 path is ready.
+fn neighbor_is_resolved(output: &str) -> bool {
+    let fields: Vec<&str> = output.split_whitespace().collect();
+    fields
+        .windows(2)
+        .any(|w| w[0] == "lladdr" && !w[1].is_empty())
+        && fields.iter().any(|field| {
+            matches!(
+                *field,
+                "PERMANENT" | "NOARP" | "REACHABLE" | "STALE" | "DELAY" | "PROBE"
+            )
+        })
+}
+
 /// Heredoc delimiter separating the batched `ip` commands from the shell script.
 const IP_BATCH_DELIMITER: &str = "FCVM_IP_BATCH";
 
@@ -861,10 +880,9 @@ impl PastaNetwork {
     /// the process is running, not that ports are listening. Without this check,
     /// the health monitor may declare the VM "healthy" (via nsenter/bridge) before
     /// port forwarding actually works.
-    async fn wait_for_port_forwarding(&self) -> Result<()> {
+    async fn wait_for_port_forwarding_until(&self, deadline: std::time::Instant) -> Result<()> {
         use tokio::net::TcpStream;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let loopback = self.loopback_ip.as_deref().unwrap_or("127.0.0.1");
 
         for mapping in &self.port_mappings {
@@ -879,22 +897,40 @@ impl PastaNetwork {
             let addr = format!("{}:{}", bind_addr, mapping.host_port);
 
             loop {
-                match TcpStream::connect(&addr).await {
-                    Ok(_) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    anyhow::bail!("pasta port forward not ready within 5s: {}", addr);
+                }
+                match tokio::time::timeout(remaining, TcpStream::connect(&addr)).await {
+                    Ok(Ok(_)) => {
                         debug!(addr = %addr, "port forward ready");
                         break;
                     }
-                    Err(_) => {
-                        if std::time::Instant::now() > deadline {
+                    Ok(Err(_)) => {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
                             anyhow::bail!("pasta port forward not ready within 5s: {}", addr);
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(50)))
+                            .await;
                     }
+                    Err(_) => anyhow::bail!(
+                        "pasta port forward connect exceeded the 5s readiness deadline: {}",
+                        addr
+                    ),
                 }
             }
         }
 
         Ok(())
+    }
+
+    async fn wait_for_port_forwarding(&self) -> Result<()> {
+        self.wait_for_port_forwarding_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
     }
 }
 
@@ -1089,11 +1125,13 @@ impl NetworkManager for PastaNetwork {
     /// Verify pasta's L2 forwarding path is ready after snapshot restore.
     ///
     /// After snapshot restore, pasta needs the guest's MAC address to forward
-    /// L2 frames. We actively ping the guest from the namespace to trigger a
-    /// normal ARP exchange. With arp_accept=0 (Linux default), the guest's
-    /// gratuitous arping does NOT create neighbor entries — only updates
-    /// existing ones. The active ping forces the namespace kernel to send an
-    /// ARP request that the guest replies to, creating a REACHABLE entry.
+    /// L2 frames. We send a ping from the namespace only to trigger a normal ARP
+    /// exchange, then inspect the bridge's neighbour table. The echo reply is
+    /// deliberately not the gate: a guest can ignore ICMP while its published
+    /// TCP service is fully functional. With arp_accept=0 (Linux default), the
+    /// guest's gratuitous arping does NOT create neighbour entries — only updates
+    /// existing ones. The outbound packet forces the namespace kernel to send an
+    /// ARP request that the guest replies to, creating a resolved entry.
     ///
     /// Once ARP is resolved, we probe each forwarded port to confirm pasta's
     /// loopback port forwarding is end-to-end functional.
@@ -1104,46 +1142,91 @@ impl NetworkManager for PastaNetwork {
 
         let holder_pid = match self.holder_pid {
             Some(pid) => pid,
-            None => return Ok(()),
+            None => {
+                anyhow::bail!("cannot verify pasta port forwarding without a namespace holder PID")
+            }
         };
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 
         // Ping the guest from inside the namespace to trigger ARP resolution.
-        // A successful ping proves ARP resolved AND the guest is reachable.
-        // Use 200ms timeout for ~16 retries within the 5s deadline.
+        // The echo status is not evidence: ICMP may be disabled while published
+        // TCP is healthy. Inspect the neighbour entry after every trigger and
+        // require a resolved MAC before probing the actual published ports.
+        // Use a 200ms timeout for ~16 attempts within the 5s deadline.
         loop {
-            let output = Command::new(&nsenter_prefix[0])
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("ARP for guest {} not resolved within 5s", GUEST_IP);
+            }
+            let mut ping_command = Command::new(&nsenter_prefix[0]);
+            ping_command
                 .args(&nsenter_prefix[1..])
                 .args(["ping", "-c", "1", "-W", "0.2", GUEST_IP])
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
-                .output()
+                .kill_on_drop(true);
+            let ping = tokio::time::timeout(remaining, ping_command.output())
                 .await
+                .context("ping exceeded pasta's 5s readiness deadline")?
                 .context("running ping via nsenter in namespace")?;
 
-            if output.status.success() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("ARP for guest {} not resolved within 5s", GUEST_IP);
+            }
+            let mut neighbor_command = Command::new(&nsenter_prefix[0]);
+            neighbor_command
+                .args(&nsenter_prefix[1..])
+                .args(["ip", "neigh", "show", "to", GUEST_IP, "dev", BRIDGE_DEVICE])
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let neighbor = tokio::time::timeout(remaining, neighbor_command.output())
+                .await
+                .context("neighbor query exceeded pasta's 5s readiness deadline")?
+                .context("reading guest neighbour entry via nsenter in namespace")?;
+            if !neighbor.status.success() {
+                anyhow::bail!(
+                    "failed to inspect ARP entry for guest {} on {}: {}",
+                    GUEST_IP,
+                    BRIDGE_DEVICE,
+                    String::from_utf8_lossy(&neighbor.stderr).trim()
+                );
+            }
+            let neighbor_stdout = String::from_utf8_lossy(&neighbor.stdout);
+            if neighbor_is_resolved(&neighbor_stdout) {
                 info!(
                     guest_ip = GUEST_IP,
-                    "guest reachable via ping, ARP resolved"
+                    neighbor = %neighbor_stdout.trim(),
+                    ping_replied = ping.status.success(),
+                    "guest MAC resolved; verifying published ports"
                 );
-                self.wait_for_port_forwarding().await?;
+                self.wait_for_port_forwarding_until(deadline).await?;
                 return Ok(());
             }
 
             if std::time::Instant::now() > deadline {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = String::from_utf8_lossy(&ping.stderr);
                 let stderr = stderr.trim();
                 anyhow::bail!(
-                    "ARP for guest {} not resolved within 5s on {}: ping stderr: {}",
+                    "ARP for guest {} not resolved within 5s on {}: neighbour: {}; ping stderr: {}",
                     GUEST_IP,
                     BRIDGE_DEVICE,
+                    if neighbor_stdout.trim().is_empty() {
+                        "(no entry)"
+                    } else {
+                        neighbor_stdout.trim()
+                    },
                     if stderr.is_empty() { "(empty)" } else { stderr }
                 );
             }
 
-            debug!(guest_ip = GUEST_IP, "ping to guest failed, retrying");
+            debug!(guest_ip = GUEST_IP, "ARP unresolved, retrying");
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
+            }
         }
     }
 
@@ -1164,6 +1247,36 @@ mod tests {
         assert_eq!(net.pasta_device, "pasta0");
         assert_eq!(net.guest_ip, "10.0.2.100");
         assert_eq!(net.gateway_ip(), "10.0.2.2");
+    }
+
+    #[test]
+    fn resolved_neighbor_is_ready_even_when_icmp_echo_is_disabled() {
+        // This is the production predicate used after the ARP-triggering ping.
+        // The ping's exit status is intentionally absent: a guest with
+        // icmp_echo_ignore_all=1 still has a valid forwarding path.
+        assert!(neighbor_is_resolved(
+            "10.0.2.100 dev br0 lladdr 02:aa:bb:cc:dd:ee REACHABLE"
+        ));
+        assert!(neighbor_is_resolved(
+            "10.0.2.100 dev br0 lladdr 02:aa:bb:cc:dd:ee STALE"
+        ));
+        assert!(!neighbor_is_resolved("10.0.2.100 dev br0 INCOMPLETE"));
+        assert!(!neighbor_is_resolved("10.0.2.100 dev br0 FAILED"));
+        assert!(!neighbor_is_resolved(""));
+    }
+
+    #[tokio::test]
+    async fn published_ports_without_a_namespace_holder_fail_closed() {
+        let mapping = PortMapping::parse("9222:9222").unwrap();
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap0".to_string(), vec![mapping]);
+        let error = net
+            .verify_port_forwarding()
+            .await
+            .expect_err("missing holder PID must not declare forwarding ready");
+        assert!(
+            error.to_string().contains("namespace holder PID"),
+            "unexpected error: {error:#}"
+        );
     }
 
     /// Batch lines are exactly the heredoc body, in order, one per line.

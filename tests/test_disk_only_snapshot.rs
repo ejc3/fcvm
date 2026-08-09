@@ -173,6 +173,14 @@ async fn test_disk_only_clone_preserves_work_and_regenerates_identity() -> Resul
     )
     .await?;
     common::poll_health_by_pid(clone_pid, 120).await?;
+    let clone_state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .load_state_by_pid(clone_pid)
+        .await
+        .context("loading disk-only clone state")?;
+    assert!(
+        clone_state.lifecycle_ready,
+        "disk-only clone must publish lifecycle readiness after cold-boot resources are installed"
+    );
 
     // The clone's container must carry the preserved file.
     let clone_file = common::exec_in_container(clone_pid, &["cat", "/work.txt"]).await?;

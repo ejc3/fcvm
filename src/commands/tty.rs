@@ -75,19 +75,76 @@ fn install_signal_handlers() {
 /// 2. Delegates to `run_tty_session_connected()` for I/O handling
 /// 3. Cleans up socket on exit
 pub fn run_tty_session(socket_path: &str, tty: bool, interactive: bool) -> Result<i32> {
+    run_tty_session_cancellable(
+        socket_path,
+        tty,
+        interactive,
+        tokio_util::sync::CancellationToken::new(),
+        None,
+    )
+}
+
+/// Run a TTY listener that can be stopped before the guest connects.
+///
+/// Snapshot restore creates its host listeners before starting the VMM.  A
+/// restore failure in that window must be able to join the listener thread
+/// before deleting its socket directory; a blocking `accept(2)` cannot provide
+/// that guarantee.  The ordinary podman path passes a never-cancelled token via
+/// [`run_tty_session`], while snapshot setup supplies its teardown token and a
+/// readiness channel so it never races cleanup against a listener that has not
+/// bound yet.
+pub(crate) fn run_tty_session_cancellable(
+    socket_path: &str,
+    tty: bool,
+    interactive: bool,
+    cancel: tokio_util::sync::CancellationToken,
+    ready: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+) -> Result<i32> {
     // Remove stale socket if it exists
     let _ = std::fs::remove_file(socket_path);
 
-    let listener =
-        UnixListener::bind(socket_path).with_context(|| format!("binding to {}", socket_path))?;
+    let listener = match UnixListener::bind(socket_path)
+        .with_context(|| format!("binding to {}", socket_path))
+    {
+        Ok(listener) => listener,
+        Err(error) => {
+            if let Some(ready) = ready {
+                let _ = ready.send(Err(format!("{error:#}")));
+            }
+            return Err(error);
+        }
+    };
 
     info!(socket = %socket_path, tty, interactive, "TTY session started");
 
-    // Accept connection from guest (blocking)
-    listener
-        .set_nonblocking(false)
-        .context("setting listener to blocking")?;
-    let (stream, _) = listener.accept().context("accepting connection")?;
+    // A nonblocking accept loop is what makes cancellation an ownership
+    // barrier: after the token is cancelled, joining this thread proves it no
+    // longer owns the socket or can touch the runtime directory.
+    if let Err(error) = listener
+        .set_nonblocking(true)
+        .context("setting listener to nonblocking")
+    {
+        if let Some(ready) = ready {
+            let _ = ready.send(Err(format!("{error:#}")));
+        }
+        return Err(error);
+    }
+    if let Some(ready) = ready {
+        let _ = ready.send(Ok(()));
+    }
+    let stream = loop {
+        if cancel.is_cancelled() {
+            let _ = std::fs::remove_file(socket_path);
+            return Ok(0);
+        }
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error).context("accepting connection"),
+        }
+    };
 
     debug!("TTY connection established");
 
@@ -405,4 +462,45 @@ fn writer_loop(stream: &mut std::os::unix::net::UnixStream, done: Arc<AtomicBool
         "writer_loop: exiting, total written: {} bytes",
         total_written
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellable_listener_exits_before_guest_connects() {
+        let dir = tempfile::tempdir().expect("temporary TTY directory");
+        let socket = dir.path().join("tty.sock");
+        let socket_text = socket.to_string_lossy().into_owned();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+
+        let worker = std::thread::spawn(move || {
+            let result = run_tty_session_cancellable(
+                &socket_text,
+                false,
+                false,
+                worker_cancel,
+                Some(ready_tx),
+            );
+            let _ = done_tx.send(result);
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("TTY listener did not report readiness")
+            .expect("TTY listener failed to bind");
+        assert!(socket.exists(), "ready listener did not own its socket");
+
+        cancel.cancel();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("cancelled TTY listener stayed blocked in accept")
+            .expect("cancelled TTY listener returned an error");
+        worker.join().expect("TTY listener thread panicked");
+        assert!(!socket.exists(), "cancelled TTY listener left its socket");
+    }
 }

@@ -35,14 +35,58 @@ Every rule here exists because of a defect listed in bench/chromium/AGENTS.md:
 """
 
 import argparse
+import fcntl
+import hashlib
+import ipaddress
 import json
 import math
+import os
 import random
 import statistics
 import sys
+import tempfile
 
 
 MIN_CDP_ATTEMPTS_PER_BACKEND = 200
+MIN_NOOP_ATTEMPTS = 6
+DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
+QUIET_LOADAVG1_LIMIT = 2.0
+ANALYZER_SCHEMA_VERSION = 2
+SEALED_ANALYZER_FD_ENV = "REQANALYZE_SEALED_FD"
+ANALYZER_SOURCE_PATH_ENV = "REQANALYZE_SOURCE_PATH"
+
+# Fields that define one comparable benchmark population. Files may be pooled
+# only when every one matches. Seed/repetition counts are deliberately excluded:
+# they describe how a cell was sampled, not what was sampled.
+CELL_FIELDS = (
+    "backend",
+    "uffd_mode",
+    "arms",
+    "url",
+    "format",
+    "quality",
+    "image",
+    "image_id",
+    "snapshot",
+    "snapshot_created_at",
+    "snapshot_vm_id",
+    "fcvm_sha256",
+    "harness_sha256",
+    "runtime_bundle_sha256",
+    "source_revision",
+    "cdp_port",
+    "port_mappings",
+    "network_mode",
+    "cpu",
+    "memory_mib",
+    "rust_log",
+    "ws_url_prewired",
+    "allow_busy",
+    "quiet_loadavg1_limit",
+    "host_boot_id",
+    "host_kernel_release",
+    "host_machine",
+)
 
 
 def median_ci(xs, iters=20000, conf=0.95, seed=12345):
@@ -121,45 +165,937 @@ def clopper_pearson(k: int, n: int, conf: float = 0.95):
     return lo, hi
 
 
-def load(paths):
-    """Load each artifact with the backend declared by that artifact.
+def _cell_from_meta(meta, source):
+    errors = []
+    cell = {}
+    string_fields = {
+        "backend", "uffd_mode", "url", "format", "image", "image_id", "snapshot",
+        "snapshot_created_at", "snapshot_vm_id", "fcvm_sha256", "harness_sha256",
+        "runtime_bundle_sha256", "source_revision", "network_mode", "rust_log", "host_boot_id",
+        "host_kernel_release", "host_machine",
+    }
+    positive_int_fields = {"quality", "cdp_port", "cpu", "memory_mib"}
+    positive_number_fields = {"quiet_loadavg1_limit"}
+    for field in CELL_FIELDS:
+        value = meta.get(field)
+        if field == "arms":
+            valid = (
+                isinstance(value, list)
+                and bool(value)
+                and all(isinstance(arm, str) and arm for arm in value)
+                and len(value) == len(set(value))
+            )
+        elif field == "port_mappings":
+            def valid_host_ip(mapping):
+                host_ip = mapping.get("host_ip")
+                if host_ip is None:
+                    return True
+                if not isinstance(host_ip, str):
+                    return False
+                try:
+                    return str(ipaddress.ip_address(host_ip)) == host_ip
+                except ValueError:
+                    return False
 
-    A record does not repeat the backend on every line; its enclosing JSONL file
-    supplies that identity.  Keeping files separate here prevents a `file` run
-    and a `uffd` run passed in one invocation from becoming one synthetic sample.
+            valid = (
+                isinstance(value, list)
+                and bool(value)
+                and all(
+                    isinstance(mapping, dict)
+                    and set(mapping) == {
+                        "host_ip", "host_port", "guest_port", "proto"
+                    }
+                    and valid_host_ip(mapping)
+                    and isinstance(mapping.get("host_port"), int)
+                    and not isinstance(mapping.get("host_port"), bool)
+                    and isinstance(mapping.get("guest_port"), int)
+                    and not isinstance(mapping.get("guest_port"), bool)
+                    and 1 <= mapping.get("host_port") <= 65535
+                    and 1 <= mapping.get("guest_port") <= 65535
+                    and mapping.get("proto") in ("tcp", "udp")
+                    for mapping in value
+                )
+            )
+        elif field in ("ws_url_prewired", "allow_busy"):
+            valid = isinstance(value, bool)
+        else:
+            valid = (
+                isinstance(value, str) and bool(value.strip())
+                if field in string_fields
+                else isinstance(value, int) and not isinstance(value, bool) and value > 0
+                if field in positive_int_fields
+                else isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value > 0
+                if field in positive_number_fields
+                else False
+            )
+        if not valid:
+            errors.append(f"{source} metadata has no valid {field}")
+        else:
+            cell[field] = (
+                sorted(value) if field == "arms"
+                else sorted(value, key=lambda mapping: json.dumps(mapping, sort_keys=True))
+                if field == "port_mappings"
+                else value.strip() if isinstance(value, str)
+                else value
+            )
+    if cell.get("backend") not in (None, "file", "uffd"):
+        errors.append(f"{source} metadata has unsupported backend {cell['backend']!r}")
+    if cell.get("uffd_mode") not in (None, "file", "copy", "minor"):
+        errors.append(
+            f"{source} metadata has unsupported uffd_mode {cell['uffd_mode']!r}"
+        )
+    if (
+        cell.get("backend") == "file" and cell.get("uffd_mode") != "file"
+    ) or (
+        cell.get("backend") == "uffd" and cell.get("uffd_mode") not in ("copy", "minor")
+    ):
+        errors.append(
+            f"{source} metadata backend={cell.get('backend')!r} is inconsistent "
+            f"with uffd_mode={cell.get('uffd_mode')!r}"
+        )
+    if cell.get("format") not in (None, "png", "jpeg"):
+        errors.append(f"{source} metadata has unsupported format {cell['format']!r}")
+    if cell.get("network_mode") not in (None, "rootless", "bridged", "routed"):
+        errors.append(
+            f"{source} metadata has unsupported network_mode {cell['network_mode']!r}"
+        )
+    if cell.get("rust_log") not in (None, "fcvm=debug"):
+        errors.append(
+            f"{source} metadata rust_log must be 'fcvm=debug', got {cell['rust_log']!r}"
+        )
+    if cell.get("quiet_loadavg1_limit") not in (None, QUIET_LOADAVG1_LIMIT):
+        errors.append(
+            f"{source} metadata quiet_loadavg1_limit must be "
+            f"{QUIET_LOADAVG1_LIMIT}"
+        )
+    if "quality" in cell and not 1 <= cell["quality"] <= 100:
+        errors.append(f"{source} metadata quality is outside 1..100")
+    if "cdp_port" in cell and not 1 <= cell["cdp_port"] <= 65535:
+        errors.append(f"{source} metadata cdp_port is outside 1..65535")
+    if "port_mappings" in cell and "cdp_port" in cell:
+        cdp = cell["cdp_port"]
+        if not any(
+            mapping.get("proto") == "tcp"
+            and mapping.get("host_port") == cdp
+            and mapping.get("guest_port") == cdp
+            for mapping in cell["port_mappings"]
+        ):
+            errors.append(
+                f"{source} metadata does not publish TCP {cdp}:{cdp}"
+            )
+    if "port_mappings" in cell:
+        identities = [
+            (mapping.get("host_ip"), mapping["host_port"], mapping["guest_port"], mapping["proto"])
+            for mapping in cell["port_mappings"]
+        ]
+        if len(identities) != len(set(identities)):
+            errors.append(f"{source} metadata has duplicate port mappings")
+    for field in ("fcvm_sha256", "harness_sha256", "runtime_bundle_sha256"):
+        value = cell.get(field, "")
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            errors.append(f"{source} metadata has invalid {field}")
+    revision = cell.get("source_revision", "")
+    if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
+        errors.append(f"{source} metadata has invalid source_revision")
+    image_id = cell.get("image_id", "")
+    if (
+        not image_id.startswith("sha256:")
+        or len(image_id) != 71
+        or any(character not in "0123456789abcdef" for character in image_id[7:])
+    ):
+        errors.append(f"{source} metadata has invalid image_id")
+    snapshot_vm_id = cell.get("snapshot_vm_id", "")
+    if (
+        len(snapshot_vm_id) != 35
+        or not snapshot_vm_id.startswith("vm-")
+        or any(character not in "0123456789abcdef" for character in snapshot_vm_id[3:])
+    ):
+        errors.append(f"{source} metadata has invalid snapshot_vm_id")
+    if errors:
+        return None, errors
+    return cell, []
+
+
+def _cell_id(cell):
+    raw = json.dumps(cell, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _line_ranges(lines):
+    lines = sorted(set(lines))
+    ranges = []
+    for line in lines:
+        if not ranges or line != ranges[-1][1] + 1:
+            ranges.append([line, line])
+        else:
+            ranges[-1][1] = line
+    return ranges
+
+
+def provenance(records):
+    """Exact file lines and governing metadata line for contributing records."""
+    grouped = {}
+    for record in records:
+        source = record.get("_source") or {}
+        path = source.get("path")
+        line = source.get("line")
+        meta_line = source.get("meta_line")
+        sha256 = source.get("sha256")
+        size = source.get("size")
+        if path is None or line is None:
+            continue
+        grouped.setdefault((path, sha256, size, meta_line), []).append(line)
+    return [
+        {
+            "path": path,
+            "sha256": sha256,
+            "size": size,
+            "meta_line": meta_line,
+            "record_lines": _line_ranges(lines),
+            "n": len(lines),
+        }
+        for (path, sha256, size, meta_line), lines in sorted(
+            grouped.items(), key=lambda item: (item[0][0], item[0][3] or -1)
+        )
+    ]
+
+
+def metric_summary(records, getter):
+    contributing = []
+    values = []
+    for record in records:
+        value = getter(record)
+        if value is not None:
+            contributing.append(record)
+            values.append(value)
+    result = dict(zip(("median", "lo", "hi", "n"), median_ci(values)))
+    result["provenance"] = provenance(contributing)
+    return result
+
+
+def _validate_schedule(dataset):
+    """Validate one producer invocation's declared, complete arm schedule."""
+    if len(dataset.get("metas", [])) != 1:
+        return
+    meta = dataset["metas"][0]
+    source = meta.get("_source") or {}
+    label = f"{source.get('path')}:{source.get('line')}"
+    run_id = meta.get("run_id")
+    arms = meta.get("arms")
+    reps = meta.get("reps")
+    warmup = meta.get("warmup")
+    seed = meta.get("seed")
+    started = meta.get("started")
+    errors = dataset["metadata_errors"]
+
+    def finite_number(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+
+    def finite_nonnegative(value):
+        return finite_number(value) and value >= 0
+
+    def finite_positive(value):
+        return finite_number(value) and value > 0
+
+    if not isinstance(run_id, str) or not run_id:
+        errors.append(f"{label} metadata has no run_id")
+    if (
+        not isinstance(started, (int, float))
+        or isinstance(started, bool)
+        or not math.isfinite(started)
+    ):
+        errors.append(f"{label} metadata has no numeric started timestamp")
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        errors.append(f"{label} metadata has no integer seed")
+    if (
+        not isinstance(arms, list)
+        or not arms
+        or any(not isinstance(arm, str) or not arm for arm in arms)
+        or len(arms) != len(set(arms))
+    ):
+        errors.append(f"{label} metadata has no valid duplicate-free arms list")
+    elif any(arm not in {"exec", "cdp", "cdp-fast", "noop"} for arm in arms):
+        errors.append(f"{label} metadata declares an unsupported arm")
+    elif "exec" not in arms or "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
+        errors.append(
+            f"{label} publication schedule requires exec, noop, and a CDP arm"
+        )
+    if not isinstance(reps, int) or isinstance(reps, bool) or reps <= 0:
+        errors.append(f"{label} metadata has no positive reps count")
+    if not isinstance(warmup, int) or isinstance(warmup, bool) or warmup <= 0:
+        errors.append(f"{label} metadata has no positive warmup count")
+    loadavg = meta.get("loadavg")
+    try:
+        start_load = [float(value) for value in loadavg]
+    except (TypeError, ValueError):
+        start_load = []
+    quiet_limit = meta.get("quiet_loadavg1_limit")
+    if not finite_positive(quiet_limit):
+        # _cell_from_meta already reports the bad cell field. Keep schedule
+        # validation total as well: malformed metadata must become a gate error,
+        # never a TypeError while comparing load samples with a string/NaN.
+        quiet_limit = QUIET_LOADAVG1_LIMIT
+    if len(start_load) != 3 or any(not finite_nonnegative(value) for value in start_load):
+        errors.append(f"{label} metadata has no valid three-value loadavg sample")
+    elif start_load[0] > quiet_limit:
+        errors.append(
+            f"{label} host loadavg1 {start_load[0]} exceeds quiet limit "
+            f"{quiet_limit}"
+        )
+    quiet_vm_processes = meta.get("quiet_vm_processes")
+    if (
+        not isinstance(quiet_vm_processes, int)
+        or isinstance(quiet_vm_processes, bool)
+        or quiet_vm_processes != 0
+    ):
+        errors.append(
+            f"{label} metadata does not prove zero VM processes at guard time"
+        )
+    guard_load = meta.get("quiet_guard_loadavg1")
+    if not finite_nonnegative(guard_load):
+        errors.append(f"{label} metadata has no valid guard-time loadavg1")
+    elif guard_load > quiet_limit:
+        errors.append(
+            f"{label} guard-time loadavg1 {guard_load} exceeds quiet limit "
+            f"{quiet_limit}"
+        )
+    if meta.get("quiet_guard_passed") is not True:
+        errors.append(f"{label} metadata does not prove the quiet-host guard passed")
+    if meta.get("allow_busy") is True:
+        errors.append(f"{label} metadata used ALLOW_BUSY and is exploratory only")
+    if errors:
+        dataset["run_id"] = run_id if isinstance(run_id, str) else None
+        return
+
+    rng = random.Random(seed)
+    expected_order = []
+    for rep in range(warmup + reps):
+        order = list(arms)
+        rng.shuffle(order)
+        expected_order.extend((arm, rep, rep < warmup) for arm in order)
+    expected = set(expected_order)
+    observed = {}
+    observed_order = []
+    for record in dataset["records"]:
+        rsource = record.get("_source") or {}
+        rlabel = f"{rsource.get('path')}:{rsource.get('line')}"
+        arm = record.get("arm")
+        rep = record.get("rep")
+        is_warmup = record.get("warmup")
+        if (
+            not isinstance(arm, str)
+            or not isinstance(rep, int)
+            or isinstance(rep, bool)
+            or not isinstance(is_warmup, bool)
+        ):
+            errors.append(f"{rlabel} record has invalid arm/rep/warmup identity")
+            continue
+        key = (arm, rep, is_warmup)
+        observed_order.append(key)
+        expected_id = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"
+        if record.get("run_id") != run_id:
+            errors.append(f"{rlabel} record run_id does not match metadata run {run_id}")
+        if record.get("record_id") != expected_id:
+            errors.append(f"{rlabel} record_id is not {expected_id}")
+        if key in observed:
+            errors.append(
+                f"{rlabel} duplicates schedule record {key}; first at line {observed[key]}"
+            )
+        else:
+            observed[key] = rsource.get("line")
+
+        ok = record.get("ok")
+        if not isinstance(ok, bool):
+            errors.append(f"{rlabel} record ok must be boolean, got {ok!r}")
+        teardown = record.get("teardown")
+        expected_mode = (
+            "exec" if arm == "exec"
+            else "fast" if arm == "cdp-fast"
+            else "normal"
+        )
+        if not isinstance(teardown, dict):
+            errors.append(f"{rlabel} record has no teardown object")
+        else:
+            if teardown.get("all_gone") is not True:
+                errors.append(f"{rlabel} record does not confirm all_gone")
+            if teardown.get("disk_cleanup_verified") is not True:
+                errors.append(f"{rlabel} record does not verify disk cleanup")
+            if teardown.get("child_attribution_established") is not True:
+                errors.append(f"{rlabel} record does not prove child attribution")
+            if teardown.get("mode") != expected_mode:
+                errors.append(
+                    f"{rlabel} arm {arm} has teardown mode "
+                    f"{teardown.get('mode')!r}, expected {expected_mode!r}"
+                )
+            collection_fields = {
+                "survivors": dict,
+                "disk_errors": list,
+                "disk_reap_failed": list,
+            }
+            for field, expected_type in collection_fields.items():
+                value = teardown.get(field)
+                if value is not None and not isinstance(value, expected_type):
+                    errors.append(
+                        f"{rlabel} teardown {field} has invalid type "
+                        f"{type(value).__name__}"
+                    )
+                elif value:
+                    errors.append(
+                        f"{rlabel} teardown claims success but also records {field}"
+                    )
+            skipped = teardown.get("disk_reap_skipped")
+            if skipped is not None and not isinstance(skipped, bool):
+                errors.append(
+                    f"{rlabel} teardown disk_reap_skipped must be boolean when present"
+                )
+            elif skipped:
+                errors.append(
+                    f"{rlabel} teardown claims success but also records disk_reap_skipped"
+                )
+            # These are the complete set of optional numeric fields emitted by
+            # teardown_normal/fast/exec. They are consumed selectively below,
+            # but all of them remain publication evidence even on a failed or
+            # warmup attempt. A string/boolean/negative value must not evade the
+            # schema merely because that particular summary does not read it.
+            for metric in (
+                "signal_ms", "reap_wall_ms", "fcvm_exit_ms",
+                "teardown_total_ms", "disk_reap_ms", "machine_cpu_ms",
+                "harness_cpu_ms", "control_busy_cores",
+                "control_harness_cpu_ms", "sample_period_s", "tick_ms",
+            ):
+                value = teardown.get(metric)
+                if value is not None and not finite_nonnegative(value):
+                    errors.append(
+                        f"{rlabel} teardown has invalid {metric}={value!r}"
+                    )
+            excess = teardown.get("machine_cpu_ms_excess")
+            if excess is not None and not finite_number(excess):
+                errors.append(
+                    f"{rlabel} teardown has invalid machine_cpu_ms_excess={excess!r}"
+                )
+            processes = teardown.get("per_child_cpu")
+            if processes is not None:
+                if not isinstance(processes, dict):
+                    errors.append(f"{rlabel} teardown per_child_cpu is not an object")
+                else:
+                    for process_name, process in processes.items():
+                        if not isinstance(process, dict):
+                            # The successful fast-arm validator below adds the
+                            # arm-specific message. This generic check is needed
+                            # for failed/warmup records too.
+                            continue
+                        for metric in (
+                            "cpu_before_ms", "cpu_final_ms", "reclaim_cpu_ms",
+                            "reclaim_cpu_ms_lo", "reclaim_cpu_ms_hi",
+                        ):
+                            value = process.get(metric)
+                            if value is not None and not finite_nonnegative(value):
+                                errors.append(
+                                    f"{rlabel} teardown process {process_name} "
+                                    f"has invalid {metric}={value!r}"
+                                )
+                        below_resolution = process.get("below_resolution")
+                        if (
+                            below_resolution is not None
+                            and not isinstance(below_resolution, bool)
+                        ):
+                            errors.append(
+                                f"{rlabel} teardown process {process_name} "
+                                "has invalid below_resolution classification"
+                            )
+        if isinstance(ok, bool):
+            for metric in ("blocking_ms", "wall_ms"):
+                value = record.get(metric)
+                if not finite_nonnegative(value):
+                    errors.append(
+                        f"{rlabel} record has invalid {metric}={value!r}"
+                    )
+            if (
+                finite_nonnegative(record.get("blocking_ms"))
+                and finite_nonnegative(record.get("wall_ms"))
+                and record["wall_ms"] < record["blocking_ms"]
+            ):
+                errors.append(f"{rlabel} record has wall_ms < blocking_ms")
+        if ok is True:
+            if arm == "exec":
+                if record.get("rc") != 0 or record.get("timed_out") is not False:
+                    errors.append(f"{rlabel} successful exec did not exit cleanly")
+                if not finite_nonnegative(record.get("render_total_ms")):
+                    errors.append(f"{rlabel} successful exec has no render_total_ms")
+            elif arm in ("cdp", "cdp-fast"):
+                for metric in ("state_to_port_ms", "spawn_to_port_ms"):
+                    if not finite_nonnegative(record.get(metric)):
+                        errors.append(f"{rlabel} successful CDP record has no {metric}")
+                render = record.get("render")
+                if not isinstance(render, dict) or render.get("ok") is not True:
+                    errors.append(f"{rlabel} successful CDP record has no successful render")
+                else:
+                    expected_fields = {
+                        "url": meta.get("url"),
+                        "format": meta.get("format"),
+                        "cdp_host": record.get("endpoint"),
+                    }
+                    for field, expected_value in expected_fields.items():
+                        if render.get(field) != expected_value:
+                            errors.append(
+                                f"{rlabel} CDP render {field}={render.get(field)!r} "
+                                f"does not match {expected_value!r}"
+                            )
+                    if render.get("idle_timeout") != 0:
+                        errors.append(
+                            f"{rlabel} CDP render did not complete its declared idle policy"
+                        )
+                    if render.get("target_prewired") is not meta.get("ws_url_prewired"):
+                        errors.append(f"{rlabel} CDP target prewire mode mismatches metadata")
+                    stages = render.get("stages")
+                    required_stages = (
+                        "resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms",
+                        "connect_total_ms", "navigate_ms", "idle_ms",
+                        "screenshot_ms", "decode_ms", "nav_timing_ms", "total_ms",
+                    )
+                    if not isinstance(stages, dict):
+                        errors.append(f"{rlabel} successful CDP render has no stages")
+                    else:
+                        for stage in required_stages:
+                            if not finite_nonnegative(stages.get(stage)):
+                                errors.append(
+                                    f"{rlabel} successful CDP render has invalid {stage}"
+                                )
+                    image_bytes = render.get("image_bytes")
+                    image_sha256 = render.get("image_sha256")
+                    if (
+                        not isinstance(image_bytes, int)
+                        or isinstance(image_bytes, bool)
+                        or image_bytes <= 0
+                    ):
+                        errors.append(f"{rlabel} CDP render has no positive image_bytes")
+                    if (
+                        not isinstance(image_sha256, str)
+                        or len(image_sha256) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in image_sha256
+                        )
+                    ):
+                        errors.append(f"{rlabel} CDP render has invalid image_sha256")
+                    for dimension in ("width", "height"):
+                        value = render.get(dimension)
+                        if (
+                            not isinstance(value, int)
+                            or isinstance(value, bool)
+                            or value <= 0
+                        ):
+                            errors.append(f"{rlabel} CDP render has invalid {dimension}")
+                    expected_quality = meta["quality"] if meta["format"] == "jpeg" else 0
+                    if render.get("quality") != expected_quality:
+                        errors.append(f"{rlabel} CDP render quality mismatches metadata")
+                    nav = render.get("nav")
+                    nav_fields = (
+                        "dns_ms", "connect_ms", "tls_ms", "ttfb_ms",
+                        "resp_ms", "load_ms",
+                    )
+                    if not isinstance(nav, dict):
+                        errors.append(f"{rlabel} CDP render has no navigation timing")
+                    else:
+                        for field in nav_fields:
+                            if not finite_nonnegative(nav.get(field)):
+                                errors.append(
+                                    f"{rlabel} CDP render has invalid nav.{field}"
+                                )
+                if arm == "cdp-fast" and isinstance(teardown, dict):
+                    if teardown.get("accounting_version") != "post-terminal-ambient-v1":
+                        errors.append(f"{rlabel} fast teardown has stale accounting semantics")
+                    for metric in ("reap_wall_ms", "teardown_total_ms"):
+                        if not finite_nonnegative(teardown.get(metric)):
+                            errors.append(f"{rlabel} fast teardown has no valid {metric}")
+                    for metric in (
+                        "machine_cpu_ms", "harness_cpu_ms",
+                        "control_busy_cores",
+                        "control_harness_cpu_ms", "sample_period_s", "tick_ms",
+                    ):
+                        if not finite_nonnegative(teardown.get(metric)):
+                            errors.append(
+                                f"{rlabel} fast teardown has no valid {metric}"
+                            )
+                    if not finite_number(teardown.get("machine_cpu_ms_excess")):
+                        errors.append(
+                            f"{rlabel} fast teardown has no finite machine_cpu_ms_excess"
+                        )
+                    processes = teardown.get("per_child_cpu")
+                    if not isinstance(processes, dict) or not processes:
+                        errors.append(f"{rlabel} fast teardown has no per-process CPU data")
+                    else:
+                        if "fcvm" not in processes:
+                            errors.append(f"{rlabel} fast teardown omits fcvm CPU data")
+                        for process_name, process in processes.items():
+                            if not isinstance(process, dict):
+                                errors.append(
+                                    f"{rlabel} fast teardown process {process_name} is invalid"
+                                )
+                                continue
+                            if not isinstance(process.get("complete"), bool):
+                                errors.append(
+                                    f"{rlabel} fast teardown process {process_name} "
+                                    "has no completion classification"
+                                )
+                            reclaim = process.get("reclaim_cpu_ms")
+                            if reclaim is not None and not finite_nonnegative(reclaim):
+                                errors.append(
+                                    f"{rlabel} fast teardown process {process_name} "
+                                    "has invalid reclaim CPU"
+                                )
+            elif arm == "noop" and not finite_nonnegative(record.get("spawn_to_port_ms")):
+                errors.append(f"{rlabel} successful noop has no spawn_to_port_ms")
+        elif ok is False and not isinstance(record.get("error"), str):
+            errors.append(f"{rlabel} failed record has no string error")
+        loadavg = record.get("loadavg1")
+        if not finite_nonnegative(loadavg):
+            errors.append(f"{rlabel} record has invalid loadavg1={loadavg!r}")
+
+    missing = sorted(expected - set(observed))
+    extra = sorted(set(observed) - expected)
+    if missing:
+        errors.append(
+            f"{label} schedule is missing {len(missing)} record(s), first={missing[:5]}"
+        )
+    if extra:
+        errors.append(
+            f"{label} schedule has {len(extra)} undeclared record(s), first={extra[:5]}"
+        )
+    if observed_order != expected_order:
+        mismatch = next(
+            (
+                index,
+                expected_order[index] if index < len(expected_order) else None,
+                observed_order[index] if index < len(observed_order) else None,
+            )
+            for index in range(max(len(expected_order), len(observed_order)))
+            if index >= len(expected_order)
+            or index >= len(observed_order)
+            or expected_order[index] != observed_order[index]
+        )
+        errors.append(
+            f"{label} record order does not match seed {seed}; first mismatch "
+            f"at ordinal {mismatch[0]} expected={mismatch[1]} observed={mismatch[2]}"
+        )
+    dataset["run_id"] = run_id
+
+
+def read_source_artifact(path):
+    """Read one immutable input view and bind it to a content identity."""
+    with open(path, "rb") as source_file:
+        before = os.fstat(source_file.fileno())
+        raw = source_file.read()
+        after = os.fstat(source_file.fileno())
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in fields):
+        raise RuntimeError(f"{path}: input changed while it was being read")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"{path}: input is not UTF-8: {error}") from error
+    return {
+        "path": path,
+        "realpath": os.path.realpath(path),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "size": len(raw),
+        "mtime_ns": before.st_mtime_ns,
+        "ctime_ns": before.st_ctime_ns,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "text": text,
+    }
+
+
+def exec_from_sealed_source() -> None:
+    """Re-exec the analyzer from a sealed memfd and bind identity to those bytes.
+
+    Hashing ``__file__`` after Python loaded it can attribute the analysis to a
+    concurrent edit rather than the code executing. The first process performs
+    no analysis: it copies its source into a sealed anonymous file and execs a
+    fresh interpreter from that exact fd. The second process verifies both the
+    digest and kernel seals before it is allowed to continue.
+    """
+    sealed_value = os.environ.get(SEALED_ANALYZER_FD_ENV)
+    if sealed_value:
+        try:
+            sealed_fd = int(sealed_value)
+            seals = fcntl.fcntl(sealed_fd, fcntl.F_GET_SEALS)
+        except (ValueError, OSError) as error:
+            raise RuntimeError(f"invalid sealed analyzer descriptor: {error}") from error
+        required = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        if seals & required != required:
+            raise RuntimeError("analyzer source fd is not immutably sealed")
+        sealed_path = f"/proc/self/fd/{sealed_fd}"
+        try:
+            executing_sealed_source = os.path.samefile(__file__, sealed_path)
+        except OSError as error:
+            raise RuntimeError(
+                f"cannot bind executing analyzer to sealed source fd: {error}"
+            ) from error
+        if not executing_sealed_source:
+            raise RuntimeError(
+                "sealed analyzer descriptor does not identify the executing source"
+            )
+        artifact = read_source_artifact(sealed_path)
+        if artifact["sha256"] != os.environ.get("REQANALYZE_EXPECTED_SHA256"):
+            raise RuntimeError("sealed analyzer digest does not match launcher digest")
+        return
+
+    source_path = os.path.abspath(__file__)
+    artifact = read_source_artifact(source_path)
+    sealed_fd = os.memfd_create("fcvm-reqanalyze", flags=os.MFD_ALLOW_SEALING)
+    try:
+        raw = artifact["text"].encode("utf-8")
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(sealed_fd, raw[offset:])
+        os.lseek(sealed_fd, 0, os.SEEK_SET)
+        fcntl.fcntl(
+            sealed_fd,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE,
+        )
+        os.set_inheritable(sealed_fd, True)
+        env = dict(os.environ)
+        env[SEALED_ANALYZER_FD_ENV] = str(sealed_fd)
+        env[ANALYZER_SOURCE_PATH_ENV] = source_path
+        env["REQANALYZE_EXPECTED_SHA256"] = artifact["sha256"]
+        os.execve(
+            sys.executable,
+            [sys.executable, f"/proc/self/fd/{sealed_fd}", *sys.argv[1:]],
+            env,
+        )
+    except BaseException:
+        os.close(sealed_fd)
+        raise
+
+
+def source_marker(artifact, line, meta_line):
+    return {
+        "path": artifact["path"],
+        "line": line,
+        "meta_line": meta_line,
+        "sha256": artifact["sha256"],
+        "size": artifact["size"],
+    }
+
+
+def public_artifact_identity(artifact):
+    return {key: value for key, value in artifact.items() if key != "text"}
+
+
+def write_json_atomic(path, value):
+    """Publish analysis without truncating an existing artifact on failure."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, temporary = tempfile.mkstemp(prefix=".reqanalyze-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(value, output, indent=2, allow_nan=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+def reject_json_constant(value):
+    raise ValueError(f"non-standard JSON numeric constant {value}")
+
+
+def load(paths):
+    """Load JSONL as metadata-governed segments with file:line provenance.
+
+    A JSONL file is appendable, so a later run can add another metadata record.
+    Each ordinary record belongs to the nearest preceding metadata record, not to
+    a file-wide union. Records before the first metadata line are invalid. This
+    prevents two different snapshots, binaries, URLs, or render settings in one
+    file from being pooled merely because both say ``backend=file``.
     """
     datasets = []
-    for p in paths:
-        recs, metas = [], []
-        with open(p) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+    seen_files = {}
+    for path in paths:
+        try:
+            artifact = read_source_artifact(path)
+        except (OSError, RuntimeError) as error:
+            datasets.append({
+                "backend": None,
+                "cell": None,
+                "cell_id": None,
+                "run_id": None,
+                "records": [],
+                "metas": [],
+                "sources": [path],
+                "source_artifacts": [],
+                "metadata_errors": [str(error)],
+            })
+            continue
+        file_identity = (artifact["device"], artifact["inode"])
+        if file_identity in seen_files:
+            datasets.append({
+                "backend": None,
+                "cell": None,
+                "cell_id": None,
+                "run_id": None,
+                "records": [],
+                "metas": [],
+                "sources": [path],
+                "source_artifacts": [artifact],
+                "metadata_errors": [
+                    f"duplicate input {path} is the same file as {seen_files[file_identity]}"
+                ],
+            })
+            continue
+        seen_files[file_identity] = path
+        before = len(datasets)
+        current = None
+        orphan = None
+        for line_no, raw in enumerate(artifact["text"].splitlines(), 1):
+                text = raw.strip()
+                if not text:
                     continue
-                r = json.loads(line)
-                (metas if r.get("kind") == "meta" else recs).append(r)
+                try:
+                    record = json.loads(
+                        text,
+                        object_pairs_hook=reject_duplicate_keys,
+                        parse_constant=reject_json_constant,
+                    )
+                except (json.JSONDecodeError, ValueError) as error:
+                    datasets.append({
+                        "backend": None,
+                        "cell": None,
+                        "cell_id": None,
+                        "records": [],
+                        "metas": [],
+                        "sources": [path],
+                        "source_artifacts": [artifact],
+                        "metadata_errors": [f"{path}:{line_no}: invalid JSON: {error}"],
+                    })
+                    current = None
+                    continue
 
-        errors = []
-        declared = []
-        if not metas:
-            errors.append("no metadata record declares this file's backend")
-        for i, meta in enumerate(metas):
-            backend = meta.get("backend")
-            if not isinstance(backend, str) or not backend.strip():
-                errors.append(f"metadata record {i} has no backend")
+                if not isinstance(record, dict):
+                    datasets.append({
+                        "backend": None,
+                        "cell": None,
+                        "cell_id": None,
+                        "run_id": None,
+                        "records": [],
+                        "metas": [],
+                        "sources": [path],
+                        "source_artifacts": [artifact],
+                        "metadata_errors": [
+                            f"{path}:{line_no}: JSONL value must be an object"
+                        ],
+                    })
+                    current = None
+                    continue
+
+                if record.get("kind") == "meta":
+                    record = dict(record)
+                    record["_source"] = source_marker(artifact, line_no, line_no)
+                    source = f"{path}:{line_no}"
+                    cell, errors = _cell_from_meta(record, source)
+                    current = {
+                        "backend": cell.get("backend") if cell else None,
+                        "cell": cell,
+                        "cell_id": _cell_id(cell) if cell else None,
+                        "run_id": record.get("run_id"),
+                        "records": [],
+                        "metas": [record],
+                        "sources": [path],
+                        "source_artifacts": [artifact],
+                        "metadata_errors": errors,
+                    }
+                    datasets.append(current)
+                    continue
+
+                record = dict(record)
+                record["_source"] = source_marker(
+                    artifact,
+                    line_no,
+                    current["metas"][0]["_source"]["line"] if current else None,
+                )
+                if current is None:
+                    if orphan is None:
+                        orphan = {
+                            "backend": None,
+                            "cell": None,
+                            "cell_id": None,
+                            "records": [],
+                            "metas": [],
+                            "sources": [path],
+                            "source_artifacts": [artifact],
+                            "metadata_errors": [
+                                f"{path}:{line_no}: record appears before any metadata"
+                            ],
+                        }
+                        datasets.append(orphan)
+                    orphan["records"].append(record)
+                else:
+                    current["records"].append(record)
+        if len(datasets) == before:
+            datasets.append({
+                "backend": None,
+                "cell": None,
+                "cell_id": None,
+                "run_id": None,
+                "records": [],
+                "metas": [],
+                "sources": [path],
+                "source_artifacts": [artifact],
+                "metadata_errors": [f"{path}: empty JSONL has no metadata or records"],
+            })
+
+    seen_record_ids = {}
+    for dataset in datasets:
+        _validate_schedule(dataset)
+        for record in dataset.get("records", []):
+            record_id = record.get("record_id")
+            if not isinstance(record_id, str) or not record_id:
+                continue
+            source = record.get("_source") or {}
+            here = f"{source.get('path')}:{source.get('line')}"
+            if record_id in seen_record_ids:
+                dataset["metadata_errors"].append(
+                    f"{here} duplicates record_id {record_id} from {seen_record_ids[record_id]}"
+                )
             else:
-                declared.append(backend.strip())
-        backends = sorted(set(declared))
-        if len(backends) > 1:
-            errors.append("file declares multiple backends: " + ", ".join(backends))
-        backend = backends[0] if len(backends) == 1 and not errors else None
-        datasets.append({
-            "backend": backend,
-            "records": recs,
-            "metas": metas,
-            "sources": [p],
-            "metadata_errors": errors,
-        })
+                seen_record_ids[record_id] = here
     return datasets
 
 
@@ -190,11 +1126,16 @@ def failure_label(r: dict) -> str:
     analyzer is the PUBLICATION GATE reading a JSONL artifact that outlives the
     producer, so it reads both and prefers the top level.
     """
-    return (
-        r.get("error")
-        or (r.get("render") or {}).get("error")
-        or f"rc={r.get('rc')}"
-    )
+    parts = []
+    for value in (
+        r.get("request_error"),
+        r.get("error"),
+        (r.get("render") or {}).get("error"),
+        r.get("teardown_error"),
+    ):
+        if value and value not in parts:
+            parts.append(value)
+    return "; ".join(parts) if parts else f"rc={r.get('rc')}"
 
 
 def failure_class(r: dict) -> str:
@@ -206,7 +1147,10 @@ def failure_class(r: dict) -> str:
     )
 
 
-def analyze_backend(recs, metas, backend, sources, metadata_errors):
+def analyze_backend(
+    recs, metas, backend, cell, cell_id, run_id, sources,
+    source_artifacts, metadata_errors,
+):
     live = [r for r in recs if not r.get("warmup")]
     warm = [r for r in recs if r.get("warmup")]
     ok = [r for r in live if r.get("ok")]
@@ -216,6 +1160,7 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
     print("REQUEST-OPTIMIZED A/B  --  medians with 95% bootstrap CIs")
     print("=" * 78)
     print(f"  backend={backend or 'UNASSIGNED'}")
+    sources = list(dict.fromkeys(sources))
     for source in sources:
         print(f"  input={source}")
     for error in metadata_errors:
@@ -239,7 +1184,7 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
               f"max={max(la):.1f}   <-- contention check (AGENTS.md)")
 
     arms = []
-    for r in live:
+    for r in recs:
         if r.get("arm") and r["arm"] not in arms:
             arms.append(r["arm"])
     arms.sort(key=lambda a: {"exec": 0, "cdp": 1, "cdp-fast": 2, "noop": 9}.get(a, 5))
@@ -247,14 +1192,25 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
     # EVERY attempt, not just the successes. The teardown/leak section reads this
     # one: a request that failed is precisely the one whose teardown is most
     # likely to have leaked, and the ok-filter made `all_gone: false` invisible.
-    attempted = {a: [r for r in live if r.get("arm") == a] for a in arms}
+    attempted = {a: [r for r in recs if r.get("arm") == a] for a in arms}
+    measured_attempted = {a: [r for r in live if r.get("arm") == a] for a in arms}
 
     out = {
         "backend": backend,
+        "cell": cell,
+        "cell_id": cell_id,
+        "run_id": run_id,
         "sources": sources,
+        "source_artifacts": [
+            public_artifact_identity(artifact) for artifact in source_artifacts
+        ],
         "metadata_errors": metadata_errors,
+        "provenance": {
+            "metadata": [m.get("_source") for m in metas if m.get("_source")],
+            "records": provenance(live),
+        },
         "arms": {},
-        "n_failed": len(bad),
+        "n_failed": sum(1 for record in recs if not record.get("ok")),
         "n_warmup_discarded": len(warm),
     }
 
@@ -292,6 +1248,7 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
             failure_rate=(n_bad / n_att) if n_att else None,
             failure_rate_ci=[lo, hi], publishable=pub,
             failure_classes=classes,
+            provenance=provenance(attempted[a]),
         )
     if any_unpublishable:
         print("  Arms are DIFFERENTLY CENSORED, so a cross-arm delta below is not a")
@@ -309,7 +1266,9 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
     if not expected_cdp_arms:
         expected_cdp_arms.update(a for a in arms if a.startswith("cdp"))
     expected_cdp_arms = sorted(expected_cdp_arms)
-    cdp_counts = {a: len(attempted.get(a, [])) for a in expected_cdp_arms}
+    cdp_counts = {
+        a: len(measured_attempted.get(a, [])) for a in expected_cdp_arms
+    }
     cdp_short = {
         a: count for a, count in cdp_counts.items()
         if count < MIN_CDP_ATTEMPTS_PER_BACKEND
@@ -328,6 +1287,10 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
         "required_per_arm": MIN_CDP_ATTEMPTS_PER_BACKEND,
         "expected_arms": expected_cdp_arms,
         "measured_non_warmup_attempts_per_arm": cdp_counts,
+        "provenance_per_arm": {
+            arm: provenance(measured_attempted.get(arm, []))
+            for arm in expected_cdp_arms
+        },
         "passed": cdp_sample_passed,
     }
 
@@ -346,19 +1309,34 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
         print(f"  first half : {fmt(*median_ci(f))}")
         print(f"  second half: {fmt(*median_ci(s))}")
         print(f"  drift (2nd - 1st): {d:.1f} ms, 95% CI [{dlo:.1f}, {dhi:.1f}]")
-        drifted = not (dlo <= 0 <= dhi)
-        print("  VERDICT: " + ("DRIFT DETECTED -- arm deltas are confounded, do not publish"
-                               if drifted else
-                               "no significant drift; interleaved arm deltas are usable"))
+        drift_passed = (
+            dlo >= -DRIFT_EQUIVALENCE_MARGIN_MS
+            and dhi <= DRIFT_EQUIVALENCE_MARGIN_MS
+        )
+        drifted = not drift_passed
+        print(
+            f"  equivalence margin: +/-{DRIFT_EQUIVALENCE_MARGIN_MS:.1f} ms"
+        )
+        print("  VERDICT: " + (
+            "DRIFT NOT RULED OUT -- CI crosses the practical margin, do not publish"
+            if drifted else
+            "drift is practically equivalent within the declared margin"
+        ))
         out["drift"] = {
             "evaluated": True, "n": len(noop), "delta_ms": d,
-            "ci": [dlo, dhi], "significant": drifted, "passed": not drifted,
+            "ci": [dlo, dhi], "significant": not (dlo <= 0 <= dhi),
+            "equivalence_margin_ms": DRIFT_EQUIVALENCE_MARGIN_MS,
+            "passed": drift_passed,
+            "required": MIN_NOOP_ATTEMPTS,
+            "provenance": provenance(noop_sorted),
         }
     else:
-        print("  (insufficient noop samples)")
+        print(f"  FAIL: insufficient noop samples ({len(noop)}/{MIN_NOOP_ATTEMPTS})")
         out["drift"] = {
             "evaluated": False, "n": len(noop), "delta_ms": None,
-            "ci": None, "significant": False, "passed": True,
+            "ci": None, "significant": False, "passed": False,
+            "required": MIN_NOOP_ATTEMPTS,
+            "provenance": provenance(noop),
         }
 
     # ---- 2. end-to-end, measured end to end, never composed from stages
@@ -368,13 +1346,14 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
     for a in arms:
         v = [r["blocking_ms"] for r in by[a] if r.get("blocking_ms") is not None]
         print(f"  {a:9s} blocking  {fmt(*median_ci(v))}")
-        out["arms"].setdefault(a, {})["blocking_ms"] = dict(
-            zip(("median", "lo", "hi", "n"), median_ci(v)))
+        out["arms"].setdefault(a, {})["blocking_ms"] = metric_summary(
+            by[a], lambda r: r.get("blocking_ms")
+        )
     print("\n  WALL (spawn -> VM fully gone; what the MACHINE pays, not the caller)")
     for a in arms:
         v = [r["wall_ms"] for r in by[a] if r.get("wall_ms") is not None]
         print(f"  {a:9s} wall      {fmt(*median_ci(v))}")
-        out["arms"][a]["wall_ms"] = dict(zip(("median", "lo", "hi", "n"), median_ci(v)))
+        out["arms"][a]["wall_ms"] = metric_summary(by[a], lambda r: r.get("wall_ms"))
 
     # ---- 3. paired deltas with CIs
     print("\n" + "-" * 78)
@@ -407,6 +1386,10 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
                     "delta": d, "ci": [lo, hi],
                     "significant": not (lo <= 0 <= hi),
                     "publishable": censor == "",
+                    "provenance": {
+                        a: provenance([r for r in by[a] if r.get(metric) is not None]),
+                        b: provenance([r for r in by[b] if r.get(metric) is not None]),
+                    },
                 }
 
     # ---- 4. CDP stage decomposition
@@ -431,8 +1414,9 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
             values = [r.get(metric) for r in by[a] if r.get(metric) is not None]
             if values:
                 print(f"    {metric:16s} {fmt(*median_ci(values))}   ({explanation})")
-                out["arms"][a][metric] = dict(
-                    zip(("median", "lo", "hi", "n"), median_ci(values)))
+                out["arms"][a][metric] = metric_summary(
+                    by[a], lambda r, key=metric: r.get(key)
+                )
         # `--ws-url` prewiring SKIPS /json/list and writes a synthetic
         # `resolve_ms = 0.0`. Pooling that with measured values publishes a stage
         # that was never timed, so the two populations are never mixed.
@@ -455,25 +1439,40 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
             v = [x for x in v if x is not None]
             if v:
                 print(f"    {k:16s} {fmt(*median_ci(v))}")
-                out["arms"][a][k] = dict(zip(("median", "lo", "hi", "n"), median_ci(v)))
+                out["arms"][a][k] = metric_summary(
+                    by[a],
+                    lambda r, key=k: (
+                        (r.get("render", {}).get("stages") or {}).get(key)
+                        if (r.get("render", {}).get("stages") or {}).get(key) is not None
+                        else r.get("render", {}).get(key)
+                    ),
+                )
     if "exec" in by:
         v = [r.get("render_total_ms") for r in by["exec"] if r.get("render_total_ms")]
         if v:
             print(f"  [exec] in-guest render.py total_ms {fmt(*median_ci(v))}")
-            out["arms"]["exec"]["render_total_ms"] = dict(
-                zip(("median", "lo", "hi", "n"), median_ci(v)))
+            out["arms"]["exec"]["render_total_ms"] = metric_summary(
+                by["exec"], lambda r: r.get("render_total_ms")
+            )
 
     # ---- 5. teardown, three separate numbers, never one
     print("\n" + "-" * 78)
     print("TEARDOWN -- three numbers, deliberately not summed into one")
     print("-" * 78)
     any_unconfirmed_teardown = False
+    any_unverified_disk_cleanup = False
     for a in arms:
         # `attempted`, NOT `by`: see the module docstring. A failed request's
         # teardown is the one most likely to have leaked.
         td = [r.get("teardown") for r in attempted[a] if r.get("teardown")]
         if not td:
-            print(f"  {a:9s} (teardown is inside fcvm and not separable in this arm)")
+            print(f"  {a:9s} no teardown evidence")
+            print(f"    disk_cleanup: 0/{len(attempted[a])} confirmed"
+                  f"  ** {len(attempted[a])} NOT CONFIRMED CLEAN **")
+            out["arms"][a]["disk_cleanup_confirmed"] = [0, len(attempted[a])]
+            out["arms"][a]["teardown_provenance"] = []
+            any_unverified_disk_cleanup = True
+            any_unconfirmed_teardown = True
             continue
         ok_td = [r.get("teardown") for r in by[a] if r.get("teardown")]
         rw = [t.get("reap_wall_ms") for t in ok_td if t.get("reap_wall_ms") is not None]
@@ -482,30 +1481,44 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
         if rw:
             print(f"    reap_wall_ms      {fmt(*median_ci(rw))}   (kill -> processes truly gone)")
             print(f"    teardown_total_ms {fmt(*median_ci(tt))}   (incl. synchronous on-disk reap)")
-            out["arms"][a]["reap_wall_ms"] = dict(zip(("median", "lo", "hi", "n"), median_ci(rw)))
+            out["arms"][a]["reap_wall_ms"] = metric_summary(
+                by[a], lambda r: (r.get("teardown") or {}).get("reap_wall_ms")
+            )
+            out["arms"][a]["teardown_total_ms"] = metric_summary(
+                by[a], lambda r: (r.get("teardown") or {}).get("teardown_total_ms")
+            )
         dr = [t.get("disk_reap_ms") for t in ok_td if t.get("disk_reap_ms") is not None]
         if dr:
             print(f"    disk_reap_ms      {fmt(*median_ci(dr))}   (state file + data dir)")
-            out["arms"][a]["disk_reap_ms"] = dict(zip(("median", "lo", "hi", "n"), median_ci(dr)))
+            out["arms"][a]["disk_reap_ms"] = metric_summary(
+                by[a], lambda r: (r.get("teardown") or {}).get("disk_reap_ms")
+            )
 
-        # machine_cpu_ms_excess is a whole-machine subtraction whose control window
-        # and reclaim window carry different amounts of the HARNESS's own load. It
-        # is only reported when the record proves the harness subtracted itself out
-        # of both (`harness_cpu_ms` present) — older records cannot support it.
+        # machine_cpu_ms_excess uses an adjacent POST-TERMINAL ambient control, so
+        # the control cannot contain the live VM CPU absent from the reclaim window.
+        # The version gate rejects older pre-kill controls; harness CPU is subtracted
+        # from both windows.
         mc = [t.get("machine_cpu_ms_excess") for t in ok_td
               if t.get("machine_cpu_ms_excess") is not None
-              and t.get("harness_cpu_ms") is not None]
+              and t.get("harness_cpu_ms") is not None
+              and t.get("accounting_version") == "post-terminal-ambient-v1"]
         stale = [t for t in ok_td if t.get("machine_cpu_ms_excess") is not None
-                 and t.get("harness_cpu_ms") is None]
+                 and t.get("accounting_version") != "post-terminal-ambient-v1"]
         if stale:
-            print(f"    machine_cpu_excess WITHHELD on {len(stale)} record(s): they predate "
-                  f"harness self-CPU subtraction, so the ambient baseline includes the "
-                  f"sampler's own spin and the value is not an attribution")
+            print(f"    machine_cpu_excess WITHHELD on {len(stale)} record(s): "
+                  "their ambient-control semantics are stale")
         if mc:
             print(f"    machine_cpu_excess {fmt(*median_ci(mc))}   "
                   f"(whole-machine busy jiffies over reclaim, ambient AND harness subtracted)")
-            out["arms"][a]["machine_cpu_ms_excess"] = dict(
-                zip(("median", "lo", "hi", "n"), median_ci(mc)))
+            out["arms"][a]["machine_cpu_ms_excess"] = metric_summary(
+                by[a],
+                lambda r: (
+                    (r.get("teardown") or {}).get("machine_cpu_ms_excess")
+                    if (r.get("teardown") or {}).get("accounting_version")
+                    == "post-terminal-ambient-v1"
+                    else None
+                ),
+            )
 
         # PER CHILD, keyed by comm. Pooling loses the straggler: the median of
         # {firecracker 110 ms, holder 0, pasta 0} is 0.
@@ -532,6 +1545,11 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
                     out["arms"][a]["reclaim_cpu_ms_by_child"][cname] = {
                         "median": 0.0, "below_resolution": True,
                         "upper_bound_ms": 2 * tick, "n": n_tot,
+                        "provenance": provenance([
+                            r for r in by[a]
+                            if ((r.get("teardown") or {}).get("per_child_cpu") or {})
+                            .get(cname, {}).get("reclaim_cpu_ms") is not None
+                        ]),
                     }
                     continue
                 if b["complete"]:
@@ -539,11 +1557,27 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
                     print(f"      {cname:20s} {fmt(*m)}   COMPLETE (zombie observed)")
                     out["arms"][a]["reclaim_cpu_ms_by_child"][cname] = dict(
                         zip(("median", "lo", "hi", "n"), m))
+                    out["arms"][a]["reclaim_cpu_ms_by_child"][cname]["provenance"] = provenance([
+                        r for r in by[a]
+                        if (((r.get("teardown") or {}).get("per_child_cpu") or {})
+                            .get(cname, {}).get("reclaim_cpu_ms") is not None
+                            and ((r.get("teardown") or {}).get("per_child_cpu") or {})
+                            .get(cname, {}).get("complete") is True)
+                    ])
                 if b["lower"]:
                     m = median_ci(b["lower"])
                     print(f"      {cname:20s} {fmt(*m)}   LOWER BOUND (reaper won the race)")
                     out["arms"][a]["reclaim_cpu_ms_by_child"].setdefault(cname, {})[
                         "lower_bound"] = dict(zip(("median", "lo", "hi", "n"), m))
+                    out["arms"][a]["reclaim_cpu_ms_by_child"][cname]["lower_bound"][
+                        "provenance"
+                    ] = provenance([
+                        r for r in by[a]
+                        if (((r.get("teardown") or {}).get("per_child_cpu") or {})
+                            .get(cname, {}).get("reclaim_cpu_ms") is not None
+                            and ((r.get("teardown") or {}).get("per_child_cpu") or {})
+                            .get(cname, {}).get("complete") is not True)
+                    ])
 
         # CLASSIFY ON True, NOT ON False. `ag.count(False)` drove the warning
         # gate while `len(ag)` drove the denominator, so a null or an absent
@@ -573,6 +1607,22 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
                           f"all_gone={t.get('all_gone')!r} "
                           f"survivors={t.get('survivors') or t.get('children')}")
 
+        cleanup_confirmed = sum(
+            1 for t in td if t.get("disk_cleanup_verified") is True
+        )
+        cleanup_unverified = len(attempted[a]) - cleanup_confirmed
+        print(f"    disk_cleanup: {cleanup_confirmed}/{len(attempted[a])} confirmed"
+              + (f"  ** {cleanup_unverified} NOT CONFIRMED CLEAN **"
+                 if cleanup_unverified else ""))
+        out["arms"][a]["disk_cleanup_confirmed"] = [
+            cleanup_confirmed, len(attempted[a])
+        ]
+        out["arms"][a]["teardown_provenance"] = provenance(
+            [r for r in attempted[a] if r.get("teardown")]
+        )
+        if cleanup_unverified:
+            any_unverified_disk_cleanup = True
+
     failed_by_arm = {
         arm: data["failed"] for arm, data in out["arms"].items()
         if data.get("failed")
@@ -584,7 +1634,7 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
     )
     reasons = []
     if metadata_errors or backend is None:
-        reasons.append("backend metadata does not assign every input file to one backend")
+        reasons.append("metadata does not assign every record to one complete benchmark cell")
     if any_unpublishable:
         reasons.append("one or more arms dropped requests")
     if not expected_cdp_arms:
@@ -594,10 +1644,21 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
             f"CDP arm {arm} has {count}/{MIN_CDP_ATTEMPTS_PER_BACKEND} "
             "measured non-warmup attempts"
         )
-    if drifted:
-        reasons.append("baseline drift was detected in the noop control")
+    if not out["drift"]["passed"]:
+        if out["drift"]["evaluated"]:
+            reasons.append(
+                "baseline drift is not ruled out: noop CI is not contained within "
+                "the declared equivalence margin"
+            )
+        else:
+            reasons.append(
+                f"noop drift control has {out['drift']['n']}/{MIN_NOOP_ATTEMPTS} "
+                "measured successful attempts"
+            )
     if any_unconfirmed_teardown:
         reasons.append("one or more teardowns were not confirmed gone")
+    if any_unverified_disk_cleanup:
+        reasons.append("one or more clone teardowns did not confirm on-disk cleanup")
 
     out["gate"] = {
         "passed": not reasons,
@@ -605,8 +1666,14 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
         "backend_metadata": {
             "passed": backend is not None and not metadata_errors,
             "backend": backend,
+            "cell": cell,
+            "cell_id": cell_id,
             "sources": sources,
+            "source_artifacts": [
+                public_artifact_identity(artifact) for artifact in source_artifacts
+            ],
             "errors": metadata_errors,
+            "provenance": [m.get("_source") for m in metas if m.get("_source")],
         },
         "availability": {
             "passed": not any_unpublishable,
@@ -615,9 +1682,16 @@ def analyze_backend(recs, metas, backend, sources, metadata_errors):
         "cdp_sample_size": out["cdp_sample_size"],
         "baseline_drift": out["drift"],
         "teardown": {
-            "passed": not any_unconfirmed_teardown,
+            "passed": not any_unconfirmed_teardown and not any_unverified_disk_cleanup,
             "unconfirmed": unconfirmed_teardowns,
+            "disk_cleanup_unconfirmed": sum(
+                total - confirmed
+                for data in out["arms"].values()
+                if (counts := data.get("disk_cleanup_confirmed"))
+                for confirmed, total in [counts]
+            ),
         },
+        "provenance": provenance(live),
     }
     out["publishable"] = out["gate"]["passed"]
     return out
@@ -630,41 +1704,66 @@ def main_with(argv=None):
     ap.add_argument("--no-gate", action="store_true",
                     help="exit 0 even when this run is unpublishable (exploratory only)")
     args = ap.parse_args(argv)
+    analyzer_artifact = read_source_artifact(__file__)
 
-    # Valid files with the same backend can contribute to one backend sample.
-    # Files from different backends, and files whose metadata is invalid, never
-    # share an analysis population.
+    # Valid metadata segments with the exact same cell can contribute to one
+    # sample. Backend equality alone is not enough: a different URL, quality,
+    # image, snapshot, binary, revision, network mode, CPU, or memory is a
+    # different experiment and must never be pooled to satisfy n=200.
     groups = []
     valid_group = {}
     invalid_number = 0
     for dataset in load(args.jsonl):
         backend = dataset["backend"]
-        if backend is None:
+        cell_id = dataset["cell_id"]
+        run_id = dataset.get("run_id")
+        if backend is None or cell_id is None or run_id is None or dataset["metadata_errors"]:
             invalid_number += 1
             group = dict(dataset)
             group["key"] = f"unassigned-{invalid_number}"
             groups.append(group)
             continue
-        if backend not in valid_group:
+        group_key = (backend, cell_id, run_id)
+        if group_key not in valid_group:
             group = {
-                "key": backend,
                 "backend": backend,
+                "cell": dataset["cell"],
+                "cell_id": cell_id,
+                "run_id": run_id,
                 "records": [],
                 "metas": [],
                 "sources": [],
+                "source_artifacts": [],
                 "metadata_errors": [],
             }
-            valid_group[backend] = group
+            valid_group[group_key] = group
             groups.append(group)
-        group = valid_group[backend]
-        for field in ("records", "metas", "sources", "metadata_errors"):
+        group = valid_group[group_key]
+        for field in (
+            "records", "metas", "sources", "source_artifacts", "metadata_errors"
+        ):
             group[field].extend(dataset[field])
+
+    backend_cell_counts = {}
+    for group in groups:
+        if group.get("backend") is not None and group.get("cell_id") is not None:
+            backend_cell_counts[group["backend"]] = backend_cell_counts.get(group["backend"], 0) + 1
+    for group in groups:
+        if "key" in group:
+            continue
+        group["key"] = (
+            group["backend"]
+            if backend_cell_counts[group["backend"]] == 1
+            else f"{group['backend']}:{group['run_id']}"
+        )
 
     backend_results = {}
     for group in groups:
         backend_results[group["key"]] = analyze_backend(
             group["records"], group["metas"], group["backend"],
-            group["sources"], group["metadata_errors"],
+            group.get("cell"), group.get("cell_id"), group.get("run_id"), group["sources"],
+            group.get("source_artifacts", []),
+            group["metadata_errors"],
         )
 
     overall_reasons = [
@@ -672,6 +1771,49 @@ def main_with(argv=None):
         for key, result in backend_results.items()
         for reason in result["gate"]["reasons"]
     ]
+    input_artifacts = {}
+    for group in groups:
+        for artifact in group.get("source_artifacts", []):
+            identity = (artifact.get("device"), artifact.get("inode"))
+            input_artifacts[identity] = artifact
+    output_aliases_input = False
+    if args.json_out:
+        output_realpath = os.path.realpath(args.json_out)
+        protected_artifacts = [*input_artifacts.values(), analyzer_artifact]
+        protected_paths = {
+            artifact.get("realpath") for artifact in protected_artifacts
+        }
+        source_path = os.environ.get(
+            ANALYZER_SOURCE_PATH_ENV, os.path.abspath(__file__)
+        )
+        protected_paths.add(os.path.realpath(source_path))
+        for artifact in protected_artifacts:
+            if output_realpath == artifact.get("realpath"):
+                overall_reasons.append(
+                    f"analysis output {args.json_out} aliases protected artifact "
+                    f"{artifact['path']}"
+                )
+                output_aliases_input = True
+                break
+        if not output_aliases_input and output_realpath in protected_paths:
+            overall_reasons.append(
+                f"analysis output {args.json_out} aliases analyzer source {source_path}"
+            )
+            output_aliases_input = True
+        if not output_aliases_input:
+            try:
+                output_stat = os.stat(args.json_out)
+            except FileNotFoundError:
+                output_stat = None
+            protected_inodes = {
+                (artifact.get("device"), artifact.get("inode"))
+                for artifact in protected_artifacts
+            }
+            if output_stat and (output_stat.st_dev, output_stat.st_ino) in protected_inodes:
+                overall_reasons.append(
+                    f"analysis output {args.json_out} aliases a protected inode"
+                )
+                output_aliases_input = True
     publishable = not overall_reasons
     exit_code_overridden = bool(args.no_gate and not publishable)
     if len(backend_results) == 1:
@@ -697,10 +1839,19 @@ def main_with(argv=None):
     result["publishable"] = publishable
     result["gate"]["passed"] = publishable
     result["gate"]["reasons"] = overall_reasons
+    result["analysis_identity"] = {
+        "schema_version": ANALYZER_SCHEMA_VERSION,
+        "reqanalyze": public_artifact_identity(analyzer_artifact),
+        "inputs": [
+            public_artifact_identity(artifact)
+            for artifact in sorted(
+                input_artifacts.values(), key=lambda artifact: artifact["path"]
+            )
+        ],
+    }
 
-    if args.json_out:
-        with open(args.json_out, "w") as f:
-            json.dump(result, f, indent=2, default=str)
+    if args.json_out and not output_aliases_input:
+        write_json_atomic(args.json_out, result)
         print(f"\nwrote {args.json_out}")
 
     if not publishable:
@@ -716,6 +1867,7 @@ def main_with(argv=None):
 
 
 def main():
+    exec_from_sealed_source()
     return main_with()
 
 

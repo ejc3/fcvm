@@ -268,7 +268,12 @@ impl FirecrackerConfig {
     /// Compute snapshot key by hashing the JSON representation.
     pub fn snapshot_key(&self) -> String {
         use crate::setup::rootfs::compute_sha256;
-        let json = serde_json::to_string(self).expect("FirecrackerConfig serialization failed");
+        // SnapshotConfig generation IDs are required as of schema 2. Include the
+        // schema in the cache key so an old cache directory cannot become a
+        // permanent parse miss that also blocks creation at the same tag.
+        const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+        let json = serde_json::to_string(&(SNAPSHOT_SCHEMA_VERSION, self))
+            .expect("FirecrackerConfig serialization failed");
         compute_sha256(json.as_bytes())[..12].to_string()
     }
 
@@ -495,7 +500,7 @@ mod tests {
     /// hash deliberately and document the cache invalidation.
     #[test]
     fn test_snapshot_key_golden() {
-        assert_eq!(test_config().snapshot_key(), "db30465bfbf5");
+        assert_eq!(test_config().snapshot_key(), "4278f265ad63");
     }
 
     #[test]

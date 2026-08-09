@@ -629,7 +629,9 @@ PHASE ?= run
 BACKEND ?= uffd
 REPS ?= 200
 WARMUP ?= 2
-RESULTS ?= $(CURDIR)/bench/chromium/results/reqbench-$(shell date +%Y%m%d-%H%M%S)-$(BACKEND)
+ifndef RESULTS
+RESULTS := $(CURDIR)/bench/chromium/results/reqbench-$(shell date +%Y%m%d-%H%M%S)-$(BACKEND)
+endif
 
 bench-chromium-request: build
 	@echo "==> Running gated Chromium request benchmark ($(BACKEND), $(REPS) measured attempts per arm)..."
@@ -642,7 +644,8 @@ analyze-chromium-request:
 		"$(RESULTS)/reqbench.jsonl"
 
 test-chromium-request:
-	@python3 -m unittest discover -s bench/chromium -p 'test_reqbench.py'
+	@python3 -m unittest discover -s bench/chromium -p 'test_reqbench.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
 
 bench: build
 	@echo "==> Running benchmarks..."

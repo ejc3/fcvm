@@ -27,6 +27,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -233,6 +234,276 @@ fn state_file_for_name_exists(vm_name: &str) -> bool {
         }
     }
     false
+}
+
+#[derive(Debug, Clone)]
+struct VmArtifacts {
+    vm_id: String,
+    state: fcvm::state::VmState,
+    state_path: PathBuf,
+    lock_path: PathBuf,
+    data_dir: PathBuf,
+}
+
+/// An exact process identity captured immediately after spawn. Signals go
+/// through the pidfd, so a recycled numeric PID can never target a stranger.
+#[derive(Debug)]
+struct PinnedProcess {
+    pid: u32,
+    start: u64,
+    pidfd: OwnedFd,
+}
+
+impl PinnedProcess {
+    fn capture(pid: u32) -> Result<Self> {
+        let before = proc_stat(pid)
+            .map(|(_, _, _, start)| start)
+            .with_context(|| format!("PID {pid} exited before its identity could be captured"))?;
+
+        // SAFETY: pidfd_open(2) has no memory effects. The returned fd is
+        // checked and immediately transferred into OwnedFd.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("pidfd_open on spawned PID {pid}"));
+        }
+        // SAFETY: `raw` is a fresh fd returned above and has not been shared.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+
+        let after = proc_stat(pid).map(|(_, _, _, start)| start);
+        anyhow::ensure!(
+            after == Some(before),
+            "PID {pid} exited or was recycled while its identity was being captured"
+        );
+        Ok(Self {
+            pid,
+            start: before,
+            pidfd,
+        })
+    }
+
+    fn signal(&self, signal: libc::c_int) -> Result<()> {
+        // SAFETY: this fd is owned by `self`; a NULL siginfo asks the kernel to
+        // synthesize it, and flags must be zero for pidfd_send_signal(2).
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd() as libc::c_long,
+                signal as libc::c_long,
+                std::ptr::null::<libc::siginfo_t>(),
+                0 as libc::c_long,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "sending signal {signal} through pidfd for PID {} (start time {})",
+                    self.pid, self.start
+                )
+            });
+        }
+        Ok(())
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Find the one state file belonging to `vm_name` and derive its exact lock
+/// and runtime-data paths from the deserialized VM ID. State files are keyed by
+/// VM ID, not name or PID; in particular, a rootless clone parked at
+/// `restore.pre_resume` intentionally still has `pid = null`.
+fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
+    let state_dir = fcvm::paths::state_dir();
+    let mut found = None;
+
+    for entry in std::fs::read_dir(&state_dir)
+        .with_context(|| format!("reading state directory {}", state_dir.display()))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).context("reading state directory entry"),
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading state file {}", path.display()))
+            }
+        };
+        let state: fcvm::state::VmState = serde_json::from_str(&text)
+            .with_context(|| format!("deserializing state file {}", path.display()))?;
+        if state.name.as_deref() != Some(vm_name) {
+            continue;
+        }
+
+        anyhow::ensure!(
+            found.is_none(),
+            "multiple state files claim unique VM name {vm_name}"
+        );
+        anyhow::ensure!(
+            !state.vm_id.is_empty(),
+            "state file {} for {vm_name} has an empty vm_id",
+            path.display()
+        );
+        anyhow::ensure!(
+            path == state_dir.join(format!("{}.json", state.vm_id)),
+            "state file {} does not match its recorded vm_id {}",
+            path.display(),
+            state.vm_id
+        );
+
+        let lock_path = path.with_extension("json.lock");
+        let data_dir = fcvm::paths::vm_runtime_dir(&state.vm_id);
+        let vm_disks = fcvm::paths::data_dir().join("vm-disks");
+        anyhow::ensure!(
+            data_dir.parent() == Some(vm_disks.as_path()) && data_dir != vm_disks,
+            "refusing to treat {} as one VM's runtime directory",
+            data_dir.display()
+        );
+        found = Some(VmArtifacts {
+            vm_id: state.vm_id.clone(),
+            state,
+            state_path: path,
+            lock_path,
+            data_dir,
+        });
+    }
+
+    Ok(found)
+}
+
+/// Wait until the clone has published all three exact artifacts that its
+/// orderly shutdown must reap. The child exiting before publication is a hard
+/// failure rather than a reason to skip the cleanup assertions.
+async fn wait_for_artifacts(
+    vm_name: &str,
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> Result<VmArtifacts> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(artifacts) = artifacts_for_name(vm_name)? {
+            if artifacts.state_path.is_file()
+                && artifacts.lock_path.is_file()
+                && artifacts.data_dir.is_dir()
+            {
+                return Ok(artifacts);
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "fcvm exited with {status:?} before publishing state, lock, and data for {vm_name}"
+            );
+        }
+        if Instant::now() > deadline {
+            anyhow::bail!(
+                "state, lock, and data for {vm_name} were not all present within {timeout:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// `cleanup_vm` removes all three paths synchronously before fcvm exits, but
+/// poll briefly so the log-pump and filesystem visibility cannot make the
+/// assertion timing-dependent under load.
+async fn wait_for_artifacts_removed(artifacts: &VmArtifacts, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state_exists = artifacts.state_path.exists();
+        let lock_exists = artifacts.lock_path.exists();
+        let data_exists = artifacts.data_dir.exists();
+        if !state_exists && !lock_exists && !data_exists {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            anyhow::bail!(
+                "clone {} left artifacts after orderly exit: state={}, lock={}, data={}\n\
+                 state_path={}\nlock_path={}\ndata_dir={}",
+                artifacts.vm_id,
+                state_exists,
+                lock_exists,
+                data_exists,
+                artifacts.state_path.display(),
+                artifacts.lock_path.display(),
+                artifacts.data_dir.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Fixture shutdown used after both success and failure. It returns only after
+/// `Child::wait` has reaped the exact pinned process; callers must not remove VM
+/// files unless this proof succeeds.
+async fn stop_test_child(child: &mut tokio::process::Child, process: &PinnedProcess) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    let term_result = process.signal(libc::SIGTERM);
+    if let Ok(waited) = tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        waited.context("waiting for fixture child after SIGTERM")?;
+        term_result?;
+        return Ok(());
+    }
+
+    let kill_result = process.signal(libc::SIGKILL);
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(waited) => {
+            waited.context("waiting for fixture child after SIGKILL")?;
+            term_result?;
+            kill_result?;
+            Ok(())
+        }
+        Err(_) => anyhow::bail!(
+            "fixture PID {} (start time {}) did not exit after pidfd SIGTERM and SIGKILL",
+            process.pid,
+            process.start
+        ),
+    }
+}
+
+/// Remove only a previously deserialized clone's exact paths after a failed
+/// assertion. This is test-fixture hygiene, never part of the passing oracle.
+fn cleanup_exact_artifacts(artifacts: &VmArtifacts) -> Result<()> {
+    let state_dir = fcvm::paths::state_dir();
+    let vm_disks = fcvm::paths::data_dir().join("vm-disks");
+    anyhow::ensure!(
+        artifacts.state_path == state_dir.join(format!("{}.json", artifacts.vm_id))
+            && artifacts.lock_path == state_dir.join(format!("{}.json.lock", artifacts.vm_id))
+            && artifacts.data_dir == vm_disks.join(&artifacts.vm_id)
+            && !artifacts.vm_id.is_empty(),
+        "refusing cleanup for paths that are not one exact VM's artifacts: {artifacts:?}"
+    );
+
+    for path in [&artifacts.state_path, &artifacts.lock_path] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+    match std::fs::remove_dir_all(&artifacts.data_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("removing {}", artifacts.data_dir.display()))
+        }
+    }
+    Ok(())
 }
 
 /// Spawn `fcvm exec --pid <pid> --vm -- sh -c <script>` with RUST_LOG=debug and
@@ -907,6 +1178,17 @@ async fn test_lifecycle_interleave_no_leaks_after_interleaved_teardown() -> Resu
     )
     .await?;
 
+    // PID identity is published before lifecycle supervision is completely installed.
+    // The readiness bit is the durable barrier that makes this exact child capture
+    // meaningful rather than a race against final resource ownership publication.
+    let ready_state = ls_vm_by_pid(pid)
+        .await?
+        .context("VM state disappeared at the held snapshot window")?;
+    anyhow::ensure!(
+        ready_state.lifecycle_ready,
+        "snapshot.pre_pause must run only after lifecycle readiness is published"
+    );
+
     // Capture THIS VM's firecracker and pasta (pid + start_time, immune to
     // PID reuse) while it is parked.
     let firecrackers = find_descendants_with_comm_prefix(pid, "firecracker");
@@ -987,6 +1269,454 @@ async fn test_lifecycle_interleave_no_leaks_after_interleaved_teardown() -> Resu
             let key = key.trim_matches('"').to_string();
             cleanup_snapshot_keys(&[Some(key)]).await;
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CASE: cancellation_wins_before_lifecycle_ready_claim
+// ---------------------------------------------------------------------------
+
+/// Holds the owner after its old cancellation precheck but before the atomic
+/// lifecycle-ready claim. SIGTERM must claim cancellation while the hold is
+/// active, and releasing the hold must lead directly to cleanup without ever
+/// persisting `lifecycle_ready=true`.
+#[tokio::test]
+async fn test_lifecycle_interleave_cancellation_wins_before_lifecycle_ready_claim() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("ilv-ready-cancel");
+    let go_file = PathBuf::from(format!("/tmp/{}-ready-go", vm_name));
+    remove_file_if_exists(&go_file).context("removing stale lifecycle-ready go-file")?;
+
+    let failpoint_spec = format!(
+        "lifecycle.before_ready_claim:block_until_file:{}",
+        go_file.display()
+    );
+    let (child, pid, vm_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--no-snapshot",
+            common::ALPINE_IMAGE,
+            "sleep",
+            "300",
+        ],
+        &[("FCVM_FAILPOINT", &failpoint_spec)],
+    )
+    .await
+    .context("spawning VM held before lifecycle-ready claim")?;
+    let process = PinnedProcess::capture(pid).context("pinning held VM process")?;
+    let mut fixture = Some((child, process));
+    let mut exact_artifacts = None;
+
+    let exercise: Result<()> = async {
+        let reached_at = wait_for_marker(
+            &vm_log,
+            "FAILPOINT lifecycle.before_ready_claim reached",
+            0,
+            Duration::from_secs(180),
+        )
+        .await?;
+
+        let (child, _) = fixture.as_mut().context("held VM fixture disappeared")?;
+        let artifacts = wait_for_artifacts(&vm_name, child, Duration::from_secs(10)).await?;
+        anyhow::ensure!(
+            artifacts.state.pid == Some(pid),
+            "readiness claim must follow PID publication, found {:?}",
+            artifacts.state.pid
+        );
+        anyhow::ensure!(
+            !artifacts.state.lifecycle_ready,
+            "VM became lifecycle-ready before the held atomic claim"
+        );
+        exact_artifacts = Some(artifacts.clone());
+
+        let (_, process) = fixture.as_ref().context("held VM identity disappeared")?;
+        process.signal(libc::SIGTERM)?;
+        wait_for_marker(
+            &vm_log,
+            "received SIGTERM, shutting down VM",
+            reached_at,
+            Duration::from_secs(10),
+        )
+        .await
+        .context("signal handler did not claim cancellation while readiness was held")?;
+        anyhow::ensure!(
+            search_log_from(
+                &vm_log,
+                "FAILPOINT lifecycle.before_ready_claim released",
+                reached_at
+            )
+            .is_none(),
+            "readiness hold released before cancellation was observed"
+        );
+
+        let held_state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+            .load_state(&artifacts.vm_id)
+            .await
+            .context("loading state after cancellation won readiness gate")?;
+        anyhow::ensure!(
+            !held_state.lifecycle_ready,
+            "cancellation winner published lifecycle readiness while the claim was held"
+        );
+
+        std::fs::write(&go_file, b"go").context("releasing lifecycle-ready claim")?;
+        wait_for_marker(
+            &vm_log,
+            "FAILPOINT lifecycle.before_ready_claim released",
+            reached_at,
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        let (child, _) = fixture
+            .as_mut()
+            .context("held VM disappeared before cleanup")?;
+        wait_exit(child, Duration::from_secs(60))
+            .await
+            .with_context(|| {
+                format!(
+                    "VM did not clean up after cancellation won readiness; log tail:\n{}",
+                    log_tail(&vm_log, 60)
+                )
+            })?;
+        wait_for_artifacts_removed(&artifacts, Duration::from_secs(15)).await?;
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = std::fs::write(&go_file, b"cleanup") {
+        cleanup_errors.push(format!("releasing readiness hold during cleanup: {error}"));
+    }
+    let mut child_stopped = true;
+    if let Some((child, process)) = fixture.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            child_stopped = false;
+            cleanup_errors.push(format!("stopping held VM fixture: {error:#}"));
+        }
+    }
+    if exercise.is_err() && child_stopped {
+        if exact_artifacts.is_none() {
+            match artifacts_for_name(&vm_name) {
+                Ok(found) => exact_artifacts = found,
+                Err(error) => cleanup_errors.push(format!(
+                    "finding held VM artifacts during cleanup: {error:#}"
+                )),
+            }
+        }
+        if let Some(artifacts) = &exact_artifacts {
+            if let Err(error) = cleanup_exact_artifacts(artifacts) {
+                cleanup_errors.push(format!("cleaning held VM artifacts: {error:#}"));
+            }
+        }
+    }
+    if let Err(error) = remove_file_if_exists(&go_file) {
+        cleanup_errors.push(format!("removing lifecycle-ready go-file: {error:#}"));
+    }
+
+    if let Err(error) = exercise {
+        if !cleanup_errors.is_empty() {
+            return Err(error.context(format!(
+                "fixture cleanup also failed:\n- {}",
+                cleanup_errors.join("\n- ")
+            )));
+        }
+        return Err(error);
+    }
+    if !cleanup_errors.is_empty() {
+        anyhow::bail!("fixture cleanup failed:\n- {}", cleanup_errors.join("\n- "));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CASE: snapshot_run_sigterm_before_resume_cleans_exact_artifacts
+// ---------------------------------------------------------------------------
+
+/// Pins the signal-registration boundary of `fcvm snapshot run`. A rootless
+/// clone is held at `restore.pre_resume:block_until_file` after clone setup has
+/// published its state, lock, and runtime-data directory, but before the restore
+/// function starts. No restored VMM exists at this boundary and state still has
+/// `pid = null`. SIGTERM must already be owned by fcvm in this window; otherwise
+/// the kernel's default action exits without cleanup and strands those setup
+/// artifacts.
+///
+/// The marker and go-file make the interleaving deterministic:
+///
+/// 1. wait for `restore.pre_resume reached` and all three exact clone artifacts;
+/// 2. prove the state still has no PID, deliver SIGTERM, and require fcvm's
+///    signal-handler log while the failpoint remains held;
+/// 3. release the failpoint, require an orderly bounded exit, and require the
+///    exact `state/<vm_id>.json`, `.json.lock`, and `vm-disks/<vm_id>` paths to
+///    be gone.
+///
+/// All fixture processes, the unique snapshot, and exact failed-run artifacts
+/// are cleaned even when an assertion fails.
+#[tokio::test]
+async fn test_lifecycle_interleave_snapshot_run_sigterm_before_resume_cleans_exact_artifacts(
+) -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-restore-term");
+    let go_file = PathBuf::from(format!("/tmp/{}-restore-go", clone_name));
+    remove_file_if_exists(&go_file).context("removing stale restore go-file")?;
+
+    let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut clone: Option<(tokio::process::Child, PinnedProcess, PathBuf)> = None;
+    let mut clone_artifacts: Option<VmArtifacts> = None;
+
+    let exercise: Result<()> = async {
+        // A manual full snapshot gives this test one explicit restore generation
+        // without involving the podman pre-start snapshot cache.
+        let (baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--no-snapshot",
+                common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning rootless baseline")?;
+        let baseline_process = PinnedProcess::capture(baseline_pid)
+            .context("pinning rootless baseline process")?;
+        baseline = Some((baseline_child, baseline_process));
+        common::poll_health_by_pid(baseline_pid, 180)
+            .await
+            .context("waiting for baseline health")?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
+            .await
+            .context("creating manual snapshot")?;
+
+        // The direct snapshot owns its disk and memory, so the baseline can be
+        // stopped before the clone starts. Use the same orderly signal path the
+        // clone must later exercise.
+        let (baseline_child, baseline_process) = baseline
+            .as_mut()
+            .context("baseline child disappeared from fixture")?;
+        baseline_process.signal(libc::SIGTERM)?;
+        let baseline_status = wait_exit(baseline_child, Duration::from_secs(60))
+            .await
+            .context("baseline did not stop after SIGTERM")?;
+        anyhow::ensure!(
+            baseline_status.success(),
+            "baseline exited unsuccessfully: {baseline_status:?}"
+        );
+
+        let failpoint_spec = format!(
+            "restore.pre_resume:block_until_file:{}",
+            go_file.display()
+        );
+        let (clone_child, clone_pid, clone_log) =
+            common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &snapshot_name,
+                    "--name",
+                    &clone_name,
+                ],
+                &[("FCVM_FAILPOINT", &failpoint_spec)],
+            )
+            .await
+            .context("spawning clone held before restore resume")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning clone process")?;
+        clone = Some((clone_child, clone_process, clone_log.clone()));
+
+        let reached_at = wait_for_marker(
+            &clone_log,
+            "FAILPOINT restore.pre_resume reached",
+            0,
+            Duration::from_secs(120),
+        )
+        .await?;
+
+        let (clone_child, _, _) = clone
+            .as_mut()
+            .context("clone child disappeared from fixture")?;
+        let artifacts = wait_for_artifacts(&clone_name, clone_child, Duration::from_secs(10))
+            .await
+            .with_context(|| {
+                format!(
+                    "clone artifacts were not published inside the held restore window; log tail:\n{}",
+                    log_tail(&clone_log, 40)
+                )
+            })?;
+        anyhow::ensure!(
+            artifacts.state.pid.is_none(),
+            "restore.pre_resume must precede PID publication, but clone {} recorded PID {:?}",
+            artifacts.vm_id,
+            artifacts.state.pid
+        );
+        anyhow::ensure!(
+            !artifacts.state.lifecycle_ready,
+            "restore.pre_resume must precede lifecycle readiness publication for clone {}",
+            artifacts.vm_id
+        );
+        clone_artifacts = Some(artifacts.clone());
+
+        anyhow::ensure!(
+            search_log_from(
+                &clone_log,
+                "FAILPOINT restore.pre_resume released",
+                reached_at
+            )
+            .is_none(),
+            "restore.pre_resume was released before SIGTERM; the intended interleaving did not happen"
+        );
+
+        let (_, clone_process, _) = clone
+            .as_ref()
+            .context("clone identity disappeared from fixture")?;
+        clone_process.signal(libc::SIGTERM)?;
+        wait_for_marker(
+            &clone_log,
+            "received SIGTERM, shutting down VM",
+            reached_at,
+            Duration::from_secs(10),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "fcvm did not handle SIGTERM while restore.pre_resume was held; log tail:\n{}",
+                log_tail(&clone_log, 40)
+            )
+        })?;
+        anyhow::ensure!(
+            search_log_from(
+                &clone_log,
+                "FAILPOINT restore.pre_resume released",
+                reached_at
+            )
+            .is_none(),
+            "the handler observation happened after the failpoint released"
+        );
+
+        std::fs::write(&go_file, b"go").context("releasing restore.pre_resume")?;
+        let released_at = wait_for_marker(
+            &clone_log,
+            "FAILPOINT restore.pre_resume released",
+            reached_at,
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        let (clone_child, _, _) = clone
+            .as_mut()
+            .context("clone child disappeared before exit")?;
+        let clone_status = wait_exit(clone_child, Duration::from_secs(180))
+            .await
+            .with_context(|| {
+                format!(
+                    "clone did not exit after releasing the held restore; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+        anyhow::ensure!(
+            clone_status.success(),
+            "signal-owned clone exited unsuccessfully ({clone_status:?}); log tail:\n{}",
+            log_tail(&clone_log, 60)
+        );
+        wait_for_marker(
+            &clone_log,
+            "clone setup cleanup complete",
+            released_at,
+            Duration::from_secs(10),
+        )
+        .await
+        .context("waiting for the log consumer to drain the cleanup completion record")?;
+        wait_for_artifacts_removed(&artifacts, Duration::from_secs(15)).await?;
+
+        Ok(())
+    }
+    .await;
+
+    // Always unblock a held restore before fixture teardown. If the production
+    // handler regresses, the clone may already be dead; writing the unique file
+    // is harmless and prevents the failpoint's 60s cap from delaying cleanup.
+    let mut cleanup_errors = Vec::new();
+    if let Err(e) = std::fs::write(&go_file, b"cleanup") {
+        cleanup_errors.push(format!(
+            "unblocking restore failpoint during cleanup: {:#}",
+            anyhow::Error::new(e)
+        ));
+    }
+
+    let mut all_children_stopped = true;
+    if let Some((child, process, _)) = clone.as_mut() {
+        if let Err(e) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping clone fixture: {e:#}"));
+        }
+    }
+    if let Some((child, process)) = baseline.as_mut() {
+        if let Err(e) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping baseline fixture: {e:#}"));
+        }
+    }
+
+    // If the assertion failed before the normal cleanup oracle completed,
+    // remove only the exact paths derived from this clone's deserialized state.
+    // Preserve the original failure as the test result; fixture-cleanup errors
+    // are added as context when there was no earlier failure.
+    if exercise.is_err() && all_children_stopped {
+        if clone_artifacts.is_none() {
+            match artifacts_for_name(&clone_name) {
+                Ok(found) => clone_artifacts = found,
+                Err(e) => cleanup_errors.push(format!("finding failed clone artifacts: {:#}", e)),
+            }
+        }
+        if let Some(artifacts) = &clone_artifacts {
+            if let Err(e) = cleanup_exact_artifacts(artifacts) {
+                cleanup_errors.push(format!("cleaning exact failed clone artifacts: {:#}", e));
+            }
+        }
+    } else if exercise.is_err() && !all_children_stopped {
+        cleanup_errors.push(
+            "skipped exact artifact cleanup because a fixture child was not proven stopped"
+                .to_string(),
+        );
+    }
+
+    if all_children_stopped {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting unique manual snapshot: {e:#}"));
+        }
+        if common::snapshot_exists(&snapshot_name) {
+            cleanup_errors.push(format!(
+                "unique manual snapshot {snapshot_name} survived fixture cleanup"
+            ));
+        }
+        if let Err(e) = remove_file_if_exists(&go_file) {
+            cleanup_errors.push(format!("removing restore go-file: {e:#}"));
+        }
+    } else {
+        cleanup_errors.push(
+            "skipped snapshot and go-file removal because a fixture child was not proven stopped"
+                .to_string(),
+        );
+    }
+
+    if let Err(e) = exercise {
+        if !cleanup_errors.is_empty() {
+            return Err(e.context(format!(
+                "fixture cleanup also failed:\n- {}",
+                cleanup_errors.join("\n- ")
+            )));
+        }
+        return Err(e);
+    }
+    if !cleanup_errors.is_empty() {
+        anyhow::bail!("fixture cleanup failed:\n- {}", cleanup_errors.join("\n- "));
     }
     Ok(())
 }

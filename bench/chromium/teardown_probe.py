@@ -87,7 +87,8 @@ def reap_rep(row: dict, named: dict, sp, data_dir) -> bool:
                 except (ProcessLookupError, PermissionError):
                     pass
         return True
-    reaped = reap_disk(row, sp, data_dir)
+    data_root = os.path.dirname(os.path.dirname(data_dir)) if data_dir else ""
+    reaped = reap_disk(row, data_root, sp, data_dir)
     if reaped:
         row["disk_reaped"] = reaped
     for err in row.get("disk_errors", []):

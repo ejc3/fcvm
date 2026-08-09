@@ -1,22 +1,41 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
 
 use crate::network::NetworkConfig;
 
+/// Validate a snapshot tag before it can participate in any path operation.
+pub fn validate_snapshot_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 128 {
+        anyhow::bail!("snapshot name must contain 1 to 128 characters");
+    }
+    if name == "."
+        || name == ".."
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        anyhow::bail!(
+            "invalid snapshot name '{}': use only ASCII letters, digits, '-', '_', or '.'",
+            name
+        );
+    }
+    Ok(())
+}
+
 fn default_health_check_timeout() -> u64 {
     5
 }
 
 /// Type of snapshot - distinguishes user-created from system-generated
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SnapshotType {
     /// Created by user via `fcvm snapshot create`
     User,
     /// Auto-created by podman snapshot feature (cache)
-    #[default]
     System,
 }
 
@@ -31,11 +50,9 @@ impl std::fmt::Display for SnapshotType {
 
 /// Kind of snapshot — distinguishes a full memory+disk snapshot from a
 /// disk-only snapshot (no memory image; clones cold-boot from the captured disk).
-/// Defaults to Full for backward compatibility with existing snapshots.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SnapshotKind {
     /// Memory + disk snapshot; clones resume mid-execution via UFFD.
-    #[default]
     Full,
     /// Disk-only snapshot; clones cold-boot fresh from the captured disk.
     DiskOnly,
@@ -55,6 +72,13 @@ impl std::fmt::Display for SnapshotKind {
 pub struct SnapshotConfig {
     pub name: String,
     pub vm_id: String,
+    /// Unique identity for this atomically-installed snapshot generation.
+    ///
+    /// Cache invalidation carries this value from the exact generation that a
+    /// restore attempted. A later creator can replace the same tag after the
+    /// restore releases its shared generation lease; conditional invalidation
+    /// must not delete that replacement.
+    pub generation_id: uuid::Uuid,
     /// Original VM ID for vsock socket path redirect.
     /// This is the VM ID whose path is stored in vmstate.bin.
     /// When a VM is restored from cache/snapshot, its vmstate still references
@@ -78,14 +102,29 @@ pub struct SnapshotConfig {
     pub disk_path: PathBuf,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Type of snapshot: User (explicit) or System (auto-generated cache)
-    /// Defaults to System for backward compatibility with existing snapshots
-    #[serde(default)]
     pub snapshot_type: SnapshotType,
     /// Full (memory+disk) vs DiskOnly (no memory image — clones cold-boot).
-    /// Defaults to Full so existing snapshots deserialize unchanged.
-    #[serde(default)]
     pub kind: SnapshotKind,
     pub metadata: SnapshotMetadata,
+}
+
+/// Identity of one installed snapshot generation.
+///
+/// The UUID makes every newly-created generation distinct. The config digest
+/// also detects an in-place metadata change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotGeneration {
+    generation_id: uuid::Uuid,
+    config_digest: [u8; 32],
+}
+
+impl SnapshotGeneration {
+    fn from_config(config: &SnapshotConfig, config_json: &[u8]) -> Self {
+        Self {
+            generation_id: config.generation_id,
+            config_digest: Sha256::digest(config_json).into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +243,7 @@ impl SnapshotManager {
 
     /// Save a snapshot
     pub async fn save_snapshot(&self, config: SnapshotConfig) -> Result<()> {
+        validate_snapshot_name(&config.name)?;
         info!(
             snapshot = %config.name,
             vm_id = %config.vm_id,
@@ -235,6 +275,18 @@ impl SnapshotManager {
 
     /// Load a snapshot configuration
     pub async fn load_snapshot(&self, name: &str) -> Result<SnapshotConfig> {
+        self.load_snapshot_with_generation(name)
+            .await
+            .map(|(config, _)| config)
+    }
+
+    /// Load a snapshot configuration together with the identity of the exact
+    /// generation whose config was read.
+    pub async fn load_snapshot_with_generation(
+        &self,
+        name: &str,
+    ) -> Result<(SnapshotConfig, SnapshotGeneration)> {
+        validate_snapshot_name(name)?;
         let snapshot_dir = self.snapshots_dir.join(name);
         let metadata_path = snapshot_dir.join("config.json");
 
@@ -242,14 +294,15 @@ impl SnapshotManager {
             anyhow::bail!("snapshot '{}' not found", name);
         }
 
-        let metadata_json = fs::read_to_string(&metadata_path)
+        let metadata_json = fs::read(&metadata_path)
             .await
             .context("reading snapshot metadata")?;
 
         let config: SnapshotConfig =
-            serde_json::from_str(&metadata_json).context("parsing snapshot metadata")?;
+            serde_json::from_slice(&metadata_json).context("parsing snapshot metadata")?;
+        let generation = SnapshotGeneration::from_config(&config, &metadata_json);
 
-        Ok(config)
+        Ok((config, generation))
     }
 
     /// List all snapshots
@@ -277,7 +330,17 @@ impl SnapshotManager {
 
     /// Delete a snapshot
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        validate_snapshot_name(name)?;
         let snapshot_dir = self.snapshots_dir.join(name);
+        // Serialize deletion with creators and restores.  Removing the directory
+        // without this lock allowed a tag to be recreated while a reader was
+        // loading it, producing a disk/memory generation split.  Keep the lock
+        // inode after deletion: unlinking it while held would let a new creator
+        // lock a different inode and enter the critical section concurrently.
+        let _generation_lock =
+            crate::commands::common::acquire_snapshot_dir_lock(&snapshot_dir, true)
+                .await
+                .with_context(|| format!("locking snapshot '{}' for deletion", name))?;
 
         if snapshot_dir.exists() {
             fs::remove_dir_all(&snapshot_dir)
@@ -287,13 +350,48 @@ impl SnapshotManager {
             info!(snapshot = name, "snapshot deleted");
         }
 
-        // Also remove the lock file if it exists
-        let lock_file = self.snapshots_dir.join(format!("{}.lock", name));
-        if lock_file.exists() {
-            let _ = fs::remove_file(&lock_file).await;
+        Ok(())
+    }
+
+    /// Delete `name` only if it is still the generation a failed restore used.
+    ///
+    /// The comparison happens while holding the generation lock exclusively.
+    /// This closes the release-shared/acquire-exclusive gap in cache
+    /// invalidation: if another creator installs a replacement in that gap, the
+    /// replacement is retained rather than being mistaken for the failed one.
+    pub async fn delete_snapshot_if_generation(
+        &self,
+        name: &str,
+        expected: &SnapshotGeneration,
+    ) -> Result<bool> {
+        validate_snapshot_name(name)?;
+        let snapshot_dir = self.snapshots_dir.join(name);
+        let _generation_lock =
+            crate::commands::common::acquire_snapshot_dir_lock(&snapshot_dir, true)
+                .await
+                .with_context(|| format!("locking snapshot '{}' for invalidation", name))?;
+
+        if !snapshot_dir.exists() {
+            return Ok(false);
         }
 
-        Ok(())
+        let (_, current) = self
+            .load_snapshot_with_generation(name)
+            .await
+            .with_context(|| format!("revalidating snapshot '{}' before invalidation", name))?;
+        if &current != expected {
+            info!(
+                snapshot = name,
+                "snapshot generation changed before invalidation; retaining replacement"
+            );
+            return Ok(false);
+        }
+
+        fs::remove_dir_all(&snapshot_dir)
+            .await
+            .context("removing invalid snapshot generation")?;
+        info!(snapshot = name, "invalid snapshot generation deleted");
+        Ok(true)
     }
 }
 
@@ -302,10 +400,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_names_are_single_safe_path_components() {
+        for name in ["snapshot-1", "cache_ab.cd", "A"] {
+            validate_snapshot_name(name).unwrap();
+        }
+        for name in ["", ".", "..", "../outside", "a/b", "a\\b", "bad name"] {
+            assert!(
+                validate_snapshot_name(name).is_err(),
+                "unsafe snapshot name was accepted: {name:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_delete_cannot_escape_the_snapshot_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshots = temp_dir.path().join("snapshots");
+        let outside = temp_dir.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("marker"), b"keep")
+            .await
+            .unwrap();
+        let manager = SnapshotManager::new(snapshots);
+        assert!(manager.delete_snapshot("../outside").await.is_err());
+        assert!(outside.join("marker").exists());
+        assert!(manager.load_snapshot("../outside").await.is_err());
+    }
+
+    #[test]
     fn test_snapshot_config_json_roundtrip() {
         let config = SnapshotConfig {
             name: "test-snapshot".to_string(),
             vm_id: "abc123".to_string(),
+            generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
             memory_path: PathBuf::from("/path/to/memory.bin"),
@@ -377,10 +504,13 @@ mod tests {
         let json = r#"{
             "name": "nginx-snap",
             "vm_id": "def456",
+            "generation_id": "fc9642dc-babd-4876-8c7f-48bccd9554e8",
             "memory_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/memory.bin",
             "vmstate_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/vmstate.bin",
             "disk_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/disk.raw",
             "created_at": "2024-01-15T10:30:00Z",
+            "snapshot_type": "User",
+            "kind": "Full",
             "metadata": {
                 "image": "nginx:alpine",
                 "vcpu": 4,
@@ -438,6 +568,7 @@ mod tests {
         let config = SnapshotConfig {
             name: "test-snap".to_string(),
             vm_id: "test123".to_string(),
+            generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
@@ -514,6 +645,7 @@ mod tests {
             let config = SnapshotConfig {
                 name: name.to_string(),
                 vm_id: format!("vm-{}", name),
+                generation_id: uuid::Uuid::new_v4(),
                 original_vsock_vm_id: None,
                 parent_snapshot: None,
                 memory_path: PathBuf::from("/memory.bin"),
@@ -577,6 +709,7 @@ mod tests {
         let config = SnapshotConfig {
             name: "to-delete".to_string(),
             vm_id: "vm123".to_string(),
+            generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
@@ -636,6 +769,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_delete_waits_for_generation_readers_and_keeps_lock_inode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot_dir = temp_dir.path().join("leased");
+        tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+        tokio::fs::write(snapshot_dir.join("config.json"), b"generation")
+            .await
+            .unwrap();
+        let shared = crate::commands::common::acquire_snapshot_dir_lock(&snapshot_dir, false)
+            .await
+            .unwrap();
+
+        let manager = SnapshotManager::new(temp_dir.path().to_path_buf());
+        let mut deletion = tokio::spawn(async move { manager.delete_snapshot("leased").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut deletion)
+                .await
+                .is_err(),
+            "exclusive delete entered while a shared generation lease was live"
+        );
+
+        drop(shared);
+        tokio::time::timeout(std::time::Duration::from_secs(2), deletion)
+            .await
+            .expect("delete did not acquire the released generation lock")
+            .expect("delete task panicked")
+            .expect("delete failed");
+        assert!(!snapshot_dir.exists());
+        assert!(
+            temp_dir.path().join("leased.lock").exists(),
+            "deleting the held lock pathname would let a new generation bypass old readers"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_invalidation_preserves_a_replacement_generation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(temp_dir.path().to_path_buf());
+        let config = |vm_id: &str, generation_id: uuid::Uuid| -> SnapshotConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "cached",
+                "vm_id": vm_id,
+                "generation_id": generation_id,
+                "memory_path": "/memory.bin",
+                "vmstate_path": "/vmstate.bin",
+                "disk_path": "/disk.raw",
+                "created_at": "2026-08-09T00:00:00Z",
+                "snapshot_type": "System",
+                "kind": "Full",
+                "metadata": {
+                    "image": "alpine",
+                    "vcpu": 1,
+                    "memory_mib": 256,
+                    "network_config": {
+                        "tap_device": "tap",
+                        "guest_mac": "00:00:00:00:00:00"
+                    }
+                }
+            }))
+            .unwrap()
+        };
+
+        let failed_id = uuid::Uuid::new_v4();
+        manager
+            .save_snapshot(config("failed-vm", failed_id))
+            .await
+            .unwrap();
+        let (_, failed_generation) = manager
+            .load_snapshot_with_generation("cached")
+            .await
+            .unwrap();
+
+        // Model the exact invalidation gap: the failed restore has released its
+        // shared lease, and a creator installs G2 before invalidation obtains the
+        // exclusive lease.  The expected G1 identity must protect G2.
+        let replacement_id = uuid::Uuid::new_v4();
+        manager
+            .save_snapshot(config("replacement-vm", replacement_id))
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .delete_snapshot_if_generation("cached", &failed_generation)
+                .await
+                .unwrap(),
+            "conditional invalidation deleted a replacement generation"
+        );
+
+        let (replacement, replacement_generation) = manager
+            .load_snapshot_with_generation("cached")
+            .await
+            .unwrap();
+        assert_eq!(replacement.vm_id, "replacement-vm");
+        assert_eq!(replacement.generation_id, replacement_id);
+
+        assert!(
+            manager
+                .delete_snapshot_if_generation("cached", &replacement_generation)
+                .await
+                .unwrap(),
+            "the current generation did not invalidate"
+        );
+        assert!(manager.load_snapshot("cached").await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_snapshot_manager_load_nonexistent() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = SnapshotManager::new(temp_dir.path().to_path_buf());
@@ -646,45 +884,9 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_type_default_is_system() {
-        // Verify that SnapshotType::default() is System (for backward compatibility)
-        assert_eq!(SnapshotType::default(), SnapshotType::System);
-    }
-
-    #[test]
     fn test_snapshot_type_display() {
         assert_eq!(format!("{}", SnapshotType::User), "user");
         assert_eq!(format!("{}", SnapshotType::System), "system");
-    }
-
-    #[test]
-    fn test_snapshot_config_backward_compatibility() {
-        // Test that JSON without snapshot_type field defaults to System
-        // This ensures existing snapshots (created before this feature) load correctly
-        let json = r#"{
-            "name": "old-snapshot",
-            "vm_id": "abc123",
-            "memory_path": "/path/to/memory.bin",
-            "vmstate_path": "/path/to/vmstate.bin",
-            "disk_path": "/path/to/disk.raw",
-            "created_at": "2024-01-15T10:30:00Z",
-            "metadata": {
-                "image": "nginx:alpine",
-                "vcpu": 2,
-                "memory_mib": 512,
-                "network_config": {
-                    "tap_device": "tap-test",
-                    "guest_mac": "AA:BB:CC:DD:EE:FF"
-                }
-            }
-        }"#;
-
-        let config: SnapshotConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.name, "old-snapshot");
-        // Missing snapshot_type should default to System
-        assert_eq!(config.snapshot_type, SnapshotType::System);
-        // Missing kind should default to Full (existing snapshots are memory+disk)
-        assert_eq!(config.kind, SnapshotKind::Full);
     }
 
     #[test]
@@ -693,6 +895,7 @@ mod tests {
         let user_config = SnapshotConfig {
             name: "user-snapshot".to_string(),
             vm_id: "user123".to_string(),
+            generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
@@ -756,12 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_kind_default_is_full() {
-        // Verify SnapshotKind::default() is Full (existing snapshots are memory+disk)
-        assert_eq!(SnapshotKind::default(), SnapshotKind::Full);
-    }
-
-    #[test]
     fn test_snapshot_kind_display() {
         assert_eq!(format!("{}", SnapshotKind::Full), "full");
         assert_eq!(format!("{}", SnapshotKind::DiskOnly), "disk-only");
@@ -784,10 +981,12 @@ mod tests {
         let json = r#"{
             "name": "do",
             "vm_id": "x",
+            "generation_id": "5d2cb020-b470-498d-a252-f6b6ca75b712",
             "memory_path": "/m",
             "vmstate_path": "/v",
             "disk_path": "/d",
             "created_at": "2024-01-15T10:30:00Z",
+            "snapshot_type": "User",
             "kind": "DiskOnly",
             "metadata": {
                 "image": "alpine",

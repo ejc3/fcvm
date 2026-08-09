@@ -335,13 +335,12 @@ The current request path has no benchmark-owned relay:
 | host -> published guest port | `--publish 9222:9222`; clones inherit `port_mappings` from snapshot metadata | measured by `cdpdrive` as `tcp_ms` |
 | guest external interface -> guest loopback:9222 | fc-agent PREROUTING DNAT plus `route_localnet` | included in the successful TCP connection above |
 
-The deleted `socat TCP-LISTEN:9223,fork` relay cost **2.0 MiB PSS** per
-container (0.59% in that measurement). Do not reuse the old 0.12 ms
-`port_wait_ms` as an ingress cost: that timer started only after the restored
-VM's final PID state save. A later harness change moved its boundary before
-network setup and restore, so the same field then clustered near 50 ms. Use one
-stable spawn-to-first-connect boundary for readiness and `tcp_ms` for a
-successful connection.
+The deleted `socat TCP-LISTEN:9223,fork` relay was one process and one byte-path
+hop per clone. Do not reuse the old 0.12 ms `port_wait_ms` as an ingress cost:
+that timer started only after the restored VM's final PID state save. A later
+harness change moved its boundary before network setup and restore, so the same
+field then clustered near 50 ms. Use one stable spawn-to-first-connect boundary
+for readiness and `tcp_ms` for a successful connection.
 
 Verified working on `--network rootless` (no root needed). `reqbench.sh` defaults
 to rootless for this reason.

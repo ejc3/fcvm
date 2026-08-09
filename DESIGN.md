@@ -284,9 +284,9 @@ guest loopback.
 arm64), with the flag confirmed in `/proc/<pid>/cmdline`, `/proc/net/tcp` shows
 `0100007F:2406` (`127.0.0.1:9222`) and nothing else. Before this, the only way in
 was a userspace relay process running inside every clone, in the byte path — and
-removing it saves its measured 2.0 MiB PSS per clone. A prior request-path A/B
-that reported connection drops was withdrawn because its arms were not
-comparable; it does not establish that the relay caused those failures.
+the direct DNAT removes that process and hop. A prior request-path A/B that
+reported connection drops was withdrawn because its arms were not comparable;
+it does not establish that the relay caused those failures.
 
 ##### Containing `route_localnet`
 

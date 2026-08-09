@@ -6,13 +6,13 @@
 # -> touch the ready file (which the container HEALTHCHECK gates on) -> print the
 # READY marker -> hold the browser open.
 #
-# REQUEST PATH: there is NOTHING of ours on it. Chromium's own DevTools Protocol
-# endpoint IS the request server -- it is a fully specified, already-implemented
-# protocol that returns the screenshot as base64 in the CDP response. The host
-# opens a WebSocket straight to the page target and sends Page.navigate +
-# Page.captureScreenshot. No resident interpreter, no bespoke wire format, and
-# nothing of ours that a snapshot restore could invalidate: Chromium's listener
-# is an ordinary in-guest TCP socket, not a virtio-vsock socket, so the
+# REQUEST PATH: there is no benchmark-owned userspace relay or request server.
+# Chromium's own DevTools Protocol endpoint is the request server -- it is a
+# fully specified, already-implemented protocol that returns the screenshot as
+# base64 in the CDP response. The host opens a WebSocket through fcvm's published
+# TCP path and fc-agent's PREROUTING DNAT to the page target, then sends
+# Page.navigate + Page.captureScreenshot. Chromium's listener is an ordinary
+# in-guest TCP socket, not a virtio-vsock socket, so the
 # VIRTIO_VSOCK_EVENT_TRANSPORT_RESET that a restore raises does not touch it.
 #
 # The pageserver and render.py remain in the image but are OFF the request path:
@@ -207,9 +207,10 @@ wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp
 # fc-agent/src/network.rs::publish_to_loopback and
 # DESIGN.md "Eligible published TCP ports reach guest loopback".
 #
-# The deleted socat relay added a measured 2.0 MiB PSS per clone. The earlier
-# request-path A/B that reported connection drops was withdrawn because its arms
-# were not comparable; it is not evidence that the relay caused those failures.
+# The deleted socat relay was one process and one byte-path hop per clone. The
+# earlier request-path A/B that reported connection drops was withdrawn because
+# its arms were not comparable; it is not evidence that the relay caused those
+# failures.
 # ---------------------------------------------------------------------------
 
 echo "chromium-bench: warming renderer"

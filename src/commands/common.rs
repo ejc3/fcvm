@@ -611,6 +611,10 @@ pub async fn save_vm_state_with_network(
     let fcvm_pid = std::process::id();
     info!("Saving fcvm PID: {}", fcvm_pid);
     vm_state.pid = Some(fcvm_pid);
+    // Keep the owner's in-memory state identical to the persisted process identity.
+    // StateManager::save_state also records this on its private clone, but snapshot
+    // creation later revalidates the long-lived in-memory state against disk.
+    vm_state.pid_start_time = crate::utils::process_start_time(fcvm_pid);
 
     // Mark VM as running and persist to disk
     vm_state.status = VmStatus::Running;
@@ -620,6 +624,151 @@ pub async fn save_vm_state_with_network(
         .context("persisting VM state to disk")?;
 
     Ok(())
+}
+
+/// Atomically publish that the VM lifecycle is safe for external observers to act on.
+///
+/// State and PID are written earlier because setup components need them, but an observer
+/// must not capture children or deliver a lifecycle signal until the owner has installed
+/// every long-lived resource. The identity predicate is evaluated while the state-file
+/// update lock is held, so a stale/replaced record is never marked ready.
+pub async fn publish_lifecycle_ready(
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+) -> Result<()> {
+    let expected_vm_id = vm_state.vm_id.clone();
+    let expected_pid = vm_state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("cannot publish lifecycle readiness without a PID"))?;
+    let expected_start = vm_state.pid_start_time.ok_or_else(|| {
+        anyhow::anyhow!("cannot publish lifecycle readiness without a process start time")
+    })?;
+    anyhow::ensure!(
+        crate::utils::process_start_time(expected_pid) == Some(expected_start),
+        "cannot publish lifecycle readiness for stale PID {} start {}",
+        expected_pid,
+        expected_start
+    );
+
+    let mut identity_matched = false;
+    let updated = state_manager
+        .update_state(&expected_vm_id, |state| {
+            if state.vm_id == expected_vm_id
+                && state.pid == Some(expected_pid)
+                && state.pid_start_time == Some(expected_start)
+            {
+                state.lifecycle_ready = true;
+                identity_matched = true;
+            }
+        })
+        .await
+        .context("publishing VM lifecycle readiness")?;
+    anyhow::ensure!(
+        updated.is_some(),
+        "VM state disappeared before lifecycle readiness could be published"
+    );
+    anyhow::ensure!(
+        identity_matched,
+        "VM state identity changed before lifecycle readiness could be published"
+    );
+
+    vm_state.lifecycle_ready = true;
+    info!(vm_id = %vm_state.vm_id, "VM lifecycle ready");
+    Ok(())
+}
+
+const LIFECYCLE_SETTING_UP: u8 = 0;
+const LIFECYCLE_PUBLISHING: u8 = 1;
+const LIFECYCLE_READY: u8 = 2;
+const LIFECYCLE_CANCELLED: u8 = 3;
+
+/// Linearizes cancellation against the one transition that publishes lifecycle readiness.
+///
+/// Signal handlers must call [`LifecycleReadyGate::cancel`] instead of cancelling the
+/// token directly. A cancellation that claims the gate while setup is still in progress
+/// prevents the state write. If publication claims it first, the owning task awaits that
+/// write before it can observe the cancellation and enter cleanup, so cleanup can never
+/// race an in-flight readiness write.
+#[derive(Clone)]
+pub struct LifecycleReadyGate {
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleReadyOutcome {
+    Published,
+    Cancelled,
+}
+
+impl LifecycleReadyGate {
+    pub fn new() -> Self {
+        Self {
+            phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LIFECYCLE_SETTING_UP)),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Record cancellation before waking code that can begin cleanup.
+    pub fn cancel(&self) {
+        let _ = self.phase.compare_exchange(
+            LIFECYCLE_SETTING_UP,
+            LIFECYCLE_CANCELLED,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.cancel.cancel();
+    }
+
+    /// Publish readiness only if cancellation did not claim the setup phase first.
+    pub async fn publish(
+        &self,
+        state_manager: &StateManager,
+        vm_state: &mut VmState,
+    ) -> Result<LifecycleReadyOutcome> {
+        // Test-only when armed; the normal fast path is a single environment lookup.
+        // Holding here gives the lifecycle interleave regression an exact boundary
+        // between a caller's cancellation precheck and this gate's linearization CAS.
+        failpoint::hit_async("lifecycle.before_ready_claim").await;
+        match self.phase.compare_exchange(
+            LIFECYCLE_SETTING_UP,
+            LIFECYCLE_PUBLISHING,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => {}
+            Err(LIFECYCLE_CANCELLED) => return Ok(LifecycleReadyOutcome::Cancelled),
+            Err(LIFECYCLE_READY) => return Ok(LifecycleReadyOutcome::Published),
+            Err(LIFECYCLE_PUBLISHING) => {
+                bail!("lifecycle readiness publication is already in progress")
+            }
+            Err(phase) => bail!("invalid lifecycle readiness phase {phase}"),
+        }
+
+        match publish_lifecycle_ready(state_manager, vm_state).await {
+            Ok(()) => {
+                self.phase
+                    .store(LIFECYCLE_READY, std::sync::atomic::Ordering::SeqCst);
+                Ok(LifecycleReadyOutcome::Published)
+            }
+            Err(error) => {
+                self.phase
+                    .store(LIFECYCLE_CANCELLED, std::sync::atomic::Ordering::SeqCst);
+                self.cancel.cancel();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Default for LifecycleReadyGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Owned resources for VM cleanup that can be moved into the cleanup call.
@@ -735,12 +884,12 @@ pub async fn cleanup_vm(
 ) {
     let CleanupContext {
         vm_id,
-        volume_server_handles,
+        mut volume_server_handles,
         remap_refs: _,
         data_dir,
         health_cancel_token,
         health_monitor_handle,
-        output_listener_handle,
+        mut output_listener_handle,
     } = ctx;
     // Started before the first log line so `caller_blocking_ms` covers everything the
     // caller actually waits for, including our own bookkeeping.
@@ -773,10 +922,10 @@ pub async fn cleanup_vm(
     if let Some(ref token) = health_cancel_token {
         token.cancel();
     }
-    if let Some(handle) = output_listener_handle {
+    if let Some(handle) = output_listener_handle.as_ref() {
         handle.abort();
     }
-    for handle in volume_server_handles {
+    for handle in &volume_server_handles {
         handle.abort();
     }
 
@@ -799,7 +948,15 @@ pub async fn cleanup_vm(
             }
         }
     };
-    tokio::join!(vmm_reaped, holder_reaped, health_stopped);
+    let listeners_stopped = async {
+        if let Some(handle) = output_listener_handle.take() {
+            let _ = handle.await;
+        }
+        for handle in volume_server_handles.drain(..) {
+            let _ = handle.await;
+        }
+    };
+    tokio::join!(vmm_reaped, holder_reaped, health_stopped, listeners_stopped);
     let processes_us = kill_start.elapsed().as_micros();
 
     // Sampled HERE, before network cleanup reaps pasta, so the delta covers exactly the two
@@ -1143,6 +1300,21 @@ pub struct CloneSubstrate {
     pub namespace: crate::utils::NamespaceParams,
 }
 
+/// Stop and reap a rootless namespace holder retained by a failed restore.
+/// Dropping `tokio::process::Child` does not kill it, so every error after
+/// `prepare_clone_substrate` must cross this barrier before it propagates.
+async fn cleanup_failed_clone_holder(holder: &mut Option<tokio::process::Child>, stage: &str) {
+    let Some(mut child) = holder.take() else {
+        return;
+    };
+    if let Err(error) = child.start_kill() {
+        warn!(error = %error, stage, "failed to signal clone namespace holder");
+    }
+    if let Err(error) = child.wait().await {
+        warn!(error = %error, stage, "failed to reap clone namespace holder");
+    }
+}
+
 /// Prepare the [`CloneSubstrate`]: per-network-mode namespace setup + CoW disk + extra-disk
 /// copy + mount-redirect. Shared by the Firecracker and Cloud Hypervisor restore paths.
 ///
@@ -1325,21 +1497,29 @@ async fn prepare_clone_substrate(
 
     // Copy extra disk images (disk-dir) from snapshot to the clone's disk directory so the
     // redirected baseline paths resolve to real files.
-    if !restore_config.extra_disks.is_empty() {
-        if let Some(ref snap_dir) = restore_config.snapshot_dir {
-            for extra_disk in &restore_config.extra_disks {
-                let source = snap_dir.join(&extra_disk.filename);
-                let dest = vm_dir.join(&extra_disk.filename);
-                reflink_copy(&source, &dest)
-                    .await
-                    .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
+    let extra_disks_result: Result<()> = async {
+        if !restore_config.extra_disks.is_empty() {
+            if let Some(ref snap_dir) = restore_config.snapshot_dir {
+                for extra_disk in &restore_config.extra_disks {
+                    let source = snap_dir.join(&extra_disk.filename);
+                    let dest = vm_dir.join(&extra_disk.filename);
+                    reflink_copy(&source, &dest)
+                        .await
+                        .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
+                }
+                info!(
+                    num_disks = restore_config.extra_disks.len(),
+                    "copied {} extra disk image(s) to clone",
+                    restore_config.extra_disks.len()
+                );
             }
-            info!(
-                num_disks = restore_config.extra_disks.len(),
-                "copied {} extra disk image(s) to clone",
-                restore_config.extra_disks.len()
-            );
         }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = extra_disks_result {
+        cleanup_failed_clone_holder(&mut holder_child, "copying clone extra disks").await;
+        return Err(error);
     }
 
     Ok(CloneSubstrate {
@@ -1403,12 +1583,19 @@ pub async fn restore_from_snapshot(
         restore_config.snapshot_vm_id.as_deref(),
     )?;
 
+    // Resolve the binary before acquiring a rootless namespace holder. This is
+    // pure validation and must not create a process that a later `?` can detach.
+    let firecracker_bin = find_firecracker(runtime_config)?;
+    let firecracker_args = runtime_config
+        .firecracker_args
+        .clone()
+        .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok());
+
     // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
     // mount redirect — all shared with the Cloud Hypervisor restore path.
-    let substrate =
+    let mut substrate =
         prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
     let rootfs_path = substrate.rootfs_path;
-    let holder_child = substrate.holder_child;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
 
     let fc_log_path = data_dir.join("firecracker.log");
@@ -1434,16 +1621,19 @@ pub async fn restore_from_snapshot(
         vm_manager.set_mount_redirects(baseline_dirs.clone(), clone_dir.clone());
     }
 
-    let firecracker_bin = find_firecracker(runtime_config)?;
-    let firecracker_args = runtime_config
-        .firecracker_args
-        .clone()
-        .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok());
-
-    vm_manager
+    if let Err(error) = vm_manager
         .start(&firecracker_bin, None, firecracker_args.as_deref())
         .await
-        .context("starting Firecracker")?;
+        .context("starting Firecracker")
+    {
+        // `start` can fail after spawning; ask the manager to reap any partial
+        // child, then stop the independently-owned namespace holder.
+        let _ = vm_manager.kill().await;
+        cleanup_failed_clone_holder(&mut substrate.holder_child, "starting Firecracker clone")
+            .await;
+        return Err(error);
+    }
+    let mut holder_child = substrate.holder_child.take();
 
     // Everything after start() runs inside a fallible block so a failure
     // (network post-start, snapshot load — e.g. an incompatible snapshot —
@@ -1645,7 +1835,9 @@ pub async fn restore_from_snapshot(
             );
         }
 
-        // Save VM state with complete network configuration
+        // Persist process/network identity now; cmd_snapshot_run publishes the separate
+        // lifecycle-ready barrier after it has transferred every setup owner and installed
+        // the path-specific supervision resources.
         save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
         Ok::<(), anyhow::Error>(())
@@ -1656,6 +1848,7 @@ pub async fn restore_from_snapshot(
         if let Err(kill_err) = vm_manager.kill().await {
             warn!(error = %kill_err, "failed to kill Firecracker after restore failure");
         }
+        cleanup_failed_clone_holder(&mut holder_child, "Firecracker restore failure").await;
         return Err(e);
     }
 
@@ -1739,7 +1932,7 @@ pub async fn restore_from_snapshot_ch(
     )?;
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
-    let substrate =
+    let mut substrate =
         prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
 
     // Cloud Hypervisor reads its restore config (disk/vsock/net) from the snapshot's `ch/`
@@ -1750,43 +1943,57 @@ pub async fn restore_from_snapshot_ch(
     // to the clone's TAP before restoring (the FC path does the equivalent via
     // LoadSnapshot's `network_overrides`). Copying also avoids mutating the shared snapshot,
     // which concurrent clones restore from.
-    let clone_ch_dir = data_dir.join("ch-restore");
-    let _ = tokio::fs::remove_dir_all(&clone_ch_dir).await;
-    tokio::fs::create_dir_all(&clone_ch_dir)
-        .await
-        .context("creating CH restore directory")?;
-    let mut entries = tokio::fs::read_dir(&ch_dir)
-        .await
-        .with_context(|| format!("reading CH snapshot dir {}", ch_dir.display()))?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name();
-        // config.json is rewritten below; reflink the rest (state.json, memory ranges).
-        if name == std::ffi::OsStr::new("config.json") {
-            continue;
-        }
-        reflink_copy(&ch_dir.join(&name), &clone_ch_dir.join(&name))
+    let clone_prepare: Result<(PathBuf, PathBuf)> = async {
+        let clone_ch_dir = data_dir.join("ch-restore");
+        let _ = tokio::fs::remove_dir_all(&clone_ch_dir).await;
+        tokio::fs::create_dir_all(&clone_ch_dir)
             .await
-            .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
-    }
-    // `cfg` was read, parsed, and #608-validated above (before the substrate side effects).
-    if let Some(nets) = cfg.get_mut("net").and_then(|v| v.as_array_mut()) {
-        for net in nets.iter_mut() {
-            if let Some(obj) = net.as_object_mut() {
-                obj.insert(
-                    "tap".to_string(),
-                    serde_json::Value::String(network_config.tap_device.clone()),
-                );
+            .context("creating CH restore directory")?;
+        let mut entries = tokio::fs::read_dir(&ch_dir)
+            .await
+            .with_context(|| format!("reading CH snapshot dir {}", ch_dir.display()))?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            // config.json is rewritten below; reflink the rest (state.json, memory ranges).
+            if name == std::ffi::OsStr::new("config.json") {
+                continue;
+            }
+            reflink_copy(&ch_dir.join(&name), &clone_ch_dir.join(&name))
+                .await
+                .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
+        }
+        // `cfg` was read, parsed, and #608-validated above (before the substrate side effects).
+        if let Some(nets) = cfg.get_mut("net").and_then(|v| v.as_array_mut()) {
+            for net in nets.iter_mut() {
+                if let Some(obj) = net.as_object_mut() {
+                    obj.insert(
+                        "tap".to_string(),
+                        serde_json::Value::String(network_config.tap_device.clone()),
+                    );
+                }
             }
         }
-    }
-    tokio::fs::write(
-        clone_ch_dir.join("config.json"),
-        serde_json::to_vec_pretty(&cfg).context("serializing CH restore config.json")?,
-    )
-    .await
-    .context("writing CH restore config.json")?;
+        tokio::fs::write(
+            clone_ch_dir.join("config.json"),
+            serde_json::to_vec_pretty(&cfg).context("serializing CH restore config.json")?,
+        )
+        .await
+        .context("writing CH restore config.json")?;
 
-    let ch_bin = find_cloud_hypervisor()?;
+        Ok((clone_ch_dir, find_cloud_hypervisor()?))
+    }
+    .await;
+    let (clone_ch_dir, ch_bin) = match clone_prepare {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            cleanup_failed_clone_holder(
+                &mut substrate.holder_child,
+                "preparing Cloud Hypervisor restore",
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let log_path = data_dir.join("firecracker.log");
     let mut backend =
         CloudHypervisorBackend::new(vm_id.to_string(), socket_path.to_path_buf(), Some(log_path));
@@ -1806,12 +2013,21 @@ pub async fn restore_from_snapshot_ch(
         net_namespace_path: substrate.namespace.net_namespace_path.clone(),
         mount_redirects: substrate.namespace.mount_redirects.clone(),
     };
-    backend
+    if let Err(error) = backend
         .spawn(&spec)
         .await
-        .context("launching Cloud Hypervisor --restore")?;
+        .context("launching Cloud Hypervisor --restore")
+    {
+        let _ = backend.kill().await;
+        cleanup_failed_clone_holder(
+            &mut substrate.holder_child,
+            "launching Cloud Hypervisor restore",
+        )
+        .await;
+        return Err(error);
+    }
 
-    let holder_child = substrate.holder_child;
+    let mut holder_child = substrate.holder_child.take();
     // Everything after spawn runs in a fallible block so a failure kills the CH process
     // (callers may fall back to a fresh boot, so a half-restored process must not leak).
     let post_start = async {
@@ -1853,6 +2069,8 @@ pub async fn restore_from_snapshot_ch(
             );
         }
 
+        // Lifecycle readiness is published by cmd_snapshot_run after setup ownership and
+        // supervision are complete, not by this lower-level restore primitive.
         save_vm_state_with_network(state_manager, vm_state, network_config).await?;
         Ok::<(), anyhow::Error>(())
     }
@@ -1862,6 +2080,7 @@ pub async fn restore_from_snapshot_ch(
         if let Err(kill_err) = backend.kill().await {
             warn!(error = %kill_err, "failed to kill Cloud Hypervisor after restore failure");
         }
+        cleanup_failed_clone_holder(&mut holder_child, "Cloud Hypervisor restore failure").await;
         return Err(e);
     }
 
@@ -1998,6 +2217,7 @@ pub fn build_snapshot_config(
     crate::storage::SnapshotConfig {
         name: snapshot_key.to_string(),
         vm_id: vm_state.vm_id.clone(),
+        generation_id: uuid::Uuid::new_v4(),
         original_vsock_vm_id: Some(original_vsock_vm_id),
         parent_snapshot: None, // Set by create_snapshot_core after determining diff base
         memory_path: snapshot_dir.join("memory.bin"),
@@ -2167,6 +2387,114 @@ pub async fn acquire_snapshot_dir_lock(
     }
     debug!(lock = %lock_path.display(), exclusive, "acquired per-snapshot lock");
     Ok(lock_file)
+}
+
+/// Locks that pin every snapshot generation read or replaced by one snapshot create.
+///
+/// The files stay locked until this value is dropped.  Callers acquire this before the
+/// per-VM snapshot lock and keep it through the parent-memory copy/merge and the target's
+/// atomic replacement.
+pub struct SnapshotCreateGenerationLocks {
+    _files: Vec<std::fs::File>,
+}
+
+fn snapshot_create_lock_requests(
+    target_dir: &Path,
+    parent_dir: Option<&Path>,
+) -> Vec<(PathBuf, bool)> {
+    let mut requests = vec![(target_dir.to_path_buf(), true)];
+    if let Some(parent_dir) = parent_dir {
+        // Re-creating the VM's current parent uses the target's exclusive lock for both
+        // roles. Trying to flock the same inode through a second fd can self-deadlock.
+        if parent_dir != target_dir {
+            requests.push((parent_dir.to_path_buf(), false));
+        }
+    }
+    // Two creates may have inverse target/parent relationships. A single canonical order
+    // prevents each from holding one generation lock while waiting for the other.
+    requests.sort_by(|(left, _), (right, _)| left.cmp(right));
+    requests
+}
+
+/// Pin a snapshot create's target generation exclusively and its distinct parent generation
+/// shared. Locks are always acquired in canonical path order to prevent AB/BA deadlocks.
+pub async fn acquire_snapshot_create_generation_locks(
+    target_dir: &Path,
+    parent_dir: Option<&Path>,
+) -> Result<SnapshotCreateGenerationLocks> {
+    let mut files = Vec::new();
+    for (snapshot_dir, exclusive) in snapshot_create_lock_requests(target_dir, parent_dir) {
+        files.push(acquire_snapshot_dir_lock(&snapshot_dir, exclusive).await?);
+    }
+    Ok(SnapshotCreateGenerationLocks { _files: files })
+}
+
+/// Fail closed if the state selected before snapshot locking no longer identifies the same
+/// live fcvm process after the locks are held.
+///
+/// A name can be reused by a new VM while `snapshot create` waits. Pairing the original
+/// runtime paths with that replacement VM's lineage would capture or merge unrelated bytes.
+pub(crate) fn validate_snapshot_vm_identity(
+    expected: &crate::state::VmState,
+    current: &crate::state::VmState,
+) -> Result<()> {
+    anyhow::ensure!(
+        current.vm_id == expected.vm_id,
+        "snapshot target changed while acquiring locks: expected VM {}, found {}",
+        expected.vm_id,
+        current.vm_id
+    );
+
+    let expected_pid = expected
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("snapshot target {} has no process PID", expected.vm_id))?;
+    let expected_start = expected.pid_start_time.ok_or_else(|| {
+        anyhow::anyhow!(
+            "snapshot target {} has no recorded process start time",
+            expected.vm_id
+        )
+    })?;
+    let current_pid = current.pid.ok_or_else(|| {
+        anyhow::anyhow!(
+            "snapshot target {} lost its process PID while acquiring locks",
+            expected.vm_id
+        )
+    })?;
+    let current_start = current.pid_start_time.ok_or_else(|| {
+        anyhow::anyhow!(
+            "snapshot target {} lost its process start time while acquiring locks",
+            expected.vm_id
+        )
+    })?;
+
+    anyhow::ensure!(
+        (current_pid, current_start) == (expected_pid, expected_start),
+        "snapshot target {} process identity changed while acquiring locks: \
+         expected PID {} start {}, found PID {} start {}",
+        expected.vm_id,
+        expected_pid,
+        expected_start,
+        current_pid,
+        current_start
+    );
+
+    let observed_start = crate::utils::process_start_time(current_pid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "snapshot target {} process PID {} is no longer running",
+            expected.vm_id,
+            current_pid
+        )
+    })?;
+    anyhow::ensure!(
+        observed_start == current_start,
+        "snapshot target {} process PID {} was reused: expected start {}, observed {}",
+        expected.vm_id,
+        current_pid,
+        current_start,
+        observed_start
+    );
+
+    Ok(())
 }
 
 /// Extra files to write into the snapshot directory before it is atomically finalized.
@@ -2998,6 +3326,181 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_create_lock_requests_are_canonical_and_deduplicate_self_parent() {
+        let parent = Path::new("/snapshots/a-parent");
+        let target = Path::new("/snapshots/z-target");
+        assert_eq!(
+            snapshot_create_lock_requests(target, Some(parent)),
+            vec![(parent.to_path_buf(), false), (target.to_path_buf(), true)]
+        );
+        assert_eq!(
+            snapshot_create_lock_requests(target, Some(target)),
+            vec![(target.to_path_buf(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_create_generation_locks_pin_parent_until_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().join("a-parent");
+        let target = tmp.path().join("z-target");
+        let locks = acquire_snapshot_create_generation_locks(&target, Some(&parent))
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let contender_parent = parent.clone();
+        let contender = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            acquire_snapshot_dir_lock(&contender_parent, true)
+                .await
+                .unwrap()
+        });
+        started_rx.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !contender.is_finished(),
+            "an exclusive parent replacement must wait for the create's shared pin"
+        );
+
+        drop(locks);
+        let contender_lock = tokio::time::timeout(std::time::Duration::from_secs(1), contender)
+            .await
+            .expect("parent replacement did not acquire the released generation lock")
+            .unwrap();
+        drop(contender_lock);
+
+        // A target that is also its own parent uses one exclusive lock rather than
+        // attempting a second flock on the same inode.
+        let self_parent = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_snapshot_create_generation_locks(&target, Some(&target)),
+        )
+        .await
+        .expect("target==parent lock acquisition self-deadlocked")
+        .unwrap();
+        drop(self_parent);
+    }
+
+    #[test]
+    fn snapshot_vm_identity_revalidation_fails_closed() {
+        let pid = std::process::id();
+        let start = crate::utils::process_start_time(pid).unwrap();
+        let mut expected = make_vm_state("vm-original", None);
+        expected.pid = Some(pid);
+        expected.pid_start_time = Some(start);
+
+        let current = expected.clone();
+        validate_snapshot_vm_identity(&expected, &current).unwrap();
+
+        let mut replacement = current.clone();
+        replacement.vm_id = "vm-replacement".to_string();
+        assert!(validate_snapshot_vm_identity(&expected, &replacement).is_err());
+
+        let mut changed_process = current.clone();
+        changed_process.pid_start_time = Some(start + 1);
+        assert!(validate_snapshot_vm_identity(&expected, &changed_process).is_err());
+
+        let mut missing_identity = current.clone();
+        missing_identity.pid_start_time = None;
+        assert!(validate_snapshot_vm_identity(&expected, &missing_identity).is_err());
+
+        let mut reused = current.clone();
+        reused.pid_start_time = Some(start + 1);
+        assert!(validate_snapshot_vm_identity(&reused, &reused).is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ready_publication_is_atomic_and_identity_guarded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+
+        let pid = std::process::id();
+        let start = crate::utils::process_start_time(pid).unwrap();
+        let mut state = make_vm_state("vm-ready", None);
+        state.pid = Some(pid);
+        state.pid_start_time = Some(start);
+        manager.save_state(&state).await.unwrap();
+
+        publish_lifecycle_ready(&manager, &mut state).await.unwrap();
+        assert!(state.lifecycle_ready);
+        assert!(
+            manager
+                .load_state("vm-ready")
+                .await
+                .unwrap()
+                .lifecycle_ready
+        );
+
+        manager
+            .update_state("vm-ready", |persisted| persisted.lifecycle_ready = false)
+            .await
+            .unwrap();
+        let mut stale = state.clone();
+        stale.lifecycle_ready = false;
+        stale.pid_start_time = Some(start + 1);
+        assert!(publish_lifecycle_ready(&manager, &mut stale).await.is_err());
+        assert!(
+            !manager
+                .load_state("vm-ready")
+                .await
+                .unwrap()
+                .lifecycle_ready,
+            "a stale process identity must not publish readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_precheck_and_ready_claim_prevents_publication() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        let manager = crate::state::StateManager::new(state_dir.clone());
+        manager.init().await.unwrap();
+
+        let pid = std::process::id();
+        let start = crate::utils::process_start_time(pid).unwrap();
+        let mut state = make_vm_state("vm-ready-cancelled", None);
+        state.pid = Some(pid);
+        state.pid_start_time = Some(start);
+        manager.save_state(&state).await.unwrap();
+
+        let gate = LifecycleReadyGate::new();
+        let publisher_gate = gate.clone();
+        let publisher_cancel = gate.cancellation_token();
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let publisher = tokio::spawn(async move {
+            // Reproduce the old call-site interleave exactly: setup observes no
+            // cancellation, then the signal handler wins before the async save.
+            assert!(!publisher_cancel.is_cancelled());
+            checked_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+
+            let manager = crate::state::StateManager::new(state_dir);
+            let outcome = publisher_gate.publish(&manager, &mut state).await.unwrap();
+            (outcome, state)
+        });
+
+        checked_rx.await.unwrap();
+        gate.cancel();
+        continue_tx.send(()).unwrap();
+
+        let (outcome, state) = publisher.await.unwrap();
+        assert_eq!(outcome, LifecycleReadyOutcome::Cancelled);
+        assert!(!state.lifecycle_ready);
+        assert!(gate.cancellation_token().is_cancelled());
+        assert!(
+            !manager
+                .load_state("vm-ready-cancelled")
+                .await
+                .unwrap()
+                .lifecycle_ready,
+            "cancellation that wins the lifecycle gate must leave persisted readiness false"
+        );
+    }
+
+    #[test]
     fn test_build_snapshot_config_fresh_vm() {
         // Fresh VM: no original_vsock_vm_id → falls back to vm_id
         let state = make_vm_state("vm-AAA", None);
@@ -3252,10 +3755,13 @@ mod tests {
         let json = r#"{
             "name": "old-snap",
             "vm_id": "vm-OLD",
+            "generation_id": "3f53da72-8c67-4ec7-8f3d-d25367129872",
             "memory_path": "/tmp/memory.bin",
             "vmstate_path": "/tmp/vmstate.bin",
             "disk_path": "/tmp/disk.raw",
             "created_at": "2026-01-01T00:00:00Z",
+            "snapshot_type": "User",
+            "kind": "Full",
             "metadata": {
                 "image": "nginx:alpine",
                 "vcpu": 2,

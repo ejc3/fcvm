@@ -244,13 +244,29 @@ pub async fn spawn_volume_servers_with_tables(
         });
     }
 
-    let mut handles = Vec::with_capacity(configs.len());
+    // A later volume can fail validation/bind after earlier tasks were already
+    // spawned. JoinHandle::drop detaches, so keep them behind an abort-on-drop
+    // guard until the whole set has reported ready. This also makes cancelling
+    // the setup future safe: no half-built VolumeServer survives its caller.
+    struct AbortOnDrop(Vec<JoinHandle<()>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            for handle in &self.0 {
+                handle.abort();
+            }
+        }
+    }
+    let mut handles = AbortOnDrop(Vec::with_capacity(configs.len()));
     let mut remap_refs = Vec::with_capacity(configs.len());
     let mut ready_receivers = Vec::with_capacity(configs.len());
+    // Validate every source before the first task is spawned. A bad later
+    // volume therefore cannot force an async task teardown through Drop.
+    let host_paths = configs
+        .iter()
+        .map(resolve_volume_path)
+        .collect::<Result<Vec<_>>>()?;
 
-    for (idx, config) in configs.iter().enumerate() {
-        let host_path = resolve_volume_path(config)?;
-
+    for (idx, (config, host_path)) in configs.iter().zip(host_paths).enumerate() {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         ready_receivers.push(ready_rx);
 
@@ -285,13 +301,14 @@ pub async fn spawn_volume_servers_with_tables(
                     error!("VolumeServer error for port {}: {}", port, e);
                 }
             });
-            handles.push(handle);
+            handles.0.push(handle);
         } else {
             remap_refs.push(None);
 
-            let server = VolumeServer::new(config.clone()).with_context(|| {
-                format!("creating VolumeServer for {}", config.host_path.display())
-            })?;
+            let server = VolumeServer {
+                config: config.clone(),
+                host_path,
+            };
 
             let vsock_path = vsock_socket_path.to_path_buf();
             let handle = tokio::spawn(async move {
@@ -302,7 +319,7 @@ pub async fn spawn_volume_servers_with_tables(
                     error!("VolumeServer error for port {}: {}", port, e);
                 }
             });
-            handles.push(handle);
+            handles.0.push(handle);
         }
 
         info!(
@@ -317,15 +334,22 @@ pub async fn spawn_volume_servers_with_tables(
 
     // Wait for ALL VolumeServers to signal ready (socket bound)
     for (idx, ready_rx) in ready_receivers.into_iter().enumerate() {
-        ready_rx
-            .await
-            .with_context(|| format!("VolumeServer {} failed to signal ready", idx))?;
+        if let Err(error) = ready_rx.await {
+            for handle in &handles.0 {
+                handle.abort();
+            }
+            for handle in handles.0.drain(..) {
+                let _ = handle.await;
+            }
+            return Err(error)
+                .with_context(|| format!("VolumeServer {} failed to signal ready", idx));
+        }
     }
 
     info!("all {} VolumeServer(s) ready", configs.len());
 
     Ok(SpawnedVolumes {
-        handles,
+        handles: std::mem::take(&mut handles.0),
         remap_refs,
     })
 }

@@ -586,9 +586,9 @@ use crate::proxy::PROXY_LISTEN_PORT as EGRESS_PROXY_PORT;
 /// confirmed present in `/proc/<pid>/cmdline`, `/proc/net/tcp` shows
 /// `0100007F:2406` (127.0.0.1:9222) and nothing else. The browser ignores the
 /// flag, so the only previous route in was a userspace relay running inside the
-/// guest — an extra process per clone that added a measured 2.0 MiB PSS. The
-/// earlier request-path availability A/B was withdrawn because its arms were not
-/// comparable, so it does not attribute its observed failures to that relay.
+/// guest. The direct DNAT removes that per-clone process and byte-path hop. The
+/// earlier request-path availability A/B was withdrawn because its arms were
+/// not comparable, so it does not attribute its observed failures to that relay.
 ///
 /// # Why it is unconditional
 ///

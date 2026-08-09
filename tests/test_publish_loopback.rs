@@ -12,8 +12,9 @@
 //! clone: Chromium ignores `--remote-debugging-address` and binds
 //! `127.0.0.1:9222` regardless (measured on 151.0.7922.71 — the flag is present
 //! in `/proc/<pid>/cmdline` while `/proc/net/tcp` shows `0100007F:2406` and
-//! nothing else). The deleted relay added a measured 2.0 MiB PSS per clone. A
-//! withdrawn request-path A/B did not establish that it caused connection drops.
+//! nothing else). The direct DNAT removes the relay's per-clone process and
+//! byte-path hop. A withdrawn request-path A/B did not establish that the relay
+//! caused connection drops.
 //!
 //! These run ROOTLESS and need no privilege: the rules are installed by fc-agent
 //! inside the guest's own network namespace, so no host root is involved.
@@ -418,6 +419,10 @@ fn test_udp_publish_does_not_collide_with_forward_localhost() -> Result<()> {
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    anyhow::ensure!(
+        out.status.success(),
+        "fcvm rejected or failed the valid UDP publish plus TCP forward-localhost case:\n{msg}"
     );
     anyhow::ensure!(
         !msg.contains("both claim guest port"),
