@@ -135,8 +135,7 @@ fn remap_patch_prepares_the_range_under_canonical_two_inode_locking() {
     assert!(
         !patch.lines().any(|line| {
             line.starts_with('+')
-                && (line.contains("inode_lock(inode_in)")
-                    || line.contains("inode_lock(inode_out)"))
+                && (line.contains("inode_lock(inode_in)") || line.contains("inode_lock(inode_out)"))
         }),
         "separate source/destination inode locks leave a source-change race; use \
          lock_two_nondirectories()"
