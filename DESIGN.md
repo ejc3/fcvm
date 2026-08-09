@@ -221,15 +221,18 @@ impl VmManager {
 
 Three implementations based on execution mode.
 
-#### Published ports always reach guest loopback
+#### Eligible published TCP ports reach guest loopback
 
 **Location**: `fc-agent/src/network.rs::publish_to_loopback`
 
 `--publish` delivers a packet to the guest's external interface. A guest service
 listening on `0.0.0.0` receives it; one listening on `127.0.0.1` does not. fcvm
-therefore DNATs **every published TCP port** to `127.0.0.1:<port>` inside the
-guest. There is no flag: the caller cannot know which kind of service is on the
-other end, and the rule costs nothing for the services that never needed it.
+therefore DNATs each eligible published TCP port to `127.0.0.1:<port>` inside the
+guest when containment, `route_localnet`, and that port's DNAT setup succeed.
+Port 12345 is ineligible because it is fcvm's egress proxy, and a TCP port also
+given to `--forward-localhost` is rejected before boot. A setup failure leaves
+the existing wildcard- and guest-address publication path unchanged and logs
+that loopback-only listeners are not reachable.
 
 ```text
 host:P --publish--> guest eth0:P --DNAT--> 127.0.0.1:P --> the listener
@@ -281,7 +284,9 @@ guest loopback.
 arm64), with the flag confirmed in `/proc/<pid>/cmdline`, `/proc/net/tcp` shows
 `0100007F:2406` (`127.0.0.1:9222`) and nothing else. Before this, the only way in
 was a userspace relay process running inside every clone, in the byte path — and
-that arm was the only one that dropped connections.
+removing it saves its measured 2.0 MiB PSS per clone. A prior request-path A/B
+that reported connection drops was withdrawn because its arms were not
+comparable; it does not establish that the relay caused those failures.
 
 ##### Containing `route_localnet`
 
@@ -295,7 +300,7 @@ opened, and "the microVM guards ingress" does not justify it.
 `install_loopback_containment` closes the gap:
 
 ```text
-iptables -A INPUT -i eth0 -d 127.0.0.0/8 -m conntrack ! --ctstate DNAT -j DROP
+iptables -I INPUT 1 -i eth0 -d 127.0.0.0/8 -m conntrack ! --ctstate DNAT -j DROP
 ```
 
 Conntrack records whether a connection's destination was translated, so this
@@ -303,7 +308,8 @@ admits exactly the packets our PREROUTING rules rewrote and drops anything an
 attacker addressed to `127.0.0.1` directly. `xt_conntrack` **is** built into the
 Kata kernel — verified in the guest, unlike `xt_socket`. Scoped to `-i eth0`, so
 locally-generated traffic (which re-enters on `lo`) is untouched, including the
-egress proxy's `nat OUTPUT` REDIRECT.
+egress proxy's `nat OUTPUT` REDIRECT. The rule is inserted at position 1 because
+an earlier terminating ACCEPT would bypass an appended security rule.
 
 ##### Ports that must not be published
 

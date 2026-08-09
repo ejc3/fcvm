@@ -863,7 +863,10 @@ class AnalyzerAvailability(unittest.TestCase):
 
     def _synthetic(self, path):
         with open(path, "w") as f:
-            f.write(json.dumps({"kind": "meta", "seed": 1, "arms": ["exec", "cdp"]}) + "\n")
+            f.write(json.dumps({
+                "kind": "meta", "seed": 1, "backend": "file",
+                "arms": ["exec", "cdp"],
+            }) + "\n")
             for i in range(30):
                 f.write(json.dumps({
                     "arm": "exec", "rep": i, "ok": True,
@@ -893,6 +896,46 @@ class AnalyzerAvailability(unittest.TestCase):
                     "teardown": {"mode": "fast", "all_gone": False,
                                  "reap_wall_ms": 60000.0, "teardown_total_ms": 60000.0},
                 }) + "\n")
+
+    @staticmethod
+    def _write_clean_backend(path, backend, measured, blocking_ms, noop_values=()):
+        arms = ["cdp"] + (["noop"] if noop_values else [])
+        with open(path, "w") as f:
+            f.write(json.dumps({
+                "kind": "meta", "seed": 1, "backend": backend,
+                "arms": arms, "reps": measured, "warmup": 2,
+            }) + "\n")
+            # Warmups are real records but must not satisfy the publication n.
+            for i in range(2):
+                f.write(json.dumps({
+                    "arm": "cdp", "rep": i, "warmup": True, "ok": True,
+                    "blocking_ms": blocking_ms, "wall_ms": blocking_ms + 1,
+                }) + "\n")
+            for i in range(measured):
+                f.write(json.dumps({
+                    "arm": "cdp", "rep": i, "warmup": False, "ok": True,
+                    "blocking_ms": blocking_ms, "wall_ms": blocking_ms + 1,
+                }) + "\n")
+            for i, value in enumerate(noop_values):
+                f.write(json.dumps({
+                    "arm": "noop", "rep": i, "warmup": False, "ok": True,
+                    "blocking_ms": value, "wall_ms": value + 1,
+                }) + "\n")
+
+    @staticmethod
+    def _fast_median_ci(xs, *_args, **_kwargs):
+        values = sorted(float(x) for x in xs if x is not None)
+        if not values:
+            return None, None, None, 0
+        return reqanalyze.statistics.median(values), values[0], values[-1], len(values)
+
+    def _run_gate_fixture(self, argv):
+        # The production bootstrap remains covered elsewhere. These tests target
+        # input partitioning and gate truth, so avoid tens of millions of random
+        # resamples over deliberately constant 200-record fixtures.
+        from unittest import mock
+        with mock.patch.object(reqanalyze, "median_ci", self._fast_median_ci):
+            return reqanalyze.main_with(argv)
 
     def test_failed_records_are_counted_per_arm_and_gate_publication(self):
         with tempfile.TemporaryDirectory() as d:
@@ -931,9 +974,9 @@ class AnalyzerAvailability(unittest.TestCase):
 
         RED BEFORE THE FIX: the CDP stage table printed under
             CDP ARMS: per-request stage decomposition (host -> clone over forward-localhost)
-        The harness never passes `--forward-localhost` — reqbench.sh publishes the
-        RELAY port (`--publish 9223:9223`) and entry.sh's socat carries guest
-        eth0 -> guest loopback. a55d25d4 claimed to have fixed the direction
+        The harness never passes `--forward-localhost` — reqbench.sh publishes
+        port 9222 and fc-agent DNATs it from guest eth0 to guest loopback.
+        a55d25d4 claimed to have fixed the direction
         "in the right direction" everywhere; `git show` proves it never touched
         this line, which was then the only place in bench/chromium still asserting
         the wrong one.
@@ -947,7 +990,7 @@ class AnalyzerAvailability(unittest.TestCase):
             text = buf.getvalue()
             self.assertNotIn("forward-localhost", text)
             self.assertIn("publish", text)
-            self.assertIn("relay", text)
+            self.assertIn("guest loopback", text)
 
     def test_a_null_all_gone_is_not_counted_as_confirmed(self):
         """`ag.count(False)` treats null and absent as CONFIRMED GONE.
@@ -1055,22 +1098,95 @@ class AnalyzerAvailability(unittest.TestCase):
             self.assertIn("DO NOT PUBLISH", buf.getvalue())
             self.assertNotEqual(rc, 0, "the run must gate, not merely narrate")
 
-    def test_a_clean_run_still_exits_zero(self):
+    def test_199_measured_cdp_attempts_fail_the_backend_gate(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "r.jsonl")
-            with open(src, "w") as f:
-                f.write(json.dumps({"kind": "meta", "seed": 1}) + "\n")
-                for i in range(10):
-                    f.write(json.dumps({
-                        "arm": "cdp", "rep": i, "ok": True,
-                        "blocking_ms": 384.0, "wall_ms": 455.0,
-                        "teardown": {"mode": "fast", "all_gone": True,
-                                     "reap_wall_ms": 63.0, "teardown_total_ms": 70.0},
-                    }) + "\n")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(src, "file", 199, 384.0)
             buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = reqanalyze.main_with([src])
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as f:
+                out = json.load(f)
+            sample = out["gate"]["cdp_sample_size"]
+            self.assertEqual(sample["measured_non_warmup_attempts_per_arm"]["cdp"], 199)
+            self.assertIs(sample["passed"], False)
+            self.assertIs(out["publishable"], False)
+            self.assertIn("199/200", " ".join(out["gate"]["reasons"]))
+            self.assertEqual(rc, 5, buf.getvalue())
+
+    def test_200_measured_cdp_attempts_pass_the_backend_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(src, "file", 200, 384.0)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as f:
+                out = json.load(f)
+            self.assertEqual(
+                out["gate"]["cdp_sample_size"]
+                ["measured_non_warmup_attempts_per_arm"]["cdp"],
+                200,
+            )
+            self.assertIs(out["publishable"], True)
+            self.assertIs(out["gate"]["passed"], True)
             self.assertEqual(rc, 0, buf.getvalue())
+
+    def test_two_backend_inputs_are_analyzed_without_pooling(self):
+        with tempfile.TemporaryDirectory() as d:
+            file_src = os.path.join(d, "file.jsonl")
+            uffd_src = os.path.join(d, "uffd.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(file_src, "file", 200, 100.0)
+            self._write_clean_backend(uffd_src, "uffd", 200, 900.0)
+            with redirect_stdout(io.StringIO()):
+                rc = self._run_gate_fixture(
+                    ["--json-out", dst, file_src, uffd_src]
+                )
+            with open(dst) as f:
+                out = json.load(f)
+            self.assertEqual(set(out["backends"]), {"file", "uffd"})
+            self.assertEqual(out["backends"]["file"]["sources"], [file_src])
+            self.assertEqual(out["backends"]["uffd"]["sources"], [uffd_src])
+            for backend in ("file", "uffd"):
+                count = out["backends"][backend]["gate"]["cdp_sample_size"][
+                    "measured_non_warmup_attempts_per_arm"
+                ]["cdp"]
+                self.assertEqual(count, 200, f"{backend} was pooled with the other backend")
+            self.assertEqual(out["backends"]["file"]["arms"]["cdp"]
+                             ["blocking_ms"]["median"], 100.0)
+            self.assertEqual(out["backends"]["uffd"]["arms"]["cdp"]
+                             ["blocking_ms"]["median"], 900.0)
+            self.assertIs(out["publishable"], True)
+            self.assertEqual(rc, 0)
+
+    def test_detected_drift_fails_even_when_no_gate_overrides_exit_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(
+                src, "uffd", 200, 384.0,
+                noop_values=(10.0, 10.0, 10.0, 100.0, 100.0, 100.0),
+            )
+            with redirect_stdout(io.StringIO()):
+                gated_rc = self._run_gate_fixture(["--json-out", dst, src])
+            self.assertEqual(gated_rc, 5)
+
+            with redirect_stdout(io.StringIO()):
+                override_rc = self._run_gate_fixture(
+                    ["--json-out", dst, "--no-gate", src]
+                )
+            with open(dst) as f:
+                out = json.load(f)
+            self.assertIs(out["gate"]["baseline_drift"]["significant"], True)
+            self.assertIs(out["gate"]["baseline_drift"]["passed"], False)
+            self.assertIn("baseline drift", " ".join(out["gate"]["reasons"]))
+            self.assertIs(out["publishable"], False)
+            self.assertIs(out["gate"]["passed"], False)
+            self.assertIs(out["gate"]["exit_code_overridden"], True)
+            self.assertEqual(override_rc, 0)
 
     def test_per_child_cpu_is_reported_by_name_not_pooled(self):
         """Pooling across children medians a straggler away.
@@ -1351,7 +1467,7 @@ esac
             self.assertIn("FCVM_NO_SNAPSHOT=1", got,
                           f"the assignment did not survive sudo: {got}\n{r.stderr[-800:]}")
 
-    def _run_stub(self, d, backend):
+    def _run_stub(self, d, backend, analyzer_rc=0):
         env, binx = self._env(d, BACKEND=backend, REPS="1", WARMUP="0")
         argv = os.path.join(d, "argv.log")
         pyargv = os.path.join(d, "pyargv.log")
@@ -1363,7 +1479,15 @@ if [ "$1 $2" = "snapshot serve" ]; then
 fi
 """)
         self._write(os.path.join(binx, "python3"),
-                    f'#!/bin/bash\necho "$@" >> {pyargv}\nexit 0\n')
+                    f'''#!/bin/bash
+echo "$@" >> {pyargv}
+case "$1" in
+  *reqanalyze.py) exit {analyzer_rc} ;;
+esac
+exit 0
+''')
+        self._write(os.path.join(binx, "podman"),
+                    '#!/bin/bash\necho sha256:test-image\n')
         r = subprocess.run([self.SH, "run"], env=dict(env, FCVM=fcvm),
                            capture_output=True, text=True, timeout=180)
         return (r,
@@ -1389,6 +1513,57 @@ fi
             self.assertIn("snapshot serve", argv, f"{argv}\n{r.stderr[-800:]}")
             self.assertIn("--serve-pid", pyargv, pyargv)
             self.assertNotIn("--snapshot-tag", pyargv, pyargv)
+
+    def test_analyzer_rejection_fails_the_driver(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, _argv, pyargv = self._run_stub(d, "file", analyzer_rc=5)
+            self.assertEqual(r.returncode, 5, f"stdout={r.stdout}\nstderr={r.stderr}")
+            self.assertIn("reqbench.py", pyargv, pyargv)
+            self.assertIn("reqanalyze.py", pyargv, pyargv)
+            self.assertIn("gated run exit 5", r.stderr)
+
+    def test_vm_process_count_uses_comm_prefixes_and_ignores_zombies(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = os.path.join(d, "ps.txt")
+            with open(fixture, "w") as f:
+                f.write(
+                    "S fcvm\n"
+                    "S firecracker-def\n"
+                    "S cloud-hypervis\n"
+                    "Z fcvm\n"
+                    "S codex\n"
+                    "S tmux: server\n"
+                )
+            env, binx = self._env(d, PS_FIXTURE=fixture)
+            self._write(os.path.join(binx, "ps"), '#!/bin/bash\ncat "$PS_FIXTURE"\n')
+            r = subprocess.run(
+                ["bash", "-c", f"source {self.SH}; vm_process_count"],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "3", r.stdout)
+
+    def test_busy_guard_returns_three_before_starting_measurements(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = os.path.join(d, "ps.txt")
+            loadavg = os.path.join(d, "loadavg")
+            marker = os.path.join(d, "python-called")
+            with open(fixture, "w") as f:
+                f.write("S fcvm\n")
+            with open(loadavg, "w") as f:
+                f.write("0.01 0.01 0.01 1/1 1\n")
+            env, binx = self._env(
+                d, ALLOW_BUSY="0", PS_FIXTURE=fixture, LOADAVG_FILE=loadavg,
+            )
+            self._write(os.path.join(binx, "ps"), '#!/bin/bash\ncat "$PS_FIXTURE"\n')
+            self._write(os.path.join(binx, "python3"),
+                        f'#!/bin/bash\ntouch {marker}\n')
+            r = subprocess.run(
+                [self.SH, "run"], env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 3, f"stdout={r.stdout}\nstderr={r.stderr}")
+            self.assertFalse(os.path.exists(marker), "the measurement driver ran after refusal")
+            self.assertIn("FATAL: no measurements were taken", r.stderr)
 
     def test_target_id_waits_for_readiness_and_skips_devtools_pages(self):
         """RED BEFORE THE FIX: `target_id` was a SINGLE-SHOT urlopen with

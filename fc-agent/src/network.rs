@@ -568,8 +568,10 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
 /// real listener becomes publishable.
 use crate::proxy::PROXY_LISTEN_PORT as EGRESS_PROXY_PORT;
 
-/// Make every published guest port reachable even when the service binds
-/// 127.0.0.1 only.
+/// Make each eligible published TCP port reach a service bound to 127.0.0.1.
+///
+/// Publication is extended only after containment and `route_localnet` succeed;
+/// individual DNAT failures are logged. Port 12345 is always excluded.
 ///
 /// # Why this exists
 ///
@@ -584,8 +586,9 @@ use crate::proxy::PROXY_LISTEN_PORT as EGRESS_PROXY_PORT;
 /// confirmed present in `/proc/<pid>/cmdline`, `/proc/net/tcp` shows
 /// `0100007F:2406` (127.0.0.1:9222) and nothing else. The browser ignores the
 /// flag, so the only previous route in was a userspace relay running inside the
-/// guest — an extra process per clone, in the byte path, on the one arm that
-/// dropped connections.
+/// guest — an extra process per clone that added a measured 2.0 MiB PSS. The
+/// earlier request-path availability A/B was withdrawn because its arms were not
+/// comparable, so it does not attribute its observed failures to that relay.
 ///
 /// # Why it is unconditional
 ///
@@ -652,19 +655,7 @@ use crate::proxy::PROXY_LISTEN_PORT as EGRESS_PROXY_PORT;
 /// published DNAT would hand external clients a host-side `connect()` with no
 /// destination validation and no timeout.
 pub fn publish_to_loopback(ports: &[String]) {
-    let mut wanted: Vec<u16> = Vec::new();
-    for spec in ports {
-        match spec.parse::<u16>() {
-            Ok(EGRESS_PROXY_PORT) => eprintln!(
-                "[fc-agent] WARNING: refusing to publish port {EGRESS_PROXY_PORT} to guest \
-                 loopback — it is the transparent egress proxy's listener, and exposing it \
-                 would let an external client drive host-side connections. Publish a \
-                 different guest port."
-            ),
-            Ok(p) => wanted.push(p),
-            Err(e) => eprintln!("[fc-agent] WARNING: invalid published port '{spec}': {e}"),
-        }
-    }
+    let wanted = wanted_ports(ports);
     if wanted.is_empty() {
         return;
     }
@@ -714,6 +705,28 @@ pub fn publish_to_loopback(ports: &[String]) {
     }
 }
 
+/// Parse the published-port list and retain only ports that are safe to expose.
+///
+/// Keeping this selection separate from iptables installation makes the egress
+/// proxy exclusion directly testable without booting a VM. Warnings stay here so
+/// malformed metadata and refused ports remain visible to operators.
+fn wanted_ports(ports: &[String]) -> Vec<u16> {
+    let mut wanted = Vec::new();
+    for spec in ports {
+        match spec.parse::<u16>() {
+            Ok(EGRESS_PROXY_PORT) => eprintln!(
+                "[fc-agent] WARNING: refusing to publish port {EGRESS_PROXY_PORT} to guest \
+                 loopback — it is the transparent egress proxy's listener, and exposing it \
+                 would let an external client drive host-side connections. Publish a \
+                 different guest port."
+            ),
+            Ok(p) => wanted.push(p),
+            Err(e) => eprintln!("[fc-agent] WARNING: invalid published port '{spec}': {e}"),
+        }
+    }
+    wanted
+}
+
 /// `iptables -w -t nat <op> PREROUTING -p tcp --dport P -j DNAT --to 127.0.0.1:P`.
 ///
 /// PREROUTING so the rewrite happens before the routing decision, which is what
@@ -750,7 +763,7 @@ fn loopback_dnat_args(op: &str, port: u16) -> Vec<String> {
 /// matched, so guest-internal loopback use and the egress proxy's `nat OUTPUT`
 /// REDIRECT are untouched.
 fn install_loopback_containment() -> bool {
-    match run_iptables(&containment_args("-A")) {
+    match run_iptables(&containment_install_args()) {
         Ok(()) => {
             eprintln!(
                 "[fc-agent] loopback containment installed: only DNAT'd connections reach \
@@ -765,11 +778,21 @@ fn install_loopback_containment() -> bool {
     }
 }
 
+/// The production install command is separate from the delete form so the
+/// rule-order security property is pinned by a unit test. An appended DROP can
+/// be bypassed by any earlier ACCEPT, so installation must always be rule 1.
+fn containment_install_args() -> Vec<String> {
+    containment_args("-I")
+}
+
 fn containment_args(op: &str) -> Vec<String> {
-    vec![
-        "-w".into(),
-        op.into(),
-        "INPUT".into(),
+    let mut args = vec!["-w".into(), op.into(), "INPUT".into()];
+    // `-I INPUT 1` is the security property: an earlier ACCEPT would bypass an
+    // appended DROP. Deletion syntax deliberately has no positional argument.
+    if op == "-I" {
+        args.push("1".into());
+    }
+    args.extend([
         "-i".into(),
         "eth0".into(),
         "-d".into(),
@@ -781,7 +804,8 @@ fn containment_args(op: &str) -> Vec<String> {
         "DNAT".into(),
         "-j".into(),
         "DROP".into(),
-    ]
+    ]);
+    args
 }
 
 fn run_iptables(args: &[String]) -> Result<(), String> {
@@ -848,11 +872,15 @@ mod loopback_publish_tests {
     /// DNAT` the rule would drop the published traffic too; without `-i eth0` it
     /// would break guest-internal loopback.
     #[test]
-    fn containment_drops_only_untranslated_wire_traffic() {
-        let args = containment_args("-A").join(" ");
+    fn containment_is_first_and_drops_only_untranslated_wire_traffic() {
+        let args = containment_install_args().join(" ");
         assert_eq!(
             args,
-            "-w -A INPUT -i eth0 -d 127.0.0.0/8 -m conntrack ! --ctstate DNAT -j DROP"
+            "-w -I INPUT 1 -i eth0 -d 127.0.0.0/8 -m conntrack ! --ctstate DNAT -j DROP"
+        );
+        assert!(
+            args.starts_with("-w -I INPUT 1 "),
+            "the containment DROP must precede any existing ACCEPT rule: {args}"
         );
         assert!(
             args.contains("! --ctstate DNAT"),
@@ -862,16 +890,31 @@ mod loopback_publish_tests {
             args.contains("-i eth0"),
             "must not touch locally-generated loopback: {args}"
         );
+
+        let delete = containment_args("-D").join(" ");
+        assert_eq!(
+            delete,
+            "-w -D INPUT -i eth0 -d 127.0.0.0/8 -m conntrack ! --ctstate DNAT -j DROP"
+        );
     }
 
     /// The egress proxy listens on 127.0.0.1:12345 in the guest and relays via the
     /// host. Publishing it hands an external client a host-side connect() with no
     /// destination validation and no timeout, so it must never get a DNAT.
     #[test]
-    fn the_egress_proxy_port_is_never_published() {
+    fn the_egress_proxy_port_is_never_selected_for_publication() {
         assert_eq!(
             EGRESS_PROXY_PORT, 12345,
             "must track proxy.rs::PROXY_LISTEN_PORT; if that moved, this exclusion is dead"
+        );
+        assert_eq!(
+            wanted_ports(&[
+                "9222".to_string(),
+                EGRESS_PROXY_PORT.to_string(),
+                "not-a-port".to_string(),
+            ]),
+            vec![9222],
+            "the real selection path must keep ordinary ports and exclude the egress proxy"
         );
     }
 }

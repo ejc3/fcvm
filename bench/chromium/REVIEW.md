@@ -45,14 +45,17 @@ invented. Six of this file's seven bounds reproduce exactly against
 `DocLint.test_every_binomial_bound_matches_reqanalyze_clopper_pearson` now
 recomputes every one of them.)*
 
-**Root cause of the `WsClosed` drops: still undetermined.** `render.py`'s
+**The earlier CDP-path availability A/B is withdrawn.** Its arms were not
+comparable, so its `file 1/60, UFFD 6/60, exec 0/66` counts must not be used to
+attribute failures to a transport component or to describe current behavior.
+
+**Root cause of the observed `WsClosed` records: undetermined.** `render.py`'s
 `_recv_until` discarded any bytes the peer coalesced past the `\r\n\r\n` of the
 101 response, which desyncs the very next frame header and surfaces as exactly
 `WsClosed("connection closed mid-frame")`. That is fixed in this PR — but it is a
 **variable removed, not a diagnosis**: Chromium is not expected to push before the
 first command, and the hypothesis was never confirmed against a failing record.
-The CDP arm is the only arm with a `socat` relay and pasta in the byte path, and
-it is the only arm that fails.
+That withdrawn run used a `socat` relay; the current direct-DNAT path does not.
 
 **"0 failures" is not a 0% failure rate.** Every success count in this file is
 exact-binomial bounded, not a guarantee: **0/426 is [0, 0.86%]**, **0/462 is

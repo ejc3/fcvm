@@ -33,12 +33,12 @@ import os
 import sys
 import urllib.request
 
-# Chromium's own DevTools port. There is no relay any more: fcvm DNATs every
-# published port to the guest's 127.0.0.1, so the host reaches Chromium directly
-# (fc-agent/src/network.rs::publish_to_loopback). This probe is the container
-# HEALTHCHECK, and the HEALTHCHECK is what triggers fcvm's golden snapshot — if
-# it points at a dead port, `reqbench.sh golden` waits out its full 300s and
-# never snapshots.
+# Chromium's own DevTools port. There is no relay any more: fcvm DNATs this
+# eligible published TCP port to guest 127.0.0.1, so the host reaches Chromium
+# directly (fc-agent/src/network.rs::publish_to_loopback). This probe is the
+# container HEALTHCHECK, and the HEALTHCHECK is what triggers fcvm's golden
+# snapshot — if it points at a dead port, `reqbench.sh golden` waits out its full
+# 300s and never snapshots.
 CDP_HOST = os.environ.get("BENCH_CDP_HEALTH_HOST", "127.0.0.1:9222")
 READY_FILE = os.environ.get("BENCH_READY_FILE", "/run/bench-ready")
 TIMEOUT = float(os.environ.get("BENCH_CDP_HEALTH_TIMEOUT", "3"))

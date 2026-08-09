@@ -89,6 +89,7 @@ the other.
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import random
@@ -437,6 +438,23 @@ def wait_port(endpoint: str, deadline: float) -> float:
                 raise TimeoutError(f"CDP port {endpoint} never answered")
             time.sleep(delay)
             delay = min(delay * 1.5, 0.02)
+
+
+def sha256_file(path: str) -> str:
+    """Content identity for the exact fcvm binary used by the run."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def command_text(argv: list[str]) -> str:
+    """Best-effort provenance command; the binary hash remains authoritative."""
+    try:
+        return subprocess.check_output(argv, text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
 
 
 # ------------------------------------------------------------------- teardown
@@ -820,7 +838,8 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
 
             endpoint = clone_cdp_endpoint(state, args.cdp_port)
             rec["endpoint"] = endpoint
-            rec["port_wait_ms"] = wait_port(endpoint, deadline)
+            rec["state_to_port_ms"] = wait_port(endpoint, deadline)
+            rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
             ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
             rec["ws_url_prewired"] = bool(ws_url)
@@ -960,12 +979,15 @@ def run_noop_request(args, rep: int) -> dict:
         fcvm_pid = proc.pid
         try:
             deadline = t_spawn + args.timeout
+            t = time.monotonic()
             state_path, state = find_state(args.state_dir, fcvm_pid, deadline, watch, name)
             if state is None:
                 raise TimeoutError("clone state file never appeared")
+            rec["discover_ms"] = (time.monotonic() - t) * 1000
             rec["vm_id"] = state.get("vm_id", "")
             endpoint = clone_cdp_endpoint(state, args.cdp_port)
-            rec["port_wait_ms"] = wait_port(endpoint, deadline)
+            rec["state_to_port_ms"] = wait_port(endpoint, deadline)
+            rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
             rec["ok"] = True
         except Exception as e:
             rec["ok"] = False
@@ -1101,6 +1123,9 @@ def main() -> int:
     p.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
     p.add_argument("--quality", type=int, default=80)
     p.add_argument("--cdp-port", type=int, default=9222)
+    p.add_argument("--image", default="")
+    p.add_argument("--image-id", default="")
+    p.add_argument("--snapshot-name", default="")
     p.add_argument("--ws-url", default="")
     p.add_argument("--fcvm", default=os.path.join(HERE, "..", "..", "target", "release", "fcvm"))
     p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
@@ -1143,6 +1168,17 @@ def main() -> int:
             "kind": "meta", "seed": args.seed,
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
             "warmup": args.warmup, "url": args.url, "format": args.format,
+            "source_revision": command_text([
+                "git", "-C", os.path.abspath(os.path.join(HERE, "..", "..")),
+                "rev-parse", "HEAD",
+            ]),
+            "fcvm_path": args.fcvm,
+            "fcvm_sha256": sha256_file(args.fcvm),
+            "fcvm_version": command_text([args.fcvm, "--version"]),
+            "snapshot": args.snapshot_name or args.snapshot_tag or f"serve-pid:{args.serve_pid}",
+            "image": args.image,
+            "image_id": args.image_id,
+            "cdp_port": args.cdp_port,
             "loadavg": open("/proc/loadavg").read().split()[:3],
             "started": time.time(),
         }

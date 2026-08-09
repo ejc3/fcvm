@@ -96,7 +96,7 @@ fuse = ["fuse3"]
 
 # System services and disk/filesystem tools for nested --disk-dir and --nfs
 # passt: provides pasta for rootless networking (default --network rootless backend)
-system = ["haveged", "chrony", "rsync", "nfs-common", "iptables", "passt", "btrfs-progs", "iputils-arping"]
+system = ["haveged", "chrony", "rsync", "nfs-common", "iptables", "procps", "passt", "btrfs-progs", "iputils-arping"]
 
 # Debugging and networking tools
 debug = ["strace", "netcat-openbsd"]

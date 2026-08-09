@@ -201,14 +201,15 @@ wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp
 
 # ---------------------------------------------------------------------------
 # NO RELAY. Chromium binds guest loopback only (it ignores
-# --remote-debugging-address; see the flag block above), and fcvm now DNATs every
-# PUBLISHED port to 127.0.0.1 inside the guest — so `--publish 9222:9222` reaches
-# Chromium directly. See fc-agent/src/network.rs::publish_to_loopback and
-# DESIGN.md "Published ports always reach guest loopback".
+# --remote-debugging-address; see the flag block above), and fcvm now DNATs each
+# eligible published TCP port to 127.0.0.1 inside the guest — so
+# `--publish 9222:9222` reaches Chromium directly. See
+# fc-agent/src/network.rs::publish_to_loopback and
+# DESIGN.md "Eligible published TCP ports reach guest loopback".
 #
-# The socat relay this replaces was the ONE process this design added to a clone,
-# it sat in the byte path, and the CDP arm carrying it was the only arm that
-# dropped connections (file 1/60, UFFD 6/60; exec 0/66).
+# The deleted socat relay added a measured 2.0 MiB PSS per clone. The earlier
+# request-path A/B that reported connection drops was withdrawn because its arms
+# were not comparable; it is not evidence that the relay caused those failures.
 # ---------------------------------------------------------------------------
 
 echo "chromium-bench: warming renderer"
@@ -226,5 +227,25 @@ echo "CHROMIUM_BENCH_READY cdp=127.0.0.1:$CDP_PORT pages=http://127.0.0.1:$HTTP_
 # container stops instead of hiding a dead browser behind sleep infinity. As
 # PID 1 this shell gets no default signal handlers — without the trap a
 # `podman stop` SIGTERM is dropped and teardown eats the 10s SIGKILL fallback.
-trap 'kill "$CHROME_PID" 2>/dev/null; exit 0' TERM INT
+cleanup_chromium() {
+    # Disable re-entry while this handler waits and reaps.
+    trap - TERM INT
+    kill "$CHROME_PID" 2>/dev/null || true
+
+    # POSIX sh has no timed wait. A reaped timer bounds Chromium's TERM grace
+    # period without polling a zombie (for which kill -0 remains true).
+    (
+        sleep 5
+        if kill -0 "$CHROME_PID" 2>/dev/null; then
+            echo "chromium-bench: Chromium ignored TERM for 5s; sending KILL" >&2
+            kill -KILL "$CHROME_PID" 2>/dev/null || true
+        fi
+    ) &
+    killer_pid=$!
+    wait "$CHROME_PID" 2>/dev/null || true
+    kill "$killer_pid" 2>/dev/null || true
+    wait "$killer_pid" 2>/dev/null || true
+    exit 0
+}
+trap cleanup_chromium TERM INT
 wait "$CHROME_PID"

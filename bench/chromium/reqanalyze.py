@@ -42,6 +42,9 @@ import statistics
 import sys
 
 
+MIN_CDP_ATTEMPTS_PER_BACKEND = 200
+
+
 def median_ci(xs, iters=20000, conf=0.95, seed=12345):
     """Median with a percentile-bootstrap CI. Returns (median, lo, hi, n)."""
     xs = [float(x) for x in xs if x is not None and not math.isnan(float(x))]
@@ -119,8 +122,15 @@ def clopper_pearson(k: int, n: int, conf: float = 0.95):
 
 
 def load(paths):
-    recs, metas = [], []
+    """Load each artifact with the backend declared by that artifact.
+
+    A record does not repeat the backend on every line; its enclosing JSONL file
+    supplies that identity.  Keeping files separate here prevents a `file` run
+    and a `uffd` run passed in one invocation from becoming one synthetic sample.
+    """
+    datasets = []
     for p in paths:
+        recs, metas = [], []
         with open(p) as f:
             for line in f:
                 line = line.strip()
@@ -128,7 +138,29 @@ def load(paths):
                     continue
                 r = json.loads(line)
                 (metas if r.get("kind") == "meta" else recs).append(r)
-    return recs, metas
+
+        errors = []
+        declared = []
+        if not metas:
+            errors.append("no metadata record declares this file's backend")
+        for i, meta in enumerate(metas):
+            backend = meta.get("backend")
+            if not isinstance(backend, str) or not backend.strip():
+                errors.append(f"metadata record {i} has no backend")
+            else:
+                declared.append(backend.strip())
+        backends = sorted(set(declared))
+        if len(backends) > 1:
+            errors.append("file declares multiple backends: " + ", ".join(backends))
+        backend = backends[0] if len(backends) == 1 and not errors else None
+        datasets.append({
+            "backend": backend,
+            "records": recs,
+            "metas": metas,
+            "sources": [p],
+            "metadata_errors": errors,
+        })
+    return datasets
 
 
 def hodges_lehmann_shift(a, b, iters=20000, seed=999):
@@ -174,15 +206,7 @@ def failure_class(r: dict) -> str:
     )
 
 
-def main_with(argv=None):
-    ap = argparse.ArgumentParser()
-    ap.add_argument("jsonl", nargs="+")
-    ap.add_argument("--json-out", default="")
-    ap.add_argument("--no-gate", action="store_true",
-                    help="exit 0 even when this run is unpublishable (exploratory only)")
-    args = ap.parse_args(argv)
-
-    recs, metas = load(args.jsonl)
+def analyze_backend(recs, metas, backend, sources, metadata_errors):
     live = [r for r in recs if not r.get("warmup")]
     warm = [r for r in recs if r.get("warmup")]
     ok = [r for r in live if r.get("ok")]
@@ -191,6 +215,11 @@ def main_with(argv=None):
     print("=" * 78)
     print("REQUEST-OPTIMIZED A/B  --  medians with 95% bootstrap CIs")
     print("=" * 78)
+    print(f"  backend={backend or 'UNASSIGNED'}")
+    for source in sources:
+        print(f"  input={source}")
+    for error in metadata_errors:
+        print(f"  BACKEND METADATA ERROR: {error}")
     for m in metas:
         print(f"  seed={m.get('seed')} arms={m.get('arms')} reps={m.get('reps')} "
               f"warmup={m.get('warmup')} url={m.get('url')}")
@@ -220,7 +249,14 @@ def main_with(argv=None):
     # likely to have leaked, and the ok-filter made `all_gone: false` invisible.
     attempted = {a: [r for r in live if r.get("arm") == a] for a in arms}
 
-    out = {"arms": {}, "n_failed": len(bad), "n_warmup_discarded": len(warm)}
+    out = {
+        "backend": backend,
+        "sources": sources,
+        "metadata_errors": metadata_errors,
+        "arms": {},
+        "n_failed": len(bad),
+        "n_warmup_discarded": len(warm),
+    }
 
     # ---- 0. availability per arm. This gates everything printed below it.
     print("\n" + "-" * 78)
@@ -262,11 +298,45 @@ def main_with(argv=None):
         print("  like-for-like comparison. Quote the per-arm failure rate next to any")
         print("  number taken from an arm marked DO NOT PUBLISH, or do not quote it.")
 
+    # ---- 0b. sample size per backend and per CDP arm. Metadata names the arms
+    # the producer intended to run, so an aborted arm with zero records cannot
+    # disappear from the gate merely by disappearing from the observed records.
+    expected_cdp_arms = set()
+    for meta in metas:
+        for arm in meta.get("arms") or []:
+            if isinstance(arm, str) and arm.startswith("cdp"):
+                expected_cdp_arms.add(arm)
+    if not expected_cdp_arms:
+        expected_cdp_arms.update(a for a in arms if a.startswith("cdp"))
+    expected_cdp_arms = sorted(expected_cdp_arms)
+    cdp_counts = {a: len(attempted.get(a, [])) for a in expected_cdp_arms}
+    cdp_short = {
+        a: count for a, count in cdp_counts.items()
+        if count < MIN_CDP_ATTEMPTS_PER_BACKEND
+    }
+    cdp_sample_passed = bool(expected_cdp_arms) and not cdp_short
+    print("\n" + "-" * 78)
+    print("CDP SAMPLE-SIZE GATE (measured, non-warmup attempts; evaluated per backend)")
+    print("-" * 78)
+    if not expected_cdp_arms:
+        print("  FAIL: no CDP arm is declared or observed")
+    for arm in expected_cdp_arms:
+        count = cdp_counts[arm]
+        verdict = "PASS" if count >= MIN_CDP_ATTEMPTS_PER_BACKEND else "FAIL"
+        print(f"  {arm:9s} {count}/{MIN_CDP_ATTEMPTS_PER_BACKEND} attempts  {verdict}")
+    out["cdp_sample_size"] = {
+        "required_per_arm": MIN_CDP_ATTEMPTS_PER_BACKEND,
+        "expected_arms": expected_cdp_arms,
+        "measured_non_warmup_attempts_per_arm": cdp_counts,
+        "passed": cdp_sample_passed,
+    }
+
     # ---- 1. drift control FIRST. If this moved, nothing below is trustworthy.
     print("\n" + "-" * 78)
     print("DRIFT CONTROL (arm=noop: clone spawn + restore + teardown, NO page, NO CDP)")
     print("-" * 78)
     noop = by.get("noop", [])
+    drifted = False
     if len(noop) >= 6:
         noop_sorted = sorted(noop, key=lambda r: r["rep"])
         half = len(noop_sorted) // 2
@@ -280,9 +350,16 @@ def main_with(argv=None):
         print("  VERDICT: " + ("DRIFT DETECTED -- arm deltas are confounded, do not publish"
                                if drifted else
                                "no significant drift; interleaved arm deltas are usable"))
-        out["drift"] = {"delta_ms": d, "ci": [dlo, dhi], "significant": drifted}
+        out["drift"] = {
+            "evaluated": True, "n": len(noop), "delta_ms": d,
+            "ci": [dlo, dhi], "significant": drifted, "passed": not drifted,
+        }
     else:
         print("  (insufficient noop samples)")
+        out["drift"] = {
+            "evaluated": False, "n": len(noop), "delta_ms": None,
+            "ci": None, "significant": False, "passed": True,
+        }
 
     # ---- 2. end-to-end, measured end to end, never composed from stages
     print("\n" + "-" * 78)
@@ -332,25 +409,30 @@ def main_with(argv=None):
                     "publishable": censor == "",
                 }
 
-    # ---- 4. CDP stage decomposition (the per-request connect cost this design ADDS)
+    # ---- 4. CDP stage decomposition
     print("\n" + "-" * 78)
     # NOT "forward-localhost". That flag is GUEST -> HOST (bench/chromium/AGENTS.md,
     # src/cli/args.rs: "Enables containers to reach host-only services via
     # localhost"), so it cannot carry this path in this direction — and pointing it
     # at the CDP port HIJACKS the guest's own loopback listener. What is actually
-    # measured is `--publish <relay>:<relay>` to guest eth0, then entry.sh's socat
-    # to guest loopback 9222. reqbench.sh never passes --forward-localhost.
-    print("CDP ARMS: per-request stage decomposition (host -> --publish -> guest relay)")
+    # measured is `--publish 9222:9222`; fc-agent DNATs that eligible TCP port to
+    # guest loopback. reqbench.sh never passes --forward-localhost and there is no
+    # benchmark-owned relay in the path.
+    print("CDP ARMS: per-request stage decomposition (host -> --publish -> guest loopback)")
     print("-" * 78)
     stage_keys = ["resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms", "connect_total_ms",
                   "navigate_ms", "screenshot_ms", "total_ms"]
     for a in [x for x in arms if x.startswith("cdp")]:
         print(f"  [{a}]")
-        pw = [r.get("port_wait_ms") for r in by[a] if r.get("port_wait_ms") is not None]
-        if pw:
-            print(f"    {'port_wait_ms':16s} {fmt(*median_ci(pw))}   "
-                  f"(restore -> first TCP accept; the ONLY readiness wait)")
-            out["arms"][a]["port_wait_ms"] = dict(zip(("median", "lo", "hi", "n"), median_ci(pw)))
+        for metric, explanation in (
+            ("spawn_to_port_ms", "process spawn -> first TCP accept; stable readiness boundary"),
+            ("state_to_port_ms", "first state discovery -> first TCP accept; diagnostic only"),
+        ):
+            values = [r.get(metric) for r in by[a] if r.get(metric) is not None]
+            if values:
+                print(f"    {metric:16s} {fmt(*median_ci(values))}   ({explanation})")
+                out["arms"][a][metric] = dict(
+                    zip(("median", "lo", "hi", "n"), median_ci(values)))
         # `--ws-url` prewiring SKIPS /json/list and writes a synthetic
         # `resolve_ms = 0.0`. Pooling that with measured values publishes a stage
         # that was never timed, so the two populations are never mixed.
@@ -491,29 +573,145 @@ def main_with(argv=None):
                           f"all_gone={t.get('all_gone')!r} "
                           f"survivors={t.get('survivors') or t.get('children')}")
 
-    out["publishable"] = not (any_unpublishable or any_unconfirmed_teardown)
+    failed_by_arm = {
+        arm: data["failed"] for arm, data in out["arms"].items()
+        if data.get("failed")
+    }
+    unconfirmed_teardowns = sum(
+        confirmed[1] - confirmed[0]
+        for data in out["arms"].values()
+        if (confirmed := data.get("all_gone_confirmed"))
+    )
+    reasons = []
+    if metadata_errors or backend is None:
+        reasons.append("backend metadata does not assign every input file to one backend")
+    if any_unpublishable:
+        reasons.append("one or more arms dropped requests")
+    if not expected_cdp_arms:
+        reasons.append("no measured CDP arm was declared or observed")
+    for arm, count in cdp_short.items():
+        reasons.append(
+            f"CDP arm {arm} has {count}/{MIN_CDP_ATTEMPTS_PER_BACKEND} "
+            "measured non-warmup attempts"
+        )
+    if drifted:
+        reasons.append("baseline drift was detected in the noop control")
+    if any_unconfirmed_teardown:
+        reasons.append("one or more teardowns were not confirmed gone")
+
+    out["gate"] = {
+        "passed": not reasons,
+        "reasons": reasons,
+        "backend_metadata": {
+            "passed": backend is not None and not metadata_errors,
+            "backend": backend,
+            "sources": sources,
+            "errors": metadata_errors,
+        },
+        "availability": {
+            "passed": not any_unpublishable,
+            "failed_attempts_per_arm": failed_by_arm,
+        },
+        "cdp_sample_size": out["cdp_sample_size"],
+        "baseline_drift": out["drift"],
+        "teardown": {
+            "passed": not any_unconfirmed_teardown,
+            "unconfirmed": unconfirmed_teardowns,
+        },
+    }
+    out["publishable"] = out["gate"]["passed"]
+    return out
+
+
+def main_with(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("jsonl", nargs="+")
+    ap.add_argument("--json-out", default="")
+    ap.add_argument("--no-gate", action="store_true",
+                    help="exit 0 even when this run is unpublishable (exploratory only)")
+    args = ap.parse_args(argv)
+
+    # Valid files with the same backend can contribute to one backend sample.
+    # Files from different backends, and files whose metadata is invalid, never
+    # share an analysis population.
+    groups = []
+    valid_group = {}
+    invalid_number = 0
+    for dataset in load(args.jsonl):
+        backend = dataset["backend"]
+        if backend is None:
+            invalid_number += 1
+            group = dict(dataset)
+            group["key"] = f"unassigned-{invalid_number}"
+            groups.append(group)
+            continue
+        if backend not in valid_group:
+            group = {
+                "key": backend,
+                "backend": backend,
+                "records": [],
+                "metas": [],
+                "sources": [],
+                "metadata_errors": [],
+            }
+            valid_group[backend] = group
+            groups.append(group)
+        group = valid_group[backend]
+        for field in ("records", "metas", "sources", "metadata_errors"):
+            group[field].extend(dataset[field])
+
+    backend_results = {}
+    for group in groups:
+        backend_results[group["key"]] = analyze_backend(
+            group["records"], group["metas"], group["backend"],
+            group["sources"], group["metadata_errors"],
+        )
+
+    overall_reasons = [
+        f"{key}: {reason}"
+        for key, result in backend_results.items()
+        for reason in result["gate"]["reasons"]
+    ]
+    publishable = not overall_reasons
+    exit_code_overridden = bool(args.no_gate and not publishable)
+    if len(backend_results) == 1:
+        # Retain the original convenient top-level `arms` report for callers
+        # analyzing one backend, while making the backend boundary explicit.
+        result = dict(next(iter(backend_results.values())))
+        result["backends"] = backend_results
+        result["gate"] = dict(result["gate"])
+        result["gate"]["exit_code_overridden"] = exit_code_overridden
+    else:
+        result = {
+            "backends": backend_results,
+            "publishable": publishable,
+            "gate": {
+                "passed": publishable,
+                "reasons": overall_reasons,
+                "exit_code_overridden": exit_code_overridden,
+            },
+        }
+
+    # The override changes process control only. It cannot rewrite the evidence
+    # or turn an exploratory run into a publishable one in the JSON artifact.
+    result["publishable"] = publishable
+    result["gate"]["passed"] = publishable
+    result["gate"]["reasons"] = overall_reasons
+
     if args.json_out:
         with open(args.json_out, "w") as f:
-            json.dump(out, f, indent=2, default=str)
+            json.dump(result, f, indent=2, default=str)
         print(f"\nwrote {args.json_out}")
 
-    # GATE, do not merely narrate. This returned 0 on every path: an unpublishable
-    # arm, an unconfirmed teardown and a detected drift all exited 0 while stdout
-    # said ** DO NOT PUBLISH THIS ARM'S LATENCY **. Measured end to end: a run with
-    # 10% cdp transport censoring printed the banner and exited 0. A benchmark
-    # harness that exits 0 on a run it has itself marked DO NOT PUBLISH will
-    # eventually have those numbers quoted by someone who only checked the exit
-    # code.
-    if not out["publishable"]:
-        why = []
-        if any_unpublishable:
-            why.append("an arm dropped requests")
-        if any_unconfirmed_teardown:
-            why.append("a teardown was not confirmed gone")
-        print(f"\nUNPUBLISHABLE RUN ({'; '.join(why)}). Exiting 5.")
-        print("Pass --no-gate to keep an exploratory run at exit 0.")
-        if not args.no_gate:
-            return 5
+    if not publishable:
+        print("\nUNPUBLISHABLE RUN:")
+        for reason in overall_reasons:
+            print(f"  - {reason}")
+        if args.no_gate:
+            print("Exit status overridden by --no-gate; publishable remains false.")
+            return 0
+        print("Exiting 5. Pass --no-gate to override only the exit status.")
+        return 5
     return 0
 
 

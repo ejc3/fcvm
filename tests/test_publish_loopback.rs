@@ -12,8 +12,8 @@
 //! clone: Chromium ignores `--remote-debugging-address` and binds
 //! `127.0.0.1:9222` regardless (measured on 151.0.7922.71 — the flag is present
 //! in `/proc/<pid>/cmdline` while `/proc/net/tcp` shows `0100007F:2406` and
-//! nothing else). The relay sat in the byte path on the one arm that dropped
-//! connections.
+//! nothing else). The deleted relay added a measured 2.0 MiB PSS per clone. A
+//! withdrawn request-path A/B did not establish that it caused connection drops.
 //!
 //! These run ROOTLESS and need no privilege: the rules are installed by fc-agent
 //! inside the guest's own network namespace, so no host root is involved.
@@ -32,7 +32,8 @@ mod common;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::process::Command;
+use std::io::{Read, Seek, SeekFrom};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 /// A loopback-only listener on this port proves the feature.
@@ -48,7 +49,7 @@ struct VmDisplay {
     stale: bool,
 }
 
-fn wait_healthy_loopback_ip(fcvm_path: &std::path::Path, pid: u32) -> Result<String> {
+fn wait_healthy_publish_ip(fcvm_path: &std::path::Path, pid: u32) -> Result<String> {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(180) {
         std::thread::sleep(common::POLL_INTERVAL);
@@ -74,7 +75,8 @@ fn wait_healthy_loopback_ip(fcvm_path: &std::path::Path, pid: u32) -> Result<Str
                     .network
                     .loopback_ip
                     .clone()
-                    .context("VM healthy but has no rootless loopback_ip");
+                    .or_else(|| d.vm.config.network.host_ip.clone())
+                    .context("VM healthy but has no host-side published-port address");
             }
         }
     }
@@ -104,17 +106,20 @@ fn in_vm(fcvm_path: &std::path::Path, pid: u32, script: &str) -> Result<String> 
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// One VM covers the whole contract: the feature works, the egress proxy's port
-/// is excluded, and `route_localnet` is contained. Booting three VMs to assert
-/// three properties of the same rule set would cost three times as long and
-/// prove no more.
-#[test]
-fn test_publish_reaches_loopback_and_stays_contained() -> Result<()> {
-    println!("\ntest_publish_reaches_loopback_and_stays_contained");
+/// One VM per network backend covers the whole contract: host-side publication
+/// reaches guest loopback, the egress proxy's port is excluded, and
+/// `route_localnet` is contained with the DROP first in INPUT.
+fn run_publish_loopback_case(network: &str) -> Result<()> {
+    println!("\npublish loopback case: {network}");
     let fcvm_path = common::find_fcvm_binary()?;
-    let vm_name = format!("publoop-{}", std::process::id());
+    let vm_name = format!("publoop-{network}-{}", std::process::id());
     let host_port = common::find_available_high_port().context("finding a host port")?;
-    let proxy_host_port = common::find_available_high_port().context("finding a host port")?;
+    let mut proxy_host_port =
+        common::find_available_high_port().context("finding a proxy host port")?;
+    while proxy_host_port == host_port {
+        proxy_host_port =
+            common::find_available_high_port().context("finding a distinct proxy host port")?;
+    }
 
     // nginx, whose `listen` directive gives exact control over the bind address —
     // unlike busybox `nc`, which has no bind-address option in this image.
@@ -132,7 +137,7 @@ fn test_publish_reaches_loopback_and_stays_contained() -> Result<()> {
         "--name",
         &vm_name,
         "--network",
-        "rootless",
+        network,
         "--publish",
         &format!("{host_port}:{LOOPBACK_PORT}"),
         // Deliberately ask for the forbidden one too; fc-agent must refuse it.
@@ -148,7 +153,7 @@ fn test_publish_reaches_loopback_and_stays_contained() -> Result<()> {
     let pid = fcvm.id();
 
     let result = (|| -> Result<()> {
-        let ip = wait_healthy_loopback_ip(&fcvm_path, pid)?;
+        let ip = wait_healthy_publish_ip(&fcvm_path, pid)?;
 
         // Wait for the fixture's listener rather than assuming it is up: the
         // container starts after the VM reports healthy.
@@ -214,6 +219,18 @@ fn test_publish_reaches_loopback_and_stays_contained() -> Result<()> {
         //    its own it makes EVERY guest loopback listener reachable from the
         //    guest's segment, which is far wider than --publish opened.
         let input = in_vm(&fcvm_path, pid, "iptables -w -S INPUT")?;
+        let first_input_rule = input
+            .lines()
+            .find(|line| line.starts_with("-A INPUT "))
+            .unwrap_or_default();
+        anyhow::ensure!(
+            first_input_rule.contains("-i eth0")
+                && first_input_rule.contains("127.0.0.0/8")
+                && first_input_rule.contains("--ctstate DNAT")
+                && first_input_rule.ends_with("-j DROP"),
+            "the containment DROP is not rule 1 in INPUT. An earlier ACCEPT would bypass this \
+             security boundary; production must install it with `-I INPUT 1`:\n{input}"
+        );
         anyhow::ensure!(
             input.contains("127.0.0.0/8") && input.contains("DROP"),
             "no containment rule for 127.0.0.0/8 on INPUT. route_localnet is on, so every \
@@ -238,6 +255,82 @@ fn test_publish_reaches_loopback_and_stays_contained() -> Result<()> {
     result
 }
 
+/// Rootless uses pasta's published-port path and is available without host root.
+#[test]
+fn test_publish_reaches_loopback_and_stays_contained_rootless() -> Result<()> {
+    run_publish_loopback_case("rootless")
+}
+
+/// Routed uses the built-in TCP proxy for the host-side published port.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn test_publish_reaches_loopback_and_stays_contained_routed() -> Result<()> {
+    run_publish_loopback_case("routed")
+}
+
+/// Bridged uses the host-veth DNAT path for the host-side published port.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn test_publish_reaches_loopback_and_stays_contained_bridged() -> Result<()> {
+    run_publish_loopback_case("bridged")
+}
+
+fn output_with_deadline(mut cmd: Command, timeout: Duration, failure: &str) -> Result<Output> {
+    // Regular temporary files keep draining independently of this thread and,
+    // unlike pipes, cannot fill and deadlock a verbose child while we poll its
+    // deadline. They also remain readable if a killed descendant briefly keeps
+    // an inherited descriptor open.
+    let mut stdout_file = tempfile::tempfile().context("creating stdout capture")?;
+    let mut stderr_file = tempfile::tempfile().context("creating stderr capture")?;
+    cmd.stdout(Stdio::from(
+        stdout_file.try_clone().context("cloning stdout capture")?,
+    ));
+    cmd.stderr(Stdio::from(
+        stderr_file.try_clone().context("cloning stderr capture")?,
+    ));
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut child = cmd.spawn().context("spawning fcvm")?;
+    let child_pid = child.id();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting for fcvm")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().context("reaping timed-out fcvm")?;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    };
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    stdout_file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stdout_file.read_to_end(&mut stdout))
+        .context("reading fcvm stdout")?;
+    stderr_file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stderr_file.read_to_end(&mut stderr))
+        .context("reading fcvm stderr")?;
+    let out = Output {
+        status,
+        stdout,
+        stderr,
+    };
+    if timed_out {
+        anyhow::bail!(
+            "{failure} within {:.1}s; killed and reaped pid {child_pid}. stdout={} stderr={}",
+            timeout.as_secs_f64(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        );
+    }
+    Ok(out)
+}
+
 /// `--publish P` + `--forward-localhost P` must be REJECTED, not discovered at
 /// runtime.
 ///
@@ -252,23 +345,26 @@ fn test_publish_reaches_loopback_and_stays_contained() -> Result<()> {
 fn test_publish_colliding_with_forward_localhost_is_rejected() -> Result<()> {
     println!("\ntest_publish_colliding_with_forward_localhost_is_rejected");
     let fcvm_path = common::find_fcvm_binary()?;
-    let out = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &format!("collide-{}", std::process::id()),
-            "--network",
-            "rootless",
-            "--publish",
-            "18080:1421",
-            "--forward-localhost",
-            "1421",
-            common::TEST_IMAGE,
-            "true",
-        ])
-        .output()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &format!("collide-{}", std::process::id()),
+        "--network",
+        "rootless",
+        "--publish",
+        "18080:1421",
+        "--forward-localhost",
+        "1421",
+        common::TEST_IMAGE,
+        "true",
+    ]);
+    let out = output_with_deadline(
+        cmd,
+        Duration::from_secs(30),
+        "fcvm did not reject the --publish/--forward-localhost collision",
+    )?;
 
     anyhow::ensure!(
         !out.status.success(),
@@ -298,23 +394,26 @@ fn test_publish_colliding_with_forward_localhost_is_rejected() -> Result<()> {
 fn test_udp_publish_does_not_collide_with_forward_localhost() -> Result<()> {
     println!("\ntest_udp_publish_does_not_collide_with_forward_localhost");
     let fcvm_path = common::find_fcvm_binary()?;
-    let out = Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &format!("udpok-{}", std::process::id()),
-            "--network",
-            "rootless",
-            "--publish",
-            "18081:1422/udp",
-            "--forward-localhost",
-            "1422",
-            common::TEST_IMAGE,
-            "true",
-        ])
-        .output()
-        .context("spawning fcvm")?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &format!("udpok-{}", std::process::id()),
+        "--network",
+        "rootless",
+        "--publish",
+        "18081:1422/udp",
+        "--forward-localhost",
+        "1422",
+        common::TEST_IMAGE,
+        "true",
+    ]);
+    let out = output_with_deadline(
+        cmd,
+        Duration::from_secs(60),
+        "fcvm did not complete the non-conflicting UDP publication case",
+    )?;
     let msg = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

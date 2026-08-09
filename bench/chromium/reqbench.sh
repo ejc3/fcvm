@@ -27,9 +27,10 @@ IMAGE="${IMAGE:-localhost/chromium-bench-req}"
 # 9222 is Chromium's own CDP port. It binds guest loopback ONLY (it ignores
 # --remote-debugging-address; measured evidence in entry.sh), but fcvm DNATs every
 # published port to guest 127.0.0.1, so `--publish 9222:9222` reaches it directly.
-# The socat relay that used to bridge 9223 -> 9222 is gone: it was the only thing
-# in the CDP arm's byte path that the exec arm did not have, and the only arm that
-# dropped connections. See fc-agent/src/network.rs::publish_to_loopback.
+# The former socat relay from 9223 -> 9222 is gone. Removing it saves its measured
+# 2.0 MiB PSS per clone. The earlier availability A/B was withdrawn because its
+# arms were not comparable, so it does not attribute connection failures to that
+# relay. See fc-agent/src/network.rs::publish_to_loopback.
 CDP_PORT="${CDP_PORT:-9222}"
 # rootless: --publish is supported (pasta -t) and clones inherit port_mappings
 # from snapshot metadata (src/commands/snapshot.rs:1070). No root needed, and it
@@ -44,6 +45,7 @@ FCVM_LOG="${FCVM_LOG:-fcvm=debug}"   # AGENTS.md defect 4: never measure at info
 URL="${URL:-http://127.0.0.1:8000/medium.html}"
 
 STATE_DIR="${STATE_DIR:-/mnt/fcvm-btrfs/state}"
+LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 
 mkdir -p "$RESULTS/logs"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -90,20 +92,45 @@ trap cleanup EXIT INT TERM
 
 # Refuse to measure on a box that is already busy. AGENTS.md: contention silently
 # inflates every number; a run published without saying so is the failure mode.
+vm_process_count() {
+    local rows stat comm count=0
+    rows=$(ps -eo stat=,comm=) || {
+        log "REFUSING: cannot inspect running VM processes"
+        return 3
+    }
+    while read -r stat comm; do
+        # A zombie consumes no CPU and cannot contaminate the measurement. It is
+        # still a lifecycle defect, but the benchmark's teardown gate reports it.
+        [[ "$stat" == Z* ]] && continue
+        case "$comm" in
+            fcvm|firecracker*|cloud-hypervis*) count=$((count + 1)) ;;
+        esac
+    done <<<"$rows"
+    printf '%s\n' "$count"
+}
+
 guard_quiet() {
-    # `pgrep -c firecracker` alone never matches a leaked `fcvm snapshot serve`
-    # (its comm is `fcvm`), which is exactly the residue this script's own error
-    # paths used to leave — it would accumulate invisibly while holding the
-    # snapshot mapping. scripts/ci-stray-vm-guard.sh uses this wider pattern for
-    # the same reason.
-    local fc; fc=$(pgrep -c -f '^(.*/)?(firecracker|cloud-hypervisor|fcvm)( |$)' || true)
-    local la; la=$(cut -d' ' -f1 /proc/loadavg)
+    # Match comm, not argv. Repository paths in a tmux/Codex command line used to
+    # make `pgrep -f` count the benchmark operator as an fcvm process. Prefixes
+    # are required because content-addressed Firecracker names and Linux's
+    # 15-character comm truncation defeat exact-name matching.
+    local fc
+    fc=$(vm_process_count) || return $?
+    local la
+    la=$(cut -d' ' -f1 "$LOADAVG_FILE") || {
+        log "REFUSING: cannot read host load from $LOADAVG_FILE"
+        return 3
+    }
+    [[ "$la" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        log "REFUSING: invalid host load in $LOADAVG_FILE: ${la:-<empty>}"
+        return 3
+    }
     log "load=$la vm-processes=$fc"
     if [ "${ALLOW_BUSY:-0}" != 1 ] && { [ "${fc:-0}" -gt 0 ] || \
        [ "$(printf '%.0f' "$la")" -gt 2 ]; }; then
         log "REFUSING: box is busy (load=$la, $fc firecracker/fcvm). Set ALLOW_BUSY=1 to override"
         log "and SAY SO in the report — a number measured under contention is not a number."
-        exit 3
+        return 3
     fi
 }
 
@@ -262,8 +289,8 @@ cmd_verify() {
     start_clone "$spid" "$cname" "$cl" || return 1
     local cpid="$CLONE_PID" ip="$CLONE_IP"
     # An empty IP is the most likely real misconfiguration, and it used to be
-    # fully swallowed: hops B and C then ran against ":9223", failed, printed
-    # FAILED, and verify still exited 0.
+    # fully swallowed: hops B and C then ran against ":$CDP_PORT", failed,
+    # printed FAILED, and verify still exited 0.
     [ -n "$ip" ] || { log "verify: NO host-side IP in the clone's network config"; fail=1; }
     log "verify: clone pid=$cpid host-side ip=$ip"
 
@@ -333,9 +360,18 @@ PY
 BACKEND="${BACKEND:-uffd}"
 
 cmd_run() {
-    guard_quiet
+    local guard_rc=0
+    guard_quiet || guard_rc=$?
+    if [ "$guard_rc" -ne 0 ]; then
+        log "FATAL: no measurements were taken because the quiet-host guard refused the run"
+        return "$guard_rc"
+    fi
     local rc=0 spid="" serve_bg=""
     local backend_args=()
+    local image_id
+    image_id=$(podman image inspect "$IMAGE" --format '{{.Id}}') \
+        || { log "run: cannot identify benchmark image $IMAGE"; return 1; }
+    [ -n "$image_id" ] || { log "run: benchmark image $IMAGE has an empty content ID"; return 1; }
     case "$BACKEND" in
         uffd)
             log "run: BACKEND=uffd — starting serve for $TAG"
@@ -368,6 +404,7 @@ cmd_run() {
     $SUDO env RUST_LOG=$FCVM_LOG python3 "$HERE/reqbench.py" "${backend_args[@]}" --url "$URL" \
         --out-dir "$RESULTS" --reps "${REPS:-10}" --warmup "${WARMUP:-2}" \
         --cdp-port "$CDP_PORT" --fcvm "$FCVM" --rust-log "$FCVM_LOG" \
+        --image "$IMAGE" --image-id "$image_id" --snapshot-name "$TAG" \
         --arms "${ARMS:-exec,cdp,cdp-fast,noop}" || rc=$?
     if [ -n "$spid" ]; then
         $SUDO kill "$spid" 2>/dev/null || true
@@ -375,7 +412,16 @@ cmd_run() {
         # race a serve that is still shutting down.
         wait "$serve_bg" 2>/dev/null || true
     fi
-    log "run: results in $RESULTS (backend=$BACKEND, reqbench.py exit $rc)"
+    # A completed driver is not automatically a publishable run: request-level
+    # failures and an under-sized backend arm are recorded in JSONL rather than
+    # necessarily making the producer exit non-zero. Make the analyzer part of
+    # the run contract and propagate its gate status.
+    if [ "$rc" -eq 0 ]; then
+        log "run: applying publication gates"
+        $SUDO python3 "$HERE/reqanalyze.py" --json-out "$RESULTS/analysis.json" \
+            "$RESULTS/reqbench.jsonl" || rc=$?
+    fi
+    log "run: results in $RESULTS (backend=$BACKEND, gated run exit $rc)"
     return $rc
 }
 
