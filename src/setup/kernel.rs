@@ -1320,7 +1320,7 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 // Profile Firecracker Setup
 // ============================================================================
 
-/// Fetch the latest commit hash for a repo/branch via git ls-remote.
+/// Fetch the short commit identity used by the unpinned Cloud Hypervisor path.
 async fn fetch_remote_commit_hash(repo: &str, branch: &str) -> Result<String> {
     let url = format!("https://github.com/{}", repo);
     let output = tokio::process::Command::new("git")
@@ -1345,23 +1345,162 @@ async fn fetch_remote_commit_hash(repo: &str, branch: &str) -> Result<String> {
     Ok(commit[..12].to_string()) // First 12 chars of commit hash
 }
 
-/// Compute SHA for profile firecracker binary (repo + branch + commit)
+/// Parse the commit selected for a Firecracker ref.
+///
+/// Kept separate from the command runner so ref-resolution identity can be
+/// tested without mutating process-global PATH or contacting GitHub.
+fn parse_firecracker_remote_commit(stdout: &str) -> Result<String> {
+    let commits: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    if commits.len() != 1 {
+        bail!(
+            "expected exactly one firecracker ref, found {}",
+            commits.len()
+        );
+    }
+    validate_full_git_commit(commits[0], "resolved firecracker ref")?;
+    Ok(commits[0].to_string())
+}
+
+/// Fetch the commit selected for a Firecracker repo/ref.
+async fn fetch_remote_firecracker_commit(repo: &str, branch: &str) -> Result<String> {
+    let url = format!("https://github.com/{}", repo);
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", "--refs", &url, branch])
+        .output()
+        .await
+        .context("running git ls-remote for firecracker")?;
+
+    if !output.status.success() {
+        bail!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    parse_firecracker_remote_commit(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Select the source commit after resolving the configured remote ref.
+fn select_firecracker_commit(pinned_commit: Option<&str>, resolved_commit: &str) -> Result<String> {
+    validate_full_git_commit(resolved_commit, "resolved firecracker ref")?;
+    if let Some(pinned_commit) = pinned_commit {
+        validate_full_git_commit(pinned_commit, "configured firecracker commit")?;
+        if pinned_commit != resolved_commit {
+            bail!(
+                "configured firecracker commit {} does not match resolved ref commit {}",
+                pinned_commit,
+                resolved_commit
+            );
+        }
+        return Ok(pinned_commit.to_string());
+    }
+    Ok(resolved_commit.to_string())
+}
+
+/// Verify that the clone used for a build has the source identity we selected.
+fn verify_firecracker_checkout_commit(expected: &str, actual: &str) -> Result<()> {
+    validate_full_git_commit(expected, "selected firecracker commit")?;
+    validate_full_git_commit(actual, "cloned firecracker commit")?;
+    if expected != actual {
+        bail!(
+            "cloned firecracker commit {} does not match selected commit {}",
+            actual,
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn validate_full_git_commit(commit: &str, source: &str) -> Result<()> {
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!(
+            "{} must be a full 40-character lowercase Git commit, got {:?}",
+            source,
+            commit
+        );
+    }
+    Ok(())
+}
+
+/// Compute SHA for a profile Firecracker binary.
+///
+/// Repo, ref, full commit, architecture, and libc all affect the executable;
+/// every one is part of the cache identity.
 fn compute_profile_firecracker_sha_with_commit(
     profile: &KernelProfile,
     commit_hash: &str,
 ) -> String {
+    compute_profile_firecracker_sha_for(
+        profile,
+        commit_hash,
+        std::env::consts::ARCH,
+        &libc_version_tag(),
+    )
+}
+
+fn compute_profile_firecracker_sha_for(
+    profile: &KernelProfile,
+    commit_hash: &str,
+    arch: &str,
+    libc_tag: &str,
+) -> String {
     let repo = profile.firecracker_repo.as_deref().unwrap_or("");
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
+    compute_firecracker_sha_for_fields(repo, branch, commit_hash, arch, libc_tag)
+}
+
+fn compute_firecracker_sha_for_fields(
+    repo: &str,
+    branch: &str,
+    commit_hash: &str,
+    arch: &str,
+    libc_tag: &str,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(repo.as_bytes());
-    hasher.update(branch.as_bytes());
-    hasher.update(commit_hash.as_bytes());
-    // Include libc version so host and container don't share a dynamically-linked binary.
-    // Different glibc versions produce incompatible binaries.
-    hasher.update(libc_version_tag().as_bytes());
+    hasher.update(b"fcvm-firecracker-cache-v2\0");
+    // Length-prefix every field so shifting a byte across a field boundary
+    // cannot alias another valid source/build identity.
+    for field in [repo, branch, commit_hash, arch, libc_tag] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
     let result = hasher.finalize();
     hex::encode(&result[..6]) // 12 hex chars
+}
+
+fn profile_firecracker_path_for_build(
+    dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    commit_hash: &str,
+    arch: &str,
+    libc_tag: &str,
+) -> PathBuf {
+    let sha = compute_firecracker_sha_for_fields(repo, branch, commit_hash, arch, libc_tag);
+    dir.join(format!("firecracker-{profile_name}-{sha}.bin"))
+}
+
+fn firecracker_install_temp_path(bin_path: &Path, nonce: uuid::Uuid) -> PathBuf {
+    let name = bin_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "firecracker".into());
+    bin_path.with_file_name(format!(".{name}.{nonce}.tmp"))
+}
+
+fn firecracker_build_dir(profile_name: &str, sha: &str, nonce: uuid::Uuid) -> PathBuf {
+    PathBuf::from(format!(
+        "/tmp/firecracker-build-{profile_name}-{sha}-{nonce}"
+    ))
 }
 
 /// Return a string identifying the C library (e.g. "glibc-2.39" or "musl-1.2.4").
@@ -1411,8 +1550,10 @@ const FIRECRACKER_RESOLVE_TTL_ENV: &str = "FCVM_FIRECRACKER_RESOLVE_TTL_SECS";
 
 /// A previously completed remote resolution of a profile's firecracker binary.
 ///
-/// Persisted at `assets_dir/firecracker/<profile>.resolved.json` so VM launches
-/// can reuse it instead of paying a `git ls-remote` round trip to GitHub.
+/// Persisted under `assets_dir/firecracker/` with a profile plus full
+/// repo/ref/architecture/libc identity so VM launches can reuse it instead of
+/// paying a `git ls-remote` round trip to GitHub. Independent build
+/// environments never overwrite one another's record.
 ///
 /// Concurrency: written with a unique temp file + atomic rename, never a lock —
 /// `assets_dir` can be shared across nesting levels over fuse-pipe, where
@@ -1436,8 +1577,43 @@ fn firecracker_cache_dir() -> PathBuf {
     paths::assets_dir().join("firecracker")
 }
 
-fn firecracker_resolution_path(dir: &Path, profile_name: &str) -> PathBuf {
-    dir.join(format!("{}.resolved.json", profile_name))
+fn firecracker_resolution_identity(repo: &str, branch: &str, arch: &str, libc_tag: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fcvm-firecracker-resolution-v1\0");
+    for field in [repo, branch, arch, libc_tag] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+fn firecracker_resolution_path(
+    dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+) -> PathBuf {
+    firecracker_resolution_path_for_build(
+        dir,
+        profile_name,
+        repo,
+        branch,
+        std::env::consts::ARCH,
+        &libc_version_tag(),
+    )
+}
+
+fn firecracker_resolution_path_for_build(
+    dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    arch: &str,
+    libc_tag: &str,
+) -> PathBuf {
+    let identity = firecracker_resolution_identity(repo, branch, arch, libc_tag);
+    dir.join(format!("{profile_name}-{identity}.resolved.json"))
 }
 
 /// How long a cached resolution stays usable before the remote is re-queried.
@@ -1481,10 +1657,31 @@ fn fresh_cached_firecracker_resolution_in(
     branch: &str,
     ttl_secs: u64,
 ) -> Option<PathBuf> {
+    fresh_cached_firecracker_resolution_in_for_build(
+        dir,
+        profile_name,
+        repo,
+        branch,
+        ttl_secs,
+        std::env::consts::ARCH,
+        &libc_version_tag(),
+    )
+}
+
+fn fresh_cached_firecracker_resolution_in_for_build(
+    dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    ttl_secs: u64,
+    arch: &str,
+    libc_tag: &str,
+) -> Option<PathBuf> {
     if ttl_secs == 0 {
         return None;
     }
-    let path = firecracker_resolution_path(dir, profile_name);
+    let path =
+        firecracker_resolution_path_for_build(dir, profile_name, repo, branch, arch, libc_tag);
     let raw = std::fs::read_to_string(&path).ok()?;
     let entry: FirecrackerResolution = match serde_json::from_str(&raw) {
         Ok(e) => e,
@@ -1493,7 +1690,33 @@ fn fresh_cached_firecracker_resolution_in(
             return None;
         }
     };
+    if let Err(error) = validate_full_git_commit(&entry.commit_hash, "cached firecracker commit") {
+        warn!(
+            path = %path.display(),
+            error = %error,
+            "ignoring firecracker resolution cache without a full commit identity"
+        );
+        return None;
+    }
     if entry.repo != repo || entry.branch != branch {
+        return None;
+    }
+    let expected_path = profile_firecracker_path_for_build(
+        dir,
+        profile_name,
+        repo,
+        branch,
+        &entry.commit_hash,
+        arch,
+        libc_tag,
+    );
+    if entry.resolved_path != expected_path {
+        warn!(
+            path = %path.display(),
+            recorded_path = %entry.resolved_path.display(),
+            expected_path = %expected_path.display(),
+            "ignoring firecracker resolution cache for another build identity"
+        );
         return None;
     }
     // A resolution stamped in the future (clock moved backwards) is treated as
@@ -1530,6 +1753,35 @@ fn record_firecracker_resolution_in(
     commit_hash: &str,
     resolved_path: &Path,
 ) {
+    record_firecracker_resolution_in_for_build(
+        dir,
+        profile_name,
+        repo,
+        branch,
+        commit_hash,
+        resolved_path,
+        FirecrackerBuildEnvironment {
+            arch: std::env::consts::ARCH,
+            libc_tag: &libc_version_tag(),
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+struct FirecrackerBuildEnvironment<'a> {
+    arch: &'a str,
+    libc_tag: &'a str,
+}
+
+fn record_firecracker_resolution_in_for_build(
+    dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    commit_hash: &str,
+    resolved_path: &Path,
+    build: FirecrackerBuildEnvironment<'_>,
+) {
     let entry = FirecrackerResolution {
         repo: repo.to_string(),
         branch: branch.to_string(),
@@ -1537,7 +1789,14 @@ fn record_firecracker_resolution_in(
         resolved_path: resolved_path.to_path_buf(),
         resolved_at_secs: unix_now_secs(),
     };
-    let final_path = firecracker_resolution_path(dir, profile_name);
+    let final_path = firecracker_resolution_path_for_build(
+        dir,
+        profile_name,
+        repo,
+        branch,
+        build.arch,
+        build.libc_tag,
+    );
     if let Err(e) = write_json_atomic(&final_path, &entry) {
         // Non-fatal: the next launch just pays the ls-remote again.
         warn!(
@@ -1553,22 +1812,6 @@ fn record_firecracker_resolution_in(
         commit = %commit_hash,
         "recorded firecracker resolution"
     );
-}
-
-/// [`fresh_cached_firecracker_resolution_in`] against the real assets dir.
-fn fresh_cached_firecracker_resolution(
-    profile_name: &str,
-    repo: &str,
-    branch: &str,
-    ttl_secs: u64,
-) -> Option<PathBuf> {
-    fresh_cached_firecracker_resolution_in(
-        &firecracker_cache_dir(),
-        profile_name,
-        repo,
-        branch,
-        ttl_secs,
-    )
 }
 
 /// [`record_firecracker_resolution_in`] against the real assets dir.
@@ -1629,13 +1872,19 @@ fn write_json_atomic<T: serde::Serialize>(final_path: &Path, value: &T) -> Resul
 /// This runs on the **VM launch / snapshot clone hot path**, so it does NOT
 /// contact the network on every call. Resolution order:
 ///
-/// 1. `assets_dir/firecracker/<profile>.resolved.json` — the result of the last
-///    remote resolution. Used when it names the same repo/branch, is younger
-///    than the TTL, and still points at an existing binary.
+/// When `firecracker_commit` is set, its exact content-addressed path is
+/// computed locally. Launch never contacts the network and never falls back to
+/// another cached build. Setup verifies both the remote ref and cloned HEAD.
+///
+/// Without a commit pin, resolution order is:
+///
+/// 1. The profile's repo/ref/architecture/libc-specific resolution record —
+///    the result of the last remote resolution for that exact build identity.
+///    Used when it is younger than the TTL and still points at its exact binary.
 /// 2. `git ls-remote` against the configured repo/branch, which then rewrites
 ///    the cache (only when the resolved binary exists).
-/// 3. Offline fallback: the newest cached `firecracker-<profile>-*.bin`. Errors
-///    if the remote is unreachable and nothing is cached.
+/// 3. Offline fallback: the same exact identity's stale resolution record.
+///    Errors if the remote is unreachable and that record/binary is absent.
 ///
 /// The TTL is `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` seconds (default 3600);
 /// setting it to `0` forces a remote refresh on every call.
@@ -1650,35 +1899,89 @@ pub async fn get_profile_firecracker_path(
     profile: &KernelProfile,
     profile_name: &str,
 ) -> Result<Option<PathBuf>> {
+    get_profile_firecracker_path_in(profile, profile_name, &firecracker_cache_dir()).await
+}
+
+async fn get_profile_firecracker_path_in(
+    profile: &KernelProfile,
+    profile_name: &str,
+    firecracker_dir: &Path,
+) -> Result<Option<PathBuf>> {
     // Only return path if profile has a custom firecracker configured
-    let repo = match profile.firecracker_repo.as_ref() {
+    let repo = match profile.firecracker_repo.as_deref() {
         Some(r) => r,
+        None if profile.firecracker_commit.is_some() => {
+            bail!("firecracker_commit requires firecracker_repo")
+        }
         None => return Ok(None),
     };
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
+    // An immutable pin makes the launch path fully offline and forbids falling
+    // back to a different cached build. `fcvm setup` already verified that the
+    // configured ref and cloned checkout both named this exact commit.
+    if let Some(commit_hash) = profile.firecracker_commit.as_deref() {
+        validate_full_git_commit(commit_hash, "configured firecracker commit")?;
+        let resolved = profile_firecracker_path_for_build(
+            firecracker_dir,
+            profile_name,
+            repo,
+            branch,
+            commit_hash,
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        );
+        return Ok(Some(resolved));
+    }
+
     // Fast path: reuse the last remote resolution and skip the network entirely.
     let ttl_secs = firecracker_resolve_ttl_secs();
-    if let Some(cached) = fresh_cached_firecracker_resolution(profile_name, repo, branch, ttl_secs)
-    {
+    if let Some(cached) = fresh_cached_firecracker_resolution_in(
+        firecracker_dir,
+        profile_name,
+        repo,
+        branch,
+        ttl_secs,
+    ) {
         return Ok(Some(cached));
     }
 
     // Fetch latest commit hash to detect updates
-    match fetch_remote_commit_hash(repo, branch).await {
-        Ok(commit_hash) => {
-            let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
-            let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
-            let resolved = paths::assets_dir().join("firecracker").join(filename);
+    match fetch_remote_firecracker_commit(repo, branch).await {
+        Ok(resolved_commit) => {
+            let commit_hash = select_firecracker_commit(None, &resolved_commit)?;
+            let resolved = profile_firecracker_path_for_build(
+                firecracker_dir,
+                profile_name,
+                repo,
+                branch,
+                &commit_hash,
+                std::env::consts::ARCH,
+                &libc_version_tag(),
+            );
             // Only cache resolutions that name a binary that actually exists, so
             // a not-yet-built profile keeps re-resolving (and keeps failing loudly
             // in get_firecracker_for_profile) instead of caching a dead path.
             if resolved.exists() {
-                record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &resolved);
+                record_firecracker_resolution_in(
+                    firecracker_dir,
+                    profile_name,
+                    repo,
+                    branch,
+                    &commit_hash,
+                    &resolved,
+                );
             }
             Ok(Some(resolved))
         }
-        Err(e) => match newest_cached_profile_firecracker(profile_name)? {
+        Err(e) => match offline_cached_firecracker_resolution_in(
+            firecracker_dir,
+            profile_name,
+            repo,
+            branch,
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        )? {
             Some(cached) => {
                 warn!(
                     profile = %profile_name,
@@ -1698,26 +2001,23 @@ pub async fn get_profile_firecracker_path(
 }
 
 /// Find the most recently modified cached firecracker binary for a profile.
-fn newest_cached_profile_firecracker(profile_name: &str) -> Result<Option<PathBuf>> {
-    let firecracker_dir = paths::assets_dir().join("firecracker");
-    let pattern = format!(
-        "{}/firecracker-{}-*.bin",
-        firecracker_dir.display(),
-        profile_name
-    );
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for path in glob(&pattern)
-        .context("globbing cached firecracker binaries")?
-        .filter_map(|e| e.ok())
-    {
-        let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
-            newest = Some((mtime, path));
-        }
-    }
-    Ok(newest.map(|(_, path)| path))
+fn offline_cached_firecracker_resolution_in(
+    firecracker_dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    arch: &str,
+    libc_tag: &str,
+) -> Result<Option<PathBuf>> {
+    Ok(fresh_cached_firecracker_resolution_in_for_build(
+        firecracker_dir,
+        profile_name,
+        repo,
+        branch,
+        u64::MAX,
+        arch,
+        libc_tag,
+    ))
 }
 
 /// Get the firecracker binary path for a kernel profile.
@@ -1746,11 +2046,28 @@ pub async fn get_firecracker_for_profile(
     which::which("firecracker").context("firecracker not found in PATH")
 }
 
+/// Resolve a profile's explicitly configured Firecracker, if it has one.
+///
+/// This seam keeps cold boot and snapshot restore on one resolution policy.
+pub async fn get_configured_firecracker_for_profile(
+    profile: &KernelProfile,
+    profile_name: &str,
+) -> Result<Option<PathBuf>> {
+    if profile.firecracker_repo.is_none() && profile.firecracker_commit.is_none() {
+        return Ok(None);
+    }
+    get_firecracker_for_profile(profile, profile_name)
+        .await
+        .map(Some)
+        .with_context(|| format!("resolving configured Firecracker for profile '{profile_name}'"))
+}
+
 /// Ensure the firecracker binary for a kernel profile exists.
 ///
-/// Uses content-addressed naming: firecracker-{profile}-{sha}.bin
-/// where SHA is computed from firecracker_repo + firecracker_branch + commit_hash.
-/// Automatically detects and rebuilds when new commits are pushed.
+/// Uses content-addressed naming: firecracker-{profile}-{sha}.bin, where SHA
+/// covers repo + ref + full commit + architecture + libc. With a configured
+/// commit pin, setup fails closed unless both the remote ref and cloned HEAD
+/// equal that pin. Without a pin it detects and builds the current ref commit.
 ///
 /// This is the `fcvm setup` path and it **always** performs the remote
 /// resolution (`git ls-remote`), then rewrites the launch-time resolution cache
@@ -1762,15 +2079,20 @@ pub async fn ensure_profile_firecracker(
     profile_name: &str,
 ) -> Result<Option<PathBuf>> {
     // Check if profile needs custom firecracker
-    let repo = match &profile.firecracker_repo {
+    let repo = match profile.firecracker_repo.as_deref() {
         Some(r) => r,
+        None if profile.firecracker_commit.is_some() => {
+            bail!("firecracker_commit requires firecracker_repo")
+        }
         None => return Ok(None), // No custom firecracker needed
     };
 
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
     // Fetch latest commit hash to detect updates
-    let commit_hash = fetch_remote_commit_hash(repo, branch).await?;
+    let resolved_commit = fetch_remote_firecracker_commit(repo, branch).await?;
+    let commit_hash =
+        select_firecracker_commit(profile.firecracker_commit.as_deref(), &resolved_commit)?;
     let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
 
     // Content-addressed path in assets dir (alongside kernels)
@@ -1824,10 +2146,11 @@ pub async fn ensure_profile_firecracker(
     );
     println!("    This may take 5-10 minutes...");
 
-    // Build in a per-asset temp directory. The flock above is per profile+SHA, so
-    // concurrent builds of different profiles/SHAs hold different locks and must
-    // not share a build tree (one would delete the other's checkout mid-build).
-    let build_dir = PathBuf::from(format!("/tmp/firecracker-build-{}-{}", profile_name, sha));
+    // Build in a per-invocation temp directory. The flock above may live on a
+    // fuse-pipe shared assets directory, where separate guest kernels do not
+    // share flock state; unique paths keep those builders from deleting or
+    // compiling inside one another's checkout.
+    let build_dir = firecracker_build_dir(profile_name, &sha, uuid::Uuid::new_v4());
 
     // Clean up old build
     if build_dir.exists() {
@@ -1842,6 +2165,8 @@ pub async fn ensure_profile_firecracker(
         .args([
             "clone",
             "--depth=1",
+            "--single-branch",
+            "--no-tags",
             "-b",
             branch,
             &clone_url,
@@ -1854,6 +2179,26 @@ pub async fn ensure_profile_firecracker(
     if !status.success() {
         flock.unlock().map_err(|(_, err)| err)?;
         bail!("Failed to clone firecracker repo from {}", clone_url);
+    }
+
+    let checkout = Command::new("git")
+        .args(["-C", build_dir.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("reading cloned firecracker HEAD")?;
+    if !checkout.status.success() {
+        flock.unlock().map_err(|(_, err)| err)?;
+        bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
+    if let Err(error) = verify_firecracker_checkout_commit(
+        &commit_hash,
+        String::from_utf8_lossy(&checkout.stdout).trim(),
+    ) {
+        flock.unlock().map_err(|(_, err)| err)?;
+        return Err(error);
     }
 
     // Build firecracker
@@ -1889,7 +2234,7 @@ pub async fn ensure_profile_firecracker(
     // Copy to a temp name in the same directory, then atomically rename onto the
     // content-addressed path. An interrupted or failed copy (kill, ENOSPC) must
     // never leave a partial binary that later runs treat as valid.
-    let temp_path = bin_path.with_extension("tmp");
+    let temp_path = firecracker_install_temp_path(&bin_path, uuid::Uuid::new_v4());
     let _ = tokio::fs::remove_file(&temp_path).await;
     if let Err(e) = tokio::fs::copy(&binary, &temp_path).await {
         let _ = tokio::fs::remove_file(&temp_path).await;
@@ -2387,11 +2732,166 @@ cp vmlinux arch/arm64/boot/Image
     const REPO: &str = "ejc3/firecracker";
     const BRANCH: &str = "bump-vsock-max-connections";
     const TTL: u64 = 3600;
+    const PINNED_COMMIT: &str = "27305f49ab3a5d862dc56b5108713b6536d2baa7";
+    const MOVED_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    /// Create the cache dir plus a stand-in firecracker binary inside it.
-    fn resolution_fixture(dir: &Path, sha: &str) -> PathBuf {
+    #[test]
+    fn firecracker_remote_resolution_preserves_full_commit() {
+        let output = format!("{PINNED_COMMIT}\trefs/heads/agent/nv2\n");
+        assert_eq!(
+            parse_firecracker_remote_commit(&output).unwrap(),
+            PINNED_COMMIT,
+            "the resolution manifest and checkout verifier need the full object id"
+        );
+    }
+
+    #[test]
+    fn firecracker_remote_resolution_rejects_ambiguous_or_malformed_refs() {
+        let ambiguous =
+            format!("{PINNED_COMMIT}\trefs/heads/release\n{MOVED_COMMIT}\trefs/tags/release\n");
+        assert!(parse_firecracker_remote_commit(&ambiguous).is_err());
+        assert!(parse_firecracker_remote_commit("1234\trefs/heads/main\n").is_err());
+        assert!(
+            select_firecracker_commit(Some("ABCDEF"), PINNED_COMMIT).is_err(),
+            "a short or non-canonical pin must fail before any build"
+        );
+    }
+
+    #[test]
+    fn pinned_firecracker_ref_movement_is_rejected() {
+        let err = select_firecracker_commit(Some(PINNED_COMMIT), MOVED_COMMIT).unwrap_err();
+        assert!(
+            err.to_string().contains(PINNED_COMMIT) && err.to_string().contains(MOVED_COMMIT),
+            "the mismatch error must name both identities: {err:#}"
+        );
+    }
+
+    #[test]
+    fn firecracker_checkout_mismatch_is_rejected() {
+        let err = verify_firecracker_checkout_commit(PINNED_COMMIT, MOVED_COMMIT).unwrap_err();
+        assert!(
+            err.to_string().contains(PINNED_COMMIT) && err.to_string().contains(MOVED_COMMIT),
+            "the mismatch error must name both identities: {err:#}"
+        );
+    }
+
+    #[test]
+    fn firecracker_cache_key_includes_target_architecture() {
+        let profile = KernelProfile {
+            firecracker_repo: Some(REPO.to_string()),
+            firecracker_branch: Some(BRANCH.to_string()),
+            ..Default::default()
+        };
+        let arm =
+            compute_profile_firecracker_sha_for(&profile, PINNED_COMMIT, "aarch64", "glibc-2.39");
+        let x86 =
+            compute_profile_firecracker_sha_for(&profile, PINNED_COMMIT, "x86_64", "glibc-2.39");
+        assert_ne!(
+            arm, x86,
+            "shared assets must not alias Firecracker binaries for different architectures"
+        );
+    }
+
+    #[test]
+    fn firecracker_cache_key_separates_field_boundaries() {
+        let first = KernelProfile {
+            firecracker_repo: Some("ejc3/fire".to_string()),
+            firecracker_branch: Some("cracker".to_string()),
+            ..Default::default()
+        };
+        let second = KernelProfile {
+            firecracker_repo: Some("ejc3/firec".to_string()),
+            firecracker_branch: Some("racker".to_string()),
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_profile_firecracker_sha_for(&first, PINNED_COMMIT, "aarch64", "glibc-2.39"),
+            compute_profile_firecracker_sha_for(&second, PINNED_COMMIT, "aarch64", "glibc-2.39"),
+            "adjacent cache-key fields must not admit boundary-shifting collisions"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_firecracker_pin_without_repo_is_rejected() {
+        let profile = KernelProfile {
+            firecracker_commit: Some(PINNED_COMMIT.to_string()),
+            ..Default::default()
+        };
+        let error = get_configured_firecracker_for_profile(&profile, "pin-without-repo")
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("firecracker_repo"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn missing_pinned_firecracker_never_falls_back_to_system_binary() {
+        let profile = KernelProfile {
+            firecracker_repo: Some(REPO.to_string()),
+            firecracker_branch: Some(BRANCH.to_string()),
+            firecracker_commit: Some(MOVED_COMMIT.to_string()),
+            ..Default::default()
+        };
+        let profile_name = format!("missing-pin-{}", uuid::Uuid::new_v4());
+        let error = get_configured_firecracker_for_profile(&profile, &profile_name)
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("Run: fcvm setup"),
+            "the missing exact artifact must fail before PATH fallback: {error}"
+        );
+    }
+
+    #[test]
+    fn concurrent_firecracker_installs_use_unique_temp_paths() {
+        let final_path = Path::new("/assets/firecracker/firecracker-nested-deadbeef.bin");
+        let first = firecracker_install_temp_path(
+            final_path,
+            uuid::Uuid::from_u128(0x11111111111111111111111111111111),
+        );
+        let second = firecracker_install_temp_path(
+            final_path,
+            uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+        );
+        assert_ne!(
+            first, second,
+            "concurrent builders must not share a temp file"
+        );
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn concurrent_firecracker_builds_use_unique_checkout_paths() {
+        let first = firecracker_build_dir(
+            "nested",
+            "deadbeef0000",
+            uuid::Uuid::from_u128(0x11111111111111111111111111111111),
+        );
+        let second = firecracker_build_dir(
+            "nested",
+            "deadbeef0000",
+            uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+        );
+        assert_ne!(
+            first, second,
+            "builders with different assets-dir locks must not share a checkout"
+        );
+    }
+
+    /// Create a stand-in binary at the exact current-build cache path.
+    fn resolution_fixture(dir: &Path, commit: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
-        let bin = dir.join(format!("firecracker-default-{}.bin", sha));
+        let bin = profile_firecracker_path_for_build(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            commit,
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        );
         std::fs::write(&bin, b"fake firecracker").unwrap();
         bin
     }
@@ -2400,14 +2900,14 @@ cp vmlinux arch/arm64/boot/Image
     fn resolution_cache_hit_returns_recorded_path() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let bin = resolution_fixture(dir, "aaaaaaaaaaaa");
+        let bin = resolution_fixture(dir, PINNED_COMMIT);
 
         // Nothing recorded yet -> miss (caller pays the ls-remote).
         assert!(
             fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL).is_none()
         );
 
-        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &bin);
         assert_eq!(
             fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL),
             Some(bin)
@@ -2415,14 +2915,239 @@ cp vmlinux arch/arm64/boot/Image
     }
 
     #[test]
+    fn resolution_cache_rejects_truncated_commit_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bin = resolution_fixture(dir, "27305f49ab3a");
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "27305f49ab3a", &bin);
+
+        assert!(
+            fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL).is_none(),
+            "a cache entry without the full source identity must be refreshed"
+        );
+    }
+
+    #[test]
+    fn resolution_cache_rejects_other_build_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let arm_path = profile_firecracker_path_for_build(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            PINNED_COMMIT,
+            "aarch64",
+            "glibc-2.39",
+        );
+        std::fs::write(&arm_path, b"arm firecracker").unwrap();
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &arm_path);
+
+        assert!(
+            fresh_cached_firecracker_resolution_in_for_build(
+                dir,
+                "default",
+                REPO,
+                BRANCH,
+                TTL,
+                "x86_64",
+                "glibc-2.39",
+            )
+            .is_none(),
+            "a manifest path for another architecture must not bypass the cache key"
+        );
+        assert!(
+            fresh_cached_firecracker_resolution_in_for_build(
+                dir,
+                "default",
+                REPO,
+                BRANCH,
+                TTL,
+                "aarch64",
+                "musl-1.2.5",
+            )
+            .is_none(),
+            "a manifest path for another libc must not bypass the cache key"
+        );
+    }
+
+    #[test]
+    fn resolution_cache_keeps_independent_build_identities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let arm_path = profile_firecracker_path_for_build(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            PINNED_COMMIT,
+            "aarch64",
+            "glibc-2.39",
+        );
+        let x86_path = profile_firecracker_path_for_build(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            PINNED_COMMIT,
+            "x86_64",
+            "glibc-2.39",
+        );
+        std::fs::write(&arm_path, b"arm firecracker").unwrap();
+        std::fs::write(&x86_path, b"x86 firecracker").unwrap();
+
+        record_firecracker_resolution_in_for_build(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            PINNED_COMMIT,
+            &arm_path,
+            FirecrackerBuildEnvironment {
+                arch: "aarch64",
+                libc_tag: "glibc-2.39",
+            },
+        );
+        record_firecracker_resolution_in_for_build(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            PINNED_COMMIT,
+            &x86_path,
+            FirecrackerBuildEnvironment {
+                arch: "x86_64",
+                libc_tag: "glibc-2.39",
+            },
+        );
+
+        assert_eq!(
+            fresh_cached_firecracker_resolution_in_for_build(
+                dir,
+                "default",
+                REPO,
+                BRANCH,
+                TTL,
+                "aarch64",
+                "glibc-2.39",
+            ),
+            Some(arm_path),
+            "publishing x86 must not evict the ARM resolution manifest"
+        );
+        assert_eq!(
+            fresh_cached_firecracker_resolution_in_for_build(
+                dir,
+                "default",
+                REPO,
+                BRANCH,
+                TTL,
+                "x86_64",
+                "glibc-2.39",
+            ),
+            Some(x86_path),
+            "both exact binaries must remain available to offline launches"
+        );
+    }
+
+    #[test]
+    fn offline_fallback_rejects_unidentified_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let unidentified = dir.join("firecracker-default-unidentified.bin");
+        std::fs::write(&unidentified, b"unidentified firecracker").unwrap();
+
+        assert!(
+            offline_cached_firecracker_resolution_in(
+                dir,
+                "default",
+                REPO,
+                BRANCH,
+                "aarch64",
+                "glibc-2.39",
+            )
+            .unwrap()
+            .is_none(),
+            "offline launch must not select an arbitrary same-profile binary: {}",
+            unidentified.display()
+        );
+    }
+
+    #[test]
+    fn offline_fallback_reuses_only_exact_stale_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let binary = resolution_fixture(dir, PINNED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &binary);
+        let manifest = firecracker_resolution_path(dir, "default", REPO, BRANCH);
+        let mut entry: FirecrackerResolution =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        entry.resolved_at_secs = 1;
+        std::fs::write(&manifest, serde_json::to_vec_pretty(&entry).unwrap()).unwrap();
+
+        assert_eq!(
+            offline_cached_firecracker_resolution_in(
+                dir,
+                "default",
+                REPO,
+                BRANCH,
+                std::env::consts::ARCH,
+                &libc_version_tag(),
+            )
+            .unwrap(),
+            Some(binary)
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_lookup_does_not_refresh_remote_resolution_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let profile = KernelProfile {
+            firecracker_repo: Some(REPO.to_string()),
+            firecracker_branch: Some(BRANCH.to_string()),
+            firecracker_commit: Some(PINNED_COMMIT.to_string()),
+            ..Default::default()
+        };
+        let binary = profile_firecracker_path_for_build(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            PINNED_COMMIT,
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        );
+        std::fs::write(&binary, b"pinned firecracker").unwrap();
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &binary);
+        let manifest = firecracker_resolution_path(dir, "default", REPO, BRANCH);
+        let mut entry: FirecrackerResolution =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        entry.resolved_at_secs = 1;
+        std::fs::write(&manifest, serde_json::to_vec_pretty(&entry).unwrap()).unwrap();
+
+        assert_eq!(
+            get_profile_firecracker_path_in(&profile, "default", dir)
+                .await
+                .unwrap(),
+            Some(binary)
+        );
+        let after: FirecrackerResolution =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            after.resolved_at_secs, 1,
+            "offline pinned lookup must not impersonate a new remote resolution"
+        );
+    }
+
+    #[test]
     fn resolution_cache_expires_with_ttl() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let bin = resolution_fixture(dir, "bbbbbbbbbbbb");
-        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+        let bin = resolution_fixture(dir, PINNED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &bin);
 
         // Age the entry past any plausible TTL by rewriting its timestamp.
-        let path = firecracker_resolution_path(dir, "default");
+        let path = firecracker_resolution_path(dir, "default", REPO, BRANCH);
         let mut entry: FirecrackerResolution =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         entry.resolved_at_secs -= 7200;
@@ -2442,8 +3167,8 @@ cp vmlinux arch/arm64/boot/Image
     fn resolution_cache_ttl_zero_forces_refresh() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let bin = resolution_fixture(dir, "cccccccccccc");
-        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+        let bin = resolution_fixture(dir, PINNED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &bin);
 
         assert!(
             fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, 0).is_none(),
@@ -2455,8 +3180,8 @@ cp vmlinux arch/arm64/boot/Image
     fn resolution_cache_invalidated_by_repo_or_branch_change() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let bin = resolution_fixture(dir, "dddddddddddd");
-        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+        let bin = resolution_fixture(dir, PINNED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &bin);
 
         assert!(
             fresh_cached_firecracker_resolution_in(dir, "default", "other/fork", BRANCH, TTL)
@@ -2473,8 +3198,8 @@ cp vmlinux arch/arm64/boot/Image
     fn resolution_cache_ignores_missing_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let bin = resolution_fixture(dir, "eeeeeeeeeeee");
-        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "0123456789ab", &bin);
+        let bin = resolution_fixture(dir, PINNED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &bin);
 
         std::fs::remove_file(&bin).unwrap();
         assert!(
@@ -2488,7 +3213,11 @@ cp vmlinux arch/arm64/boot/Image
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(firecracker_resolution_path(dir, "default"), b"{not json").unwrap();
+        std::fs::write(
+            firecracker_resolution_path(dir, "default", REPO, BRANCH),
+            b"{not json",
+        )
+        .unwrap();
 
         assert!(
             fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL).is_none(),
@@ -2503,15 +3232,15 @@ cp vmlinux arch/arm64/boot/Image
         // NEW binary immediately instead of waiting out the TTL.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let old = resolution_fixture(dir, "111111111111");
-        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "old000000000", &old);
+        let old = resolution_fixture(dir, PINNED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &old);
         assert_eq!(
             fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL),
             Some(old.clone())
         );
 
-        let new = resolution_fixture(dir, "222222222222");
-        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, "new000000000", &new);
+        let new = resolution_fixture(dir, MOVED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, MOVED_COMMIT, &new);
         assert_eq!(
             fresh_cached_firecracker_resolution_in(dir, "default", REPO, BRANCH, TTL),
             Some(new),

@@ -216,7 +216,29 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
 async fn snapshot_restore_runtime_config(
     args: &SnapshotRunArgs,
     kernel_profile: Option<&str>,
-) -> RuntimeConfig {
+) -> Result<RuntimeConfig> {
+    snapshot_restore_runtime_config_with(
+        args,
+        kernel_profile,
+        crate::setup::get_kernel_profile,
+        |profile, name| async move {
+            crate::setup::get_configured_firecracker_for_profile(&profile, &name).await
+        },
+    )
+    .await
+}
+
+async fn snapshot_restore_runtime_config_with<GetProfile, Resolve, ResolveFuture>(
+    args: &SnapshotRunArgs,
+    kernel_profile: Option<&str>,
+    mut get_profile: GetProfile,
+    mut resolve: Resolve,
+) -> Result<RuntimeConfig>
+where
+    GetProfile: FnMut(&str) -> Result<Option<crate::setup::KernelProfile>>,
+    Resolve: FnMut(crate::setup::KernelProfile, String) -> ResolveFuture,
+    ResolveFuture: std::future::Future<Output = Result<Option<PathBuf>>>,
+{
     let mut config = RuntimeConfig {
         firecracker_bin: args.firecracker_bin.as_ref().map(PathBuf::from),
         firecracker_args: args.firecracker_args.clone(),
@@ -234,29 +256,52 @@ async fn snapshot_restore_runtime_config(
     // PATH `firecracker` would be a different binary than created the snapshot.
     if config.firecracker_bin.is_none() {
         let profile_name = kernel_profile.unwrap_or("default");
-        for candidate in [profile_name, "default"] {
-            let Ok(Some(profile)) = crate::setup::get_kernel_profile(candidate) else {
-                continue;
-            };
+        let profile = get_profile(profile_name)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "snapshot kernel profile '{}' is not configured; refusing to restore with a different Firecracker",
+                profile_name
+            )
+        })?;
+        if config.firecracker_args.is_none() {
+            config.firecracker_args = profile.firecracker_args.clone();
+        }
+
+        let configured_profile = if profile.firecracker_repo.is_some()
+            || profile.firecracker_commit.is_some()
+        {
+            Some((profile, profile_name.to_string()))
+        } else if profile_name != "default" {
+            let default_profile = get_profile("default")?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "default kernel profile is not configured; refusing to restore snapshot profile '{}' through PATH Firecracker",
+                    profile_name
+                )
+            })?;
             if config.firecracker_args.is_none() {
-                config.firecracker_args = profile.firecracker_args.clone();
+                config.firecracker_args = default_profile.firecracker_args.clone();
             }
-            if profile.firecracker_repo.is_none() {
-                continue;
-            }
-            match crate::setup::get_firecracker_for_profile(&profile, candidate).await {
-                Ok(fc_path) => {
-                    config.firecracker_bin = Some(fc_path);
-                }
-                Err(e) => {
-                    warn!(error = %e, profile = candidate, "custom Firecracker not found for snapshot restore, falling back to system binary");
-                }
-            }
-            break;
+            (default_profile.firecracker_repo.is_some()
+                || default_profile.firecracker_commit.is_some())
+            .then(|| (default_profile, "default".to_string()))
+        } else {
+            None
+        };
+
+        if let Some((configured_profile, configured_name)) = configured_profile {
+            config.firecracker_bin = Some(
+                resolve(configured_profile, configured_name.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "profile '{}' configures Firecracker but resolved no binary",
+                            configured_name
+                        )
+                    })?,
+            );
         }
     }
 
-    config
+    Ok(config)
 }
 
 /// Wait for the restored guest's output channel, which is the final fc-agent
@@ -1147,7 +1192,7 @@ async fn cmd_snapshot_run_inner(
     let vm_id = generate_vm_id();
     let runtime_config =
         snapshot_restore_runtime_config(&args, snapshot_config.metadata.kernel_profile.as_deref())
-            .await;
+            .await?;
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -3199,12 +3244,89 @@ mod tests {
             no_swap: false,
         };
 
-        let runtime = snapshot_restore_runtime_config(&args, Some("nested")).await;
+        let runtime = snapshot_restore_runtime_config(&args, Some("nested"))
+            .await
+            .unwrap();
         assert_eq!(
             runtime.firecracker_bin,
             Some(PathBuf::from("/opt/firecracker-profile"))
         );
         assert_eq!(runtime.firecracker_args, Some("--enable-nv2".to_string()));
+    }
+
+    fn snapshot_runtime_args_without_overrides() -> SnapshotRunArgs {
+        SnapshotRunArgs {
+            pid: None,
+            snapshot: Some("snap".to_string()),
+            name: Some("clone".to_string()),
+            exec: None,
+            startup_snapshot_base_key: None,
+            cpu: None,
+            mem: None,
+            firecracker_bin: None,
+            firecracker_args: None,
+            hugepages: None,
+            non_blocking_output: false,
+            no_dirty_tracking: false,
+            no_swap: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_snapshot_requires_the_default_profile() {
+        let args = snapshot_runtime_args_without_overrides();
+        let error = snapshot_restore_runtime_config_with(
+            &args,
+            None,
+            |_name| Ok(None),
+            |_profile, _name| async { panic!("missing profiles must not be resolved") },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("default"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_profile_without_firecracker_requires_default_fallback_profile() {
+        let args = snapshot_runtime_args_without_overrides();
+        let error = snapshot_restore_runtime_config_with(
+            &args,
+            Some("btrfs"),
+            |name| match name {
+                "btrfs" => Ok(Some(crate::setup::KernelProfile::default())),
+                "default" => Ok(None),
+                _ => panic!("unexpected profile {name}"),
+            },
+            |_profile, _name| async { panic!("unconfigured profiles must not be resolved") },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("default"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn configured_firecracker_resolution_error_reaches_snapshot_restore() {
+        let args = snapshot_runtime_args_without_overrides();
+        let profile = crate::setup::KernelProfile {
+            firecracker_repo: Some("ejc3/firecracker".to_string()),
+            firecracker_commit: Some("27305f49ab3a5d862dc56b5108713b6536d2baa7".to_string()),
+            ..Default::default()
+        };
+        let error = snapshot_restore_runtime_config_with(
+            &args,
+            Some("nested"),
+            move |name| {
+                assert_eq!(name, "nested");
+                Ok(Some(profile.clone()))
+            },
+            |_profile, _name| async { bail!("missing exact configured Firecracker artifact") },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("missing exact configured Firecracker artifact"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

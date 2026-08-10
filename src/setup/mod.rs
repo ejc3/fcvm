@@ -5,8 +5,9 @@ pub mod storage;
 
 pub use kernel::{
     ensure_cloud_hypervisor, ensure_kernel, ensure_profile_firecracker,
-    get_firecracker_for_profile, get_kernel_path, get_kernel_url_hash,
-    get_profile_firecracker_path, install_host_kernel, newest_cached_cloud_hypervisor,
+    get_configured_firecracker_for_profile, get_firecracker_for_profile, get_kernel_path,
+    get_kernel_url_hash, get_profile_firecracker_path, install_host_kernel,
+    newest_cached_cloud_hypervisor,
 };
 pub use pasta::{ensure_pasta, get_pasta_for_config};
 pub use rootfs::{

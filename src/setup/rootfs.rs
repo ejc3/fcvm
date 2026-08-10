@@ -87,9 +87,12 @@ pub struct PastaConfig {
 pub struct FirecrackerConfig {
     /// GitHub repo (e.g., "ejc3/firecracker")
     pub repo: String,
-    /// Branch to build from (default: "main")
+    /// Branch or lightweight tag to build from (default: "main")
     #[serde(default = "default_branch")]
     pub branch: String,
+    /// Exact full commit required at `branch`.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 /// Cloud Hypervisor build configuration (#632).
@@ -178,9 +181,13 @@ pub struct KernelProfile {
     #[serde(default)]
     pub firecracker_repo: Option<String>,
 
-    /// Branch to build firecracker from
+    /// Branch or lightweight tag to build firecracker from
     #[serde(default)]
     pub firecracker_branch: Option<String>,
+
+    /// Exact full commit required at `firecracker_branch`
+    #[serde(default)]
+    pub firecracker_commit: Option<String>,
 
     /// Extra CLI args for firecracker
     #[serde(default)]
@@ -969,8 +976,7 @@ fn synthesize_default_profile(plan: &mut Plan) {
 
         // Inject [firecracker] config into default profile
         if let Some(ref fc) = plan.firecracker {
-            default_profile.firecracker_repo = Some(fc.repo.clone());
-            default_profile.firecracker_branch = Some(fc.branch.clone());
+            apply_default_firecracker_config(&mut default_profile, fc);
         }
 
         plan.kernel_profiles
@@ -979,6 +985,15 @@ fn synthesize_default_profile(plan: &mut Plan) {
             .entry(arch.into())
             .or_insert(default_profile);
     }
+}
+
+fn apply_default_firecracker_config(
+    default_profile: &mut KernelProfile,
+    firecracker: &FirecrackerConfig,
+) {
+    default_profile.firecracker_repo = Some(firecracker.repo.clone());
+    default_profile.firecracker_branch = Some(firecracker.branch.clone());
+    default_profile.firecracker_commit = firecracker.commit.clone();
 }
 
 /// Legacy alias for load_config (for backward compatibility during migration)
@@ -2526,6 +2541,47 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firecracker_commit_pins_deserialize_for_global_and_profile_configs() {
+        let global: FirecrackerConfig = toml::from_str(
+            r#"
+repo = "ejc3/firecracker"
+branch = "agent/nv2"
+commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            global.commit.as_deref(),
+            Some("27305f49ab3a5d862dc56b5108713b6536d2baa7")
+        );
+
+        let profile: KernelProfile = toml::from_str(
+            r#"
+firecracker_repo = "ejc3/firecracker"
+firecracker_branch = "agent/nv2"
+firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            profile.firecracker_commit.as_deref(),
+            Some("27305f49ab3a5d862dc56b5108713b6536d2baa7")
+        );
+
+        let mut synthesized = KernelProfile::default();
+        apply_default_firecracker_config(&mut synthesized, &global);
+        assert_eq!(
+            synthesized.firecracker_repo.as_deref(),
+            Some("ejc3/firecracker")
+        );
+        assert_eq!(synthesized.firecracker_branch.as_deref(), Some("agent/nv2"));
+        assert_eq!(
+            synthesized.firecracker_commit.as_deref(),
+            Some("27305f49ab3a5d862dc56b5108713b6536d2baa7")
+        );
+    }
 
     /// FCVM_FIRECRACKER_BIN is a process-global, so these run in one test.
     #[test]
