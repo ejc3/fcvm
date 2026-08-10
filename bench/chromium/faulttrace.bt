@@ -1,0 +1,59 @@
+/*
+ * Per-process handle_mm_fault latency for the FILE and UFFD reqscale cgroups.
+ *
+ * reqscale.py replaces both cgroup paths and __HARNESS_PID__ before invoking
+ * bpftrace. The harness brackets the ready-to-artifact interval with two
+ * harmless kill(firecracker_pid, 0) probes. Only signal-0 calls made by this
+ * exact harness tgid toggle a target, so ordinary liveness probes elsewhere
+ * cannot open or close a measurement interval.
+ *
+ * Maps are keyed by Firecracker tgid (`pid` in bpftrace), then joined to the
+ * exact pid/start-time recorded for each request. This deliberately counts all
+ * Firecracker-process VMAs; it is not a guest-RAM-VMA or UFFD-event metric.
+ * opened == closed == 1 and entered == completed are publication gates.
+ */
+
+BEGIN
+{
+    printf("REQSCALE_TRACE_READY\n");
+}
+
+tracepoint:syscalls:sys_enter_kill
+/pid == __HARNESS_PID__ && args->sig == 0/
+{
+    if (@active[args->pid]) {
+        @closed[args->pid] = count();
+        delete(@active[args->pid]);
+    } else {
+        @active[args->pid] = 1;
+        @opened[args->pid] = count();
+    }
+}
+
+kprobe:handle_mm_fault
+/(cgroup == cgroupid("__FILE_CGROUP_PATH__") ||
+  cgroup == cgroupid("__UFFD_CGROUP_PATH__")) && @active[pid]/
+{
+    @started_ns[tid] = nsecs;
+    @started_pid[tid] = pid;
+    @entered[pid] = count();
+}
+
+kretprobe:handle_mm_fault
+/@started_ns[tid]/
+{
+    $elapsed = nsecs - @started_ns[tid];
+    $process = @started_pid[tid];
+    @completed[$process] = count();
+    @total_ns[$process] = sum($elapsed);
+    @latency_ns[$process] = hist($elapsed);
+    delete(@started_ns[tid]);
+    delete(@started_pid[tid]);
+}
+
+END
+{
+    clear(@active);
+    clear(@started_ns);
+    clear(@started_pid);
+}

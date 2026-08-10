@@ -230,6 +230,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
+	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	bench-quick bench-throughput bench-operations bench-protocol \
 	lint fmt update-dependency ssh test-serve-sdk
 
@@ -289,6 +290,10 @@ help:
 	@echo "  bench-chromium-request  Run the gated request benchmark (PHASE=, BACKEND=, REPS=, WARMUP=, RESULTS=)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
+	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
+	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
+	@echo "  report-chromium-scale   Validate a scale run and write plain Markdown"
+	@echo "  test-chromium-scale  Run the scale harness's deterministic unit tests"
 	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
@@ -688,6 +693,57 @@ analyze-chromium-request:
 test-chromium-request:
 	@python3 -m unittest discover -s bench/chromium -p 'test_reqbench.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
+
+test-chromium-scale:
+	@python3 -m unittest discover -s bench/chromium -p 'test_reqscale.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
+
+# Open-loop CDP-fast scalability and page-fault measurement. Unlike
+# `bench-chromium-request`, whose driver loops `for rep in range(...)` and so can
+# only ever measure a closed loop, this one launches on absolute deadlines and can
+# therefore hold an arrival RATE. It also interleaves FILE and UFFD inside each
+# rate interval rather than across separate runs, so the backend comparison is not
+# confounded with drift.
+#
+# Every cell and every publication gate is required: an accidental benchmark is
+# worse than no benchmark, so there are no defaults to fall back on.
+bench-chromium-scale: build
+	@test -n "$(SCALE_RATES)" || (echo "ERROR: SCALE_RATES required (for example 2,4,8)"; exit 1)
+	@test -n "$(SCALE_BURSTS)" || (echo "ERROR: SCALE_BURSTS required (must be at least 5)"; exit 1)
+	@test -n "$(SCALE_SEED)" || (echo "ERROR: SCALE_SEED required"; exit 1)
+	@test -n "$(SCALE_OUT)" || (echo "ERROR: SCALE_OUT required"; exit 1)
+	@test -n "$(SCALE_URL)" || (echo "ERROR: SCALE_URL required"; exit 1)
+	@test -n "$(SCALE_TAG)" || (echo "ERROR: SCALE_TAG required"; exit 1)
+	@test -n "$(SCALE_CONTROL_CHROMIUM)" || (echo "ERROR: SCALE_CONTROL_CHROMIUM required"; exit 1)
+	@test -n "$(SCALE_MAX_OFFERED_ERROR_PCT)" || (echo "ERROR: SCALE_MAX_OFFERED_ERROR_PCT required"; exit 1)
+	@test -n "$(SCALE_MIN_DEPARTURE_RATIO)" || (echo "ERROR: SCALE_MIN_DEPARTURE_RATIO required"; exit 1)
+	@test -n "$(SCALE_MAX_BACKLOG)" || (echo "ERROR: SCALE_MAX_BACKLOG required"; exit 1)
+	@test -n "$(SCALE_MAX_LAUNCH_LAG_MS)" || (echo "ERROR: SCALE_MAX_LAUNCH_LAG_MS required"; exit 1)
+	@test -n "$(SCALE_MAX_CONTROL_DRIFT_PCT)" || (echo "ERROR: SCALE_MAX_CONTROL_DRIFT_PCT required"; exit 1)
+	@echo "==> Running open-loop Chromium request scalability benchmark..."
+	sudo -E env RUST_LOG=fcvm=debug python3 bench/chromium/reqscale.py \
+		--fcvm ./target/release/fcvm --snapshot-tag "$(SCALE_TAG)" \
+		--url "$(SCALE_URL)" --rates "$(SCALE_RATES)" \
+		--bursts "$(SCALE_BURSTS)" --control-chromium "$(SCALE_CONTROL_CHROMIUM)" \
+		--max-offered-rps-error-pct "$(SCALE_MAX_OFFERED_ERROR_PCT)" \
+		--min-departure-ratio "$(SCALE_MIN_DEPARTURE_RATIO)" \
+		--max-score-end-backlog "$(SCALE_MAX_BACKLOG)" \
+		--max-p95-launch-lag-ms "$(SCALE_MAX_LAUNCH_LAG_MS)" \
+		--max-control-median-drift-pct "$(SCALE_MAX_CONTROL_DRIFT_PCT)" \
+		--seed "$(SCALE_SEED)" \
+		--out-dir "$(SCALE_OUT)" $(SCALE_TRACE_ARGS)
+
+analyze-chromium-scale:
+	@test -n "$(SCALE_RUN_DIR)" || (echo "ERROR: SCALE_RUN_DIR required"; exit 1)
+	@test -n "$(SCALE_ANALYSIS_JSON)" || (echo "ERROR: SCALE_ANALYSIS_JSON required"; exit 1)
+	python3 bench/chromium/reqscale_analyze.py \
+		--run-dir "$(SCALE_RUN_DIR)" --json-out "$(SCALE_ANALYSIS_JSON)"
+
+report-chromium-scale:
+	@test -n "$(SCALE_RUN_DIR)" || (echo "ERROR: SCALE_RUN_DIR required"; exit 1)
+	@test -n "$(SCALE_REPORT)" || (echo "ERROR: SCALE_REPORT required"; exit 1)
+	python3 bench/chromium/reqscale_analyze.py \
+		--run-dir "$(SCALE_RUN_DIR)" --markdown-out "$(SCALE_REPORT)"
 
 test-ci-infrastructure:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_ci_infrastructure.py'
