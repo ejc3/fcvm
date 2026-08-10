@@ -2415,11 +2415,12 @@ async fn cmd_snapshot_run_inner(
         });
     }
 
-    // Verify pasta's L2 forwarding path is ready before starting health monitor.
+    // Verify the restored guest is reachable before starting the health monitor.
     // After snapshot restore, pasta may not have learned the guest's MAC yet.
-    // Readiness requires ARP neighbor resolution, then probes each forwarded TCP
-    // port to confirm end-to-end forwarding works. ICMP echo is unrelated to a
-    // published TCP service and may legitimately be disabled by the guest.
+    // Readiness requires an echo reply from the guest AND a resolved ARP entry,
+    // then probes each forwarded TCP port. The echo reply is what observes the
+    // guest: pasta answers a host-side connect on its own, and the neighbour
+    // entry outlives the guest going quiet, so neither can fail on a silent guest.
     //
     // On failure (the VM crashed during the wait above, or pasta's port probe timed out)
     // skip the monitor/wait section and fall through to the shared cleanup below before

@@ -33,6 +33,10 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Timeout for waiting for pasta's TAP device to appear in the namespace
 const PASTA_DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Budget for the post-restore readiness check: the guest must answer, and its
+/// published ports must accept, within this window.
+const GUEST_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Number of recent pasta stderr lines kept for error reporting
 const PASTA_STDERR_TAIL_LINES: usize = 20;
 
@@ -44,10 +48,11 @@ const PASTA_STDERR_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// Whether `ip neigh show` proves that the bridge resolved the guest's MAC.
 ///
-/// ICMP echo is not the readiness contract: a guest may deliberately ignore
-/// echo requests while serving published TCP ports.  The ping in the restore
-/// probe is only an ARP trigger.  A neighbour entry with a link-layer address
-/// is the evidence that the L2 path is ready.
+/// This is an L2 fact and nothing more. A resolved entry is necessary for
+/// readiness but NOT sufficient: the neighbour table keeps a REACHABLE entry
+/// for a guest that has stopped answering, so this predicate cannot fail when
+/// the guest goes silent. [`wait_for_guest_to_answer`] pairs it with an echo
+/// reply, which is the part that observes the guest itself.
 fn neighbor_is_resolved(output: &str) -> bool {
     let fields: Vec<&str> = output.split_whitespace().collect();
     fields
@@ -59,6 +64,194 @@ fn neighbor_is_resolved(output: &str) -> bool {
                 "PERMANENT" | "NOARP" | "REACHABLE" | "STALE" | "DELAY" | "PROBE"
             )
         })
+}
+
+/// The two namespace observations the restore readiness loop makes of a guest.
+///
+/// Both are `nsenter` invocations in production, which makes the readiness
+/// decision untestable without a namespace and a live VM. Keeping the loop
+/// generic over this boundary lets a scripted guest — one that answers, one
+/// that stays silent behind a resolved neighbour entry — drive the decision
+/// deterministically in unit tests, the same way [`crate::utils::DirEventSource`]
+/// drives the PID-file wait.
+trait GuestProbe {
+    /// Send one echo request to the guest and report whether it replied.
+    ///
+    /// `Ok(false)` is an unanswered ping, not an error: the guest may simply not
+    /// be up yet, which is the case the loop retries. `Err` means the probe
+    /// itself could not run.
+    async fn ping(&mut self, budget: std::time::Duration) -> Result<PingOutcome>;
+
+    /// Read the guest's neighbour entry from the bridge, as `ip neigh` prints it.
+    async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String>;
+}
+
+/// One echo attempt: whether the guest replied, and what the prober said if not.
+struct PingOutcome {
+    replied: bool,
+    /// Diagnostic detail for the failure message; empty when the guest replied.
+    stderr: String,
+}
+
+/// Production [`GuestProbe`]: runs `ping` and `ip neigh` inside the VM's
+/// network namespace via the holder PID.
+struct NsenterGuestProbe {
+    nsenter_prefix: Vec<String>,
+}
+
+impl NsenterGuestProbe {
+    fn new(nsenter_prefix: Vec<String>) -> Self {
+        Self { nsenter_prefix }
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.nsenter_prefix[0]);
+        command
+            .args(&self.nsenter_prefix[1..])
+            .args(args)
+            .kill_on_drop(true);
+        command
+    }
+}
+
+impl GuestProbe for NsenterGuestProbe {
+    async fn ping(&mut self, budget: std::time::Duration) -> Result<PingOutcome> {
+        let mut command = self.command(&["ping", "-c", "1", "-W", "0.2", GUEST_IP]);
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let output = tokio::time::timeout(budget, command.output())
+            .await
+            .context("ping exceeded pasta's readiness deadline")?
+            .context("running ping via nsenter in namespace")?;
+        Ok(PingOutcome {
+            replied: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String> {
+        let mut command =
+            self.command(&["ip", "neigh", "show", "to", GUEST_IP, "dev", BRIDGE_DEVICE]);
+        command.stderr(Stdio::piped());
+        let output = tokio::time::timeout(budget, command.output())
+            .await
+            .context("neighbor query exceeded pasta's readiness deadline")?
+            .context("reading guest neighbour entry via nsenter in namespace")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to inspect ARP entry for guest {} on {}: {}",
+                GUEST_IP,
+                BRIDGE_DEVICE,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// How long the readiness loop waits between probe rounds.
+const GUEST_ANSWER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Wait until the guest itself answers, or the deadline expires.
+///
+/// Readiness requires BOTH an echo reply and a resolved neighbour entry, and the
+/// reply is the load-bearing half. A neighbour entry survives the guest going
+/// quiet, so gating on it alone cannot fail when the guest is silent — a
+/// 808-clone benchmark declared 5 silent clones ready and 3 of those 5 then hung
+/// at the client's own ~100s deadline. Requiring the reply turns that into a
+/// named failure here, inside the existing budget.
+///
+/// Retries until the deadline: 803 of those 808 clones answered on the first
+/// attempt, so a healthy guest never reaches the second round.
+async fn wait_for_guest_to_answer<P: GuestProbe>(
+    probe: &mut P,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    // Carried out of the loop so the deadline message can distinguish "the guest
+    // never appeared at L2" from "the guest is at L2 but never answered".
+    let mut last_neighbor = String::new();
+    let mut last_ping_stderr = String::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_unanswered_error(&last_neighbor, &last_ping_stderr));
+        }
+        let ping = probe.ping(remaining).await?;
+        last_ping_stderr = ping.stderr;
+        if !ping.replied {
+            debug!(
+                guest_ip = GUEST_IP,
+                stderr = %last_ping_stderr,
+                "guest did not answer the readiness ping"
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_unanswered_error(&last_neighbor, &last_ping_stderr));
+        }
+        last_neighbor = probe.neighbor(remaining).await?;
+        let resolved = neighbor_is_resolved(&last_neighbor);
+
+        if ping.replied && resolved {
+            info!(
+                guest_ip = GUEST_IP,
+                neighbor = %last_neighbor.trim(),
+                "guest answered and its MAC is resolved"
+            );
+            return Ok(());
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_unanswered_error(&last_neighbor, &last_ping_stderr));
+        }
+        debug!(
+            guest_ip = GUEST_IP,
+            ping_replied = ping.replied,
+            neighbor_resolved = resolved,
+            "guest not ready yet, retrying"
+        );
+        tokio::time::sleep(remaining.min(GUEST_ANSWER_RETRY_DELAY)).await;
+    }
+}
+
+/// Deadline error for [`wait_for_guest_to_answer`], naming which half was missing.
+fn guest_unanswered_error(neighbor: &str, ping_stderr: &str) -> anyhow::Error {
+    let neighbor = neighbor.trim();
+    let ping_stderr = if ping_stderr.is_empty() {
+        "(empty)"
+    } else {
+        ping_stderr
+    };
+    if neighbor_is_resolved(neighbor) {
+        // The failure this whole path exists to catch: pasta can reach the
+        // guest's MAC, so every host-side check passes, but nothing is answering
+        // behind it. Report it here rather than letting a client discover it.
+        anyhow::anyhow!(
+            "guest {} resolved to a MAC on {} but never answered a ping within {:?}: \
+             the guest is not reachable even though its neighbour entry is present; \
+             neighbour: {}; ping stderr: {}",
+            GUEST_IP,
+            BRIDGE_DEVICE,
+            GUEST_ANSWER_DEADLINE,
+            neighbor,
+            ping_stderr
+        )
+    } else {
+        anyhow::anyhow!(
+            "ARP for guest {} not resolved within {:?} on {}: neighbour: {}; ping stderr: {}",
+            GUEST_IP,
+            GUEST_ANSWER_DEADLINE,
+            BRIDGE_DEVICE,
+            if neighbor.is_empty() {
+                "(no entry)"
+            } else {
+                neighbor
+            },
+            ping_stderr
+        )
+    }
 }
 
 /// Heredoc delimiter separating the batched `ip` commands from the shell script.
@@ -915,12 +1108,26 @@ impl PastaNetwork {
         GUEST_GATEWAY
     }
 
-    /// Wait for pasta port forwarding to be ready by probing each mapped port.
+    /// Wait for pasta to bind each mapped host port.
     ///
     /// Pasta binds ports asynchronously after startup. The PID file just means
     /// the process is running, not that ports are listening. Without this check,
     /// the health monitor may declare the VM "healthy" (via nsenter/bridge) before
-    /// port forwarding actually works.
+    /// pasta is even listening.
+    ///
+    /// This is a host-side check only, and it CANNOT tell you the guest is
+    /// reachable. pasta is a userspace stack: its listener completes the TCP
+    /// handshake itself, before and independently of any L2 forwarding to the
+    /// guest, so this connect succeeds against a guest that is silent or absent.
+    /// In the run that motivated [`wait_for_guest_to_answer`] it reported "port
+    /// forward ready" 95 MICROseconds after the readiness log line, on clones
+    /// whose guest was not answering.
+    ///
+    /// It is kept as-is rather than made end-to-end because fcvm does not know
+    /// what protocol a published port speaks — 9222 happens to be CDP, but a
+    /// mapping is just a number — so there are no bytes it could send that would
+    /// constitute a valid request. Guest liveness is established before this
+    /// runs, by the echo reply in [`wait_for_guest_to_answer`].
     async fn wait_for_port_forwarding_until(&self, deadline: std::time::Instant) -> Result<()> {
         use tokio::net::TcpStream;
 
@@ -966,10 +1173,8 @@ impl PastaNetwork {
     }
 
     async fn wait_for_port_forwarding(&self) -> Result<()> {
-        self.wait_for_port_forwarding_until(
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await
+        self.wait_for_port_forwarding_until(std::time::Instant::now() + GUEST_ANSWER_DEADLINE)
+            .await
     }
 }
 
@@ -1167,19 +1372,18 @@ impl NetworkManager for PastaNetwork {
         &self.tap_device
     }
 
-    /// Verify pasta's L2 forwarding path is ready after snapshot restore.
+    /// Verify the guest is reachable after snapshot restore, then that its
+    /// published ports accept.
     ///
-    /// After snapshot restore, pasta needs the guest's MAC address to forward
-    /// L2 frames. We send a ping from the namespace only to trigger a normal ARP
-    /// exchange, then inspect the bridge's neighbour table. The echo reply is
-    /// deliberately not the gate: a guest can ignore ICMP while its published
-    /// TCP service is fully functional. With arp_accept=0 (Linux default), the
-    /// guest's gratuitous arping does NOT create neighbour entries — only updates
-    /// existing ones. The outbound packet forces the namespace kernel to send an
-    /// ARP request that the guest replies to, creating a resolved entry.
+    /// After snapshot restore, pasta needs the guest's MAC address to forward L2
+    /// frames. The ping serves two purposes: it triggers the ARP exchange that
+    /// populates the neighbour table (with arp_accept=0, the Linux default, the
+    /// guest's gratuitous arping only updates existing entries, so the outbound
+    /// packet is what creates a resolved one), and its reply is the only signal
+    /// here that the guest itself is alive.
     ///
-    /// Once ARP is resolved, we probe each forwarded port to confirm pasta's
-    /// loopback port forwarding is end-to-end functional.
+    /// Both halves are required. See [`wait_for_guest_to_answer`] for why the
+    /// neighbour entry alone declared silent guests ready.
     async fn verify_port_forwarding(&self) -> Result<()> {
         if self.port_mappings.is_empty() {
             return Ok(());
@@ -1192,95 +1396,11 @@ impl NetworkManager for PastaNetwork {
             }
         };
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
+        let deadline = std::time::Instant::now() + GUEST_ANSWER_DEADLINE;
+        let mut probe = NsenterGuestProbe::new(self.build_nsenter_prefix(holder_pid));
 
-        // Ping the guest from inside the namespace to trigger ARP resolution.
-        // The echo status is not evidence: ICMP may be disabled while published
-        // TCP is healthy. Inspect the neighbour entry after every trigger and
-        // require a resolved MAC before probing the actual published ports.
-        // Use a 200ms timeout for ~16 attempts within the 5s deadline.
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!("ARP for guest {} not resolved within 5s", GUEST_IP);
-            }
-            let mut ping_command = Command::new(&nsenter_prefix[0]);
-            ping_command
-                .args(&nsenter_prefix[1..])
-                .args(["ping", "-c", "1", "-W", "0.2", GUEST_IP])
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let ping = tokio::time::timeout(remaining, ping_command.output())
-                .await
-                .context("ping exceeded pasta's 5s readiness deadline")?
-                .context("running ping via nsenter in namespace")?;
-            if !ping.status.success() {
-                debug!(
-                    guest_ip = GUEST_IP,
-                    status = ?ping.status.code(),
-                    stderr = %String::from_utf8_lossy(&ping.stderr).trim(),
-                    "ARP-triggering ping did not receive a reply"
-                );
-            }
-
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!("ARP for guest {} not resolved within 5s", GUEST_IP);
-            }
-            let mut neighbor_command = Command::new(&nsenter_prefix[0]);
-            neighbor_command
-                .args(&nsenter_prefix[1..])
-                .args(["ip", "neigh", "show", "to", GUEST_IP, "dev", BRIDGE_DEVICE])
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let neighbor = tokio::time::timeout(remaining, neighbor_command.output())
-                .await
-                .context("neighbor query exceeded pasta's 5s readiness deadline")?
-                .context("reading guest neighbour entry via nsenter in namespace")?;
-            if !neighbor.status.success() {
-                anyhow::bail!(
-                    "failed to inspect ARP entry for guest {} on {}: {}",
-                    GUEST_IP,
-                    BRIDGE_DEVICE,
-                    String::from_utf8_lossy(&neighbor.stderr).trim()
-                );
-            }
-            let neighbor_stdout = String::from_utf8_lossy(&neighbor.stdout);
-            if neighbor_is_resolved(&neighbor_stdout) {
-                info!(
-                    guest_ip = GUEST_IP,
-                    neighbor = %neighbor_stdout.trim(),
-                    ping_replied = ping.status.success(),
-                    "guest MAC resolved; verifying published ports"
-                );
-                self.wait_for_port_forwarding_until(deadline).await?;
-                return Ok(());
-            }
-
-            if std::time::Instant::now() > deadline {
-                let stderr = String::from_utf8_lossy(&ping.stderr);
-                let stderr = stderr.trim();
-                anyhow::bail!(
-                    "ARP for guest {} not resolved within 5s on {}: neighbour: {}; ping stderr: {}",
-                    GUEST_IP,
-                    BRIDGE_DEVICE,
-                    if neighbor_stdout.trim().is_empty() {
-                        "(no entry)"
-                    } else {
-                        neighbor_stdout.trim()
-                    },
-                    if stderr.is_empty() { "(empty)" } else { stderr }
-                );
-            }
-
-            debug!(guest_ip = GUEST_IP, "ARP unresolved, retrying");
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if !remaining.is_zero() {
-                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
-            }
-        }
+        wait_for_guest_to_answer(&mut probe, deadline).await?;
+        self.wait_for_port_forwarding_until(deadline).await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1542,11 +1662,147 @@ mod tests {
         assert_eq!(net.gateway_ip(), "10.0.2.2");
     }
 
+    /// A guest whose echo replies are scripted.
+    ///
+    /// Each entry is one attempt; the last entry repeats for every attempt after
+    /// it, so a guest can be made to answer late or never.
+    struct ScriptedGuest {
+        ping_replies: VecDeque<bool>,
+        last_ping_reply: bool,
+        neighbor: String,
+        pings: usize,
+    }
+
+    impl ScriptedGuest {
+        /// The shape of the 5 failing clones: `ip neigh` has the guest's MAC and
+        /// reports REACHABLE, and the guest answers nothing. The neighbour line
+        /// is verbatim from the captured failure log, `dev` field included by
+        /// omission — `ip neigh show ... dev br0` does not repeat the device.
+        fn silent_behind_resolved_neighbor() -> Self {
+            Self {
+                ping_replies: VecDeque::new(),
+                last_ping_reply: false,
+                neighbor: "10.0.2.100 lladdr 02:c4:f0:3b:67:bd REACHABLE".to_string(),
+                pings: 0,
+            }
+        }
+
+        /// A healthy clone: answers the first ping. 803 of 808 did.
+        fn answering() -> Self {
+            let mut guest = Self::silent_behind_resolved_neighbor();
+            guest.last_ping_reply = true;
+            guest
+        }
+
+        /// A clone still coming up: silent for `attempts` pings, then answers.
+        fn answering_after(attempts: usize) -> Self {
+            let mut guest = Self::silent_behind_resolved_neighbor();
+            guest.ping_replies = std::iter::repeat_n(false, attempts).collect();
+            guest.ping_replies.push_back(true);
+            guest
+        }
+
+        /// A guest that has not appeared at L2 at all.
+        fn absent() -> Self {
+            let mut guest = Self::silent_behind_resolved_neighbor();
+            guest.neighbor = String::new();
+            guest
+        }
+    }
+
+    impl GuestProbe for ScriptedGuest {
+        async fn ping(&mut self, _budget: std::time::Duration) -> Result<PingOutcome> {
+            self.pings += 1;
+            if let Some(replied) = self.ping_replies.pop_front() {
+                self.last_ping_reply = replied;
+            }
+            Ok(PingOutcome {
+                // The captured failure logged `stderr=` empty: ping simply timed
+                // out waiting for a reply, it did not fail to run.
+                replied: self.last_ping_reply,
+                stderr: String::new(),
+            })
+        }
+
+        async fn neighbor(&mut self, _budget: std::time::Duration) -> Result<String> {
+            Ok(self.neighbor.clone())
+        }
+    }
+
+    /// A short real deadline: the loop's budget is a `std::time::Instant`, so
+    /// tokio's paused clock cannot expire it.
+    fn short_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_millis(100)
+    }
+
+    #[tokio::test]
+    async fn silent_guest_behind_a_resolved_neighbor_is_not_ready() {
+        // The bug: readiness gated on the neighbour entry, which stays REACHABLE
+        // after the guest goes quiet and so cannot fail. Of 808 restored clones,
+        // the 5 whose readiness ping went unanswered were all declared ready and
+        // 3 of them then failed at the client's own ~100s deadline.
+        let mut guest = ScriptedGuest::silent_behind_resolved_neighbor();
+
+        let error = wait_for_guest_to_answer(&mut guest, short_deadline())
+            .await
+            .expect_err("a guest that never answers must not be declared ready");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("never answered a ping"), "{message}");
+        assert!(message.contains("02:c4:f0:3b:67:bd"), "{message}");
+        assert!(message.contains("(empty)"), "{message}");
+        assert!(
+            guest.pings > 1,
+            "must keep retrying while budget remains, got {} attempt(s)",
+            guest.pings
+        );
+    }
+
+    #[tokio::test]
+    async fn answering_guest_is_ready_on_the_first_attempt() {
+        // The healthy path must not pay for the fix.
+        let mut guest = ScriptedGuest::answering();
+
+        wait_for_guest_to_answer(&mut guest, short_deadline())
+            .await
+            .expect("a guest that answers with a resolved MAC is ready");
+
+        assert_eq!(guest.pings, 1);
+    }
+
+    #[tokio::test]
+    async fn guest_that_answers_late_is_ready_without_waiting_out_the_deadline() {
+        // A slow clone must be retried, not failed on its first silent ping.
+        let mut guest = ScriptedGuest::answering_after(2);
+
+        wait_for_guest_to_answer(&mut guest, short_deadline())
+            .await
+            .expect("a guest that answers within the budget is ready");
+
+        assert_eq!(guest.pings, 3);
+    }
+
+    #[tokio::test]
+    async fn guest_absent_from_the_neighbour_table_still_reports_arp_failure() {
+        // The pre-existing failure mode keeps its own message: nothing at L2 is
+        // a different diagnosis from present-at-L2-but-silent.
+        let mut guest = ScriptedGuest::absent();
+
+        let error = wait_for_guest_to_answer(&mut guest, short_deadline())
+            .await
+            .expect_err("an absent guest must not be declared ready");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("ARP for guest"), "{message}");
+        assert!(message.contains("(no entry)"), "{message}");
+        assert!(!message.contains("never answered a ping"), "{message}");
+    }
+
     #[test]
-    fn resolved_neighbor_is_ready_even_when_icmp_echo_is_disabled() {
-        // This is the production predicate used after the ARP-triggering ping.
-        // The ping's exit status is intentionally absent: a guest with
-        // icmp_echo_ignore_all=1 still has a valid forwarding path.
+    fn neighbour_predicate_reads_l2_resolution_only() {
+        // The predicate is L2-only and says nothing about the guest answering;
+        // `wait_for_guest_to_answer` supplies that half. Every assertion here is
+        // unchanged from when this predicate alone gated readiness.
         assert!(neighbor_is_resolved(
             "10.0.2.100 dev br0 lladdr 02:aa:bb:cc:dd:ee REACHABLE"
         ));
