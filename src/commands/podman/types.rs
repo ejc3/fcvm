@@ -78,7 +78,7 @@ pub struct VmContext {
     /// Host-side Unix socket path for the TTY vsock port (set when running with -t).
     /// Used to unblock the TTY accept thread if the guest never connected.
     pub tty_socket_path: Option<String>,
-    pub output_handle: Option<tokio::task::JoinHandle<Vec<(String, String)>>>,
+    pub output_handle: Option<tokio::task::JoinHandle<()>>,
     /// Egress proxy task (rootless mode only); aborted during cleanup.
     pub egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
     pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,

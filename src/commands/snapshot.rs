@@ -54,7 +54,7 @@ struct CloneSetupResources {
     volume_servers: Option<SpawnedVolumes>,
     tty_cancel: tokio_util::sync::CancellationToken,
     tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
-    output_handle: Option<tokio::task::JoinHandle<Vec<(String, String)>>>,
+    output_handle: Option<tokio::task::JoinHandle<()>>,
     egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
     network: Option<Box<dyn NetworkManager>>,
     implicit_uffd_cancel: tokio_util::sync::CancellationToken,
@@ -1393,10 +1393,9 @@ async fn cmd_snapshot_run_inner(
             )
             .await
             {
-                Ok(lines) => lines,
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
-                    Vec::new()
                 }
             }
         }));

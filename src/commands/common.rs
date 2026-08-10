@@ -804,7 +804,7 @@ pub struct CleanupContext {
     pub data_dir: PathBuf,
     pub health_cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub health_monitor_handle: Option<JoinHandle<()>>,
-    pub output_listener_handle: Option<JoinHandle<Vec<(String, String)>>>,
+    pub output_listener_handle: Option<JoinHandle<()>>,
 }
 
 /// Errors observed while tearing down independent VM resources.

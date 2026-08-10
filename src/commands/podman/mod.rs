@@ -485,6 +485,61 @@ async fn verify_prepared_snapshot_in(
         );
     }
 
+    // The three core artifacts are not the whole generation. A clone also opens every
+    // extra disk and, for a portable volume, its inode table — so a generation missing
+    // one of those would report `prepared` here and fail (or silently renumber inodes)
+    // at restore, after the cache entry is already durable and shared.
+    for disk in &config.metadata.extra_disks {
+        let mut components = std::path::Path::new(&disk.filename).components();
+        let contained = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        anyhow::ensure!(
+            contained,
+            "prepared snapshot {} extra disk {} names a path outside its generation: {}",
+            snapshot_key,
+            disk.drive_id,
+            disk.filename
+        );
+        let path = snapshot_dir.join(&disk.filename);
+        let metadata = tokio::fs::metadata(&path).await.with_context(|| {
+            format!(
+                "reading prepared snapshot {} extra disk {} artifact {}",
+                snapshot_key,
+                disk.drive_id,
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() > 0,
+            "prepared snapshot {} extra disk {} artifact is not a non-empty regular file: {}",
+            snapshot_key,
+            disk.drive_id,
+            path.display()
+        );
+    }
+
+    // Portable volumes restore their inode numbering from a table written into the
+    // generation before its atomic rename (see create_podman_snapshot). A clone that
+    // finds no table renumbers inodes, which is exactly the glitch the table prevents.
+    for volume in config.metadata.volumes.iter().filter(|v| v.portable) {
+        let path = snapshot_dir.join(format!("volume-{}-inode-table.json", volume.vsock_port));
+        let metadata = tokio::fs::metadata(&path).await.with_context(|| {
+            format!(
+                "reading prepared snapshot {} portable volume {} inode table {}",
+                snapshot_key,
+                volume.guest_path,
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() > 0,
+            "prepared snapshot {} portable volume {} inode table is not a non-empty regular file: {}",
+            snapshot_key,
+            volume.guest_path,
+            path.display()
+        );
+    }
+
     // `prepare` is a durability boundary, not merely a namespace rename. Flush every file
     // in the installed generation, then the generation and snapshot-root directories, while
     // the shared generation lease prevents replacement. Success therefore survives a host
@@ -1477,10 +1532,9 @@ async fn prepare_vm_for_lifecycle(
             )
             .await
             {
-                Ok(lines) => lines,
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
-                    Vec::new()
                 }
             }
         }))
@@ -2970,6 +3024,154 @@ mod tests {
         assert!(
             crate::commands::snapshots::prune_reclaims(&tagged_config, true, None),
             "--all still reclaims it"
+        );
+    }
+
+    /// A generation is only complete if every artifact a clone opens is in it. The three
+    /// core files are not the whole set: an extra disk or a portable volume's inode table
+    /// can be absent while memory, vmstate and disk are all present and non-empty.
+    #[tokio::test]
+    async fn a_generation_missing_a_disk_or_inode_table_is_not_prepared() {
+        async fn verify_with(
+            temp: &std::path::Path,
+            extra_disks: Vec<crate::storage::snapshot::SnapshotExtraDisk>,
+            volumes: Vec<crate::storage::SnapshotVolumeConfig>,
+            side_files: &[(&str, &[u8])],
+        ) -> Result<bool> {
+            let snapshot_key = "0123456789ab-startup";
+            let snapshot_dir = temp.join(snapshot_key);
+            tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+
+            let vm_state = VmState::new(
+                "vm-prepare-parts".to_string(),
+                "alpine:latest".to_string(),
+                1,
+                512,
+            );
+            let mut config = super::super::common::build_snapshot_config(
+                &vm_state,
+                snapshot_key,
+                crate::storage::SnapshotType::System,
+                &snapshot_dir,
+                Vec::new(),
+                Vec::new(),
+            );
+            config.content_key = Some(snapshot_key.to_string());
+            config.metadata.extra_disks = extra_disks;
+            config.metadata.volumes = volumes;
+            for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
+                tokio::fs::write(path, b"durable-artifact").await.unwrap();
+            }
+            for (name, bytes) in side_files {
+                tokio::fs::write(snapshot_dir.join(name), bytes)
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(
+                snapshot_dir.join("config.json"),
+                serde_json::to_vec_pretty(&config).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let target = prepare_install_target(&PrepareOptions::default(), snapshot_key).unwrap();
+            // The lease is released with the returned value; these cases only ask
+            // whether the generation verified at all.
+            Ok(
+                verify_prepared_snapshot_in(temp, &target, PreparedCache::Hit)
+                    .await?
+                    .is_some(),
+            )
+        }
+
+        fn disk(filename: &str) -> crate::storage::snapshot::SnapshotExtraDisk {
+            crate::storage::snapshot::SnapshotExtraDisk {
+                filename: filename.to_string(),
+                mount_path: "/data".to_string(),
+                read_only: false,
+                drive_id: "disk0".to_string(),
+            }
+        }
+
+        fn volume(portable: bool) -> crate::storage::SnapshotVolumeConfig {
+            crate::storage::SnapshotVolumeConfig {
+                host_path: std::path::PathBuf::from("/srv/data"),
+                guest_path: "/data".to_string(),
+                read_only: false,
+                vsock_port: 5001,
+                portable,
+            }
+        }
+
+        // An extra disk recorded in metadata but absent from the generation.
+        let temp = tempfile::tempdir().unwrap();
+        let error = verify_with(temp.path(), vec![disk("disk-dir-0.raw")], Vec::new(), &[])
+            .await
+            .expect_err("a missing extra disk must not verify");
+        assert!(
+            format!("{error:#}").contains("extra disk disk0 artifact"),
+            "unexpected error: {error:#}"
+        );
+
+        // Present but empty is the same failure at restore.
+        let temp = tempfile::tempdir().unwrap();
+        let error = verify_with(
+            temp.path(),
+            vec![disk("disk-dir-0.raw")],
+            Vec::new(),
+            &[("disk-dir-0.raw", b"")],
+        )
+        .await
+        .expect_err("an empty extra disk must not verify");
+        assert!(
+            format!("{error:#}").contains("is not a non-empty regular file"),
+            "unexpected error: {error:#}"
+        );
+
+        // A filename that escapes the generation is never followed.
+        let temp = tempfile::tempdir().unwrap();
+        let error = verify_with(temp.path(), vec![disk("../escape.raw")], Vec::new(), &[])
+            .await
+            .expect_err("an escaping extra disk filename must not verify");
+        assert!(
+            format!("{error:#}").contains("names a path outside its generation"),
+            "unexpected error: {error:#}"
+        );
+
+        // A portable volume with no inode table renumbers inodes on the clone.
+        let temp = tempfile::tempdir().unwrap();
+        let error = verify_with(temp.path(), Vec::new(), vec![volume(true)], &[])
+            .await
+            .expect_err("a missing inode table must not verify");
+        assert!(
+            format!("{error:#}").contains("portable volume /data inode table"),
+            "unexpected error: {error:#}"
+        );
+
+        // A non-portable volume writes no table, so its absence is correct.
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            verify_with(temp.path(), Vec::new(), vec![volume(false)], &[])
+                .await
+                .unwrap(),
+            "a non-portable volume needs no inode table"
+        );
+
+        // Complete generation: both artifacts present and non-empty.
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            verify_with(
+                temp.path(),
+                vec![disk("disk-dir-0.raw")],
+                vec![volume(true)],
+                &[
+                    ("disk-dir-0.raw", b"disk-bytes"),
+                    ("volume-5001-inode-table.json", b"{}"),
+                ],
+            )
+            .await
+            .unwrap(),
+            "a complete generation must verify"
         );
     }
 
