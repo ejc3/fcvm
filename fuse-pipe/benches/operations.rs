@@ -46,6 +46,29 @@ fn setup_test_files(dir: &PathBuf) {
         let path = subdir.join(format!("file_{}.txt", i));
         fs::write(&path, format!("content {}", i)).unwrap();
     }
+
+    // Distinct files for the uncached metadata probes. Restating a path the
+    // kernel already has cached measures the cache, so those benchmarks walk
+    // this pool instead, and the pool is larger than any run's sample count so
+    // a single iteration never revisits an entry.
+    let pool = dir.join(METADATA_POOL_DIR);
+    fs::create_dir_all(&pool).unwrap();
+    for i in 0..METADATA_POOL_FILES {
+        fs::write(pool.join(format!("m_{i}.dat")), b"m").unwrap();
+    }
+}
+
+/// Directory holding the uncached-metadata file pool.
+const METADATA_POOL_DIR: &str = "metadata_pool";
+
+/// How many distinct files the uncached metadata probes rotate through.
+const METADATA_POOL_FILES: usize = 20_000;
+
+/// Nth file in the pool, wrapping. Callers pass a monotonically increasing
+/// counter, so consecutive iterations touch different inodes.
+fn pool_file(root: &std::path::Path, n: u64) -> PathBuf {
+    root.join(METADATA_POOL_DIR)
+        .join(format!("m_{}.dat", (n as usize) % METADATA_POOL_FILES))
 }
 
 fn cleanup(data_dir: &PathBuf, mount_dir: &PathBuf) {
@@ -82,9 +105,25 @@ fn bench_getattr(c: &mut Criterion) {
     // FUSE with 256 readers (our recommended default)
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
     let fuse_file = fuse.mount_path().join("test.dat");
-    group.bench_function("fuse_256_readers", |b| {
+
+    // Restating one path measures the kernel's attribute cache: FUSE mounts
+    // default to a 1s attr_timeout, so after the first stat the daemon is not
+    // contacted at all. That is a real number for a hot working set, but it is
+    // not the cost of a FUSE getattr, so it is named for what it measures.
+    group.bench_function("fuse_256_readers_attr_cache_hit", |b| {
         b.iter(|| {
             let _ = fs::metadata(&fuse_file).unwrap();
+        })
+    });
+
+    // The round trip. Each iteration stats a file this mount has not seen, so
+    // the request reaches the server.
+    let pool_root = fuse.mount_path().to_path_buf();
+    let counter = AtomicU64::new(0);
+    group.bench_function("fuse_256_readers_uncached", |b| {
+        b.iter(|| {
+            let n = counter.fetch_add(1, Ordering::Relaxed);
+            let _ = fs::metadata(pool_file(&pool_root, n)).unwrap();
         })
     });
 
@@ -94,6 +133,8 @@ fn bench_getattr(c: &mut Criterion) {
 }
 
 fn bench_lookup(c: &mut Criterion) {
+    ensure_ulimit();
+
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-lookup");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-lookup");
 
@@ -114,9 +155,21 @@ fn bench_lookup(c: &mut Criterion) {
     // FUSE
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
     let fuse_file = fuse.mount_path().join("test.dat");
-    group.bench_function("fuse_256_readers", |b| {
+
+    // As with getattr: one repeated path is served by the kernel's dentry
+    // cache (entry_timeout), not by the server.
+    group.bench_function("fuse_256_readers_dentry_cache_hit", |b| {
         b.iter(|| {
             let _ = fuse_file.exists();
+        })
+    });
+
+    let pool_root = fuse.mount_path().to_path_buf();
+    let counter = AtomicU64::new(0);
+    group.bench_function("fuse_256_readers_uncached", |b| {
+        b.iter(|| {
+            let n = counter.fetch_add(1, Ordering::Relaxed);
+            let _ = pool_file(&pool_root, n).exists();
         })
     });
 

@@ -155,6 +155,8 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 export CARGO_TARGET_DIR := target
 NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
+# Extra flags forwarded to every criterion bench recipe (see bench-quick).
+BENCH_ARGS ?=
 
 # cargo/nextest target runner for the privileged suites. cargo-nextest stays unprivileged
 # and only the test binary is elevated, so the `sudo` hop sits in the middle of the process
@@ -204,6 +206,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
+	bench-quick bench-throughput bench-operations bench-protocol \
 	lint fmt update-dependency ssh test-serve-sdk
 
 all: build
@@ -665,15 +668,54 @@ test-chromium-request:
 test-ci-infrastructure:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_ci_infrastructure.py'
 
-bench: build
-	@echo "==> Running benchmarks..."
+# The three fuse-pipe suites, in order. Prerequisites rather than recursive
+# $(MAKE) calls: a sub-make RUNS even under `make -n`, so the delegating form
+# turned a dry run into a real build. Do not run this under -j; concurrent
+# benchmarks measure each other.
+bench: bench-throughput bench-operations bench-protocol
+
+# throughput and operations mount a real FUSE filesystem, so they take the
+# privileged runner the root tests use; protocol is pure serialization and
+# stays unprivileged.
+#
+# Each privileged suite hands target/ back afterwards. criterion writes its
+# results from inside the bench binary, so under that runner target/criterion
+# ends up root-owned, and two things break: bench-protocol, which is
+# deliberately unprivileged, fails every write with `Permission denied (os
+# error 13)` — it still prints timings but persists nothing, so criterion never
+# holds a baseline for it and can never report a change — and `_test-root`
+# refuses to start until the ownership is repaired. The repair is inline rather
+# than a $(MAKE) call because a sub-make runs even under `make -n`, and this
+# one would invoke sudo.
+bench-throughput: build
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench -p fuse-pipe --bench throughput
+	$(CARGO) bench -p fuse-pipe --bench throughput $(BENCH_ARGS); \
+	RC=$$?; \
+	if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
+		sudo chown -R $$(id -u):$$(id -g) target/; \
+	fi; \
+	exit $$RC
+
+bench-operations: build
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench -p fuse-pipe --bench operations
-	$(CARGO) bench -p fuse-pipe --bench protocol
+	$(CARGO) bench -p fuse-pipe --bench operations $(BENCH_ARGS); \
+	RC=$$?; \
+	if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
+		sudo chown -R $$(id -u):$$(id -g) target/; \
+	fi; \
+	exit $$RC
+
+bench-protocol: build
+	$(CARGO) bench -p fuse-pipe --bench protocol $(BENCH_ARGS)
+
+# The same three suites at criterion's smallest honest sample count, for
+# iteration. A target-specific variable reaches the prerequisites, so this
+# needs no recursive make. Quote `make bench` in any report: a 10-sample
+# interval is wide.
+bench-quick: BENCH_ARGS := --sample-size 10 --warm-up-time 1 --measurement-time 3
+bench-quick: bench
 
 # VM benchmarks (exec, clone) - require KVM, Firecracker, setup
 bench-vm: build setup-default
