@@ -23,6 +23,107 @@ VM_EVIDENCE_STACK_LINES=60
 # Seconds between reclaim/compaction stack samples (tests set 0).
 VM_EVIDENCE_MM_INTERVAL="${FCVM_MM_SAMPLE_INTERVAL_SECONDS:-1}"
 
+# Linux comm is limited to 15 bytes. `cloud-hypervisor` is therefore observed as
+# `cloud-hypervis`; the prefix intentionally covers both that and the full spelling.
+VM_SCAN_RE='^(firecracker|cloud-hypervis|fcvm)'
+
+# vm_scan_all_threads <destination> <timeout_seconds> <tmp_prefix>
+#
+# One process-table snapshot behind a hard deadline, normalized to a
+# tab-separated TGID/TID/PPID/STATE/THREAD artifact. We do not wait for a
+# timed-out reader after SIGKILL: if the kernel has already parked it in D
+# state, waiting would recreate the guard hang this scan exists to diagnose.
+# Diagnostics go to stdout; callers that must stay silent capture them.
+vm_scan_all_threads() {
+	local destination=$1 scan_timeout=$2 tmp_prefix=$3
+	local raw scan_stderr scan_pid deadline rc line
+	raw=$(mktemp "${tmp_prefix}.XXXXXX") || return 1
+	scan_stderr=$(mktemp "${tmp_prefix}.XXXXXX") || return 1
+	printf 'TGID\tTID\tPPID\tSTATE\tTHREAD\n' >"$destination"
+
+	# Do not let the scanner inherit the caller's stdout/stderr pipes. If ps
+	# wedges in D state, SIGKILL remains pending and every inherited pipe
+	# writer stays open, making a workflow caller wait forever for EOF even
+	# after the calling script exits.
+	ps -eL -o pid= -o lwp= -o ppid= -o state= -o comm= >"$raw" 2>"$scan_stderr" &
+	scan_pid=$!
+	deadline=$((SECONDS + scan_timeout))
+	while kill -0 "$scan_pid" 2>/dev/null; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			kill -9 "$scan_pid" 2>/dev/null || true
+			disown "$scan_pid" 2>/dev/null || true
+			while IFS= read -r line || [ -n "$line" ]; do
+				printf 'process/thread scanner stderr: %s\n' "$line"
+			done <"$scan_stderr"
+			echo "process/thread scan timed out after ${scan_timeout}s"
+			return 124
+		fi
+		sleep 0.05
+	done
+
+	wait "$scan_pid"
+	rc=$?
+	while IFS= read -r line || [ -n "$line" ]; do
+		printf 'process/thread scanner stderr: %s\n' "$line"
+	done <"$scan_stderr"
+	if [ "$rc" -ne 0 ]; then
+		echo "process/thread scan failed with status ${rc}"
+		return "$rc"
+	fi
+
+	# Normalize the variable-width comm column to a tab-separated artifact. Thread
+	# names can contain spaces, so fields 5..NF are joined back together.
+	awk '
+		BEGIN { OFS = "\t" }
+		NF >= 5 {
+			thread = $5
+			for (i = 6; i <= NF; i++)
+				thread = thread " " $i
+			print $1, $2, $3, $4, thread
+		}
+	' "$raw" >>"$destination"
+}
+
+# vm_select_vm_groups <all_threads> <selected_threads> <live_groups> <zombie_groups>
+#
+# Select complete task groups whose leader name is a VM process. Outputs one TGID
+# per live group and one per zombie-only group; the thread artifact always contains
+# every sibling, including the zombie leader itself.
+vm_select_vm_groups() {
+	local all_threads=$1
+	local selected_threads=$2
+	local live_groups=$3
+	local zombie_groups=$4
+
+	awk -F '\t' -v re="$VM_SCAN_RE" \
+		-v selected="$selected_threads" \
+		-v live_out="$live_groups" \
+		-v zombie_out="$zombie_groups" '
+		BEGIN { OFS = "\t" }
+		NR == 1 { header = $0; next }
+		{
+			rows[++count] = $0
+			tgid[count] = $1
+			if ($1 == $2 && $5 ~ re)
+				target[$1] = 1
+			if ($4 !~ /^Z/)
+				live[$1] = 1
+		}
+		END {
+			print header > selected
+			for (i = 1; i <= count; i++)
+				if (tgid[i] in target)
+					print rows[i] >> selected
+			for (id in target) {
+				if (live[id])
+					print id > live_out
+				else
+					print id > zombie_out
+			}
+		}
+	' "$all_threads"
+}
+
 # vm_evidence_tid <tgid> <tid>
 #
 # One thread's kernel-side state: status (State + SigPnd/ShdPnd prove "SIGKILL
