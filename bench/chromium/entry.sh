@@ -2,7 +2,8 @@
 # chromium-bench container entry: fixture pageserver + WARM headless Chromium.
 #
 # Sequence: start pageserver -> launch Chromium with CDP -> warm it (navigate a
-# fixture, screenshot once to heat the raster/encode path, park on about:blank)
+# fixture, screenshot once to heat the raster/encode path, prove the same loader
+# reached a complete about:blank document)
 # -> touch the ready file (which the container HEALTHCHECK gates on) -> print the
 # READY marker -> hold the browser open.
 #
@@ -217,10 +218,14 @@ echo "chromium-bench: warming renderer"
 python3 /opt/bench/render.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
     --out-prefix /tmp/warmup --then-blank
 
-# Warm marker. The container HEALTHCHECK (cdp_health.py) requires BOTH this file
-# AND a live CDP round trip that finds a page target, so fcvm's health gate — the
-# trigger for the golden snapshot — cannot fire on a browser that is merely
-# listening. "Healthy" therefore means "warm and provably able to screenshot".
+# Warm marker. render.py returns zero only after the about:blank navigation's
+# own loader emits lifecycle `load` and Runtime.evaluate confirms both
+# location.href=about:blank and readyState=complete. Because this script uses
+# `set -e`, any missing/incorrect blank transition exits before this touch. The
+# container HEALTHCHECK (cdp_health.py) then requires BOTH this file and a live
+# CDP round trip that finds a page target, so fcvm's health gate — the trigger
+# for the golden snapshot — cannot fire on a browser that is merely listening or
+# whose warmup document was not proven quiescent.
 touch "$READY_FILE"
 echo "CHROMIUM_BENCH_READY cdp=127.0.0.1:$CDP_PORT pages=http://127.0.0.1:$HTTP_PORT"
 

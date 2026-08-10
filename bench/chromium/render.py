@@ -247,6 +247,7 @@ def main() -> int:
     t0 = time.monotonic()
     deadline = t0 + args.timeout
     stage = "connect"
+    ws = None
     try:
         ws = WsClient(find_page_ws_url(args.cdp_host, deadline), deadline)
         cdp = Cdp(ws)
@@ -311,17 +312,53 @@ def main() -> int:
         dom_ms = (time.monotonic() - t_dom) * 1000
 
         if args.then_blank:
-            stage = "blank"
-            cdp.cmd("Page.navigate", {"url": "about:blank"}, deadline=deadline)
+            stage = "blank-navigate"
+            blank_nav = cdp.cmd(
+                "Page.navigate", {"url": "about:blank"}, deadline=deadline
+            )
+            if "errorText" in blank_nav:
+                raise RuntimeError(
+                    f"about:blank navigation failed: {blank_nav['errorText']}"
+                )
+            blank_loader = blank_nav.get("loaderId")
+            if not blank_loader:
+                raise RuntimeError("about:blank navigation returned no loaderId")
+
+            # Page.navigate's command response only acknowledges the request.  A
+            # generic Page.loadEventFired can be left over from another loader,
+            # so it is not proof that the page frozen into the golden snapshot is
+            # blank and quiescent.  Lifecycle events carry the loader identity.
+            stage = "blank-load"
             try:
                 cdp.wait_event(
-                    lambda ev: ev["method"] == "Page.loadEventFired",
+                    lambda ev: ev["method"] == "Page.lifecycleEvent"
+                    and ev["params"].get("name") == "load"
+                    and ev["params"].get("loaderId") == blank_loader,
                     min(deadline, time.monotonic() + 2),
                 )
-            except TimeoutError:
-                pass  # blank settle is best-effort
-        ws.close()
+            except TimeoutError as error:
+                raise TimeoutError(
+                    f"about:blank loader {blank_loader} never reached lifecycle load"
+                ) from error
 
+            stage = "blank-verify"
+            blank_state = cdp.cmd(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "({href: location.href, readyState: document.readyState})"
+                    ),
+                    "returnByValue": True,
+                },
+                deadline=deadline,
+            )["result"]["value"]
+            if blank_state != {
+                "href": "about:blank",
+                "readyState": "complete",
+            }:
+                raise RuntimeError(
+                    f"about:blank did not settle completely: {blank_state!r}"
+                )
         total_ms = (time.monotonic() - t0) * 1000
         print(
             f"RENDER_OK url={args.url} connect_ms={connect_ms:.1f} "
@@ -335,6 +372,9 @@ def main() -> int:
     except (OSError, RuntimeError, TimeoutError, WsClosed, KeyError) as e:
         print(f'RENDER_FAIL url={args.url} stage={stage} error="{e}"', flush=True)
         return 1
+    finally:
+        if ws is not None:
+            ws.close()
 
 
 if __name__ == "__main__":

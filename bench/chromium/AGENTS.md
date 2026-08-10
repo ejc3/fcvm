@@ -369,10 +369,14 @@ to rootless for this reason.
 With no `--health-check` URL, fcvm's `Healthy` = container running AND podman's
 `HEALTHCHECK` healthy (`src/health.rs`, "AND logic"). So the image's HEALTHCHECK
 decides what gets frozen. `cdp_health.py` requires BOTH a warm marker (entry.sh
-touches it only after a full navigate+screenshot) AND a live CDP round trip that
-finds a page target. Healthy therefore means *provably able to screenshot*, not
-*port is open*. Caveat to verify: podman healthchecks need systemd timers in the
-guest; `src/health.rs` notes they can fail to schedule in some rootless setups.
+touches it only after a full navigate+screenshot and a loader-correlated
+`about:blank` lifecycle `load`; render.py then verifies `location.href` and
+`document.readyState == complete`) AND a live CDP round trip that finds a page
+target. The blank transition is fail-closed: its timeout is not best-effort, and
+entry.sh's `set -e` exits before publishing the marker. Healthy therefore means
+*warm, quiescent, and provably able to screenshot*, not *port is open*. Caveat to
+verify: podman healthchecks need systemd timers in the guest; `src/health.rs`
+notes they can fail to schedule in some rootless setups.
 
 ### Fast teardown: one signal, kernel-enforced — scope the guarantee, don't blanket it
 
