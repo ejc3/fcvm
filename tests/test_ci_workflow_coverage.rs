@@ -746,3 +746,47 @@ fn workflow_changes_get_a_relevant_gated_check() {
          it fails"
     );
 }
+
+/// Summary must be able to pass when the VM matrix is skipped.
+///
+/// Making Summary run on every PR (so it can be a required check) means it now
+/// runs for PRs where `changes` skips the matrix. Its artifact steps analyse
+/// that matrix's output, and `analyze_ci_vms.py` exits non-zero on an empty
+/// directory — so on the first docs-only PR after that change, Summary failed
+/// at `Analyze CI run` while every gating job was correctly skipped. A
+/// required check that cannot pass for a whole class of PR blocks them all.
+#[test]
+fn summary_artifact_steps_are_gated_on_the_changes_job() {
+    let ci = parse_workflow("ci.yml");
+    let steps = workflow_job(&ci, "summary")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("ci.yml `summary` job has no steps");
+
+    let mut checked = 0usize;
+    for step in steps {
+        let name = step.get("name").and_then(Value::as_str).unwrap_or("");
+        let uses = step.get("uses").and_then(Value::as_str).unwrap_or("");
+        let touches_artifacts = uses.contains("download-artifact") || name == "Analyze CI run";
+        if !touches_artifacts {
+            continue;
+        }
+        checked += 1;
+        let cond = step
+            .get("if")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("summary step `{name}` has no `if:` gate"));
+        assert!(
+            cond.contains("needs.changes.outputs.code == 'true'"),
+            "summary step `{name}` consumes the VM matrix's artifacts but is not gated on the \
+             `changes` job, so it runs — and fails on an empty artifact directory — for every \
+             PR that skips the matrix"
+        );
+    }
+
+    assert!(
+        checked >= 2,
+        "expected to find the download-artifact and Analyze CI run steps in `summary`; found \
+         {checked}, so this test is not inspecting what it claims"
+    );
+}
