@@ -16,25 +16,19 @@ L2 tests when transferring >300MB through NFS mounts.
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
- net/vmw_vsock/virtio_transport.c | 10 ++++++++++
- 1 file changed, 10 insertions(+)
+ net/vmw_vsock/virtio_transport.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
 
 --- a/net/vmw_vsock/virtio_transport.c
 +++ b/net/vmw_vsock/virtio_transport.c
-@@ -17,6 +17,9 @@
- #include <linux/virtio_ids.h>
- #include <linux/virtio_config.h>
- #include <linux/virtio_vsock.h>
+@@ -19,0 +20,3 @@
 +#ifdef CONFIG_ARM64
 +#include <asm/barrier.h>
 +#endif
- #include <net/sock.h>
- #include <linux/mutex.h>
- #include <net/af_vsock.h>
-@@ -618,6 +621,14 @@
-
- 	mutex_lock(&vsock->rx_lock);
-
+@@ -639 +642,9 @@ static void virtio_transport_rx_work(struct work_struct *work)
+-	mutex_lock(&vsock->rx_lock);
++	mutex_lock(&vsock->rx_lock);
++
 +#ifdef CONFIG_ARM64
 +	/*
 +	 * Under nested virtualization (NV2), ensure L2's writes to the
@@ -42,6 +36,3 @@ Signed-off-by: fcvm <fcvm@localhost>
 +	 */
 +	dsb(sy);
 +#endif
-+
- 	if (!vsock->rx_run)
- 		goto out;

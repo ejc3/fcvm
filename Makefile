@@ -154,6 +154,7 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # (a prerequisite of every build/test target).
 export CARGO_TARGET_DIR := target
 NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
+TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
 
 # cargo/nextest target runner for the privileged suites. cargo-nextest stays unprivileged
 # and only the test binary is elevated, so the `sudo` hop sits in the middle of the process
@@ -410,15 +411,15 @@ clean:
 
 # Run-only targets (no setup deps, used by container)
 _test-unit: cargo-target-link
-	$(NEXTEST) --no-default-features $(FILTER)
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) --no-default-features $(FILTER)
 
 _test-fast: cargo-target-link
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
+	$(TEST_CONFIG_WRAPPER) ./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
 
 _test-all: cargo-target-link
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
+	$(TEST_CONFIG_WRAPPER) ./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
 _test-root: cargo-target-link
 	@if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
@@ -429,7 +430,7 @@ _test-root: cargo-target-link
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --features privileged-tests $(IPV6_FILTER) $(CI_NESTED_FILTER) $(FILTER) || \
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --features privileged-tests $(IPV6_FILTER) $(CI_NESTED_FILTER) $(FILTER) || \
 	{ echo ""; \
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 	  echo "TEST FAILED - Check debug logs for root cause:"; \
@@ -466,7 +467,7 @@ _test-fc-mock: cargo-target-link
 	FCVM_DATA_DIR=$${FCVM_DATA_DIR:-$(ROOT_DATA_DIR)} \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E '$(FC_MOCK_FILTER)' $(FILTER) || \
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E '$(FC_MOCK_FILTER)' $(FILTER) || \
 	{ echo ""; \
 	  echo "TEST FAILED (fc-mock mode)"; \
 	  exit 1; }

@@ -103,10 +103,8 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
     );
 
     // Wait for completion. This single budget covers the whole VM lifecycle (cold
-    // bridged boot, pre-start snapshot pause, in-guest image/container startup, the
-    // test script, and shutdown), so keep it just under the 600s nextest
-    // slow-timeout for VM tests — under heavy parallel snapshot I/O the container
-    // start alone has been observed to take several minutes.
+    // bridged boot, in-guest image/container startup, the test script, and
+    // shutdown), so keep it just under the 600s nextest slow-timeout for VM tests.
     let timeout = std::time::Duration::from_secs(570);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
@@ -135,15 +133,6 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
 
     if !exit_status.success() {
         let code = exit_status.code().unwrap_or(-1);
-        // Exit code 95 = EOPNOTSUPP, 38 = ENOSYS
-        // Exit code 1 = cp --reflink=always returns 1 when reflink not supported
-        if code == 95 || code == 38 || code == 1 {
-            eprintln!(
-                "SKIP: {} - kernel or filesystem doesn't support FUSE remap_file_range (exit={})",
-                test_name, code
-            );
-            return Ok(());
-        }
         anyhow::bail!(
             "{} failed: exit={} ({:.1}s)",
             test_name,
@@ -184,10 +173,12 @@ fn verify_shared_extents(data_dir: &str) {
 /// Test FICLONE (whole file clone) via cp --reflink=always
 #[tokio::test]
 async fn test_ficlone_cp_reflink_in_vm() {
-    // Shell script that tests cp --reflink=always
+    // Shell script that tests cp --reflink=always, including the request-length
+    // path above u32::MAX. The running host kernel may predate this branch, but
+    // this VM boots the exact 7.1.7 profile kernel produced by the branch.
     // Alpine's busybox cp doesn't support --reflink, so we install coreutils first
     // Note: --cmd is passed directly to container, so we need sh -c wrapper
-    let script = r#"sh -c 'set -e; apk add --no-cache coreutils >/dev/null 2>&1; cd /data; dd if=/dev/urandom of=source.bin bs=1M count=1 2>/dev/null; cp --reflink=always source.bin dest.bin; cmp source.bin dest.bin; echo FICLONE test passed'"#;
+    let script = r#"sh -c 'set -e; apk add --no-cache coreutils >/dev/null 2>&1; cd /data; size=5368709120; printf fcvm-remap > source.bin; truncate -s "$size" source.bin; printf Z | dd of=source.bin bs=1 seek=$((size - 1)) conv=notrunc status=none; cp --reflink=always source.bin dest.bin; actual=$(stat -c %s dest.bin); test "$actual" -eq "$size" || { echo "FICLONE size mismatch: got $actual expected $size" >&2; exit 1; }; head -c 10 source.bin > source.head; head -c 10 dest.bin > dest.head; cmp source.head dest.head; tail -c 1 source.bin > source.tail; tail -c 1 dest.bin > dest.tail; cmp source.tail dest.tail; echo FICLONE 5GiB test passed'"#;
 
     run_remap_test_in_vm("ficlone", script)
         .await

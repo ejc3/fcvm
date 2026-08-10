@@ -60,6 +60,19 @@ impl ImageCacheMount {
     }
 }
 
+/// Resolve the same active fcvm config directory used by the test wrapper.
+/// L1 runs its nested fcvm process as root, so callers mount this directory at
+/// `/root/.config/fcvm` instead of letting L2 reopen a shared host config.
+fn active_fcvm_config_dir() -> std::path::PathBuf {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(config_home).join("fcvm")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home).join(".config/fcvm")
+    } else {
+        std::path::PathBuf::from("/tmp/fcvm-config")
+    }
+}
+
 #[tokio::test]
 async fn test_kvm_available_in_vm() -> Result<()> {
     println!("\nNested KVM test");
@@ -247,10 +260,9 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("   Mounting: /mnt/fcvm-btrfs (assets) and fcvm binary");
 
     let fcvm_volume = format!("{}:/opt/fcvm", fcvm_dir.display());
-    // Mount host config dir so inner fcvm can find its config
-    // Use $HOME which is set by spawn_fcvm based on the current user
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
+    // Mount the active isolated config so inner fcvm uses this exact worktree.
+    let config_dir = active_fcvm_config_dir();
+    let config_mount = format!("{}:/root/.config/fcvm:ro", config_dir.display());
     // Use nginx so health check works (bridged networking does HTTP health check to port 80)
     // Note: firecracker is in /mnt/fcvm-btrfs/bin which is mounted via the btrfs mount
     let (mut _child, outer_pid) = common::spawn_fcvm(&[
@@ -412,9 +424,23 @@ except OSError as e:
     // cannot appear in the argv fcvm echoes into the stderr this test captures.
     const NESTED_MARKER: &str = "NESTED_SUCCESS_INNER_VM_WORKS";
 
-    let inner_cmd = r#"
+    let inner_snapshot_env = std::env::var("FCVM_NO_SNAPSHOT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|_| "export FCVM_NO_SNAPSHOT=1")
+        .unwrap_or("");
+    let inner_cmd = format!(
+        r#"
         export PATH=/opt/fcvm:/mnt/fcvm-btrfs/bin:$PATH
         export HOME=/root
+        # RUST_LOG does not cross the exec boundary, and the inner fcvm's
+        # default level suppresses the INFO-tier lines that carry the L2
+        # serial console it streams. Without this the captured tail is a
+        # few hundred bytes of health-monitor warnings (measured 262 bytes
+        # over a full 600s wedge) instead of the console evidence the
+        # bounded run exists to surface.
+        export RUST_LOG=info
+        {inner_snapshot_env}
         # Load tun kernel module (needed for TAP device creation)
         modprobe tun 2>/dev/null || true
         mkdir -p /dev/net
@@ -423,12 +449,31 @@ except OSError as e:
         cd /mnt/fcvm-btrfs
         # Use bridged networking (outer VM is privileged so iptables works)
         # Use ECR image to avoid Docker Hub rate limits
-        fcvm podman run \
+        #
+        # Bound the inner run so a wedged L2 fails inside this exec instead of
+        # tripping the outer per-test timeout: nextest kills the whole test
+        # before the exec returns, which discards everything the inner fcvm
+        # wrote (including the L2 serial console it streams), leaving a bare
+        # TIMEOUT with no evidence. The file redirect (rather than a command
+        # substitution) matters too: a surviving grandchild holding the pipe
+        # would block the capture even after timeout(1) reaps the inner fcvm.
+        # SIGTERM from timeout(1) lets the inner fcvm tear the L2 VM down.
+        inner_log=/tmp/inner-fcvm-run.log
+        timeout 600 fcvm podman run \
             --name inner-test \
             --network bridged \
             --cmd "printf '%s_%s\n' NESTED_SUCCESS INNER_VM_WORKS" \
-            public.ecr.aws/nginx/nginx:alpine
-    "#;
+            public.ecr.aws/nginx/nginx:alpine >"$inner_log" 2>&1
+        rc=$?
+        echo "INNER_FCVM_EXIT_CODE=$rc"
+        tail -c 131072 "$inner_log"
+        if [ "$rc" -ne 0 ]; then
+            echo "=== L1 dmesg tail ==="
+            dmesg | tail -80
+        fi
+        exit "$rc"
+    "#
+    );
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
@@ -439,7 +484,7 @@ except OSError as e:
             "--",
             "sh",
             "-c",
-            inner_cmd,
+            inner_cmd.as_str(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -532,9 +577,9 @@ async fn run_nested_chain(total_levels: usize) -> Result<()> {
 
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Home dir for config mount
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
+    // Mount the active isolated config into the first nested level.
+    let config_dir = active_fcvm_config_dir();
+    let config_mount = format!("{}:/root/.config/fcvm:ro", config_dir.display());
 
     // Track PIDs for cleanup
     let mut level_pids: Vec<u32> = Vec::new();
