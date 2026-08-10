@@ -16,6 +16,10 @@ use super::types::{CacheRequest, LogLine};
 /// releases the connection instead of holding it for the process's lifetime.
 const CACHE_ACK_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+const RESTORE_COMPLETION_PREFIX: &str = "restore-complete:";
+const RESTORE_COMPLETION_MAX_FRAME_BYTES: usize = 128;
+const RESTORE_COMPLETION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Listen for fc-agent status messages on the status vsock port.
 ///
 /// Firecracker forwards guest vsock connections to Unix sockets with format:
@@ -381,6 +385,114 @@ async fn serve_bootplan(listener: tokio::net::UnixListener, payload: Vec<u8>) {
     }
 }
 
+/// Bind the one-shot restored-guest completion listener before the VMM resumes.
+///
+/// The output, TTY, and exec sockets are workload transports, not proof that the
+/// restore handler finished. This dedicated channel carries one exact restore UUID
+/// after fc-agent has completed cleanup, exec/egress rebind, and its Succeeded
+/// transition. Bind is synchronous so a missing correctness oracle fails setup
+/// instead of becoming a detached guest/host race.
+pub(crate) fn spawn_restore_completion_listener(
+    socket_path: &str,
+    expected_epoch: &str,
+) -> Result<(
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+)> {
+    use tokio::net::UnixListener;
+
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path).with_context(|| {
+        format!(
+            "binding restore-completion listener (phase=bind expected_epoch={expected_epoch} observed_epoch=<none>) to {socket_path}"
+        )
+    })?;
+    let expected_epoch = expected_epoch.to_owned();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    info!(
+        socket = %socket_path,
+        expected_epoch = %expected_epoch,
+        "Restore-completion listener started (vsock)"
+    );
+
+    let handle = tokio::spawn(async move {
+        let result = receive_restore_completion(listener, &expected_epoch).await;
+        if completion_tx.send(result).is_err() {
+            debug!(
+                expected_epoch = %expected_epoch,
+                "restore-completion receiver dropped before listener result was consumed"
+            );
+        }
+    });
+    Ok((handle, completion_rx))
+}
+
+async fn receive_restore_completion(
+    listener: tokio::net::UnixListener,
+    expected_epoch: &str,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    let (stream, _) = listener.accept().await.with_context(|| {
+        format!(
+            "restore-completion protocol failed (phase=accept expected_epoch={expected_epoch} observed_epoch=<none>)"
+        )
+    })?;
+    let mut frame = Vec::with_capacity(RESTORE_COMPLETION_MAX_FRAME_BYTES);
+    let mut limited =
+        tokio::io::BufReader::new(stream).take((RESTORE_COMPLETION_MAX_FRAME_BYTES + 1) as u64);
+    match tokio::time::timeout(
+        RESTORE_COMPLETION_READ_TIMEOUT,
+        limited.read_until(b'\n', &mut frame),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "restore-completion protocol failed (phase=read-frame expected_epoch={expected_epoch} observed_epoch=<io-error>)"
+                )
+            });
+        }
+        Err(_) => {
+            anyhow::bail!(
+                "restore-completion protocol timed out (phase=read-frame expected_epoch={expected_epoch} observed_epoch=<incomplete> timeout={RESTORE_COMPLETION_READ_TIMEOUT:?})"
+            );
+        }
+    }
+    validate_restore_completion_frame(&frame, expected_epoch)
+}
+
+fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Result<()> {
+    if frame.len() > RESTORE_COMPLETION_MAX_FRAME_BYTES {
+        anyhow::bail!(
+            "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<oversized> bytes={})",
+            frame.len()
+        );
+    }
+
+    let message = std::str::from_utf8(frame).map_err(|error| {
+        anyhow::anyhow!(
+            "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<invalid-utf8>): {error}"
+        )
+    })?;
+    let observed_epoch = message
+        .strip_prefix(RESTORE_COMPLETION_PREFIX)
+        .and_then(|value| value.strip_suffix('\n'))
+        .filter(|value| !value.is_empty() && !value.contains('\n'))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<malformed> frame={message:?})"
+            )
+        })?;
+    anyhow::ensure!(
+        observed_epoch == expected_epoch,
+        "restore-completion protocol rejected generation (phase=validate-epoch expected_epoch={expected_epoch} observed_epoch={observed_epoch})"
+    );
+    Ok(())
+}
+
 /// Bidirectional I/O listener for container stdin/stdout/stderr.
 ///
 /// Listens on port 4997 for raw output from fc-agent.
@@ -567,6 +679,28 @@ pub(crate) async fn run_output_listener(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn restore_completion_rejects_the_wrong_epoch_with_exact_diagnostics() {
+        let error = validate_restore_completion_frame(
+            b"restore-complete:observed-generation\n",
+            "expected-generation",
+        )
+        .expect_err("a stale or foreign restore generation must fail closed");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("phase=validate-epoch"),
+            "protocol failure must identify its phase: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("expected_epoch=expected-generation"),
+            "protocol failure must identify the expected epoch: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("observed_epoch=observed-generation"),
+            "protocol failure must identify the observed epoch: {diagnostic}"
+        );
+    }
 
     /// Verify that writeln! to a broken pipe doesn't panic (returns Err),
     /// while println! would panic with "failed printing to stdout".

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::info;
 
@@ -29,6 +29,10 @@ pub fn validate_snapshot_name(name: &str) -> Result<()> {
 fn default_health_check_timeout() -> u64 {
     5
 }
+
+/// Host/guest protocol version for the immutable TCP generation boundary that
+/// is captured in every current memory snapshot.
+pub const SNAPSHOT_NETWORK_BOUNDARY_VERSION: u32 = 1;
 
 /// Type of snapshot - distinguishes user-created from system-generated
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,14 +83,23 @@ pub struct SnapshotConfig {
     /// restore releases its shared generation lease; conditional invalidation
     /// must not delete that replacement.
     pub generation_id: uuid::Uuid,
-    /// Original VM ID for vsock socket path redirect.
-    /// This is the VM ID whose path is stored in vmstate.bin.
+    /// Required restore-safety protocol. A full snapshot without this exact
+    /// version may resume with external ingress live before socket cleanup, so
+    /// it must be rejected by the host before the VMM is started.
+    pub network_boundary_version: u32,
+    /// Original VM lineage retained for disk redirects and diagnostics.
     /// When a VM is restored from cache/snapshot, its vmstate still references
     /// the original VM's paths. When snapshotting such a VM, we preserve this
-    /// original_vm_id so clones use the correct redirect path.
-    /// Defaults to vm_id if not set (for snapshots of fresh VMs).
+    /// original_vm_id. `source_vsock_socket_path` below is authoritative for
+    /// vsock redirection; an ID cannot represent a custom `--vsock-dir`.
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
+    /// Exact host-side vsock base path embedded in the VMM state.
+    ///
+    /// This is not necessarily `vm_runtime_dir(original_vsock_vm_id)/vsock.sock`:
+    /// a cold source may use `--vsock-dir`, and a snapshot of a restored clone
+    /// still embeds its ancestor's path while listeners are clone-local.
+    pub source_vsock_socket_path: PathBuf,
     /// Parent snapshot name used as the diff base for this snapshot's memory.
     /// - Full snapshots: None (no diff base needed)
     /// - Diff snapshots: Some("parent-name") — memory.bin was created by merging
@@ -402,21 +415,49 @@ fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotCon
             "snapshot '{name}' has unsupported metadata schema: config.json must contain an object; delete and recreate the snapshot"
         )
     })?;
-    let missing_or_null: Vec<&str> = ["generation_id", "snapshot_type", "kind"]
-        .into_iter()
-        .filter(|field| object.get(*field).map_or(true, serde_json::Value::is_null))
-        .collect();
+    let missing_or_null: Vec<&str> = [
+        "generation_id",
+        "network_boundary_version",
+        "source_vsock_socket_path",
+        "snapshot_type",
+        "kind",
+    ]
+    .into_iter()
+    .filter(|field| object.get(*field).map_or(true, serde_json::Value::is_null))
+    .collect();
     if !missing_or_null.is_empty() {
         anyhow::bail!(
             "snapshot '{name}' has unsupported metadata schema (required fields missing or null: {}); delete and recreate the snapshot",
             missing_or_null.join(", ")
         );
     }
-    serde_json::from_value(value).with_context(|| {
+    let config: SnapshotConfig = serde_json::from_value(value).with_context(|| {
         format!(
             "snapshot '{name}' metadata is incompatible with this fcvm build; delete and recreate the snapshot"
         )
-    })
+    })?;
+    let source_parent = config.source_vsock_socket_path.parent();
+    if !config.source_vsock_socket_path.is_absolute()
+        || config.source_vsock_socket_path.file_name() != Some(std::ffi::OsStr::new("vsock.sock"))
+        || source_parent.is_none()
+        || source_parent == Some(Path::new("/"))
+    {
+        anyhow::bail!(
+            "snapshot '{name}' has invalid source_vsock_socket_path {}; expected an absolute path named vsock.sock under a dedicated directory; delete and recreate the snapshot",
+            config.source_vsock_socket_path.display()
+        );
+    }
+    if config.kind == SnapshotKind::Full
+        && config.network_boundary_version != SNAPSHOT_NETWORK_BOUNDARY_VERSION
+    {
+        anyhow::bail!(
+            "snapshot '{name}' uses unsupported network generation boundary version {} \
+             (expected {}); delete and recreate the snapshot",
+            config.network_boundary_version,
+            SNAPSHOT_NETWORK_BOUNDARY_VERSION
+        );
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -460,12 +501,14 @@ mod tests {
             (
                 "missing-all",
                 serde_json::json!({"name": "missing-all", "vm_id": "vm-old"}),
-                "generation_id, snapshot_type, kind",
+                "generation_id, network_boundary_version, source_vsock_socket_path, snapshot_type, kind",
             ),
             (
                 "missing-generation",
                 serde_json::json!({
                     "name": "missing-generation", "vm_id": "vm-old",
+                    "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                    "source_vsock_socket_path": "/source/vsock.sock",
                     "snapshot_type": "User", "kind": "Full"
                 }),
                 "generation_id",
@@ -474,7 +517,10 @@ mod tests {
                 "missing-type",
                 serde_json::json!({
                     "name": "missing-type", "vm_id": "vm-old",
-                    "generation_id": uuid::Uuid::nil(), "kind": "Full"
+                    "generation_id": uuid::Uuid::nil(),
+                    "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                    "source_vsock_socket_path": "/source/vsock.sock",
+                    "kind": "Full"
                 }),
                 "snapshot_type",
             ),
@@ -482,7 +528,10 @@ mod tests {
                 "missing-kind",
                 serde_json::json!({
                     "name": "missing-kind", "vm_id": "vm-old",
-                    "generation_id": uuid::Uuid::nil(), "snapshot_type": "User"
+                    "generation_id": uuid::Uuid::nil(),
+                    "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                    "source_vsock_socket_path": "/source/vsock.sock",
+                    "snapshot_type": "User"
                 }),
                 "kind",
             ),
@@ -490,9 +539,32 @@ mod tests {
                 "null-generation",
                 serde_json::json!({
                     "name": "null-generation", "vm_id": "vm-old",
-                    "generation_id": null, "snapshot_type": "User", "kind": "Full"
+                    "generation_id": null,
+                    "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                    "source_vsock_socket_path": "/source/vsock.sock",
+                    "snapshot_type": "User", "kind": "Full"
                 }),
                 "generation_id",
+            ),
+            (
+                "missing-network-boundary",
+                serde_json::json!({
+                    "name": "missing-network-boundary", "vm_id": "vm-old",
+                    "generation_id": uuid::Uuid::nil(),
+                    "source_vsock_socket_path": "/source/vsock.sock",
+                    "snapshot_type": "User", "kind": "Full"
+                }),
+                "network_boundary_version",
+            ),
+            (
+                "missing-source-vsock",
+                serde_json::json!({
+                    "name": "missing-source-vsock", "vm_id": "vm-old",
+                    "generation_id": uuid::Uuid::nil(),
+                    "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                    "snapshot_type": "User", "kind": "Full"
+                }),
+                "source_vsock_socket_path",
             ),
         ] {
             let snapshot_dir = snapshots.join(name);
@@ -521,7 +593,9 @@ mod tests {
             name: "test-snapshot".to_string(),
             vm_id: "abc123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
+            network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
             original_vsock_vm_id: None,
+            source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
             memory_path: PathBuf::from("/path/to/memory.bin"),
             vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
@@ -584,6 +658,18 @@ mod tests {
             parsed.metadata.network_config.guest_ip,
             Some("172.30.0.2".to_string())
         );
+
+        let mut incompatible = config;
+        incompatible.network_boundary_version = SNAPSHOT_NETWORK_BOUNDARY_VERSION + 1;
+        let bytes = serde_json::to_vec(&incompatible).unwrap();
+        let error = parse_snapshot_config("test-snapshot", &bytes)
+            .expect_err("an unknown network boundary must be rejected before restore");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unsupported network generation boundary"),
+            "{message}"
+        );
+        assert!(message.contains("delete and recreate"), "{message}");
     }
 
     #[test]
@@ -593,6 +679,8 @@ mod tests {
             "name": "nginx-snap",
             "vm_id": "def456",
             "generation_id": "fc9642dc-babd-4876-8c7f-48bccd9554e8",
+            "network_boundary_version": 1,
+            "source_vsock_socket_path": "/source/vsock.sock",
             "memory_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/memory.bin",
             "vmstate_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/vmstate.bin",
             "disk_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/disk.raw",
@@ -657,7 +745,9 @@ mod tests {
             name: "test-snap".to_string(),
             vm_id: "test123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
+            network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
             original_vsock_vm_id: None,
+            source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
@@ -734,7 +824,9 @@ mod tests {
                 name: name.to_string(),
                 vm_id: format!("vm-{}", name),
                 generation_id: uuid::Uuid::new_v4(),
+                network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
                 original_vsock_vm_id: None,
+                source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
                 parent_snapshot: None,
                 memory_path: PathBuf::from("/memory.bin"),
                 vmstate_path: PathBuf::from("/vmstate.bin"),
@@ -798,7 +890,9 @@ mod tests {
             name: "to-delete".to_string(),
             vm_id: "vm123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
+            network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
             original_vsock_vm_id: None,
+            source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
@@ -899,6 +993,8 @@ mod tests {
                 "name": "cached",
                 "vm_id": vm_id,
                 "generation_id": generation_id,
+                "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                "source_vsock_socket_path": "/source/vsock.sock",
                 "memory_path": "/memory.bin",
                 "vmstate_path": "/vmstate.bin",
                 "disk_path": "/disk.raw",
@@ -984,7 +1080,9 @@ mod tests {
             name: "user-snapshot".to_string(),
             vm_id: "user123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
+            network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
             original_vsock_vm_id: None,
+            source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
@@ -1070,6 +1168,8 @@ mod tests {
             "name": "do",
             "vm_id": "x",
             "generation_id": "5d2cb020-b470-498d-a252-f6b6ca75b712",
+            "network_boundary_version": 1,
+            "source_vsock_socket_path": "/source/vsock.sock",
             "memory_path": "/m",
             "vmstate_path": "/v",
             "disk_path": "/d",

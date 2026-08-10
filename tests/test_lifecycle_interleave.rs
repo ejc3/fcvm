@@ -1473,6 +1473,237 @@ async fn test_lifecycle_interleave_cancellation_wins_before_lifecycle_ready_clai
 }
 
 // ---------------------------------------------------------------------------
+// CASE: early_published_connection_cannot_poison_restored_ingress
+// ---------------------------------------------------------------------------
+
+/// Pins the external-flow generation boundary against the exact hostile
+/// ordering that used to wedge a later request for roughly one TCP timeout:
+/// rootless pasta has already published the clone's host port, but the restored
+/// VMM has not resumed yet. One client completes a host-side TCP connect and
+/// closes it inside that window. After release, the clone must finish
+/// cookie-bound cleanup and the first fresh HTTP request must succeed within a
+/// short bound; retrying for 108 seconds would hide the failure.
+#[tokio::test]
+async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingress() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-early-ingress");
+    let go_file = PathBuf::from(format!("/tmp/{clone_name}-restore-go"));
+    remove_file_if_exists(&go_file).context("removing stale restore go-file")?;
+    let host_port = common::find_available_high_port()?;
+    let publish_arg = format!("{host_port}:80");
+
+    let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut clone: Option<(tokio::process::Child, PinnedProcess, PathBuf)> = None;
+    let mut clone_artifacts: Option<VmArtifacts> = None;
+    let mut snapshot_created = false;
+
+    let exercise: Result<()> = async {
+        let (baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--no-snapshot",
+                "--publish",
+                &publish_arg,
+                "--health-check",
+                "http://localhost:80",
+                common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning published baseline")?;
+        let baseline_process =
+            PinnedProcess::capture(baseline_pid).context("pinning published baseline")?;
+        baseline = Some((baseline_child, baseline_process));
+        let (baseline_child, _) = baseline.as_mut().expect("baseline stored above");
+        common::poll_health(baseline_child, 180)
+            .await
+            .context("waiting for published baseline health")?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
+            .await
+            .context("creating published manual snapshot")?;
+        snapshot_created = true;
+
+        let (baseline_child, baseline_process) =
+            baseline.as_mut().context("baseline fixture disappeared")?;
+        stop_test_child(baseline_child, baseline_process)
+            .await
+            .context("stopping baseline before clone restore")?;
+        baseline = None;
+
+        let failpoint_spec = format!("restore.pre_resume:block_until_file:{}", go_file.display());
+        let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &[("FCVM_FAILPOINT", &failpoint_spec)],
+        )
+        .await
+        .context("spawning clone held before VMM resume")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning held clone")?;
+        clone = Some((clone_child, clone_process, clone_log.clone()));
+
+        let reached_at = wait_for_marker(
+            &clone_log,
+            "FAILPOINT restore.pre_resume reached",
+            0,
+            Duration::from_secs(120),
+        )
+        .await?;
+        let (clone_child, _, _) = clone.as_mut().context("clone fixture disappeared")?;
+        let artifacts = wait_for_artifacts(&clone_name, clone_child, Duration::from_secs(10))
+            .await
+            .context("waiting for held clone network state")?;
+        anyhow::ensure!(
+            artifacts.state.pid.is_none() && !artifacts.state.lifecycle_ready,
+            "restore hold must precede VMM/lifecycle publication: pid={:?} ready={}",
+            artifacts.state.pid,
+            artifacts.state.lifecycle_ready
+        );
+        let loopback_ip = artifacts
+            .state
+            .config
+            .network
+            .loopback_ip
+            .clone()
+            .context("held rootless clone has no published loopback IP")?;
+        clone_artifacts = Some(artifacts);
+
+        // Non-vacuity: pasta's host listener is live while the VMM is still
+        // blocked. This connect+close is the adversarial pre-resume flow; no
+        // retry is allowed, and the marker proves the VMM cannot have run yet.
+        let mut early = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(format!("{loopback_ip}:{host_port}")),
+        )
+        .await
+        .context("early published-port connect timed out")?
+        .context("early published-port connect failed")?;
+        early
+            .shutdown()
+            .await
+            .context("closing adversarial early connection")?;
+        drop(early);
+        anyhow::ensure!(
+            search_log_from(
+                &clone_log,
+                "FAILPOINT restore.pre_resume released",
+                reached_at
+            )
+            .is_none(),
+            "the VMM resumed before the adversarial connection completed"
+        );
+
+        std::fs::write(&go_file, b"go").context("releasing restore.pre_resume")?;
+        let released_at = wait_for_marker(
+            &clone_log,
+            "FAILPOINT restore.pre_resume released",
+            reached_at,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let (clone_child, _, _) = clone.as_mut().context("clone fixture disappeared")?;
+        common::poll_health(clone_child, 180)
+            .await
+            .with_context(|| {
+                format!(
+                    "clone did not become healthy; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+        wait_for_marker(
+            &clone_log,
+            "snapshot network cleanup complete",
+            released_at,
+            Duration::from_secs(30),
+        )
+        .await
+        .context("missing exact cookie-cleanup completion diagnostic")?;
+
+        // One fresh request is the oracle. The regression stalls this request
+        // for ~108s; retries or a matching timeout would conceal it.
+        let fresh = common::curl_check_with_diag(&loopback_ip, host_port, 5, Some(clone_pid)).await;
+        anyhow::ensure!(
+            fresh.success && fresh.body_len > 0,
+            "the first post-restore request was poisoned by the early connection: {}",
+            fresh.error
+        );
+        Ok(())
+    }
+    .await;
+
+    // Release first so fixture teardown can never wait for the failpoint's
+    // hard cap. Stop exact pinned children before deleting their snapshot.
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = std::fs::write(&go_file, b"cleanup") {
+        cleanup_errors.push(format!("releasing restore failpoint: {error}"));
+    }
+    let mut all_children_stopped = true;
+    if let Some((child, process, _)) = clone.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping clone: {error:#}"));
+        }
+    }
+    if let Some((child, process)) = baseline.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping baseline: {error:#}"));
+        }
+    }
+    if all_children_stopped {
+        if let Some(artifacts) = &clone_artifacts {
+            if let Err(error) = wait_for_artifacts_removed(artifacts, Duration::from_secs(15)).await
+            {
+                cleanup_errors.push(format!("clone production cleanup: {error:#}"));
+                if exercise.is_err() {
+                    if let Err(cleanup_error) = cleanup_exact_artifacts(artifacts) {
+                        cleanup_errors.push(format!(
+                            "cleaning exact failed clone artifacts: {cleanup_error:#}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if snapshot_created && all_children_stopped {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    if let Err(error) = remove_file_if_exists(&go_file) {
+        cleanup_errors.push(format!("removing restore go-file: {error:#}"));
+    }
+
+    if let Err(error) = exercise {
+        if cleanup_errors.is_empty() {
+            return Err(error);
+        }
+        return Err(error.context(format!(
+            "fixture cleanup also failed:\n- {}",
+            cleanup_errors.join("\n- ")
+        )));
+    }
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "fixture cleanup failed:\n- {}",
+        cleanup_errors.join("\n- ")
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // CASE: snapshot_run_sigterm_before_resume_cleans_exact_artifacts
 // ---------------------------------------------------------------------------
 
