@@ -1851,6 +1851,705 @@ def teardown_normal(
     return out
 
 
+# -------------------------------------------------------------- failure probe
+#
+# EVIDENCE CAPTURE FOR AN UNSOLVED ROOT CAUSE. Nothing here fixes anything and
+# nothing here is measured.
+#
+# The 808-clone run produced 3 CDP failures. Every one came from a clone whose
+# ARP-triggering readiness ping got no reply (5 clones, 3 failed; of the 803
+# whose ping replied, none failed), and in each the guest stayed ALIVE for the
+# full 100+ seconds (its Chromium kept writing to the serial console) while
+# the host-driven CDP path either never connected or was reset mid-session. The
+# `exec` and `noop` arms reach the guest over VSOCK and never failed.
+#
+# What is NOT known is why the guest stopped answering on the IP path and why it
+# never recovered. A transient startup race resolves in milliseconds; these ran
+# out the client's own deadline. The leading and UNPROVEN hypothesis is that the
+# guest's post-restore network re-initialisation never happened or never
+# finished for that clone: fcvm PUTs a `restore-epoch` per clone, fc-agent's
+# `watch_restore_epoch` reacts to it by flushing the ARP cache, sending a
+# gratuitous ARP and re-registering exec, and a clone that misses that keeps
+# stale IP networking for life while vsock keeps working.
+#
+# VSOCK EXEC KEEPS WORKING DURING THE FAILURE, so the broken guest is
+# interrogable at exactly the moment it is broken. Until now the harness tore the
+# clone down and the evidence died with it.
+#
+# Three properties this code has to hold, in priority order:
+#   1. It must not perturb what is measured. Every probe runs AFTER the record's
+#      `blocking_ms` is stamped, so the caller-visible latency is already
+#      closed, and only on the failure path, plus exactly one healthy control per run.
+#   2. It must be bounded. It runs against a guest that may be wedged, so every
+#      command has a hard timeout enforced by killing the process GROUP (an
+#      `fcvm exec` that hangs has a guest-side child behind it), and the whole
+#      capture has a budget that skips the steps it cannot afford.
+#   3. It must never take the request or the run with it. Every failure inside
+#      the probe is recorded as data. The dump is the artifact even when most of
+#      it failed to collect.
+
+
+PROBE_COMMAND_TIMEOUT_S = 20.0
+"""Hard bound on one probe command. `fcvm exec`'s own connect ladder spans ~54 s
+(41 attempts from 5 ms, 1.5x, capped at 2 s, in `src/commands/exec.rs`), so an
+unbounded probe against a wedged exec server would outlast the request that
+failed. A live restored clone re-registers exec within single-digit
+milliseconds, so 20 s is not a race with a healthy guest: hitting this bound is
+itself the finding, and it is recorded as `timed_out`."""
+
+PROBE_BUDGET_S = 60.0
+"""Hard bound on one whole capture, checked before each step. A step that does not
+fit records why it was skipped rather than being silently absent."""
+
+PROBE_SECTION_LIMIT = 64 * 1024
+"""Per-section output cap. `dmesg` and `cat /proc/net/tcp` are unbounded in
+principle."""
+
+PROBE_BATCH_LIMIT = 512 * 1024
+"""Cap on a whole batch's stdout, applied BEFORE it is split into sections.
+Deliberately larger than the per-section cap: clipping the stream at the section
+cap would cut the last section's status line off and report a completed section
+as unknown."""
+
+PROBE_STREAM_LIMIT = 16 * 1024
+"""Cap on a probe process's own stderr (where `fcvm exec` reports why it could
+not reach the guest)."""
+
+PROBE_SECTION_MARK = "===fcvm-probe-section"
+PROBE_RC_MARK = "===fcvm-probe-rc"
+
+PROBE_GUEST_PASSIVE_SECTIONS = (
+    # Restore syncs the guest clock from the host (`fc-agent/src/restore.rs`
+    # calls `sync_clock_from_host` FIRST), so a guest still sitting at the
+    # snapshot's wall time is direct evidence the restore handler never ran.
+    ("guest_date", "date -u +%Y-%m-%dT%H:%M:%SZ"),
+    ("guest_uptime", "cat /proc/uptime"),
+    ("ip_addr", "ip addr"),
+    ("ip_link_stats", "ip -s link"),
+    ("ip_route", "ip route"),
+    # Does the guest hold a stale gateway MAC? `handle_clone_restore` flushes
+    # this table and re-ARPs; an entry pointing at the pre-snapshot bridge port,
+    # or a FAILED/INCOMPLETE one, is the shape the hypothesis predicts.
+    ("ip_neigh", "ip neigh"),
+    ("proc_net_arp", "cat /proc/net/arp"),
+    ("proc_net_dev", "cat /proc/net/dev"),
+    # Is Chromium still listening on the CDP port INSIDE the guest? The
+    # container runs `--network=host` (`fc-agent/src/container.rs`), so the VM's
+    # netns is the container's netns and this sees the container's listener.
+    ("listening_sockets", "ss -ltnp"),
+    ("proc_net_tcp", "cat /proc/net/tcp"),
+    # `awk '/[c]hrom/'`, not `grep chrom`: the bracket keeps the matcher's own
+    # argv from matching, and the full `args` column is the point: which
+    # Chromium flags are live, and on which port.
+    ("chromium_processes",
+     "ps -eo pid,ppid,stat,etimes,comm,args | awk 'NR==1 || /[c]hrom/'"),
+    ("dmesg_tail", "dmesg | tail -50"),
+    # fc-agent writes its restore-epoch narration to stderr, which lands on the
+    # serial console rather than in a file, so this is usually empty. The
+    # authoritative copy is the host-side log-marker capture below. It is here
+    # because "usually" is not "always" and an empty section costs nothing.
+    ("fc_agent_journal",
+     "journalctl -b --no-pager -o cat -n 400 | grep -F '[fc-agent]' | tail -40"),
+)
+
+PROBE_HOLDER_NS_SECTIONS = (
+    ("ns_ip_addr", "ip addr"),
+    ("ns_ip_link_stats", "ip -s link"),
+    # The host half of the same question `ip_neigh` asks in the guest. This is
+    # the exact table `verify_port_forwarding` reads before it declares the
+    # clone ready (`src/network/pasta.rs`: `ip neigh show to 10.0.2.100 dev br0`).
+    ("ns_ip_neigh", "ip neigh"),
+    ("ns_ip_route", "ip route"),
+    ("ns_bridge_link", "bridge link"),
+    ("ns_listening_sockets", "ss -ltn"),
+)
+
+PROBE_LOG_MARKERS = (
+    # fc-agent's restore narration, straight off the guest serial console:
+    # "detected restore-epoch", "handling restore", "ARP cache flushed",
+    # "exec re-registered after restore", "restore complete", and the
+    # "restore metadata fetch failed" line that fires when MMDS is unreachable.
+    "[fc-agent]",
+    "restore-epoch",
+    # pasta's readiness verdict, including the `ping_replied=` field that
+    # separated the 5 no-reply clones from the other 803.
+    "ping_replied",
+    "ARP",
+    "neighbour",
+    "port forward",
+    "pasta",
+)
+
+PROBE_LOG_MAX_LINES = 200
+
+
+def probe_batch_script(sections) -> str:
+    """One shell script that runs every section and frames its output and status.
+
+    Batched deliberately: one `fcvm exec` per batch instead of one per command
+    means one handshake, one timeout to enforce, and one instant that all the
+    state comes from. Each section still carries its OWN exit status, so a
+    missing binary inside the batch is recorded as that section's `rc` rather
+    than discarding the batch.
+
+    Each section runs in a SUBSHELL, not a brace group. A brace group shares the
+    batch's shell, so one section calling `exit` ends the whole batch and every
+    later section vanishes with no status line, and silently, since the frame
+    that would have said so was never printed. The subshell also keeps a section's
+    `cd`, variables and traps out of the next one.
+    """
+    parts = []
+    for name, command in sections:
+        quoted = shlex.quote(name)
+        parts.append(
+            f"printf '{PROBE_SECTION_MARK} %s\\n' {quoted}; "
+            f"( {command} ) 2>&1; "
+            f"printf '{PROBE_RC_MARK} %s %s\\n' {quoted} \"$?\""
+        )
+    return "\n".join(parts)
+
+
+def parse_probe_batch(text: str) -> dict:
+    """Split framed batch output into {section: {"output", "rc"}}.
+
+    A section whose RC line never arrived keeps `rc: None`. That is what a batch
+    cut off by the timeout looks like, and it must not read as rc 0.
+    """
+    sections: dict = {}
+    current = None
+    buffered: list = []
+
+    def close(name, rc):
+        body = "\n".join(buffered)
+        if len(body) > PROBE_SECTION_LIMIT:
+            body = body[:PROBE_SECTION_LIMIT] + "\n...[truncated]"
+            sections[name]["truncated"] = True
+        sections[name]["output"] = body
+        sections[name]["rc"] = rc
+
+    for line in text.splitlines():
+        if line.startswith(PROBE_SECTION_MARK + " "):
+            if current is not None:
+                close(current, None)
+            current = line[len(PROBE_SECTION_MARK) + 1:].strip()
+            sections[current] = {"output": "", "rc": None}
+            buffered = []
+        elif current is not None and line.startswith(PROBE_RC_MARK + " "):
+            rest = line[len(PROBE_RC_MARK) + 1:].strip()
+            name, _, status = rest.rpartition(" ")
+            if name == current:
+                try:
+                    close(current, int(status))
+                except ValueError:
+                    close(current, None)
+                current = None
+                buffered = []
+            else:
+                buffered.append(line)
+        elif current is not None:
+            buffered.append(line)
+    if current is not None:
+        close(current, None)
+    return sections
+
+
+def clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+def run_probe_command(argv, timeout_s: float, budget_limited: bool = False,
+                      output_limit: int = PROBE_BATCH_LIMIT) -> dict:
+    """Run one probe command in its own session; never raise, always record.
+
+    `start_new_session` plus a process-GROUP kill is the whole reason this is
+    not `subprocess.run(timeout=...)`: that kills only the direct child, and the
+    direct child here is `fcvm exec`, which is holding a vsock session with a
+    command running inside the guest.
+
+    `budget_limited` says this command got less than the full per-command
+    timeout because the capture's own budget was nearly spent. Without it a
+    `timed_out: True` from a 40 ms residual budget is indistinguishable from a
+    genuinely wedged guest, which is the whole thing the dump exists to tell
+    apart.
+    """
+    started = time.monotonic()
+    record: dict = {"argv": list(argv), "timeout_s": timeout_s,
+                    "budget_limited": budget_limited}
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            text=True,
+            errors="replace",
+        )
+    except OSError as error:
+        record["rc"] = None
+        record["timed_out"] = False
+        record["error"] = f"{type(error).__name__}: {error}"
+        record["elapsed_ms"] = (time.monotonic() - started) * 1000
+        return record
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+    record["rc"] = proc.returncode
+    record["timed_out"] = timed_out
+    record["stdout"] = clip(out or "", output_limit)
+    record["stderr"] = clip(err or "", PROBE_STREAM_LIMIT)
+    record["elapsed_ms"] = (time.monotonic() - started) * 1000
+    return record
+
+
+def probe_log_markers(log_path: str, markers=PROBE_LOG_MARKERS,
+                      max_lines: int = PROBE_LOG_MAX_LINES) -> dict:
+    """Pull the restore/readiness narration out of THIS clone's own fcvm log.
+
+    fc-agent's restore lines arrive on the guest serial console and pasta's
+    readiness verdict is fcvm's own `info!`, so both are already in the per-clone
+    log, but a dump that says "go read a 20 000 line log" is not
+    self-describing. Keeps the head and the tail of the matches, since the
+    restore evidence is at the start and the failure at the end.
+    """
+    out: dict = {"path": log_path, "matched": 0, "lines": [], "truncated": False}
+    if not log_path:
+        out["error"] = "no log path for this request"
+        return out
+    head: list = []
+    tail: list = []
+    half = max(1, max_lines // 2)
+    try:
+        with open(log_path, "r", errors="replace") as handle:
+            for line in handle:
+                if not any(marker in line for marker in markers):
+                    continue
+                out["matched"] += 1
+                line = line.rstrip("\n")
+                if len(head) < half:
+                    head.append(line)
+                else:
+                    tail.append(line)
+                    if len(tail) > half:
+                        tail.pop(0)
+    except OSError as error:
+        out["error"] = f"{type(error).__name__}: {error}"
+        return out
+    omitted = out["matched"] - len(head) - len(tail)
+    if omitted > 0:
+        out["truncated"] = True
+        out["lines"] = head + [f"...[{omitted} lines omitted]"] + tail
+    else:
+        out["lines"] = head + tail
+    return out
+
+
+def read_probe_file(path: str, limit: int = PROBE_SECTION_LIMIT) -> dict:
+    try:
+        with open(path, "r", errors="replace") as handle:
+            return {"path": path, "content": clip(handle.read(limit + 1), limit)}
+    except OSError as error:
+        return {"path": path, "error": f"{type(error).__name__}: {error}"}
+
+
+def probe_process_facts(pid) -> dict:
+    """pid, comm, scheduler state and argv for one host process, or why not."""
+    facts: dict = {"pid": pid}
+    if not isinstance(pid, int) or pid <= 0:
+        facts["error"] = f"not a usable pid: {pid!r}"
+        return facts
+    fields = proc_stat_fields(pid)
+    if fields is None:
+        facts["alive"] = False
+        return facts
+    facts["alive"] = True
+    facts["state"] = fields[0]
+    facts["utime_ms"] = fields[1] * 1000.0 / CLK_TCK
+    facts["stime_ms"] = fields[2] * 1000.0 / CLK_TCK
+    facts["start_time"] = fields[3]
+    facts["comm"] = proc_comm(pid)
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            facts["cmdline"] = handle.read(4096).replace(b"\0", b" ").decode(
+                "utf8", "replace").strip()
+    except OSError as error:
+        facts["cmdline_error"] = f"{type(error).__name__}: {error}"
+    return facts
+
+
+def probe_tcp_connect(endpoint: str, timeout_s: float = 2.0) -> dict:
+    """Does the host->guest published port answer RIGHT NOW?
+
+    The failure is defined by this path not working; asking it again at probe
+    time is what separates "still broken 100 s later" from "recovered and the
+    client had already given up".
+    """
+    import socket
+
+    out: dict = {"endpoint": endpoint, "timeout_s": timeout_s}
+    if not endpoint or ":" not in endpoint:
+        out["error"] = f"no usable endpoint: {endpoint!r}"
+        return out
+    host, _, port = endpoint.rpartition(":")
+    started = time.monotonic()
+    try:
+        socket.create_connection((host, int(port)), timeout_s).close()
+        out["connected"] = True
+    except (OSError, ValueError) as error:
+        out["connected"] = False
+        out["error"] = f"{type(error).__name__}: {error}"
+    out["elapsed_ms"] = (time.monotonic() - started) * 1000
+    return out
+
+
+class FailureProbe:
+    """Capture guest-side and host-side state for a clone that just failed.
+
+    One instance per run. It owns the once-per-run control capture, so the
+    control cannot be taken twice or taken from a clone that also failed.
+    """
+
+    def __init__(self, fcvm: str, data_root: str, out_dir: str, run_id: str,
+                 cdp_port: int, command_timeout_s: float = PROBE_COMMAND_TIMEOUT_S,
+                 budget_s: float = PROBE_BUDGET_S):
+        self.fcvm = fcvm
+        self.data_root = data_root
+        self.out_dir = out_dir
+        self.run_id = run_id
+        self.cdp_port = cdp_port
+        self.command_timeout_s = command_timeout_s
+        self.budget_s = budget_s
+        self.control_captured = False
+        self.control_path = ""
+        self.is_warmup = False
+
+    def begin_request(self, is_warmup: bool) -> None:
+        """Tell the probe whether the rep about to run is a discarded warmup.
+
+        The control has to come from a HEALTHY clone, so it is the one capture
+        that touches a request the analyzer might read. Placing it on a warmup
+        rep makes that free: warmups are discarded explicitly at analysis. When
+        no warmup rep is available the control still runs, because a failure dump
+        with nothing to compare against proves little, and the record it perturbs is
+        stamped `probe_perturbed_timings` so it is excludable by hand.
+        """
+        self.is_warmup = bool(is_warmup)
+
+    def role_for(self, rec: dict):
+        if rec.get("ok") is False:
+            return "failure"
+        if rec.get("ok") is True and not self.control_captured:
+            return "control"
+        return None
+
+    def observe(self, rec: dict, *, name: str, fcvm_pid: int, state_path,
+                log_path: str, endpoint: str = "") -> None:
+        """Capture if this record earns it, and stamp the record either way.
+
+        Wrapped whole: a probe that raises would abort a request that had
+        already produced its answer, which is strictly worse than no probe.
+        """
+        role = self.role_for(rec)
+        if role is None:
+            return
+        try:
+            dump = self.capture(
+                role=role, rec=rec, name=name, fcvm_pid=fcvm_pid,
+                state_path=state_path, log_path=log_path, endpoint=endpoint,
+            )
+            path = self.write(name, dump)
+            errors = dump.get("errors", [])
+            rec["probe"] = {
+                "role": role,
+                "path": path,
+                # A dump with nothing to compare against proves little, so the
+                # failing record names the run's healthy control too. Empty when
+                # the failure preceded any healthy CDP rep, which is itself worth
+                # knowing rather than looking like an absent file.
+                "control_path": dump.get("control_path", ""),
+                "elapsed_ms": dump.get("elapsed_ms"),
+                "budget_exhausted": dump.get("budget_exhausted", False),
+                "errors": errors[:10],
+                "error_count": len(errors),
+            }
+            if role == "control":
+                self.control_path = path
+        except Exception as error:  # noqa: BLE001 - the probe is never fatal
+            rec["probe"] = {
+                "role": role,
+                "path": "",
+                "probe_error": f"{type(error).__name__}: {error}",
+            }
+        if role == "control":
+            self.control_captured = True
+            if not self.is_warmup:
+                rec["probe_perturbed_timings"] = True
+                print(
+                    f"probe: control captured on MEASURED rep {rec.get('rep')} "
+                    f"({name}); its wall_ms and teardown are perturbed and the "
+                    "record is stamped probe_perturbed_timings",
+                    file=sys.stderr, flush=True,
+                )
+
+    def write(self, name: str, dump: dict) -> str:
+        """Write the dump atomically, next to this request's clone log."""
+        path = os.path.join(self.out_dir, f"{name}.probe.json")
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as handle:
+            json.dump(dump, handle, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+        return path
+
+    def capture(self, *, role, rec, name, fcvm_pid, state_path, log_path,
+                endpoint) -> dict:
+        started = time.monotonic()
+        deadline = started + self.budget_s
+        dump: dict = {
+            "schema": "fcvm-cdp-failure-probe-v1",
+            "role": role,
+            "run_id": self.run_id,
+            "name": name,
+            "arm": rec.get("arm"),
+            "rep": rec.get("rep"),
+            "vm_id": rec.get("vm_id"),
+            "endpoint": endpoint or rec.get("endpoint", ""),
+            "request_error": rec.get("error"),
+            "failure_class": rec.get("failure_class"),
+            "failure_stage": rec.get("failure_stage"),
+            "blocking_ms": rec.get("blocking_ms"),
+            "fcvm_pid": fcvm_pid,
+            "state_path": state_path or "",
+            "log_path": log_path,
+            "captured_at": time.time(),
+            "command_timeout_s": self.command_timeout_s,
+            "budget_s": self.budget_s,
+            "control_path": "" if role == "control" else self.control_path,
+            "host": {},
+            "guest": {},
+            "errors": [],
+        }
+
+        def note(where, detail):
+            dump["errors"].append(f"{where}: {detail}")
+
+        def remaining():
+            return deadline - time.monotonic()
+
+        def budget_for(step):
+            """Timeout for one step, or None when the budget is spent.
+
+            Returns `(timeout, budget_limited)` so a step that got a shortened
+            timeout can say so on its own record instead of reporting an
+            indistinguishable `timed_out`.
+            """
+            left = remaining()
+            if left <= 0:
+                dump["budget_exhausted"] = True
+                note(step, "skipped, probe budget exhausted")
+                return None
+            return (min(self.command_timeout_s, left), left < self.command_timeout_s)
+
+        # ---- host, instantaneous: no subprocess, nothing that can hang.
+        state = None
+        if state_path:
+            try:
+                with open(state_path) as handle:
+                    state = json.load(handle)
+            except (OSError, ValueError) as error:
+                note("clone_state", f"{type(error).__name__}: {error}")
+        else:
+            note("clone_state", "no state file was ever found for this clone")
+        dump["host"]["clone_state"] = state
+        holder_pid = (state or {}).get("holder_pid")
+        vm_id = (state or {}).get("vm_id") or rec.get("vm_id") or ""
+        dump["host"]["holder_pid"] = holder_pid
+        dump["host"]["fcvm_process"] = probe_process_facts(fcvm_pid)
+        dump["host"]["fcvm_children"] = [
+            probe_process_facts(child) for child in children_of(fcvm_pid)
+        ]
+        try:
+            dump["host"]["loadavg"] = read_trimmed("/proc/loadavg")
+        except OSError as error:
+            note("loadavg", f"{type(error).__name__}: {error}")
+
+        # pasta identifies itself by a per-VM pid file (`src/network/pasta.rs`
+        # writes `pasta-<vm_id[:8]>.pid` under the data dir), which is the only
+        # way to name THIS clone's pasta rather than one of the others'.
+        pasta: dict = {}
+        if valid_vm_id(vm_id):
+            pid_path = os.path.join(self.data_root, f"pasta-{vm_id[:8]}.pid")
+            pasta["pid_file"] = pid_path
+            try:
+                with open(pid_path) as handle:
+                    pasta["pid"] = int(handle.read().strip())
+            except (OSError, ValueError) as error:
+                pasta["error"] = f"{type(error).__name__}: {error}"
+        else:
+            pasta["error"] = f"no usable vm_id to locate the pasta pid file: {vm_id!r}"
+        if isinstance(pasta.get("pid"), int):
+            pasta["process"] = probe_process_facts(pasta["pid"])
+        dump["host"]["pasta"] = pasta
+
+        # The holder's own procfs exposes its network namespace with no
+        # privilege and no nsenter, so this half survives even when entering the
+        # namespace does not.
+        if isinstance(holder_pid, int):
+            dump["host"]["holder_procfs"] = {
+                which: read_probe_file(f"/proc/{holder_pid}/net/{which}")
+                for which in ("arp", "dev", "route", "tcp")
+            }
+        else:
+            note("holder_procfs", f"no holder pid in state: {holder_pid!r}")
+
+        dump["host"]["cdp_connect_now"] = probe_tcp_connect(
+            dump["endpoint"], min(2.0, max(0.1, remaining()))
+        )
+
+        # ---- guest, passive. The reason this probe exists: vsock exec still
+        # works while the IP path does not, so the broken guest can be asked.
+        allowance = budget_for("guest_passive")
+        if allowance is not None:
+            dump["guest"]["passive"] = self.exec_batch(
+                fcvm_pid, PROBE_GUEST_PASSIVE_SECTIONS, *allowance
+            )
+
+        # ---- host, inside the clone's network namespace. `-U -n` is exactly
+        # what fcvm itself uses (`PastaNetwork::build_nsenter_prefix`), so it
+        # needs no privilege in rootless mode; the retry without `-U` covers the
+        # modes that have no user namespace. Both attempts are recorded.
+        if isinstance(holder_pid, int) and budget_for("holder_namespace") is not None:
+            dump["host"]["holder_namespace"] = self.nsenter_batch(
+                holder_pid, PROBE_HOLDER_NS_SECTIONS, deadline
+            )
+        loopback = ((state or {}).get("config", {}).get("network", {}) or {}).get(
+            "loopback_ip"
+        )
+        if loopback:
+            allowance = budget_for("host_listeners")
+            if allowance is not None:
+                # Does pasta's host-side listener for this clone still exist?
+                # That is the socket `wait_for_port_forwarding_until` connected
+                # to before the clone was declared ready.
+                dump["host"]["listeners"] = run_probe_command(
+                    ["ss", "-H", "-ltn", "src", loopback], *allowance
+                )
+
+        # ---- guest, ACTIVE and last. These three mutate state: arping refills
+        # the neighbour table this dump has already recorded. Passive capture
+        # runs first for exactly that reason. Their value is that they answer
+        # "is this still broken NOW", which the unsolved question is about.
+        allowance = budget_for("guest_active")
+        if allowance is not None:
+            dump["guest"]["active_mutating"] = self.exec_batch(
+                fcvm_pid, self.guest_active_sections(), *allowance
+            )
+            dump["guest"]["active_mutating"]["mutates_guest_state"] = True
+
+        # Last, so it includes anything the probe itself provoked.
+        dump["host"]["log_markers"] = probe_log_markers(log_path)
+        dump["elapsed_ms"] = (time.monotonic() - started) * 1000
+        dump.setdefault("budget_exhausted", False)
+        return dump
+
+    def guest_active_sections(self):
+        port = self.cdp_port
+        return (
+            # Chromium answering on guest loopback while the host cannot reach
+            # it puts the fault in the network path, not in the browser.
+            ("cdp_from_guest_loopback",
+             f"printf 'GET /json/version HTTP/1.0\\r\\n\\r\\n' "
+             f"| nc -w 2 127.0.0.1 {port}"),
+            # What restore-epoch does the guest see RIGHT NOW, and can it see
+            # MMDS at all? `fetch_latest_metadata` is MMDS V2, so the token PUT
+            # comes first. netcat-openbsd is installed in the VM rootfs
+            # (`rootfs-config.toml` [packages] debug); curl is not.
+            ("mmds_latest",
+             "tok=$(printf 'PUT /latest/api/token HTTP/1.0\\r\\n"
+             "X-metadata-token-ttl-seconds: 60\\r\\nConnection: close\\r\\n\\r\\n' "
+             "| nc -w 2 169.254.169.254 80 | tr -d '\\r' | tail -1); "
+             "printf 'GET /latest HTTP/1.0\\r\\nX-metadata-token: %s\\r\\n"
+             "Accept: application/json\\r\\nConnection: close\\r\\n\\r\\n' \"$tok\" "
+             "| nc -w 2 169.254.169.254 80 | tr -d '\\r' | tail -5"),
+            # The same arping `handle_clone_restore` sends. iputils-arping is in
+            # the VM rootfs. A gateway that does not answer this, 100 s after the
+            # request gave up, is a persistent L2 break rather than a race.
+            ("arping_gateway",
+             "gw=$(ip route show default | awk '/via/{print $3; exit}'); "
+             "echo \"gateway=$gw\"; arping -c 1 -w 2 -I eth0 \"$gw\""),
+        )
+
+    def exec_batch(self, fcvm_pid: int, sections, timeout_s: float,
+                   budget_limited: bool = False) -> dict:
+        """Run a section batch in the guest VM over vsock exec.
+
+        `--vm`, not the container: the container runs `--network=host`, so the
+        VM's view already covers the container's sockets and processes, and one
+        exec is one thing that can hang instead of two.
+        """
+        script = probe_batch_script(sections)
+        # fcvm logs to stderr and keeps stdout clean for command output
+        # (`src/main.rs`: "Logs to stderr, keep stdout clean"), so the framed
+        # sections parse out of stdout while the exec client's own retry ladder
+        # and connect errors stay readable in `stderr`.
+        argv = [self.fcvm, "exec", "--pid", str(fcvm_pid), "--vm",
+                "--", "sh", "-c", script]
+        result = run_probe_command(argv, timeout_s, budget_limited)
+        result["sections"] = parse_probe_batch(result.get("stdout", ""))
+        result.pop("stdout", None)
+        return result
+
+    def nsenter_batch(self, holder_pid: int, sections, deadline: float) -> dict:
+        """Enter the clone's network namespace, preferring the way fcvm does it.
+
+        `-U -n --preserve-credentials` is `PastaNetwork::build_nsenter_prefix`
+        verbatim, and it needs no privilege in rootless mode because the holder's
+        user namespace makes the caller root inside it. Dropping `-U` is the
+        retry for a mode with no user namespace. Each attempt is separately
+        bounded against the capture deadline, so a hanging first attempt cannot
+        buy the second one a fresh budget.
+        """
+        script = probe_batch_script(sections)
+        variants = (
+            ("user+net", ["-t", str(holder_pid), "-U", "-n", "--preserve-credentials"]),
+            ("net", ["-t", str(holder_pid), "-n", "--preserve-credentials"]),
+        )
+        attempts = []
+        resolved = None
+        for variant, flags in variants:
+            timeout = min(self.command_timeout_s, deadline - time.monotonic())
+            if timeout <= 0:
+                attempts.append({"nsenter_variant": variant,
+                                 "error": "skipped, probe budget exhausted"})
+                continue
+            result = run_probe_command(
+                ["nsenter", *flags, "--", "sh", "-c", script], timeout,
+                budget_limited=timeout < self.command_timeout_s,
+            )
+            result["nsenter_variant"] = variant
+            result["sections"] = parse_probe_batch(result.get("stdout", ""))
+            result.pop("stdout", None)
+            attempts.append(result)
+            if result.get("rc") == 0 and result["sections"]:
+                resolved = variant
+                break
+        return {"attempts": attempts, "resolved_variant": resolved}
+
+
 # ----------------------------------------------------------------- one request
 
 
@@ -1895,7 +2594,7 @@ def spawn_clone_process(cmd: list[str], log: str, env: dict) -> subprocess.Popen
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def run_cdp_request(args, rep: int, fast: bool) -> dict:
+def run_cdp_request(args, rep: int, fast: bool, probe=None) -> dict:
     import cdpdrive
 
     name = f"rb-{args.run_id}-{rep}-{'fast' if fast else 'norm'}"
@@ -2030,6 +2729,22 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
                         rec["state_error"] = str(data_error)
     finally:
         watch.close()
+
+    # EVIDENCE, NOT MEASUREMENT. `rec["blocking_ms"]` is the caller-visible
+    # latency and the only number this arm publishes as a response time, and it
+    # is already stamped on both the success and the failure path above, so nothing
+    # below can move it. The clone is still up, and on the failure path its vsock
+    # exec still works while its IP path does not, which is the whole reason to
+    # ask it anything before the teardown deletes it.
+    if probe is not None:
+        probe.observe(
+            rec,
+            name=name,
+            fcvm_pid=fcvm_pid,
+            state_path=state_path,
+            log_path=log,
+            endpoint=rec.get("endpoint", ""),
+        )
 
     if fast:
         try:
@@ -2596,6 +3311,23 @@ def run_exec_request(args, rep: int) -> dict:
     return rec
 
 
+def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> dict:
+    """Route one scheduled attempt to its arm, carrying the failure probe.
+
+    Extracted from `main`'s loop so the wiring is testable: the probe reaching
+    the CDP arms is the difference between a failure that leaves evidence and one
+    that does not, and a wiring gap inside a 90-line loop body is invisible until
+    the next unexplained failure has already been torn down.
+    """
+    if probe is not None:
+        probe.begin_request(is_warmup)
+    if arm == "exec":
+        return run_exec_request(args, rep)
+    if arm == "noop":
+        return run_noop_request(args, rep)
+    return run_cdp_request(args, rep, fast=(arm == "cdp-fast"), probe=probe)
+
+
 def main() -> int:
     """Run one schedule and release every whole-run resource on every exit."""
     with ExitStack() as resources:
@@ -2765,6 +3497,15 @@ def main_with_resources(resources: ExitStack) -> int:
 
     out_path = os.path.join(args.out_dir, "reqbench.jsonl")
     run_id = args.run_id
+    # One probe per run: it owns the once-per-run healthy control, so the
+    # control cannot be taken twice or taken from a clone that also failed.
+    probe = FailureProbe(
+        fcvm=args.fcvm,
+        data_root=args.data_root,
+        out_dir=args.out_dir,
+        run_id=args.run_id,
+        cdp_port=args.cdp_port,
+    )
     try:
         quiet_guard_loadavg1 = float(os.environ["REQBENCH_GUARD_LOADAVG1"])
         quiet_guard_vm_processes = int(
@@ -2825,12 +3566,7 @@ def main_with_resources(resources: ExitStack) -> int:
             # leave no trace in the artifact, so `n=` was the only evidence that
             # anything had been dropped.
             try:
-                if arm == "exec":
-                    rec = run_exec_request(args, rep)
-                elif arm == "noop":
-                    rec = run_noop_request(args, rep)
-                else:
-                    rec = run_cdp_request(args, rep, fast=(arm == "cdp-fast"))
+                rec = dispatch_request(args, rep, arm, is_warmup, probe)
                 fatal = None
             except SurvivedTeardown as e:
                 rec = dict(e.record) or {"arm": arm, "rep": rep}

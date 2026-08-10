@@ -452,6 +452,46 @@ Caveat: synthetic dirty-anon pages, not Firecracker's MAP_PRIVATE file-backed
 guest memory; clean file-backed pages may unmap cheaper. Corroboration: the
 observed ~78 ms VM teardown for a ~1 GB VM sits on the ~60 ms/GiB line.
 
+## Failure-time evidence capture: what the probe takes, and what it cannot say
+
+An 808-clone run produced 3 CDP failures. Every one came from a clone whose
+ARP-triggering readiness ping got no reply (5 clones had no reply, 3 of them
+failed; of the 803 whose ping replied, none failed), the guest stayed alive for
+the whole 100+ seconds, and the `exec` and `noop` arms, which reach the guest
+over vsock, never failed. **Why the guest stopped answering on the IP path, and
+why it never recovered, is UNSOLVED.** The leading hypothesis, which nothing has
+yet proved, is that the guest's post-restore network re-initialisation never
+ran or never finished for that clone.
+
+`reqbench.py`'s `FailureProbe` exists because vsock exec keeps working while the
+IP path does not, so the broken guest is interrogable at exactly the moment it
+is broken, and the harness used to delete it. On a failed CDP request, and once
+per run on a healthy one as the control, it writes `<request-name>.probe.json`
+next to that request's clone log and references it from the JSONL record.
+
+- Guest, over `fcvm exec --vm`: addresses, routes, the neighbour table,
+  interface counters, listening sockets, the Chromium process table, `dmesg`,
+  the guest clock, an in-guest CDP connect, an MMDS read of the current
+  restore-epoch, and an arping of the gateway.
+- Host, for the same clone: the state file, the fcvm process tree, pasta's pid
+  and process state, the holder's namespace via `nsenter` and via its procfs, a
+  fresh TCP connect to the published port, and the restore and readiness lines
+  from that clone's own fcvm log.
+
+Read the failure dump against the control; a dump with nothing to compare
+against proves little, which is why the control is captured whether or not the
+run ends up failing. Read `role`, `budget_exhausted` and each command's
+`budget_limited` before reading anything else: a `timed_out` step that was
+`budget_limited` is the probe running out of budget, not a wedged guest.
+
+**What it cannot settle.** The passive capture is taken ~100 s after the request
+gave up, so it describes the STEADY state of the failure, not the moment it
+began; ordering questions still need the clone's log. It cannot see anything
+Firecracker's MMDS server did or did not serve, only what the guest can now read
+back. Its host-side namespace view is one `nsenter` snapshot, so it cannot show
+a neighbour entry that expired earlier. And the active section mutates what the
+passive section just recorded, deliberately and last.
+
 ## Claims currently REFUTED — status per `REVIEW.md`
 
 This list and `REVIEW.md` disagreed for a while: everything here said "do not

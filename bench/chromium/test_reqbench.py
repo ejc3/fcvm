@@ -1802,7 +1802,14 @@ class SnapshotGenerationIdentity(unittest.TestCase):
             def run_noop(_args, rep):
                 return record("noop", rep)
 
-            def run_cdp(_args, rep, fast):
+            # `probe` is recorded, not ignored: this is the only test that
+            # drives the real `main`, so it is the only place the failure
+            # probe's arrival at a CDP arm can be observed end to end rather
+            # than asserted about the source.
+            cdp_probes = []
+
+            def run_cdp(_args, rep, fast, probe=None):
+                cdp_probes.append(probe)
                 return record("cdp-fast" if fast else "cdp", rep)
 
             saved = {
@@ -1897,6 +1904,11 @@ class SnapshotGenerationIdentity(unittest.TestCase):
                         os.environ[key] = value
 
             self.assertEqual(rc, 0)
+            self.assertTrue(cdp_probes, "the cdp-fast arm never ran")
+            self.assertTrue(
+                all(isinstance(p, reqbench.FailureProbe) for p in cdp_probes),
+                f"main must hand every CDP arm a real failure probe: {cdp_probes}",
+            )
             self.assertEqual(contender_errors, [])
             self.assertEqual(request_observations, [{
                 "attempt_completed": True,
@@ -4110,6 +4122,502 @@ class DocLint(unittest.TestCase):
                         f"{name}: the verification exits 0 on a MISSING healthcheck "
                         f"(fcvm treats a missing healthcheck as a PASS, so the golden "
                         f"snapshot would fire on a cold browser).\n{snippet}")
+
+
+def probe_stub_source(clone_pid_file, exec_log, sleep_pid_file, exec_mode="canned"):
+    """An fcvm stub that is BOTH a clone and an exec client.
+
+    The clone half is the usual shape (a pdeathsig child, a state file, wait).
+    The exec half is what makes the failure probe testable without a microVM: it
+    answers `fcvm exec --pid N --vm -- sh -c <script>` with a canned framed
+    reply, and records whether the clone was still ALIVE when the exec arrived.
+    That liveness flag is the ordering proof: teardown's first act kills the
+    clone, so an exec that finds it alive provably ran before teardown.
+
+    `exec_mode="hang"` sleeps instead, with the sleep's pid recorded, so a test
+    can check that the bound killed the process GROUP and not just the stub.
+    """
+    if exec_mode == "hang":
+        exec_body = f"""
+    sleep 120 &
+    printf '%s\\n' "$!" > {shlex.quote(sleep_pid_file)}
+    wait
+    exit 0
+"""
+    else:
+        exec_body = """
+    for section in guest_date ip_neigh listening_sockets; do
+        printf '===fcvm-probe-section %s\\n' "$section"
+        printf 'stub output for %s\\n' "$section"
+        printf '===fcvm-probe-rc %s 0\\n' "$section"
+    done
+    exit 0
+"""
+    return f"""#!/bin/bash
+if [ "$1" = "exec" ]; then
+    clone_pid=$(cat {shlex.quote(clone_pid_file)} 2>/dev/null || echo 0)
+    if kill -0 "$clone_pid" 2>/dev/null; then alive=yes; else alive=no; fi
+    printf 'exec clone_alive=%s\\n' "$alive" >> {shlex.quote(exec_log)}
+{exec_body}
+fi
+python3 -c 'import ctypes,signal,time; ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL); time.sleep(600)' &
+printf '%s\\n' "$$" > {shlex.quote(clone_pid_file)}
+"""
+
+
+class ProbeBatchFraming(unittest.TestCase):
+    """The framing has to survive a real shell and a cut-off batch.
+
+    A batch is one `fcvm exec`, so every section's status rides back inside one
+    stdout stream. Two things must hold: a section that failed reports ITS exit
+    status rather than the batch's, and a batch the timeout cut in half reports
+    the unterminated section as unknown rather than as success.
+    """
+
+    SECTIONS = (
+        ("healthy", "echo hello"),
+        ("failing", "exit 7"),
+        ("absent", "fcvm-probe-no-such-binary-xyzzy"),
+        ("piped", "printf 'a\\nb\\nc\\n' | tail -2"),
+    )
+
+    def test_each_section_carries_its_own_status_through_a_real_shell(self):
+        script = reqbench.probe_batch_script(self.SECTIONS)
+        result = subprocess.run(["sh", "-c", script], capture_output=True,
+                                text=True, timeout=30)
+        parsed = reqbench.parse_probe_batch(result.stdout)
+        self.assertEqual(sorted(parsed), ["absent", "failing", "healthy", "piped"])
+        self.assertEqual(parsed["healthy"]["rc"], 0)
+        self.assertEqual(parsed["healthy"]["output"], "hello")
+        self.assertEqual(parsed["failing"]["rc"], 7)
+        self.assertEqual(parsed["absent"]["rc"], 127)
+        self.assertIn("not found", parsed["absent"]["output"])
+        self.assertEqual(parsed["piped"]["rc"], 0)
+        self.assertEqual(parsed["piped"]["output"], "b\nc")
+
+    def test_a_truncated_batch_reports_unknown_status_not_success(self):
+        script = reqbench.probe_batch_script(self.SECTIONS)
+        result = subprocess.run(["sh", "-c", script], capture_output=True,
+                                text=True, timeout=30)
+        cut = result.stdout.split(f"{reqbench.PROBE_RC_MARK} piped")[0]
+        parsed = reqbench.parse_probe_batch(cut)
+        self.assertEqual(parsed["healthy"]["rc"], 0)
+        self.assertIsNone(
+            parsed["piped"]["rc"],
+            "a section whose status line never arrived must not read as rc 0",
+        )
+        self.assertEqual(parsed["piped"]["output"], "b\nc")
+
+
+class ProbeLogMarkers(unittest.TestCase):
+    """The dump quotes the clone's own restore narration instead of citing it."""
+
+    def test_matching_lines_are_kept_head_and_tail_with_the_gap_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "clone.log")
+            with open(path, "w") as f:
+                f.write("boring line\n")
+                for i in range(500):
+                    f.write(f"[fc-agent] restore line {i}\n")
+                    f.write(f"unrelated chatter {i}\n")
+                f.write("guest MAC resolved ping_replied=false\n")
+            out = reqbench.probe_log_markers(path, max_lines=10)
+        self.assertEqual(out["matched"], 501)
+        self.assertTrue(out["truncated"])
+        self.assertIn("[fc-agent] restore line 0", out["lines"])
+        self.assertIn("guest MAC resolved ping_replied=false", out["lines"])
+        self.assertTrue(any("lines omitted" in line for line in out["lines"]))
+        self.assertNotIn("boring line", out["lines"])
+
+    def test_a_missing_log_is_recorded_rather_than_raised(self):
+        out = reqbench.probe_log_markers("/nonexistent/clone.log")
+        self.assertIn("error", out)
+        self.assertEqual(out["matched"], 0)
+
+
+class FailureProbeCapture(unittest.TestCase):
+    """Guest-side and host-side evidence for a CDP failure, before teardown.
+
+    RED BEFORE THE FIX (`test_a_failed_cdp_request_leaves_a_dump...`): the CDP
+    arms tore the clone down the instant the request resolved, so the only record
+    of a failure was its one-line `error` string. The 808-clone run's three
+    failures had a live, interrogable guest, since vsock exec kept working the
+    whole time, and every one of them was deleted before anything asked it a
+    question.
+    """
+
+    def _args(self, d, stub, port, state_dir):
+        return argparse.Namespace(
+            fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+            snapshot_tag="", serve_pid=1, rust_log="off",
+            timeout=10.0, teardown_timeout=5.0, cdp_port=port,
+            state_dir=state_dir, data_root=d, ws_url="", run_id="0" * 32,
+        )
+
+    def _stub_clone(self, d, state_dir, name, port, exec_mode="canned"):
+        """Write the stub plus the state file it will publish. Returns paths."""
+        vm_id = "vm-22222222222222222222222222222222"
+        clone_pid_file = os.path.join(d, "clone.pid")
+        exec_log = os.path.join(d, "exec.log")
+        sleep_pid_file = os.path.join(d, "sleep.pid")
+        stub = os.path.join(d, "fcvm-stub")
+        state_path = os.path.join(state_dir, f"{vm_id}.json")
+        body = probe_stub_source(clone_pid_file, exec_log, sleep_pid_file, exec_mode)
+        state = json.dumps({
+            "vm_id": vm_id, "name": name, "pid": "PID", "pid_start_time": "START",
+            "lifecycle_ready": True,
+            "config": {"network": {"loopback_ip": "127.0.0.1"}},
+        })
+        body += (
+            "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+            "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+            f"printf '%s\\n' {shlex.quote(state)} "
+            f"| sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}\n"
+            f": > {state_path}.lock\n"
+            "wait\n"
+        )
+        with open(stub, "w") as f:
+            f.write(body)
+        os.chmod(stub, 0o755)
+        return stub, state_path, exec_log, sleep_pid_file
+
+    def _drive(self, args, probe, fast=True):
+        """Run one CDP rep and return its record however the rep ended.
+
+        `teardown_fast` needs `/proc/<pid>/task/<tid>/children`, which a kernel
+        built without `CONFIG_PROC_CHILDREN` does not have; there it raises
+        `SurvivedTeardown` carrying the same record. The probe runs BEFORE
+        teardown either way, which is the property under test, so both endings
+        are accepted and neither is silently treated as a pass.
+        """
+        try:
+            return reqbench.run_cdp_request(args, 0, fast=fast, probe=probe)
+        except reqbench.SurvivedTeardown as error:
+            return error.record
+
+    def test_a_failed_cdp_request_leaves_a_dump_taken_while_the_clone_was_alive(self):
+        import cdpdrive
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            os.makedirs(state_dir)
+            server = socket.socket()
+            server.bind(("127.0.0.1", 0))
+            server.listen(8)
+            port = server.getsockname()[1]
+            name = f"rb-{'0' * 32}-0-fast"
+            stub, state_path, exec_log, _ = self._stub_clone(d, state_dir, name, port)
+            real_drive = cdpdrive.drive
+            cdpdrive.drive = lambda _a: {
+                "ok": False, "error": "TimeoutError: timed out",
+                "failure_class": "transport", "stage": "connect", "stages": {},
+            }
+            probe = reqbench.FailureProbe(
+                fcvm=stub, data_root=d, out_dir=d, run_id="0" * 32, cdp_port=port,
+                command_timeout_s=10.0, budget_s=30.0,
+            )
+            clone_pid_file = os.path.join(d, "clone.pid")
+            try:
+                rec = self._drive(self._args(d, stub, port, state_dir), probe)
+            finally:
+                cdpdrive.drive = real_drive
+                server.close()
+                # The stub clone outlives a teardown that refused to prove its
+                # child set. Tests must not leak either (AGENTS.md).
+                try:
+                    with open(clone_pid_file) as f:
+                        os.kill(int(f.read().strip()), signal.SIGKILL)
+                except (OSError, ValueError, ProcessLookupError):
+                    pass
+
+            self.assertIs(rec["ok"], False)
+            self.assertIn("probe", rec, f"no probe stamp on a failed record: {rec}")
+            self.assertEqual(rec["probe"]["role"], "failure")
+            dump_path = rec["probe"]["path"]
+            self.assertTrue(os.path.exists(dump_path), dump_path)
+            with open(dump_path) as f:
+                dump = json.load(f)
+
+            # The dump names its own request, so the artifact stands alone.
+            self.assertEqual(dump["name"], name)
+            self.assertEqual(dump["run_id"], "0" * 32)
+            self.assertEqual(dump["failure_stage"], "connect")
+            self.assertIn("TimeoutError", dump["request_error"])
+
+            # Guest side, over the vsock exec path that keeps working.
+            self.assertEqual(
+                sorted(dump["guest"]["passive"]["sections"]),
+                ["guest_date", "ip_neigh", "listening_sockets"],
+            )
+            self.assertIn("--vm", dump["guest"]["passive"]["argv"])
+            self.assertIn("active_mutating", dump["guest"])
+            self.assertIs(dump["guest"]["active_mutating"]["mutates_guest_state"], True)
+
+            # Host side for the same clone.
+            self.assertEqual(dump["host"]["clone_state"]["vm_id"],
+                             "vm-22222222222222222222222222222222")
+            self.assertIs(dump["host"]["cdp_connect_now"]["connected"], True)
+            self.assertIn("log_markers", dump["host"])
+            self.assertIn("pasta", dump["host"])
+
+            # Ordering: the clone was still alive when the probe reached it, and
+            # teardown's first act is to kill it.
+            with open(exec_log) as f:
+                execs = f.read().split()
+            self.assertTrue(execs, "the probe never ran an exec against the clone")
+            self.assertNotIn(
+                "clone_alive=no", execs,
+                "the probe must run BEFORE teardown, while the guest still exists",
+            )
+
+    def test_a_success_after_the_control_writes_no_dump(self):
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222,
+            )
+            probe.control_captured = True
+            rec = {"arm": "cdp", "rep": 3, "ok": True}
+            probe.observe(rec, name="rb-x-3-fast", fcvm_pid=os.getpid(),
+                          state_path="", log_path="", endpoint="")
+            self.assertNotIn("probe", rec)
+            self.assertEqual(
+                [n for n in os.listdir(d) if n.endswith(".probe.json")], [],
+                "a healthy request past the control must write nothing",
+            )
+
+    def test_the_healthy_control_is_taken_once_and_only_from_a_healthy_clone(self):
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222, budget_s=5.0,
+            )
+            probe.begin_request(True)
+            first = {"arm": "cdp", "rep": 0, "ok": True}
+            probe.observe(first, name="rb-x-0-fast", fcvm_pid=os.getpid(),
+                          state_path="", log_path="", endpoint="")
+            second = {"arm": "cdp", "rep": 1, "ok": True}
+            probe.observe(second, name="rb-x-1-fast", fcvm_pid=os.getpid(),
+                          state_path="", log_path="", endpoint="")
+            self.assertEqual(first["probe"]["role"], "control")
+            self.assertNotIn("probe", second)
+            self.assertNotIn(
+                "probe_perturbed_timings", first,
+                "a warmup rep is discarded at analysis, so it is not a perturbation",
+            )
+            dumps = [n for n in os.listdir(d) if n.endswith(".probe.json")]
+            self.assertEqual(dumps, ["rb-x-0-fast.probe.json"],
+                             "the second healthy rep must write nothing")
+
+            # A later failure has to be able to find the control it is read
+            # against; the control itself has nothing earlier to point at.
+            self.assertEqual(first["probe"]["control_path"], "")
+            failed = {"arm": "cdp", "rep": 2, "ok": False}
+            probe.observe(failed, name="rb-x-2-fast", fcvm_pid=os.getpid(),
+                          state_path="", log_path="", endpoint="")
+            self.assertEqual(failed["probe"]["control_path"],
+                             first["probe"]["path"])
+
+    def test_a_control_taken_from_a_measured_rep_is_stamped_as_perturbing(self):
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222, budget_s=5.0,
+            )
+            probe.begin_request(False)
+            rec = {"arm": "cdp", "rep": 4, "ok": True}
+            with io.StringIO() as buf:
+                stderr, sys.stderr = sys.stderr, buf
+                try:
+                    probe.observe(rec, name="rb-x-4-fast", fcvm_pid=os.getpid(),
+                                  state_path="", log_path="", endpoint="")
+                finally:
+                    sys.stderr = stderr
+                warning = buf.getvalue()
+            self.assertIs(rec["probe_perturbed_timings"], True)
+            self.assertIn("probe_perturbed_timings", warning)
+
+    def test_a_probe_that_raises_is_recorded_and_the_request_survives(self):
+        """RED BEFORE THE FIX: `observe` called `capture` bare, so anything the
+        probe got wrong took down a request that had ALREADY produced its answer
+        and, through `main`'s `fatal` path, the rest of the schedule."""
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222,
+            )
+
+            def explode(**_kwargs):
+                raise RuntimeError("probe blew up")
+
+            probe.capture = explode
+            rec = {"arm": "cdp", "rep": 2, "ok": False, "error": "original failure"}
+            probe.observe(rec, name="rb-x-2-fast", fcvm_pid=os.getpid(),
+                          state_path="", log_path="", endpoint="")
+            self.assertIn("probe blew up", rec["probe"]["probe_error"])
+            self.assertEqual(rec["error"], "original failure",
+                             "the probe must not overwrite the real failure")
+
+    def test_a_hung_guest_exec_is_cut_off_at_the_bound_with_its_group(self):
+        """A wedged guest must cost the bound, not the request's whole budget.
+
+        `fcvm exec`'s own connect ladder spans ~54 s, and the exec holds a
+        command running inside the guest, so killing only the direct child would
+        leave the real work behind. The bound therefore kills the process GROUP,
+        and this checks the grandchild is gone rather than checking the wrapper
+        returned.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            os.makedirs(state_dir)
+            stub, state_path, _, sleep_pid_file = self._stub_clone(
+                d, state_dir, "rb-x-0-fast", 9222, exec_mode="hang"
+            )
+            probe = reqbench.FailureProbe(
+                fcvm=stub, data_root=d, out_dir=d, run_id="0" * 32, cdp_port=9222,
+                command_timeout_s=1.0, budget_s=30.0,
+            )
+            started = time.monotonic()
+            result = probe.exec_batch(os.getpid(), (("noop", "true"),), 1.0)
+            elapsed = time.monotonic() - started
+            self.assertIs(result["timed_out"], True)
+            self.assertLess(elapsed, 15.0, f"the bound did not hold: {elapsed:.1f}s")
+            self.assertEqual(result["sections"], {},
+                             "a cut-off batch has no completed sections")
+            with open(sleep_pid_file) as f:
+                grandchild = int(f.read().strip())
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if reqbench.proc_stat_fields(grandchild) is None:
+                    break
+                time.sleep(0.02)
+            self.assertIsNone(
+                reqbench.proc_stat_fields(grandchild),
+                "the timeout killed the exec wrapper but left its guest-side work",
+            )
+
+    def test_the_capture_stops_at_its_budget_and_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222,
+                command_timeout_s=5.0, budget_s=0.0,
+            )
+            dump = probe.capture(
+                role="failure", rec={"arm": "cdp", "rep": 0, "ok": False},
+                name="rb-x-0-fast", fcvm_pid=os.getpid(), state_path="",
+                log_path="", endpoint="",
+            )
+            self.assertIs(dump["budget_exhausted"], True)
+            self.assertNotIn("passive", dump["guest"])
+            self.assertNotIn("active_mutating", dump["guest"])
+            self.assertTrue(
+                [e for e in dump["errors"] if "budget" in e],
+                f"the skipped steps must be named: {dump['errors']}",
+            )
+            # Even a fully skipped capture is a usable artifact.
+            self.assertIn("fcvm_process", dump["host"])
+            self.assertIn("log_markers", dump["host"])
+
+    def test_a_step_given_a_shortened_timeout_says_so_on_its_own_record(self):
+        """`timed_out` from a nearly-spent budget is not a wedged guest.
+
+        Without this label the two are the same boolean, and telling them apart
+        is the entire job of the dump.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            os.makedirs(state_dir)
+            stub, _, _, _ = self._stub_clone(d, state_dir, "rb-x-0-fast", 9222)
+            probe = reqbench.FailureProbe(
+                fcvm=stub, data_root=d, out_dir=d, run_id="0" * 32, cdp_port=9222,
+                command_timeout_s=30.0, budget_s=5.0,
+            )
+            dump = probe.capture(
+                role="failure", rec={"arm": "cdp", "rep": 0, "ok": False},
+                name="rb-x-0-fast", fcvm_pid=os.getpid(), state_path="",
+                log_path="", endpoint="",
+            )
+            passive = dump["guest"]["passive"]
+            self.assertIs(passive["budget_limited"], True)
+            self.assertLess(passive["timeout_s"], 30.0)
+            self.assertIs(passive["timed_out"], False)
+            self.assertEqual(sorted(passive["sections"]),
+                             ["guest_date", "ip_neigh", "listening_sockets"])
+
+
+class FailureProbeWiring(unittest.TestCase):
+    """The probe has to REACH the CDP arms; a gap here is invisible until the
+    next unexplained failure has already been torn down."""
+
+    def _recorders(self):
+        calls = []
+
+        def cdp(args, rep, fast, probe=None):
+            calls.append(("cdp-fast" if fast else "cdp", probe))
+            return {"arm": "cdp", "rep": rep}
+
+        def other(name):
+            def run(args, rep):
+                calls.append((name, None))
+                return {"arm": name, "rep": rep}
+            return run
+
+        return calls, cdp, other
+
+    def test_both_cdp_arms_get_the_probe_and_the_warmup_flag(self):
+        calls, cdp, other = self._recorders()
+        seen = []
+
+        class Recorder(reqbench.FailureProbe):
+            def __init__(self):
+                super().__init__(fcvm="", data_root="", out_dir="",
+                                 run_id="", cdp_port=0)
+
+            def begin_request(self, is_warmup):
+                seen.append(is_warmup)
+                super().begin_request(is_warmup)
+
+        probe = Recorder()
+        saved = (reqbench.run_cdp_request, reqbench.run_exec_request,
+                 reqbench.run_noop_request)
+        reqbench.run_cdp_request = cdp
+        reqbench.run_exec_request = other("exec")
+        reqbench.run_noop_request = other("noop")
+        try:
+            for arm, warm in (("cdp", True), ("cdp-fast", False),
+                              ("exec", False), ("noop", True)):
+                reqbench.dispatch_request(argparse.Namespace(), 0, arm, warm, probe)
+        finally:
+            (reqbench.run_cdp_request, reqbench.run_exec_request,
+             reqbench.run_noop_request) = saved
+        self.assertEqual([name for name, _ in calls],
+                         ["cdp", "cdp-fast", "exec", "noop"])
+        self.assertIs(calls[0][1], probe)
+        self.assertIs(calls[1][1], probe)
+        self.assertEqual(seen, [True, False, False, True],
+                         "every arm must set the warmup flag, not just the CDP ones")
+
+    def test_the_dispatcher_is_the_only_request_call_site_in_the_schedule(self):
+        """`main` must not reach an arm around the dispatcher.
+
+        That `main` hands a REAL probe to a CDP arm is proved behaviourally, by
+        `SnapshotGenerationIdentity.test_main_holds_the_generation_lease_through_the_full_schedule`,
+        which drives the actual `main` and asserts on the object the arm
+        received. What that cannot see is a second call site added later that
+        bypasses the dispatcher, since it would simply not be exercised by that
+        run's schedule, so this reads the loop body.
+        """
+        with open(os.path.join(HERE, "reqbench.py")) as f:
+            body = f.read().split("for rep, arm, is_warmup in schedule:", 1)
+        self.assertEqual(len(body), 2, "the schedule loop moved; update this lint")
+        for arm_call in ("run_cdp_request(", "run_exec_request(", "run_noop_request("):
+            self.assertNotIn(
+                arm_call, body[1],
+                f"the schedule loop calls {arm_call} directly instead of "
+                "dispatch_request, so the probe is not carried",
+            )
 
 
 if __name__ == "__main__":
