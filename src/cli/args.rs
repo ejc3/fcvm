@@ -381,6 +381,15 @@ pub struct SnapshotServeArgs {
     ///   instead of a running guest dying with SIGBUS when the pool runs dry.
     #[arg(long, value_name = "copy|minor", env = "FCVM_UFFD_MODE")]
     pub uffd_mode: Option<String>,
+
+    /// Whether to record each clone's restore working set and replay it into the next one.
+    ///
+    /// - `on` (default): the pages a clone faults are recorded beside the snapshot and
+    ///   bulk-populated into every later clone, so it does not trap for pages we already know
+    ///   it will touch. A missing, stale or wrong record just means demand paging.
+    /// - `off`: no recording, no replay — every clone faults every page in.
+    #[arg(long, value_name = "on|off", env = "FCVM_UFFD_PREFETCH")]
+    pub uffd_prefetch: Option<String>,
 }
 
 #[derive(Args, Debug)]

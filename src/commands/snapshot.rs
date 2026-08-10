@@ -20,7 +20,7 @@ use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
 };
 use crate::storage::{validate_snapshot_name, SnapshotGeneration, SnapshotManager};
-use crate::uffd::{UffdBacking, UffdServer};
+use crate::uffd::{Prefetch, UffdBacking, UffdServer};
 use crate::volume::{SpawnedVolumes, VolumeConfig};
 
 use super::common::{
@@ -671,14 +671,26 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         None => UffdBacking::Copy,
     };
 
+    // Whether clones replay the snapshot's recorded working set instead of faulting it in
+    // one page at a time (--uffd-prefetch / FCVM_UFFD_PREFETCH).
+    let prefetch = match args.uffd_prefetch.as_deref() {
+        Some(value) => Prefetch::parse(value)?,
+        None => Prefetch::On,
+    };
+
     // The server names its own socket after this process's (pid, start_time), so no two
     // live servers can collide on it. Clones rebuild the same name from the serve state
     // file (see `cmd_snapshot_run`).
     let server = UffdServer::new(
         args.snapshot_name.clone(),
         &snapshot_config.memory_path,
+        &paths::snapshot_dir()
+            .join(&args.snapshot_name)
+            .join("config.json"),
+        &super::common::snapshot_sibling(&paths::snapshot_dir().join(&args.snapshot_name), "lock"),
         &paths::data_dir(),
         backing,
+        prefetch,
     )
     .await
     .context("creating UFFD server")?;
@@ -1599,9 +1611,11 @@ async fn cmd_snapshot_run_inner(
                 "FCVM_FORCE_UFFD"
             };
             let backing = setup_try!(UffdBacking::from_env(hugepages));
+            let prefetch = setup_try!(Prefetch::from_env());
             info!(
                 reason = %reason,
                 mode = backing.name(),
+                prefetch = ?prefetch,
                 "starting implicit UFFD server for snapshot restore"
             );
 
@@ -1619,8 +1633,16 @@ async fn cmd_snapshot_run_inner(
             let server = setup_try!(UffdServer::new(
                 "implicit".to_string(),
                 &snapshot_config.memory_path,
+                &paths::snapshot_dir()
+                    .join(&snapshot_name)
+                    .join("config.json"),
+                &super::common::snapshot_sibling(
+                    &paths::snapshot_dir().join(&snapshot_name),
+                    "lock",
+                ),
                 &data_dir,
                 backing,
+                prefetch,
             )
             .await
             .context("creating implicit UFFD server"));

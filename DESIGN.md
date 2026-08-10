@@ -1495,7 +1495,7 @@ fcvm snapshot create my-vm --tag warm-nginx
 
 **Usage**:
 ```bash
-fcvm snapshot serve <SNAPSHOT_NAME>
+fcvm snapshot serve <SNAPSHOT_NAME> [--uffd-mode copy|minor] [--uffd-prefetch on|off]
 ```
 
 The memory server:
@@ -1503,12 +1503,26 @@ The memory server:
 - Listens for clone connections via Unix socket
 - Serves memory pages on-demand via UFFD (userfaultfd)
 - Enables sharing physical pages across multiple clones
+- Records each clone's restore working set and replays it into the next clone
+
+**Flags**:
+
+| Flag | Env var | Default | Effect |
+|------|---------|---------|--------|
+| `--uffd-mode copy\|minor` | `FCVM_UFFD_MODE` | `copy` | `copy` fills faults with `UFFDIO_COPY` (private per-clone pages); `minor` serves a sealed memfd with `UFFDIO_CONTINUE` (true page sharing) |
+| `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set` and replays them into later clones; `off` is fully inert — no recording, no replay, no files |
 
 **Example**:
 ```bash
 # Start memory server (blocks, keeps running)
 fcvm snapshot serve my-snapshot
+
+# Baseline arm for measurement: pure demand paging, nothing recorded
+fcvm snapshot serve my-snapshot --uffd-prefetch off
 ```
+
+See "Working-Set Replay" in `AGENTS.md` for the fault-locality data behind the default and for
+the invalidation/isolation rules.
 
 #### `fcvm snapshot run`
 
@@ -1675,7 +1689,9 @@ fcvm/
 │   ├── uffd/               # UFFD memory server
 │   │   ├── mod.rs
 │   │   ├── server.rs       # Userfaultfd page handler
-│   │   └── handler.rs      # UFFD event handler
+│   │   ├── handler.rs      # UFFD event handler
+│   │   ├── working_set.rs  # Record/persist the restore working set
+│   │   └── prefetch.rs     # Replay it into a restoring clone
 │   │
 │   ├── volume/             # FUSE volume handling
 │   │   └── mod.rs          # Host → guest filesystem mapping
