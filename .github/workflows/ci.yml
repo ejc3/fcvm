@@ -16,13 +16,12 @@ on:
   # branch, not main — so `branches: [main]` skipped every job below for exactly
   # the PRs the workflow tells people to open, while still rendering a check set
   # with no failures. See tests/test_ci_workflow_coverage.rs.
+  # No `paths-ignore:` either. A PR whose every changed file matched that list
+  # produced NO check runs at all — not even a skipped Summary — and GitHub
+  # reported it CLEAN (PR #785 was mechanically mergeable that way). The
+  # expensive matrix is skipped per-job via the `changes` job below instead, so
+  # every PR still gets exactly one `Summary` check and it can be required.
   pull_request:
-    paths-ignore:
-      - 'scripts/claude-assistant/**'
-      - '.github/workflows/claude*.yml'
-      - '.claude/**'
-      - '*.md'
-      - 'docs/**'
   push:
     branches: [main]
     paths-ignore:
@@ -54,6 +53,71 @@ jobs:
   # Skip expensive CI jobs on main pushes when the tree SHA already passed on a PR.
   # When a PR merges via fast-forward or rebase, the merge commit has the same tree
   # SHA as the PR tip. Re-running all tests on self-hosted runners is wasteful.
+  # Which paths make the expensive matrix meaningful. A PR touching only these
+  # (docs, the assistant tooling, the claude workflows) still runs `actionlint`
+  # and still publishes `Summary`; it just skips the VM matrix, which cannot say
+  # anything about those files. Gating per-job rather than per-workflow is what
+  # keeps `Summary` present on every PR.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - name: Detect whether any non-doc path changed
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Only a pull_request has a well-defined changed-file set here; every
+          # other trigger runs the full matrix rather than guess.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "event $EVENT: running the full matrix"
+            exit 0
+          fi
+          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
+          if [ -z "$files" ]; then
+            # An empty file list is unexpected, so fail toward running the matrix.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "no changed files reported: running the full matrix"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r f; do
+            case "$f" in
+              scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*|docs/*|*.md) ;;
+              *) code=true; echo "code path: $f" ;;
+            esac
+          done <<< "$files"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code_changed=$code"
+
+  # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
+  # gates it: a PR that changes only `.github/workflows/claude*.yml` skips the
+  # matrix, and this is then the check that can actually fail for it.
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download actionlint (checksum-pinned)
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/actionlint.tgz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.10/actionlint_1.7.10_linux_amd64.tar.gz
+          echo "f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f  /tmp/actionlint.tgz" | sha256sum -c -
+          tar -C /tmp -xzf /tmp/actionlint.tgz actionlint
+      - name: Lint workflows
+        # shellcheck stays off until the pre-existing SC2086/SC2129 findings in
+        # claude.yml's run blocks are fixed; actionlint's own checks
+        # (expressions, action inputs, needs references, runner labels) apply.
+        run: /tmp/actionlint -shellcheck=
+
   skip-check:
     name: Skip Check
     runs-on: ubuntu-latest
@@ -102,6 +166,8 @@ jobs:
   # Fast checks: fmt, clippy, audit, deny
   lint:
     name: Lint
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -150,6 +216,8 @@ jobs:
   # Verifies cargo install works without source tree access
   packaging:
     name: Packaging
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -181,6 +249,8 @@ jobs:
   # instead of real Firecracker VMs. No KVM or btrfs required.
   fc-mock:
     name: fc-mock
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -232,8 +302,8 @@ jobs:
   # Self-hosted runners with nested virtualization (ARM64: c7g.metal, x86: c5.metal)
   host:
     name: Host-${{ matrix.arch }}
-    needs: [skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' }}
+    needs: [changes, skip-check]
+    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     # Longest of the last 6 successful runs: 12 min. GitHub's default is SIX HOURS, which is
     # how a wedged runner held a job all day on 2026-08-06 (one job stuck >5h) while the
@@ -471,8 +541,8 @@ jobs:
   #   This validates the full snapshot lifecycle: create -> persist -> restore
   host-root:
     name: Host-Root-${{ matrix.arch }}-${{ matrix.mode }}
-    needs: [skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' }}
+    needs: [changes, skip-check]
+    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     # Longest of the last 6 successful runs: 43 min (arm64 SnapshotEnabled, which runs the
     # whole suite twice, plus the nested + btrfs kernel builds). ~3x headroom.
@@ -695,8 +765,8 @@ jobs:
   # Needs KVM for VM tests (container mounts /dev/kvm)
   container:
     name: Container-${{ matrix.arch }}
-    needs: [skip-check]
-    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.skip != 'true' }}
+    needs: [changes, skip-check]
+    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     # Longest of the last 6 successful runs: 21 min. ~3x headroom.
     # See the Host job comment for why the 6h default is not acceptable here.
@@ -823,7 +893,7 @@ jobs:
   # Final summary job - runs after all test jobs
   summary:
     name: Summary
-    needs: [skip-check, lint, packaging, fc-mock, host, host-root, container]
+    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:
