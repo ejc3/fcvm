@@ -106,23 +106,34 @@ fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: Ra
     use std::os::unix::fs::PermissionsExt;
 
     let before = 0o644;
-    fs::set_permissions(backing, fs::Permissions::from_mode(before)).unwrap();
-    assert_eq!(
-        forced_statx_mode(fd) as u32,
-        before,
-        "the mount does not agree with the backing file even before anything is changed \
-         behind its back, so neither half of this check would mean anything"
-    );
-
     let after = 0o600;
-    fs::set_permissions(backing, fs::Permissions::from_mode(after)).unwrap();
 
-    let cached = fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777;
-    assert_eq!(
-        cached,
-        before,
-        "a plain stat through {} already saw the out-of-band chmod, so the attribute cache is \
-         not in play here and the forced case proves nothing",
+    // The cached half is only meaningful while the mount's 1s attr_timeout has
+    // not elapsed between the priming statx and the plain stat. A descheduling
+    // longer than that (a loaded CI host) expires the cache and the plain stat
+    // reports the new mode — a scheduling artifact, not the property under
+    // test — so that half retries. The forced half stays a hard assertion.
+    let mut cache_held = false;
+    for _ in 0..5 {
+        fs::set_permissions(backing, fs::Permissions::from_mode(before)).unwrap();
+        assert_eq!(
+            forced_statx_mode(fd) as u32,
+            before,
+            "the mount does not agree with the backing file even before anything is changed \
+             behind its back, so neither half of this check would mean anything"
+        );
+
+        fs::set_permissions(backing, fs::Permissions::from_mode(after)).unwrap();
+
+        if fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777 == before {
+            cache_held = true;
+            break;
+        }
+    }
+    assert!(
+        cache_held,
+        "a plain stat through {} saw the out-of-band chmod on five consecutive attempts, so \
+         the attribute cache is not in play here and the forced case proves nothing",
         via_mount.display()
     );
 

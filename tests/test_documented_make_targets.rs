@@ -693,7 +693,9 @@ fn a_bench_that_persisted_nothing_fails_its_target() {
             .run();
         assert!(
             !missing.ok,
-            "{goal} reported success with no criterion output directory, so the suite              persisted nothing and its numbers cannot be compared against anything.              stderr: {}",
+            "{goal} reported success with no criterion output directory, so the suite \
+             persisted nothing and its numbers cannot be compared against anything. \
+             stderr: {}",
             missing.stderr
         );
         assert!(
