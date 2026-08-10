@@ -603,3 +603,39 @@ fn makefile_routes_every_cargo_command_through_the_target_lease() {
         "Makefile recipe(s) bypass the cargo-target shared lease: {bypasses:#?}"
     );
 }
+#[test]
+fn target_pruner_owns_discovery_and_cleanup_at_one_privilege() {
+    let script = std::fs::read_to_string(repo_root().join("scripts/runner-disk-preflight.sh"))
+        .expect("read runner-disk-preflight.sh");
+    let helper = std::fs::read_to_string(repo_root().join("scripts/prune-cargo-target.sh"))
+        .expect("read privileged target-pruning helper");
+
+    assert!(
+        script.contains("\"${SUDO[@]}\" env")
+            && script.contains("\"$TARGET_PRUNE_HELPER\"")
+            && script.contains(
+                "\"$TARGET_CUTOFF\" \"$DRY_RUN\" \"$runner_root\" \"$btrfs_target_root\""
+            ),
+        "target roots are not handed to one helper through the cleanup privilege boundary"
+    );
+    assert!(
+        !script.contains("-printf '%p\\0%D:%i\\0'")
+            && !script.contains("expected_identity")
+            && !helper.contains("expected_identity"),
+        "the cleanup still relies on a reusable cross-process dev:ino identity token"
+    );
+
+    let open = helper
+        .find("return open_beneath(parent_fd, name, OPEN_FLAGS)")
+        .expect("helper does not open candidates relative to the retained parent fd");
+    let lock = helper
+        .find("fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)")
+        .expect("helper does not acquire the exclusive target lease");
+    let reclaim = helper
+        .find("def reclaim_target(fd, census):")
+        .expect("helper reclaim is not rooted at the locked fd with a mount boundary");
+    assert!(
+        open < lock && lock < reclaim,
+        "candidate open, exclusive lock, and fd-rooted reclaim are not one helper critical section"
+    );
+}
