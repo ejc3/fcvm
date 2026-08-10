@@ -654,8 +654,8 @@ def find_state(
     full `json.load` of every file in it and NO sleep, no yield and no backoff. It
     therefore burned 100% of one core for its entire duration — measured at 400 ms
     of harness CPU for a 400 ms wall wait — while the 2-vCPU clone it is waiting on
-    was restoring on the same box. `wait_port` a few lines below already had a
-    backoff ladder, so the omission was local, not a policy.
+    was restoring on the same box. The standalone forwarding probe already had
+    a backoff ladder, so the omission was local, not a policy.
 
     Now it blocks in `poll()` on an inotify fd and rescans only when the directory
     actually changes: zero CPU while waiting, and it notices the file sooner than a
@@ -721,7 +721,26 @@ def find_state(
             watch.close()
 
 
-def wait_state_owned(
+def _state_matches_owner(
+    state: dict | None,
+    fcvm_pid: int,
+    fcvm_start_time: int,
+    expected_name: str,
+    require_lifecycle_ready: bool,
+) -> bool:
+    return bool(
+        state is not None
+        and state.get("pid") == fcvm_pid
+        and state.get("pid_start_time") == fcvm_start_time
+        and (not expected_name or state.get("name") == expected_name)
+        and (
+            not require_lifecycle_ready
+            or state.get("lifecycle_ready") is True
+        )
+    )
+
+
+def _wait_state_owner_transition(
     state_path: str,
     fcvm_pid: int,
     deadline: float,
@@ -729,19 +748,27 @@ def wait_state_owned(
     proc: subprocess.Popen,
     fcvm_start_time: int,
     expected_name: str = "",
+    require_lifecycle_ready: bool = False,
 ):
-    """Wait until the state records the spawned fcvm's exact process identity.
+    """Wait for exact ownership, optionally including lifecycle readiness.
 
     fcvm publishes the state by name before restore, while ``pid`` is still
-    null, then atomically replaces it after resume with the owner PID.  Killing
-    fcvm in that interval bypasses its signal handler and leaves an unsweepable
-    null-PID state file plus the clone disk.  The noop arm records port readiness
-    at the first successful connect, then waits here before beginning teardown.
+    null, then atomically replaces it after resume with the owner PID and start
+    time.  A separate later save publishes ``lifecycle_ready=true`` after clone
+    setup has installed every long-lived supervisor and verified forwarding.
 
     Watch both the directory and the process pidfd.  A clone that exits before
-    claiming its state is a failure immediately, not a reason to consume the
-    rest of a 120-second benchmark deadline.
+    reaching the requested transition is a failure immediately, not a reason to
+    consume the rest of a 120-second benchmark deadline.
     """
+    milestone = (
+        "publishing lifecycle-ready state"
+        if require_lifecycle_ready
+        else "claiming its post-resume state"
+    )
+    timeout_description = (
+        "ready owner" if require_lifecycle_ready else "post-resume owner"
+    )
     pid_fd = pidfd_open(fcvm_pid)
     poller = select.poll()
     poller.register(watch.fd, select.POLLIN)
@@ -756,18 +783,18 @@ def wait_state_owned(
                     state = json.load(f)
             except (OSError, ValueError):
                 state = None
-            if (
-                state is not None
-                and state.get("pid") == fcvm_pid
-                and state.get("pid_start_time") == fcvm_start_time
-                and (not expected_name or state.get("name") == expected_name)
-                and state.get("lifecycle_ready") is True
+            if _state_matches_owner(
+                state,
+                fcvm_pid,
+                fcvm_start_time,
+                expected_name,
+                require_lifecycle_ready,
             ):
                 return state
 
             rc = proc.poll()
             if rc is not None:
-                raise exited_before(proc, f"claiming state {state_path}")
+                raise exited_before(proc, milestone)
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -776,21 +803,18 @@ def wait_state_owned(
                         final_state = json.load(f)
                 except (OSError, ValueError):
                     final_state = None
-                if (
-                    final_state is not None
-                    and final_state.get("pid") == fcvm_pid
-                    and final_state.get("pid_start_time") == fcvm_start_time
-                    and (
-                        not expected_name
-                        or final_state.get("name") == expected_name
-                    )
-                    and final_state.get("lifecycle_ready") is True
+                if _state_matches_owner(
+                    final_state,
+                    fcvm_pid,
+                    fcvm_start_time,
+                    expected_name,
+                    require_lifecycle_ready,
                 ):
                     return final_state
                 if proc.poll() is not None:
-                    raise exited_before(proc, f"claiming state {state_path}")
+                    raise exited_before(proc, milestone)
                 raise TimeoutError(
-                    f"state {state_path} never recorded ready owner "
+                    f"state {state_path} never recorded {timeout_description} "
                     f"({fcvm_pid}, {fcvm_start_time})"
                 )
             # pidfds are available on every supported fcvm host. Keep a bounded
@@ -804,26 +828,67 @@ def wait_state_owned(
                             final_state = json.load(f)
                     except (OSError, ValueError):
                         final_state = None
-                    if (
-                        final_state is not None
-                        and final_state.get("pid") == fcvm_pid
-                        and final_state.get("pid_start_time") == fcvm_start_time
-                        and (
-                            not expected_name
-                            or final_state.get("name") == expected_name
-                        )
-                        and final_state.get("lifecycle_ready") is True
+                    if _state_matches_owner(
+                        final_state,
+                        fcvm_pid,
+                        fcvm_start_time,
+                        expected_name,
+                        require_lifecycle_ready,
                     ):
                         return final_state
                     if proc.poll() is not None:
-                        raise exited_before(proc, f"claiming state {state_path}")
+                        raise exited_before(proc, milestone)
                     raise TimeoutError(
-                        f"state {state_path} never recorded ready owner "
+                        f"state {state_path} never recorded {timeout_description} "
                         f"({fcvm_pid}, {fcvm_start_time})"
                     )
     finally:
         if pid_fd is not None:
             os.close(pid_fd)
+
+
+def wait_state_owned(
+    state_path: str,
+    fcvm_pid: int,
+    deadline: float,
+    watch: DirWatch,
+    proc: subprocess.Popen,
+    fcvm_start_time: int,
+    expected_name: str = "",
+):
+    """Wait for the exact PID/start-time state save performed after VM resume."""
+    return _wait_state_owner_transition(
+        state_path,
+        fcvm_pid,
+        deadline,
+        watch,
+        proc,
+        fcvm_start_time,
+        expected_name,
+        require_lifecycle_ready=False,
+    )
+
+
+def wait_lifecycle_ready(
+    state_path: str,
+    fcvm_pid: int,
+    deadline: float,
+    watch: DirWatch,
+    proc: subprocess.Popen,
+    fcvm_start_time: int,
+    expected_name: str = "",
+):
+    """Wait for exact ownership plus fcvm's final lifecycle-ready barrier."""
+    return _wait_state_owner_transition(
+        state_path,
+        fcvm_pid,
+        deadline,
+        watch,
+        proc,
+        fcvm_start_time,
+        expected_name,
+        require_lifecycle_ready=True,
+    )
 
 
 def clone_cdp_endpoint(state: dict, port: int) -> str:
@@ -860,11 +925,12 @@ def wait_port(
     proc: subprocess.Popen | None = None,
     log_path: str = "",
 ) -> float:
-    """Retry-connect until the forwarded CDP port answers. Returns wait in ms.
+    """Retry until the host-side forwarding listener accepts. Returns ms.
 
-    This is the readiness signal, and it is the minimum possible one: the first
-    successful TCP connect to Chromium's own listener. There is no health poll,
-    no exec handshake and no marker file in the request path.
+    This is NOT guest or application readiness in rootless mode: pasta can
+    complete the host TCP handshake before its bridge exists and before the VM
+    snapshot is loaded.  The request benchmark therefore never calls this on
+    its startup path; it remains only for the standalone teardown probe.
     """
     import socket
 
@@ -1941,10 +2007,30 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
             data_dir = clone_data_dir(args.data_root, state)
             rec["vm_id"] = vm_id
 
+            # The first name-keyed state is intentionally published before host
+            # networking and restore.  Do not touch the forwarded socket yet:
+            # rootless pasta accepts host TCP connections before its bridge and
+            # the guest exist, and pre-resume probes are documented to poison
+            # its connection state.  The exact PID/start-time save happens only
+            # after load+resume+MMDS publication, so it is the first safe network
+            # boundary.  Full lifecycle readiness is still required below before
+            # teardown can act on the clone.
+            t_owned = time.monotonic()
+            state = wait_state_owned(
+                state_path,
+                fcvm_pid,
+                deadline,
+                watch,
+                proc,
+                fcvm_start_time,
+                name,
+            )
+            rec["state_owner_wait_ms"] = (time.monotonic() - t_owned) * 1000
+            rec["spawn_to_state_owned_ms"] = (time.monotonic() - t_spawn) * 1000
+            rec["state_owner_pid"] = state.get("pid")
+            data_dir = clone_data_dir(args.data_root, state)
             endpoint = clone_cdp_endpoint(state, args.cdp_port)
             rec["endpoint"] = endpoint
-            rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
-            rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
             ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
             rec["ws_url_prewired"] = bool(ws_url)
@@ -1987,8 +2073,8 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
             # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
             # teardown, and none of it is latency the caller pays.
             rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
-            t_owned = time.monotonic()
-            state = wait_state_owned(
+            t_ready = time.monotonic()
+            state = wait_lifecycle_ready(
                 state_path,
                 fcvm_pid,
                 deadline,
@@ -1998,8 +2084,9 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
                 name,
             )
             data_dir = clone_data_dir(args.data_root, state)
-            rec["state_owner_wait_ms"] = (time.monotonic() - t_owned) * 1000
-            rec["state_owner_pid"] = state.get("pid")
+            rec["lifecycle_wait_after_response_ms"] = (
+                time.monotonic() - t_ready
+            ) * 1000
         except BaseException as e:
             rec["ok"] = False
             rec["request_error"] = f"{type(e).__name__}: {e}"
@@ -2112,7 +2199,7 @@ def clone_backend_args(args) -> list:
 
 
 def run_noop_request(args, rep: int) -> dict:
-    """DRIFT CONTROL. Clone spawn -> CDP port answers -> normal teardown. No page.
+    """DRIFT CONTROL. Clone spawn -> lifecycle ready -> normal teardown. No page.
 
     AGENTS.md defect 2 requires a probe that exercises NONE of the varied
     dimension, so wall-clock drift is measurable and removable rather than being
@@ -2162,15 +2249,12 @@ def run_noop_request(args, rep: int) -> dict:
             rec["discover_ms"] = (time.monotonic() - t) * 1000
             rec["vm_id"] = state.get("vm_id", "")
             data_dir = clone_data_dir(args.data_root, state)
-            endpoint = clone_cdp_endpoint(state, args.cdp_port)
-            rec["endpoint"] = endpoint
-            rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
-            rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
-            # This is the noop caller's response boundary. Waiting for fcvm to
-            # claim the state is teardown preparation and must not inflate it.
-            rec["blocking_ms"] = rec["spawn_to_port_ms"]
-            t_owned = time.monotonic()
-            state = wait_state_owned(
+            # Noop is the substrate control, so its response boundary is fcvm's
+            # full event-driven lifecycle barrier.  It deliberately performs no
+            # TCP/CDP probe: a rootless host listener can accept before the VM is
+            # loaded, which both omitted restore from this control and could
+            # poison pasta's pre-resume forwarding state.
+            state = wait_lifecycle_ready(
                 state_path,
                 fcvm_pid,
                 deadline,
@@ -2180,7 +2264,10 @@ def run_noop_request(args, rep: int) -> dict:
                 name,
             )
             data_dir = clone_data_dir(args.data_root, state)
-            rec["state_owner_wait_ms"] = (time.monotonic() - t_owned) * 1000
+            rec["spawn_to_lifecycle_ready_ms"] = (
+                time.monotonic() - t_spawn
+            ) * 1000
+            rec["blocking_ms"] = rec["spawn_to_lifecycle_ready_ms"]
             rec["state_owner_pid"] = state.get("pid")
             rec["ok"] = True
         except BaseException as e:
@@ -2282,7 +2369,7 @@ def run_exec_request(args, rep: int) -> dict:
             raise TimeoutError("exec clone state file never appeared")
         rec["vm_id"] = state.get("vm_id", "")
         data_dir = clone_data_dir(args.data_root, state)
-        state = wait_state_owned(
+        state = wait_lifecycle_ready(
             state_path,
             proc.pid,
             deadline,

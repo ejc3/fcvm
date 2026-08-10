@@ -654,8 +654,8 @@ print(n.get("loopback_ip") or n.get("host_ip") or n.get("guest_ip") or "")')
 # Delegates to cdpdrive.py --print-target rather than hand-rolling the lookup,
 # which fixes TWO defects at once. (1) READINESS: this was a single-shot urlopen
 # with `2>/dev/null || true`, and `start_clone` returns as soon as the state file
-# carries a pid — it never waits for the CDP port (contrast reqbench.py's
-# `wait_port`). Clone 1 is warm because HOPs A/B/C ran against it; clone 2 was
+# carries a pid — it does not use reqbench.py's lifecycle-ready request barrier.
+# Clone 1 is warm because HOPs A/B/C ran against it; clone 2 was
 # queried the instant it registered, so a connection refused produced an empty id
 # and the documented stability gate failed on a RACE. It fails closed, which is
 # the right direction, but a flaky gate is the thing people learn to bypass.

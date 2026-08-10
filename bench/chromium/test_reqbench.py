@@ -12,15 +12,19 @@ There is no pytest in this repo, so this is stdlib `unittest` only.
 """
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import io
 import json
 import os
 import random
+import select
 import signal
 import shlex
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -35,6 +39,7 @@ sys.path.insert(0, HERE)
 
 import reqanalyze  # noqa: E402
 import reqbench  # noqa: E402
+import render as render_driver  # noqa: E402
 
 
 def self_cpu_ms() -> float:
@@ -154,6 +159,374 @@ wait "$child"
     with open(path, "w") as output:
         output.write(script)
     os.chmod(path, 0o755)
+
+
+def write_gated_clone_stub(
+    path,
+    state_path,
+    data_dir,
+    name,
+    ready_release,
+    owner_release=None,
+):
+    """Write a clone stub with externally gated atomic state transitions.
+
+    With ``owner_release``, the first state is name-owned with a null PID; the
+    exact PID/start-time save is held until that path appears.  In both modes,
+    ``lifecycle_ready=true`` is held until ``ready_release`` appears.  This
+    mirrors fcvm's real pre-restore, post-resume, and final-ready saves without a
+    VM or a timing sleep in the assertion path.
+    """
+    quoted_state = shlex.quote(state_path)
+    quoted_state_tmp = shlex.quote(state_path + ".tmp")
+    quoted_state_lock = shlex.quote(state_path + ".lock")
+    quoted_data = shlex.quote(data_dir)
+    quoted_ready_release = shlex.quote(ready_release)
+    quoted_owner_release = shlex.quote(owner_release) if owner_release else ""
+    encoded_name = json.dumps(name)
+    encoded_vm_id = json.dumps(os.path.basename(state_path)[:-5])
+    unowned_save = ""
+    owner_gate = ""
+    if owner_release:
+        unowned_save = f"""cat > {quoted_state_tmp} <<EOF
+{{"vm_id":{encoded_vm_id},"name":{encoded_name},"pid":null,"pid_start_time":null,"lifecycle_ready":false,"config":{{"network":{{"loopback_ip":"127.0.0.1"}}}}}}
+EOF
+mv {quoted_state_tmp} {quoted_state}
+"""
+        owner_gate = f"""while [ ! -e {quoted_owner_release} ]; do sleep 0.01; done
+publish false
+"""
+    else:
+        unowned_save = "publish false\n"
+
+    script = f"""#!/bin/bash
+python3 -c 'import ctypes,signal,time; ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL); time.sleep(300)' &
+child=$!
+cleanup() {{
+    kill -TERM "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+    rm -f {quoted_state} {quoted_state_tmp} {quoted_state_lock}
+    rmdir {quoted_data}
+    exit 0
+}}
+trap cleanup TERM INT
+mkdir -p {quoted_data}
+read -r proc_stat < /proc/$$/stat
+proc_stat=${{proc_stat##*) }}
+read -ra proc_fields <<< "$proc_stat"
+start=${{proc_fields[19]}}
+publish() {{
+    cat > {quoted_state_tmp} <<EOF
+{{"vm_id":{encoded_vm_id},"name":{encoded_name},"pid":$$,"pid_start_time":$start,"lifecycle_ready":$1,"config":{{"network":{{"loopback_ip":"127.0.0.1"}}}}}}
+EOF
+    mv {quoted_state_tmp} {quoted_state}
+}}
+{unowned_save}: > {quoted_state_lock}
+{owner_gate}while [ ! -e {quoted_ready_release} ]; do sleep 0.01; done
+publish true
+wait "$child"
+"""
+    with open(path, "w") as output:
+        output.write(script)
+    os.chmod(path, 0o755)
+
+
+class FakeRenderCdpServer:
+    """Two-connection /json/list + WebSocket CDP server for render.main tests."""
+
+    def __init__(self, blank_mode):
+        if blank_mode not in {"missing-load", "wrong-state", "verified"}:
+            raise ValueError(blank_mode)
+        self.blank_mode = blank_mode
+        self.listener = socket.socket()
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(2)
+        self.listener.settimeout(5)
+        self.port = self.listener.getsockname()[1]
+        self.stop = threading.Event()
+        self.connection = None
+        self.commands = []
+        self.error = None
+        self.thread = threading.Thread(target=self._serve)
+
+    @staticmethod
+    def _recv_exact(connection, size):
+        data = b""
+        while len(data) < size:
+            chunk = connection.recv(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    @classmethod
+    def _recv_until(cls, connection, marker):
+        data = b""
+        while marker not in data:
+            chunk = connection.recv(4096)
+            if not chunk:
+                raise ConnectionError("fake CDP peer closed during HTTP request")
+            data += chunk
+        return data
+
+    @classmethod
+    def _recv_ws_json(cls, connection):
+        header = cls._recv_exact(connection, 2)
+        if header is None:
+            return None
+        first, second = header
+        opcode = first & 0x0F
+        size = second & 0x7F
+        if size == 126:
+            encoded = cls._recv_exact(connection, 2)
+            if encoded is None:
+                return None
+            (size,) = struct.unpack("!H", encoded)
+        elif size == 127:
+            encoded = cls._recv_exact(connection, 8)
+            if encoded is None:
+                return None
+            (size,) = struct.unpack("!Q", encoded)
+        mask = cls._recv_exact(connection, 4) if second & 0x80 else None
+        payload = cls._recv_exact(connection, size)
+        if payload is None:
+            return None
+        if mask is not None:
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        if opcode == 0x8:
+            return None
+        if opcode != 0x1:
+            raise AssertionError(f"unexpected client WebSocket opcode {opcode}")
+        return json.loads(payload)
+
+    @staticmethod
+    def _send_ws_json(connection, message):
+        payload = json.dumps(message).encode()
+        size = len(payload)
+        if size < 126:
+            header = struct.pack("!BB", 0x81, size)
+        elif size < 65536:
+            header = struct.pack("!BBH", 0x81, 126, size)
+        else:
+            header = struct.pack("!BBQ", 0x81, 127, size)
+        connection.sendall(header + payload)
+
+    def _reply(self, connection, command, result):
+        self._send_ws_json(connection, {"id": command["id"], "result": result})
+
+    def _event(self, connection, method, params=None):
+        self._send_ws_json(
+            connection, {"method": method, "params": params or {}}
+        )
+
+    def _serve_http_discovery(self):
+        connection, _ = self.listener.accept()
+        with connection:
+            request = self._recv_until(connection, b"\r\n\r\n")
+            if not request.startswith(b"GET /json/list "):
+                raise AssertionError(request.split(b"\r\n", 1)[0])
+            body = json.dumps(
+                [
+                    {
+                        "type": "page",
+                        "url": "about:blank",
+                        "webSocketDebuggerUrl": (
+                            f"ws://127.0.0.1:{self.port}/devtools/page/fake"
+                        ),
+                    }
+                ]
+            ).encode()
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+
+    def _serve_websocket(self):
+        connection, _ = self.listener.accept()
+        self.connection = connection
+        connection.settimeout(5)
+        with connection:
+            request = self._recv_until(connection, b"\r\n\r\n")
+            headers = {}
+            for line in request.decode("latin1").split("\r\n")[1:]:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    headers[key.lower()] = value.strip()
+            ws_key = headers["sec-websocket-key"]
+            accept = base64.b64encode(
+                hashlib.sha1((ws_key + render_driver.WS_GUID).encode()).digest()
+            )
+            connection.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+
+            while not self.stop.is_set():
+                command = self._recv_ws_json(connection)
+                if command is None:
+                    return
+                method = command["method"]
+                params = command.get("params", {})
+                self.commands.append((method, params))
+                if method in {"Page.enable", "Page.setLifecycleEventsEnabled"}:
+                    self._reply(connection, command, {})
+                elif method == "Page.navigate" and params.get("url") != "about:blank":
+                    self._reply(connection, command, {"loaderId": "fixture-loader"})
+                    self._event(connection, "Page.loadEventFired")
+                elif method == "Page.captureScreenshot":
+                    self._reply(
+                        connection,
+                        command,
+                        {"data": base64.b64encode(b"\x89PNG-fake").decode()},
+                    )
+                elif (
+                    method == "Runtime.evaluate"
+                    and params.get("expression") == "document.documentElement.outerHTML"
+                ):
+                    self._reply(
+                        connection,
+                        command,
+                        {"result": {"value": "<html>fixture</html>"}},
+                    )
+                elif method == "Page.navigate" and params.get("url") == "about:blank":
+                    self._reply(connection, command, {"loaderId": "blank-loader"})
+                    # This generic event made the old best-effort gate pass even
+                    # though no event proved blank-loader itself had loaded.
+                    self._event(connection, "Page.loadEventFired")
+                    loader = (
+                        "wrong-loader"
+                        if self.blank_mode == "missing-load"
+                        else "blank-loader"
+                    )
+                    self._event(
+                        connection,
+                        "Page.lifecycleEvent",
+                        {"name": "load", "loaderId": loader},
+                    )
+                elif method == "Runtime.evaluate" and "location.href" in params.get(
+                    "expression", ""
+                ):
+                    value = {
+                        "href": (
+                            "https://stale.invalid/"
+                            if self.blank_mode == "wrong-state"
+                            else "about:blank"
+                        ),
+                        "readyState": "complete",
+                    }
+                    self._reply(connection, command, {"result": {"value": value}})
+                else:
+                    raise AssertionError(f"unexpected CDP command {command!r}")
+
+    def _serve(self):
+        try:
+            self._serve_http_discovery()
+            self._serve_websocket()
+        except BaseException as error:
+            if not (self.stop.is_set() and isinstance(error, OSError)):
+                self.error = error
+
+    def start(self):
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        if self.connection is not None:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.listener.close()
+        self.thread.join(5)
+
+
+class GoldenBlankQuiescence(unittest.TestCase):
+    """The warm marker requires a proven, loader-correlated blank page."""
+
+    def _run_render(self, blank_mode):
+        with tempfile.TemporaryDirectory() as d:
+            server = FakeRenderCdpServer(blank_mode)
+            server.start()
+            saved_argv = sys.argv
+            output = io.StringIO()
+            try:
+                sys.argv = [
+                    "render.py",
+                    "http://fixture.invalid/warmup.html",
+                    "--cdp-host",
+                    f"127.0.0.1:{server.port}",
+                    "--out-prefix",
+                    os.path.join(d, "warmup"),
+                    "--timeout",
+                    "0.75",
+                    "--then-blank",
+                ]
+                with redirect_stdout(output):
+                    return_code = render_driver.main()
+            finally:
+                sys.argv = saved_argv
+                server.close()
+            self.assertFalse(server.thread.is_alive(), "fake CDP server did not stop")
+            if server.error is not None:
+                raise server.error
+            return return_code, output.getvalue(), server.commands
+
+    def test_uncorrelated_blank_load_fails_closed(self):
+        """RED BEFORE: Page.loadEventFired was accepted and timeout swallowed.
+
+        The fake browser acknowledges the about:blank navigation and emits the
+        generic event the old code accepted, plus a lifecycle load for the wrong
+        loader.  No event is correlated with the returned blank-loader.  Old
+        render.main printed RENDER_OK and returned zero; the fixed gate returns
+        one, so entry.sh's ``set -e`` cannot publish its ready marker.
+        """
+        return_code, output, commands = self._run_render("missing-load")
+        self.assertEqual(return_code, 1, output)
+        self.assertIn("RENDER_FAIL", output)
+        self.assertIn("stage=blank-load", output)
+        self.assertNotIn("RENDER_OK", output)
+        self.assertFalse(
+            any(
+                method == "Runtime.evaluate"
+                and "location.href" in params.get("expression", "")
+                for method, params in commands
+            )
+        )
+
+        with open(os.path.join(HERE, "entry.sh")) as source:
+            entry = source.read()
+        self.assertLess(entry.index("set -eu"), entry.index("--then-blank"))
+        self.assertLess(entry.index("--then-blank"), entry.index('touch "$READY_FILE"'))
+
+    def test_blank_location_and_ready_state_are_verified(self):
+        """A correlated load is necessary but stale document state still fails."""
+        return_code, output, commands = self._run_render("wrong-state")
+        self.assertEqual(return_code, 1, output)
+        self.assertIn("RENDER_FAIL", output)
+        self.assertIn("stage=blank-verify", output)
+        self.assertTrue(
+            any(
+                method == "Runtime.evaluate"
+                and "location.href" in params.get("expression", "")
+                for method, params in commands
+            )
+        )
+
+    def test_correlated_complete_about_blank_passes(self):
+        return_code, output, commands = self._run_render("verified")
+        self.assertEqual(return_code, 0, output)
+        self.assertIn("RENDER_OK", output)
+        self.assertNotIn("RENDER_FAIL", output)
+        self.assertTrue(
+            any(
+                method == "Runtime.evaluate"
+                and "location.href" in params.get("expression", "")
+                for method, params in commands
+            )
+        )
 
 
 class CloneSpawnSignalMask(unittest.TestCase):
@@ -626,6 +999,218 @@ class TeardownAttributionFailure(unittest.TestCase):
                 self.assertTrue(os.path.isdir(data))
 
 
+class RequestStartupStateBarriers(unittest.TestCase):
+    """The request path must not confuse pasta's listener with VM readiness."""
+
+    @staticmethod
+    def _run_in_thread(target):
+        outcome = {}
+
+        def invoke():
+            try:
+                outcome["record"] = target()
+            except BaseException as error:
+                outcome["error"] = error
+
+        thread = threading.Thread(target=invoke)
+        thread.start()
+        return thread, outcome
+
+    @staticmethod
+    def _release(path):
+        with open(path, "w"):
+            pass
+
+    def test_cdp_never_probes_listener_before_exact_post_resume_owner(self):
+        """RED BEFORE: raw wait_port connected while the state PID was null.
+
+        The listening socket is a deterministic pasta stand-in: it completes a
+        host TCP handshake without accepting it.  The ownership transition is
+        externally gated, so entering ``wait_state_owned`` is an exact boundary.
+        Before the fix, wait_port ran first and left this listener readable.  CDP
+        also waited for full lifecycle readiness; now it may start after exact
+        post-resume ownership while teardown still waits for lifecycle readiness.
+        """
+        import cdpdrive
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            vm_id = "vm-33333333333333333333333333333333"
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            data_dir = os.path.join(d, "vm-disks", vm_id)
+            owner_release = os.path.join(d, "release-owner")
+            ready_release = os.path.join(d, "release-ready")
+            stub = os.path.join(d, "fcvm-stub")
+            os.makedirs(state_dir)
+            write_gated_clone_stub(
+                stub,
+                state_path,
+                data_dir,
+                "rb-test-run-0-norm",
+                ready_release,
+                owner_release,
+            )
+
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(8)
+            args = argparse.Namespace(
+                fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off",
+                timeout=5.0, teardown_timeout=3.0,
+                cdp_port=listener.getsockname()[1], state_dir=state_dir,
+                data_root=d, ws_url="", run_id="test-run",
+            )
+
+            owner_wait_entered = threading.Event()
+            drive_started = threading.Event()
+            raw_port_probe_called = threading.Event()
+            real_drive = cdpdrive.drive
+            real_wait_state_owned = reqbench.wait_state_owned
+            real_wait_port = reqbench.wait_port
+
+            def mark_owner_wait(*call_args, **call_kwargs):
+                owner_wait_entered.set()
+                return real_wait_state_owned(*call_args, **call_kwargs)
+
+            def mark_raw_port_probe(*call_args, **call_kwargs):
+                raw_port_probe_called.set()
+                return real_wait_port(*call_args, **call_kwargs)
+
+            def drive_without_network(_args):
+                drive_started.set()
+                return {"ok": True, "stages": {}}
+
+            reqbench.wait_state_owned = mark_owner_wait
+            reqbench.wait_port = mark_raw_port_probe
+            cdpdrive.drive = drive_without_network
+            thread, outcome = self._run_in_thread(
+                lambda: reqbench.run_cdp_request(args, 0, fast=False)
+            )
+            try:
+                reached_owner_wait = owner_wait_entered.wait(3)
+                probed_before_owner = raw_port_probe_called.is_set()
+                listener_poisoned_before_owner = bool(
+                    select.select([listener], [], [], 0)[0]
+                )
+                self._release(owner_release)
+                drove_before_lifecycle_ready = drive_started.wait(3)
+                response_waited_for_lifecycle = thread.is_alive()
+                self._release(ready_release)
+                thread.join(10)
+            finally:
+                self._release(owner_release)
+                self._release(ready_release)
+                thread.join(10)
+                cdpdrive.drive = real_drive
+                reqbench.wait_state_owned = real_wait_state_owned
+                reqbench.wait_port = real_wait_port
+                listener.close()
+
+            self.assertFalse(thread.is_alive(), "request thread did not finish")
+            if "error" in outcome:
+                raise outcome["error"]
+            record = outcome["record"]
+            self.assertTrue(reached_owner_wait)
+            self.assertFalse(probed_before_owner)
+            self.assertFalse(listener_poisoned_before_owner)
+            self.assertTrue(drove_before_lifecycle_ready)
+            self.assertTrue(response_waited_for_lifecycle)
+            self.assertTrue(record["ok"], record)
+            self.assertIn("spawn_to_state_owned_ms", record)
+            self.assertIn("lifecycle_wait_after_response_ms", record)
+            self.assertNotIn("state_to_port_ms", record)
+            self.assertNotIn("spawn_to_port_ms", record)
+
+    def test_noop_waits_lifecycle_without_tcp_or_cdp(self):
+        """RED BEFORE: noop connected to pasta and returned before restore.
+
+        The stub publishes exact ownership with lifecycle_ready=false, then is
+        held there.  The fixed noop blocks at that state transition and leaves
+        the unaccepted poison listener empty.  It records the complete
+        spawn-to-lifecycle interval and never constructs a CDP endpoint.
+        """
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            vm_id = "vm-44444444444444444444444444444444"
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            data_dir = os.path.join(d, "vm-disks", vm_id)
+            ready_release = os.path.join(d, "release-ready")
+            stub = os.path.join(d, "fcvm-stub")
+            os.makedirs(state_dir)
+            write_gated_clone_stub(
+                stub,
+                state_path,
+                data_dir,
+                "rb-test-run-0-noop",
+                ready_release,
+            )
+
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(8)
+            args = argparse.Namespace(
+                fcvm=stub, out_dir=d, snapshot_tag="", serve_pid=1,
+                rust_log="off", timeout=5.0, teardown_timeout=3.0,
+                cdp_port=listener.getsockname()[1], state_dir=state_dir,
+                data_root=d, run_id="test-run",
+            )
+
+            lifecycle_wait_entered = threading.Event()
+            raw_port_probe_called = threading.Event()
+            real_wait_lifecycle_ready = reqbench.wait_lifecycle_ready
+            real_wait_port = reqbench.wait_port
+
+            def mark_lifecycle_wait(*call_args, **call_kwargs):
+                lifecycle_wait_entered.set()
+                return real_wait_lifecycle_ready(*call_args, **call_kwargs)
+
+            def mark_raw_port_probe(*call_args, **call_kwargs):
+                raw_port_probe_called.set()
+                return real_wait_port(*call_args, **call_kwargs)
+
+            reqbench.wait_lifecycle_ready = mark_lifecycle_wait
+            reqbench.wait_port = mark_raw_port_probe
+            thread, outcome = self._run_in_thread(
+                lambda: reqbench.run_noop_request(args, 0)
+            )
+            try:
+                reached_lifecycle_wait = lifecycle_wait_entered.wait(3)
+                finished_before_ready = not thread.is_alive()
+                probed_before_ready = raw_port_probe_called.is_set()
+                listener_poisoned_before_ready = bool(
+                    select.select([listener], [], [], 0)[0]
+                )
+                self._release(ready_release)
+                thread.join(10)
+            finally:
+                self._release(ready_release)
+                thread.join(10)
+                reqbench.wait_lifecycle_ready = real_wait_lifecycle_ready
+                reqbench.wait_port = real_wait_port
+                listener.close()
+
+            self.assertFalse(thread.is_alive(), "request thread did not finish")
+            if "error" in outcome:
+                raise outcome["error"]
+            record = outcome["record"]
+            self.assertTrue(reached_lifecycle_wait)
+            self.assertFalse(finished_before_ready)
+            self.assertFalse(probed_before_ready)
+            self.assertFalse(listener_poisoned_before_ready)
+            self.assertTrue(record["ok"], record)
+            self.assertEqual(
+                record["blocking_ms"], record["spawn_to_lifecycle_ready_ms"]
+            )
+            self.assertNotIn("endpoint", record)
+            self.assertNotIn("render", record)
+            self.assertNotIn("state_to_port_ms", record)
+            self.assertNotIn("spawn_to_port_ms", record)
+
+
 class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
     """A cdpdrive `ok: false` that does not RAISE must still label the record.
 
@@ -660,7 +1245,7 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                     "wait\n"
                 )
             os.chmod(stub, 0o755)
-            # A listener so wait_port succeeds without a VM.
+            # A stable endpoint for the mocked driver; no TCP probe is made.
             import socket
             srv = socket.socket()
             srv.bind(("127.0.0.1", 0))
@@ -701,8 +1286,8 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             os.makedirs(state_dir)
             os.makedirs(data_dir)
             child_ready = os.path.join(d, "child-ready")
-            owner_wait_entered = os.path.join(d, "owner-wait-entered")
-            owner_wait_release = os.path.join(d, "owner-wait-release")
+            lifecycle_wait_entered = os.path.join(d, "lifecycle-wait-entered")
+            lifecycle_wait_release = os.path.join(d, "lifecycle-wait-release")
             stub = os.path.join(d, "fcvm-stub")
 
             server = socket.socket()
@@ -735,8 +1320,8 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                     "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
                     f"printf '%s\\n' '{initial}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}\n"
                     f": > {state_path}.lock\n"
-                    f"( while [ ! -e {owner_wait_entered} ] && [ ! -e {owner_wait_release} ]; do sleep 0.01; done; "
-                    f"if [ -e {owner_wait_entered} ]; then sleep 0.25; "
+                    f"( while [ ! -e {lifecycle_wait_entered} ] && [ ! -e {lifecycle_wait_release} ]; do sleep 0.01; done; "
+                    f"if [ -e {lifecycle_wait_entered} ]; then sleep 0.25; "
                     f"printf '%s\\n' '{ready}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}.tmp; "
                     f"mv {state_path}.tmp {state_path}; fi ) &\n"
                     "wait\n"
@@ -744,16 +1329,16 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             os.chmod(stub, 0o755)
 
             real_drive = cdpdrive.drive
-            real_wait_state_owned = reqbench.wait_state_owned
+            real_wait_lifecycle_ready = reqbench.wait_lifecycle_ready
             cdpdrive.drive = lambda _args: {"ok": True, "stages": {}}
-            owner_wait_calls = []
+            lifecycle_wait_calls = []
 
-            def mark_owner_wait(*call_args, **call_kwargs):
-                owner_wait_calls.append(True)
-                open(owner_wait_entered, "w").close()
-                return real_wait_state_owned(*call_args, **call_kwargs)
+            def mark_lifecycle_wait(*call_args, **call_kwargs):
+                lifecycle_wait_calls.append(True)
+                open(lifecycle_wait_entered, "w").close()
+                return real_wait_lifecycle_ready(*call_args, **call_kwargs)
 
-            reqbench.wait_state_owned = mark_owner_wait
+            reqbench.wait_lifecycle_ready = mark_lifecycle_wait
             args = argparse.Namespace(
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
@@ -763,15 +1348,17 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
             finally:
-                open(owner_wait_release, "w").close()
+                open(lifecycle_wait_release, "w").close()
                 cdpdrive.drive = real_drive
-                reqbench.wait_state_owned = real_wait_state_owned
+                reqbench.wait_lifecycle_ready = real_wait_lifecycle_ready
                 server.close()
 
             self.assertTrue(rec["ok"])
-            self.assertEqual(owner_wait_calls, [True])
-            self.assertTrue(os.path.exists(owner_wait_entered))
-            self.assertGreaterEqual(rec["state_owner_wait_ms"], 150.0, rec)
+            self.assertEqual(lifecycle_wait_calls, [True])
+            self.assertTrue(os.path.exists(lifecycle_wait_entered))
+            self.assertGreaterEqual(
+                rec["lifecycle_wait_after_response_ms"], 150.0, rec
+            )
             self.assertTrue(rec["teardown"]["all_gone"])
             self.assertFalse(os.path.lexists(state_path))
             self.assertFalse(os.path.lexists(data_dir))
@@ -1266,7 +1853,7 @@ class FindStateIsEventDriven(unittest.TestCase):
                 p.wait(timeout=5)
 
     def test_waits_for_post_resume_owner_without_polling_or_early_teardown(self):
-        """Port readiness can precede the state file's owner-PID update."""
+        """The name-keyed state can precede its post-resume owner update."""
         with tempfile.TemporaryDirectory() as d:
             state_path = os.path.join(d, "vm-x.json")
             p = subprocess.Popen(["sleep", "300"])
@@ -1318,7 +1905,9 @@ class FindStateIsEventDriven(unittest.TestCase):
             p.wait(timeout=5)
             t0 = time.monotonic()
             try:
-                with self.assertRaisesRegex(RuntimeError, "before claiming state"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "before claiming its post-resume state"
+                ):
                     reqbench.wait_state_owned(
                         state_path,
                         p.pid,
@@ -2044,8 +2633,9 @@ class AnalyzerAvailability(unittest.TestCase):
                     },
                 }
                 if arm.startswith("cdp"):
-                    record["state_to_port_ms"] = 0.1
-                    record["spawn_to_port_ms"] = 1.0
+                    record["state_owner_wait_ms"] = 0.5
+                    record["spawn_to_state_owned_ms"] = 1.0
+                    record["lifecycle_wait_after_response_ms"] = 0.2
                     record["endpoint"] = "127.0.0.2:9222"
                     record["render"] = {
                         "ok": True,
@@ -2144,7 +2734,7 @@ class AnalyzerAvailability(unittest.TestCase):
                         "render_total_ms": max(0.0, value - 1.0),
                     })
                 elif arm == "noop":
-                    record["spawn_to_port_ms"] = value
+                    record["spawn_to_lifecycle_ready_ms"] = value
                 f.write(json.dumps(record) + "\n")
 
     @staticmethod
@@ -2436,6 +3026,40 @@ class AnalyzerAvailability(unittest.TestCase):
                         any(expected in error for error in errors),
                         errors,
                     )
+
+    def test_legacy_port_timing_fields_do_not_satisfy_the_schema(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "legacy-port-timing.jsonl")
+            self._write_clean_backend(src, "file", 6, 384.0)
+
+            def restore_legacy_cdp_fields(record):
+                record.pop("state_owner_wait_ms")
+                record.pop("spawn_to_state_owned_ms")
+                record.pop("lifecycle_wait_after_response_ms")
+                record["state_to_port_ms"] = 0.1
+                record["spawn_to_port_ms"] = 1.0
+
+            self._mutate_record(src, "cdp", restore_legacy_cdp_fields)
+            errors = self._metadata_errors(src)
+            self.assertTrue(
+                any("spawn_to_state_owned_ms" in error for error in errors),
+                errors,
+            )
+            self.assertTrue(
+                any("lifecycle_wait_after_response_ms" in error for error in errors),
+                errors,
+            )
+
+            def restore_legacy_noop_field(record):
+                record.pop("spawn_to_lifecycle_ready_ms")
+                record["spawn_to_port_ms"] = 1.0
+
+            self._mutate_record(src, "noop", restore_legacy_noop_field)
+            errors = self._metadata_errors(src)
+            self.assertTrue(
+                any("spawn_to_lifecycle_ready_ms" in error for error in errors),
+                errors,
+            )
 
     def test_invalid_optional_teardown_numerics_are_rejected(self):
         cases = (

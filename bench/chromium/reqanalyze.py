@@ -665,7 +665,11 @@ def _validate_schedule(dataset):
                 if not finite_nonnegative(record.get("render_total_ms")):
                     errors.append(f"{rlabel} successful exec has no render_total_ms")
             elif arm in ("cdp", "cdp-fast"):
-                for metric in ("state_to_port_ms", "spawn_to_port_ms"):
+                for metric in (
+                    "state_owner_wait_ms",
+                    "spawn_to_state_owned_ms",
+                    "lifecycle_wait_after_response_ms",
+                ):
                     if not finite_nonnegative(record.get(metric)):
                         errors.append(f"{rlabel} successful CDP record has no {metric}")
                 render = record.get("render")
@@ -956,8 +960,12 @@ def _validate_schedule(dataset):
                                     f"{rlabel} fast teardown process {process_name} "
                                     "has invalid reclaim CPU"
                                 )
-            elif arm == "noop" and not finite_nonnegative(record.get("spawn_to_port_ms")):
-                errors.append(f"{rlabel} successful noop has no spawn_to_port_ms")
+            elif arm == "noop" and not finite_nonnegative(
+                record.get("spawn_to_lifecycle_ready_ms")
+            ):
+                errors.append(
+                    f"{rlabel} successful noop has no spawn_to_lifecycle_ready_ms"
+                )
         elif ok is False and not isinstance(record.get("error"), str):
             errors.append(f"{rlabel} failed record has no string error")
         loadavg = record.get("loadavg1")
@@ -1613,8 +1621,16 @@ def analyze_backend(
     for a in [x for x in arms if x.startswith("cdp")]:
         print(f"  [{a}]")
         for metric, explanation in (
-            ("spawn_to_port_ms", "process spawn -> first TCP accept; stable readiness boundary"),
-            ("state_to_port_ms", "first state discovery -> first TCP accept; diagnostic only"),
+            (
+                "spawn_to_state_owned_ms",
+                "process spawn -> exact post-resume PID/start state publication; "
+                "first safe network boundary",
+            ),
+            (
+                "lifecycle_wait_after_response_ms",
+                "caller response -> lifecycle-ready teardown barrier; excluded from "
+                "blocking_ms",
+            ),
         ):
             values = [r.get(metric) for r in by[a] if r.get(metric) is not None]
             if values:

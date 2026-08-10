@@ -339,8 +339,14 @@ The deleted `socat TCP-LISTEN:9223,fork` relay was one process and one byte-path
 hop per clone. Do not reuse the old 0.12 ms `port_wait_ms` as an ingress cost:
 that timer started only after the restored VM's final PID state save. A later
 harness change moved its boundary before network setup and restore, so the same
-field then clustered near 50 ms. Use one stable spawn-to-first-connect boundary
-for readiness and `tcp_ms` for a successful connection.
+interval appeared as roughly 50 ms. Worse, in rootless mode that raw connection
+only reached pasta's host listener: pasta can accept before its bridge exists and
+before the snapshot is loaded, and a pre-resume connection can poison forwarding
+state. The harness now waits for the exact post-resume PID/start-time state save
+before CDP, waits for full `lifecycle_ready` before teardown, and makes the noop
+control wait for `lifecycle_ready` without touching TCP or CDP. `tcp_ms` remains
+the measured ingress connection after the safe ownership boundary; the displaced
+50 ms interval is clone startup, not a new per-connection cost.
 
 Verified working on `--network rootless` (no root needed). `reqbench.sh` defaults
 to rootless for this reason.
@@ -350,10 +356,14 @@ to rootless for this reason.
 With no `--health-check` URL, fcvm's `Healthy` = container running AND podman's
 `HEALTHCHECK` healthy (`src/health.rs`, "AND logic"). So the image's HEALTHCHECK
 decides what gets frozen. `cdp_health.py` requires BOTH a warm marker (entry.sh
-touches it only after a full navigate+screenshot) AND a live CDP round trip that
-finds a page target. Healthy therefore means *provably able to screenshot*, not
-*port is open*. Caveat to verify: podman healthchecks need systemd timers in the
-guest; `src/health.rs` notes they can fail to schedule in some rootless setups.
+touches it only after a full navigate+screenshot and a loader-correlated
+`about:blank` lifecycle `load`; render.py then verifies `location.href` and
+`document.readyState == complete`) AND a live CDP round trip that finds a page
+target. The blank transition is fail-closed: its timeout is not best-effort, and
+entry.sh's `set -e` exits before publishing the marker. Healthy therefore means
+*warm, quiescent, and provably able to screenshot*, not *port is open*. Caveat to
+verify: podman healthchecks need systemd timers in the guest; `src/health.rs`
+notes they can fail to schedule in some rootless setups.
 
 ### Fast teardown: one signal, kernel-enforced — scope the guarantee, don't blanket it
 

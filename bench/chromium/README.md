@@ -32,7 +32,7 @@ Fan-out phases add burst latency and marginal memory per concurrent request.
 | `../../Containerfile.chromium-bench` | the golden image: Debian chromium + python3 driver/pageserver, warm-point `/ready` health endpoint, and the `ENV VK_ICD_FILENAMES` pre-seed (see below) |
 | `entry.sh` | container entry: pageserver → warm Chromium via CDP → touch ready-file → hold. Carries the full write-up of the ANGLE setenv/getenv crash workaround |
 | `pageserver.py` | in-guest fixture server (`Cache-Control: no-store`, `/ready` gate for `--health-check` golden snapshots) |
-| `render.py` | per-request CDP driver (stdlib-only WebSocket client); prints one machine-parsable `RENDER_OK` line with per-phase timings |
+| `render.py` | per-request CDP driver (stdlib-only WebSocket client); prints one machine-parsable `RENDER_OK` line with per-phase timings; warmup mode proves loader-correlated, complete `about:blank` quiescence before the golden ready marker |
 | `bench.sh` | host-side harness: golden snapshots, egress matrix, fan-out, baselines (see phases below) |
 | `hostserver.py` | host-side "simulated external site": dual-stack bind, optional self-signed TLS, same `pages/` bytes as the image |
 | `report.py` | `sample` (host memory + per-clone PSS one-liner) and `finalize` (requests/samples → `raw.json` + `report.md`) |
