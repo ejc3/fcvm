@@ -16,7 +16,9 @@ per-request setup cost and a lumped number would hide which hop to attack:
     tcp_ms       TCP connect to the WebSocket endpoint
     upgrade_ms   RFC 6455 handshake (the 101 exchange)
     enable_ms    Page.enable + Page.setLifecycleEventsEnabled
-    navigate_ms  Page.navigate -> Page.loadEventFired
+    navigate_command_ms  Page.navigate send -> command response
+    navigate_load_event_ms command response -> Page.loadEventFired
+    navigate_ms  Sum of the two navigation phases above
     screenshot_ms Page.captureScreenshot (base64 image arrives here)
     decode_ms    base64 decode + magic/dimension check on the host
 
@@ -243,6 +245,25 @@ def nav_timing(cdp, deadline: float) -> dict:
     }
 
 
+def transport_signal(error: BaseException, render_mod) -> str:
+    """Classify the observable close signal without guessing its network hop."""
+    if isinstance(error, ConnectionResetError) or getattr(error, "errno", None) == 104:
+        return "tcp-rst"
+    if isinstance(error, BrokenPipeError) or getattr(error, "errno", None) == 32:
+        return "tcp-write-closed"
+    if isinstance(error, render_mod.WsClosed):
+        if "close frame" in str(error):
+            return "websocket-close-frame"
+        # recv() returned EOF. This proves an orderly TCP close reached the
+        # client, but not whether Chromium, pasta, or another hop originated it.
+        return "tcp-eof"
+    if isinstance(error, TimeoutError):
+        return "local-deadline"
+    if isinstance(error, OSError):
+        return "socket-os-error"
+    return "not-transport"
+
+
 def drive(args) -> dict:
     render = load_render(args.render_module)
     t0 = time.monotonic()
@@ -250,6 +271,7 @@ def drive(args) -> dict:
     out: dict = {"ok": False, "cdp_host": args.cdp_host, "url": args.url, "format": args.format}
     stages: dict[str, float] = {}
     stage = "resolve"
+    stage_started = t0
     ws = None
     try:
         if args.ws_url:
@@ -274,12 +296,14 @@ def drive(args) -> dict:
         out["ws_url"] = ws_url
 
         stage = "connect"
+        stage_started = time.monotonic()
         ws = TimedWs(render, ws_url, deadline)
         stages["tcp_ms"] = ws.tcp_ms
         stages["upgrade_ms"] = ws.upgrade_ms
         cdp = render.Cdp(ws)
 
         stage = "enable"
+        stage_started = time.monotonic()
         t = time.monotonic()
         cdp.cmd("Page.enable", deadline=deadline)
         if args.idle_wait_ms > 0:
@@ -287,16 +311,23 @@ def drive(args) -> dict:
         stages["enable_ms"] = (time.monotonic() - t) * 1000
         stages["connect_total_ms"] = (time.monotonic() - t0) * 1000
 
-        stage = "navigate"
-        t = time.monotonic()
+        stage = "navigate-command-response"
+        stage_started = time.monotonic()
+        t = stage_started
         nav = cdp.cmd("Page.navigate", {"url": args.url}, deadline=deadline)
+        stages["navigate_command_ms"] = (time.monotonic() - stage_started) * 1000
         if "errorText" in nav:
             raise RuntimeError(f"navigation failed: {nav['errorText']}")
         loader = nav.get("loaderId")
+
+        stage = "navigate-load-event"
+        stage_started = time.monotonic()
         cdp.wait_event(lambda ev: ev["method"] == "Page.loadEventFired", deadline)
+        stages["navigate_load_event_ms"] = (time.monotonic() - stage_started) * 1000
         stages["navigate_ms"] = (time.monotonic() - t) * 1000
 
         stage = "network-idle"
+        stage_started = time.monotonic()
         t = time.monotonic()
         out["idle_timeout"] = 0
         if args.idle_wait_ms > 0:
@@ -312,6 +343,7 @@ def drive(args) -> dict:
         stages["idle_ms"] = (time.monotonic() - t) * 1000
 
         stage = "screenshot"
+        stage_started = time.monotonic()
         t = time.monotonic()
         params = {"format": args.format}
         if args.format == "jpeg":
@@ -320,6 +352,7 @@ def drive(args) -> dict:
         stages["screenshot_ms"] = (time.monotonic() - t) * 1000
 
         stage = "decode"
+        stage_started = time.monotonic()
         t = time.monotonic()
         raw = base64.b64decode(shot["data"])
         magic = b"\x89PNG" if args.format == "png" else b"\xff\xd8\xff"
@@ -340,6 +373,7 @@ def drive(args) -> dict:
 
         if args.nav_timing:
             stage = "nav-timing"
+            stage_started = time.monotonic()
             t = time.monotonic()
             out["nav"] = nav_timing(cdp, deadline)
             stages["nav_timing_ms"] = (time.monotonic() - t) * 1000
@@ -348,6 +382,28 @@ def drive(args) -> dict:
     except (OSError, RuntimeError, TimeoutError, KeyError, ValueError, render.WsClosed) as e:
         out["error"] = f"{type(e).__name__}: {e}"
         out["stage"] = stage
+        out["failure_operation"] = {
+            "navigate-command-response": "Page.navigate response",
+            "navigate-load-event": "Page.loadEventFired wait",
+        }.get(stage, stage)
+        out["failure_phase_elapsed_ms"] = (time.monotonic() - stage_started) * 1000
+        out["transport_signal"] = transport_signal(e, render)
+        if isinstance(e, OSError):
+            out["socket_errno"] = e.errno
+        sock = getattr(ws, "sock", None)
+        if sock is not None:
+            try:
+                out["socket_local"] = list(sock.getsockname())
+            except OSError:
+                pass
+            try:
+                out["socket_peer"] = list(sock.getpeername())
+            except OSError:
+                pass
+            try:
+                out["socket_so_error"] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            except OSError:
+                pass
         # Classify, so downstream can gate on it instead of substring-matching the
         # message. A `WsClosed` is the PEER closing the TCP connection — it is NOT
         # this driver's own timeout (render.py raises TimeoutError for that), so a
