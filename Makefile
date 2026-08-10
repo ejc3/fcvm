@@ -198,7 +198,7 @@ CONTAINER_RUN_BASE := podman run --rm --privileged \
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
 .PHONY: all help build clean clean-test-data check-disk \
-	test test-unit test-fast test-all test-root test-packaging test-ci-infrastructure fuzz \
+	test test-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz \
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
@@ -223,6 +223,7 @@ help:
 	@echo "  test-all           + slow VM tests (rootless, no sudo)"
 	@echo "  test-root, test    + privileged tests (bridged, pjdfstest, sudo)"
 	@echo "  test-fc-mock       Run tests with fc-mock (no KVM required)"
+	@echo "  test-clone-floor-overlap  Reproduce the clone/CH/hugepage lifecycle overlap"
 	@echo "  test-ci-infrastructure  Deterministic runner-failure classifier fixtures"
 	@echo "  fuzz               Seeded lifecycle chaos fuzz (SEEDS=N|list OPS=M, defaults 1/10)"
 	@echo ""
@@ -656,6 +657,32 @@ test-chromium-request:
 
 test-ci-infrastructure:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_ci_infrastructure.py'
+
+# Run three ordinary nextest lanes concurrently. Each lane keeps the repository's
+# normal scheduling (in particular, hugepage tests remain serialized by their
+# configured test group); separate lanes are needed on one-CPU test hosts where a
+# single nextest process cannot overlap the clone stress test with lifecycle tests.
+# Standard helpers keep writing their per-fcvm debug logs, while each lane also
+# captures its complete nextest and cleanup transcript.
+CLONE_FLOOR_CLONE_FILTER := -E 'package(fcvm) & test(=test_snapshot_clone_stress_100_bridged)'
+CLONE_FLOOR_CH_FILTER := -E 'package(fcvm) & test(=test_cloud_hypervisor_cold_boot)'
+CLONE_FLOOR_HUGEPAGE_FILTER := -E 'package(fcvm) & (test(=test_hugepage_vm_boot) | test(=test_hugepage_cache_restore_uses_uffd) | test(=test_hugepage_snapshot_clone))'
+test-clone-floor-overlap: show-notes check-disk setup-fcvm setup-hugepages
+	@mkdir -p $(TEST_LOG_DIR)
+	@set -uo pipefail; \
+		run_lane() { \
+			lane="$$1"; filter="$$2"; \
+			$(MAKE) --no-print-directory _test-root STREAM=1 FILTER="$$filter" 2>&1 | \
+				tee "$(TEST_LOG_DIR)/clone-floor-overlap-$${lane}.log"; \
+		}; \
+		run_lane clones "$(CLONE_FLOOR_CLONE_FILTER)" & clones_job=$$!; \
+		run_lane cloud-hypervisor "$(CLONE_FLOOR_CH_FILTER)" & ch_job=$$!; \
+		run_lane hugepages "$(CLONE_FLOOR_HUGEPAGE_FILTER)" & hugepages_job=$$!; \
+		clones_rc=0; wait "$$clones_job" || clones_rc=$$?; \
+		ch_rc=0; wait "$$ch_job" || ch_rc=$$?; \
+		hugepages_rc=0; wait "$$hugepages_job" || hugepages_rc=$$?; \
+		echo "clone-floor overlap results: clones=$$clones_rc cloud-hypervisor=$$ch_rc hugepages=$$hugepages_rc"; \
+		test "$$clones_rc" -eq 0 -a "$$ch_rc" -eq 0 -a "$$hugepages_rc" -eq 0
 
 bench: build
 	@echo "==> Running benchmarks..."
