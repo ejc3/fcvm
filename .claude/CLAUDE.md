@@ -25,6 +25,26 @@ The stale `db.sql` disaster happened because setup "usually" cleaned up before s
 
 **Before committing, ask:** "Can any other process/thread/test touch this state at the same time?" If yes, add synchronization or make it atomic. No exceptions.
 
+## WRITE PLAINLY, ENGINEER TO ENGINEER
+
+Commit messages, PR descriptions, code comments, docs: all of it is one engineer telling
+another what changed and why. Say that and stop.
+
+- State the change, the reason, and the evidence. Nothing else belongs there.
+- No selling. Cut "worth having", "the real win", "makes it trustworthy", "elegant",
+  "powerful", "seamless", "comprehensive", "robust".
+- No throat-clearing. First sentence names the change. Skip the scene-setting paragraph.
+- No rhetorical scaffolding: "Two things follow from that", "Four properties make this
+  work", "Here's the thing". Make the point instead of announcing it.
+- No staccato triples ("No traceback. No crash. No exception."). One normal sentence.
+- No em dashes. Comma, parenthesis, or a new sentence.
+- Don't narrate the journey. "I first tried X, then found Y" belongs nowhere. Describe the
+  end state.
+- Don't restate the diff in prose. If the code already says it, delete the sentence.
+- A claim needs a number or a command. "Faster" is not a claim; `2.4s -> 0.3s` is.
+- Read it back as if a colleague sent it to you. If it reads like marketing or an essay,
+  rewrite it.
+
 ## VERIFY PLAN AND RUN NEW TESTS LOCALLY
 
 **Before committing, ALWAYS:**
