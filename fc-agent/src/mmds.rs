@@ -162,6 +162,7 @@ pub async fn watch_restore_epoch(
     transport: crate::bootplan::Transport,
 ) {
     let mut last_epoch: Option<String> = None;
+    let mut restore_control = RestoreMetadataControl::new(transport);
 
     // Track the egress proxy generation at the last stable point.
     // Updated after each handle_clone_restore completes successfully.
@@ -210,8 +211,10 @@ pub async fn watch_restore_epoch(
             }
         }
 
-        let metadata = match crate::bootplan::fetch_metadata(transport).await {
-            Ok(m) => m,
+        let boundary_is_armed = crate::snapshot_network::boundary_is_armed();
+        let metadata_transport = restore_control.select_transport(boundary_is_armed);
+        let metadata = match crate::bootplan::fetch_metadata(metadata_transport).await {
+            Ok(value) => value,
             Err(e) => {
                 // Log the first few then every 200th failure to avoid spam while still
                 // surfacing persistent errors after snapshot restore.
@@ -220,62 +223,247 @@ pub async fn watch_restore_epoch(
                 let count = FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if count < 5 || count.is_multiple_of(200) {
                     eprintln!(
-                        "[fc-agent] restore metadata fetch failed (count={}): {:?}",
-                        count, e
+                        "[fc-agent] restore metadata fetch failed (count={} transport={:?} \
+                         boundary_armed={} awaiting_mmds_epoch={:?}): {:#}",
+                        count,
+                        metadata_transport,
+                        boundary_is_armed,
+                        restore_control.awaiting_mmds_epoch,
+                        e
                     );
                 }
                 continue;
             }
         };
+        match restore_control.observe(
+            metadata_transport,
+            metadata.restore_epoch.as_deref(),
+            last_epoch.as_deref(),
+        ) {
+            Ok(RestoreMetadataDisposition::Dispatch) => {}
+            Ok(RestoreMetadataDisposition::IgnoreUntilMirror) => {
+                eprintln!(
+                    "[fc-agent] ignoring snapshot-old MMDS restore epoch while waiting for \
+                     the host to mirror the authoritative vsock generation"
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[fc-agent] restore metadata rejected by control-generation gate: {error:#}"
+                );
+                continue;
+            }
+        }
 
         if let Some(ref current) = metadata.restore_epoch {
             match &last_epoch {
                 None => {
                     eprintln!("[fc-agent] detected restore-epoch: {}", current,);
+                    if let Err(error) = signals.restore_status.begin() {
+                        eprintln!(
+                            "[fc-agent] FATAL: cannot begin clone restore (epoch={}): {:#}; \
+                             shutting down clone",
+                            current, error
+                        );
+                        signals.restore_status.fail();
+                        crate::system::shutdown_vm(1).await;
+                    }
                     // Signal notify_cache_ready_and_wait to stop waiting.
                     // Must be set BEFORE handle_clone_restore so the poll loop
                     // exits before output reconnect changes vsock state.
                     signals
                         .restore_flag
                         .store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(
+                    if let Err(error) = crate::restore::handle_clone_restore(
                         &signals,
                         metadata.clone_ipv6.as_deref(),
                         egress_gen_at_last_stable,
                         current,
-                        transport,
+                        metadata_transport,
                     )
-                    .await;
+                    .await
+                    {
+                        signals.restore_status.fail();
+                        eprintln!(
+                            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}. \
+                             Output/exec readiness will not be published; shutting down clone",
+                            current, error
+                        );
+                        crate::system::shutdown_vm(1).await;
+                    }
+                    // Publish the handled generation in watcher state before
+                    // reconnecting output. The host can request another snapshot
+                    // as soon as readiness appears; that snapshot must not capture
+                    // an old `last_epoch` and mistake its existing listener for a
+                    // new restore control generation.
+                    last_epoch = Some(current.clone());
+                    if let Err(error) = signals.restore_status.succeed() {
+                        signals.restore_status.fail();
+                        eprintln!(
+                            "[fc-agent] FATAL: cannot publish clone restore readiness \
+                             (epoch={}): {:#}; shutting down clone",
+                            current, error
+                        );
+                        crate::system::shutdown_vm(1).await;
+                    }
                     // Update stable generation after successful restore handling
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
-                    last_epoch = metadata.restore_epoch;
                     // Epoch found and handled — the fast window did its job.
                     fast_until = None;
+                    // This is the guest's final restore publication edge. It is
+                    // intentionally AFTER RestoreStatus::Succeeded and after the
+                    // watcher state above is capture-safe. The host gates every
+                    // lifecycle/TTY/--exec path on this exact epoch.
+                    if let Err(error) = crate::vsock::notify_restore_complete(current).await {
+                        signals.restore_status.fail();
+                        eprintln!(
+                            "[fc-agent] FATAL: restore-completion ACK failed closed \
+                             (epoch={} phase=notify-host): {:#}; host lifecycle/exec \
+                             readiness will not be published; shutting down clone",
+                            current, error
+                        );
+                        crate::system::shutdown_vm(1).await;
+                    }
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
+                    if let Err(error) = signals.restore_status.begin() {
+                        eprintln!(
+                            "[fc-agent] FATAL: cannot begin clone restore (epoch={}): {:#}; \
+                             shutting down clone",
+                            current, error
+                        );
+                        signals.restore_status.fail();
+                        crate::system::shutdown_vm(1).await;
+                    }
                     signals
                         .restore_flag
                         .store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(
+                    if let Err(error) = crate::restore::handle_clone_restore(
                         &signals,
                         metadata.clone_ipv6.as_deref(),
                         egress_gen_at_last_stable,
                         current,
-                        transport,
+                        metadata_transport,
                     )
-                    .await;
+                    .await
+                    {
+                        signals.restore_status.fail();
+                        eprintln!(
+                            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}. \
+                             Output/exec readiness will not be published; shutting down clone",
+                            current, error
+                        );
+                        crate::system::shutdown_vm(1).await;
+                    }
+                    last_epoch = Some(current.clone());
+                    if let Err(error) = signals.restore_status.succeed() {
+                        signals.restore_status.fail();
+                        eprintln!(
+                            "[fc-agent] FATAL: cannot publish clone restore readiness \
+                             (epoch={}): {:#}; shutting down clone",
+                            current, error
+                        );
+                        crate::system::shutdown_vm(1).await;
+                    }
                     // Update stable generation after successful restore handling
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
-                    last_epoch = metadata.restore_epoch;
                     // Epoch found and handled — the fast window did its job.
                     fast_until = None;
+                    if let Err(error) = crate::vsock::notify_restore_complete(current).await {
+                        signals.restore_status.fail();
+                        eprintln!(
+                            "[fc-agent] FATAL: restore-completion ACK failed closed \
+                             (epoch={} phase=notify-host): {:#}; host lifecycle/exec \
+                             readiness will not be published; shutting down clone",
+                            current, error
+                        );
+                        crate::system::shutdown_vm(1).await;
+                    }
                 }
                 _ => {}
             }
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RestoreMetadataDisposition {
+    Dispatch,
+    IgnoreUntilMirror,
+}
+
+/// Selects one immutable restore generation across the vsock→MMDS handoff.
+///
+/// Firecracker's normal control plane is MMDS, but a current snapshot contains
+/// eth0 down. The host therefore publishes the new restore epoch over vsock
+/// before resume and mirrors that exact epoch into MMDS afterward. VCPUs can run
+/// before the MMDS PUT, so the snapshot-old MMDS epoch must not be dispatched in
+/// between. The latch is installed only for a *new* vsock epoch: a source VM
+/// created by an earlier restore still has its old listener, and its snapshot
+/// preparation must not capture a false pending handoff.
+struct RestoreMetadataControl {
+    preferred: crate::bootplan::Transport,
+    awaiting_mmds_epoch: Option<String>,
+}
+
+impl RestoreMetadataControl {
+    fn new(preferred: crate::bootplan::Transport) -> Self {
+        Self {
+            preferred,
+            awaiting_mmds_epoch: None,
+        }
+    }
+
+    fn select_transport(&self, boundary_is_armed: bool) -> crate::bootplan::Transport {
+        use crate::bootplan::Transport;
+        match self.preferred {
+            Transport::Vsock => Transport::Vsock,
+            Transport::Mmds if boundary_is_armed => Transport::Vsock,
+            Transport::Mmds if self.awaiting_mmds_epoch.is_some() => Transport::Mmds,
+            Transport::Mmds => Transport::Mmds,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        selected: crate::bootplan::Transport,
+        observed_epoch: Option<&str>,
+        last_dispatched_epoch: Option<&str>,
+    ) -> Result<RestoreMetadataDisposition> {
+        use crate::bootplan::Transport;
+
+        if self.preferred == Transport::Vsock {
+            return Ok(RestoreMetadataDisposition::Dispatch);
+        }
+
+        if selected == Transport::Vsock {
+            let epoch = observed_epoch
+                .context("armed Firecracker restore metadata over vsock has no restore-epoch")?;
+            if Some(epoch) != last_dispatched_epoch {
+                self.awaiting_mmds_epoch = Some(epoch.to_string());
+            } else {
+                // This is the source VM preparing another snapshot while its
+                // existing restore listener still serves the already-handled
+                // epoch. Never capture a pending old MMDS handoff in the new
+                // snapshot; its clone's listener will provide a new epoch.
+                self.awaiting_mmds_epoch = None;
+            }
+            return Ok(RestoreMetadataDisposition::Dispatch);
+        }
+
+        if let Some(expected) = self.awaiting_mmds_epoch.as_deref() {
+            if observed_epoch == Some(expected) {
+                self.awaiting_mmds_epoch = None;
+                return Ok(RestoreMetadataDisposition::Dispatch);
+            }
+            return Ok(RestoreMetadataDisposition::IgnoreUntilMirror);
+        }
+
+        Ok(RestoreMetadataDisposition::Dispatch)
     }
 }
 
@@ -312,4 +500,81 @@ pub async fn sync_clock_from_host() -> Result<()> {
         serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
     crate::bootplan::set_system_clock(&metadata.host_time).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootplan::Transport;
+
+    #[test]
+    fn firecracker_restore_latches_vsock_epoch_until_exact_mmds_mirror() {
+        let mut control = RestoreMetadataControl::new(Transport::Mmds);
+
+        assert_eq!(control.select_transport(true), Transport::Vsock);
+        assert_eq!(
+            control
+                .observe(Transport::Vsock, Some("epoch-a"), None)
+                .unwrap(),
+            RestoreMetadataDisposition::Dispatch
+        );
+
+        // Cleanup has removed the boundary manifest, but the host has not yet
+        // run after resume to replace snapshot-old MMDS epoch-b.
+        assert_eq!(control.select_transport(false), Transport::Mmds);
+        assert_eq!(
+            control
+                .observe(Transport::Mmds, Some("epoch-b"), Some("epoch-a"))
+                .unwrap(),
+            RestoreMetadataDisposition::IgnoreUntilMirror
+        );
+
+        // Only the exact mirror acknowledges the handoff. A genuinely later
+        // MMDS generation can then be dispatched normally.
+        assert_eq!(
+            control
+                .observe(Transport::Mmds, Some("epoch-a"), Some("epoch-a"))
+                .unwrap(),
+            RestoreMetadataDisposition::Dispatch
+        );
+        assert_eq!(control.select_transport(false), Transport::Mmds);
+        assert_eq!(
+            control
+                .observe(Transport::Mmds, Some("epoch-c"), Some("epoch-a"))
+                .unwrap(),
+            RestoreMetadataDisposition::Dispatch
+        );
+    }
+
+    #[test]
+    fn later_armed_restore_replaces_a_captured_pending_handoff() {
+        let mut control = RestoreMetadataControl::new(Transport::Mmds);
+        control.awaiting_mmds_epoch = Some("epoch-a".to_string());
+
+        assert_eq!(
+            control.select_transport(true),
+            Transport::Vsock,
+            "an armed restore must supersede an MMDS handoff captured in memory"
+        );
+        assert_eq!(
+            control
+                .observe(Transport::Vsock, Some("epoch-c"), Some("epoch-a"))
+                .unwrap(),
+            RestoreMetadataDisposition::Dispatch
+        );
+        assert_eq!(control.awaiting_mmds_epoch.as_deref(), Some("epoch-c"));
+    }
+
+    #[test]
+    fn source_snapshot_does_not_latch_its_existing_restore_listener() {
+        let mut control = RestoreMetadataControl::new(Transport::Mmds);
+        control.awaiting_mmds_epoch = Some("epoch-a".to_string());
+        assert_eq!(
+            control
+                .observe(Transport::Vsock, Some("epoch-a"), Some("epoch-a"))
+                .unwrap(),
+            RestoreMetadataDisposition::Dispatch
+        );
+        assert_eq!(control.awaiting_mmds_epoch, None);
+    }
 }

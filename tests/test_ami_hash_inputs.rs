@@ -257,7 +257,7 @@ fn ami_hash_refuses_to_compute_when_no_host_patches_match() {
 }
 
 /// The key must identify the HOST kernel, not every kernel in the file.
-/// rootfs-config.toml carries eight `kernel_version` assignments; a bare grep
+/// rootfs-config.toml carries many `kernel_version` assignments; a bare grep
 /// churned the key — and forced a full EC2 rebuild — whenever an unrelated
 /// profile moved.
 #[test]

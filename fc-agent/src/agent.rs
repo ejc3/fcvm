@@ -69,7 +69,8 @@ pub async fn run() -> Result<()> {
             std::time::Duration::from_secs(10),
             "vsock connected",
         )
-        .await;
+        .await
+        .context("waiting for initial egress proxy readiness")?;
         Some(gen_rx)
     } else {
         None
@@ -85,6 +86,12 @@ pub async fn run() -> Result<()> {
     // reset = snapshot restore) to the restore-epoch watcher.
     let (output, output_writer, vsock_reset_rx) = output::create();
     tokio::spawn(output_writer);
+
+    // Pending until the cache handshake proves this is a cold start or the
+    // restore watcher completes every restore phase. The state owns the only
+    // explicit output reconnect edge, so a failed restore cannot race an
+    // independent WarmStart reconnect below.
+    let restore_status = crate::restore::RestoreStatus::new(output.clone());
 
     // Shared flag: set by restore-epoch watcher, checked by notify_cache_ready_and_wait.
     // Breaks the 30s poll loop when POLLHUP is not delivered after snapshot restore.
@@ -109,7 +116,7 @@ pub async fn run() -> Result<()> {
     // handle_clone_restore identically when a restore-epoch appears.
     {
         let restore_signals = crate::restore::RestoreSignals {
-            output: output.clone(),
+            restore_status: restore_status.clone(),
             restore_flag: restore_flag.clone(),
             exec_rebind: exec_rebind.clone(),
             exec_rebind_needed: exec_rebind_needed.clone(),
@@ -339,11 +346,6 @@ pub async fn run() -> Result<()> {
         image_ref
     };
 
-    // Capture egress generation before cache handshake — used to detect reconnection
-    // after snapshot restore (warm start). If proxy already reconnected by the time
-    // we check, wait_for returns immediately because watch retains the latest value.
-    let egress_gen_before = egress_gen_rx.as_ref().map(|rx| *rx.borrow());
-
     // Notify host for cache snapshot. notify_cache_ready_and_wait logs the
     // digest itself, then quiesces the console BEFORE the notification so the
     // host's pre-start snapshot pause can never capture the UART mid-transmit.
@@ -357,45 +359,20 @@ pub async fn run() -> Result<()> {
                     eprintln!("[fc-agent] cache ready: cold start (cache-ack received)");
                     // Pause/resume does NOT reset vsock — reconnect is harmless
                     // (just cycles the connection). No egress wait needed.
-                    output.reconnect();
+                    restore_status
+                        .succeed()
+                        .context("publishing cold-start output readiness")?;
                 }
                 container::CacheResult::WarmStart => {
                     eprintln!("[fc-agent] cache ready: warm start (snapshot restore detected)");
-                    // Vsock IS dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on restore).
-                    // The restore-epoch watcher runs handle_clone_restore concurrently, and
-                    // the host treats the first output connection as the readiness signal:
-                    // it must not arrive before the exec server has re-registered and the
-                    // egress proxy has reconnected (same ordering handle_clone_restore
-                    // enforces). Wait on the exec_rebind_done flag rather than its Notify —
-                    // exec.rs uses notify_one() and the restore handler must win that
-                    // notification.
-                    let rebind_wait = std::time::Instant::now();
-                    while !exec_rebind_done.load(std::sync::atomic::Ordering::Acquire) {
-                        if rebind_wait.elapsed() > std::time::Duration::from_secs(10) {
-                            eprintln!(
-                                "[fc-agent] WARNING: exec re-register not confirmed within 10s, \
-                                 reconnecting output anyway"
-                            );
-                            break;
-                        }
-                        sleep(Duration::from_millis(25)).await;
-                    }
-                    // No explicit signal to proxy needed — it detects the dead vsock fd
-                    // natively via Interest::ERROR (EPOLLERR fires instantly after restore).
-                    // Just wait for the watch channel to confirm reconnection.
-                    if let (Some(rx), Some(gen_before)) = (&egress_gen_rx, egress_gen_before) {
-                        proxy::wait_for_egress_gen(
-                            rx,
-                            gen_before,
-                            std::time::Duration::from_secs(5),
-                            "reconnected after warm start",
-                        )
-                        .await;
-                    }
-                    // Reconnect output before starting the container — for fast-exit
-                    // containers (echo + exit in ~200ms), output must be live or the
-                    // container's stdout/stderr goes to the dead vsock.
-                    output.reconnect();
+                    // The watcher publishes Succeeded only after exec and egress are
+                    // ready, and requests output reconnect before waking this wait.
+                    // Failed is terminal and propagates to main(), which shuts the clone
+                    // down without ever publishing host-visible readiness.
+                    restore_status
+                        .wait_for_output_readiness()
+                        .await
+                        .context("waiting for warm-start restore readiness")?;
                 }
                 container::CacheResult::Failed => {
                     eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");

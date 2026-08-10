@@ -74,6 +74,10 @@ pub(crate) const EXEC_EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Post-handshake / handshake write timeout.
 const EXEC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn exec_vsock_socket_path(vm_state: &crate::state::VmState) -> Result<PathBuf> {
+    Ok(super::common::recorded_vsock_socket_path(vm_state)?.to_path_buf())
+}
+
 /// Connect to the exec server via vsock with retry logic.
 ///
 /// The guest VM takes several seconds to boot and start fc-agent with the exec server.
@@ -588,9 +592,9 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         bail!("Either --pid or name is required");
     };
 
-    // Get the vsock socket path for this VM
-    let vm_dir = paths::vm_runtime_dir(&vm_state.vm_id);
-    let vsock_socket = vm_dir.join("vsock.sock");
+    // Use the exact persisted path. `--vsock-dir` deliberately places the
+    // socket outside vm_runtime_dir, so reconstructing it breaks exec/health.
+    let vsock_socket = exec_vsock_socket_path(&vm_state)?;
 
     // Suppress logs when in TTY or quiet mode (they mix with command output)
     let quiet = args.quiet || args.tty;
@@ -911,6 +915,21 @@ mod exec_fuzz_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_uses_exact_persisted_custom_vsock_path() {
+        let mut state =
+            crate::state::VmState::new("vm-custom-exec".to_string(), "alpine".to_string(), 1, 128);
+        state.config.vsock_socket_path = Some(PathBuf::from("/srv/fcvm-vsock/vsock.sock"));
+        assert_eq!(
+            exec_vsock_socket_path(&state).unwrap(),
+            PathBuf::from("/srv/fcvm-vsock/vsock.sock")
+        );
+
+        state.config.vsock_socket_path = None;
+        let error = exec_vsock_socket_path(&state).unwrap_err();
+        assert!(error.to_string().contains("no recorded vsock socket path"));
+    }
 
     fn response_line(response: &ExecResponse) -> String {
         format!("{}\n", serde_json::to_string(response).unwrap())

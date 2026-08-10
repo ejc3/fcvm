@@ -1,29 +1,4 @@
-use tokio::{
-    process::Command,
-    time::{sleep, Duration},
-};
-
-pub async fn flush_arp_cache() {
-    let output = Command::new("ip")
-        .args(["neigh", "flush", "all"])
-        .output()
-        .await;
-
-    match output {
-        Ok(o) if o.status.success() => {
-            eprintln!("[fc-agent] ARP cache flushed");
-        }
-        Ok(o) => {
-            eprintln!(
-                "[fc-agent] WARNING: ARP flush failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-        }
-        Err(e) => {
-            eprintln!("[fc-agent] WARNING: ARP flush error: {}", e);
-        }
-    }
-}
+use tokio::process::Command;
 
 /// Send ARP to the gateway and verify layer 2 reachability.
 ///
@@ -35,7 +10,7 @@ pub async fn flush_arp_cache() {
 /// Uses `arping` instead of `ping` because ping requires ICMP raw sockets which
 /// fail in rootless mode (pasta doesn't respond to ICMP), causing a 3s timeout.
 /// `arping` operates at layer 2 — pasta responds to ARP even in rootless mode.
-pub async fn send_gratuitous_arp() {
+pub async fn refresh_gateway_arp() {
     let route_output = Command::new("ip")
         .args(["route", "show", "default"])
         .output()
@@ -84,127 +59,6 @@ pub async fn send_gratuitous_arp() {
                 e
             );
         }
-    }
-}
-
-/// Kill stale EXTERNAL TCP connections after snapshot restore.
-///
-/// Only kills connections to non-local addresses. Local connections
-/// (127.0.0.1, ::1) between services in the same VM (e.g., HHVM → mcrouter)
-/// are preserved — they're still valid after restore since both endpoints
-/// resumed from the same snapshot.
-///
-/// Killing local connections causes a reconnection storm: mcrouter drops
-/// HHVM's connections, HHVM retries, TAO/ucache lookups fail, status.php
-/// blocks for minutes waiting for services to re-establish.
-pub async fn kill_stale_tcp_connections() {
-    let list_output = Command::new("ss")
-        .args(["-tn", "state", "established"])
-        .output()
-        .await;
-
-    let Ok(o) = list_output else {
-        eprintln!("[fc-agent] WARNING: failed to list TCP connections");
-        return;
-    };
-
-    let connections = String::from_utf8_lossy(&o.stdout);
-    let mut external_count = 0;
-    let mut local_count = 0;
-
-    for line in connections.lines().skip(1) {
-        // ss output: Recv-Q Send-Q Local_Address:Port Peer_Address:Port
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 4 {
-            continue;
-        }
-        let peer = fields[3];
-        if peer.starts_with("127.")
-            || peer.starts_with("[::1]:")
-            || peer.starts_with("::1:")
-            || peer.starts_with("10.0.2.")
-            || peer.starts_with("[fd00:")
-        {
-            local_count += 1;
-        } else {
-            external_count += 1;
-        }
-    }
-
-    eprintln!(
-        "[fc-agent] TCP connections: {} external (will kill), {} local (preserving)",
-        external_count, local_count
-    );
-
-    if external_count == 0 {
-        eprintln!("[fc-agent] no external TCP connections to kill");
-        return;
-    }
-
-    // Kill only external connections using ss filter.
-    // Preserve: loopback (127.0.0.0/8, [::1]), VM gateway (10.0.2.0/24).
-    // Note: ss doesn't support IPv6 CIDR in brackets — [fd00::]/64 fails.
-    // fd00:: traffic goes through the gateway anyway (preserved by 10.0.2.0/24 rule).
-    let kill_output = Command::new("ss")
-        .args([
-            "-K",
-            "state",
-            "established",
-            "(",
-            "!",
-            "dst",
-            "127.0.0.0/8",
-            "and",
-            "!",
-            "dst",
-            "[::1]",
-            "and",
-            "!",
-            "dst",
-            "10.0.2.0/24",
-            ")",
-        ])
-        .output()
-        .await;
-
-    match kill_output {
-        Ok(o) if o.status.success() => {
-            eprintln!(
-                "[fc-agent] killed {} external TCP connections",
-                external_count
-            );
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if stderr.contains("INET_DIAG_DESTROY") || stderr.contains("Operation not supported") {
-                eprintln!("[fc-agent] ss -K not supported, trying conntrack");
-                kill_connections_via_conntrack().await;
-            } else {
-                eprintln!("[fc-agent] WARNING: ss -K failed: {}", stderr);
-            }
-        }
-        Err(e) => {
-            eprintln!("[fc-agent] WARNING: ss -K error: {}", e);
-        }
-    }
-
-    sleep(Duration::from_millis(10)).await;
-}
-
-async fn kill_connections_via_conntrack() {
-    let output = Command::new("conntrack").args(["-F"]).output().await;
-
-    match output {
-        Ok(o) if o.status.success() => {
-            eprintln!("[fc-agent] flushed conntrack table");
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if !stderr.contains("No such file") {
-                eprintln!("[fc-agent] conntrack flush: {}", stderr.trim());
-            }
-        }
-        Err(_) => {} // conntrack not available
     }
 }
 

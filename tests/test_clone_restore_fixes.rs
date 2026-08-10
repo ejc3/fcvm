@@ -1,6 +1,6 @@
 //! Integration tests for clone restore fixes:
 //! - Clock sync after snapshot restore (chronyd + MMDS time sync)
-//! - ss -K filter preserves gateway connections (10.0.2.0/24)
+//! - exact restore cleanup re-establishes gateway and container connectivity
 //! - --no-swap creates dedicated cgroup with memory.swap.max=0
 //! - --no-dirty-tracking passes track_dirty_pages=false
 
@@ -67,12 +67,13 @@ async fn test_clock_synced_after_clone_restore() -> Result<()> {
     Ok(())
 }
 
-/// After snapshot restore, ss -K should kill external connections but PRESERVE
-/// gateway (10.0.2.x) and loopback connections. Verify by checking that the
-/// clone can still reach the gateway and that nginx responds inside the container.
+/// After snapshot restore, cookie-bound stale-socket cleanup must leave the
+/// clone with a usable gateway and loopback service. Every non-loopback socket,
+/// including a gateway peer, belongs to the snapshot generation and is removed;
+/// this verifies the post-cleanup network is re-established successfully.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
-async fn test_ss_filter_preserves_gateway_after_restore() -> Result<()> {
+async fn test_restore_network_cleanup_reestablishes_gateway() -> Result<()> {
     let fixture = common::SnapshotFixture::new("ssfilter", "bridged").await?;
 
     let (_, clone_name, _, _) = common::unique_names("ssfilter-c");
@@ -112,9 +113,7 @@ async fn test_ss_filter_preserves_gateway_after_restore() -> Result<()> {
         ],
     )
     .await
-    .context(
-        "nginx should be reachable after restore — ss -K may have killed gateway connections",
-    )?;
+    .context("nginx should be reachable after exact restore cleanup")?;
     assert!(
         container_out.contains("nginx") || container_out.contains("Welcome"),
         "nginx should respond after restore"

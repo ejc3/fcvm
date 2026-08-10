@@ -832,11 +832,11 @@ fn continue_vm_gone(e: &userfaultfd::Error) -> bool {
 /// Whether a UFFDIO_COPY error means the clone's mm is gone (process exited).
 ///
 /// The COPY equivalent of [`continue_vm_gone`]. A clone that exits with a fault in flight
-/// races the handler: the `read_event`-returns-error path (uffd closed) is the common
-/// ending, but if the copy is already in the kernel it comes back `ESRCH` instead. That is
-/// an ordinary end of life, NOT a service failure — and the distinction now matters, because
-/// a failure here kills a VMM and reports the clone FAILED. Misreading a normal exit as a
-/// failure would fill the serve log with false alarms and devalue the real ones.
+/// races the handler: normally the peer pidfd wins the select and ends the handler, but if a
+/// copy is already in the kernel it comes back `ESRCH` instead. That is an ordinary end of
+/// life, NOT a service failure — and the distinction now matters, because a failure here kills
+/// a VMM and reports the clone FAILED. Misreading a normal exit as a failure would fill the
+/// serve log with false alarms and devalue the real ones.
 fn copy_vm_gone(e: &userfaultfd::Error) -> bool {
     matches!(
         e,
@@ -1101,7 +1101,8 @@ async fn handle_vm_page_faults(
 
 /// How a [`drain_events`] pass ended.
 enum DrainOutcome {
-    /// The uffd is closed: the clone's VMM exited and there is nothing left to serve.
+    /// A fault-resolution ioctl reported that the clone's mm is already gone. Idle peer exit
+    /// is observed exclusively through the pidfd; a `read_event` error is never normal exit.
     VmExited,
     /// The event queue is empty; readiness may be cleared and the handler may park.
     QueueDrained,
@@ -1134,23 +1135,24 @@ fn drain_events(
             let event = match guard.get_inner().read_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => break, // No more events ready
-                Err(_) => {
-                    // UFFD closed = VM exited
+                Err(e) => {
+                    // The pidfd is the sole authoritative normal-exit signal. Firecracker
+                    // retains its own reference to this userfaultfd, and this handler owns a
+                    // second one, so peer exit does not turn OUR read into EOF. Treating an
+                    // arbitrary read failure as exit silently drops the handler while a live
+                    // Firecracker can retain the other fd: its next missing-page fault then
+                    // sleeps forever with nobody left to resolve it. Propagate into
+                    // serve_clone_fail_closed, which kills the pinned VMM and makes the clone
+                    // fail loudly instead of wedging.
                     let elapsed = start_time.elapsed();
-                    let rate = if elapsed.as_secs_f64() > 0.0 {
-                        *fault_count as f64 / elapsed.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    info!(
-                        target: "uffd",
-                        vm_id = %vm_id,
-                        fault_count = *fault_count,
-                        elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
-                        pages_per_sec = format!("{:.0}", rate),
-                        "VM exited"
-                    );
-                    return Ok(DrainOutcome::VmExited);
+                    let error = anyhow::Error::from(e).context(format!(
+                        "reading userfaultfd event for VM {vm_id} failed after {} faults over \
+                         {:.3}s; peer exit is reported by pidfd, so this read failure is not \
+                         a clean disconnect",
+                        *fault_count,
+                        elapsed.as_secs_f64(),
+                    ));
+                    return Err(error);
                 }
             };
             handled += 1;
@@ -2465,6 +2467,50 @@ mod tests {
         assert_eq!(toucher.join().unwrap(), 0);
         unsafe { libc::munmap(guest, 4096) };
         drop(client);
+    }
+
+    /// A failure READING the event stream is a handler failure, never evidence that the VMM
+    /// exited. Before this regression fix, `drain_events` converted every `read_event` error
+    /// into `DrainOutcome::VmExited`; `serve_clone_fail_closed` therefore saw `Ok(())`, left
+    /// the stand-in VMM alive, and this test failed after the bounded five-second poll.
+    ///
+    /// Feed the handler a one-byte event stream through the real handshake/SCM_RIGHTS path.
+    /// `userfaultfd::Uffd::read_event` deterministically reports `IncompleteMsg` because a
+    /// kernel `uffd_msg` is 32 bytes. The exact error must propagate through `serve_clone` and
+    /// arm the existing fail-closed SIGKILL path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_read_event_error_kills_the_clones_vmm() {
+        use std::io::Write;
+
+        let (snap_path, mem_size) = write_test_snapshot();
+        let mem_file = File::open(&snap_path).unwrap();
+        let mmap = unsafe { MmapOptions::new().len(mem_size).map(&mem_file).unwrap() };
+        let source = Arc::new(PageSource::Copy { mmap });
+        std::fs::remove_file(&snap_path).ok();
+
+        let victim = spawn_victim();
+        let peer = PeerVmm::from_pid(victim.id()).unwrap();
+        let (server_side, client_side) = UnixStream::pair().unwrap();
+
+        // A socket is deliberately passed in place of Firecracker's userfaultfd. The
+        // production receiver owns and reads the descriptor identically; only the injected
+        // bytes differ. One byte makes the crate return IncompleteMsg rather than an event.
+        let (fake_uffd, mut event_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        event_writer.write_all(&[0x12]).unwrap();
+
+        let mappings = r#"[{"base_host_virt_addr":4096,"size":4096,"offset":0,"page_size":4096}]"#;
+        let client = client_side.into_std().unwrap();
+        client.set_nonblocking(false).unwrap();
+        client
+            .send_with_fd(mappings.as_bytes(), fake_uffd.as_raw_fd())
+            .expect("sending the malformed event fd through the real handshake");
+
+        serve_clone_fail_closed("vm-read-error", server_side, source, peer).await;
+        assert_vmm_was_killed(victim).await;
+
+        drop(client);
+        drop(fake_uffd);
+        drop(event_writer);
     }
 
     #[test]

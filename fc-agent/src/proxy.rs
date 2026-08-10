@@ -36,19 +36,34 @@ pub async fn wait_for_egress_gen(
     threshold: u64,
     timeout: std::time::Duration,
     context: &str,
-) {
+) -> anyhow::Result<()> {
     let mut rx = rx.clone();
     match tokio::time::timeout(timeout, async {
         rx.wait_for(|&v| v > threshold).await.map(|_| ())
     })
     .await
     {
-        Ok(Ok(())) => eprintln!("[fc-agent] egress proxy {} (gen={})", context, *rx.borrow()),
-        Ok(Err(_)) => eprintln!("[fc-agent] WARNING: egress proxy gen_tx dropped"),
-        Err(_) => eprintln!(
-            "[fc-agent] WARNING: egress proxy {} timed out ({}s)",
-            context,
-            timeout.as_secs()
+        Ok(Ok(())) => {
+            // `wait_for` may return the retained matching value even after every
+            // sender has gone away. A matching generation from a dead proxy is
+            // not readiness: the restored workload would publish with no owner
+            // left to carry its next egress stream.
+            if rx.has_changed().is_err() {
+                anyhow::bail!(
+                    "egress proxy generation publisher stopped after reaching generation {} ({context})",
+                    *rx.borrow()
+                );
+            }
+            eprintln!("[fc-agent] egress proxy {} (gen={})", context, *rx.borrow());
+            Ok(())
+        }
+        Ok(Err(_)) => anyhow::bail!(
+            "egress proxy generation publisher stopped before generation exceeded {threshold} ({context})"
+        ),
+        Err(_) => anyhow::bail!(
+            "egress proxy {context} timed out after {:?} waiting for generation to exceed {threshold} (current={})",
+            timeout,
+            *rx.borrow()
         ),
     }
 }
@@ -703,4 +718,52 @@ fn get_original_dst_v6(fd: std::os::fd::RawFd) -> anyhow::Result<(Ipv6Addr, u16)
     let port = u16::from_be(addr.sin6_port);
 
     Ok((ip, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn egress_generation_timeout_is_a_readiness_error() {
+        let (_publisher, receiver) = watch::channel(7u64);
+        let error = wait_for_egress_gen(
+            &receiver,
+            7,
+            std::time::Duration::ZERO,
+            "injected restore wait",
+        )
+        .await
+        .expect_err("an unchanged egress generation must fail restore readiness");
+
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("timed out"),
+            "unexpected error: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("current=7"),
+            "timeout must identify the generation that failed to advance: {diagnostic}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_egress_publisher_rejects_even_a_retained_matching_generation() {
+        let (publisher, receiver) = watch::channel(8u64);
+        drop(publisher);
+
+        let error = wait_for_egress_gen(
+            &receiver,
+            7,
+            std::time::Duration::from_secs(1),
+            "injected restore wait",
+        )
+        .await
+        .expect_err("a retained generation from a dead proxy is not readiness");
+
+        assert!(
+            format!("{error:#}").contains("publisher stopped"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

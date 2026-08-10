@@ -71,7 +71,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         .context("creating snapshot directory")?;
     let state_manager = crate::state::StateManager::new(paths::state_dir());
     let mut expected_parent_key = vm_state.config.snapshot_name.clone();
-    let (_generation_locks, _vm_lock, parent_snapshot_key) = loop {
+    let (_generation_locks, _vm_lock, parent_snapshot_key, vsock_socket_path) = loop {
         if let Some(parent) = expected_parent_key.as_deref() {
             validate_snapshot_name(parent).context("invalid parent snapshot name in VM state")?;
         }
@@ -115,7 +115,14 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
             continue;
         }
 
-        break (generation_locks, vm_lock, expected_parent_key.clone());
+        let vsock_socket_path =
+            crate::commands::common::recorded_vsock_socket_path(&fresh_state)?.to_path_buf();
+        break (
+            generation_locks,
+            vm_lock,
+            expected_parent_key.clone(),
+            vsock_socket_path,
+        );
     };
 
     info!(snapshot_key = %snapshot_key, "Creating podman snapshot");
@@ -133,7 +140,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         &snapshot_dir,
         snapshot_volumes,
         extra_disks,
-    );
+    )?;
 
     // Inode tables for portable volumes are written into the temp (.creating) directory
     // by create_snapshot_core BEFORE the atomic rename, so a finalized snapshot can never
@@ -168,6 +175,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         client,
         snapshot_config,
         disk_path,
+        &vsock_socket_path,
         parent_dir.as_deref(),
         Some(&extra_files),
     )

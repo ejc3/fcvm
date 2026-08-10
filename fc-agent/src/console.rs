@@ -677,14 +677,22 @@ mod tests {
         // Recover the console: drain everything. The writer must flush its
         // pending bytes and append ONE summary line about the dropped bytes.
         let mut sunk: Vec<u8> = Vec::new();
-        assert!(wait_until(
-            || {
-                // Keep draining until the writer reports fully flushed.
-                drain_console(&mut console_rd, &mut sunk);
-                state.flushed() && state.dropped.load(Ordering::SeqCst) == 0
-            },
-            Duration::from_secs(10)
-        ));
+        assert!(
+            wait_until(
+                || {
+                    // Observe the promised external effect itself. `dropped` is
+                    // cleared immediately before the summary is appended to the
+                    // writer's pending queue, so `flushed() && dropped == 0` has
+                    // a legitimate transient window before the summary is
+                    // visible on the console.
+                    drain_console(&mut console_rd, &mut sunk);
+                    String::from_utf8_lossy(&sunk)
+                        .contains("bytes of log output while the console was stalled")
+                },
+                Duration::from_secs(10)
+            ),
+            "writer must emit the recovery summary after the console drains"
+        );
 
         let text = String::from_utf8_lossy(&sunk);
         let summaries = text.matches("dropped").count();
