@@ -39,9 +39,7 @@ const GUEST_CID: u32 = 3;
 const SOCKET_WAIT_RETRY_COUNT: u32 = 500;
 const SOCKET_WAIT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const STDERR_TAIL_LINES: usize = 10;
-/// Upper bound on waiting for the stderr reader to reach EOF after the VMM
-/// exits. The wait ends on EOF; this only bounds an inherited, still-open pipe.
-const STDERR_EOF_TIMEOUT: Duration = Duration::from_secs(2);
+const STDERR_DRAIN_DELAY: Duration = Duration::from_millis(200);
 
 /// Buffered VM configuration accumulated by the `configure_*` methods, applied at boot.
 #[derive(Default)]
@@ -66,9 +64,6 @@ pub struct CloudHypervisorBackend {
     log_path: Option<PathBuf>,
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
-    /// Reader task for the child's stderr pipe, awaited (bounded) before rendering
-    /// `stderr_tail` on a launch failure so the tail is complete.
-    stderr_reader: Option<JoinHandle<()>>,
     client: Option<ChClient>,
     pending: PendingConfig,
     vsock_path: Option<PathBuf>,
@@ -104,7 +99,6 @@ impl CloudHypervisorBackend {
             log_path,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
-            stderr_reader: None,
             client: None,
             pending: PendingConfig::default(),
             vsock_path: None,
@@ -189,10 +183,7 @@ impl CloudHypervisorBackend {
                 return Ok(());
             }
             if let Some(status) = self.try_wait()? {
-                // Wait for the stderr reader to hit EOF (the exit closed the write
-                // end) so the error carries everything the VMM printed.
-                crate::utils::wait_for_stderr_eof(&mut self.stderr_reader, STDERR_EOF_TIMEOUT)
-                    .await;
+                sleep(STDERR_DRAIN_DELAY).await;
                 bail!(
                     "Cloud Hypervisor exited with {} before its API socket became ready{}",
                     status,
@@ -333,7 +324,7 @@ impl Hypervisor for CloudHypervisorBackend {
         install_namespace_pre_exec(&mut cmd, &self.namespace)?;
 
         let stderr_tail = Arc::clone(&self.stderr_tail);
-        let spawned = spawn_streaming(cmd, move |line, is_stderr| {
+        let child = spawn_streaming(cmd, move |line, is_stderr| {
             let clean = line.trim_end();
             if is_stderr {
                 if let Ok(mut tail) = stderr_tail.lock() {
@@ -354,8 +345,7 @@ impl Hypervisor for CloudHypervisorBackend {
         })
         .context("spawning Cloud Hypervisor process")?;
 
-        self.process = Some(spawned.child);
-        self.stderr_reader = Some(spawned.stderr_reader);
+        self.process = Some(child);
         self.wait_for_api().await?;
         self.client = Some(ChClient::new(self.api_socket.clone()));
 
@@ -407,22 +397,16 @@ impl Hypervisor for CloudHypervisorBackend {
         }
     }
 
-    fn start_kill(&mut self) -> Result<()> {
+    async fn kill(&mut self) -> Result<()> {
         if let Some(tail) = self.console_tail.take() {
             tail.abort();
         }
-        if let Some(ref mut p) = self.process {
-            info!(vm_id = %self.vm_id, "SIGKILL to Cloud Hypervisor process");
-            p.start_kill()
-                .context("sending SIGKILL to Cloud Hypervisor")?;
-        }
-        Ok(())
-    }
-
-    async fn reap(&mut self) {
         if let Some(mut p) = self.process.take() {
+            info!(vm_id = %self.vm_id, "killing Cloud Hypervisor process");
+            p.kill().await.context("killing Cloud Hypervisor")?;
             let _ = p.wait().await;
         }
+        Ok(())
     }
 
     async fn stream_console(&self, _console_path: &Path) -> Result<mpsc::Receiver<String>> {

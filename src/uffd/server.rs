@@ -434,6 +434,81 @@ fn continue_page(
     Ok(ContinueOutcome::Resolved)
 }
 
+/// Per-fault trace, enabled only by `FCVM_UFFD_FAULT_TRACE=<dir>`.
+///
+/// Records `(guest_file_offset, ns_before_resolve, ns_after_resolve)` for every fault this
+/// handler serves and writes them to `<dir>/<serve_pid>-<vm_id>.faults` as little-endian u64
+/// triples when the handler exits. The offset is into the snapshot memory file, NOT a host
+/// virtual address: host addresses differ per clone, so only the file offset can be compared
+/// between clones of the same snapshot.
+///
+/// This is a measurement facility, not part of serving: it costs one `Vec::push` and two
+/// `Instant::elapsed()` calls per fault, and is entirely inert unless the env var is set.
+/// The flush lives in `Drop` so that every handler exit path — clean VM exit, `VmGone`
+/// mid-CONTINUE, or an error return — writes the trace.
+struct FaultTrace {
+    path: PathBuf,
+    origin: std::time::Instant,
+    records: Vec<[u64; 3]>,
+}
+
+impl FaultTrace {
+    fn from_env(vm_id: &str, origin: std::time::Instant) -> Option<Self> {
+        let dir = PathBuf::from(std::env::var("FCVM_UFFD_FAULT_TRACE").ok()?);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(
+                target: "uffd",
+                dir = %dir.display(),
+                error = %e,
+                "FCVM_UFFD_FAULT_TRACE directory not usable - fault tracing disabled"
+            );
+            return None;
+        }
+        Some(Self {
+            path: dir.join(format!("{}-{}.faults", std::process::id(), vm_id)),
+            origin,
+            // 2GiB of 4KiB granules is 512Ki faults worst case; start big enough that
+            // the hot path does not reallocate for a typical restore working set.
+            records: Vec::with_capacity(1 << 16),
+        })
+    }
+
+    #[inline]
+    fn now_ns(&self) -> u64 {
+        self.origin.elapsed().as_nanos() as u64
+    }
+
+    #[inline]
+    fn record(&mut self, file_offset: u64, before_ns: u64, after_ns: u64) {
+        self.records.push([file_offset, before_ns, after_ns]);
+    }
+}
+
+impl Drop for FaultTrace {
+    fn drop(&mut self) {
+        let mut buf = Vec::with_capacity(self.records.len() * 24);
+        for rec in &self.records {
+            for v in rec {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        match std::fs::write(&self.path, &buf) {
+            Ok(()) => info!(
+                target: "uffd",
+                path = %self.path.display(),
+                faults = self.records.len(),
+                "wrote UFFD fault trace"
+            ),
+            Err(e) => warn!(
+                target: "uffd",
+                path = %self.path.display(),
+                error = %e,
+                "failed to write UFFD fault trace"
+            ),
+        }
+    }
+}
+
 /// Handle page faults for a single VM
 async fn handle_vm_page_faults(
     vm_id: String,
@@ -464,6 +539,7 @@ async fn handle_vm_page_faults(
 
     let mut fault_count = 0u64;
     let start_time = std::time::Instant::now();
+    let mut trace = FaultTrace::from_env(&vm_id, start_time);
 
     // MINOR faults whose UFFDIO_CONTINUE came back `EAGAIN` (`mmap_changing` was set),
     // keyed by page address, value = retry attempts so far. The faulting vCPU sleeps
@@ -514,6 +590,7 @@ async fn handle_vm_page_faults(
                 &mut fault_count,
                 &mut pending_continues,
                 start_time,
+                &mut trace,
             )? {
                 return Ok(()); // VM exited
             }
@@ -568,6 +645,7 @@ fn drain_events(
     fault_count: &mut u64,
     pending_continues: &mut std::collections::BTreeMap<usize, u32>,
     start_time: std::time::Instant,
+    trace: &mut Option<FaultTrace>,
 ) -> Result<bool> {
     {
         // Read all available events (non-blocking)
@@ -618,6 +696,18 @@ fn drain_events(
                         ));
                     }
 
+                    // Offset of this granule within the snapshot memory file. Computed for
+                    // both backings (COPY needs it to find the bytes; MINOR needs nothing,
+                    // but the fault trace does) because it is the only fault key that is
+                    // stable across clones — host virtual addresses are per-process.
+                    let offset_in_region = fault_page - base_host;
+                    let mapping_offset = usize::try_from(mapping.offset)
+                        .map_err(|_| anyhow!("mapping offset exceeds host address space"))?;
+                    let offset_in_file = mapping_offset
+                        .checked_add(offset_in_region)
+                        .ok_or_else(|| anyhow!("mapping offset overflow"))?;
+                    let trace_t0 = trace.as_ref().map(|t| t.now_ns()).unwrap_or(0);
+
                     let mmap = match source {
                         PageSource::Minor { .. } => {
                             // MINOR mode: the page is already in the page cache of the shared
@@ -656,17 +746,15 @@ fn drain_events(
                                     pending_continues.entry(fault_page).or_insert(0);
                                 }
                             }
+                            if let Some(t) = trace.as_mut() {
+                                let t1 = t.now_ns();
+                                t.record(offset_in_file as u64, trace_t0, t1);
+                            }
                             continue;
                         }
                         PageSource::Copy { mmap } => mmap,
                     };
 
-                    let offset_in_region = fault_page - base_host;
-                    let mapping_offset = usize::try_from(mapping.offset)
-                        .map_err(|_| anyhow!("mapping offset exceeds host address space"))?;
-                    let offset_in_file = mapping_offset
-                        .checked_add(offset_in_region)
-                        .ok_or_else(|| anyhow!("mapping offset overflow"))?;
                     let mmap_len = mmap.len();
 
                     if offset_in_file >= mmap_len {
@@ -695,6 +783,10 @@ fn drain_events(
                                 "UFFD zero-page copy failed"
                             );
                             return Err(e.into());
+                        }
+                        if let Some(t) = trace.as_mut() {
+                            let t1 = t.now_ns();
+                            t.record(offset_in_file as u64, trace_t0, t1);
                         }
                         continue;
                     }
@@ -742,6 +834,10 @@ fn drain_events(
                                     fault_addr = format!("0x{:x}", fault_page),
                                     "UFFD copy skipped - page already filled (EEXIST)"
                                 );
+                                if let Some(t) = trace.as_mut() {
+                                    let t1 = t.now_ns();
+                                    t.record(offset_in_file as u64, trace_t0, t1);
+                                }
                                 continue;
                             }
                         }
@@ -756,6 +852,11 @@ fn drain_events(
                             "UFFD copy failed"
                         );
                         return Err(e.into());
+                    }
+
+                    if let Some(t) = trace.as_mut() {
+                        let t1 = t.now_ns();
+                        t.record(offset_in_file as u64, trace_t0, t1);
                     }
                 }
                 Event::Remove { start, end } => {

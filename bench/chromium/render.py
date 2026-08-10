@@ -49,7 +49,6 @@ class WsClient:
         self.sock = socket.create_connection(
             (u.hostname, u.port or 80), timeout=max(0.05, deadline - time.monotonic())
         )
-        self._buf = b""  # BEFORE the handshake: _recv_until parks leftovers here
         key = base64.b64encode(os.urandom(16)).decode()
         path = u.path + ("?" + u.query if u.query else "")
         self.sock.sendall(
@@ -69,31 +68,17 @@ class WsClient:
         expect = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest())
         if expect not in response:
             raise ConnectionError("ws handshake: bad Sec-WebSocket-Accept")
+        self._buf = b""
 
     def _recv_until(self, marker: bytes, deadline: float) -> bytes:
-        """Read through `marker`, KEEPING whatever followed it in `self._buf`.
-
-        It used to accumulate into a local and return it, so any bytes the peer
-        coalesced into the same segment as the 101 response were DROPPED — and
-        `__init__` then reset `self._buf = b""`, discarding them a second time.
-        The next `_recv_exact(2)` would start reading in the middle of a frame,
-        the header parse would desync, and the symptom is precisely
-        `WsClosed("connection closed mid-frame")`. This is a free correctness fix
-        for a failure mode the CDP arm reports at 1.7%/10.0% and the exec arm
-        (which speaks guest loopback with no socat relay in the path) never hits;
-        it is a variable removed, NOT a diagnosis of that drop.
-        """
-        data = self._buf
-        self._buf = b""
+        data = b""
         while marker not in data:
             self.sock.settimeout(max(0.05, deadline - time.monotonic()))
             chunk = self.sock.recv(4096)
             if not chunk:
                 raise WsClosed("connection closed during handshake")
             data += chunk
-        head, _, rest = data.partition(marker)
-        self._buf = rest
-        return head + marker
+        return data
 
     def _recv_exact(self, n: int, deadline: float) -> bytes:
         while len(self._buf) < n:

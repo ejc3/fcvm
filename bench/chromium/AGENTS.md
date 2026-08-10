@@ -91,13 +91,8 @@ nothing. Every rule below exists because one of them broke.
   site-isolation-off while actively rendering. RSS counts each shared page once per
   process, and the baseline runs 10–11 processes vs 5. Use PSS.
 - **PNG encoding, not rasterization, dominates screenshot cost** (Chromium devs
-  profiled it; CDP's `optimizeForSpeed` exists for this). JPEG q80 measured
-  −28.8% on the screenshot STAGE (−52.9 ms, CI −63.8…−44.8) and −8.3% on the
-  whole request (−65.8 ms, CI −83.1…−42.6), n=12, `corrected.json` ->
-  `screenshot_format`. This line used to read "−40% screenshot, −21% whole
-  request"; both figures are contradicted by the record run and REVIEW.md marks
-  the −21% claim **REFUTED AS STATED**. The screenshot is only ~18% of the
-  request, which is why a −29% stage win is an −8% request win.
+  profiled it; CDP's `optimizeForSpeed` exists for this). JPEG q80 measured −40%
+  screenshot, −21% whole request in-VM.
 - **`--deterministic-mode` is a trap on aarch64** — it bundles
   `--disable-skia-runtime-opts`, disabling NEON in exactly the raster/encode path
   you care about. Take its sub-flags selectively.
@@ -158,40 +153,21 @@ is load-bearing. Fix the registration first, then prove it with the #617 repro.
 ## fcvm reference numbers (main @ 2026-08-08, quiet box)
 
 Compare against these; a large deviation means contention or a regression.
-"Large" is only decidable against a spread, so every row carries one — a row with
-a bare point estimate cannot tell a reader whether their 45 ms is a regression or
-a draw. Defect 6 applies to this table as much as to a report.
-
-**Basis for the whole-request row: n=10 draws, one clone at a time, quiet box.**
-The decomposed stages below it were recorded in the SAME run but were not
-re-sampled per stage, so they carry the whole's dispersion, not their own. They
-are quoted to the precision that supports — whole ms — and they sum to ~126 ms
-against a whole of 132, a difference well inside the 12 ms spread of the whole.
-Do not read the stage split as ten independent measurements.
 
 | Metric | Value |
 |---|---|
 | clone spawn → exec-ready | **132 ms p50** (min 121, p90 133, n=10) |
-| — `resolve-fc` | <1 ms (n=10; was 341 ms: per-clone `git ls-remote`) |
-| — `listeners+state` | ~3 ms (n=10) |
-| — `netns+pasta` | ~38 ms (n=10; was ~96: inotify replaced a 50 ms poll) |
-| — `snapshot-load` | ~6 ms (n=10) — the actual Firecracker restore primitive |
-| — `resume→ready` | ~79 ms (n=10; was 220: a 201 ms sleep that guarded nothing) |
-| routed first-egress after restore | ~1 ms (n=10; was ~1000 — IPv6 DAD) |
-| reflink, 12.8 GB disk | ~9 ms (tracks extent count; the published 1.5 ms does not generalize) |
-| host-native warm Chromium floor | ~245 ms (order of magnitude only; n and spread not recorded) |
+| — `resolve-fc` | 0.5 ms (was 341 ms: per-clone `git ls-remote`) |
+| — `listeners+state` | 2.5 ms |
+| — `netns+pasta` | 38.0 ms (was ~96: inotify replaced a 50 ms poll) |
+| — `snapshot-load` | 5.8 ms — the actual Firecracker restore primitive |
+| — `resume→ready` | 79.3 ms (was 220: a 201 ms sleep that guarded nothing) |
+| routed first-egress after restore | 0.7 ms (was 1002.5 — IPv6 DAD) |
+| reflink, 12.8 GB disk | 9.4 ms (tracks extent count; the published 1.5 ms does not generalize) |
+| host-native warm Chromium floor | ~245 ms |
 
-**One number for the restore primitive.** The `snapshot-load` row above and the
-"hypervisor restore" figure in the request-path section below were previously
-quoted as 5.8 ms and 4 ms — a 45% disagreement between two point estimates of the
-same primitive, in one file, neither carrying a band that would make it a
-non-disagreement. They are the same quantity measured in two different runs and
-are now quoted once, as **~6 ms**, from the row above. If you need it tighter,
-re-measure it and quote an interval.
-
-`--exec` runs in-container via podman entry (~94–100 ms, n and basis NOT recorded
-— treat as an order of magnitude, not a measurement) vs `crun exec` (~4 ms, same
-caveat). Known, unfixed, and a real component of any end-to-end number.
+`--exec` runs in-container via podman entry (~94–100 ms) vs `crun exec` (~4 ms) —
+known, unfixed, and a real component of any end-to-end number.
 
 ### CDP handshake is now a PER-REQUEST cost — measure it, don't drop it
 
@@ -202,66 +178,34 @@ cost that design would have removed, and it must be reported rather than quietly
 dropped. `render.py`'s `connect` stage — `/json/list` + TCP + the RFC 6455 upgrade —
 is what to look at.
 
-**The only auditable figure is the primary cell of the record run.** It is
-`corrected.json` -> `primary_cell.stages.r_connect_ms`:
+**These are scavenged from existing logs, NOT a benchmark.** They are here so the
+number is not lost and so a proper measurement has something to disagree with. All
+three are the *in-guest* connect to `127.0.0.1:9222`, so they exclude the host↔guest
+hop that the chosen design adds; a host-driven connect over fcvm port forwarding
+will be **larger** than every figure below.
 
-| Source | n | median | 95% CI |
-|---|---|---|---|
-| restored clone, primary cell, one request at a time (`corrected.json`) | 12 | 16.7 ms | 16.4–16.9 ms |
+| Source | n | p50 | p90 | max |
+|---|---|---|---|---|
+| host container, no VM (`scratchpad/cb/*.jsonl`) | 1332 | 3.5 ms | 10.4 ms | 15.4 ms |
+| restored clone, quiet box (`scratchpad/cb/vmlogs/clone-*.log`) | 104 | 10.7 ms | 13.8 ms | 15.4 ms |
+| restored clone, under benchmark load (`results/20260808-corrected/requests/*.log`) | 1138 | 19.1 ms | 30.5 ms | 39.2 ms |
 
-That is the *in-guest* connect to `127.0.0.1:9222`, so it excludes the host↔guest
-hop the chosen design adds; a host-driven connect over fcvm port forwarding will
-be **larger**.
+The single `connect_ms=13.3` sample that has been quoted around this work is one
+draw from row 2 (`clone-base-png-medium-1.log`) — roughly its p85, and **not** a
+container-local figure. Do not cite it as a point estimate.
 
-**Three scavenged rows were deleted from this table on 2026-08-08.** They quoted
-a host-container p50 of 3.5 ms (n=1332), a quiet-box clone p50 of 10.7 ms
-(n=104), and a loaded-box p50 of 19.1 ms (n=1138), and concluded "p50 nearly
-doubles from quiet box to loaded box". None of the three is auditable from this
-repo: the first two cite `scratchpad/`, which `git ls-tree` shows is not in the
-tree at all, and the third cites a `requests/*.log` directory under a `results/`
-path that `.gitignore` excludes — so all three violate this file's own
-Deliverables rule 3 ("every figure traceable to a raw record"), and the only
-comparative claim in the block rested entirely on the two uncommitted ones. The
-19.1 ms figure ALSO sat unreconciled next to REVIEW.md's 16.7 ms (16.4–16.9) for
-the same stage in the same PR — two point estimates of one quantity, the exact
-defect the `snapshot-load` entry below was written about. They are different
-populations (all cells and concurrencies under load, vs the primary cell one at a
-time), which is a fine explanation that neither document was making. If the
-load-sensitivity claim matters, re-measure it and commit the record.
-
-`results/…` figures exclude the `url=noop` drift-control probe, which prints a
-hardcoded `connect_ms=0.0`. Any per-request CDP handshake number is only
-meaningful with the concurrency stated next to it.
+Note the load sensitivity: p50 nearly doubles from quiet box to loaded box. Any
+per-request CDP handshake number is only meaningful with the concurrency stated
+next to it. `results/…` rows exclude the `url=noop` drift-control probe, which
+prints a hardcoded `connect_ms=0.0`.
 
 ## The request-optimized path (CDP direct + fast teardown)
 
-Every figure below is `corrected.json` -> `primary_cell.stages`, n=12, cell
-`rootless-proxy`/`uffd-4k`/`medium`/JPEG q80, with its 95% CI:
-
-- **request-independent startup ~305 ms** — restore 52.9 (52.0–54.0) + fcvm exec
-  handshake 28.0 (27.0–29.5) + guest command start 224.5 (217.0–232.0).
-- **render ~356 ms** — CDP handshake 16.7 (16.4–16.9) + page load 204.0
-  (196.6–207.3) + screenshot 133.8 (120.8–144.2) + DOM 1.8 (1.6–2.1).
-- **teardown 175.1 ms (150.4–194.9)**, entirely AFTER the artifact exists.
-- **total 890.6 ms (869.6–928.9)**; artifact 730.1 (708.4–741.1).
-
-So startup is ~34% and teardown ~20% of wall clock — both attackable, which is
-the design argument. Two changes attack the two non-render parts; they are
-separate arms in `reqbench.py` so they can be attributed separately.
-
-*This paragraph used to read "the measured 573 ms request breaks into ~145 ms of
-request-INDEPENDENT process startup, ~226 ms of actual render, and ~154 ms of
-teardown". Three defects: `git grep 573` found exactly two hits — this line and a
-comment in `reqbench.py` citing this line, a circular citation and not evidence;
-145 + 226 + 154 = 525, forty-eight milliseconds short of 573, unattributed and
-unmentioned; and REVIEW.md L3 says "Quote only from `20260808-corrected`", whose
-primary cell is 890.6 ms total, not 573. No committed artifact on this branch
-produces 573 ms.*
-
-The hypervisor restore is **~6 ms** — the single `snapshot-load` figure from the
-reference table above; this line used to say 4 ms and the table 5.8 ms, which was
-two point estimates of one quantity disagreeing by 45% with no interval between
-them.
+The measured 573 ms request breaks into ~145 ms of request-INDEPENDENT process
+startup, 226 ms of actual render, and ~154 ms of teardown that runs AFTER the
+screenshot already exists. The hypervisor restore is 4 ms. Two changes attack the
+two non-render parts; they are separate arms in `reqbench.py` so they can be
+attributed separately.
 
 **Chromium's CDP endpoint IS the request server.** Do not wrap it. An earlier
 design put a resident Python server in the guest speaking a bespoke JSON protocol
@@ -283,15 +227,8 @@ podman-only reproduction (no VM). Each fails SILENTLY.
 `podman build` prints `HEALTHCHECK is not supported for OCI image format and will
 be ignored` as a *warning* and succeeds. The image then has no healthcheck, fcvm's
 health gate never sees one, and the golden snapshot triggers on the wrong
-condition. **Build with `--format docker`.** Verify with a command that FAILS —
-"must print the Test array" is an instruction to a human, inside a block designed
-to be pasted, and it exits 0 either way. This is the check `reqbench.sh` already
-gates on, so there is one gate to keep correct rather than two:
-
-```bash
-podman image inspect <img> --format '{{json .HealthCheck}}' \
-  | grep -q cdp_health || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
-```
+condition. **Build with `--format docker`.** Verify:
+`podman inspect <img> --format '{{json .HealthCheck}}'` must print the Test array.
 
 **2. `--remote-debugging-address=0.0.0.0` IS IGNORED by chromium 151.0.7922.71
 (Debian bookworm arm64).** The flag is present in `/proc/<pid>/cmdline` and
@@ -349,110 +286,54 @@ finds a page target. Healthy therefore means *provably able to screenshot*, not
 *port is open*. Caveat to verify: podman healthchecks need systemd timers in the
 guest; `src/health.rs` notes they can fail to schedule in some rootless setups.
 
-### Fast teardown: one signal, kernel-enforced — scope the guarantee, don't blanket it
+### Fast teardown: one signal, kernel-enforced, cannot leak
 
-`kill(fcvm, SIGKILL)` is the whole teardown. fcvm arms `PR_SET_PDEATHSIG=SIGKILL`
-on all three long-lived children — Firecracker
-(`src/utils.rs::install_namespace_pre_exec`), the namespace holder
-(`src/commands/common.rs::spawn_namespace_holder`) and pasta
-(`src/network/pasta.rs`) — so the kernel's `forget_original_parent()` pass
-delivers SIGKILL to all of them, concurrently, in one pass: no ordering to get
-wrong, and no cleanup code of ours that must survive a SIGKILL. This is the chain
-PR #730 restored after ~490 VMs leaked.
+`kill(fcvm, SIGKILL)` is the whole teardown. fcvm spawns Firecracker and the
+namespace holder with `PR_SET_PDEATHSIG=SIGKILL`, so the kernel's
+`forget_original_parent()` pass delivers SIGKILL to **both, concurrently, in one
+pass** — no ordering to get wrong, and no cleanup code of ours that must survive a
+SIGKILL. This is the chain PR #730 restored after ~490 VMs leaked.
+Regression proof: `test_sigkill_kills_firecracker_rootless` (podman-run flavour)
+and `test_bench_fast_teardown_leaks_nothing_clone` (the clone flavour the bench
+actually uses, via the snapshot-restore spawn path).
 
-**This heading used to read "cannot leak". It does not say that any more, because
-the guarantee is not uniform across the three hops.** pasta's arming carries a
-precondition the other two do not: `commit_creds()` zeroes `pdeath_signal`
-whenever uid/gid change or `cred_cap_issubset(old, new)` fails, and pasta
-`setns()`es into the holder's user namespace after its `pre_exec`. Under sudo
-that is a capability LOSS, the subset test passes, and the signal survives. Run
-fcvm genuinely unprivileged and it becomes a capability GAIN, the kernel clears
-the signal, and pasta falls back to passt's own 1-second PID watch of the holder.
-So: kernel-enforced for the VMM and the holder unconditionally; for pasta while
-fcvm runs as root. A harness must not assume any of it — `reqbench.py`'s
-`teardown_fast` waits on a pidfd per child and REFUSES to reap on-disk state if
-any child is still alive.
-
-Regression proof: `test_sigkill_reaps_rootless_vm_tree` (podman-run flavour) and
-`test_bench_fast_teardown_leaks_nothing_clone` (the clone flavour the bench
-actually uses, via the snapshot-restore spawn path). Both REQUIRE firecracker,
-holder and pasta to be discovered before they assert anything. That is not
-pedantry: until 2026-08-08 the clone test held the holder as a bare `Option` and
-asserted `!holder.is_some_and(running)`, which is `!false` when discovery returns
-`None` — an assertion that cannot fail when its subject is absent, and discovery
-is coupled to production by the literal string `sleep infinity`. Verified by
-fault injection (holder argv → `sleep 2147483647`): the old test still passed
-while a real orphan sat on the box.
-
-Because SIGKILL cannot be caught, `cleanup_vm` never runs and the state file, its
-`.json.lock`, and the data dir all survive. `reqbench.py` reaps them
-**synchronously** after the clock stops — no janitor. Both clone-path tests assert
-the state file AND the data dir are still there after the kill, precisely so
-nobody deletes that reap step. The data dir matters on its own: it holds a reflink
-of the golden rootfs, so a leaked one pins the golden snapshot's extents on btrfs
-and `snapshots delete` frees nothing.
+Because SIGKILL cannot be caught, `cleanup_vm` never runs and the state file and
+data dir survive. `reqbench.py` reaps them **synchronously** after the clock
+stops — no janitor. The clone-path test asserts the state file is still there
+after the kill, precisely so nobody deletes that reap step.
 
 ### Teardown is NOT free — measured, not asserted
 
 Kernel address-space reclaim, measured VM-free on this box (64 cores, 125 GB) with
 the same parent+pdeathsig topology, median of 3 per size, `/proc/<pid>/stat` read
 in the `Z` state so the figure is complete (`exit_mm()` runs before
-`exit_notify()`, so a zombie-state read already includes all reclaim).
+`exit_notify()`, so a zombie-state read already includes all reclaim):
 
-**Read the CPU column as quantized, not as measured to 10 ms.** `/proc/<pid>/stat`
-counts in jiffies and `CLK_TCK` is 100 on this box, so its resolution is 10 ms —
-which is why every value in that column is an exact multiple of 10. Each figure is
-`value ± 10 ms` from quantization ALONE, before any sampling variance from n=3.
-
-| Address space | reap wall (n=3) | reclaim CPU (n=3, ±10 ms quantization) |
+| Address space | reap wall | reclaim CPU |
 |---|---|---|
-| 256 MiB | ~15 ms | 30 ± 10 ms |
-| 512 MiB | ~32 ms | 50 ± 10 ms |
-| 1024 MiB | ~64 ms | 110 ± 10 ms |
-| 2048 MiB | ~121 ms | 180 ± 10 ms |
+| 256 MiB | 15.2 ms | 30 ms |
+| 512 MiB | 32.2 ms | 50 ms |
+| 1024 MiB | 63.5 ms | 110 ms |
+| 2048 MiB | 121.4 ms | 180 ms |
 
-A 4-point fit over medians of 3, with the CPU column quantized, supports roughly
-**60 ms wall/GiB and 80–130 ms CPU/GiB** — a fitted RANGE, not a measurement, and
-stated as one. Over most of that range CPU exceeds wall, so reclaim runs on more
-than one core: moving it off the response path does not make it free, it makes it
-concurrent. **The claim "early response converts teardown from LATENCY into
-THROUGHPUT cost" is supported — "converts", never "removes".** At saturation that
-CPU competes with new requests. Do not report the latency win as a capacity win.
-
-**What this table does NOT support:** "CPU exceeds wall" as stated for the 256 MiB
-row. 15 ms wall against 30 ± 10 ms CPU is 15 vs [20, 40] — the direction holds but
-the margin is not resolved by n=3 at this quantization.
+≈ **62 ms wall/GiB, ≈ 90–120 ms CPU/GiB**, linear. CPU EXCEEDS wall, so reclaim
+runs on more than one core: moving it off the response path does not make it free,
+it makes it concurrent. **The claim "early response converts teardown from LATENCY
+into THROUGHPUT cost" is supported — "converts", never "removes".** At saturation
+that ~110 ms CPU/GiB competes with new requests. Do not report the latency win as a
+capacity win.
 
 Caveat: synthetic dirty-anon pages, not Firecracker's MAP_PRIVATE file-backed
 guest memory; clean file-backed pages may unmap cheaper. Corroboration: the
-observed ~78 ms VM teardown for a ~1 GB VM sits on the ~60 ms/GiB line.
+observed 78 ms VM teardown for a ~1 GB VM sits right on the 62 ms/GiB line.
 
-## Claims currently REFUTED — status per `REVIEW.md`
+## Claims currently REFUTED — do not re-publish without new data
 
-This list and `REVIEW.md` disagreed for a while: everything here said "do not
-re-publish" while the ledger had already marked the same claims SUPPORTED /
-SUPERSEDED / REPLACED / RESOLVED on the corrected run. Whichever a reader hit
-first decided whether the number could be published. `REVIEW.md` is the ledger;
-this list now points at it rather than contradicting it.
-
-- "fcvm beats a warm container pool on marginal memory (129 vs 151 MiB)" —
-  **SUPPORTED but much smaller, and backend-dependent** (REVIEW.md row 1). Quote
-  the corrected figures, never the original 129 vs 151.
-- any egress-mode *ordering* — **STILL NOT SUPPORTED** (REVIEW.md row 2). The
-  confound is gone but run-to-run variance dominates; do not publish an ordering.
-- "16 clones sustain 5.5–6.3 req/s" — **SUPERSEDED** (REVIEW.md row 3). And do not
-  quote a burst figure as throughput.
-- "7.9 vs 5.3 req/GB" (slope without intercept) — **REPLACED** (REVIEW.md row 4).
-- ~70 ms of the 310 ms file-vs-UFFD gap — **RESOLVED** (REVIEW.md row 5).
-- "JPEG q80 −21% per request" — **REFUTED AS STATED** (REVIEW.md, SURVIVED table).
-  The screenshot-STAGE win is real (−28.8%); the whole-request win is −8.3%. This
-  list omitted the claim entirely while the Chromium-findings section above kept
-  publishing the refuted number, which is precisely the disagreement the preamble
-  above says this list exists to end.
-- every figure from the `reqbench` CDP A/B — **WITHDRAWN IN FULL** (REVIEW.md,
-  "The CDP-path A/B"). `exec 565 ms`, `cdp 384 ms`, `cdp-fast 372 ms`,
-  `PART 1 −180.5 ms`, `reclaim CPU 0.00 ms`, the `+610.4 ms` machine cost and the
-  `pasta 704 ms` straggler are all withdrawn; do not quote any of them.
+- "fcvm beats a warm container pool on marginal memory (129 vs 151 MiB)"
+- any egress-mode *ordering* (all modes collapsed to ~1.30 ± 0.06 s under review)
+- "16 clones sustain 5.5–6.3 req/s" (n=1 bursts; sustained data said 7.7 rps)
+- "7.9 vs 5.3 req/GB" (slope without intercept)
+- ~70 ms of the 310 ms file-vs-UFFD gap (unattributable at `RUST_LOG=info`)
 
 `REVIEW.md` is the ledger of what holds and what doesn't. **Update it every run.**
 

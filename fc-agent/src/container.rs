@@ -1105,20 +1105,7 @@ pub fn notify_cache_ready_and_wait(
                 total_read += n;
                 let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
                 if received.contains("cache-ack") {
-                    // Positive close handshake: close our end FIRST, before any
-                    // logging, so the host's drain sees EOF as early as possible.
-                    // The host holds this connection open until then precisely so
-                    // it never closes with one of our 500ms liveness probes still
-                    // unread — an unread byte at close becomes a vsock RST that
-                    // flushes this receive buffer, and the ack we just read would
-                    // have been lost to a spurious WarmStart (#627). Our close is
-                    // what tells the host the ack landed.
-                    //
-                    // `poll_fds` borrowed `sock`, but its last use was the
-                    // `hung_up` read above, so the borrow has already ended and
-                    // the socket can be dropped — which closes the fd.
-                    drop(sock);
-                    eprintln!("[fc-agent] received cache-ack from host (handshake closed)");
+                    eprintln!("[fc-agent] received cache-ack from host");
                     return CacheResult::ColdStart;
                 }
                 // Host keepalive: it is alive but still queued on the snapshot

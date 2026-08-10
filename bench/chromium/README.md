@@ -44,20 +44,7 @@ Fan-out phases add burst latency and marginal memory per concurrent request.
 
 ```bash
 # repo root context (.dockerignore excludes target/)
-# --format docker is LOAD-BEARING: podman's default OCI format drops the image's
-# HEALTHCHECK with only a warning, and fcvm treats a MISSING healthcheck as a
-# pass — so the golden snapshot would fire on a COLD browser.
-podman build --format docker -t localhost/chromium-bench -f Containerfile.chromium-bench .
-
-# ...and verify it survived — this FAILS (exit 1) if the OCI format dropped it.
-# It must FAIL, not print a warning: fcvm treats a MISSING healthcheck as a PASS
-# (src/health.rs AND-logic), so a dropped HEALTHCHECK means the golden snapshot
-# fires on a COLD browser and silently inflates page load, screenshot, artifact
-# and total for every restore in the run. `bench.sh` — the harness
-# `make bench-chromium` actually runs — has no build step and no healthcheck
-# check, so on that route this line is the ENTIRE verification.
-podman image inspect localhost/chromium-bench --format '{{json .HealthCheck}}' \
-  | grep -q cdp_health || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
+podman build -t localhost/chromium-bench -f Containerfile.chromium-bench .
 
 # host smoke test, no VM:
 podman run -d --name cb localhost/chromium-bench
@@ -117,35 +104,11 @@ change. Never publish numbers whose review verdicts were refuted; see
 
 ## Current status
 
-The **2026-08-08 corrected run** is the current record: `results/20260808-corrected/`
-(`summary.md`, `charts/*.svg`, `corrected.json`). It fixes all six methodology defects that
-sank the first run — matched per-clone cgroup accounting plus an independent whole-machine
-`MemAvailable` basis, one seeded interleaved schedule with two control arms, the burst as the
-experimental unit with bootstrap CIs, `RUST_LOG=fcvm=debug` stage attribution, slopes reported
-with intercepts and req/GiB at concrete N, and uncertainty on every figure.
-
-Headlines: artifact **730 ms** (95% CI 708-741) end to end against a host-native warm floor of
-**218 ms** (202-229); `--uffd-mode minor` with hugepages at **34.7 +/- 0.4 MiB per concurrent
-request**; routed's 1 s first-egress stall gone (3.0 ms on every mode). Two previously published
-Chromium figures are **refuted** by this run: JPEG q80 is -8.3% per request (not -21%), and
-site-isolation-off saves 3.6% on PSS (not 23% - that number was an RSS artifact).
-
-`REVIEW.md` is the ledger of what holds, what was refuted, and what remains unmeasured. Read it
-before quoting anything from this directory.
-
-### Running it reproducibly
-
-Pin the binary: this is a shared box, and a concurrent workload rebuilding
-`target/release/fcvm` from its own uncommitted changes will silently swap the thing under test.
-
-```bash
-git worktree add /tmp/pristine --detach origin/main && (cd /tmp/pristine && make build)
-FCVM=/tmp/pristine/target/release/fcvm RESULTS=bench/chromium/results/<stamp> \
-  bench/chromium/bench.sh run
-python3 bench/chromium/analyze.py bench/chromium/results/<stamp>
-python3 bench/chromium/charts.py  bench/chromium/results/<stamp>
-```
-
-`hostinfo.json` records the binary sha256, git commit, image id, and the load average at start;
-`samples/loadavg.jsonl` records load every 5 s so every phase can be reported with the
-contention it actually ran under.
+The harness is durable; the first full run's **comparative** numbers are not.
+`REVIEW.md` records which claims survived adversarial review (5ms restore
+primitive, routed first-egress stall, the VK_ICD fix, JPEG/site-isolation
+deltas) and which were refuted (marginal-memory basis mismatch, egress-mode
+ordering confound, n=1 bursts, exec retry quantization). The comparative
+memory / egress / throughput numbers require a rerun with matched cgroup
+accounting, interleaved mode ordering, repeated bursts, and
+`RUST_LOG=fcvm=debug`.

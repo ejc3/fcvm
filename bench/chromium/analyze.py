@@ -32,15 +32,8 @@ import statistics
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from reqanalyze import clopper_pearson  # noqa: E402 - sibling module, one exact-binomial impl
-
 BOOT_N = 10000
 BOOT_SEED = 20260808
-# The sustained phase runs ONE window per cell, so no rate interval is derivable
-# from it as collected. Splitting that window is the best available and is
-# labelled as not-a-replicate; the durable fix is to replicate the window.
-SUSTAINED_SUBWINDOWS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -441,43 +434,12 @@ def analyse_throughput(results, recs, out):
         cell, rate = mrec["cell"], mrec["rate"]
         done = [r for r in recs if r.get("phase") == f"sust-r{rate}" and
                 r.get("arm") == cell and r.get("ok")]
-        t_lo, t_hi = mrec.get("t0", 0), mrec.get("t1", 0)
-        dur = t_hi - t_lo
+        dur = mrec.get("t1", 0) - mrec.get("t0", 0)
         v, lo, hi, k = boot_ci([r["total_ms"] for r in done if r.get("total_ms")])
-        # THE RATE GETS AN INTERVAL TOO. `achieved_rps` was a bare quotient over
-        # ONE 63.6 s window, printed to two decimals into a table whose only CI
-        # column is latency — while the burst path immediately above it bootstraps
-        # its rate because bursts are replicated 5x. Splitting the single window
-        # into equal sub-windows and bootstrapping the per-sub-window rate is not
-        # a substitute for replicating the window (the sub-windows are not
-        # independent draws of a fresh machine state), so it is labelled as what
-        # it is. When the per-request timestamps needed for the split are absent,
-        # emit NO interval rather than a fabricated one.
-        rate_ci = None
-        rate_basis = "single unreplicated window; no interval derivable"
-        comp_ts = [r["t0_ts"] + r["total_ms"] / 1000.0
-                   for r in done if r.get("t0_ts") and r.get("total_ms")]
-        if dur > 0 and len(comp_ts) == len(done) and len(done) >= SUSTAINED_SUBWINDOWS:
-            w = dur / SUSTAINED_SUBWINDOWS
-            counts = [0] * SUSTAINED_SUBWINDOWS
-            for t in comp_ts:
-                i = int((t - t_lo) / w)
-                counts[min(max(i, 0), SUSTAINED_SUBWINDOWS - 1)] += 1
-            rv, rlo, rhi, _ = boot_ci([c / w for c in counts])
-            rate_ci = [rlo, rhi]
-            rate_basis = (f"{SUSTAINED_SUBWINDOWS} equal sub-windows of one "
-                          f"{dur:.1f}s window (sub-windows are NOT independent "
-                          f"replicates; median {rv:.2f} rps)")
-        # "462/462 completed" is not a 0% failure rate, same rule as everywhere
-        # else in this bench. analyze.py had no binomial function at all.
-        launched = mrec.get("launched", 0)
-        f_lo, f_hi = clopper_pearson(max(0, launched - len(done)), launched)
         out["sustained"][f"{cell}/target={rate}rps"] = {
-            "launched": launched, "skipped": mrec["skipped"],
+            "launched": mrec["launched"], "skipped": mrec["skipped"],
             "completed_ok": len(done),
             "achieved_rps": (len(done) / dur) if dur > 0 else None,
-            "rate_ci": rate_ci, "rate_ci_basis": rate_basis,
-            "incomplete_rate_ci": [f_lo, f_hi],
             "duration_s": dur,
             "latency_median_ms": v, "latency_ci": [lo, hi], "n": k,
         }
@@ -679,27 +641,13 @@ def write_md(out, path):
         a(f"| {k} | {v['n_bursts']} | {ci_cell(v.get('burst_wall_median_ms'), v.get('burst_wall_ci'))} "
           f"| {ci_cell(v.get('rps_median'), v.get('rps_ci'))} |")
     a("")
-    # `achieved req/s` is one decimal, not two: a single unreplicated window
-    # cannot support 0.01 rps of resolution, and quoting 7.26 claimed it did.
-    a("| sustained cell | launched | completed (CP 95% incomplete) "
-      "| achieved req/s (sub-window CI) | latency ms, median (95% CI) |")
+    a("| sustained cell | launched | completed | achieved req/s | latency ms, median (95% CI) |")
     a("|---|---|---|---|---|")
     for k, v in sorted(out.get("sustained", {}).items()):
-        ar = f"{v['achieved_rps']:.1f}" if v.get("achieved_rps") else "n/a"
-        if v.get("rate_ci"):
-            ar += f" ({v['rate_ci'][0]:.1f}-{v['rate_ci'][1]:.1f})"
-        else:
-            ar += " (single window, no interval)"
-        fci = v.get("incomplete_rate_ci")
-        comp = f"{v['completed_ok']}"
-        if fci:
-            comp += f" [{100 * fci[0]:.2f}%, {100 * fci[1]:.2f}%]"
-        a(f"| {k} | {v['launched']} | {comp} | {ar} "
+        ar = f"{v['achieved_rps']:.2f}" if v.get("achieved_rps") else "n/a"
+        a(f"| {k} | {v['launched']} | {v['completed_ok']} | {ar} "
           f"| {ci_cell(v.get('latency_median_ms'), v.get('latency_ci'))} |")
     a("")
-    a("*Sub-window CIs split ONE window; the sub-windows are not independent "
-      "replicates of a fresh machine state, unlike the burst cells above (5 "
-      "bursts each). Do not read them as run-to-run uncertainty.*\n")
 
     a("### E. Host-native baseline (same pages, same screenshot format)\n")
     a("| baseline | total ms, median (95% CI) | artifact ms, median (95% CI) | n |")

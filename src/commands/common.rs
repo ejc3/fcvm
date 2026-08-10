@@ -637,95 +637,16 @@ pub struct CleanupContext {
     pub output_listener_handle: Option<JoinHandle<Vec<(String, String)>>>,
 }
 
-/// How long teardown waits for the health monitor to observe its cancellation before
-/// moving on. It only writes state through the per-VM flock, which `delete_state` takes
-/// too, so an unjoined straggler is safe — this is a courtesy join, not a barrier.
-const HEALTH_MONITOR_STOP_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Total CPU charged to this process's REAPED children so far (`RUSAGE_CHILDREN`).
+/// Cleanup resources for a VM (used by both podman and snapshot commands)
 ///
-/// A child's ENTIRE lifetime CPU lands here at the moment it is reaped, not as it runs — so
-/// a raw delta across teardown is the VMM's whole-life CPU (measured: 12.3 CPU-seconds for
-/// a VM that lived a couple of minutes), NOT the cost of tearing it down. See
-/// [`process_cpu`] for the subtraction that turns this into a reclaim figure.
-fn reaped_children_cpu() -> std::time::Duration {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    // SAFETY: getrusage fully initializes the rusage it is given; we only read it on success.
-    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) } != 0 {
-        return std::time::Duration::ZERO;
-    }
-    let usage = unsafe { usage.assume_init() };
-    let to_duration = |t: libc::timeval| {
-        std::time::Duration::new(t.tv_sec.max(0) as u64, (t.tv_usec.max(0) as u32) * 1000)
-    };
-    to_duration(usage.ru_utime) + to_duration(usage.ru_stime)
-}
-
-/// CPU (`utime + stime`) consumed so far by a LIVE process, from `/proc/<pid>/stat`.
-///
-/// Sampled just before the SIGKILL, this is what a child had already spent while doing its
-/// job. Subtracting it from that child's whole-life CPU (credited to `RUSAGE_CHILDREN` when
-/// it is reaped) leaves exactly the CPU it accrued after the signal — i.e. its exit path,
-/// which for the VMM is dominated by `exit_mmap()` unmapping the guest's multi-GiB address
-/// space. Returns zero if the process is already gone, which biases the reported reclaim
-/// UP, never down: this number exists to stop teardown being called free.
-///
-/// `comm` (field 2) can contain spaces and parentheses, so fields are counted from after
-/// the last `") "`; `utime`/`stime` are fields 14/15, i.e. indices 11/12 from there.
-fn process_cpu(pid: u32) -> std::time::Duration {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
-        return std::time::Duration::ZERO;
-    };
-    let Some(after_comm) = stat.rsplit_once(") ").map(|(_, rest)| rest) else {
-        return std::time::Duration::ZERO;
-    };
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    let ticks: u64 = [11usize, 12]
-        .iter()
-        .filter_map(|i| fields.get(*i))
-        .filter_map(|f| f.parse::<u64>().ok())
-        .sum();
-    // SAFETY: sysconf is a pure query with no memory effects.
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz <= 0 {
-        return std::time::Duration::ZERO;
-    }
-    std::time::Duration::from_nanos(ticks.saturating_mul(1_000_000_000 / hz as u64))
-}
-
-/// Tear down every resource a VM owns. Used by both the podman and snapshot commands.
-///
-/// Ordered to minimize how long the caller is blocked without deferring any of the work:
-///
-/// 1. **Signal, block on nothing.** SIGKILL the VMM, the namespace holder and the network
-///    helper, and cancel/abort the in-process tasks — no `await` in between, so every
-///    process is already dying before the first wait. Previously each kill awaited its own
-///    exit before the next was even signalled, which serialized ~40ms of VMM address-space
-///    reclaim, the holder's exit and ~28ms of pasta teardown that could have overlapped.
-/// 2. **Join the waits together**, so the total is the slowest exit rather than their sum.
-/// 3. **Network cleanup**, once the processes that were using the namespace are gone.
-/// 4. **On-disk reaping — synchronous, always.** State file, NFS exports, Firecracker log,
-///    VM data directory.
-///
-/// Nothing is moved to a background task or a janitor. "Leave nothing on disk" is a
-/// correctness contract exactly like "leave no orphaned VM": a deferred sweep would let a
-/// crash between here and the sweep strand a state file (whose PID is then reused), a
-/// reflinked rootfs, or an `/etc/exports.d` entry that makes every later `exportfs -ra`
-/// fail. It measures ~10ms. It is not the problem.
-///
-/// Emits one `vm teardown complete` record with three DISTINCT numbers, because a fast
-/// teardown and a free one are not the same thing:
-/// - `caller_blocking_ms` — what the request actually pays, start to finish.
-/// - `until_gone_ms` — first SIGKILL until the last resource is released. Below
-///   `caller_blocking_ms` only by the pre-signal bookkeeping; that they are near-equal is
-///   the point, and is what makes "nothing was deferred" checkable rather than asserted.
-/// - `reclaim_cpu_ms` — CPU the VMM and holder accrued AFTER their SIGKILL, i.e. what the
-///   kernel spent actually destroying them (mostly `exit_mmap()` on the guest mapping).
-///   Overlapping the waits does not shrink it: the box is still burning this either way,
-///   which is the whole reason it is reported separately from the wall-clock numbers.
-///
-/// Plus a per-phase breakdown in MICROseconds (`processes_us`/`network_us`/`disk_us`) —
-/// two of those phases are sub-millisecond in bridged mode and would round to a useless 0.
+/// This function handles the complete cleanup sequence:
+/// 1. Cancel health monitor gracefully
+/// 2. Abort volume server tasks
+/// 3. Kill VM process
+/// 4. Kill holder process (rootless mode)
+/// 5. Cleanup network resources
+/// 6. Delete state file
+/// 7. Remove data directory
 pub async fn cleanup_vm(
     ctx: CleanupContext,
     vm_manager: &mut dyn Hypervisor,
@@ -742,127 +663,78 @@ pub async fn cleanup_vm(
         health_monitor_handle,
         output_listener_handle,
     } = ctx;
-    // Started before the first log line so `caller_blocking_ms` covers everything the
-    // caller actually waits for, including our own bookkeeping.
-    let cleanup_start = std::time::Instant::now();
-    let cpu_before = reaped_children_cpu();
     info!("cleaning up resources");
 
-    // --- Phase 1: signal everything. No `await` until all signals are out. -------------
-    // Sample what the VMM and holder have already spent, so the reclaim figure below is
-    // their POST-signal CPU rather than their whole-life CPU (see `process_cpu`).
-    let cpu_spent_before_kill = vm_manager.pid().map(process_cpu).unwrap_or_default()
-        + holder_child
-            .as_ref()
-            .and_then(|h| h.id())
-            .map(process_cpu)
-            .unwrap_or_default();
-
-    let kill_start = std::time::Instant::now();
-    if let Err(e) = vm_manager.start_kill() {
-        warn!("failed to signal VM process: {}", e);
-    }
-    if let Some(ref mut holder) = holder_child {
-        if let Err(e) = holder.start_kill() {
-            warn!("failed to signal namespace holder process: {}", e);
+    // Signal health monitor to stop gracefully, then wait briefly for it
+    if let (Some(token), Some(handle)) = (health_cancel_token, health_monitor_handle) {
+        token.cancel();
+        tokio::select! {
+            _ = handle => {
+                debug!("health monitor stopped gracefully");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                debug!("health monitor didn't stop in time, continuing cleanup");
+            }
         }
     }
-    network.start_kill_processes();
 
-    // In-process tasks: cancel/abort is synchronous, the join happens in phase 2.
-    if let Some(ref token) = health_cancel_token {
-        token.cancel();
-    }
+    // Abort output listener task if still running
     if let Some(handle) = output_listener_handle {
         handle.abort();
     }
+
+    // Cancel VolumeServer tasks
     for handle in volume_server_handles {
         handle.abort();
     }
 
-    // --- Phase 2: join every wait at once. ---------------------------------------------
-    let vmm_reaped = vm_manager.reap();
-    let holder_reaped = async {
-        if let Some(ref mut holder) = holder_child {
-            // Reap the zombie left by the SIGKILL above.
-            let _ = holder.wait().await;
-        }
-    };
-    let health_stopped = async {
-        let Some(handle) = health_monitor_handle else {
-            return;
-        };
-        tokio::select! {
-            _ = handle => debug!("health monitor stopped gracefully"),
-            _ = tokio::time::sleep(HEALTH_MONITOR_STOP_BUDGET) => {
-                debug!("health monitor didn't stop in time, continuing cleanup");
-            }
-        }
-    };
-    tokio::join!(vmm_reaped, holder_reaped, health_stopped);
-    let processes_us = kill_start.elapsed().as_micros();
+    // Kill VM process
+    if let Err(e) = vm_manager.kill().await {
+        warn!("failed to kill VM process: {}", e);
+    }
 
-    // Sampled HERE, before network cleanup reaps pasta, so the delta covers exactly the two
-    // processes whose pre-kill CPU we subtracted. Anything reaped later (pasta) would add
-    // its whole lifetime and silently inflate the reclaim.
-    let reclaim_cpu = reaped_children_cpu()
-        .saturating_sub(cpu_before)
-        .saturating_sub(cpu_spent_before_kill);
+    // Kill holder process (rootless mode only)
+    if let Some(ref mut holder) = holder_child {
+        info!("killing namespace holder process");
+        if let Err(e) = holder.kill().await {
+            warn!("failed to kill holder process: {}", e);
+        }
+        let _ = holder.wait().await; // Clean up zombie
+    }
 
-    // --- Phase 3: network teardown, now that nothing is using the namespace. -----------
-    let network_start = std::time::Instant::now();
+    // Cleanup network
     if let Err(e) = network.cleanup().await {
         warn!("failed to cleanup network: {}", e);
     }
-    let network_us = network_start.elapsed().as_micros();
 
-    // --- Phase 4: on-disk reaping. Synchronous — cleanup_vm does not return until every
-    // one of these is done. They are independent of each other, so they run concurrently;
-    // the log copy and the directory removal are the one ordered pair (the log lives in
-    // the directory), so they share a future.
-    let disk_start = std::time::Instant::now();
-    // Removing this VM's /etc/exports.d entry (no-op when it had none) belongs on every exit
-    // path — podman run, converge teardown, restored clones. A leftover entry for a deleted
-    // directory makes every later `exportfs -ra` fail until the self-heal prunes it.
-    let exports_removed = super::podman::cleanup_nfs_exports(&vm_id);
-    let state_deleted = async {
-        if let Err(e) = state_manager.delete_state(&vm_id).await {
-            warn!("failed to delete state file: {}", e);
-        }
-    };
-    let data_dir_removed = async {
-        // Preserve the Firecracker log (for debugging snapshot restore failures) BEFORE
-        // removing the directory it lives in.
-        let fc_log = data_dir.join("firecracker.log");
-        if fc_log.exists() {
-            let dest = std::path::PathBuf::from(format!("/tmp/fcvm-firecracker-{}.log", vm_id));
-            if let Err(e) = tokio::fs::copy(&fc_log, &dest).await {
-                debug!(vm_id = %vm_id, error = %e, "could not save firecracker log");
-            } else {
-                info!(vm_id = %vm_id, log = %dest.display(), "saved firecracker log");
-            }
-        }
+    // Remove this VM's NFS exports (no-op when the VM had none). Lives here so
+    // every exit path — podman run, converge teardown, restored clones — drops
+    // its /etc/exports.d entry; a leftover entry for a deleted directory makes
+    // every later `exportfs -ra` fail until the self-heal prunes it.
+    super::podman::cleanup_nfs_exports(&vm_id).await;
 
-        // Includes disks, sockets, everything under the VM's runtime directory.
-        if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
-            warn!(vm_id = %vm_id, error = %e, "failed to cleanup VM data directory");
+    // Delete state file
+    if let Err(e) = state_manager.delete_state(&vm_id).await {
+        warn!("failed to delete state file: {}", e);
+    }
+
+    // Save Firecracker log before cleanup (for debugging snapshot restore failures)
+    let fc_log = data_dir.join("firecracker.log");
+    if fc_log.exists() {
+        let dest = std::path::PathBuf::from(format!("/tmp/fcvm-firecracker-{}.log", vm_id));
+        if let Err(e) = tokio::fs::copy(&fc_log, &dest).await {
+            debug!(vm_id = %vm_id, error = %e, "could not save firecracker log");
         } else {
-            info!(vm_id = %vm_id, "cleaned up VM data directory");
+            info!(vm_id = %vm_id, log = %dest.display(), "saved firecracker log");
         }
-    };
-    tokio::join!(exports_removed, state_deleted, data_dir_removed);
-    let disk_us = disk_start.elapsed().as_micros();
+    }
 
-    info!(
-        vm_id = %vm_id,
-        caller_blocking_ms = cleanup_start.elapsed().as_millis(),
-        until_gone_ms = kill_start.elapsed().as_millis(),
-        reclaim_cpu_ms = reclaim_cpu.as_millis(),
-        processes_us,
-        network_us,
-        disk_us,
-        "vm teardown complete"
-    );
+    // Cleanup VM data directory (includes disks, sockets, etc.)
+    if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
+        warn!(vm_id = %vm_id, error = %e, "failed to cleanup VM data directory");
+    } else {
+        info!(vm_id = %vm_id, "cleaned up VM data directory");
+    }
 }
 
 /// Memory backend configuration for snapshot restore
