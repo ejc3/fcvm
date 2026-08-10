@@ -838,9 +838,40 @@ impl CleanupFailures {
 }
 
 /// How long teardown waits for the health monitor to observe its cancellation before
-/// moving on. It only writes state through the per-VM flock, which `delete_state` takes
-/// too, so an unjoined straggler is safe — this is a courtesy join, not a barrier.
+/// aborting it. Cleanup must then await the abort before tearing down network resources:
+/// dropping a live `JoinHandle` detaches its task, which could otherwise keep using the
+/// network namespace after cleanup has begun destroying it.
 const HEALTH_MONITOR_STOP_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Stop and reap the exact health-monitor task before resource teardown continues.
+///
+/// The timeout borrows the handle. If graceful cancellation misses its budget, ownership
+/// therefore remains here so the task can be aborted and awaited; moving the handle directly
+/// into a `select!` arm would drop and detach it when the timeout arm wins.
+async fn stop_health_monitor(mut handle: JoinHandle<()>) {
+    match tokio::time::timeout(HEALTH_MONITOR_STOP_BUDGET, &mut handle).await {
+        Ok(Ok(())) => debug!("health monitor stopped gracefully"),
+        Ok(Err(error)) => {
+            warn!(?error, "health monitor task failed while stopping");
+        }
+        Err(_) => {
+            debug!(
+                budget_ms = HEALTH_MONITOR_STOP_BUDGET.as_millis(),
+                "health monitor didn't stop in time; aborting it"
+            );
+            handle.abort();
+            match handle.await {
+                Ok(()) => debug!("health monitor completed while its abort was being delivered"),
+                Err(error) if error.is_cancelled() => {
+                    debug!("health monitor aborted and reaped");
+                }
+                Err(error) => {
+                    warn!(?error, "health monitor task failed while being aborted");
+                }
+            }
+        }
+    }
+}
 
 /// Total CPU charged to this process's REAPED children so far (`RUSAGE_CHILDREN`).
 ///
@@ -1046,32 +1077,13 @@ async fn cleanup_vm_inner(
         Ok::<(), anyhow::Error>(())
     };
     let health_stopped = async {
-        let Some(mut handle) = health_monitor_handle else {
-            return Ok::<(), anyhow::Error>(());
-        };
-        tokio::select! {
-            result = &mut handle => {
-                match result {
-                    Ok(()) => debug!("health monitor stopped gracefully"),
-                    Err(error) if error.is_cancelled() => {}
-                    Err(error) => return Err(error).context("joining health monitor"),
-                }
-            }
-            _ = tokio::time::sleep(HEALTH_MONITOR_STOP_BUDGET) => {
-                if verified {
-                    handle.abort();
-                    match handle.await {
-                        Ok(()) => {}
-                        Err(error) if error.is_cancelled() => {}
-                        Err(error) => return Err(error).context("joining aborted health monitor"),
-                    }
-                    debug!("health monitor didn't stop in time; aborted and joined it");
-                } else {
-                    debug!("health monitor didn't stop in time, continuing cleanup");
-                }
-            }
+        // Unconditional abort-and-reap: dropping a live JoinHandle detaches its
+        // task, which could keep using the network namespace after cleanup has
+        // begun destroying it — on the fast path as much as the verified one.
+        if let Some(handle) = health_monitor_handle {
+            stop_health_monitor(handle).await;
         }
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     };
     let listeners_stopped = async {
         let mut errors = Vec::new();
@@ -3505,6 +3517,61 @@ mod tests {
         verify_process_reaped("test", Some((pid, start + 1)))
             .expect("a reused PID with a different start time is not the owned process");
         verify_process_reaped("test", None).expect("an unstarted process owns no resource");
+    }
+
+    /// A health monitor that ignores cooperative cancellation must still be gone before the
+    /// stop barrier returns. Before the fix, the timeout branch dropped its `JoinHandle`,
+    /// detaching the task; this test then observed `dropped == false`.
+    #[tokio::test(start_paused = true)]
+    async fn health_monitor_timeout_aborts_and_reaps_task() {
+        struct DropOracle(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropOracle {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ignored_cancel = cancel.clone();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = std::sync::Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let health_monitor = tokio::spawn(async move {
+            let _drop_oracle = DropOracle(task_dropped);
+            let _ignored_cancel = ignored_cancel;
+            started_tx.send(()).unwrap();
+            // Deliberately ignore graceful cancellation forever. Tokio abort must destroy
+            // this future, and awaiting its JoinHandle must observe that destruction.
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        cancel.cancel();
+
+        let stopper = tokio::spawn(stop_health_monitor(health_monitor));
+        tokio::task::yield_now().await;
+        assert!(
+            !stopper.is_finished(),
+            "the graceful-stop budget must be honored"
+        );
+
+        tokio::time::advance(HEALTH_MONITOR_STOP_BUDGET - std::time::Duration::from_millis(1))
+            .await;
+        tokio::task::yield_now().await;
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the monitor must not be aborted before its graceful-stop budget"
+        );
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), stopper)
+            .await
+            .expect("health-monitor stop remained blocked after abort")
+            .expect("health-monitor stopper task panicked");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the timed-out health-monitor future must be dropped before the stop barrier returns"
+        );
     }
 
     /// Regression guard for the deaf-clone bug: a snapshot taken from a restored
