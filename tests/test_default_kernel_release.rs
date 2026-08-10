@@ -180,7 +180,7 @@ fn kernel_workflow_builds_and_releases_default_for_both_runner_arches() {
         .collect::<Vec<_>>()
         .join("\n");
     for required in [
-        "setup --kernel-profile default --build-kernels",
+        "make release-default-kernel",
         "kernel_sha",
         "gh release view",
         "gh release create",
@@ -191,4 +191,20 @@ fn kernel_workflow_builds_and_releases_default_for_both_runner_arches() {
             "default release job is missing `{required}`"
         );
     }
+
+    // The workflow delegates the build to make, so the invariant that the
+    // release binary comes from `--kernel-profile default` now lives in the
+    // recipe. Check the whole chain, not just the hand-off: a Makefile edit
+    // that drops the profile flag would otherwise leave the workflow releasing
+    // whatever kernel a bare `setup` happens to produce.
+    let makefile = std::fs::read_to_string(repo_root().join("Makefile")).unwrap();
+    let recipe_start = makefile
+        .find("\nrelease-default-kernel:")
+        .expect("Makefile no longer defines release-default-kernel");
+    let recipe = &makefile[recipe_start + 1..];
+    let recipe = &recipe[..recipe.find("\n\n").unwrap_or(recipe.len())];
+    assert!(
+        recipe.contains("setup --kernel-profile default --build-kernels"),
+        "release-default-kernel no longer builds the default profile; recipe is:\n{recipe}"
+    );
 }
