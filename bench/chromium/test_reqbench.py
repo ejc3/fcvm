@@ -12,6 +12,7 @@ There is no pytest in this repo, so this is stdlib `unittest` only.
 """
 
 import argparse
+import ctypes
 import fcntl
 import hashlib
 import io
@@ -28,7 +29,7 @@ import threading
 import time
 import unittest
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -120,6 +121,76 @@ def kill_tree(p):
         p.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+
+
+PR_SET_CHILD_SUBREAPER = 36
+PR_GET_CHILD_SUBREAPER = 37
+
+
+@contextmanager
+def child_subreaper():
+    """Adopt orphaned grandchildren for the duration, so this process reaps them.
+
+    Whether a killed orphan's `/proc/<pid>` entry disappears is a property of
+    whoever inherits it, not of the kill. Under a PID 1 that reaps (systemd on a
+    normal host) it vanishes; under a PID 1 that does not (a container, or
+    `unshare --pid --fork`) the corpse stays in state `Z` forever and a test
+    that waits for the entry to go away waits out its whole deadline and then
+    fails, while the process it was asking about has in fact been dead the whole
+    time. Becoming the subreaper makes the orphan OURS, so the test can reap it
+    itself and read how it died instead of inferring death from an absence.
+    """
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    previous = ctypes.c_int(0)
+    restore = libc.prctl(PR_GET_CHILD_SUBREAPER, ctypes.byref(previous),
+                         0, 0, 0) == 0
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
+    try:
+        yield
+    finally:
+        libc.prctl(PR_SET_CHILD_SUBREAPER,
+                   previous.value if restore else 0, 0, 0, 0)
+
+
+def reap_orphan(pid, note, timeout=5.0):
+    """Reap an adopted orphan and return its raw wait status.
+
+    Returns None when the pid is not ours to wait for, which is the case on a
+    host whose PID 1 got there first; the caller then has to settle for the
+    weaker evidence. Raises `note` if it is ours and still running at the
+    deadline, because that is the defect the caller is testing for.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            reaped, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return None
+        if reaped == pid:
+            return status
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"{note}: pid {pid} is still running {timeout:.0f}s later, "
+                f"state {reqbench.proc_stat_fields(pid)}"
+            )
+        time.sleep(0.01)
+
+
+def assert_sigkilled(test, pid, status, note):
+    """Assert `pid` was KILLED, from its exit status where we have one.
+
+    The status is the direct evidence and says which signal did it. Only when
+    the orphan was never ours does this fall back to the procfs entry being
+    gone, which is a claim about the reaper as much as about the kill.
+    """
+    if status is None:
+        test.assertIsNone(reqbench.proc_stat_fields(pid), note)
+        return
+    test.assertTrue(
+        os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL,
+        f"{note}: it ended on its own with wait status {status:#x}",
+    )
 
 
 def write_graceful_clone_stub(path, state_path, data_dir, name, term_path):
@@ -4465,10 +4536,12 @@ class FailureProbeCapture(unittest.TestCase):
         `fcvm exec`'s own connect ladder spans ~54 s, and the exec holds a
         command running inside the guest, so killing only the direct child would
         leave the real work behind. The bound therefore kills the process GROUP,
-        and this checks the grandchild is gone rather than checking the wrapper
-        returned.
+        and this asserts the grandchild was KILLED rather than asserting its
+        procfs entry went away — those are different claims, and the second one
+        is about the reaper rather than about the kill. This test adopts the
+        orphan and reads its exit status, so it says what it means.
         """
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, child_subreaper():
             state_dir = os.path.join(d, "state")
             os.makedirs(state_dir)
             stub, state_path, _, sleep_pid_file = self._stub_clone(
@@ -4487,15 +4560,9 @@ class FailureProbeCapture(unittest.TestCase):
                              "a cut-off batch has no completed sections")
             with open(sleep_pid_file) as f:
                 grandchild = int(f.read().strip())
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if reqbench.proc_stat_fields(grandchild) is None:
-                    break
-                time.sleep(0.02)
-            self.assertIsNone(
-                reqbench.proc_stat_fields(grandchild),
-                "the timeout killed the exec wrapper but left its guest-side work",
-            )
+            note = ("the timeout killed the exec wrapper but left its "
+                    "guest-side work")
+            assert_sigkilled(self, grandchild, reap_orphan(grandchild, note), note)
 
     def test_the_capture_stops_at_its_budget_and_says_so(self):
         with tempfile.TemporaryDirectory() as d:
