@@ -783,6 +783,127 @@ pub fn install_namespace_pre_exec(
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_stderr_eof_waits_for_delayed_bulk_output() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt;
+
+        const BULK_LINES: usize = 512;
+        let (read_end, mut write_end) = tokio::io::duplex(256);
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reader_captured = Arc::clone(&captured);
+        let reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(read_end).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                reader_captured
+                    .lock()
+                    .expect("captured stderr mutex poisoned")
+                    .push(line);
+            }
+        });
+
+        let (bulk_written_tx, bulk_written_rx) = tokio::sync::oneshot::channel();
+        let (write_final_tx, write_final_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            for index in 0..BULK_LINES {
+                write_end
+                    .write_all(format!("bulk-{index}\n").as_bytes())
+                    .await
+                    .expect("writing bulk stderr");
+            }
+            bulk_written_tx
+                .send(())
+                .expect("bulk-write observer dropped");
+            write_final_rx.await.expect("final-line gate dropped");
+            write_end
+                .write_all(b"delayed-final\n")
+                .await
+                .expect("writing delayed final stderr");
+            write_end.shutdown().await.expect("closing stderr writer");
+        });
+        bulk_written_rx.await.expect("bulk writer exited early");
+
+        let (wait_started_tx, wait_started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let mut reader = Some(reader);
+            wait_started_tx
+                .send(())
+                .expect("wait-start observer dropped");
+            wait_for_stderr_eof(&mut reader, Duration::from_secs(2)).await;
+            reader
+        });
+        wait_started_rx.await.expect("stderr waiter exited early");
+        assert!(
+            !waiter.is_finished(),
+            "stderr waiter returned while the writer still held the pipe open"
+        );
+
+        write_final_tx
+            .send(())
+            .expect("stderr waiter dropped the final-line gate");
+        let remaining_reader = waiter.await.expect("stderr waiter panicked");
+        writer.await.expect("stderr writer panicked");
+        assert!(
+            remaining_reader.is_none(),
+            "stderr waiter must consume its reader handle"
+        );
+
+        let captured = captured.lock().expect("captured stderr mutex poisoned");
+        assert_eq!(captured.len(), BULK_LINES + 1);
+        assert_eq!(captured.first().map(String::as_str), Some("bulk-0"));
+        assert_eq!(captured.last().map(String::as_str), Some("delayed-final"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_stderr_eof_accepts_a_late_waiter_after_eof() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt;
+
+        let (read_end, mut write_end) = tokio::io::duplex(64);
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reader_captured = Arc::clone(&captured);
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(read_end).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                reader_captured
+                    .lock()
+                    .expect("captured stderr mutex poisoned")
+                    .push(line);
+            }
+            eof_tx.send(()).expect("EOF observer dropped");
+        });
+
+        write_end
+            .write_all(b"already-drained\n")
+            .await
+            .expect("writing stderr before EOF");
+        write_end.shutdown().await.expect("closing stderr writer");
+        drop(write_end);
+        eof_rx.await.expect("stderr reader exited before EOF");
+        assert!(
+            reader.is_finished(),
+            "reader must be terminal before waiting"
+        );
+
+        let mut reader = Some(reader);
+        wait_for_stderr_eof(&mut reader, Duration::from_secs(2)).await;
+        assert!(
+            reader.is_none(),
+            "late waiter must consume the reader handle"
+        );
+        assert_eq!(
+            captured
+                .lock()
+                .expect("captured stderr mutex poisoned")
+                .as_slice(),
+            ["already-drained"]
+        );
+
+        // A second waiter is explicitly a no-op, not an error or another wait.
+        wait_for_stderr_eof(&mut reader, Duration::ZERO).await;
+    }
+
     #[tokio::test]
     async fn dir_watch_consumes_event_queued_between_check_and_park() {
         let dir = tempfile::tempdir().expect("create watched directory");
