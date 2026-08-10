@@ -3522,34 +3522,23 @@ exec /bin/bash "$@"
                 env["RESULTS"], "runtime", os.path.basename(bundle),
             )))
 
-    def test_fcvm_no_snapshot_survives_sudo(self):
-        """RED BEFORE THE FIX: `FCVM_NO_SNAPSHOT=1 $SUDO env RUST_LOG=... fcvm ...`
-        binds the assignment to SUDO, whose default env_reset drops it. RUST_LOG
-        survives only because it rides the `env` AFTER sudo. The sibling harness
-        already does it right (bench.sh: `sudo env FCVM_NO_SNAPSHOT=1 RUST_LOG=...`),
-        so this is a local divergence, not house style. With the variable dropped,
-        `src/commands/podman/mod.rs` takes the snapshot-cache path and the phase
-        documented as `golden: cold boot` would RESTORE from a stale cached
-        snapshot and then snapshot THAT as $TAG — contaminating every arm.
-        Observed with an env_reset-emulating sudo stub: FCVM_NO_SNAPSHOT=<unset>.
+    def test_golden_delegates_the_cold_build_to_prepare(self):
+        """golden's cold-boot guarantee now lives inside `podman prepare`.
+
+        The previous flow exported FCVM_NO_SNAPSHOT=1 around a hand-rolled
+        `podman run`, and a sudo env_reset once silently dropped the assignment,
+        turning "cold boot" into a restore from a stale cached snapshot. prepare
+        forces the cold build internally (src/commands/podman/mod.rs sets
+        no_snapshot before any cache lookup), so the knob must be GONE from the
+        invocation: its reappearance would mean someone reintroduced the
+        env-sensitive dance this rework deleted. Run under an env_reset sudo to
+        hold the original failure conditions in place.
         """
         with tempfile.TemporaryDirectory() as d:
-            # Staged, like the sibling shell tests: the unstaged path re-execs
-            # itself through a content-addressed copy and first requires real
-            # fcvm and fc-agent binaries for THIS host's arch. That is a
-            # property of the box, not of the quoting under test, and on an
-            # x86 checkout of an arm64 tree it stops the phase before fcvm.
             env, binx = self._env(d, REQBENCH_STAGED="1")
             seen = os.path.join(d, "seen.txt")
             self._write(os.path.join(binx, "sudo"),
                         '#!/bin/bash\nexec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
-            # `golden` inspects the benchmark image before it ever reaches fcvm.
-            # Without this stub the test needs a real podman AND a real
-            # localhost/chromium-bench-req on the box: where either is missing
-            # the phase returns at the inspect, fcvm is never invoked, and the
-            # assertion below reports "the assignment did not survive sudo"
-            # about a command that never ran. Seen on a box whose podman had no
-            # crun: `default OCI runtime "crun" not found`.
             self._write(os.path.join(binx, "podman"), '''#!/bin/bash
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
@@ -3559,38 +3548,25 @@ exit 1
 ''')
             fcvm = os.path.join(d, "fcvm")
             self._write(fcvm, f"""#!/bin/bash
-case "$1 $2" in
-  "podman run")
-      echo "FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}
-      echo $$ > {d}/golden.pid
-      echo CHROMIUM_BENCH_READY; exec sleep 30 ;;
-  "snapshot create") echo created ;;
-  "snapshots delete") ;;
-  "ls --json")
-      pid=$(cat {d}/golden.pid)
-      if [ "$3" = "--pid" ]; then
-          echo "[{{\"pid\": $pid, \"vm_id\": \"vm-11111111111111111111111111111111\", \"health_status\": \"healthy\"}}]"
-      else
-          echo "[{{\"name\": \"cb-req-g-{self.RUN_ID}\", \"pid\": $pid}}]"
-      fi ;;
-esac
+if [ "$1 $2" = "podman prepare" ]; then
+    echo "argv=$* FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}
+    exit 1  # stop before the provenance step; the invocation is the evidence
+fi
+exit 1
 """)
-            r = subprocess.run([self.SH, "golden"], env=dict(env, SUDO="sudo", FCVM=fcvm),
-                               capture_output=True, text=True, timeout=120)
+            subprocess.run([self.SH, "golden"], env=dict(env, SUDO="sudo", FCVM=fcvm),
+                           capture_output=True, text=True, timeout=120)
             got = self._read_if_exists(seen, "<no invocation>")
-            # Separate "fcvm never ran" from "fcvm ran without the variable".
-            # One is a broken harness, the other is the defect under test, and
-            # attributing the first to the second sends the reader after sudo's
-            # env_reset for a phase that returned long before sudo.
             self.assertNotEqual(
                 got, "<no invocation>",
-                "golden never invoked fcvm, so this test observed nothing about "
-                f"the assignment: {r.stderr[-800:]}")
-            self.assertIn("FCVM_NO_SNAPSHOT=1", got,
-                          f"the assignment did not survive sudo: {got}\n{r.stderr[-800:]}")
+                "golden never invoked `fcvm podman prepare`, so this test observed nothing")
+            self.assertIn("--tag cb-req-golden", got)
+            self.assertIn("--force", got)
+            self.assertIn("FCVM_NO_SNAPSHOT=<unset>", got,
+                          f"the retired cold-boot env knob is back: {got}")
 
-    def test_golden_fails_when_fcvm_exits_before_readiness(self):
-        """A dead cold-boot child is attributed immediately, not after 300s."""
+    def test_golden_fails_when_prepare_fails(self):
+        """A failed prepare is attributed immediately, not after a poll timeout."""
         with tempfile.TemporaryDirectory() as d:
             env, binx = self._env(d, REQBENCH_STAGED="1")
             fcvm = os.path.join(d, "fcvm")
@@ -3607,32 +3583,20 @@ exit 1
                 capture_output=True, text=True, timeout=10,
             )
             self.assertNotEqual(result.returncode, 0, result.stderr)
-            self.assertIn("golden: fcvm exited before readiness (rc=42)", result.stderr)
-            self.assertNotIn("BOOT TIMEOUT", result.stderr)
+            self.assertIn("golden: PREPARE FAILED", result.stderr)
 
     def _golden_image_identity_fixture(self, d, snapshot_cache_key):
         env, binx = self._env(d, DATA_ROOT=d)
         argv = os.path.join(d, "fcvm-argv.log")
-        pid_file = os.path.join(d, "golden.pid")
         digest = "a" * 64
         image_id = "b" * 64
         fcvm = os.path.join(d, "fcvm")
+        # The prepare stub installs what the real one installs: the snapshot
+        # generation directory with its config.json, under the tag's lock.
         self._write(fcvm, f'''#!/bin/bash
 echo "$*" >> {argv}
 case "$1 $2" in
-  "snapshots delete") exit 0 ;;
-  "podman run")
-      echo $$ > {pid_file}
-      echo CHROMIUM_BENCH_READY
-      exec sleep 30
-      ;;
-  "ls --json")
-      pid=$(cat {pid_file})
-      cat <<EOF
-[{{"name":"cb-req-g-{self.RUN_ID}","pid":$pid,"vm_id":"vm-11111111111111111111111111111111","health_status":"healthy"}}]
-EOF
-      ;;
-  "snapshot create")
+  "podman prepare")
       mkdir -p "$DATA_ROOT/snapshots/$TAG"
       : > "$DATA_ROOT/snapshots/$TAG.lock"
       cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
@@ -3662,13 +3626,15 @@ exit 1
                 d, "a" * 64,
             )
             self.assertEqual(result.returncode, 0, result.stderr[-1600:])
-            podman_run = next(
-                line for line in argv.splitlines() if line.startswith("podman run ")
+            prepare_line = next(
+                line for line in argv.splitlines() if line.startswith("podman prepare ")
             )
             self.assertTrue(
-                podman_run.endswith(" localhost/chromium-bench-req"), podman_run,
+                prepare_line.endswith(" localhost/chromium-bench-req"), prepare_line,
             )
-            self.assertNotIn(image_id, podman_run)
+            self.assertIn("--tag cb-req-golden", prepare_line)
+            self.assertIn("--force", prepare_line)
+            self.assertNotIn(image_id, prepare_line)
             with open(os.path.join(
                 d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
             )) as source:

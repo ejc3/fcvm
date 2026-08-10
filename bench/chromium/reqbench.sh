@@ -5,7 +5,7 @@
 # incrementally as it executes, so editing bench.sh while a run is in flight
 # corrupts that run. This file is self-contained; bench.sh is untouched.
 #
-#   ./reqbench.sh golden      # cold boot with CDP published, snapshot at the health gate
+#   ./reqbench.sh golden      # podman prepare: cold build, snapshot at the image health gate
 #   ./reqbench.sh verify      # prove all three hops on a RESTORED CLONE (do this first)
 #   ./reqbench.sh run         # the three-arm A/B
 #
@@ -250,20 +250,6 @@ stop_tracked() {
     return "$forced"
 }
 
-# `$pid` is our unreaped shell child, so its numeric PID cannot be reused until
-# wait(2) below. Detecting the zombie through /proc therefore closes the gap
-# where a failed fcvm child could leave a phase polling for five minutes for
-# state that will never appear.
-BACKGROUND_CHILD_RC=""
-background_child_exited() {
-    local pid="$1" rc=0
-    process_identity "$pid" >/dev/null && return 1
-    wait "$pid" || rc=$?
-    untrack "$pid"
-    BACKGROUND_CHILD_RC="$rc"
-    return 0
-}
-
 CLEANUP_RAN=0
 
 cleanup() {
@@ -434,10 +420,9 @@ cmd_build() {
 }
 
 cmd_golden() {
-    log "golden: cold boot with CDP published on $CDP_PORT -> snapshot $TAG"
-    $SUDO "$FCVM" snapshots delete -f "$TAG" >/dev/null 2>&1 || true
+    log "golden: podman prepare --tag $TAG (cold build, snapshot at the image health gate)"
     local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
-    local image_record image_digest image_id image_cache_key source_vm_id
+    local image_record image_digest image_id image_cache_key
     # One inspect binds the mutable tag's manifest digest and immutable image ID
     # to the same observation. fcvm performs the same atomic resolution before
     # exporting by ID; the cache-path check committed with the snapshot below
@@ -463,77 +448,35 @@ cmd_golden() {
     fi
     # --publish carries host -> guest; fc-agent DNATs the published port to
     # guest loopback (fc-agent/src/network.rs::publish_to_loopback), the hop
-    # Chromium refuses to make itself. Clones inherit port_mappings from the snapshot
-    # metadata (src/commands/snapshot.rs:1070), which is what makes a restored
-    # clone drivable at all.
-    # NO --health-check URL: leaving it unset is what makes fcvm consult the
-    # image's podman HEALTHCHECK (src/health.rs "AND logic"), which is the real
-    # CDP round trip we want as the snapshot trigger.
-    # The assignment goes AFTER $SUDO, inside the `env` that follows it. Written
-    # as `FCVM_NO_SNAPSHOT=1 $SUDO env RUST_LOG=... fcvm ...` it binds to `sudo`,
-    # whose default env_reset drops it — RUST_LOG survived only because it already
-    # rode the `env`. bench.sh in this same directory has always done it right.
-    # With the variable dropped, src/commands/podman/mod.rs gates `no_snapshot`
-    # false and this phase — documented as "golden: cold boot" — would RESTORE
-    # from a stale cached snapshot and then snapshot THAT as $TAG, contaminating
-    # every arm derived from it. Latent while SUDO defaults to "", live the moment
-    # anyone uses the documented root-mode hook.
-    $SUDO env FCVM_NO_SNAPSHOT=1 RUST_LOG="$FCVM_LOG" "$FCVM" podman run --name "$name" \
-        --cpu "$CPU" --mem "$MEM" --network "$NETMODE" --publish "$CDP_PORT:$CDP_PORT" \
-        "$IMAGE" >"$lf" 2>&1 &
-    # Capture the handle IMMEDIATELY. The BOOT TIMEOUT path below fires before any
-    # state file exists, so `$!` is the ONLY way to reach this VM at that point.
-    local vm_bg=$!
-    track "$vm_bg"
-    local t0=$SECONDS pid=""
-    until grep -q CHROMIUM_BENCH_READY "$lf" 2>/dev/null; do
-        if background_child_exited "$vm_bg"; then
-            log "golden: fcvm exited before readiness (rc=$BACKGROUND_CHILD_RC)"
-            tail -20 "$lf" >&2
-            return 1
-        fi
-        [ $((SECONDS-t0)) -lt 300 ] || { log "golden: BOOT TIMEOUT"; tail -20 "$lf" >&2; return 1; }
-        sleep 1
-    done
-    pid=$(state_pid_by_name "$name")
-    [ -n "$pid" ] || { log "golden: no state pid"; return 1; }
-    track "$pid"
-    source_vm_id=$(state_vm_id_by_pid "$pid")
-    [ -n "$source_vm_id" ] || { log "golden: state has no source vm_id"; return 1; }
-
-    # Wait for fcvm to publish Healthy — i.e. for the container HEALTHCHECK's real
-    # CDP round trip to pass. THIS is the warm point the snapshot must capture.
-    log "golden: waiting for fcvm health gate (pid $pid)"
-    t0=$SECONDS
-    until [ "$($SUDO "$FCVM" ls --json --pid "$pid" | python3 -c \
-              'import json,sys; print(json.load(sys.stdin)[0].get("health_status",""))')" = healthy ]; do
-        if background_child_exited "$vm_bg"; then
-            log "golden: fcvm exited before the health gate (rc=$BACKGROUND_CHILD_RC)"
-            tail -20 "$lf" >&2
-            return 1
-        fi
-        [ $((SECONDS-t0)) -lt 300 ] || { log "golden: HEALTH TIMEOUT"; tail -20 "$lf" >&2; return 1; }
-        sleep 1
-    done
-    log "golden: healthy after $((SECONDS-t0))s — snapshotting"
-    # Guarded: unguarded, a failed `snapshot create` exits the shell under `set -e`
-    # before the kill below, leaking a live VM. Now it reaches the trap.
-    $SUDO "$FCVM" snapshot create --pid "$pid" --tag "$TAG" >>"$lf" 2>&1 \
-        || { log "golden: SNAPSHOT CREATE FAILED"; tail -20 "$lf" >&2; return 1; }
+    # Chromium refuses to make itself. Clones inherit port_mappings from the
+    # snapshot metadata, which is what makes a restored clone drivable at all.
+    #
+    # `podman prepare` owns the lifecycle this phase used to hand-roll: it
+    # forces a cold build (no snapshot-cache restore, the contamination the old
+    # FCVM_NO_SNAPSHOT=1 dance guarded against), requires and waits for the
+    # image's podman HEALTHCHECK — the real CDP round trip — as the capture
+    # trigger, installs the generation atomically under the tag, verifies the
+    # installed artifact, and tears the source VM down with verified cleanup.
+    # --force replaces a stale tag, which also retires the explicit
+    # `snapshots delete` this phase used to need.
+    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force \
+        --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
+        --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" >"$lf" 2>&1 \
+        || { log "golden: PREPARE FAILED"; tail -20 "$lf" >&2; return 1; }
     # Bind the mutable image tag to the exact content captured by this snapshot.
     # The file lives inside the atomically replaced snapshot directory and names
     # its generation, so a recreated tag cannot inherit stale provenance.
     $SUDO python3 - "$DATA_ROOT/snapshots/$TAG/config.json" \
         "$DATA_ROOT/snapshots/$TAG/reqbench-provenance.json" \
         "$DATA_ROOT/snapshots/$TAG.lock" "$IMAGE" "$image_id" "$image_digest" \
-        "$image_cache_key" "$source_vm_id" \
+        "$image_cache_key" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
         "${REQBENCH_SOURCE_REVISION:-}" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
-    image_cache_key, source_vm_id,
+    image_cache_key,
     fcvm_sha256, runtime_bundle_sha256, source_revision,
 ) = sys.argv[1:]
 lock = open(lock_path, "a+")
@@ -562,11 +505,11 @@ if not os.path.basename(image_disk_path).startswith(image_cache_key + "."):
         f"snapshot image disk {image_disk_path!r} does not match inspected "
         f"cache key {image_cache_key!r}; the image tag changed during golden creation"
     )
-if config.get("vm_id") != source_vm_id:
-    raise SystemExit(
-        f"snapshot source {config.get('vm_id')!r} does not match golden {source_vm_id!r}; "
-        "the tag changed before provenance could be committed"
-    )
+# The source VM identity comes from the installed generation itself: prepare
+# writes config.json atomically with the generation, and the reader validates
+# provenance against the config in the SAME directory, so a tag replaced
+# between this read and the provenance write strands the record in an orphaned
+# generation and the reader fails closed asking for a fresh golden.
 record = {
     "snapshot_generation_id": generation_id,
     "snapshot_config_sha256": config_sha256,
@@ -602,10 +545,6 @@ except BaseException:
         pass
     raise
 PY
-    stop_tracked "$pid" \
-        || { log "golden: fcvm required SIGKILL; cleanup was not graceful"; return 1; }
-    stop_tracked "$vm_bg" \
-        || { log "golden: fcvm required SIGKILL; cleanup was not graceful"; return 1; }
     log "golden: done ($TAG)"
 }
 
