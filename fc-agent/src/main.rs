@@ -11,6 +11,7 @@ mod network;
 mod output;
 mod proxy;
 mod restore;
+mod snapshot_network;
 mod system;
 mod tty;
 mod types;
@@ -58,6 +59,26 @@ async fn main() {
     if std::env::args().any(|a| a == "--notify-reboot") {
         let ok = vsock::notify_reboot();
         std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    // Snapshot network boundary one-shots are invoked by the host immediately
+    // around the VMM pause/save/resume transaction. They must not start the
+    // long-running agent a second time, and any failure must be visible in the
+    // exec exit status so snapshot creation fails closed.
+    let one_shot = std::env::args().nth(1);
+    let one_shot_result = match one_shot.as_deref() {
+        Some("--prepare-snapshot-network") => {
+            Some(snapshot_network::prepare_snapshot_network().await)
+        }
+        Some("--resume-snapshot-network") => Some(snapshot_network::resume_source_network().await),
+        _ => None,
+    };
+    if let Some(result) = one_shot_result {
+        if let Err(error) = result {
+            eprintln!("[fc-agent] snapshot network boundary failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     // Use a non-blocking writer for stderr so that log writes never block the
