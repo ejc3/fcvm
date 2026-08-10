@@ -94,6 +94,7 @@ fn exec_vsock_socket_path(vm_state: &crate::state::VmState) -> Result<PathBuf> {
 }
 
 /// The same decision against a caller-supplied runtime directory, for tests.
+#[cfg(test)]
 fn exec_vsock_socket_path_in(
     vm_state: &crate::state::VmState,
     runtime_dir: &Path,
