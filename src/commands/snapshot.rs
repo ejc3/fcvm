@@ -174,7 +174,11 @@ impl CloneSetupResources {
         // through exportfs. Data is removed only after all socket owners are
         // joined; state is the final deletion, so a disk-removal failure keeps
         // its identifying pointer instead of creating an unattributed orphan.
-        crate::commands::podman::cleanup_nfs_exports(&self.vm_id).await;
+        if let Err(error) = crate::commands::podman::cleanup_nfs_exports(&self.vm_id).await {
+            errors.push(format!(
+                "removing NFS exports after failed clone setup: {error:#}"
+            ));
+        }
         let mut data_removed = true;
         match tokio::fs::remove_dir_all(&self.data_dir).await {
             Ok(()) => {}
@@ -566,6 +570,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     &vm_disk_path,
                     parent_dir.as_deref(),
                     None,
+                    super::common::SnapshotSourceDisposition::Resume,
                 )
                 .await?;
             }
@@ -1383,6 +1388,7 @@ async fn cmd_snapshot_run_inner(
                 None,
                 reconnect,
                 non_blocking_output,
+                true,
                 Some(output_connected_tx),
             )
             .await
@@ -2495,7 +2501,11 @@ async fn cmd_snapshot_run_inner(
                                 remap_refs: &volume_servers.remap_refs,
                             };
                             tokio::select! {
-                                outcome = create_snapshot_interruptible(&snap, &cancel) => {
+                                outcome = create_snapshot_interruptible(
+                                    &snap,
+                                    &cancel,
+                                    super::common::SnapshotSourceDisposition::Resume,
+                                ) => {
                                     match outcome {
                                         SnapshotOutcome::Interrupted => {
                                             container_exit_code = None;

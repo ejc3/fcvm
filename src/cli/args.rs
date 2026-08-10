@@ -117,6 +117,8 @@ pub struct PodmanArgs {
 pub enum PodmanCommands {
     /// Run a container in a microVM (Firecracker or Cloud Hypervisor)
     Run(RunArgs),
+    /// Build and verify the healthy startup snapshot, then reap the disposable VM
+    Prepare(RunArgs),
 }
 
 #[derive(Args, Debug)]
@@ -709,9 +711,41 @@ mod tests {
         match cli.cmd {
             Commands::Podman(podman) => match podman.cmd {
                 PodmanCommands::Run(run) => run,
+                PodmanCommands::Prepare(_) => panic!("expected `podman run` command"),
             },
             _ => panic!("expected `podman run` command"),
         }
+    }
+
+    #[test]
+    fn prepare_accepts_the_run_configuration_shape() {
+        let cli = Cli::try_parse_from([
+            "fcvm",
+            "podman",
+            "prepare",
+            "--name",
+            "prepared-web",
+            "--cpu",
+            "4",
+            "--health-check",
+            "http://web.internal/ready",
+            "nginx:alpine",
+        ])
+        .expect("prepare CLI should parse");
+
+        let Commands::Podman(podman) = cli.cmd else {
+            panic!("expected podman command");
+        };
+        let PodmanCommands::Prepare(args) = podman.cmd else {
+            panic!("expected podman prepare command");
+        };
+        assert_eq!(args.name, "prepared-web");
+        assert_eq!(args.cpu, 4);
+        assert_eq!(args.image, "nginx:alpine");
+        assert_eq!(
+            args.health_check.as_deref(),
+            Some("http://web.internal/ready")
+        );
     }
 
     #[test]

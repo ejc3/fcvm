@@ -50,6 +50,10 @@ pub(crate) async fn run_status_listener(
 
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
+    // Cache-close drains must not block the accept loop, but they remain children of this
+    // listener. Dropping the JoinSet on listener shutdown aborts every outstanding drain,
+    // which makes a joined status-listener handle proof that no detached socket task remains.
+    let mut cache_close_drains = tokio::task::JoinSet::new();
 
     // Accept connections for the lifetime of the VM ("cache-ready", "ready",
     // "exit:", "reboot", host-side "drain" probes). No idle timeout: a VM can run
@@ -57,6 +61,11 @@ pub(crate) async fn run_status_listener(
     // listener (plus its socket) would silently break reboot-in-place and exit
     // reporting. The run loop's cleanup aborts this task.
     loop {
+        while let Some(result) = cache_close_drains.try_join_next() {
+            if let Err(error) = result {
+                warn!(vm_id = %vm_id, error = %error, "cache-close drain task failed");
+            }
+        }
         let (stream, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -267,13 +276,13 @@ pub(crate) async fn run_status_listener(
                 // window cannot give that guarantee — a probe landing one
                 // millisecond after it expires reopens exactly the same race.
                 //
-                // Detached so the accept loop is never held up. The next
+                // Concurrent so the accept loop is never held up. The next
                 // connection carries "ready", and it must not queue behind a
                 // guest that is slow to close — or never closes, which is the
                 // normal outcome when the ack was suppressed above and this VM is
                 // being torn down and replaced by a restore.
                 let drain_vm_id = vm_id.to_string();
-                tokio::spawn(async move {
+                cache_close_drains.spawn(async move {
                     let deadline = tokio::time::Instant::now() + CACHE_ACK_CLOSE_TIMEOUT;
                     let mut probe = String::new();
                     loop {
@@ -395,6 +404,7 @@ pub(crate) async fn run_output_listener(
     log_tx: Option<tokio::sync::broadcast::Sender<LogLine>>,
     reconnect_notify: Arc<tokio::sync::Notify>,
     non_blocking_output: bool,
+    emit_output: bool,
     connected_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -409,7 +419,7 @@ pub(crate) async fn run_output_listener(
     // In non-blocking mode, use a bounded channel + writer thread so the
     // listener never blocks on stdout/stderr. Messages are dropped when the
     // channel is full, preventing backpressure from cascading into the container.
-    let nb_tx = if non_blocking_output {
+    let nb_tx = if non_blocking_output && emit_output {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(bool, String)>(1024);
         std::thread::Builder::new()
             .name("output-writer".into())
@@ -497,14 +507,20 @@ pub(crate) async fn run_output_listener(
                                 // error, which kills the listener task and stops
                                 // draining the vsock — deadlocking the container.
                                 let is_stdout = stream == "stdout";
-                                if let Some(ref tx) = nb_tx {
-                                    // Non-blocking mode: try_send drops if channel full.
-                                    // Writer thread handles the blocking stdout write.
-                                    let _ = tx.try_send((is_stdout, content.to_string()));
-                                } else if is_stdout {
-                                    let _ = writeln!(std::io::stdout(), "{}", content);
-                                } else {
-                                    let _ = writeln!(std::io::stderr(), "{}", content);
+                                // `podman prepare` reserves stdout for its single JSON result
+                                // and stderr for host diagnostics, so it forwards nothing here.
+                                // The line is still read and recorded below, so a silenced guest
+                                // can never backpressure container startup.
+                                if emit_output {
+                                    if let Some(ref tx) = nb_tx {
+                                        // Non-blocking mode: try_send drops if channel full.
+                                        // Writer thread handles the blocking stdout write.
+                                        let _ = tx.try_send((is_stdout, content.to_string()));
+                                    } else if is_stdout {
+                                        let _ = writeln!(std::io::stdout(), "{}", content);
+                                    } else {
+                                        let _ = writeln!(std::io::stderr(), "{}", content);
+                                    }
                                 }
                                 output_lines.push((stream.to_string(), content.to_string()));
                             }
@@ -627,7 +643,7 @@ mod tests {
         let socket_str = socket_path.to_string_lossy().to_string();
         let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
         let handle = tokio::spawn(async move {
-            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy, None).await
+            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy, true, None).await
         });
         for _ in 0..50 {
             if socket_path.exists() {

@@ -125,6 +125,16 @@ impl SnapshotGeneration {
             config_digest: Sha256::digest(config_json).into(),
         }
     }
+
+    /// UUID written into the exact installed `config.json` generation.
+    pub fn generation_id(&self) -> uuid::Uuid {
+        self.generation_id
+    }
+
+    /// SHA-256 of the exact installed `config.json` bytes.
+    pub fn config_digest_hex(&self) -> String {
+        hex::encode(self.config_digest)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
