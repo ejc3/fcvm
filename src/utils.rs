@@ -345,10 +345,14 @@ pub async fn wait_for_stderr_eof(
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     timeout: Duration,
 ) {
-    let Some(handle) = reader.take() else {
+    let Some(mut handle) = reader.take() else {
         return;
     };
-    if tokio::time::timeout(timeout, handle).await.is_err() {
+    if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+        // Timing out must also stop the reader: dropping a JoinHandle only
+        // detaches the task, which would leave it consuming the pipe (and
+        // logging under this attempt's context) while the next attempt runs.
+        handle.abort();
         warn!(
             timeout_ms = timeout.as_millis() as u64,
             "stderr pipe did not reach EOF within the bound; error output may be truncated"
@@ -864,5 +868,38 @@ mod tests {
     #[test]
     fn test_strip_firecracker_prefix_plain() {
         assert_eq!(strip_firecracker_prefix("plain message"), "plain message");
+    }
+
+    #[tokio::test]
+    async fn stderr_eof_timeout_aborts_the_reader() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A reader whose pipe never reaches EOF: the sender side stays held,
+        // standing in for a grandchild that inherited the write end.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_in_task = reads.clone();
+        let mut reader = Some(tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                reads_in_task.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        // The channel is still open, so this must take the timeout path.
+        wait_for_stderr_eof(&mut reader, Duration::from_millis(50)).await;
+        assert!(reader.is_none(), "the handle must be taken either way");
+
+        // The timed-out reader must be aborted, not detached: data arriving
+        // after the bound must never be consumed under the old attempt's
+        // context. Detached (the bug), the still-live task consumes the send
+        // immediately; aborted, its receiver is gone and the send just fails.
+        let _ = tx.send(1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "stderr reader survived its EOF timeout and kept consuming the pipe"
+        );
     }
 }
