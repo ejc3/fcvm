@@ -410,7 +410,7 @@ clean:
 
 # Run-only targets (no setup deps, used by container)
 _test-unit: cargo-target-link
-	$(NEXTEST) --no-default-features
+	$(NEXTEST) --no-default-features $(FILTER)
 
 _test-fast: cargo-target-link
 	RUST_LOG="$(TEST_LOG)" \
