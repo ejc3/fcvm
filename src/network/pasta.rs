@@ -446,6 +446,25 @@ impl PastaNetwork {
         Some(proxy_url)
     }
 
+    /// Kill a pasta process that missed its PID-file deadline, then construct the
+    /// timeout error only after the stderr reader has drained to EOF.
+    async fn pasta_pid_deadline_error(
+        &mut self,
+        child: &mut Child,
+        ready_timeout: std::time::Duration,
+    ) -> anyhow::Error {
+        let _ = child.kill().await;
+        // `kill()` closes pasta's stderr write end, but the reader task can still
+        // be draining buffered final lines. Await EOF before rendering the tail,
+        // just like the child-exit branch in `start_pasta`.
+        crate::utils::wait_for_stderr_eof(&mut self.stderr_reader, PASTA_STDERR_EOF_TIMEOUT).await;
+        anyhow::anyhow!(
+            "pasta did not become ready within {:?}{}",
+            ready_timeout,
+            self.stderr_tail_message()
+        )
+    }
+
     /// Start pasta process attached to the namespace
     ///
     /// pasta creates its own TAP device (pasta0) in the namespace and provides
@@ -737,11 +756,9 @@ impl PastaNetwork {
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    let _ = child.kill().await;
-                    anyhow::bail!(
-                        "pasta did not become ready within {:?}{}",
-                        PASTA_READY_TIMEOUT,
-                        self.stderr_tail_message()
+                    return Err(
+                        self.pasta_pid_deadline_error(&mut child, PASTA_READY_TIMEOUT)
+                            .await,
                     );
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
@@ -1155,6 +1172,55 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pasta_pid_deadline_waits_for_delayed_final_stderr() -> Result<()> {
+        let mut network = PastaNetwork::new(
+            "vm-deadline-stderr".to_string(),
+            "tap-fc".to_string(),
+            vec![],
+        );
+
+        // `cat` stays alive on its piped stdin until the deadline branch kills it.
+        // ProcessWatch is the exact, event-driven signal that the kill completed;
+        // only then does this stand-in reader publish pasta's final stderr line.
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawning deadline fixture")?;
+        let child_pid = child.id().context("deadline fixture has no PID")?;
+        let mut child_exit = crate::utils::ProcessWatch::open(child_pid)?
+            .context("deadline fixture exited before it could be watched")?;
+        let stderr_tail = Arc::clone(&network.stderr_tail);
+        network.stderr_reader = Some(tokio::spawn(async move {
+            child_exit.exited().await;
+            stderr_tail
+                .lock()
+                .expect("stderr tail mutex poisoned")
+                .push_back("delayed final pasta diagnostic".to_string());
+        }));
+
+        let error = network
+            .pasta_pid_deadline_error(&mut child, std::time::Duration::ZERO)
+            .await;
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("delayed final pasta diagnostic"),
+            "timeout rendered stderr before its reader reached EOF: {message}"
+        );
+        assert!(
+            network.stderr_reader.is_none(),
+            "deadline path must consume the stderr reader handle"
+        );
+        assert!(
+            child.try_wait()?.is_some(),
+            "deadline path must reap the killed pasta process"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_network_creation() {
