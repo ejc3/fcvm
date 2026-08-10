@@ -2231,6 +2231,10 @@ async fn cmd_snapshot_run_inner(
                     // `bail!` turns it into a non-zero exit. `cleanup_vm` then kills the
                     // VMM — a wedged task waits in TASK_KILLABLE (`fs/userfaultfd.c`), so
                     // SIGKILL does reap it, measured under 2s on an already-parked clone.
+                    // That reap is enforced (5s ceiling, concurrent clones) by
+                    // `concurrent_sigkill_reaps_clones_parked_on_unserved_faults` in
+                    // tests/test_snapshot_clone.rs, so a kernel rebase that breaks the
+                    // killable property fails a test instead of wedging a runner.
                     clone_failure = Some(format!(
                         "its memory server (PID {}) exited while this clone was still \
                          running. Every page not already faulted in is unreachable, and \

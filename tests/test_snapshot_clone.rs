@@ -2598,6 +2598,346 @@ async fn a_clone_dies_when_its_memory_server_dies() -> Result<()> {
     Ok(())
 }
 
+/// comm, state, ppid, starttime (fields 2, 3, 4, 22) from `/proc/<pid>/stat`.
+/// comm may contain spaces and parens, so parse around the LAST `)`.
+#[cfg(feature = "privileged-tests")]
+fn proc_stat(pid: u32) -> Option<(String, char, u32, u64)> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    let comm = text[open + 1..close].to_string();
+    let rest: Vec<&str> = text[close + 1..].split_whitespace().collect();
+    let state = rest.first()?.chars().next()?;
+    let ppid = rest.get(1)?.parse().ok()?;
+    let starttime = rest.get(19)?.parse().ok()?;
+    Some((comm, state, ppid, starttime))
+}
+
+#[cfg(feature = "privileged-tests")]
+fn is_descendant_of(mut pid: u32, ancestor: u32) -> bool {
+    for _ in 0..32 {
+        if pid == ancestor {
+            return true;
+        }
+        if pid <= 1 {
+            return false;
+        }
+        match proc_stat(pid) {
+            Some((_, _, ppid, _)) => pid = ppid,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The firecracker process under a given fcvm, as (pid, starttime). The
+/// starttime pins identity across the assertion window: a reused PID has a
+/// different starttime, so it can never masquerade as an unreaped VMM.
+#[cfg(feature = "privileged-tests")]
+fn find_firecracker_descendant(fcvm_pid: u32) -> Option<(u32, u64)> {
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Some((comm, _, _, starttime)) = proc_stat(pid) else {
+            continue;
+        };
+        // TASK_COMM_LEN truncates the binary name to `firecracker-def`-style prefixes.
+        if comm.starts_with("firecracker") && is_descendant_of(pid, fcvm_pid) {
+            return Some((pid, starttime));
+        }
+    }
+    None
+}
+
+/// "Reaped" for this test means the kernel released the task: fully gone, the
+/// PID reused by a different process, or a zombie awaiting its parent's wait().
+/// What it must NOT be is a live task ignoring SIGKILL — that is the wedge.
+#[cfg(feature = "privileged-tests")]
+fn reaped_zombie_or_gone(pid: u32, starttime: u64) -> bool {
+    match proc_stat(pid) {
+        None => true,
+        Some((_, _, _, st)) if st != starttime => true,
+        Some((_, state, _, _)) => state == 'Z',
+    }
+}
+
+/// Per-TID stack/wchan/status for a survivor, mirroring what
+/// scripts/ci-stray-vm-guard.sh archives on CI. Kernel stacks need root, which
+/// privileged-tests runs have.
+#[cfg(feature = "privileged-tests")]
+fn dump_task_evidence(pid: u32) -> String {
+    let task_dir = format!("/proc/{pid}/task");
+    let Ok(entries) = std::fs::read_dir(&task_dir) else {
+        return format!("\n<{task_dir} unreadable — process gone>");
+    };
+    let mut out = String::new();
+    for entry in entries.flatten() {
+        let tid = entry.file_name().to_string_lossy().to_string();
+        let read = |file: &str| {
+            std::fs::read_to_string(entry.path().join(file))
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"))
+        };
+        let status = read("status");
+        let signal_lines: Vec<&str> = status
+            .lines()
+            .filter(|l| {
+                ["Name:", "State:", "SigPnd:", "ShdPnd:"]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+            })
+            .collect();
+        out.push_str(&format!(
+            "\n-- tid {tid}\n{}\nwchan: {}\nstack:\n{}",
+            signal_lines.join("\n"),
+            read("wchan").trim(),
+            read("stack")
+        ));
+    }
+    out
+}
+
+/// Block until some task of `fc_pid` sleeps in the userfaultfd wait path. This
+/// is the precondition gate: without it, a clone that never reached a cold page
+/// would make the reap assertion pass vacuously.
+#[cfg(feature = "privileged-tests")]
+async fn wait_until_parked_on_userfault(fc_pid: u32, deadline: Duration) -> Result<()> {
+    let start = Instant::now();
+    let mut last_seen = Vec::new();
+    while start.elapsed() < deadline {
+        last_seen.clear();
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{fc_pid}/task")) {
+            for entry in entries.flatten() {
+                let wchan = std::fs::read_to_string(entry.path().join("wchan")).unwrap_or_default();
+                if wchan.contains("userfault") {
+                    return Ok(());
+                }
+                last_seen.push(format!(
+                    "{}: {}",
+                    entry.file_name().to_string_lossy(),
+                    wchan.trim()
+                ));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "no task of firecracker {fc_pid} parked in handle_userfault within {deadline:?} \
+         (last wchans: {last_seen:?}). The cold-memory exec never reached an unserved fault, \
+         so asserting the reap now would prove nothing."
+    )
+}
+
+/// Concurrent SIGKILL during unserved faults must reap every clone VMM within 5s.
+///
+/// This is the standing control for the ARM CI failure class: during concurrent
+/// clone teardown, a SIGKILLed firecracker stayed non-zombie in D state and
+/// wedged the runner, and the evidence died with the recycled runner. The clone
+/// supervise loop's comment (src/commands/snapshot.rs) claims the benign
+/// version of that moment: a task parked on an unserved fault waits in
+/// TASK_KILLABLE (`fs/userfaultfd.c`), so SIGKILL reaps it, "measured under
+/// 2s". A measurement made once proves nothing about the next kernel rebase —
+/// this test converts it into an enforced assertion.
+///
+/// Construction: SIGSTOP the memory server (fault handlers registered but
+/// never served — the parked-forever state, without killing the server the way
+/// `a_clone_dies_when_its_memory_server_dies` does), drive two clones onto
+/// cold pages, verify each has a task in `handle_userfault` by wchan, then
+/// SIGKILL both VMMs back to back and require every one to be zombie-or-gone
+/// within 5s. A survivor gets its stack/wchan/status dumped before the bail —
+/// on a wedge, that dump IS the artifact the ARM incident never archived.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn concurrent_sigkill_reaps_clones_parked_on_unserved_faults() -> Result<()> {
+    const KILLABLE_FILE: &str = "/dev/shm/fcvm-killable";
+    const KILLABLE_BYTES: usize = 8 * 1024 * 1024;
+    const REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+    let (baseline_name, clone_prefix, snapshot_name, _) = common::unique_names("killable");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    println!("Step 1: baseline VM with an 8 MiB pattern in guest RAM");
+    let (mut baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    common::exec_in_vm(
+        baseline_pid,
+        &[&format!(
+            "yes KILLABLE | head -c {KILLABLE_BYTES} > {KILLABLE_FILE} && sync"
+        )],
+    )
+    .await
+    .context("writing the cold-memory pattern")?;
+
+    println!("Step 2: snapshot + memory server");
+    common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "killable-serve")
+            .await?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+    println!("Step 3: two clones (served by PID {serve_pid})");
+    let serve_pid_str = serve_pid.to_string();
+    let mut clone_children = Vec::new();
+    let mut clone_pids = Vec::new();
+    for i in 0..2 {
+        let name = format!("{clone_prefix}-{i}");
+        let (child, pid) = common::spawn_fcvm_with_logs(
+            &["snapshot", "run", "--pid", &serve_pid_str, "--name", &name],
+            &name,
+        )
+        .await
+        .with_context(|| format!("spawning clone {i}"))?;
+        common::poll_health_by_pid(pid, 150)
+            .await
+            .with_context(|| format!("clone {i} never became healthy"))?;
+        clone_children.push(child);
+        clone_pids.push(pid);
+    }
+
+    let mut firecrackers = Vec::new();
+    for &pid in &clone_pids {
+        let fc = find_firecracker_descendant(pid)
+            .with_context(|| format!("no firecracker child found for clone fcvm PID {pid}"))?;
+        println!(
+            "  clone fcvm {pid} -> firecracker {} (starttime {})",
+            fc.0, fc.1
+        );
+        firecrackers.push(fc);
+    }
+
+    println!("Step 4: SIGSTOP the memory server — faults now go unserved");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(serve_pid as i32),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .context("SIGSTOP serve")?;
+
+    // Assertions run in a block so SIGCONT + teardown always happen.
+    let verdict = async {
+        println!("Step 5: drive each clone onto a cold page");
+        let mut exec_children = Vec::new();
+        for &pid in &clone_pids {
+            // These execs HANG by design (the fault they trigger is never
+            // served): spawn without awaiting, discard output, kill_on_drop.
+            let child = tokio::process::Command::new(&fcvm_path)
+                .args([
+                    "exec",
+                    "--pid",
+                    &pid.to_string(),
+                    "--vm",
+                    "--",
+                    "sh",
+                    "-c",
+                    &format!("md5sum {KILLABLE_FILE}"),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .context("spawning cold-memory exec")?;
+            exec_children.push(child);
+        }
+
+        for &(fc_pid, _) in &firecrackers {
+            wait_until_parked_on_userfault(fc_pid, Duration::from_secs(60)).await?;
+        }
+        println!("  ✓ every clone has a task parked on an unserved fault");
+
+        println!("Step 6: SIGKILL both firecrackers back to back");
+        let killed_at = Instant::now();
+        for &(fc_pid, _) in &firecrackers {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(fc_pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .with_context(|| format!("SIGKILL firecracker {fc_pid}"))?;
+        }
+
+        loop {
+            let survivors: Vec<u32> = firecrackers
+                .iter()
+                .filter(|&&(pid, start)| !reaped_zombie_or_gone(pid, start))
+                .map(|&(pid, _)| pid)
+                .collect();
+            if survivors.is_empty() {
+                break;
+            }
+            if killed_at.elapsed() > REAP_DEADLINE {
+                let evidence: String = survivors
+                    .iter()
+                    .map(|&pid| dump_task_evidence(pid))
+                    .collect();
+                anyhow::bail!(
+                    "firecracker PID(s) {survivors:?} still not reaped {REAP_DEADLINE:?} after \
+                     SIGKILL with tasks parked on unserved faults. handle_userfault waits in \
+                     TASK_KILLABLE, so a survivor means a kernel rebase broke the killable \
+                     property every fcvm teardown path relies on. Evidence:{evidence}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        println!(
+            "  ✓ both firecrackers reaped {}ms after SIGKILL (ceiling {REAP_DEADLINE:?})",
+            killed_at.elapsed().as_millis()
+        );
+        drop(exec_children);
+        anyhow::Ok(())
+    }
+    .await;
+
+    println!("Step 7: teardown");
+    // SIGCONT unconditionally: a stopped serve cannot run its own shutdown, and
+    // kill_process's SIGTERM would sit undelivered on it forever.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(serve_pid as i32),
+        nix::sys::signal::Signal::SIGCONT,
+    );
+    for (child, pid) in clone_children.iter_mut().zip(&clone_pids) {
+        // Each clone's VMM is gone; the supervise loop must notice and exit on
+        // its own. The forced reap is a bounded fallback, not the expectation.
+        if tokio::time::timeout(Duration::from_secs(30), child.wait())
+            .await
+            .is_err()
+        {
+            force_reap(child, *pid, "clone fcvm").await?;
+        }
+    }
+    common::kill_process(serve_pid).await;
+    common::kill_process(baseline_pid).await;
+    let _ = baseline_child.start_kill();
+    let _ = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshots", "delete", &snapshot_name])
+        .output()
+        .await;
+
+    verdict?;
+
+    // Zero survivors: with every clone fcvm reaped above, even a zombie VMM
+    // here means teardown leaked into the next test — the runner-poisoning
+    // shape the stray-VM guard exists to catch.
+    for &(fc_pid, start) in &firecrackers {
+        anyhow::ensure!(
+            proc_stat(fc_pid).is_none_or(|(_, _, _, st)| st != start),
+            "firecracker PID {fc_pid} still exists after full teardown{}",
+            dump_task_evidence(fc_pid)
+        );
+    }
+    println!("✅ CONCURRENT SIGKILL REAP TEST PASSED");
+    Ok(())
+}
+
 /// An exited clone must release the memory server's concurrency slot.
 ///
 /// Firecracker keeps a reference to its userfaultfd, but the server owns a separate copy.
