@@ -3432,10 +3432,29 @@ exec /bin/bash "$@"
         Observed with an env_reset-emulating sudo stub: FCVM_NO_SNAPSHOT=<unset>.
         """
         with tempfile.TemporaryDirectory() as d:
-            env, binx = self._env(d)
+            # Staged, like the sibling shell tests: the unstaged path re-execs
+            # itself through a content-addressed copy and first requires real
+            # fcvm and fc-agent binaries for THIS host's arch. That is a
+            # property of the box, not of the quoting under test, and on an
+            # x86 checkout of an arm64 tree it stops the phase before fcvm.
+            env, binx = self._env(d, REQBENCH_STAGED="1")
             seen = os.path.join(d, "seen.txt")
             self._write(os.path.join(binx, "sudo"),
                         '#!/bin/bash\nexec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
+            # `golden` inspects the benchmark image before it ever reaches fcvm.
+            # Without this stub the test needs a real podman AND a real
+            # localhost/chromium-bench-req on the box: where either is missing
+            # the phase returns at the inspect, fcvm is never invoked, and the
+            # assertion below reports "the assignment did not survive sudo"
+            # about a command that never ran. Seen on a box whose podman had no
+            # crun: `default OCI runtime "crun" not found`.
+            self._write(os.path.join(binx, "podman"), '''#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+    exit 0
+fi
+exit 1
+''')
             fcvm = os.path.join(d, "fcvm")
             self._write(fcvm, f"""#!/bin/bash
 case "$1 $2" in
@@ -3457,6 +3476,14 @@ esac
             r = subprocess.run([self.SH, "golden"], env=dict(env, SUDO="sudo", FCVM=fcvm),
                                capture_output=True, text=True, timeout=120)
             got = self._read_if_exists(seen, "<no invocation>")
+            # Separate "fcvm never ran" from "fcvm ran without the variable".
+            # One is a broken harness, the other is the defect under test, and
+            # attributing the first to the second sends the reader after sudo's
+            # env_reset for a phase that returned long before sudo.
+            self.assertNotEqual(
+                got, "<no invocation>",
+                "golden never invoked fcvm, so this test observed nothing about "
+                f"the assignment: {r.stderr[-800:]}")
             self.assertIn("FCVM_NO_SNAPSHOT=1", got,
                           f"the assignment did not survive sudo: {got}\n{r.stderr[-800:]}")
 
