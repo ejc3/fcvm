@@ -1206,13 +1206,47 @@ struct VmContext<'a> {
     mem_size: usize,
 }
 
+/// A fault whose `UFFDIO_CONTINUE` returned EAGAIN and is waiting for a retry.
+struct PendingContinue {
+    parked_at: std::time::Instant,
+    /// `(file_offset, t0_ns)` for the trace interval this fault opened, carried so the
+    /// retry that actually releases the vCPU is what closes it. Closing it around the
+    /// FAILED ioctl instead would report the EAGAIN as the fault's resolution cost, and
+    /// `faultanalyze.py` reads these intervals as exact ioctl service time.
+    /// `None` when tracing is off.
+    trace: Option<(u64, u64)>,
+}
+
 struct VmState {
     fault_count: u64,
-    pending_continues: std::collections::BTreeMap<usize, std::time::Instant>,
+    pending_continues: std::collections::BTreeMap<usize, PendingContinue>,
     recorded: Option<PageSet>,
     started: std::time::Instant,
     /// `Some` only under `FCVM_UFFD_FAULT_TRACE`; see [`FaultTrace`].
     trace: Option<FaultTrace>,
+}
+
+impl VmState {
+    /// Park a fault whose CONTINUE returned EAGAIN, keeping the trace interval OPEN.
+    ///
+    /// A fault already parked keeps its original start: the vCPU has been blocked
+    /// since that first attempt, and that is the cost the trace is measuring.
+    fn park_continue(&mut self, page: usize, trace: Option<(u64, u64)>) {
+        self.pending_continues
+            .entry(page)
+            .or_insert(PendingContinue {
+                parked_at: std::time::Instant::now(),
+                trace,
+            });
+    }
+
+    /// Close a parked fault's trace interval at the retry that resolved it.
+    fn close_parked_trace(&mut self, trace: Option<(u64, u64)>) {
+        if let (Some((offset, t0)), Some(t)) = (trace, self.trace.as_mut()) {
+            let t1 = t.now_ns();
+            t.record(offset, t0, t1);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1548,23 +1582,25 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
 
 fn retry_pending_continues(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) -> Result<bool> {
     let mut resolved = Vec::new();
-    for (&page, parked_at) in &state.pending_continues {
+    for (&page, pending) in &state.pending_continues {
         match continue_page(uffd, ctx.vm_id, page, ctx.page_size)? {
-            ContinueOutcome::Resolved => resolved.push(page),
+            ContinueOutcome::Resolved => resolved.push((page, pending.trace)),
             ContinueOutcome::VmGone => return Ok(false),
-            ContinueOutcome::Retry if parked_at.elapsed() >= MAX_CONTINUE_WAIT => {
+            ContinueOutcome::Retry if pending.parked_at.elapsed() >= MAX_CONTINUE_WAIT => {
                 return Err(anyhow!(
                     "UFFDIO_CONTINUE at 0x{page:x} still EAGAIN after {:?}; refusing to drop \
                      a fault that would permanently hang a vCPU for vm {}",
-                    parked_at.elapsed(),
+                    pending.parked_at.elapsed(),
                     ctx.vm_id
                 ));
             }
             ContinueOutcome::Retry => {}
         }
     }
-    for page in resolved {
+    for (page, trace) in resolved {
         state.pending_continues.remove(&page);
+        // This retry is what released the vCPU, so it is what ends the interval.
+        state.close_parked_trace(trace);
     }
     Ok(true)
 }
@@ -1676,28 +1712,32 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                     fault_page
                                 ));
                             }
+                            let trace_start = state
+                                .trace
+                                .as_ref()
+                                .map(|_| (offset_in_file as u64, trace_t0));
                             match continue_page(uffd, vm_id, fault_page, page_size)? {
-                                ContinueOutcome::Resolved => {}
+                                ContinueOutcome::Resolved => {
+                                    if let Some(t) = state.trace.as_mut() {
+                                        let t1 = t.now_ns();
+                                        t.record(offset_in_file as u64, trace_t0, t1);
+                                    }
+                                }
                                 ContinueOutcome::VmGone => return Ok(DrainOutcome::VmExited),
                                 ContinueOutcome::Retry => {
                                     // mmap_changing is set and the event that raised it is
-                                    // somewhere in THIS queue. Don't spin here — park the
+                                    // somewhere in THIS queue. Don't spin here, park the
                                     // fault; the caller retries it right after the drain.
+                                    // The trace interval stays OPEN across the park: the
+                                    // vCPU is still blocked, and the retry is what frees it.
                                     debug!(
                                         target: "uffd",
                                         vm_id = %vm_id,
                                         fault_addr = format!("0x{:x}", fault_page),
                                         "UFFDIO_CONTINUE EAGAIN (mmap_changing) - parked for retry"
                                     );
-                                    state
-                                        .pending_continues
-                                        .entry(fault_page)
-                                        .or_insert_with(std::time::Instant::now);
+                                    state.park_continue(fault_page, trace_start);
                                 }
-                            }
-                            if let Some(t) = state.trace.as_mut() {
-                                let t1 = t.now_ns();
-                                t.record(offset_in_file as u64, trace_t0, t1);
                             }
                             continue;
                         }
@@ -2409,6 +2449,61 @@ mod tests {
             })
             .collect();
         assert_eq!(decoded, vec![[0x1000, 10, 20], [u64::MAX, 0, u64::MAX]]);
+    }
+
+    /// A fault parked on EAGAIN is still blocking its vCPU, so its trace interval must
+    /// end at the retry that resolved it. Closing it around the FAILED ioctl reports the
+    /// EAGAIN as the resolution cost, and faultanalyze.py reads these intervals as exact
+    /// ioctl service time, so every MINOR-mode mmap-changing event would understate it.
+    #[test]
+    fn a_parked_continue_is_timed_to_its_retry_not_to_the_eagain() {
+        const PAGE: usize = 0x4000;
+        const OFFSET: u64 = 0x8000;
+        const PARKED: std::time::Duration = std::time::Duration::from_millis(20);
+
+        let dir = tempfile::tempdir().expect("create trace directory");
+        let path = dir.path().join("parked.faults");
+        let origin = std::time::Instant::now();
+        let mut state = VmState {
+            fault_count: 0,
+            pending_continues: std::collections::BTreeMap::new(),
+            recorded: None,
+            started: origin,
+            trace: Some(FaultTrace {
+                path: path.clone(),
+                origin,
+                records: Vec::new(),
+            }),
+        };
+
+        let t0 = state.trace.as_ref().expect("trace").now_ns();
+        state.park_continue(PAGE, Some((OFFSET, t0)));
+        assert_eq!(
+            state.trace.as_ref().expect("trace").records.len(),
+            0,
+            "parking must not close the interval; the vCPU is still blocked"
+        );
+
+        // The vCPU stays blocked for as long as the fault is parked.
+        std::thread::sleep(PARKED);
+
+        let parked = state
+            .pending_continues
+            .remove(&PAGE)
+            .expect("the fault is parked");
+        state.close_parked_trace(parked.trace);
+
+        let recorded = state.trace.as_ref().expect("trace").records.clone();
+        assert_eq!(recorded.len(), 1, "one interval per resolved fault");
+        let [offset, start, end] = recorded[0];
+        assert_eq!(offset, OFFSET);
+        assert_eq!(start, t0, "the interval still starts at the first attempt");
+        let held_ms = (end - start) / 1_000_000;
+        assert!(
+            held_ms >= 15,
+            "the interval must span the park: {held_ms}ms recorded for a fault held \
+             {PARKED:?}, so the retry that freed the vCPU was not what closed it"
+        );
     }
 
     /// A full demand batch means events remain queued. Speculative replay must not issue an

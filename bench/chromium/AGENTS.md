@@ -556,6 +556,34 @@ this list now points at it rather than contradicting it.
 
 `REVIEW.md` is the ledger of what holds and what doesn't. **Update it every run.**
 
+## The fault harness refuses to report a number it cannot stand behind
+
+`faultbench.py` measures per-request page faults and `faultanalyze.py` reduces them.
+Both instruments attribute costs to a specific request, so each one has a rule about
+when it must report NOTHING rather than something plausible. A wrong number here is
+worse than a missing one, because it reads exactly like a real one and `agg` would
+average it in. `make test-chromium-fault` guards all four.
+
+- **An ambiguous UFFD trace attributes to neither request.** A trace is written when
+  its handler exits, so it trails `t1` by the clone's teardown, and its filename
+  carries the serve process's own connection counter, which nothing in the request
+  record maps to. With two candidates inside one window there is no identity to break
+  the tie, so `match_trace` returns None and stamps `trace_ambiguous`. Taking the
+  newest would hand a request the NEXT one's faults and corrupt counts, locality and
+  service time together. `agg` then reports a smaller `n`, which is the honest signal.
+- **A clone that outlives its request stops the run.** Serial isolation is what makes
+  attribution possible; a surviving clone keeps faulting and burning CPU while the next
+  request is measured. `require_clones_gone` raises rather than letting the run
+  continue, and the records already written stay valid.
+- **An output directory is used once.** `requests.jsonl` is appended to and traces are
+  matched by mtime, so reusing `--out` blends two runs, possibly taken with different
+  arguments, into one analysis. `require_fresh_out_dir` refuses anything non-empty.
+- **A parked CONTINUE is timed to its retry.** When `UFFDIO_CONTINUE` returns EAGAIN
+  the vCPU stays blocked, so `src/uffd/server.rs` keeps the trace interval open across
+  the park and closes it at the retry that actually resolved the fault. Closing it
+  around the failed ioctl would report the EAGAIN as the resolution cost, and these
+  intervals are read as exact ioctl service time.
+
 ## Deliverables
 
 The end product is a **readable markdown benchmark with inline visualizations**, in

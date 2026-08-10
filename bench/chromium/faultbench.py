@@ -469,6 +469,37 @@ def serve_pid_for_pid_gone(pid):
     return not Path(f"/proc/{pid}").exists()
 
 
+def require_clones_gone(prefix, timeout_s, context):
+    """Stop the run if a clone outlived its request.
+
+    Serial isolation is what makes every later number attributable. A clone still up
+    keeps faulting and burning CPU while the NEXT request is measured, so its cost
+    lands on the wrong VM in both the per-request and the serve-CPU figures. The
+    records already written stay valid, which is why this stops rather than skips.
+    """
+    if not wait_clones_gone(prefix, timeout_s):
+        raise SystemExit(
+            f"[faultbench] clone cleanup for {prefix} did not finish within "
+            f"{timeout_s}s after {context}; refusing to measure the next request "
+            f"alongside a surviving clone"
+        )
+
+
+def require_fresh_out_dir(out):
+    """Refuse an output directory that already holds a run.
+
+    requests.jsonl is APPENDED to and traces are matched by mtime, so reusing a
+    directory blends two runs, possibly taken with different arguments, into one
+    analysis. Absent or empty is fine; anything already in it is not.
+    """
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(
+            f"[faultbench] --out {out} is not empty; a run appends to requests.jsonl "
+            f"and matches traces by mtime, so reusing it would blend two runs into one "
+            f"analysis. Name a fresh directory."
+        )
+
+
 def wait_clones_gone(prefix, timeout=120):
     t_dead = time.time() + timeout
     while time.time() < t_dead:
@@ -535,6 +566,7 @@ def main():
     args = ap.parse_args()
 
     out = Path(args.out)
+    require_fresh_out_dir(out)
     (out / "requests").mkdir(parents=True, exist_ok=True)
     (out / "traces").mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(parents=True, exist_ok=True)
@@ -599,7 +631,7 @@ def main():
                         f.write(json.dumps(rec) + "\n")
                     print(f"[faultbench] {cell} {page} rep{i}{' (warmup)' if rec['warmup'] else ''}: "
                           f"rc={rec['rc']} wall={rec['wall_ms']:.0f}ms fc_pid={rec['fc_pid']}", flush=True)
-                    wait_clones_gone(f"fb-{runid}", 120)
+                    require_clones_gone(f"fb-{runid}", 120, f"{cell} {page} rep{i}")
                     time.sleep(1.0)
 
             if memarm == "uffd":

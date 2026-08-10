@@ -123,6 +123,27 @@ def locality(offsets_in_order, granule):
     }
 
 
+# A trace is written when its handler EXITS, which trails the request's own t1 by the
+# clone's teardown. This is how much of that trailing edge still counts as "this request".
+TRACE_GRACE_S = 5.0
+
+
+def match_trace(traces, t0, t1):
+    """The one trace belonging to a request, as `(trace_file, ambiguous_names)`.
+
+    Exactly one candidate in the window is the answer. Zero is a request that produced
+    no trace. Two or more cannot be told apart: the name carries the serve process's own
+    connection counter, which nothing in the request record maps to, so there is no
+    identity to break the tie with. Returning None there costs one request's UFFD
+    numbers; guessing the newest would hand this request the NEXT one's faults and
+    corrupt counts, locality and service time together.
+    """
+    cands = [f for f in traces if t0 <= f.stat().st_mtime <= t1 + TRACE_GRACE_S]
+    if len(cands) == 1:
+        return cands[0], []
+    return None, [c.name for c in cands]
+
+
 def jaccard(a, b):
     if not a and not b:
         return 1.0
@@ -136,6 +157,7 @@ def stability(sets):
     js = [jaccard(sets[i], sets[j]) for i in range(len(sets)) for j in range(i + 1, len(sets))]
     inter = set.intersection(*sets)
     union = set.union(*sets)
+    mean_size = sum(len(s) for s in sets) / len(sets)
     cov, waste = [], []
     for i, s in enumerate(sets):
         others = set.union(*[t for j, t in enumerate(sets) if j != i])
@@ -149,7 +171,9 @@ def stability(sets):
         "jaccard_max": max(js),
         "core_size": len(inter),
         "union_size": len(union),
-        "core_frac_of_mean_set": len(inter) / (sum(len(s) for s in sets) / len(sets)),
+        # Every set can be empty (a trace with no faults), and a fraction of nothing
+        # is not zero, it is undefined.
+        "core_frac_of_mean_set": (len(inter) / mean_size) if mean_size else None,
         "loo_coverage_mean": sum(cov) / len(cov),
         "loo_coverage_min": min(cov),
         "loo_waste_mean": sum(waste) / len(waste),
@@ -237,12 +261,11 @@ def main():
             # silently attribute every later trace to the wrong run.
             tf = None
             if r["memarm"] == "uffd":
-                cands = [f for f in traces if r["t0"] <= f.stat().st_mtime <= r["t1"] + 5]
-                if len(cands) == 1:
-                    tf = cands[0]
-                elif cands:
-                    item["trace_ambiguous"] = [c.name for c in cands]
-                    tf = cands[-1]
+                # An ambiguous window reports nothing rather than a wrong number:
+                # `agg` skips the absent keys and reports the smaller `n`.
+                tf, ambiguous = match_trace(traces, r["t0"], r["t1"])
+                if ambiguous:
+                    item["trace_ambiguous"] = ambiguous
             if tf is not None:
                 tr = read_fault_trace(tf)
                 item["uffd_trace_file"] = tf.name

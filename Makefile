@@ -231,6 +231,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	cargo-target-link build-host-tools setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
+	test-chromium-fault \
 	bench-quick bench-throughput bench-operations bench-protocol \
 	lint fmt update-dependency ssh test-serve-sdk
 
@@ -295,6 +296,7 @@ help:
 	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
 	@echo "  report-chromium-scale   Validate a scale run and write plain Markdown"
 	@echo "  test-chromium-scale  Run the scale harness's deterministic unit tests"
+	@echo "  test-chromium-fault  Run the fault harness's deterministic unit tests"
 	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
@@ -697,6 +699,10 @@ test-chromium-request:
 
 test-chromium-scale:
 	@python3 -m unittest discover -s bench/chromium -p 'test_reqscale.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
+
+test-chromium-fault:
+	@python3 -m unittest discover -s bench/chromium -p 'test_faultbench.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
 
 # Open-loop CDP-fast scalability and page-fault measurement. Unlike
