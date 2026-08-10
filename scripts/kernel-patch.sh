@@ -241,8 +241,9 @@ cmd_create() {
     [[ -z "$patch_name" ]] && error "Usage: $0 create <profile> <patch-name> <file1> [file2...]"
     [[ ${#files[@]} -eq 0 ]] && error "Usage: $0 create <profile> <patch-name> <file1> [file2...]"
 
-    local version=$(get_kernel_version "$profile")
-    local patches_dir=$(get_patches_dir "$profile")
+    local version patches_dir
+    version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
+    patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
     local workdir="/tmp/kernel-patch-$$"
 
     # An empty patches_dir means the profile deliberately applies no patches.
@@ -287,8 +288,9 @@ cmd_finish() {
     [[ -z "$patch_name" ]] && error "Usage: $0 finish <profile> <patch-name> <workdir>"
     [[ -z "$workdir" ]] && error "Usage: $0 finish <profile> <patch-name> <workdir>"
 
-    local version=$(get_kernel_version "$profile")
-    local patches_dir=$(get_patches_dir "$profile")
+    local version patches_dir
+    version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
+    patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
     local kernel_dir="$workdir/linux-${version}"
 
     # An empty patches_dir means the profile deliberately applies no patches.
@@ -321,8 +323,9 @@ cmd_edit() {
     [[ -z "$profile" ]] && error "Usage: $0 edit <profile> <patch-number>"
     [[ -z "$patch_num" ]] && error "Usage: $0 edit <profile> <patch-number>"
 
-    local version=$(get_kernel_version "$profile")
-    local patches_dir=$(get_patches_dir "$profile")
+    local version patches_dir
+    version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
+    patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
     local workdir="/tmp/kernel-patch-$$"
 
     # An empty patches_dir means the profile deliberately applies no patches.
@@ -368,8 +371,9 @@ cmd_validate() {
 
     [[ -z "$profile" ]] && error "Usage: $0 validate <profile>"
 
-    local version=$(get_kernel_version "$profile")
-    local patches_dir=$(get_patches_dir "$profile")
+    local version patches_dir
+    version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
+    patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
     local workdir="/tmp/kernel-validate-$$"
 
     # An empty patches_dir means the profile deliberately applies no patches.

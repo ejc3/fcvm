@@ -60,6 +60,21 @@ impl ImageCacheMount {
     }
 }
 
+/// Resolve the same active fcvm config directory used by the test wrapper.
+/// L1 runs its nested fcvm process as root, so callers mount this directory at
+/// `/root/.config/fcvm` instead of letting L2 reopen a shared host config.
+fn active_fcvm_config_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/root/.config"))
+        .join("fcvm")
+}
+
 #[tokio::test]
 async fn test_kvm_available_in_vm() -> Result<()> {
     println!("\nNested KVM test");
@@ -247,10 +262,9 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("   Mounting: /mnt/fcvm-btrfs (assets) and fcvm binary");
 
     let fcvm_volume = format!("{}:/opt/fcvm", fcvm_dir.display());
-    // Mount host config dir so inner fcvm can find its config
-    // Use $HOME which is set by spawn_fcvm based on the current user
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
+    // Mount the active isolated config so inner fcvm uses this exact worktree.
+    let config_dir = active_fcvm_config_dir();
+    let config_mount = format!("{}:/root/.config/fcvm:ro", config_dir.display());
     // Use nginx so health check works (bridged networking does HTTP health check to port 80)
     // Note: firecracker is in /mnt/fcvm-btrfs/bin which is mounted via the btrfs mount
     let (mut _child, outer_pid) = common::spawn_fcvm(&[
@@ -540,9 +554,9 @@ async fn run_nested_chain(total_levels: usize) -> Result<()> {
 
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Home dir for config mount
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
+    // Mount the active isolated config into the first nested level.
+    let config_dir = active_fcvm_config_dir();
+    let config_mount = format!("{}:/root/.config/fcvm:ro", config_dir.display());
 
     // Track PIDs for cleanup
     let mut level_pids: Vec<u32> = Vec::new();

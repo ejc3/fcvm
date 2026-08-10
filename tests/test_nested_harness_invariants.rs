@@ -6,10 +6,13 @@
 
 use std::path::PathBuf;
 
-fn nested_smoke_test_source() -> String {
+fn nested_test_source() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_kvm.rs");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+fn nested_smoke_test_source() -> String {
+    let source = nested_test_source();
     let start = source
         .find("async fn test_nested_run_fcvm_inside_vm()")
         .expect("simple nested smoke test is missing");
@@ -33,6 +36,11 @@ fn test_config_wrapper_source() -> String {
 
 fn privileged_runner_source() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/root-test-runner.sh");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+fn shared_test_helpers_source() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/mod.rs");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
@@ -80,6 +88,47 @@ fn test_recipes_use_an_exact_worktree_local_config() {
 }
 
 #[test]
+fn isolated_config_wraps_the_fc_mock_recipe() {
+    let makefile = makefile_source();
+    let start = makefile
+        .find("_test-fc-mock: cargo-target-link")
+        .expect("fc-mock run-only recipe is missing");
+    let end = makefile[start..]
+        .find("test-fc-mock: show-notes")
+        .map(|offset| start + offset)
+        .expect("fc-mock public recipe must follow its run-only recipe");
+    let recipe = &makefile[start..end];
+
+    assert!(
+        recipe.contains("$(TEST_CONFIG_WRAPPER) $(NEXTEST)"),
+        "fc-mock must use the same per-worktree config isolation as every other host nextest recipe"
+    );
+}
+
+#[test]
+fn isolated_config_mounts_the_active_xdg_config_into_nested_guests() {
+    let source = nested_test_source();
+
+    assert!(
+        source.contains("var_os(\"XDG_CONFIG_HOME\")"),
+        "nested launches must resolve the config mounted into L1 from the active XDG_CONFIG_HOME"
+    );
+    assert!(
+        source.contains("join(\"fcvm\")"),
+        "the mounted host path must be XDG_CONFIG_HOME/fcvm"
+    );
+    assert_eq!(
+        source.matches("active_fcvm_config_dir()").count(),
+        3,
+        "the helper definition and both nested launch paths must share the active config resolver"
+    );
+    assert!(
+        source.contains("config_dir.display()"),
+        "the resolved XDG fcvm directory must feed the /root/.config/fcvm mount"
+    );
+}
+
+#[test]
 fn test_unit_recipe_honors_its_filter() {
     let makefile = makefile_source();
 
@@ -107,5 +156,33 @@ fn privileged_runner_keeps_the_isolated_xdg_config_authoritative() {
         guard < unset && unset < exec,
         "SUDO_USER must be removed after confirming XDG isolation and before executing the \
          root test binary; otherwise fcvm reopens the shared ~/.config/fcvm path"
+    );
+}
+
+#[test]
+fn config_schema_check_reads_the_active_xdg_path() {
+    let source = shared_test_helpers_source();
+    let start = source
+        .find("fn ensure_config_exists()")
+        .expect("shared config setup helper is missing");
+    let end = source[start..]
+        .find("/// Make a spawned fcvm child")
+        .map(|offset| start + offset)
+        .expect("config setup helper must precede the child-lifecycle helper");
+    let helper = &source[start..end];
+    let xdg = helper
+        .find("var_os(\"XDG_CONFIG_HOME\")")
+        .expect("config validation must inspect XDG_CONFIG_HOME");
+    let home = helper
+        .find("var_os(\"HOME\")")
+        .expect("config validation must retain the HOME fallback");
+
+    assert!(
+        xdg < home,
+        "the isolated XDG config must be checked before falling back to ~/.config/fcvm"
+    );
+    assert!(
+        helper.contains("join(\"fcvm/rootfs-config.toml\")"),
+        "XDG_CONFIG_HOME must resolve to its fcvm/rootfs-config.toml child"
     );
 }
