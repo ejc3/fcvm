@@ -827,7 +827,9 @@ if [[ -n "${{KERNEL_CONFIG:-}}" ]] && [[ -f "$KERNEL_CONFIG" ]]; then
         if [[ "$line" =~ ^(CONFIG_[A-Z0-9_]+)=y ]]; then
             opt="${{BASH_REMATCH[1]}}"
             if ! grep -qx "${{opt}}=y" .config; then
-                echo "ERROR: requested kernel option ${{opt}}=y was disabled by Kconfig"
+                # To stderr: the runner only surfaces the script's stderr, so an
+                # error on stdout leaves CI failing with no visible reason.
+                echo "ERROR: requested kernel option ${{opt}}=y was disabled by Kconfig" >&2
                 exit 1
             fi
         fi
@@ -838,7 +840,7 @@ fi
 echo ""
 echo "Verifying configuration:"
 if ! grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS|TUN|VETH|INET_DIAG|INET_DIAG_DESTROY|PACKET)=" .config; then
-    echo "ERROR: built kernel exposes none of the profile summary options"
+    echo "ERROR: built kernel exposes none of the profile summary options" >&2
     exit 1
 fi
 echo ""
