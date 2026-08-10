@@ -10,6 +10,12 @@
 # only when every sibling thread is also a zombie; a D-state vCPU sibling still owns
 # live KVM/MM resources and makes the whole group actionable.
 #
+# Every reported group also gets per-TID evidence (kernel stack, wchan, status)
+# captured BEFORE the kill attempt, and SIGKILL survivors get a second capture
+# plus reclaim/compaction diagnostics — see scripts/lib/vm-evidence.sh. The one
+# time this class struck (a SIGKILLed firecracker stuck non-zombie in D state),
+# the stacks were read by hand and lost with the recycled runner.
+#
 # Usage: ci-stray-vm-guard.sh <pre|post> [--dry-run]
 #
 #   --dry-run  report only, kill nothing. The default SIGKILL behavior is intended
@@ -26,6 +32,9 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
 	LOG_DIR="/tmp/fcvm-test-logs"
 	mkdir -p "$LOG_DIR"
 fi
+
+# shellcheck source=scripts/lib/vm-evidence.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/vm-evidence.sh"
 
 REPORT="$LOG_DIR/stray-vm-guard-${PHASE}.log"
 THREADS_BEFORE="$LOG_DIR/stray-vm-threads-${PHASE}-before.tsv"
@@ -193,6 +202,11 @@ fi
 
 print_thread_table "$THREADS_BEFORE"
 
+# Evidence first, kill second: SIGKILL destroys exactly the state (stacks,
+# wchan, pending-signal masks) that explains a survivor, and the survivor case
+# is the one that recycles the runner before anything else can look.
+vm_evidence_group "$THREADS_BEFORE" "pre-kill, ${PHASE}" "${STRAY_TGIDS[@]}"
+
 if [ "$DRY_RUN" -eq 1 ]; then
 	echo "::warning title=Stray microVMs (${PHASE}, dry-run)::${COUNT} live process group(s) found; NOT killing them (--dry-run)."
 	echo "--dry-run: reporting only, killing nothing"
@@ -223,6 +237,12 @@ mapfile -t SURVIVOR_TGIDS <"$LIVE_AFTER"
 echo "killed ${COUNT} process group(s), still live after SIGKILL: ${#SURVIVOR_TGIDS[@]}"
 if [ "${#SURVIVOR_TGIDS[@]}" -gt 0 ]; then
 	print_thread_table "$THREADS_AFTER"
+	# A survivor is a task the kernel could not reap: its status now shows the
+	# pending SIGKILL bit on a non-zombie task, and whatever owns it (the ARM
+	# case: kcompactd holding a folio lock under do_swap_page) is visible only
+	# while the survivor exists. Capture both before this runner disappears.
+	vm_evidence_group "$THREADS_AFTER" "post-SIGKILL survivors, ${PHASE}" "${SURVIVOR_TGIDS[@]}"
+	vm_evidence_mm_diagnostics 150
 	echo "::warning title=Unkillable microVMs (${PHASE})::${#SURVIVOR_TGIDS[@]} process group(s) survived SIGKILL; D-state means this runner needs replacement."
 fi
 
