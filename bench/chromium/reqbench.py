@@ -2236,6 +2236,12 @@ class FailureProbe:
     control cannot be taken twice or taken from a clone that also failed.
     """
 
+    # A control that failed to WRITE is not a control, so the next healthy clone
+    # gets another go -- bounded, because each attempt costs up to the full
+    # budget and perturbs the rep it lands on, and a systematically broken probe
+    # would otherwise tax every healthy request in the run.
+    CONTROL_ATTEMPTS = 3
+
     def __init__(self, fcvm: str, data_root: str, out_dir: str, run_id: str,
                  cdp_port: int, command_timeout_s: float = PROBE_COMMAND_TIMEOUT_S,
                  budget_s: float = PROBE_BUDGET_S):
@@ -2247,6 +2253,7 @@ class FailureProbe:
         self.command_timeout_s = command_timeout_s
         self.budget_s = budget_s
         self.control_captured = False
+        self.control_attempts = 0
         self.control_path = ""
         self.is_warmup = False
 
@@ -2265,7 +2272,8 @@ class FailureProbe:
     def role_for(self, rec: dict):
         if rec.get("ok") is False:
             return "failure"
-        if rec.get("ok") is True and not self.control_captured:
+        if (rec.get("ok") is True and not self.control_captured
+                and self.control_attempts < self.CONTROL_ATTEMPTS):
             return "control"
         return None
 
@@ -2296,6 +2304,8 @@ class FailureProbe:
                 "skipped": f"termination signal {pending} pending",
             }
             return
+        if role == "control":
+            self.control_attempts += 1
         try:
             dump = self.capture(
                 role=role, rec=rec, name=name, fcvm_pid=fcvm_pid,
@@ -2318,23 +2328,27 @@ class FailureProbe:
                 "error_count": len(errors),
             }
             if role == "control":
+                # A WRITTEN dump is what makes this the control. Setting the
+                # flag on the exception path below instead retired the control
+                # for the whole run over one transient error, and every later
+                # failure dump then had nothing to be read against.
                 self.control_path = path
+                self.control_captured = True
         except Exception as error:  # noqa: BLE001 - the probe is never fatal
             rec["probe"] = {
                 "role": role,
                 "path": "",
                 "probe_error": f"{type(error).__name__}: {error}",
             }
-        if role == "control":
-            self.control_captured = True
-            if not self.is_warmup:
-                rec["probe_perturbed_timings"] = True
-                print(
-                    f"probe: control captured on MEASURED rep {rec.get('rep')} "
-                    f"({name}); its wall_ms and teardown are perturbed and the "
-                    "record is stamped probe_perturbed_timings",
-                    file=sys.stderr, flush=True,
-                )
+        if role == "control" and not self.is_warmup:
+            rec["probe_perturbed_timings"] = True
+            print(
+                f"probe: control capture attempt {self.control_attempts} on "
+                f"MEASURED rep {rec.get('rep')} ({name}); its wall_ms and "
+                "teardown are perturbed and the record is stamped "
+                "probe_perturbed_timings",
+                file=sys.stderr, flush=True,
+            )
 
     def write(self, name: str, dump: dict) -> str:
         """Write the dump atomically, next to this request's clone log."""

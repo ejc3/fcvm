@@ -4509,6 +4509,84 @@ class FailureProbeCapture(unittest.TestCase):
             self.assertEqual(failed["probe"]["control_path"],
                              first["probe"]["path"])
 
+    def _healthy(self, probe, rep):
+        rec = {"arm": "cdp", "rep": rep, "ok": True}
+        probe.observe(rec, name=f"rb-x-{rep}-fast", fcvm_pid=os.getpid(),
+                      state_path="", log_path="", endpoint="")
+        return rec
+
+    def test_a_control_that_fails_to_write_retries_on_the_next_healthy_clone(self):
+        """RED BEFORE THE FIX: `control_captured` was set in a block that also
+        ran on the exception path, so one failed write retired the control for
+        the whole run and every later failure dump had nothing to be read
+        against:
+
+            AssertionError: True is not false : a dump that was never written
+            is not the control
+        """
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222, budget_s=5.0,
+            )
+            probe.begin_request(True)
+            real_write = probe.write
+            written = []
+
+            def fail_the_first_write(name, dump):
+                written.append(name)
+                if len(written) == 1:
+                    raise OSError(28, "No space left on device")
+                return real_write(name, dump)
+
+            probe.write = fail_the_first_write
+            first = self._healthy(probe, 0)
+            self.assertIn("No space left on device", first["probe"]["probe_error"])
+            self.assertEqual(first["probe"]["path"], "")
+            self.assertFalse(probe.control_captured,
+                             "a dump that was never written is not the control")
+
+            second = self._healthy(probe, 1)
+            self.assertEqual(second["probe"]["role"], "control")
+            self.assertTrue(second["probe"]["path"].endswith(
+                "rb-x-1-fast.probe.json"))
+            self.assertTrue(probe.control_captured)
+
+            # The point of retrying: a later failure has something to read the
+            # dump against.
+            failed = {"arm": "cdp", "rep": 2, "ok": False}
+            probe.observe(failed, name="rb-x-2-fast", fcvm_pid=os.getpid(),
+                          state_path="", log_path="", endpoint="")
+            self.assertEqual(failed["probe"]["control_path"],
+                             second["probe"]["path"])
+
+            # And the retry does not become a second control.
+            third = self._healthy(probe, 3)
+            self.assertNotIn("probe", third)
+
+    def test_a_control_that_never_writes_stops_taxing_healthy_reps(self):
+        """Retrying forever is the other way to get this wrong: each attempt
+        costs up to the full budget and perturbs the measured rep it lands on,
+        so a systematically broken probe would tax every healthy request in the
+        run."""
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222, budget_s=5.0,
+            )
+            probe.begin_request(True)
+
+            def never_writes(name, dump):
+                raise OSError(28, "No space left on device")
+
+            probe.write = never_writes
+            attempted = [rep for rep in range(probe.CONTROL_ATTEMPTS + 2)
+                         if "probe" in self._healthy(probe, rep)]
+            self.assertEqual(attempted, list(range(probe.CONTROL_ATTEMPTS)),
+                             "the control retry is not bounded")
+            self.assertEqual(probe.control_attempts, probe.CONTROL_ATTEMPTS)
+            self.assertFalse(probe.control_captured)
+
     def test_a_control_taken_from_a_measured_rep_is_stamped_as_perturbing(self):
         with tempfile.TemporaryDirectory() as d:
             probe = reqbench.FailureProbe(
