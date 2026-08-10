@@ -39,7 +39,7 @@ use crate::hypervisor::firecracker::FirecrackerBackend;
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
-    VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
+    RuntimeConfig, VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
 };
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
 use crate::paths;
@@ -83,6 +83,62 @@ fn resolve_image_mode(args: &RunArgs) -> crate::firecracker::ImageMode {
 
     // Default: overlay
     ImageMode::Overlay
+}
+
+/// Build the VMM runtime configuration from the selected kernel profile.
+///
+/// Keeping the profile/fallback selection and configured-binary resolution in
+/// one tested function prevents callers from accidentally turning an exact
+/// Firecracker resolution failure back into a PATH fallback.
+async fn runtime_config_from_kernel_profiles<Resolve, ResolveFuture>(
+    profile_name: &str,
+    profile: Option<crate::setup::KernelProfile>,
+    default_profile: Option<crate::setup::KernelProfile>,
+    mut resolve: Resolve,
+) -> Result<RuntimeConfig>
+where
+    Resolve: FnMut(crate::setup::KernelProfile, String) -> ResolveFuture,
+    ResolveFuture: std::future::Future<Output = Result<Option<PathBuf>>>,
+{
+    let mut config = RuntimeConfig::default();
+    let Some(profile) = profile else {
+        return Ok(config);
+    };
+
+    let configured_profile =
+        if profile.firecracker_repo.is_some() || profile.firecracker_commit.is_some() {
+            Some((profile.clone(), profile_name.to_string()))
+        } else if profile_name != "default" {
+            default_profile.and_then(|default_profile| {
+                (default_profile.firecracker_repo.is_some()
+                    || default_profile.firecracker_commit.is_some())
+                .then(|| (default_profile, "default".to_string()))
+            })
+        } else {
+            None
+        };
+
+    if let Some((configured_profile, configured_name)) = configured_profile {
+        if let Some(path) = resolve(configured_profile, configured_name.clone()).await? {
+            info!(firecracker_bin = %path.display(), profile = %configured_name, "from profile");
+            config.firecracker_bin = Some(path);
+        }
+    }
+
+    if let Some(ref fc_args) = profile.firecracker_args {
+        info!(firecracker_args = %fc_args, "from profile");
+        config.firecracker_args = Some(fc_args.clone());
+    }
+    if let Some(ref boot_args) = profile.boot_args {
+        info!(boot_args = %boot_args, "from profile");
+        config.boot_args = Some(boot_args.clone());
+    }
+    if let Some(readers) = profile.fuse_readers {
+        info!(fuse_readers = %readers, "from profile");
+        config.fuse_readers = Some(readers);
+    }
+
+    Ok(config)
 }
 
 /// Start a VM with the given args. Returns a handle to the running VM.
@@ -337,58 +393,25 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // Build RuntimeConfig from kernel profile (replaces env var config passing)
     // Uses explicit --kernel-profile if given, otherwise falls back to "default" profile
     // for [firecracker] config (custom Firecracker binary from rootfs-config.toml).
-    let mut runtime_config = super::common::RuntimeConfig::default();
     let effective_profile_name = args.kernel_profile.as_deref().unwrap_or("default");
-    if let Some(profile) = crate::setup::get_kernel_profile(effective_profile_name)? {
-        if args.kernel_profile.is_some() {
-            info!(profile = %effective_profile_name, "using kernel profile");
-        }
-
-        // Check for custom Firecracker binary (from profile or [firecracker] config)
-        // If the explicit profile has its own firecracker_repo, use that.
-        // Otherwise fall back to the "default" profile (which inherits [firecracker] config).
-        if profile.firecracker_repo.is_some() {
-            match crate::setup::get_firecracker_for_profile(&profile, effective_profile_name).await
-            {
-                Ok(fc_path) => {
-                    info!(firecracker_bin = %fc_path.display(), "from profile");
-                    runtime_config.firecracker_bin = Some(fc_path);
-                }
-                Err(e) => {
-                    warn!(profile = %effective_profile_name, error = %e, "custom Firecracker not found, falling back to system binary");
-                }
-            }
-        } else if effective_profile_name != "default" {
-            // Explicit profile (e.g. "btrfs") doesn't have custom FC — check default profile
-            if let Ok(Some(default_profile)) = crate::setup::get_kernel_profile("default") {
-                if default_profile.firecracker_repo.is_some() {
-                    match crate::setup::get_firecracker_for_profile(&default_profile, "default")
-                        .await
-                    {
-                        Ok(fc_path) => {
-                            info!(firecracker_bin = %fc_path.display(), "from default profile");
-                            runtime_config.firecracker_bin = Some(fc_path);
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "custom Firecracker not found, falling back to system binary");
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(ref fc_args) = profile.firecracker_args {
-            info!(firecracker_args = %fc_args, "from profile");
-            runtime_config.firecracker_args = Some(fc_args.clone());
-        }
-        if let Some(ref boot_args) = profile.boot_args {
-            info!(boot_args = %boot_args, "from profile");
-            runtime_config.boot_args = Some(boot_args.clone());
-        }
-        if let Some(readers) = profile.fuse_readers {
-            info!(fuse_readers = %readers, "from profile");
-            runtime_config.fuse_readers = Some(readers);
-        }
+    let profile = crate::setup::get_kernel_profile(effective_profile_name)?;
+    if profile.is_some() && args.kernel_profile.is_some() {
+        info!(profile = %effective_profile_name, "using kernel profile");
     }
+    let default_profile = if effective_profile_name == "default" {
+        None
+    } else {
+        crate::setup::get_kernel_profile("default")?
+    };
+    let runtime_config = runtime_config_from_kernel_profiles(
+        effective_profile_name,
+        profile,
+        default_profile,
+        |profile, name| async move {
+            crate::setup::get_configured_firecracker_for_profile(&profile, &name).await
+        },
+    )
+    .await?;
 
     // Get kernel path
     // Priority: --kernel (explicit) > profile (named or "default")
@@ -1730,6 +1753,27 @@ mod tests {
     use super::*;
     use crate::cli::args::{ImageMode as CliImageMode, NetworkMode};
     use crate::firecracker::ImageMode;
+
+    #[tokio::test]
+    async fn configured_firecracker_resolution_error_reaches_cold_boot() {
+        let profile = crate::setup::KernelProfile {
+            firecracker_repo: Some("ejc3/firecracker".to_string()),
+            firecracker_commit: Some("27305f49ab3a5d862dc56b5108713b6536d2baa7".to_string()),
+            ..Default::default()
+        };
+        let error = runtime_config_from_kernel_profiles(
+            "nested",
+            Some(profile),
+            None,
+            |_profile, _name| async { bail!("missing exact configured Firecracker artifact") },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("missing exact configured Firecracker artifact"),
+            "{error:#}"
+        );
+    }
 
     fn test_args() -> RunArgs {
         RunArgs {
