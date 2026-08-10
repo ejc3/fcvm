@@ -442,11 +442,29 @@ except OSError as e:
         cd /mnt/fcvm-btrfs
         # Use bridged networking (outer VM is privileged so iptables works)
         # Use ECR image to avoid Docker Hub rate limits
-        fcvm podman run \
+        #
+        # Bound the inner run so a wedged L2 fails inside this exec instead of
+        # tripping the outer per-test timeout: nextest kills the whole test
+        # before the exec returns, which discards everything the inner fcvm
+        # wrote (including the L2 serial console it streams), leaving a bare
+        # TIMEOUT with no evidence. The file redirect (rather than a command
+        # substitution) matters too: a surviving grandchild holding the pipe
+        # would block the capture even after timeout(1) reaps the inner fcvm.
+        # SIGTERM from timeout(1) lets the inner fcvm tear the L2 VM down.
+        inner_log=/tmp/inner-fcvm-run.log
+        timeout 600 fcvm podman run \
             --name inner-test \
             --network bridged \
             --cmd "printf '%s_%s\n' NESTED_SUCCESS INNER_VM_WORKS" \
-            public.ecr.aws/nginx/nginx:alpine
+            public.ecr.aws/nginx/nginx:alpine >"$inner_log" 2>&1
+        rc=$?
+        echo "INNER_FCVM_EXIT_CODE=$rc"
+        tail -c 131072 "$inner_log"
+        if [ "$rc" -ne 0 ]; then
+            echo "=== L1 dmesg tail ==="
+            dmesg | tail -80
+        fi
+        exit "$rc"
     "#
     );
 
