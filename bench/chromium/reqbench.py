@@ -790,14 +790,18 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": "cdp-fast" if fast else "cdp", "rep": rep, "name": name}
 
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
+    cmd = list(getattr(args, "spawn_prefix", ())) + [
+        args.fcvm, "snapshot", "run",
+    ] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
     watch = DirWatch(args.state_dir)
-    t_spawn = time.monotonic()
+    t_spawn_ns = time.monotonic_ns()
+    t_spawn = t_spawn_ns / 1_000_000_000
+    rec["started_monotonic_ns"] = t_spawn_ns
     try:
         with open(log, "wb") as lf:
             # stdout/stderr to a FILE, never a pipe we do not drain: an undrained
@@ -822,29 +826,47 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
             rec["endpoint"] = endpoint
             rec["port_wait_ms"] = wait_port(endpoint, deadline)
 
-            ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
-            rec["ws_url_prewired"] = bool(ws_url)
-            drive_args = argparse.Namespace(
-                cdp_host=endpoint,
-                url=args.url,
-                format=args.format,
-                quality=args.quality,
-                timeout=max(1.0, deadline - time.monotonic()),
-                idle_wait_ms=0.0,
-                out_prefix="",
-                ws_url=ws_url,
-                connect_retries=200,
-                nav_timing=True,
-                print_target=False,
-                # This Namespace is an explicit, CLOSED field list, so every flag
-                # cdpdrive grows has to be added here too or `drive()` raises
-                # AttributeError — which is not in its except tuple, escapes it,
-                # and is swallowed by the `except Exception` below, failing every
-                # cdp rep. cdpdrive also reads it with getattr; both halves.
-                host_header="",
-                render_module=os.path.join(HERE, "render.py"),
-            )
-            result = cdpdrive.drive(drive_args)
+            # reqscale supplies one private probe per concurrent request. It
+            # resolves the exact Firecracker child, proves cgroup membership,
+            # snapshots minflt/majflt, and (for traced windows) opens the
+            # bpftrace interval. A probe failure is a request failure and still
+            # flows through the normal teardown below; measurement code never
+            # gets to strand the clone it was observing.
+            fault_probe = getattr(args, "firecracker_fault_probe", None)
+            fault_probe_started = False
+            if fault_probe is not None:
+                fault_probe.begin(fcvm_pid)
+                fault_probe_started = True
+
+            try:
+                ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
+                rec["ws_url_prewired"] = bool(ws_url)
+                drive_args = argparse.Namespace(
+                    cdp_host=endpoint,
+                    url=args.url,
+                    format=args.format,
+                    quality=args.quality,
+                    timeout=max(1.0, deadline - time.monotonic()),
+                    idle_wait_ms=0.0,
+                    out_prefix="",
+                    ws_url=ws_url,
+                    connect_retries=200,
+                    nav_timing=True,
+                    print_target=False,
+                    # This Namespace is an explicit, CLOSED field list, so every flag
+                    # cdpdrive grows has to be added here too or `drive()` raises
+                    # AttributeError — which is not in its except tuple, escapes it,
+                    # and is swallowed by the `except Exception` below, failing every
+                    # cdp rep. cdpdrive also reads it with getattr; both halves.
+                    host_header="",
+                    render_module=os.path.join(HERE, "render.py"),
+                )
+                result = cdpdrive.drive(drive_args)
+            finally:
+                if fault_probe_started:
+                    rec["firecracker_process_faults_ready_to_artifact"] = (
+                        fault_probe.finish()
+                    )
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
             if not rec["ok"]:
@@ -862,6 +884,8 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
             # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
             # teardown, and none of it is latency the caller pays.
             rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+            if rec["ok"]:
+                rec["artifact_monotonic_ns"] = time.monotonic_ns()
         except Exception as e:
             rec["ok"] = False
             rec["error"] = f"{type(e).__name__}: {e}"
@@ -907,6 +931,7 @@ def run_cdp_request(args, rep: int, fast: bool) -> dict:
             e.record = rec
             raise
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+    rec["finished_monotonic_ns"] = time.monotonic_ns()
     rec["log"] = log
     return rec
 

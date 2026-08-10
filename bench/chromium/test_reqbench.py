@@ -357,11 +357,26 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 "ok": False, "error": "WsClosed: connection closed mid-frame",
                 "failure_class": "transport", "stage": "navigate", "stages": {},
             }
+
+            class Probe:
+                def __init__(self):
+                    self.events = []
+
+                def begin(self, fcvm_pid):
+                    self.events.append(("begin", fcvm_pid))
+
+                def finish(self):
+                    self.events.append(("finish",))
+                    return {"pid": 123, "pid_start_time_ticks": 456,
+                            "minor_faults": 7, "major_faults": 0}
+
+            probe = Probe()
             args = argparse.Namespace(
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=10.0, teardown_timeout=5.0, cdp_port=port,
                 state_dir=state_dir, data_root=d, ws_url="",
+                firecracker_fault_probe=probe,
             )
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
@@ -372,6 +387,12 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertIn("WsClosed", rec.get("error", ""))
             self.assertEqual(rec.get("failure_class"), "transport")
             self.assertEqual(rec.get("failure_stage"), "navigate")
+            self.assertEqual([event[0] for event in probe.events], ["begin", "finish"])
+            self.assertEqual(
+                rec["firecracker_process_faults_ready_to_artifact"]["minor_faults"], 7
+            )
+            self.assertIn("started_monotonic_ns", rec)
+            self.assertIn("finished_monotonic_ns", rec)
 
 
 class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):

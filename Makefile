@@ -197,7 +197,8 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-chromium bench-clone-latency \
+	bench-container-import bench-chromium bench-chromium-scale analyze-chromium-scale report-chromium-scale bench-clone-latency \
+	test-chromium-request test-chromium-scale \
 	lint fmt update-dependency ssh test-serve-sdk
 
 all: build
@@ -252,6 +253,11 @@ help:
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
+	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
+	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
+	@echo "  report-chromium-scale   Validate a scale run and write plain Markdown"
+	@echo "  test-chromium-request  Deterministic CDP request-path tests (no VM)"
+	@echo "  test-chromium-scale   Deterministic request scalability harness tests (no VM)"
 	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
@@ -618,6 +624,57 @@ test-serve-sdk: build
 bench-chromium: build
 	@echo "==> Running Chromium shared-nothing benchmark..."
 	@bash bench/chromium/bench.sh run
+
+# Open-loop CDP-fast scalability and page-fault measurement. The Python driver
+# creates split driver/control/FILE/UFFD cgroups, starts its own UFFD serve and
+# persistent host Chromium, and records the full mixed request schedule before
+# the first request. No defaults for cells or publication gates: an accidental
+# benchmark is worse than no benchmark.
+bench-chromium-scale: build
+	@test -n "$(SCALE_RATES)" || (echo "ERROR: SCALE_RATES required (for example 2,4,8)"; exit 1)
+	@test -n "$(SCALE_BURSTS)" || (echo "ERROR: SCALE_BURSTS required (must be at least 5)"; exit 1)
+	@test -n "$(SCALE_SEED)" || (echo "ERROR: SCALE_SEED required"; exit 1)
+	@test -n "$(SCALE_OUT)" || (echo "ERROR: SCALE_OUT required"; exit 1)
+	@test -n "$(SCALE_URL)" || (echo "ERROR: SCALE_URL required"; exit 1)
+	@test -n "$(SCALE_TAG)" || (echo "ERROR: SCALE_TAG required"; exit 1)
+	@test -n "$(SCALE_CONTROL_CHROMIUM)" || (echo "ERROR: SCALE_CONTROL_CHROMIUM required"; exit 1)
+	@test -n "$(SCALE_MAX_OFFERED_ERROR_PCT)" || (echo "ERROR: SCALE_MAX_OFFERED_ERROR_PCT required"; exit 1)
+	@test -n "$(SCALE_MIN_DEPARTURE_RATIO)" || (echo "ERROR: SCALE_MIN_DEPARTURE_RATIO required"; exit 1)
+	@test -n "$(SCALE_MAX_BACKLOG)" || (echo "ERROR: SCALE_MAX_BACKLOG required"; exit 1)
+	@test -n "$(SCALE_MAX_LAUNCH_LAG_MS)" || (echo "ERROR: SCALE_MAX_LAUNCH_LAG_MS required"; exit 1)
+	@test -n "$(SCALE_MAX_CONTROL_DRIFT_PCT)" || (echo "ERROR: SCALE_MAX_CONTROL_DRIFT_PCT required"; exit 1)
+	@echo "==> Running open-loop Chromium request scalability benchmark..."
+	sudo -E env RUST_LOG=fcvm=debug python3 bench/chromium/reqscale.py \
+		--fcvm ./target/release/fcvm --snapshot-tag "$(SCALE_TAG)" \
+		--url "$(SCALE_URL)" --rates "$(SCALE_RATES)" \
+		--bursts "$(SCALE_BURSTS)" --control-chromium "$(SCALE_CONTROL_CHROMIUM)" \
+		--max-offered-rps-error-pct "$(SCALE_MAX_OFFERED_ERROR_PCT)" \
+		--min-departure-ratio "$(SCALE_MIN_DEPARTURE_RATIO)" \
+		--max-score-end-backlog "$(SCALE_MAX_BACKLOG)" \
+		--max-p95-launch-lag-ms "$(SCALE_MAX_LAUNCH_LAG_MS)" \
+		--max-control-median-drift-pct "$(SCALE_MAX_CONTROL_DRIFT_PCT)" \
+		--seed "$(SCALE_SEED)" \
+		--out-dir "$(SCALE_OUT)" $(SCALE_TRACE_ARGS)
+
+analyze-chromium-scale:
+	@test -n "$(SCALE_RUN_DIR)" || (echo "ERROR: SCALE_RUN_DIR required"; exit 1)
+	@test -n "$(SCALE_ANALYSIS_JSON)" || (echo "ERROR: SCALE_ANALYSIS_JSON required"; exit 1)
+	python3 bench/chromium/reqscale_analyze.py \
+		--run-dir "$(SCALE_RUN_DIR)" --json-out "$(SCALE_ANALYSIS_JSON)"
+
+report-chromium-scale:
+	@test -n "$(SCALE_RUN_DIR)" || (echo "ERROR: SCALE_RUN_DIR required"; exit 1)
+	@test -n "$(SCALE_REPORT)" || (echo "ERROR: SCALE_REPORT required"; exit 1)
+	python3 bench/chromium/reqscale_analyze.py \
+		--run-dir "$(SCALE_RUN_DIR)" --markdown-out "$(SCALE_REPORT)"
+
+test-chromium-request:
+	@echo "==> Running deterministic Chromium request-path tests..."
+	python3 bench/chromium/test_reqbench.py
+
+test-chromium-scale: test-chromium-request
+	@echo "==> Running deterministic Chromium scalability harness tests..."
+	python3 bench/chromium/test_reqscale.py
 
 bench: build
 	@echo "==> Running benchmarks..."
