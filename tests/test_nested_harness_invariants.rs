@@ -56,6 +56,58 @@ fn simple_nested_smoke_test_propagates_the_snapshot_mode_into_l2() {
 }
 
 #[test]
+fn simple_nested_smoke_keeps_inner_runtime_local_and_streams_stage_output() {
+    let source = nested_smoke_test_source();
+
+    assert!(
+        source.contains("mkfs.xfs")
+            && source.contains("reflink=1")
+            && source.contains("\"--disk\""),
+        "FCVM_DATA_DIR must be a guest-local reflink-capable block filesystem; \
+         snapshot-enabled L2 launches cannot snapshot an ext4 directory"
+    );
+    assert!(
+        source.contains("export FCVM_DATA_DIR=/root/fcvm-data"),
+        "the inner fcvm's mutable disks, state, and Unix sockets must live on L1's local disk; \
+         /mnt/fcvm-btrfs is a FUSE mount reserved for shared immutable assets"
+    );
+    assert!(
+        source.contains("mkdir -p \"$FCVM_DATA_DIR/state\" \"$FCVM_DATA_DIR/vm-disks\""),
+        "the guest-local inner fcvm data roots must exist before launch"
+    );
+    assert!(
+        source.contains(
+            "install -m 0755 /opt/fcvm/fcvm /opt/fcvm/fc-agent /root/fcvm-bin/",
+        )
+            && source.contains("export PATH=/root/fcvm-bin"),
+        "inner launches and health checks must execute guest-local fcvm and fc-agent siblings; \
+         paging either executable from L1 FUSE can consume the entire health-check timeout"
+    );
+    assert!(
+        source.contains("export RUST_LOG=info"),
+        "the nested launch must emit stage-level progress while CI waits"
+    );
+    assert!(
+        source.contains("--cpu 1"),
+        "the ARM NV2 smoke test must keep the conservative single-vCPU L2 setting"
+    );
+    assert!(
+        source.contains(".stdout(Stdio::inherit())")
+            && source.contains(".stderr(Stdio::inherit())"),
+        "the 20-minute CI stage must stream inner-launch progress instead of buffering it \
+         until completion"
+    );
+
+    // The local mutable-data override must not sever either input that remains shared:
+    // the exact worktree's read-only config and content-addressed kernel/image assets.
+    assert!(
+        source.contains("active_fcvm_config_dir()")
+            && source.contains("/mnt/fcvm-btrfs:/mnt/fcvm-btrfs"),
+        "inner runtime isolation must preserve the exact config and shared asset mounts"
+    );
+}
+
+#[test]
 fn test_recipes_use_an_exact_worktree_local_config() {
     let makefile = makefile_source();
     let wrapper = test_config_wrapper_source();

@@ -255,6 +255,39 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     let fcvm_dir = fcvm_path.parent().unwrap();
     let (vm_name, _, _, _) = common::unique_names("nested-full");
 
+    // The inner fcvm needs mutable storage that is local to L1 (so its control
+    // sockets never traverse FUSE) and supports reflinks (so SnapshotEnabled can
+    // capture its disk). The nested kernel already carries XFS support, so attach
+    // one unique sparse XFS image as a real block device for this test run.
+    let runtime_disk_file = tempfile::Builder::new()
+        .prefix(&format!("{vm_name}-runtime-"))
+        .suffix(".xfs")
+        .tempfile_in("/mnt/fcvm-btrfs")
+        .context("creating L1-local runtime disk")?;
+    runtime_disk_file
+        .as_file()
+        .set_len(16_u64 * 1024 * 1024 * 1024)
+        .context("sizing L1-local runtime disk")?;
+    runtime_disk_file
+        .as_file()
+        .sync_all()
+        .context("syncing L1-local runtime disk")?;
+    let runtime_disk = runtime_disk_file.into_temp_path();
+    let mkfs_output = tokio::process::Command::new("mkfs.xfs")
+        .args(["-f", "-m", "reflink=1"])
+        .arg(runtime_disk.as_os_str())
+        .output()
+        .await
+        .context("formatting L1-local runtime disk as XFS")?;
+    if !mkfs_output.status.success() {
+        bail!(
+            "mkfs.xfs failed for L1-local runtime disk:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&mkfs_output.stdout),
+            String::from_utf8_lossy(&mkfs_output.stderr)
+        );
+    }
+    let runtime_disk_spec = format!("{}:/root/fcvm-data", runtime_disk.display());
+
     // 1. Start outer VM with nested kernel profile
     println!("\n1. Starting outer VM with nested kernel profile...");
     println!("   Mounting: /mnt/fcvm-btrfs (assets) and fcvm binary");
@@ -275,6 +308,8 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
         "--kernel-profile",
         "nested",
         "--privileged",
+        "--disk",
+        &runtime_disk_spec,
         "--map",
         "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
         "--map",
@@ -307,7 +342,8 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
             "--",
             "sh",
             "-c",
-            "ls -la /opt/fcvm/fcvm /mnt/fcvm-btrfs/kernels/ /dev/kvm 2>&1 | head -10",
+            "ls -la /opt/fcvm/fcvm /mnt/fcvm-btrfs/kernels/ /dev/kvm 2>&1 | head -10; \
+             printf 'runtime_fs='; stat -f -c %T /root/fcvm-data",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -317,7 +353,10 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("   {}", stdout.trim().replace('\n', "\n   "));
 
-    if !stdout.contains("fcvm") || !stdout.contains("vmlinux") {
+    if !stdout.contains("fcvm")
+        || !stdout.contains("vmlinux")
+        || !stdout.contains("runtime_fs=xfs")
+    {
         common::kill_process(outer_pid).await;
         bail!("Required files not mounted in outer VM:\n{}", stdout);
     }
@@ -423,6 +462,7 @@ except OSError as e:
     // Assembled by the guest from two halves (see the assertion below), so this literal
     // cannot appear in the argv fcvm echoes into the stderr this test captures.
     const NESTED_MARKER: &str = "NESTED_SUCCESS_INNER_VM_WORKS";
+    const NESTED_INNER_LOG: &str = "/root/nested-inner.log";
 
     let inner_snapshot_env = std::env::var("FCVM_NO_SNAPSHOT")
         .ok()
@@ -431,9 +471,19 @@ except OSError as e:
         .unwrap_or("");
     let inner_cmd = format!(
         r#"
-        export PATH=/opt/fcvm:/mnt/fcvm-btrfs/bin:$PATH
         export HOME=/root
+        export FCVM_DATA_DIR=/root/fcvm-data
+        export RUST_LOG=info
         {inner_snapshot_env}
+        mkdir -p /root/fcvm-bin
+        install -m 0755 /opt/fcvm/fcvm /opt/fcvm/fc-agent /root/fcvm-bin/
+        export PATH=/root/fcvm-bin:/mnt/fcvm-btrfs/bin:$PATH
+        mkdir -p "$FCVM_DATA_DIR/state" "$FCVM_DATA_DIR/vm-disks"
+        printf local-runtime > "$FCVM_DATA_DIR/.reflink-source"
+        cp --reflink=always "$FCVM_DATA_DIR/.reflink-source" "$FCVM_DATA_DIR/.reflink-probe"
+        rm -f "$FCVM_DATA_DIR/.reflink-source" "$FCVM_DATA_DIR/.reflink-probe"
+        rm -f {nested_inner_log}
+        echo "inner harness: runtime=$(stat -f -c %T "$FCVM_DATA_DIR") binary=$(command -v fcvm)"
         # Load tun kernel module (needed for TAP device creation)
         modprobe tun 2>/dev/null || true
         mkdir -p /dev/net
@@ -445,57 +495,77 @@ except OSError as e:
         fcvm podman run \
             --name inner-test \
             --network bridged \
+            --cpu 1 \
             --cmd "printf '%s_%s\n' NESTED_SUCCESS INNER_VM_WORKS" \
-            public.ecr.aws/nginx/nginx:alpine
-    "#
+            public.ecr.aws/nginx/nginx:alpine 2>&1 | tee {nested_inner_log}
+    "#,
+        nested_inner_log = NESTED_INNER_LOG,
     );
 
-    let output = tokio::process::Command::new(&fcvm_path)
+    // Stream this long stage into the nextest/Actions log while the L1-local tee
+    // retains an exact marker oracle. Buffering with `output()` hid all inner
+    // progress until nextest's 20-minute timeout killed the test.
+    let inner_status = tokio::process::Command::new(&fcvm_path)
         .args([
             "exec",
             "--pid",
             &outer_pid.to_string(),
             "--vm",
             "--",
-            "sh",
+            "bash",
+            "-o",
+            "pipefail",
             "-c",
             inner_cmd.as_str(),
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("running fcvm inside outer VM")?;
+
+    let inner_log_result = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &outer_pid.to_string(),
+            "--vm",
+            "--",
+            "cat",
+            NESTED_INNER_LOG,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .await
-        .context("running fcvm inside outer VM")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    println!("   Inner VM output:");
-    for line in stdout.lines().take(20) {
-        println!("     {}", line);
-    }
-    if !stderr.is_empty() {
-        println!("   Inner VM stderr (last 10 lines):");
-        for line in stderr
-            .lines()
-            .rev()
-            .take(10)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            println!("     {}", line);
-        }
-    }
+        .await;
 
     // 5. Cleanup
     println!("\n5. Cleaning up outer VM...");
     common::kill_process(outer_pid).await;
 
+    let inner_log_output = inner_log_result.context("reading streamed inner VM log")?;
+    let inner_log = String::from_utf8_lossy(&inner_log_output.stdout);
+    let inner_log_stderr = String::from_utf8_lossy(&inner_log_output.stderr);
+
+    if !inner_status.success() {
+        bail!(
+            "inner fcvm stage failed with {inner_status}\n\
+             Captured inner log: {inner_log}\n\
+             Log retrieval stderr: {inner_log_stderr}"
+        );
+    }
+    if !inner_log_output.status.success() {
+        bail!(
+            "failed to retrieve the streamed inner VM log\n\
+             stdout: {inner_log}\n\
+             stderr: {inner_log_stderr}"
+        );
+    }
+
     // 6. Verify success
     //
-    // Check both stdout and stderr since fcvm logs container output to its own stderr
-    // with [ctr:stdout] prefix, so when running via exec, the output appears in stderr.
+    // The inner launch combines stdout and stderr before tee, so the marker is
+    // checked against only the retained stage log, never the outer exec command echo.
     //
     // The marker MUST NOT appear literally in the command we send. fcvm logs the whole
     // argv at INFO ("exec request acknowledged, command starting command=[...]") and that
@@ -514,8 +584,7 @@ except OSError as e:
          in the guest (e.g. printf '%s_%s') instead of inlining it."
     );
 
-    let combined = format!("{}\n{}", stdout, stderr);
-    if combined.contains(NESTED_MARKER) {
+    if inner_log.contains(NESTED_MARKER) {
         println!("\n✅ NESTED TEST PASSED!");
         println!("   Successfully ran fcvm inside fcvm (nested virtualization)");
         Ok(())
@@ -523,10 +592,8 @@ except OSError as e:
         bail!(
             "Nested virtualization failed - inner VM did not produce expected output\n\
              Expected: {NESTED_MARKER}\n\
-             Got stdout: {}\n\
-             Got stderr: {}",
-            stdout,
-            stderr
+             Got streamed inner log: {inner_log}\n\
+             Log retrieval stderr: {inner_log_stderr}"
         );
     }
 }
