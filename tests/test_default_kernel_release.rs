@@ -129,15 +129,20 @@ fn every_guest_kernel_fragment_supports_snapshot_socket_cleanup() {
             // The directional NEW-flow REJECT gate that holds the boundary shut
             // while cookies are captured and retired. The guest runs both
             // iptables and ip6tables, so both families must be present or the
-            // gate cannot install and snapshot creation fails closed.
+            // gate cannot install and snapshot creation fails closed. The
+            // guest's iptables is the nft backend, which creates its tables
+            // dynamically and reaches the xt REJECT target and conntrack match
+            // through NFT_COMPAT; the legacy filter tables are gated behind
+            // NETFILTER_XTABLES_LEGACY on 6.18 and must not be requested, or
+            // Kconfig drops them and the build's own guard refuses to publish.
             "CONFIG_NETFILTER_XTABLES=y",
+            "CONFIG_NF_TABLES=y",
+            "CONFIG_NFT_COMPAT=y",
             "CONFIG_NF_CONNTRACK=y",
             "CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y",
             "CONFIG_IP_NF_IPTABLES=y",
-            "CONFIG_IP_NF_FILTER=y",
             "CONFIG_IP_NF_TARGET_REJECT=y",
             "CONFIG_IP6_NF_IPTABLES=y",
-            "CONFIG_IP6_NF_FILTER=y",
             "CONFIG_IP6_NF_TARGET_REJECT=y",
         ] {
             assert!(
