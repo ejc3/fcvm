@@ -327,6 +327,10 @@ impl<'a> Harness<'a> {
              set -u\n\
              printf '%s\\n' \"$*\" >> \"$BENCH_RECORD_DIR/argv.log\"\n\
              printf '%s\\n' \"${CRITERION_HOME:-<unset>}\" >> \"$BENCH_RECORD_DIR/home.log\"\n\
+             # A real `cargo bench` writes criterion output; the persistence guard in\n\
+             # the bench recipes checks for it. BENCH_STUB_NO_OUTPUT stands in for the\n\
+             # criterion that logged a persistence failure and still exited 0.\n\
+             [ -n \"${BENCH_STUB_NO_OUTPUT:-}\" ] || mkdir -p \"${CRITERION_HOME:-.}\"\n\
              live=\"$BENCH_RECORD_DIR/live.$$\"\n\
              : > \"$live\"\n\
              if [ \"$(ls \"$BENCH_RECORD_DIR\"/live.* | wc -l)\" -gt 1 ]; then\n\
@@ -405,6 +409,9 @@ impl<'a> Harness<'a> {
             .env_remove("CRITERION_HOME")
             .env("PATH", path)
             .env("BENCH_RECORD_DIR", &rec);
+        if self.criterion_home_missing {
+            cmd.env("BENCH_STUB_NO_OUTPUT", "1");
+        }
 
         let out = cmd.output().expect("run make");
         let read = |f: &str| fs::read_to_string(rec.join(f)).unwrap_or_default();
@@ -446,10 +453,15 @@ fn bench_quick_passes_criterion_flags_after_the_cargo_separator() {
         .output()
         .expect("run cargo");
     let control_err = String::from_utf8_lossy(&control.stderr);
+    // The rejection MESSAGE is the property, not the exit status: a `cargo` shim on
+    // PATH can forward the diagnostic and still exit 0, which is what CI has. Keying
+    // the control on the status made this test pass locally and fail there.
     assert!(
-        !control.status.success() && control_err.contains("unexpected argument '--sample-size'"),
+        control_err.contains("unexpected argument '--sample-size'"),
         "cargo no longer rejects criterion flags given to it directly, so this test is guarding \
-         a rule that no longer holds. cargo said: {control_err}"
+         a rule that no longer holds. cargo at {cargo} exited {status:?} and said: {control_err}",
+        cargo = cargo.display(),
+        status = control.status.code(),
     );
 
     let quick = Harness::new("bench-quick", &["bench-quick"]).run();
