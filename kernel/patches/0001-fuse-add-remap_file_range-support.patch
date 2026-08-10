@@ -10,11 +10,12 @@ belong; neither replaces the other.
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
+
 diff --git a/fs/fuse/file.c b/fs/fuse/file.c
-index 676fd9856bfbf..1a47c623a0868 100644
+index 585dd9036..a5ee72516 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3158,6 +3158,131 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3123,6 +3123,131 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  	return ret;
  }
  
@@ -146,20 +147,19 @@ index 676fd9856bfbf..1a47c623a0868 100644
  static const struct file_operations fuse_file_operations = {
  	.llseek		= fuse_file_llseek,
  	.read_iter	= fuse_file_read_iter,
-@@ -3178,6 +3303,7 @@ static const struct file_operations fuse_file_operations = {
+@@ -3142,6 +3267,7 @@ static const struct file_operations fuse_file_operations = {
+ 	.poll		= fuse_file_poll,
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
--	.setlease	= generic_setlease,
-+	.setlease	= generic_setlease,
 +	.remap_file_range = fuse_remap_file_range,
  };
  
  static const struct address_space_operations fuse_file_aops  = {
 diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
-index 7f16049387d15..fd1bbee65e88d 100644
+index c288f28f6..b00caf2e4 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
-@@ -873,6 +873,9 @@ struct fuse_conn {
+@@ -860,6 +860,9 @@ struct fuse_conn {
  	/** Does the filesystem support copy_file_range_64? */
  	unsigned no_copy_file_range_64:1;
  
@@ -170,7 +170,7 @@ index 7f16049387d15..fd1bbee65e88d 100644
  	unsigned int destroy:1;
  
 diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
-index c13e1f9a2f12b..4ad264aa6a993 100644
+index c13e1f9a2..4ad264aa6 100644
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
 @@ -663,6 +663,7 @@ enum fuse_opcode {

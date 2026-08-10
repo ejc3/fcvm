@@ -301,17 +301,32 @@ fn nested_profile_remap_test_covers_request_lengths_above_u32() {
     );
 }
 
-/// These profiles are user-deployable. Linux 7.0.14 reached EOL on 2026-06-27,
-/// so retaining that pin would ship an unsupported kernel rather than preserve
-/// a test-only reproduction target.
+/// These profiles are user-deployable, so they must pin a kernel that is both
+/// kernel.org-supported and actually works as an NV2 L1. Linux 7.0.14 reached
+/// EOL on 2026-06-27. Worse, every 7.x kernel probed to date (7.0.14, 7.1.7,
+/// 7.1.8) wedges nested guests: the L2 kernel boots and stays scheduled, but
+/// its userspace freezes at the first burst of virtio-blk reads against the
+/// FUSE-backed root disk, while the same test is green on 6.18.x with every
+/// other variable held fixed (same host kernel, same Firecracker, same box).
+/// Until a fixed 7.x release is verified, the pin stays on the 6.18 longterm
+/// line.
 #[test]
-fn deployable_kernel_profiles_do_not_pin_eol_7_0_14() {
+fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
     let config = repo_file("rootfs-config.toml");
 
     assert!(
         !config.contains("kernel_version = \"7.0.14\""),
         "rootfs-config.toml still pins deployable profiles to EOL Linux 7.0.14"
     );
+    for broken in ["7.0.14", "7.1.7", "7.1.8"] {
+        assert!(
+            !config.contains(&format!("kernel_version = \"{broken}\"")),
+            "rootfs-config.toml pins {broken}, which wedges nested (NV2) guests: L2 \
+             userspace freezes on its first heavy virtio-blk reads of the FUSE-backed \
+             root disk (verified RED on c7gd.metal, 2026-08-10, with 6.18.x green as \
+             the control)"
+        );
+    }
 
     for profile in [
         "kernel_profiles.nested.arm64",
@@ -325,8 +340,8 @@ fn deployable_kernel_profiles_do_not_pin_eol_7_0_14() {
         assert!(
             section
                 .lines()
-                .any(|line| line.trim() == "kernel_version = \"7.1.7\""),
-            "deployable profile [{profile}] must pin exact supported Linux 7.1.7"
+                .any(|line| line.trim() == "kernel_version = \"6.18.44\""),
+            "deployable profile [{profile}] must pin exact supported longterm Linux 6.18.44"
         );
     }
 }

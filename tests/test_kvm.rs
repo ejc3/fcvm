@@ -433,6 +433,13 @@ except OSError as e:
         r#"
         export PATH=/opt/fcvm:/mnt/fcvm-btrfs/bin:$PATH
         export HOME=/root
+        # RUST_LOG does not cross the exec boundary, and the inner fcvm's
+        # default level suppresses the INFO-tier lines that carry the L2
+        # serial console it streams. Without this the captured tail is a
+        # few hundred bytes of health-monitor warnings (measured 262 bytes
+        # over a full 600s wedge) instead of the console evidence the
+        # bounded run exists to surface.
+        export RUST_LOG=info
         {inner_snapshot_env}
         # Load tun kernel module (needed for TAP device creation)
         modprobe tun 2>/dev/null || true
