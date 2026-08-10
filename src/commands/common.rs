@@ -981,7 +981,7 @@ pub async fn cleanup_vm(
     // Normal runs intentionally retain their best-effort teardown contract.  Prepare calls
     // `cleanup_vm_verified` so it can fail closed instead of reporting a durable artifact
     // while host resources remain.
-    let _ = cleanup_vm_inner(ctx, vm_manager, holder_child, network, state_manager, false).await;
+    let _ = cleanup_vm_inner(ctx, vm_manager, holder_child, network, state_manager).await;
 }
 
 /// Tear down every VM resource and return an error if any cleanup action failed.
@@ -996,7 +996,7 @@ pub async fn cleanup_vm_verified(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
 ) -> Result<()> {
-    cleanup_vm_inner(ctx, vm_manager, holder_child, network, state_manager, true).await
+    cleanup_vm_inner(ctx, vm_manager, holder_child, network, state_manager).await
 }
 
 async fn cleanup_vm_inner(
@@ -1005,7 +1005,6 @@ async fn cleanup_vm_inner(
     holder_child: &mut Option<tokio::process::Child>,
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
-    verified: bool,
 ) -> Result<()> {
     let CleanupContext {
         vm_id,
