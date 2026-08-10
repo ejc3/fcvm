@@ -1,0 +1,7 @@
+# Immutable inputs for the published amd64 default kernel artifact.
+# Bump build_spec whenever the generated kernel build procedure changes in a
+# way that can change vmlinux bytes.
+build_spec = 1
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+kernel_config = "kernel/default-x86.conf"
+patches_dir = ""
