@@ -1012,8 +1012,8 @@ fn continue_vm_gone(e: &userfaultfd::Error) -> bool {
 /// Whether a UFFDIO_COPY error means the clone's mm is gone (process exited).
 ///
 /// The COPY equivalent of [`continue_vm_gone`]. A clone that exits with a fault in flight
-/// races the handler: the `read_event`-returns-error path (uffd closed) is the common
-/// ending, but if the copy is already in the kernel it comes back `ESRCH` instead. That is
+/// races the handler: normally the peer pidfd wins the select and ends the handler, but if
+/// a copy is already in the kernel it comes back `ESRCH` instead. That is
 /// an ordinary end of life, NOT a service failure — and the distinction now matters, because
 /// a failure here kills a VMM and reports the clone FAILED. Misreading a normal exit as a
 /// failure would fill the serve log with false alarms and devalue the real ones.
