@@ -67,6 +67,25 @@ nothing. Every rule below exists because one of them broke.
 - **`scripts/ci-stray-vm-guard.sh` is DESTRUCTIVE** — it SIGKILLs everything matching,
   with no interlock against a concurrent job. An agent ran it "to exercise it" and
   killed another agent's live test. Use `--dry-run`. Never run it on a shared box.
+- **All phases must use ONE podman store.** `build` and `golden` have to run under
+  the same identity fcvm runs as. The harness invokes fcvm through `$SUDO`, so with
+  `SUDO=sudo` from an unprivileged shell the image is built in the *rootless* store
+  and consumed from *root's* — two stores, two different images under one tag. The
+  golden phase's identity guard catches it and is right to:
+  `snapshot image disk '<...>/67de414c….storage-v2.img' does not match inspected
+  cache key '592250fc…'`. That is not a corrupt cache; it is the tag resolving to a
+  different image in the store fcvm actually read. Run the whole chain as one user.
+- **Rootless podman needs a runtime dir, and says something else when it lacks one.**
+  On a fresh box `podman info` fails with `default OCI runtime "crun" not found:
+  invalid argument` while `/usr/bin/crun` is installed and executable. `--log-level=debug`
+  names the real cause: `Configured OCI runtime crun initialization failed: creating
+  OCI runtime exit files directory: mkdir /run/user/1000: permission denied`. A user
+  with no login session has no `XDG_RUNTIME_DIR`; `sudo -u <user>` does not create one.
+  Fix is `loginctl enable-linger <user>`. Do not go looking for crun.
+- **`fcvm setup` must have run, and `build` will not tell you.** Without the fc-agent
+  initrd the golden phase dies one second in with `setting up fc-agent initrd:
+  fc-agent initrd not found`, after `build` reported success — the two phases check
+  nothing about each other.
 - **Poisoned CI caches are real.** A runner that dies mid-write with
   `CACHE_ON_FAILURE: true` persists a truncated cache that later restores and makes
   `cargo build` segfault in 70 ms. If a build fails impossibly fast, check cache
