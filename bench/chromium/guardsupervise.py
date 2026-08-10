@@ -52,7 +52,10 @@ def main() -> int:
         print("guardsupervise: parent changed while arming parent-death", file=sys.stderr)
         return 125
     try:
-        with open(cgroup_procs, "w") as stream:
+        # Appending, not truncating: writing to a real cgroup.procs MOVES one pid into
+        # the cgroup and never replaces its membership, so "w" misrepresents what this
+        # write does and, on any file-backed stand-in, silently drops every other member.
+        with open(cgroup_procs, "a") as stream:
             stream.write(f"{os.getpid()}\n")
     except OSError as error:
         print(f"guardsupervise: cannot enter cgroup: {error}", file=sys.stderr)
@@ -105,7 +108,13 @@ def main() -> int:
             time.sleep(0.01)
 
     def terminate(_signum, _frame):
-        kill_cgroup()
+        # The signal path owes the same answer as the normal one: a cgroup that will
+        # not empty is not a clean shutdown just because a signal started it.
+        remaining = kill_cgroup()
+        if remaining:
+            print(f"guardsupervise: {len(remaining)} process(es) still in {cgroup_dir} "
+                  f"after cgroup.kill: {remaining}", file=sys.stderr)
+            raise SystemExit(126)
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, terminate)

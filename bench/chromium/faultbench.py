@@ -549,7 +549,8 @@ def stop_serve(proc, pid, tag=None, umode=None):
         time.sleep(0.2)
     if not serve_pid_for_pid_gone(pid):
         raise SystemExit(
-            f"[faultbench] serve pid {pid} is gone but /proc/{pid} remains after 10s"
+            f"[faultbench] serve pid {pid} was killed but /proc/{pid} still exists 10s "
+            f"later; something is holding the process"
         )
     if tag is not None and serve_pid_for(tag, umode) is not None:
         raise SystemExit(
@@ -825,13 +826,23 @@ def main():
             require_clones_gone(f"fb-{runid}", 120, f"{cell} {page} rep{i}")
             time.sleep(1.0)
     finally:
+        # Every step runs even if an earlier one fails, then the failures are
+        # reported together. Letting stop_serve's SystemExit propagate from here
+        # skipped the remaining serves, the load sampler, the host server and the
+        # ftrace instance, so one bad teardown leaked all of them.
+        teardown_errors = []
         for cell, (proc, pid, tag, umode) in serves.items():
-            stop_serve(proc, pid, tag, umode)
+            try:
+                stop_serve(proc, pid, tag, umode)
+            except SystemExit as error:
+                teardown_errors.append(f"{cell}: {error}")
         load_stop.set()
         load_sampler.join(timeout=5)
         srv.terminate()
         if args.ftrace:
             ftrace_teardown()
+        if teardown_errors:
+            raise SystemExit("[faultbench] teardown failed:\n  " + "\n  ".join(teardown_errors))
 
     print(f"[faultbench] done: {len(results)} requests -> {out}", flush=True)
 

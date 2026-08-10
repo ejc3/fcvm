@@ -746,10 +746,15 @@ print(child.pid, flush=True)
             # A cgroup v2 directory always carries cgroup.kill; the wrapper uses its
             # presence to tell a real cgroup from an ordinary directory.
             open(os.path.join(tmp, "cgroup.kill"), "w").close()
-            # The wrapper writes its child's pid here on startup, and nothing removes
-            # it from an ordinary file, so this stands in for a member that outlives
-            # the child.
-            open(cgroup_procs, "w").close()
+            # A THIRD-PARTY survivor, not the supervisor's own enrollment: the wrapper
+            # writes its own pid here at startup, and in a real cgroup `cgroup.kill`
+            # would take that process too, so asserting on it would not distinguish
+            # "a child outlived the browser" from "the supervisor enrolled itself".
+            survivor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            self.addCleanup(survivor.wait)
+            self.addCleanup(survivor.kill)
+            with open(cgroup_procs, "w") as handle:
+                handle.write(f"{survivor.pid}\n")
 
             done = subprocess.run(
                 [
@@ -766,9 +771,9 @@ print(child.pid, flush=True)
                 "a cgroup that will not empty must fail the request, not report the "
                 f"child's own status: {done.stderr}",
             )
-            self.assertRegex(
-                done.stderr, r"process\(es\) still in .* after cgroup\.kill: \['\d+'\]",
-                "the survivors must be named so they can be chased",
+            self.assertIn(
+                str(survivor.pid), done.stderr,
+                "the third-party survivor must be named so it can be chased",
             )
 
     def test_guardsupervise_terminates_the_third_party_process_group(self):
