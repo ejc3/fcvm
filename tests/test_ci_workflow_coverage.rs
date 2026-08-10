@@ -588,3 +588,161 @@ fn claude_infrastructure_retry_is_trusted_bounded_and_gates_ci_fix() {
         );
     }
 }
+
+/// Every PR must produce exactly one `Summary` check run.
+///
+/// ci.yml used to carry a `paths-ignore` on its `pull_request` trigger, so a PR
+/// whose every changed file matched that list produced **no check runs at all**
+/// — not even a skipped Summary — and GitHub reported it CLEAN. PR #785 (a
+/// two-file actions/setup-node bump touching only `.github/workflows/claude*.yml`)
+/// was mechanically mergeable that way. Same claim-confusion as the base-branch
+/// filter above: "no failing checks" and "the checks ran" are different claims.
+///
+/// The fix is per-JOB skipping, not per-workflow: the trigger fires for every
+/// PR, a `changes` job decides whether the VM matrix is meaningful, and Summary
+/// is always present so it can be a required check. A second workflow that also
+/// emits `Summary` is NOT an acceptable substitute: `paths` fires when ANY file
+/// matches while `paths-ignore` skips only when EVERY file matches, so a PR
+/// touching both `src/` and a doc would emit two `Summary` check runs and make
+/// the required-check result ambiguous.
+#[test]
+fn every_pull_request_produces_exactly_one_summary() {
+    let ci = parse_workflow("ci.yml");
+    let pull_request = triggers(&ci)
+        .get("pull_request")
+        .expect("ci.yml has no `pull_request:` trigger — PRs would get no CI at all");
+
+    if let Some(mapping) = pull_request.as_mapping() {
+        assert!(
+            !mapping.contains_key(Value::from("paths-ignore")),
+            "ci.yml restricts `pull_request` with `paths-ignore:`. A PR whose every changed \
+             file matches it then produces zero check runs and reads as CLEAN (PR #785). Skip \
+             the expensive jobs with the `changes` job instead, so Summary is always present."
+        );
+        assert!(
+            !mapping.contains_key(Value::from("paths")),
+            "ci.yml restricts `pull_request` with `paths:`, so PRs outside that list get no \
+             Summary at all"
+        );
+    }
+
+    // No other workflow may render a competing check of the same name.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    for entry in std::fs::read_dir(&dir).expect("read workflows dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name == "ci.yml" {
+            continue;
+        }
+        let wf: Value = serde_norway::from_str(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{name} is not valid YAML: {e}"));
+        let Some(jobs) = wf.get("jobs").and_then(Value::as_mapping) else {
+            continue;
+        };
+        for (_, job) in jobs {
+            let renders_summary = job.get("name").and_then(Value::as_str) == Some("Summary");
+            assert!(
+                !renders_summary,
+                "{name} also renders a check named `Summary`. Two workflows emitting the same \
+                 check name make a required-check result ambiguous, and their path filters \
+                 cannot be kept complementary (`paths` fires on ANY match, `paths-ignore` \
+                 skips only on EVERY match), so a mixed PR emits both."
+            );
+        }
+    }
+}
+
+/// The VM matrix is skipped per-job, and only for paths it cannot speak to.
+///
+/// This is the other half of the fix above: dropping `paths-ignore` must not
+/// mean running hours of self-hosted VM tests to validate a doc typo. Each
+/// expensive job is gated on `changes.outputs.code`, and Summary keeps gating
+/// them — a skipped `needs` is already treated as non-failure by the Summary
+/// step, while a failed one still fails it.
+#[test]
+fn expensive_jobs_are_gated_on_the_changes_job() {
+    let ci = parse_workflow("ci.yml");
+    let jobs = ci
+        .get("jobs")
+        .and_then(Value::as_mapping)
+        .expect("ci.yml has no `jobs:` mapping");
+
+    let changes = jobs
+        .get(Value::from("changes"))
+        .expect("ci.yml has no `changes` job to decide whether the matrix is meaningful");
+    let detect = format!("{changes:?}");
+    for ignored in [
+        "scripts/claude-assistant/",
+        ".github/workflows/claude",
+        ".claude/",
+        "docs/",
+        "*.md",
+    ] {
+        assert!(
+            detect.contains(ignored),
+            "the `changes` job no longer recognises `{ignored}` as a path the VM matrix cannot \
+             speak to, so PRs touching only it will run the full matrix"
+        );
+    }
+
+    for job in [
+        "lint",
+        "packaging",
+        "fc-mock",
+        "host",
+        "host-root",
+        "container",
+    ] {
+        let cond = jobs
+            .get(Value::from(job))
+            .and_then(|j| j.get("if"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("ci.yml job `{job}` has no `if:` gate"));
+        assert!(
+            cond.contains("needs.changes.outputs.code == 'true'"),
+            "ci.yml job `{job}` is not gated on the `changes` job, so a docs-only PR runs it"
+        );
+    }
+}
+
+/// `.github/workflows/claude*.yml` changes must get a check that can fail.
+///
+/// Those files are exactly the ones the VM matrix says nothing about, so they
+/// skip it — which must not decay into "nothing checks them". `actionlint`
+/// lives in ci.yml (not in claude-lint.yml) precisely so `Summary` gates it:
+/// for a claude-workflow-only PR it is the one gating job that still runs.
+#[test]
+fn workflow_changes_get_a_relevant_gated_check() {
+    let ci = parse_workflow("ci.yml");
+    let jobs = ci
+        .get("jobs")
+        .and_then(Value::as_mapping)
+        .expect("ci.yml has no `jobs:` mapping");
+
+    let actionlint = jobs.get(Value::from("actionlint")).expect(
+        "ci.yml no longer defines an `actionlint` job, so a workflow-only PR skips the \
+                 matrix and nothing else can fail for it",
+    );
+    assert!(
+        actionlint.get("if").is_none(),
+        "the `actionlint` job must not be gated on `changes`: workflow-only PRs are exactly \
+         the case it exists to cover"
+    );
+
+    let needs: Vec<String> = jobs
+        .get(Value::from("summary"))
+        .and_then(|s| s.get("needs"))
+        .and_then(Value::as_sequence)
+        .expect("ci.yml `summary` job has no `needs:` list")
+        .iter()
+        .map(|v| v.as_str().expect("needs entry").to_string())
+        .collect();
+    assert!(
+        needs.iter().any(|n| n == "actionlint"),
+        "`actionlint` is defined but is not in `summary.needs`, so Summary can go green while \
+         it fails"
+    );
+}
