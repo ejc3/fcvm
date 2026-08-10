@@ -42,10 +42,16 @@ pub struct CreateSnapshotParams<'a> {
     pub remap_refs: &'a [Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotInstall {
+    Created,
+    Existing,
+}
+
 /// Create a podman snapshot from a running VM.
 ///
-/// This pauses the VM, creates a Firecracker snapshot, copies the disk,
-/// saves metadata using SnapshotManager, and resumes the VM.
+/// This pauses the VM, creates a Firecracker snapshot, copies the disk, saves metadata,
+/// and applies the requested source disposition.
 ///
 /// The snapshot is stored in snapshot_dir with snapshot_key as the name,
 /// making it accessible via `fcvm snapshot run --snapshot <snapshot_key>`.
@@ -54,7 +60,10 @@ pub struct CreateSnapshotParams<'a> {
 /// lock is held, so a concurrent `fcvm snapshot create` (which resets the KVM
 /// dirty bitmap and updates `snapshot_name`) can never leave us merging a diff
 /// onto a stale base.
-pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<()> {
+pub async fn create_podman_snapshot(
+    snap: &CreateSnapshotParams<'_>,
+    source_disposition: crate::commands::common::SnapshotSourceDisposition,
+) -> Result<SnapshotInstall> {
     let CreateSnapshotParams {
         vm_manager,
         snapshot_key,
@@ -88,7 +97,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         // waited for its generation lock.
         if snapshot_dir.join("config.json").exists() {
             info!(snapshot_key = %snapshot_key, "Snapshot already exists (created by another process)");
-            return Ok(());
+            return Ok(SnapshotInstall::Existing);
         }
 
         // Serialize dirty-bitmap resets, then ensure both the owning process identity and
@@ -170,10 +179,11 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         disk_path,
         parent_dir.as_deref(),
         Some(&extra_files),
+        source_disposition,
     )
     .await?;
 
-    Ok(())
+    Ok(SnapshotInstall::Created)
 }
 
 /// Create a snapshot with signal interruption support.
@@ -186,21 +196,20 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
 pub async fn create_snapshot_interruptible(
     snap: &CreateSnapshotParams<'_>,
     cancel: &CancellationToken,
+    source_disposition: crate::commands::common::SnapshotSourceDisposition,
 ) -> SnapshotOutcome {
-    // CRITICAL: Do NOT use tokio::select! to interrupt the snapshot future.
-    // create_snapshot_core pauses the VM, creates the snapshot, then resumes.
-    // If we drop the future between pause and resume (via select!), the VM
-    // stays paused forever. Instead, check cancellation before starting and
-    // let the snapshot run to completion once started.
+    // CRITICAL: Do NOT interrupt the snapshot future after it starts. A normal source must
+    // reach its resume step; a disposable source must finish atomic artifact installation.
+    // Check cancellation before starting and let the snapshot reach its requested terminal
+    // disposition once started.
     if cancel.is_cancelled() {
         info!("snapshot creation skipped -- already cancelled");
         return SnapshotOutcome::Interrupted;
     }
 
-    // Run snapshot to completion. create_snapshot_core always resumes the VM
-    // before returning, even on error, so this is safe.
-    match create_podman_snapshot(snap).await {
-        Ok(()) => {
+    // Run snapshot to completion so its source disposition is always honored.
+    match create_podman_snapshot(snap, source_disposition).await {
+        Ok(_) => {
             if cancel.is_cancelled() {
                 // Snapshot succeeded but we're shutting down
                 SnapshotOutcome::Interrupted

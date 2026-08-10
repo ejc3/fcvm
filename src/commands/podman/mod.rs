@@ -27,7 +27,7 @@ pub(crate) use listeners::{run_output_listener, run_status_listener, spawn_bootp
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
-    CreateSnapshotParams,
+    CreateSnapshotParams, SnapshotInstall,
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
@@ -143,7 +143,252 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
     match args.cmd {
         PodmanCommands::Run(run_args) => cmd_podman_run(run_args).await,
+        PodmanCommands::Prepare(run_args) => cmd_podman_prepare(run_args).await,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PodmanLifecycle {
+    Run,
+    Prepare,
+}
+
+fn snapshot_source_disposition(
+    lifecycle: PodmanLifecycle,
+) -> super::common::SnapshotSourceDisposition {
+    match lifecycle {
+        PodmanLifecycle::Run => super::common::SnapshotSourceDisposition::Resume,
+        PodmanLifecycle::Prepare => super::common::SnapshotSourceDisposition::LeavePaused,
+    }
+}
+
+fn validate_prepare_args(args: &RunArgs) -> Result<()> {
+    anyhow::ensure!(
+        !args.no_snapshot,
+        "podman prepare cannot be used with --no-snapshot"
+    );
+    anyhow::ensure!(!args.tty, "podman prepare does not support --tty");
+    anyhow::ensure!(
+        !args.interactive,
+        "podman prepare does not support --interactive"
+    );
+    anyhow::ensure!(
+        args.vsock_dir.is_none(),
+        "podman prepare does not support --vsock-dir because its source VM is disposable"
+    );
+    anyhow::ensure!(
+        args.hypervisor == crate::cli::args::Hypervisor::Firecracker,
+        "podman prepare currently requires --hypervisor firecracker"
+    );
+    anyhow::ensure!(
+        args.rootfs_override.is_none(),
+        "podman prepare cannot prepare an internal disk-only clone"
+    );
+    anyhow::ensure!(
+        std::env::var("FCVM_NO_SNAPSHOT").map_or(true, |value| value.is_empty()),
+        "podman prepare cannot run while FCVM_NO_SNAPSHOT disables snapshots"
+    );
+    anyhow::ensure!(
+        std::env::var("FCVM_BOOTPLAN").as_deref() != Ok("vsock"),
+        "podman prepare does not support the forced FCVM_BOOTPLAN=vsock debug path"
+    );
+    Ok(())
+}
+
+fn should_arm_startup_snapshot(
+    skip_snapshot_creation: bool,
+    has_snapshot_key: bool,
+    has_explicit_http_health_check: bool,
+    lifecycle: PodmanLifecycle,
+) -> bool {
+    !skip_snapshot_creation
+        && has_snapshot_key
+        && (lifecycle == PodmanLifecycle::Prepare || has_explicit_http_health_check)
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum PreparedCache {
+    Hit,
+    Created,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+struct PreparedSnapshotOutput {
+    status: &'static str,
+    cache: PreparedCache,
+    snapshot_key: String,
+    generation_id: String,
+    config_digest: String,
+}
+
+struct PreparedSnapshot {
+    output: PreparedSnapshotOutput,
+    // Held through JSON publication so a concurrent creator/deleter cannot replace the
+    // generation between verification and the successful command response.
+    _generation_lock: std::fs::File,
+}
+
+enum VmPreparation {
+    Active(Box<VmContext>),
+    RunCompleted,
+    Prepared(PreparedSnapshot),
+}
+
+async fn verify_prepared_snapshot(
+    snapshot_key: &str,
+    cache: PreparedCache,
+) -> Result<Option<PreparedSnapshot>> {
+    verify_prepared_snapshot_in(&paths::snapshot_dir(), snapshot_key, cache).await
+}
+
+async fn verify_prepared_snapshot_in(
+    snapshot_root: &std::path::Path,
+    snapshot_key: &str,
+    cache: PreparedCache,
+) -> Result<Option<PreparedSnapshot>> {
+    let snapshot_dir = snapshot_root.join(snapshot_key);
+    tokio::fs::create_dir_all(snapshot_root)
+        .await
+        .context("creating snapshot directory")?;
+    let generation_lock = super::common::acquire_snapshot_dir_lock(&snapshot_dir, false).await?;
+
+    let config_path = snapshot_dir.join("config.json");
+    if !tokio::fs::try_exists(&config_path)
+        .await
+        .with_context(|| format!("checking prepared snapshot {}", config_path.display()))?
+    {
+        return Ok(None);
+    }
+
+    let manager = crate::storage::SnapshotManager::new(snapshot_root.to_path_buf());
+    let (config, generation) = manager
+        .load_snapshot_with_generation(snapshot_key)
+        .await
+        .with_context(|| format!("loading prepared snapshot {snapshot_key}"))?;
+
+    anyhow::ensure!(
+        config.name == snapshot_key,
+        "prepared snapshot key mismatch: requested {}, config names {}",
+        snapshot_key,
+        config.name
+    );
+    anyhow::ensure!(
+        config.generation_id != uuid::Uuid::nil(),
+        "prepared snapshot {} has a nil generation ID",
+        snapshot_key
+    );
+    anyhow::ensure!(
+        config.snapshot_type == crate::storage::SnapshotType::System,
+        "prepared snapshot {} is not a system cache snapshot",
+        snapshot_key
+    );
+    anyhow::ensure!(
+        config.kind == crate::storage::SnapshotKind::Full,
+        "prepared snapshot {} is not a full memory snapshot",
+        snapshot_key
+    );
+
+    for (label, configured, expected) in [
+        (
+            "memory",
+            &config.memory_path,
+            snapshot_dir.join("memory.bin"),
+        ),
+        (
+            "VM state",
+            &config.vmstate_path,
+            snapshot_dir.join("vmstate.bin"),
+        ),
+        ("disk", &config.disk_path, snapshot_dir.join("disk.raw")),
+    ] {
+        anyhow::ensure!(
+            configured == &expected,
+            "prepared snapshot {} {} path points outside its generation: {}",
+            snapshot_key,
+            label,
+            configured.display()
+        );
+        let metadata = tokio::fs::metadata(configured).await.with_context(|| {
+            format!(
+                "reading prepared snapshot {} {} artifact {}",
+                snapshot_key,
+                label,
+                configured.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() > 0,
+            "prepared snapshot {} {} artifact is not a non-empty regular file: {}",
+            snapshot_key,
+            label,
+            configured.display()
+        );
+    }
+
+    // `prepare` is a durability boundary, not merely a namespace rename. Flush every file
+    // in the installed generation, then the generation and snapshot-root directories, while
+    // the shared generation lease prevents replacement. Success therefore survives a host
+    // crash after the JSON response rather than depending on eventual writeback.
+    let sync_dir = snapshot_dir.clone();
+    let sync_root = snapshot_root.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        for entry in std::fs::read_dir(&sync_dir)
+            .with_context(|| format!("reading prepared generation {}", sync_dir.display()))?
+        {
+            let entry = entry.context("reading prepared generation entry")?;
+            if entry
+                .file_type()
+                .context("reading prepared generation entry type")?
+                .is_file()
+            {
+                std::fs::File::open(entry.path())
+                    .with_context(|| {
+                        format!("opening prepared artifact {}", entry.path().display())
+                    })?
+                    .sync_all()
+                    .with_context(|| {
+                        format!("syncing prepared artifact {}", entry.path().display())
+                    })?;
+            }
+        }
+        std::fs::File::open(&sync_dir)
+            .with_context(|| format!("opening prepared generation {}", sync_dir.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing prepared generation {}", sync_dir.display()))?;
+        std::fs::File::open(&sync_root)
+            .with_context(|| format!("opening snapshot root {}", sync_root.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing snapshot root {}", sync_root.display()))?;
+        Ok(())
+    })
+    .await
+    .context("joining prepared snapshot durability sync")??;
+
+    Ok(Some(PreparedSnapshot {
+        output: PreparedSnapshotOutput {
+            status: "prepared",
+            cache,
+            snapshot_key: snapshot_key.to_string(),
+            generation_id: generation.generation_id().to_string(),
+            config_digest: generation.config_digest_hex(),
+        },
+        _generation_lock: generation_lock,
+    }))
+}
+
+fn publish_prepared_snapshot(prepared: &PreparedSnapshot) -> Result<()> {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, &prepared.output)
+        .context("serializing prepared snapshot result")?;
+    writeln!(&mut stdout).context("writing prepared snapshot result")?;
+    stdout
+        .flush()
+        .context("flushing prepared snapshot result")?;
+    Ok(())
 }
 
 /// Best-effort removal of host state persisted during a failed `prepare_vm`.
@@ -236,8 +481,26 @@ async fn cleanup_failed_prepare(
     }
 }
 
-pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
-    info!("Starting fcvm podman run");
+pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
+    match prepare_vm_for_lifecycle(args, PodmanLifecycle::Run).await? {
+        VmPreparation::Active(ctx) => Ok(Some(*ctx)),
+        VmPreparation::RunCompleted => Ok(None),
+        VmPreparation::Prepared(_) => unreachable!("run lifecycle cannot prepare an artifact"),
+    }
+}
+
+async fn prepare_vm_for_lifecycle(
+    mut args: RunArgs,
+    lifecycle: PodmanLifecycle,
+) -> Result<VmPreparation> {
+    info!(
+        lifecycle = ?lifecycle,
+        "Starting fcvm podman lifecycle"
+    );
+
+    if lifecycle == PodmanLifecycle::Prepare {
+        validate_prepare_args(&args)?;
+    }
 
     // Validate VM name before any setup work
     validate_vm_name(&args.name).context("invalid VM name")?;
@@ -490,8 +753,22 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot
         let startup_key = startup_snapshot_key(&key);
 
+        if lifecycle == PodmanLifecycle::Prepare {
+            if let Some(prepared) =
+                verify_prepared_snapshot(&startup_key, PreparedCache::Hit).await?
+            {
+                info!(
+                    snapshot_key = %startup_key,
+                    generation_id = %prepared.output.generation_id,
+                    "Prepared startup snapshot hit"
+                );
+                return Ok(VmPreparation::Prepared(prepared));
+            }
+        }
+
         // Check for startup snapshot first (fully initialized application)
-        if check_podman_snapshot(&startup_key).await.is_some() {
+        if lifecycle == PodmanLifecycle::Run && check_podman_snapshot(&startup_key).await.is_some()
+        {
             info!(
                 snapshot_key = %startup_key,
                 image = %args.image,
@@ -518,7 +795,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             };
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
             match attempt.result {
-                Ok(()) => return Ok(None),
+                Ok(()) => return Ok(VmPreparation::RunCompleted),
                 Err(e) if is_snapshot_load_failure(&e) => {
                     invalidate_unusable_snapshot(&startup_key, attempt.generation.as_ref(), &e)
                         .await;
@@ -529,7 +806,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
-        if check_podman_snapshot(&key).await.is_some() {
+        if lifecycle == PodmanLifecycle::Run && check_podman_snapshot(&key).await.is_some() {
             info!(
                 snapshot_key = %key,
                 image = %args.image,
@@ -557,7 +834,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             };
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
             match attempt.result {
-                Ok(()) => return Ok(None),
+                Ok(()) => return Ok(VmPreparation::RunCompleted),
                 Err(e) if is_snapshot_load_failure(&e) => {
                     invalidate_unusable_snapshot(&key, attempt.generation.as_ref(), &e).await;
                     // fall through to a fresh boot (which re-creates the snapshot)
@@ -963,7 +1240,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     let (cache_tx, cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
-    ) = if !skip_snapshot_creation {
+    ) = if !skip_snapshot_creation && lifecycle == PodmanLifecycle::Run {
         let (tx, rx) = mpsc::channel(1);
         (Some(tx), Some(rx))
     } else {
@@ -978,7 +1255,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     let (startup_tx, startup_rx): (
         Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
         Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
-    ) = if !skip_snapshot_creation && snapshot_key.is_some() && args.health_check.is_some() {
+    ) = if should_arm_startup_snapshot(
+        skip_snapshot_creation,
+        snapshot_key.is_some(),
+        args.health_check.is_some(),
+        lifecycle,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {
@@ -1053,6 +1335,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 log_tx_clone,
                 reconnect,
                 non_blocking_output,
+                lifecycle == PodmanLifecycle::Run,
                 None,
             )
             .await
@@ -1159,7 +1442,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     let disk_path = data_dir.join("disks/rootfs.raw");
 
-    Ok(Some(VmContext {
+    Ok(VmPreparation::Active(Box::new(VmContext {
         restore_from_cache: None,
         vm_id,
         vm_name,
@@ -1190,7 +1473,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         reboot_requested,
         container_exit_seen,
         reboot_spec,
-    }))
+    })))
 }
 
 /// Resolve a UID to a username via the host's /etc/passwd.
@@ -1454,7 +1737,13 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         volume_configs: &ctx.volume_configs,
                         remap_refs: &ctx.volume_servers.remap_refs,
                     };
-                    match create_snapshot_interruptible(&snap, &cancel).await {
+                    match create_snapshot_interruptible(
+                        &snap,
+                        &cancel,
+                        snapshot_source_disposition(PodmanLifecycle::Run),
+                    )
+                    .await
+                    {
                         SnapshotOutcome::Interrupted => {
                             return Ok(None);
                         }
@@ -1549,7 +1838,11 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             remap_refs: &ctx.volume_servers.remap_refs,
                         };
                         tokio::select! {
-                            outcome = create_snapshot_interruptible(&snap, &cancel) => {
+                            outcome = create_snapshot_interruptible(
+                                &snap,
+                                &cancel,
+                                snapshot_source_disposition(PodmanLifecycle::Run),
+                            ) => {
                                 match outcome {
                                     SnapshotOutcome::Interrupted => {
                                         return Ok(None);
@@ -1589,6 +1882,84 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
     }
 }
 
+/// Wait for the ordinary health monitor's first Healthy transition, capture the startup
+/// artifact, and leave the disposable source paused. No prepare-specific readiness probe
+/// exists: image HEALTHCHECK (when present), container-running state otherwise, and the
+/// optional HTTP health check retain exactly the same authority as a normal run.
+async fn run_prepare_loop(
+    ctx: &mut VmContext,
+    cancel: &CancellationToken,
+) -> Result<PreparedSnapshot> {
+    let startup_rx = ctx
+        .startup_rx
+        .take()
+        .context("prepare lifecycle has no startup health trigger")?;
+
+    let startup_ack = tokio::select! {
+        _ = cancel.cancelled() => {
+            bail!("interrupted before the container became healthy");
+        }
+        status = ctx.vm_manager.wait() => {
+            let status = status.context("waiting for disposable prepare VM")?;
+            bail!("disposable prepare VM exited before the container became healthy: {status}");
+        }
+        startup_ack = startup_rx => {
+            startup_ack.context("health monitor stopped before prepare snapshot creation")?
+        }
+    };
+
+    let base_key = ctx
+        .snapshot_key
+        .as_deref()
+        .context("prepare lifecycle has no content-addressed snapshot key")?;
+    let startup_key = startup_snapshot_key(base_key);
+    info!(snapshot_key = %startup_key, "Creating prepared startup snapshot (VM healthy)");
+
+    let fc_backend = ctx
+        .vm_manager
+        .as_any()
+        .downcast_ref::<FirecrackerBackend>()
+        .context("podman prepare requires the Firecracker backend")?;
+    let snap = CreateSnapshotParams {
+        vm_manager: fc_backend,
+        snapshot_key: &startup_key,
+        vm_state: &ctx.vm_state,
+        disk_path: &ctx.disk_path,
+        volume_configs: &ctx.volume_configs,
+        remap_refs: &ctx.volume_servers.remap_refs,
+    };
+    let install = snapshot::create_podman_snapshot(
+        &snap,
+        snapshot_source_disposition(PodmanLifecycle::Prepare),
+    )
+    .await
+    .with_context(|| format!("creating prepared startup snapshot {startup_key}"))?;
+
+    if cancel.is_cancelled() {
+        bail!("interrupted while creating prepared startup snapshot");
+    }
+
+    // Acquire a shared generation lease immediately after the creator releases its exclusive
+    // install lock. Keep it through verified cleanup and JSON publication.
+    let cache = match install {
+        SnapshotInstall::Created => PreparedCache::Created,
+        SnapshotInstall::Existing => PreparedCache::Hit,
+    };
+    let prepared = verify_prepared_snapshot(&startup_key, cache)
+        .await?
+        .with_context(|| {
+            format!(
+                "prepared startup snapshot {} disappeared after atomic installation",
+                startup_key
+            )
+        })?;
+
+    // Never acknowledge Healthy in the disposable source. It remains paused until cleanup;
+    // dropping this ack only releases the monitor so its task can observe cancellation.
+    drop(startup_ack);
+    Ok(prepared)
+}
+
 /// Clean up all resources associated with a VM.
 pub async fn cleanup_vm_context(mut ctx: VmContext) {
     // Cancel status listener (podman-specific)
@@ -1621,6 +1992,82 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
         &ctx.state_manager,
     )
     .await;
+}
+
+/// Verified counterpart to [`cleanup_vm_context`] for finite lifecycle commands.
+async fn cleanup_vm_context_verified(mut ctx: VmContext) -> Result<()> {
+    let mut companion_errors = Vec::new();
+
+    let mut companions = vec![("status listener", ctx.status_handle)];
+    if let Some(handle) = ctx.egress_proxy_handle.take() {
+        companions.push(("egress proxy", handle));
+    }
+    if let Some(handle) = ctx.bootplan_handle.take() {
+        companions.push(("boot-plan listener", handle));
+    }
+    for (_, handle) in &companions {
+        handle.abort();
+    }
+    for (name, handle) in companions {
+        if let Err(error) = handle.await {
+            if !error.is_cancelled() {
+                companion_errors.push(format!("joining {name}: {error}"));
+            }
+        }
+    }
+
+    let cleanup_result = super::common::cleanup_vm_verified(
+        super::common::CleanupContext {
+            vm_id: ctx.vm_id,
+            volume_server_handles: ctx.volume_servers.handles,
+            remap_refs: ctx.volume_servers.remap_refs,
+            data_dir: ctx.data_dir,
+            health_cancel_token: Some(ctx.health_cancel_token),
+            health_monitor_handle: Some(ctx.health_monitor_handle),
+            output_listener_handle: ctx.output_handle,
+        },
+        ctx.vm_manager.as_mut(),
+        &mut ctx.holder_child,
+        ctx.network.as_mut(),
+        &ctx.state_manager,
+    )
+    .await;
+
+    if let Err(error) = cleanup_result {
+        companion_errors.push(format!("common VM resources: {error:#}"));
+    }
+    if companion_errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "verified prepare cleanup failed: {}",
+            companion_errors.join("; ")
+        )
+    }
+}
+
+fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
+    let value = match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(operation), Err(cleanup)) => Err(anyhow::anyhow!(
+            "prepare failed: {operation:#}; cleanup also failed: {cleanup:#}"
+        )),
+    }?;
+    Ok(value)
+}
+
+fn publish_prepared_snapshot_gated(
+    lifecycle_gate: &super::common::LifecycleReadyGate,
+    prepared: &PreparedSnapshot,
+) -> Result<()> {
+    match lifecycle_gate.claim_terminal_publication()? {
+        super::common::LifecycleReadyOutcome::Published => publish_prepared_snapshot(prepared),
+        super::common::LifecycleReadyOutcome::Cancelled => {
+            bail!("interrupted before prepared snapshot publication")
+        }
+    }
 }
 
 /// CLI entrypoint for `fcvm podman run`. Thin wrapper around prepare_vm/run_vm_loop/cleanup.
@@ -1723,6 +2170,56 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// CLI entrypoint for `fcvm podman prepare`.
+///
+/// A cache hit verifies and publishes the exact installed startup generation without booting
+/// a VM. A miss boots one disposable source, waits for normal health, atomically installs a
+/// startup snapshot while leaving the source paused, reaps every host resource, then emits one
+/// JSON record while holding a shared lease on that exact generation.
+pub async fn cmd_podman_prepare(args: RunArgs) -> Result<()> {
+    let lifecycle_gate = super::common::LifecycleReadyGate::new();
+    let cancel = lifecycle_gate.cancellation_token();
+    let signal_gate = lifecycle_gate.clone();
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                signal_gate.cancel();
+                info!("received SIGTERM, cancelling podman prepare");
+            }
+            _ = sigint.recv() => {
+                signal_gate.cancel();
+                info!("received SIGINT, cancelling podman prepare");
+            }
+        }
+    });
+
+    match prepare_vm_for_lifecycle(args, PodmanLifecycle::Prepare).await? {
+        VmPreparation::Prepared(prepared) => {
+            publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
+        }
+        VmPreparation::RunCompleted => {
+            unreachable!("prepare lifecycle never runs a cached snapshot")
+        }
+        VmPreparation::Active(mut ctx) => {
+            let operation = async {
+                if cancel.is_cancelled() {
+                    bail!("interrupted during disposable VM setup");
+                }
+                // The source is an implementation detail, not a runnable workload. Leave its
+                // lifecycle barrier unpublished so external commands cannot adopt/snapshot it.
+                run_prepare_loop(&mut ctx, &cancel).await
+            }
+            .await;
+
+            let cleanup = cleanup_vm_context_verified(*ctx).await;
+            let prepared = finish_prepare(operation, cleanup)?;
+            publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1828,6 +2325,177 @@ mod tests {
         args.image_mode = Some(CliImageMode::Btrfs);
 
         assert_eq!(resolve_image_mode(&args), ImageMode::Btrfs);
+    }
+
+    #[test]
+    fn prepare_and_run_have_explicit_source_dispositions() {
+        assert_eq!(
+            snapshot_source_disposition(PodmanLifecycle::Run),
+            super::super::common::SnapshotSourceDisposition::Resume
+        );
+        assert_eq!(
+            snapshot_source_disposition(PodmanLifecycle::Prepare),
+            super::super::common::SnapshotSourceDisposition::LeavePaused
+        );
+    }
+
+    #[test]
+    fn prepare_arms_normal_health_without_requiring_an_http_override() {
+        assert!(should_arm_startup_snapshot(
+            false,
+            true,
+            false,
+            PodmanLifecycle::Prepare
+        ));
+        assert!(!should_arm_startup_snapshot(
+            false,
+            true,
+            false,
+            PodmanLifecycle::Run
+        ));
+        assert!(should_arm_startup_snapshot(
+            false,
+            true,
+            true,
+            PodmanLifecycle::Run
+        ));
+    }
+
+    #[test]
+    fn prepare_rejects_modes_that_cannot_produce_a_finite_verified_artifact() {
+        let mut args = test_args();
+        let error = validate_prepare_args(&args).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "podman prepare cannot be used with --no-snapshot"
+        );
+
+        args.no_snapshot = false;
+        args.tty = true;
+        let error = validate_prepare_args(&args).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "podman prepare does not support --tty"
+        );
+
+        args.tty = false;
+        args.vsock_dir = Some("/tmp/external-vsock".to_string());
+        let error = validate_prepare_args(&args).unwrap_err();
+        assert!(format!("{error:#}").contains("does not support --vsock-dir"));
+    }
+
+    #[test]
+    fn prepare_publication_requires_successful_cleanup_and_no_cancellation() {
+        assert_eq!(finish_prepare(Ok("artifact"), Ok(())).unwrap(), "artifact");
+
+        let cleanup_error =
+            finish_prepare(Ok("artifact"), Err(anyhow::anyhow!("holder still alive"))).unwrap_err();
+        assert_eq!(format!("{cleanup_error:#}"), "holder still alive");
+
+        let combined = finish_prepare::<()>(
+            Err(anyhow::anyhow!("snapshot install failed")),
+            Err(anyhow::anyhow!("network cleanup failed")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{combined:#}"),
+            "prepare failed: snapshot install failed; cleanup also failed: network cleanup failed"
+        );
+
+        let cancelled_gate = super::super::common::LifecycleReadyGate::new();
+        cancelled_gate.cancel();
+        assert_eq!(
+            cancelled_gate.claim_terminal_publication().unwrap(),
+            super::super::common::LifecycleReadyOutcome::Cancelled
+        );
+
+        let publication_gate = super::super::common::LifecycleReadyGate::new();
+        assert_eq!(
+            publication_gate.claim_terminal_publication().unwrap(),
+            super::super::common::LifecycleReadyOutcome::Published
+        );
+        publication_gate.cancel();
+        assert_eq!(
+            publication_gate.claim_terminal_publication().unwrap(),
+            super::super::common::LifecycleReadyOutcome::Published,
+            "a terminal publication that linearized first remains the winner"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_snapshot_verification_pins_exact_complete_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot_key = "0123456789ab-startup";
+        let snapshot_dir = temp.path().join(snapshot_key);
+        tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+
+        let vm_state = VmState::new(
+            "vm-prepare-verify".to_string(),
+            "alpine:latest".to_string(),
+            1,
+            512,
+        );
+        let config = super::super::common::build_snapshot_config(
+            &vm_state,
+            snapshot_key,
+            crate::storage::SnapshotType::System,
+            &snapshot_dir,
+            Vec::new(),
+            Vec::new(),
+        );
+        for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
+            tokio::fs::write(path, b"durable-artifact").await.unwrap();
+        }
+        tokio::fs::write(
+            snapshot_dir.join("config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let prepared =
+            verify_prepared_snapshot_in(temp.path(), snapshot_key, PreparedCache::Created)
+                .await
+                .unwrap()
+                .expect("complete installed generation should verify");
+        assert_eq!(prepared.output.status, "prepared");
+        assert_eq!(prepared.output.cache, PreparedCache::Created);
+        assert_eq!(prepared.output.snapshot_key, snapshot_key);
+        assert_eq!(
+            prepared.output.generation_id,
+            config.generation_id.to_string()
+        );
+        assert_eq!(prepared.output.config_digest.len(), 64);
+
+        let contender_dir = snapshot_dir.clone();
+        let contender = tokio::spawn(async move {
+            super::super::common::acquire_snapshot_dir_lock(&contender_dir, true)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !contender.is_finished(),
+            "verified generation must stay pinned until publication"
+        );
+        drop(prepared);
+        let exclusive = tokio::time::timeout(std::time::Duration::from_secs(1), contender)
+            .await
+            .expect("exclusive replacement did not acquire released generation lease")
+            .unwrap();
+        drop(exclusive);
+
+        tokio::fs::remove_file(&config.disk_path).await.unwrap();
+        let error = match verify_prepared_snapshot_in(temp.path(), snapshot_key, PreparedCache::Hit)
+            .await
+        {
+            Ok(_) => panic!("missing disk artifact must fail verification"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("disk artifact"),
+            "unexpected verification error: {error:#}"
+        );
     }
 
     #[tokio::test]

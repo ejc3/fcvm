@@ -724,6 +724,27 @@ impl LifecycleReadyGate {
         self.cancel.cancel();
     }
 
+    /// Claim a terminal, synchronous publication without writing VM readiness state.
+    ///
+    /// Finite lifecycle commands use this immediately before their final response. A signal
+    /// that claims setup first prevents the response; once publication claims the gate, a
+    /// later signal cannot turn an already-linearized success into a cancellation race.
+    pub fn claim_terminal_publication(&self) -> Result<LifecycleReadyOutcome> {
+        match self.phase.compare_exchange(
+            LIFECYCLE_SETTING_UP,
+            LIFECYCLE_READY,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) | Err(LIFECYCLE_READY) => Ok(LifecycleReadyOutcome::Published),
+            Err(LIFECYCLE_CANCELLED) => Ok(LifecycleReadyOutcome::Cancelled),
+            Err(LIFECYCLE_PUBLISHING) => {
+                bail!("lifecycle readiness publication is already in progress")
+            }
+            Err(phase) => bail!("invalid lifecycle readiness phase {phase}"),
+        }
+    }
+
     /// Publish readiness only if cancellation did not claim the setup phase first.
     pub async fn publish(
         &self,
@@ -786,6 +807,32 @@ pub struct CleanupContext {
     pub output_listener_handle: Option<JoinHandle<Vec<(String, String)>>>,
 }
 
+/// Errors observed while tearing down independent VM resources.
+///
+/// Cleanup must always attempt every resource even when an earlier action fails.  Normal
+/// `run` keeps its existing best-effort contract, while `prepare` uses the verified wrapper
+/// below and refuses to publish success when this collection is non-empty.
+#[derive(Default)]
+struct CleanupFailures {
+    failures: Vec<String>,
+}
+
+impl CleanupFailures {
+    fn record<T>(&mut self, action: &str, result: Result<T>) {
+        if let Err(error) = result {
+            self.failures.push(format!("{action}: {error:#}"));
+        }
+    }
+
+    fn into_result(self) -> Result<()> {
+        if self.failures.is_empty() {
+            Ok(())
+        } else {
+            bail!("verified VM cleanup failed: {}", self.failures.join("; "))
+        }
+    }
+}
+
 /// How long teardown waits for the health monitor to observe its cancellation before
 /// moving on. It only writes state through the per-VM flock, which `delete_state` takes
 /// too, so an unjoined straggler is safe — this is a courtesy join, not a barrier.
@@ -842,6 +889,20 @@ fn process_cpu(pid: u32) -> std::time::Duration {
     std::time::Duration::from_nanos(ticks.saturating_mul(1_000_000_000 / hz as u64))
 }
 
+fn verify_process_reaped(label: &str, identity: Option<(u32, u64)>) -> Result<()> {
+    let Some((pid, start_time)) = identity else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        crate::utils::process_start_time(pid) != Some(start_time),
+        "{} process {} with start time {} is still running after cleanup",
+        label,
+        pid,
+        start_time
+    );
+    Ok(())
+}
+
 /// Tear down every resource a VM owns. Used by both the podman and snapshot commands.
 ///
 /// Ordered to minimize how long the caller is blocked without deferring any of the work:
@@ -882,6 +943,35 @@ pub async fn cleanup_vm(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
 ) {
+    // Normal runs intentionally retain their best-effort teardown contract.  Prepare calls
+    // `cleanup_vm_verified` so it can fail closed instead of reporting a durable artifact
+    // while host resources remain.
+    let _ = cleanup_vm_inner(ctx, vm_manager, holder_child, network, state_manager, false).await;
+}
+
+/// Tear down every VM resource and return an error if any cleanup action failed.
+///
+/// All actions are attempted before the aggregated error is returned.  This is the cleanup
+/// contract used by finite lifecycle operations such as `podman prepare`, where a successful
+/// response is also a claim that the disposable source VM has been fully reaped.
+pub async fn cleanup_vm_verified(
+    ctx: CleanupContext,
+    vm_manager: &mut dyn Hypervisor,
+    holder_child: &mut Option<tokio::process::Child>,
+    network: &mut dyn NetworkManager,
+    state_manager: &StateManager,
+) -> Result<()> {
+    cleanup_vm_inner(ctx, vm_manager, holder_child, network, state_manager, true).await
+}
+
+async fn cleanup_vm_inner(
+    ctx: CleanupContext,
+    vm_manager: &mut dyn Hypervisor,
+    holder_child: &mut Option<tokio::process::Child>,
+    network: &mut dyn NetworkManager,
+    state_manager: &StateManager,
+    verified: bool,
+) -> Result<()> {
     let CleanupContext {
         vm_id,
         mut volume_server_handles,
@@ -895,6 +985,7 @@ pub async fn cleanup_vm(
     // caller actually waits for, including our own bookkeeping.
     let cleanup_start = std::time::Instant::now();
     let cpu_before = reaped_children_cpu();
+    let mut failures = CleanupFailures::default();
     info!("cleaning up resources");
 
     // --- Phase 1: signal everything. No `await` until all signals are out. -------------
@@ -906,15 +997,30 @@ pub async fn cleanup_vm(
             .and_then(|h| h.id())
             .map(process_cpu)
             .unwrap_or_default();
+    let vm_process_identity = vm_manager
+        .pid()
+        .ok()
+        .and_then(|pid| crate::utils::process_start_time(pid).map(|start| (pid, start)));
+    let holder_process_identity = holder_child.as_ref().and_then(|holder| {
+        holder
+            .id()
+            .and_then(|pid| crate::utils::process_start_time(pid).map(|start| (pid, start)))
+    });
 
     let kill_start = std::time::Instant::now();
-    if let Err(e) = vm_manager.start_kill() {
-        warn!("failed to signal VM process: {}", e);
+    let signal_vm = vm_manager.start_kill();
+    if let Err(error) = &signal_vm {
+        warn!("failed to signal VM process: {}", error);
     }
+    failures.record("signalling VM process", signal_vm);
     if let Some(ref mut holder) = holder_child {
-        if let Err(e) = holder.start_kill() {
-            warn!("failed to signal namespace holder process: {}", e);
+        let signal_holder = holder
+            .start_kill()
+            .context("signalling namespace holder process");
+        if let Err(error) = &signal_holder {
+            warn!("failed to signal namespace holder process: {}", error);
         }
+        failures.record("signalling namespace holder process", signal_holder);
     }
     network.start_kill_processes();
 
@@ -934,29 +1040,87 @@ pub async fn cleanup_vm(
     let holder_reaped = async {
         if let Some(ref mut holder) = holder_child {
             // Reap the zombie left by the SIGKILL above.
-            let _ = holder.wait().await;
+            holder
+                .wait()
+                .await
+                .context("waiting for namespace holder process")?;
         }
+        Ok::<(), anyhow::Error>(())
     };
     let health_stopped = async {
-        let Some(handle) = health_monitor_handle else {
-            return;
+        let Some(mut handle) = health_monitor_handle else {
+            return Ok::<(), anyhow::Error>(());
         };
         tokio::select! {
-            _ = handle => debug!("health monitor stopped gracefully"),
+            result = &mut handle => {
+                match result {
+                    Ok(()) => debug!("health monitor stopped gracefully"),
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => return Err(error).context("joining health monitor"),
+                }
+            }
             _ = tokio::time::sleep(HEALTH_MONITOR_STOP_BUDGET) => {
-                debug!("health monitor didn't stop in time, continuing cleanup");
+                if verified {
+                    handle.abort();
+                    match handle.await {
+                        Ok(()) => {}
+                        Err(error) if error.is_cancelled() => {}
+                        Err(error) => return Err(error).context("joining aborted health monitor"),
+                    }
+                    debug!("health monitor didn't stop in time; aborted and joined it");
+                } else {
+                    debug!("health monitor didn't stop in time, continuing cleanup");
+                }
             }
         }
+        Ok(())
     };
     let listeners_stopped = async {
+        let mut errors = Vec::new();
         if let Some(handle) = output_listener_handle.take() {
-            let _ = handle.await;
+            if let Err(error) = handle.await {
+                if !error.is_cancelled() {
+                    errors.push(format!("joining output listener: {error}"));
+                }
+            }
         }
         for handle in volume_server_handles.drain(..) {
-            let _ = handle.await;
+            if let Err(error) = handle.await {
+                if !error.is_cancelled() {
+                    errors.push(format!("joining volume server: {error}"));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!(errors.join("; "))
         }
     };
-    tokio::join!(vmm_reaped, holder_reaped, health_stopped, listeners_stopped);
+    let ((), holder_reaped, health_stopped, listeners_stopped) =
+        tokio::join!(vmm_reaped, holder_reaped, health_stopped, listeners_stopped);
+    if let Err(error) = &holder_reaped {
+        warn!("failed to reap namespace holder process: {}", error);
+    }
+    failures.record("reaping namespace holder process", holder_reaped);
+    if let Err(error) = &health_stopped {
+        warn!("failed to stop health monitor: {error:#}");
+    }
+    failures.record("stopping health monitor", health_stopped);
+    if let Err(error) = &listeners_stopped {
+        warn!("failed to stop VM listeners: {error:#}");
+    }
+    failures.record("stopping VM listeners", listeners_stopped);
+    let vm_reaped = verify_process_reaped("VM", vm_process_identity);
+    if let Err(error) = &vm_reaped {
+        warn!("VM process survived cleanup: {error:#}");
+    }
+    failures.record("verifying VM process reap", vm_reaped);
+    let holder_reaped = verify_process_reaped("namespace holder", holder_process_identity);
+    if let Err(error) = &holder_reaped {
+        warn!("namespace holder process survived cleanup: {error:#}");
+    }
+    failures.record("verifying namespace holder process reap", holder_reaped);
     let processes_us = kill_start.elapsed().as_micros();
 
     // Sampled HERE, before network cleanup reaps pasta, so the delta covers exactly the two
@@ -968,9 +1132,11 @@ pub async fn cleanup_vm(
 
     // --- Phase 3: network teardown, now that nothing is using the namespace. -----------
     let network_start = std::time::Instant::now();
-    if let Err(e) = network.cleanup().await {
-        warn!("failed to cleanup network: {}", e);
+    let network_cleaned = network.cleanup().await;
+    if let Err(error) = &network_cleaned {
+        warn!("failed to cleanup network: {}", error);
     }
+    failures.record("cleaning network", network_cleaned);
     let network_us = network_start.elapsed().as_micros();
 
     // --- Phase 4: on-disk reaping. Synchronous — cleanup_vm does not return until every
@@ -983,9 +1149,11 @@ pub async fn cleanup_vm(
     // directory makes every later `exportfs -ra` fail until the self-heal prunes it.
     let exports_removed = super::podman::cleanup_nfs_exports(&vm_id);
     let state_deleted = async {
-        if let Err(e) = state_manager.delete_state(&vm_id).await {
-            warn!("failed to delete state file: {}", e);
+        let result = state_manager.delete_state(&vm_id).await;
+        if let Err(error) = &result {
+            warn!("failed to delete state file: {}", error);
         }
+        result
     };
     let data_dir_removed = async {
         // Preserve the Firecracker log (for debugging snapshot restore failures) BEFORE
@@ -1001,13 +1169,27 @@ pub async fn cleanup_vm(
         }
 
         // Includes disks, sockets, everything under the VM's runtime directory.
-        if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
-            warn!(vm_id = %vm_id, error = %e, "failed to cleanup VM data directory");
-        } else {
-            info!(vm_id = %vm_id, "cleaned up VM data directory");
+        match tokio::fs::remove_dir_all(&data_dir).await {
+            Ok(()) => {
+                info!(vm_id = %vm_id, "cleaned up VM data directory");
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                warn!(vm_id = %vm_id, error = %error, "failed to cleanup VM data directory");
+                Err(error)
+                    .with_context(|| format!("removing VM data directory {}", data_dir.display()))
+            }
         }
     };
-    tokio::join!(exports_removed, state_deleted, data_dir_removed);
+    let (exports_removed, state_deleted, data_dir_removed) =
+        tokio::join!(exports_removed, state_deleted, data_dir_removed);
+    if let Err(error) = &exports_removed {
+        warn!("failed to remove NFS exports: {error:#}");
+    }
+    failures.record("removing NFS exports", exports_removed);
+    failures.record("deleting state", state_deleted);
+    failures.record("removing VM data directory", data_dir_removed);
     let disk_us = disk_start.elapsed().as_micros();
 
     info!(
@@ -1020,6 +1202,8 @@ pub async fn cleanup_vm(
         disk_us,
         "vm teardown complete"
     );
+
+    failures.into_result()
 }
 
 /// Memory backend configuration for snapshot restore
@@ -2516,6 +2700,15 @@ pub(crate) fn validate_snapshot_vm_identity(
 /// portable-volume inode tables.
 pub type SnapshotExtraFiles<'a> = Option<&'a (dyn Fn() -> Vec<(String, Vec<u8>)> + Send + Sync)>;
 
+/// What to do with the source VM after capturing its memory and disks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotSourceDisposition {
+    /// The source is the caller's workload and must continue running.
+    Resume,
+    /// The source is disposable and remains paused until verified cleanup reaps it.
+    LeavePaused,
+}
+
 /// Disk-only capture: quiesce the guest, reflink only the disk (no memory dump,
 /// no vCPU pause — `fsfreeze` provides consistency), unfreeze, and finalize a
 /// `DiskOnly` snapshot. Clones cold-boot from this disk. See
@@ -2763,13 +2956,16 @@ async fn record_vsock_reset_for_snapshot(vm_id: &str, snapshot_name: &str) {
 /// before calling this function.
 ///
 /// # Returns
-/// Ok(()) on success, Err on failure. VM is resumed regardless of success/failure.
+/// Ok(()) on success, Err on failure. A normal source is resumed regardless of
+/// success/failure after a successful pause. A disposable source remains paused on every
+/// post-pause return so it cannot mutate after its prepared startup point.
 pub async fn create_snapshot_core(
     client: &crate::firecracker::FirecrackerClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
     parent_snapshot_dir: Option<&Path>,
     extra_files: SnapshotExtraFiles<'_>,
+    source_disposition: SnapshotSourceDisposition,
 ) -> Result<()> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
@@ -2968,17 +3164,20 @@ pub async fn create_snapshot_core(
                         );
                     }
                     Err(e) => {
-                        // Full retry failed — record the vsock reset, resume VM, abort.
+                        // Full retry failed — record the vsock reset, then either resume the
+                        // normal workload or leave the disposable prepare source paused.
                         record_vsock_reset_for_snapshot(
                             &snapshot_config.vm_id,
                             &snapshot_config.name,
                         )
                         .await;
-                        let _ = snapshot_client
-                            .patch_vm_state(ApiVmState {
-                                state: "Resumed".to_string(),
-                            })
-                            .await;
+                        if source_disposition == SnapshotSourceDisposition::Resume {
+                            let _ = snapshot_client
+                                .patch_vm_state(ApiVmState {
+                                    state: "Resumed".to_string(),
+                                })
+                                .await;
+                        }
                         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
                         return Err(e)
                             .context("Full snapshot retry failed after diff tracking failure");
@@ -3006,17 +3205,23 @@ pub async fn create_snapshot_core(
     // orphan detection race-free.
     record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
 
-    // Resume VM (ALWAYS, regardless of snapshot/disk copy result).
+    // Resume a normal source regardless of snapshot/disk copy result. A prepare source is
+    // disposable and intentionally remains paused until verified cleanup reaps it.
     // Memory merge happens after resume since it operates on snapshot files, not live disk.
     // failpoint: hold after the snapshot save (VM still paused) and before resume —
     // makes "client observes a saved-but-still-paused VM" (stalled exec/curl/vsock
     // across an arbitrarily long pause) deterministic.
     failpoint::hit_async("snapshot.post_save_pre_resume").await;
-    let resume_result = snapshot_client
-        .patch_vm_state(ApiVmState {
-            state: "Resumed".to_string(),
-        })
-        .await;
+    let resume_result = match source_disposition {
+        SnapshotSourceDisposition::Resume => {
+            snapshot_client
+                .patch_vm_state(ApiVmState {
+                    state: "Resumed".to_string(),
+                })
+                .await
+        }
+        SnapshotSourceDisposition::LeavePaused => Ok(()),
+    };
 
     if let Err(e) = &resume_result {
         // Resume failure is critical — VM may be stuck paused.
@@ -3038,7 +3243,14 @@ pub async fn create_snapshot_core(
         return Err(e).context("resuming VM after snapshot");
     }
 
-    info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
+    match source_disposition {
+        SnapshotSourceDisposition::Resume => {
+            info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
+        }
+        SnapshotSourceDisposition::LeavePaused => {
+            info!(snapshot = %snapshot_config.name, "disposable source remains paused, processing snapshot");
+        }
+    }
 
     // NOTE: Do NOT bump restore-epoch here. Snapshot create (pause → dump → resume)
     // does NOT reset vsock connections — empirically verified with scratch VMs.
@@ -3286,6 +3498,40 @@ mod tests {
     use crate::state::VmState;
     use crate::storage::SnapshotType;
     use std::path::Path;
+
+    #[test]
+    fn verified_cleanup_reports_every_failure_after_all_attempts() {
+        let mut failures = CleanupFailures::default();
+        failures.record(
+            "signalling VMM",
+            Err::<(), _>(anyhow::anyhow!("kill denied")),
+        );
+        failures.record(
+            "cleaning network",
+            Err::<(), _>(anyhow::anyhow!("netlink denied")),
+        );
+        failures.record("deleting state", Ok(()));
+
+        let error = failures
+            .into_result()
+            .expect_err("verified cleanup must fail when any cleanup action failed");
+        assert_eq!(
+            format!("{error:#}"),
+            "verified VM cleanup failed: signalling VMM: kill denied; cleaning network: netlink denied"
+        );
+    }
+
+    #[test]
+    fn verified_cleanup_checks_exact_process_identity_is_gone() {
+        let pid = std::process::id();
+        let start = crate::utils::process_start_time(pid).unwrap();
+        let error = verify_process_reaped("test", Some((pid, start))).unwrap_err();
+        assert!(format!("{error:#}").contains("is still running after cleanup"));
+
+        verify_process_reaped("test", Some((pid, start + 1)))
+            .expect("a reused PID with a different start time is not the owned process");
+        verify_process_reaped("test", None).expect("an unstarted process owns no resource");
+    }
 
     /// Regression guard for the deaf-clone bug: a snapshot taken from a restored
     /// VM embeds the ancestor's restore epoch in guest memory, so two restores in
