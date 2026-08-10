@@ -50,6 +50,10 @@ pub(crate) async fn run_status_listener(
 
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
+    // Cache-close drains must not block the accept loop, but they remain children of this
+    // listener. Dropping the JoinSet on listener shutdown aborts every outstanding drain,
+    // which makes a joined status-listener handle proof that no detached socket task remains.
+    let mut cache_close_drains = tokio::task::JoinSet::new();
 
     // Accept connections for the lifetime of the VM ("cache-ready", "ready",
     // "exit:", "reboot", host-side "drain" probes). No idle timeout: a VM can run
@@ -57,6 +61,11 @@ pub(crate) async fn run_status_listener(
     // listener (plus its socket) would silently break reboot-in-place and exit
     // reporting. The run loop's cleanup aborts this task.
     loop {
+        while let Some(result) = cache_close_drains.try_join_next() {
+            if let Err(error) = result {
+                warn!(vm_id = %vm_id, error = %error, "cache-close drain task failed");
+            }
+        }
         let (stream, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -267,13 +276,13 @@ pub(crate) async fn run_status_listener(
                 // window cannot give that guarantee — a probe landing one
                 // millisecond after it expires reopens exactly the same race.
                 //
-                // Detached so the accept loop is never held up. The next
+                // Concurrent so the accept loop is never held up. The next
                 // connection carries "ready", and it must not queue behind a
                 // guest that is slow to close — or never closes, which is the
                 // normal outcome when the ack was suppressed above and this VM is
                 // being torn down and replaced by a restore.
                 let drain_vm_id = vm_id.to_string();
-                tokio::spawn(async move {
+                cache_close_drains.spawn(async move {
                     let deadline = tokio::time::Instant::now() + CACHE_ACK_CLOSE_TIMEOUT;
                     let mut probe = String::new();
                     loop {
@@ -388,15 +397,18 @@ async fn serve_bootplan(listener: tokio::net::UnixListener, payload: Vec<u8>) {
 ///   Guest -> Host: "stdout:content" or "stderr:content"
 ///   Host -> Guest: "stdin:content" (written to container stdin)
 ///
-/// Returns collected output lines as Vec<(stream, line)>.
+/// Lines are forwarded (to stdout/stderr and to `log_tx`) as they arrive and are
+/// never retained: the listener runs for the whole life of the VM, so holding
+/// every line would grow without bound.
 pub(crate) async fn run_output_listener(
     socket_path: &str,
     vm_id: &str,
     log_tx: Option<tokio::sync::broadcast::Sender<LogLine>>,
     reconnect_notify: Arc<tokio::sync::Notify>,
     non_blocking_output: bool,
+    emit_output: bool,
     connected_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<Vec<(String, String)>> {
+) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -409,7 +421,7 @@ pub(crate) async fn run_output_listener(
     // In non-blocking mode, use a bounded channel + writer thread so the
     // listener never blocks on stdout/stderr. Messages are dropped when the
     // channel is full, preventing backpressure from cascading into the container.
-    let nb_tx = if non_blocking_output {
+    let nb_tx = if non_blocking_output && emit_output {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(bool, String)>(1024);
         std::thread::Builder::new()
             .name("output-writer".into())
@@ -431,7 +443,7 @@ pub(crate) async fn run_output_listener(
 
     info!(socket = %socket_path, "Output listener started");
 
-    let mut output_lines: Vec<(String, String)> = Vec::new();
+    let mut lines_forwarded: u64 = 0;
     let mut connection_count: u64 = 0;
     let mut lines_read = 0u64;
 
@@ -441,7 +453,7 @@ pub(crate) async fn run_output_listener(
         Err(e) => {
             warn!(vm_id = %vm_id, error = %e, "Error accepting initial output connection");
             let _ = std::fs::remove_file(socket_path);
-            return Ok(output_lines);
+            return Ok(());
         }
     };
     connection_count += 1;
@@ -497,16 +509,22 @@ pub(crate) async fn run_output_listener(
                                 // error, which kills the listener task and stops
                                 // draining the vsock — deadlocking the container.
                                 let is_stdout = stream == "stdout";
-                                if let Some(ref tx) = nb_tx {
-                                    // Non-blocking mode: try_send drops if channel full.
-                                    // Writer thread handles the blocking stdout write.
-                                    let _ = tx.try_send((is_stdout, content.to_string()));
-                                } else if is_stdout {
-                                    let _ = writeln!(std::io::stdout(), "{}", content);
-                                } else {
-                                    let _ = writeln!(std::io::stderr(), "{}", content);
+                                // `podman prepare` reserves stdout for its single JSON result
+                                // and stderr for host diagnostics, so it forwards nothing here.
+                                // The line is still read and discarded, so a silenced guest
+                                // can never backpressure container startup.
+                                if emit_output {
+                                    if let Some(ref tx) = nb_tx {
+                                        // Non-blocking mode: try_send drops if channel full.
+                                        // Writer thread handles the blocking stdout write.
+                                        let _ = tx.try_send((is_stdout, content.to_string()));
+                                    } else if is_stdout {
+                                        let _ = writeln!(std::io::stdout(), "{}", content);
+                                    } else {
+                                        let _ = writeln!(std::io::stderr(), "{}", content);
+                                    }
                                 }
-                                output_lines.push((stream.to_string(), content.to_string()));
+                                lines_forwarded += 1;
                             }
                             if let Some(ref tx) = log_tx {
                                 let _ = tx.send(LogLine {
@@ -559,8 +577,8 @@ pub(crate) async fn run_output_listener(
     // Clean up
     let _ = std::fs::remove_file(socket_path);
 
-    info!(vm_id = %vm_id, lines = output_lines.len(), "Output listener finished");
-    Ok(output_lines)
+    info!(vm_id = %vm_id, lines = lines_forwarded, "Output listener finished");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -623,11 +641,11 @@ mod tests {
     async fn spawn_listener(
         socket_path: &std::path::Path,
         lossy: bool,
-    ) -> tokio::task::JoinHandle<Result<Vec<(String, String)>>> {
+    ) -> tokio::task::JoinHandle<Result<()>> {
         let socket_str = socket_path.to_string_lossy().to_string();
         let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
         let handle = tokio::spawn(async move {
-            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy, None).await
+            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy, true, None).await
         });
         for _ in 0..50 {
             if socket_path.exists() {
@@ -637,6 +655,100 @@ mod tests {
         }
         assert!(socket_path.exists(), "output socket not created");
         handle
+    }
+
+    /// Resident set size of this process, in bytes.
+    fn resident_bytes() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .expect("VmRSS in /proc/self/status");
+        let kb: u64 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse().ok())
+            .expect("VmRSS value");
+        kb * 1024
+    }
+
+    /// The listener runs for the whole life of the VM, so it must not retain the
+    /// guest output it forwards. `podman prepare` is the worst case: it passes
+    /// emit_output=false and drops the listener's result, so anything the listener
+    /// keeps is unreachable memory held for the full startup budget.
+    #[tokio::test]
+    async fn test_output_listener_does_not_retain_forwarded_lines() {
+        const LINES: usize = 150_000;
+        const CONTENT_BYTES: usize = 512;
+        // Retaining every line costs >75 MB; forwarding without retaining costs
+        // the read buffer plus the broadcast backlog, both well under a megabyte.
+        const MAX_GROWTH_BYTES: u64 = 24 * 1024 * 1024;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("output-retain.sock");
+        let socket_str = socket_path.to_string_lossy().to_string();
+
+        // log_tx fires for every line regardless of emit_output, so counting its
+        // deliveries is a deterministic "the listener has processed all N lines".
+        let (log_tx, mut log_rx) = tokio::sync::broadcast::channel::<LogLine>(1024);
+        let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::spawn(async move {
+            run_output_listener(
+                &socket_str,
+                "test-vm",
+                Some(log_tx),
+                reconnect,
+                false,
+                false, // emit_output=false: the `podman prepare` path
+                None,
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket_path.exists(), "output socket not created");
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let baseline = resident_bytes();
+
+        let writer = tokio::spawn(async move {
+            let line = format!("stdout:{}\n", "x".repeat(CONTENT_BYTES));
+            for _ in 0..LINES {
+                stream.write_all(line.as_bytes()).await.unwrap();
+            }
+            stream.flush().await.unwrap();
+            drop(stream);
+        });
+
+        let mut seen = 0usize;
+        while seen < LINES {
+            match log_rx.recv().await {
+                Ok(_) => seen += 1,
+                // The receiver is slower than the listener; skipped lines were
+                // still processed, which is what this test is counting.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => seen += n as usize,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("listener dropped log channel after {seen}/{LINES} lines")
+                }
+            }
+        }
+        let growth = resident_bytes().saturating_sub(baseline);
+        writer.await.unwrap();
+        listener.abort();
+
+        assert!(
+            growth < MAX_GROWTH_BYTES,
+            "listener grew {} MiB while forwarding {} lines of {} bytes; it is retaining \
+             output that no caller can read (limit {} MiB)",
+            growth / (1024 * 1024),
+            LINES,
+            CONTENT_BYTES,
+            MAX_GROWTH_BYTES / (1024 * 1024),
+        );
     }
 
     /// With --non-blocking-output, the listener processes all input without blocking.

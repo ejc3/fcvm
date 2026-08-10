@@ -97,6 +97,17 @@ pub struct SnapshotConfig {
     /// restore-source to avoid memory corruption.
     #[serde(default)]
     pub parent_snapshot: Option<String>,
+    /// Content-addressed cache key whose content this generation holds.
+    ///
+    /// Set for every snapshot the podman cache installs. A generation installed under
+    /// its own key repeats that key here; `podman prepare --tag` installs the same
+    /// content under a caller-chosen `name`, and this is the only record of which
+    /// content it holds. `None` for `snapshot create`, which captures a live VM rather
+    /// than a config, and for generations written before this field existed — those
+    /// self-identify through `name`, so read this through
+    /// `SnapshotConfig::content_key()` rather than directly.
+    #[serde(default)]
+    pub content_key: Option<String>,
     pub memory_path: PathBuf,
     pub vmstate_path: PathBuf,
     pub disk_path: PathBuf,
@@ -106,6 +117,17 @@ pub struct SnapshotConfig {
     /// Full (memory+disk) vs DiskOnly (no memory image — clones cold-boot).
     pub kind: SnapshotKind,
     pub metadata: SnapshotMetadata,
+}
+
+impl SnapshotConfig {
+    /// The content-addressed cache key this generation holds.
+    ///
+    /// Falls back to `name` so a generation installed under its own key — every
+    /// podman cache entry before `content_key` existed, and every untagged one since —
+    /// answers the same question without a migration.
+    pub fn content_key(&self) -> &str {
+        self.content_key.as_deref().unwrap_or(self.name.as_str())
+    }
 }
 
 /// Identity of one installed snapshot generation.
@@ -124,6 +146,16 @@ impl SnapshotGeneration {
             generation_id: config.generation_id,
             config_digest: Sha256::digest(config_json).into(),
         }
+    }
+
+    /// UUID written into the exact installed `config.json` generation.
+    pub fn generation_id(&self) -> uuid::Uuid {
+        self.generation_id
+    }
+
+    /// SHA-256 of the exact installed `config.json` bytes.
+    pub fn config_digest_hex(&self) -> String {
+        hex::encode(self.config_digest)
     }
 }
 
@@ -523,6 +555,7 @@ mod tests {
             generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
+            content_key: None,
             memory_path: PathBuf::from("/path/to/memory.bin"),
             vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
             disk_path: PathBuf::from("/path/to/disk.raw"),
@@ -622,6 +655,46 @@ mod tests {
             config.metadata.network_config.guest_mac,
             "11:22:33:44:55:66"
         );
+        // Written before content_key existed, so it answers for its own name.
+        assert_eq!(config.content_key, None);
+        assert_eq!(config.content_key(), "nginx-snap");
+    }
+
+    /// A generation installed under a caller-chosen name records the cache key whose
+    /// content it holds, and that survives the on-disk round trip.
+    #[test]
+    fn a_recorded_content_key_survives_the_json_round_trip() {
+        let json = r#"{
+            "name": "cb-req-golden",
+            "vm_id": "def456",
+            "generation_id": "fc9642dc-babd-4876-8c7f-48bccd9554e8",
+            "content_key": "0123456789ab-startup",
+            "memory_path": "/mnt/fcvm-btrfs/snapshots/cb-req-golden/memory.bin",
+            "vmstate_path": "/mnt/fcvm-btrfs/snapshots/cb-req-golden/vmstate.bin",
+            "disk_path": "/mnt/fcvm-btrfs/snapshots/cb-req-golden/disk.raw",
+            "created_at": "2024-01-15T10:30:00Z",
+            "snapshot_type": "User",
+            "kind": "Full",
+            "metadata": {
+                "image": "localhost/chromium-bench",
+                "vcpu": 4,
+                "memory_mib": 1024,
+                "network_config": {
+                    "tap_device": "tap-def456",
+                    "guest_mac": "11:22:33:44:55:66",
+                    "guest_ip": null,
+                    "host_ip": null
+                }
+            }
+        }"#;
+
+        let config: SnapshotConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.content_key(), "0123456789ab-startup");
+        assert_eq!(config.name, "cb-req-golden");
+
+        let reparsed: SnapshotConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.content_key(), "0123456789ab-startup");
     }
 
     #[test]
@@ -659,6 +732,7 @@ mod tests {
             generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
+            content_key: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
@@ -736,6 +810,7 @@ mod tests {
                 generation_id: uuid::Uuid::new_v4(),
                 original_vsock_vm_id: None,
                 parent_snapshot: None,
+                content_key: None,
                 memory_path: PathBuf::from("/memory.bin"),
                 vmstate_path: PathBuf::from("/vmstate.bin"),
                 disk_path: PathBuf::from("/disk.raw"),
@@ -800,6 +875,7 @@ mod tests {
             generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
+            content_key: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
@@ -986,6 +1062,7 @@ mod tests {
             generation_id: uuid::Uuid::new_v4(),
             original_vsock_vm_id: None,
             parent_snapshot: None,
+            content_key: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),

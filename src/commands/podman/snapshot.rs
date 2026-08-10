@@ -28,13 +28,33 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
     format!("{}-startup", base_key)
 }
 
+/// What to do when a generation is already installed at the target name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistingGeneration {
+    /// Keep it and report [`SnapshotInstall::Existing`]. The name is the content-addressed
+    /// key, so an installed generation holds this same content and another process
+    /// installing it first is a race worth losing.
+    Reuse,
+    /// Replace it. `podman prepare --force` asks for a rebuild, and `podman prepare --tag`
+    /// installs under a caller-chosen name that can hold any content at all.
+    Replace,
+}
+
 /// Parameters for cache snapshot creation.
 ///
 /// Uses VmState as the single source of truth for snapshot metadata,
 /// ensuring fields like `original_vsock_vm_id` are always preserved correctly.
 pub struct CreateSnapshotParams<'a> {
     pub vm_manager: &'a FirecrackerBackend,
+    /// Directory name the generation is installed under, and its `config.name`.
     pub snapshot_key: &'a str,
+    /// Content-addressed key whose content this generation holds. Equals `snapshot_key`
+    /// for the cache entries `podman run` installs; differs under `prepare --tag`.
+    pub content_key: &'a str,
+    /// `System` for a content-addressed cache entry `snapshots prune` may reclaim,
+    /// `User` for a caller-named artifact it must keep.
+    pub snapshot_type: SnapshotType,
+    pub existing: ExistingGeneration,
     pub vm_state: &'a VmState,
     pub disk_path: &'a Path,
     pub volume_configs: &'a [VolumeConfig],
@@ -42,10 +62,50 @@ pub struct CreateSnapshotParams<'a> {
     pub remap_refs: &'a [Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
 }
 
+impl CreateSnapshotParams<'_> {
+    /// The parameters `podman run` uses for its content-addressed cache entries: the name
+    /// is the key, the entry is prunable cache, and another process winning the race is
+    /// a reusable result.
+    pub fn cache_entry<'a>(
+        vm_manager: &'a FirecrackerBackend,
+        snapshot_key: &'a str,
+        vm_state: &'a VmState,
+        disk_path: &'a Path,
+        volume_configs: &'a [VolumeConfig],
+        remap_refs: &'a [Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
+    ) -> CreateSnapshotParams<'a> {
+        CreateSnapshotParams {
+            vm_manager,
+            snapshot_key,
+            content_key: snapshot_key,
+            snapshot_type: SnapshotType::System,
+            existing: ExistingGeneration::Reuse,
+            vm_state,
+            disk_path,
+            volume_configs,
+            remap_refs,
+        }
+    }
+}
+
+/// Whether a generation already installed at the target name ends this create.
+///
+/// Read under the exclusive generation lock, so `installed` is the state no other
+/// creator can change until this create finishes.
+pub(crate) fn keeps_installed_generation(existing: ExistingGeneration, installed: bool) -> bool {
+    installed && existing == ExistingGeneration::Reuse
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotInstall {
+    Created,
+    Existing,
+}
+
 /// Create a podman snapshot from a running VM.
 ///
-/// This pauses the VM, creates a Firecracker snapshot, copies the disk,
-/// saves metadata using SnapshotManager, and resumes the VM.
+/// This pauses the VM, creates a Firecracker snapshot, copies the disk, saves metadata,
+/// and applies the requested source disposition.
 ///
 /// The snapshot is stored in snapshot_dir with snapshot_key as the name,
 /// making it accessible via `fcvm snapshot run --snapshot <snapshot_key>`.
@@ -54,10 +114,16 @@ pub struct CreateSnapshotParams<'a> {
 /// lock is held, so a concurrent `fcvm snapshot create` (which resets the KVM
 /// dirty bitmap and updates `snapshot_name`) can never leave us merging a diff
 /// onto a stale base.
-pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<()> {
+pub async fn create_podman_snapshot(
+    snap: &CreateSnapshotParams<'_>,
+    source_disposition: crate::commands::common::SnapshotSourceDisposition,
+) -> Result<SnapshotInstall> {
     let CreateSnapshotParams {
         vm_manager,
         snapshot_key,
+        content_key,
+        snapshot_type,
+        existing,
         vm_state,
         disk_path,
         volume_configs,
@@ -86,9 +152,9 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
 
         // Another VM process may have finished this content-addressed snapshot while we
         // waited for its generation lock.
-        if snapshot_dir.join("config.json").exists() {
+        if keeps_installed_generation(*existing, snapshot_dir.join("config.json").exists()) {
             info!(snapshot_key = %snapshot_key, "Snapshot already exists (created by another process)");
-            return Ok(());
+            return Ok(SnapshotInstall::Existing);
         }
 
         // Serialize dirty-bitmap resets, then ensure both the owning process identity and
@@ -126,14 +192,16 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
     // Build snapshot config from VmState (single source of truth)
     let snapshot_volumes = crate::commands::common::volume_configs_to_snapshot(volume_configs);
     let extra_disks = crate::commands::common::extra_disks_to_snapshot(vm_state);
-    let snapshot_config = crate::commands::common::build_snapshot_config(
+    let mut snapshot_config = crate::commands::common::build_snapshot_config(
         vm_state,
         snapshot_key,
-        SnapshotType::System,
+        *snapshot_type,
         &snapshot_dir,
         snapshot_volumes,
         extra_disks,
     );
+    // The only record of which content a caller-named generation holds.
+    snapshot_config.content_key = Some(content_key.to_string());
 
     // Inode tables for portable volumes are written into the temp (.creating) directory
     // by create_snapshot_core BEFORE the atomic rename, so a finalized snapshot can never
@@ -170,10 +238,11 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         disk_path,
         parent_dir.as_deref(),
         Some(&extra_files),
+        source_disposition,
     )
     .await?;
 
-    Ok(())
+    Ok(SnapshotInstall::Created)
 }
 
 /// Create a snapshot with signal interruption support.
@@ -186,21 +255,20 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
 pub async fn create_snapshot_interruptible(
     snap: &CreateSnapshotParams<'_>,
     cancel: &CancellationToken,
+    source_disposition: crate::commands::common::SnapshotSourceDisposition,
 ) -> SnapshotOutcome {
-    // CRITICAL: Do NOT use tokio::select! to interrupt the snapshot future.
-    // create_snapshot_core pauses the VM, creates the snapshot, then resumes.
-    // If we drop the future between pause and resume (via select!), the VM
-    // stays paused forever. Instead, check cancellation before starting and
-    // let the snapshot run to completion once started.
+    // CRITICAL: Do NOT interrupt the snapshot future after it starts. A normal source must
+    // reach its resume step; a disposable source must finish atomic artifact installation.
+    // Check cancellation before starting and let the snapshot reach its requested terminal
+    // disposition once started.
     if cancel.is_cancelled() {
         info!("snapshot creation skipped -- already cancelled");
         return SnapshotOutcome::Interrupted;
     }
 
-    // Run snapshot to completion. create_snapshot_core always resumes the VM
-    // before returning, even on error, so this is safe.
-    match create_podman_snapshot(snap).await {
-        Ok(()) => {
+    // Run snapshot to completion so its source disposition is always honored.
+    match create_podman_snapshot(snap, source_disposition).await {
+        Ok(_) => {
             if cancel.is_cancelled() {
                 // Snapshot succeeded but we're shutting down
                 SnapshotOutcome::Interrupted

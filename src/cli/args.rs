@@ -117,6 +117,44 @@ pub struct PodmanArgs {
 pub enum PodmanCommands {
     /// Run a container in a microVM (Firecracker or Cloud Hypervisor)
     Run(RunArgs),
+    /// Build and verify the healthy startup snapshot, then reap the disposable VM
+    ///
+    /// Takes the same arguments as `run`. On a cache miss it boots one disposable VM,
+    /// waits for the container to report healthy, installs a full memory+disk snapshot,
+    /// reaps every host resource, and prints one JSON line naming the installed
+    /// generation. On a hit it verifies that generation and prints the same line without
+    /// booting. Nothing else is left running.
+    ///
+    /// The snapshot is keyed by the content of these arguments. `--tag` installs it under
+    /// a name you choose so `fcvm snapshot serve` and `fcvm snapshot run` can address it,
+    /// and marks it a user snapshot so `fcvm snapshots prune` keeps it. `--force` rebuilds
+    /// content whose cache key did not change.
+    Prepare(PrepareArgs),
+}
+
+/// `podman prepare` takes every `podman run` argument plus the two that only make
+/// sense for a build-and-exit command: where to install the result, and whether to
+/// rebuild one that is already installed.
+#[derive(Args, Debug)]
+pub struct PrepareArgs {
+    /// Install the startup snapshot under this name instead of the content-addressed
+    /// cache key, and mark it a user snapshot so `fcvm snapshots prune` keeps it.
+    /// The name is an ordinary snapshot name: `fcvm snapshot serve <tag>`,
+    /// `fcvm snapshot run --snapshot <tag>`, `fcvm snapshots ls` and
+    /// `fcvm snapshots delete <tag>` all address it the same way they address a
+    /// `fcvm snapshot create --tag` snapshot. A tag holding a different image or VM
+    /// shape is rebuilt, so the result always matches the arguments you passed.
+    #[arg(long)]
+    pub tag: Option<String>,
+
+    /// Rebuild even when the installed generation already matches these arguments.
+    /// Needed when the content changed without the cache key changing, e.g. a remote
+    /// image reference repointed to a new digest.
+    #[arg(long)]
+    pub force: bool,
+
+    #[command(flatten)]
+    pub run: RunArgs,
 }
 
 #[derive(Args, Debug)]
@@ -709,9 +747,68 @@ mod tests {
         match cli.cmd {
             Commands::Podman(podman) => match podman.cmd {
                 PodmanCommands::Run(run) => run,
+                PodmanCommands::Prepare(_) => panic!("expected `podman run` command"),
             },
             _ => panic!("expected `podman run` command"),
         }
+    }
+
+    fn parse_prepare(extra: &[&str]) -> PrepareArgs {
+        let mut argv = vec!["fcvm", "podman", "prepare"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("prepare CLI should parse");
+        let Commands::Podman(podman) = cli.cmd else {
+            panic!("expected podman command");
+        };
+        let PodmanCommands::Prepare(args) = podman.cmd else {
+            panic!("expected podman prepare command");
+        };
+        args
+    }
+
+    #[test]
+    fn prepare_accepts_the_run_configuration_shape() {
+        let args = parse_prepare(&[
+            "--name",
+            "prepared-web",
+            "--cpu",
+            "4",
+            "--health-check",
+            "http://web.internal/ready",
+            "nginx:alpine",
+        ]);
+
+        assert_eq!(args.run.name, "prepared-web");
+        assert_eq!(args.run.cpu, 4);
+        assert_eq!(args.run.image, "nginx:alpine");
+        assert_eq!(
+            args.run.health_check.as_deref(),
+            Some("http://web.internal/ready")
+        );
+        assert_eq!(args.tag, None);
+        assert!(!args.force);
+    }
+
+    /// `--tag` and `--force` have to reach `prepare` alongside the run configuration,
+    /// including the trailing container command that `RunArgs` collects.
+    #[test]
+    fn prepare_accepts_a_tag_and_a_forced_rebuild() {
+        let args = parse_prepare(&[
+            "--name",
+            "golden",
+            "--tag",
+            "cb-req-golden",
+            "--force",
+            "localhost/chromium-bench",
+            "sh",
+            "-c",
+            "entry.sh",
+        ]);
+
+        assert_eq!(args.tag.as_deref(), Some("cb-req-golden"));
+        assert!(args.force);
+        assert_eq!(args.run.image, "localhost/chromium-bench");
+        assert_eq!(args.run.command_args, vec!["sh", "-c", "entry.sh"]);
     }
 
     #[test]

@@ -835,21 +835,36 @@ pub(crate) async fn setup_nfs_exports(
     Ok(())
 }
 
-/// Clean up NFS exports for VM
-pub(crate) async fn cleanup_nfs_exports(vm_id: &str) {
+/// Clean up NFS exports for VM.
+///
+/// NotFound is success because cleanup is idempotent.  Other removal failures and an
+/// unsuccessful `exportfs -ra` are returned so finite lifecycle operations can verify that
+/// no host registration remains.
+pub(crate) async fn cleanup_nfs_exports(vm_id: &str) -> Result<()> {
     let exports_path = format!("/etc/exports.d/fcvm-{}.exports", vm_id);
-    if std::path::Path::new(&exports_path).exists() {
-        if let Err(e) = tokio::fs::remove_file(&exports_path).await {
-            warn!("Failed to remove NFS exports file: {}", e);
-        } else {
-            // Refresh exports to unregister
-            let _ = tokio::process::Command::new("exportfs")
-                .arg("-ra")
-                .status()
-                .await;
-            debug!("Cleaned up NFS exports: {}", exports_path);
+    match tokio::fs::remove_file(&exports_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("removing NFS export {exports_path}"));
         }
     }
+
+    let status = tokio::process::Command::new("exportfs")
+        .arg("-ra")
+        .status()
+        .await
+        .context("refreshing NFS exports after cleanup")?;
+    if !status.success() {
+        anyhow::bail!(
+            "exportfs -ra failed after removing NFS export {} with status {}",
+            exports_path,
+            status
+        );
+    }
+
+    debug!("Cleaned up NFS exports: {}", exports_path);
+    Ok(())
 }
 
 /// Parameters for VM setup, grouping the many read-only inputs.
@@ -934,7 +949,9 @@ pub(super) async fn run_vm_setup(
         }
         // NFS exports may have been written before the failing step; remove them
         // (no-op when the exports file was never created).
-        cleanup_nfs_exports(&vm_id).await;
+        if let Err(cleanup_error) = cleanup_nfs_exports(&vm_id).await {
+            warn!("failed to clean NFS exports after VM setup error: {cleanup_error:#}");
+        }
         return Err(e);
     }
 

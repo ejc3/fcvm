@@ -54,7 +54,7 @@ struct CloneSetupResources {
     volume_servers: Option<SpawnedVolumes>,
     tty_cancel: tokio_util::sync::CancellationToken,
     tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
-    output_handle: Option<tokio::task::JoinHandle<Vec<(String, String)>>>,
+    output_handle: Option<tokio::task::JoinHandle<()>>,
     egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
     network: Option<Box<dyn NetworkManager>>,
     implicit_uffd_cancel: tokio_util::sync::CancellationToken,
@@ -174,7 +174,11 @@ impl CloneSetupResources {
         // through exportfs. Data is removed only after all socket owners are
         // joined; state is the final deletion, so a disk-removal failure keeps
         // its identifying pointer instead of creating an unattributed orphan.
-        crate::commands::podman::cleanup_nfs_exports(&self.vm_id).await;
+        if let Err(error) = crate::commands::podman::cleanup_nfs_exports(&self.vm_id).await {
+            errors.push(format!(
+                "removing NFS exports after failed clone setup: {error:#}"
+            ));
+        }
         let mut data_removed = true;
         match tokio::fs::remove_dir_all(&self.data_dir).await {
             Ok(()) => {}
@@ -566,6 +570,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     &vm_disk_path,
                     parent_dir.as_deref(),
                     None,
+                    super::common::SnapshotSourceDisposition::Resume,
                 )
                 .await?;
             }
@@ -1383,14 +1388,14 @@ async fn cmd_snapshot_run_inner(
                 None,
                 reconnect,
                 non_blocking_output,
+                true,
                 Some(output_connected_tx),
             )
             .await
             {
-                Ok(lines) => lines,
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
-                    Vec::new()
                 }
             }
         }));
@@ -2486,16 +2491,20 @@ async fn cmd_snapshot_run_inner(
                             // The diff parent is resolved inside create_podman_snapshot under
                             // the per-VM snapshot lock (re-read from the state file), so a
                             // concurrent `fcvm snapshot create` cannot leave us with a stale base.
-                            let snap = CreateSnapshotParams {
-                                vm_manager: fc_backend,
-                                snapshot_key: &startup_key,
-                                vm_state: &vm_state,
-                                disk_path: &disk_path,
-                                volume_configs: &volume_configs,
-                                remap_refs: &volume_servers.remap_refs,
-                            };
+                            let snap = CreateSnapshotParams::cache_entry(
+                                fc_backend,
+                                &startup_key,
+                                &vm_state,
+                                &disk_path,
+                                &volume_configs,
+                                &volume_servers.remap_refs,
+                            );
                             tokio::select! {
-                                outcome = create_snapshot_interruptible(&snap, &cancel) => {
+                                outcome = create_snapshot_interruptible(
+                                    &snap,
+                                    &cancel,
+                                    super::common::SnapshotSourceDisposition::Resume,
+                                ) => {
                                     match outcome {
                                         SnapshotOutcome::Interrupted => {
                                             container_exit_code = None;
