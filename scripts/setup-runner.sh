@@ -70,7 +70,7 @@ apt-get install -y curl wget git jq build-essential \
   podman uidmap passt fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
-  skopeo busybox-static cpio zstd autoconf automake libtool
+  skopeo busybox-static cpio zstd autoconf automake libtool python3 util-linux
 
 # Node.js 22.x
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -94,9 +94,7 @@ git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm-passt
 # caches out-of-band and, if the hard floor still cannot be met, stops the
 # runner service so the box goes offline and gets replaced instead of
 # poisoning jobs.
-install -m 755 /tmp/fcvm-passt/scripts/runner-disk-preflight.sh /usr/local/bin/runner-disk-preflight.sh
-install -m 644 /tmp/fcvm-passt/scripts/runner-disk-guard.service /etc/systemd/system/runner-disk-guard.service
-install -m 644 /tmp/fcvm-passt/scripts/runner-disk-guard.timer /etc/systemd/system/runner-disk-guard.timer
+/tmp/fcvm-passt/scripts/install-runner-disk-guard.sh /tmp/fcvm-passt
 systemctl daemon-reload
 systemctl enable --now runner-disk-guard.timer
 

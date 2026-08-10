@@ -62,7 +62,7 @@ jobs:
       - name: Build fcvm and fc-agent
         working-directory: fcvm
         run: |
-          cargo build --release -p fcvm -p fc-agent
+          make build-host-tools
           # Sync the checkout's embedded config to the runner user's config dir so the
           # kernel build below uses this checkout, not stale per-runner state.
           ./target/release/fcvm setup --generate-config --force
@@ -280,7 +280,7 @@ jobs:
       - name: Build fcvm and fc-agent
         working-directory: fcvm
         run: |
-          cargo build --release -p fcvm -p fc-agent
+          make build-host-tools
           # Sync the checkout's embedded config to the runner user's config dir so the
           # kernel build below uses this checkout, not stale per-runner state.
           ./target/release/fcvm setup --generate-config --force

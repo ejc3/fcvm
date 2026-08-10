@@ -15,7 +15,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT}/fuse-pipe"
+cd "${ROOT}"
+make cargo-target-link
+CARGO_RUNNER="${ROOT}/scripts/cargo-target-run.sh"
 
 LOG_DIR="${LOG_DIR:-/tmp/fuse-pipe-tests}"
 mkdir -p "${LOG_DIR}"
@@ -44,16 +46,19 @@ die() {
     exit 1
 }
 
-run_step "unit+lib" cargo test --lib -- --nocapture || die "unit/lib tests failed"
-run_step "integration" cargo test --test integration -- --nocapture || die "integration tests failed"
+run_step "unit+lib" "${CARGO_RUNNER}" cargo test -p fuse-pipe --lib -- --nocapture || die "unit/lib tests failed"
+run_step "integration" "${CARGO_RUNNER}" cargo test -p fuse-pipe --test integration -- --nocapture || die "integration tests failed"
 
 if [[ $EUID -ne 0 ]]; then
     echo "==> Re-running remaining tests with sudo for full coverage" | tee -a "${LOG_FILE}"
 fi
 
 run_step "stress" sudo env STRESS_WORKERS="${STRESS_WORKERS:-4}" STRESS_OPS="${STRESS_OPS:-1000}" \
-    cargo test --test stress -- --nocapture || die "stress test failed"
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" BTRFS_ROOT="${BTRFS_ROOT:-/mnt/fcvm-btrfs}" \
+    "${CARGO_RUNNER}" cargo test -p fuse-pipe --test stress -- --nocapture || die "stress test failed"
 
-run_step "pjdfstest-matrix" sudo cargo test --test pjdfstest_matrix -- --nocapture || die "pjdfstest_matrix failed"
+run_step "pjdfstest-matrix" sudo env CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" \
+    BTRFS_ROOT="${BTRFS_ROOT:-/mnt/fcvm-btrfs}" \
+    "${CARGO_RUNNER}" cargo test -p fuse-pipe --test pjdfstest_matrix -- --nocapture || die "pjdfstest_matrix failed"
 
 echo -e "\n==> ALL TESTS PASSED" | tee -a "${LOG_FILE}"

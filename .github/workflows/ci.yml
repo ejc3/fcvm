@@ -292,7 +292,10 @@ jobs:
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: fcvm -> target
+          # Persistent self-hosted targets live in leased btrfs generations.
+          # Restoring a cache here would replace the checkout symlink with an
+          # unleased real directory after disk preflight.
+          cache-targets: "false"
           cache-on-failure: "true"
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install dependencies
@@ -537,7 +540,10 @@ jobs:
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: fcvm -> target
+          # Persistent self-hosted targets live in leased btrfs generations.
+          # Restoring a cache here would replace the checkout symlink with an
+          # unleased real directory after disk preflight.
+          cache-targets: "false"
           cache-on-failure: "true"
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install dependencies

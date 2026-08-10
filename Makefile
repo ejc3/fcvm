@@ -1,14 +1,12 @@
 SHELL := /bin/bash
 
-# Guard: never run make as root on the host (except clean). Running cargo
+# Guard: never run make as root on the host. Running build plumbing
 # as root leaves root-owned files in target/ that break subsequent user builds
 # with BrokenPipe errors from nextest finding stale binaries.
 # Skip this guard inside containers (where root is normal).
 ifeq ($(shell id -u),0)
-ifeq ($(filter clean,$(MAKECMDGOALS)),)
 ifeq ($(wildcard /.dockerenv /run/.containerenv),)
 $(error Do not run make as root. Use 'make test-root' as your normal user — it uses sudo only for the test runner)
-endif
 endif
 endif
 
@@ -19,7 +17,13 @@ RUST_BIN := $(shell command -v cargo >/dev/null 2>&1 && dirname $$(command -v ca
 	(ls -d $(HOME)/.rustup/toolchains/stable-*/bin 2>/dev/null | head -1) || \
 	(ls -d $(HOME)/.rustup/toolchains/*/bin 2>/dev/null | head -1))
 export PATH := $(RUST_BIN):$(PATH)
-CARGO := cargo
+CARGO_BIN ?= cargo
+# Every Cargo command issued by this Makefile holds a shared lease on this
+# worktree's target directory.  runner-disk-preflight.sh takes the same lease
+# exclusively before pruning idle artifacts, so age-check -> delete cannot race
+# a build.  `override` prevents `make CARGO=cargo ...` from silently bypassing
+# the safety protocol; CARGO_BIN remains available for toolchain selection.
+override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN)
 
 # Custom dependencies bin directory
 CUSTOM_DEPS_BIN := /mnt/fcvm-btrfs/deps/bin
@@ -142,6 +146,7 @@ endif
 # owns the derivation and the symlink, and is the ONLY place that computes the path.
 # Overridable so tests/test_cargo_target_link.rs can point it at a temp dir.
 BTRFS_ROOT ?= /mnt/fcvm-btrfs
+export BTRFS_ROOT
 MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Base test command
@@ -196,7 +201,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
 	lint fmt update-dependency ssh test-serve-sdk
 
@@ -319,12 +324,12 @@ check-disk: cargo-target-link
 		else echo "==> WARNING: no rustup toolchain found to restore cargo from"; fi; \
 	fi
 	@# Ensure cargo-nextest (the test runner; a separate install from rustup).
-	@if ! PATH="$$HOME/.cargo/bin:$$PATH" cargo nextest --version >/dev/null 2>&1; then \
+	@if ! PATH="$$HOME/.cargo/bin:$$PATH" $(CARGO) nextest --version >/dev/null 2>&1; then \
 		echo "==> Installing cargo-nextest..."; \
 		case "$$(uname -m)" in aarch64|arm64) NURL=https://get.nexte.st/latest/linux-arm ;; *) NURL=https://get.nexte.st/latest/linux ;; esac; \
 		mkdir -p "$$HOME/.cargo/bin"; \
 		curl -LsSf "$$NURL" | tar zxf - -C "$$HOME/.cargo/bin" \
-			|| PATH="$$HOME/.cargo/bin:$$PATH" cargo install cargo-nextest --locked; \
+			|| PATH="$$HOME/.cargo/bin:$$PATH" $(CARGO) install cargo-nextest --locked; \
 	fi
 	@BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$BTRFS_FREE" ] && [ "$$BTRFS_FREE" -lt 15 ]; then \
@@ -380,6 +385,12 @@ build: cargo-target-link
 	@# Sync embedded config to user config dir (config is embedded at compile time)
 	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
+# Host-native tools used by the kernel-builder AMI/workflow. Unlike `build`,
+# this does not require a musl Rust target for the guest agent.
+build-host-tools: cargo-target-link
+	@echo "==> Building host-native fcvm and fc-agent..."
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm -p fc-agent
+
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-mock
@@ -393,21 +404,23 @@ test-packaging: build
 	./scripts/test-packaging.sh target/release/fcvm
 
 clean:
-	sudo rm -rf target/*
+	@# Publish an empty namespace; the disk guard safely reclaims the retired
+	@# generation without unlinking dentries that may be foreign mountpoints.
+	@BTRFS_ROOT="$(BTRFS_ROOT)" "$(MAKEFILE_DIR)scripts/cargo-target-link.sh" --rotate
 
 # Run-only targets (no setup deps, used by container)
-_test-unit:
+_test-unit: cargo-target-link
 	$(NEXTEST) --no-default-features
 
-_test-fast:
+_test-fast: cargo-target-link
 	RUST_LOG="$(TEST_LOG)" \
 	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
 
-_test-all:
+_test-all: cargo-target-link
 	RUST_LOG="$(TEST_LOG)" \
 	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
-_test-root:
+_test-root: cargo-target-link
 	@if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
 		echo "==> WARNING: root-owned files in target/ (from sudo cargo?). Fixing ownership..."; \
 		sudo chown -R $$(id -u):$$(id -g) target/; \
@@ -447,7 +460,7 @@ fuzz: show-notes check-disk setup-fcvm
 # Uses fc-mock binary instead of Firecracker.
 # Only runs tests known to work with fc-mock (no KVM, no real Firecracker).
 FC_MOCK_FILTER := package(fcvm) & (test(=test_sanity_bridged) | test(=test_sanity_rootless) | test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/))
-_test-fc-mock:
+_test-fc-mock: cargo-target-link
 	@FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
 	RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$${FCVM_DATA_DIR:-$(ROOT_DATA_DIR)} \
@@ -716,7 +729,7 @@ container-bench: check-disk container-build
 	@echo "==> Running benchmarks in container..."
 	$(CONTAINER_RUN_BASE) $(CONTAINER_TAG) make build _bench
 
-_bench:
+_bench: cargo-target-link
 	@echo "==> Running benchmarks..."
 	$(CARGO) bench -p fuse-pipe --bench throughput
 	$(CARGO) bench -p fuse-pipe --bench operations
@@ -726,9 +739,9 @@ _bench:
 CARGO_AUDIT_VERSION := 0.22.0
 CARGO_DENY_VERSION := 0.18.9
 
-setup-lint-tools:
-	@which cargo-audit > /dev/null || (echo "Installing cargo-audit..." && cargo install cargo-audit@$(CARGO_AUDIT_VERSION) --locked)
-	@which cargo-deny > /dev/null || (echo "Installing cargo-deny..." && cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked)
+setup-lint-tools: cargo-target-link
+	@which cargo-audit > /dev/null || (echo "Installing cargo-audit..." && $(CARGO) install cargo-audit@$(CARGO_AUDIT_VERSION) --locked)
+	@which cargo-deny > /dev/null || (echo "Installing cargo-deny..." && $(CARGO) install cargo-deny@$(CARGO_DENY_VERSION) --locked)
 
 lint: setup-lint-tools
 	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint --check
@@ -736,7 +749,7 @@ lint: setup-lint-tools
 	$(CARGO) audit
 	$(CARGO) deny check
 
-update-dependency:
+update-dependency: cargo-target-link
 	@test -n "$(PACKAGE)" || (echo "ERROR: PACKAGE required"; exit 1)
 	$(CARGO) update -p "$(PACKAGE)" $(if $(VERSION),--precise "$(VERSION)")
 
@@ -770,7 +783,7 @@ train-land:
 train-bisect:
 	./scripts/ci-train.sh --branch $(TRAIN) bisect
 
-fmt:
+fmt: cargo-target-link
 	$(CARGO) fmt
 
 # SSH to jumpbox (IP from terraform: cd ~/src/aws && terraform output jumpbox_ssh_command)

@@ -33,8 +33,10 @@
 #   1. podman system prune (rootless + root storage) — images/containers/
 #      volumes are re-pulled or re-built on demand.
 #   2. /tmp/fcvm-test-logs entries older than LOG_AGE_DAYS.
-#   3. cargo/nextest target dirs (runner _work checkouts and
-#      /mnt/fcvm-btrfs/cargo-target*) with no activity for TARGET_AGE_DAYS.
+#   3. managed cargo/nextest generations under /mnt/fcvm-btrfs/cargo-target/
+#      with no activity for TARGET_AGE_DAYS. Pre-protocol real target dirs in
+#      runner _work are reported but retained because they cannot be atomically
+#      rotated without renaming a possibly-mounted dentry.
 #   4. content-addressed caches on /mnt/fcvm-btrfs (image-cache entries,
 #      snapshot dirs, kernel/rootfs/initrd/firecracker assets) idle for
 #      CACHE_AGE_DAYS, plus core dumps older than LOG_AGE_DAYS.
@@ -50,6 +52,9 @@
 # the same critical section — the ABA locking bug class AGENTS.md bans).
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+TARGET_PRUNE_HELPER="$SCRIPT_DIR/prune-cargo-target.sh"
+
 MIN_FREE_GB="${MIN_FREE_GB:-15}"
 HARD_FLOOR_GB="${HARD_FLOOR_GB:-5}"
 LOG_AGE_DAYS="${LOG_AGE_DAYS:-1}"
@@ -58,18 +63,24 @@ CACHE_AGE_DAYS="${CACHE_AGE_DAYS:-4}"
 DRY_RUN="${DRY_RUN:-0}"
 
 QUARANTINE=0
+TARGET_DIRS_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --quarantine) QUARANTINE=1 ;;
+    # Operationally useful on a runner and a narrow entry point for the
+    # concurrency regression tests.  It runs as the caller and touches only
+    # the configured cargo target roots.
+    --target-dirs-only) TARGET_DIRS_ONLY=1 ;;
     *)
-      echo "usage: $0 [--quarantine]" >&2
+      echo "usage: $0 [--quarantine] [--target-dirs-only]" >&2
       exit 2
       ;;
   esac
 done
 
 GIB=$((1024 * 1024 * 1024))
-BTRFS_ROOT=/mnt/fcvm-btrfs
+BTRFS_ROOT="${BTRFS_ROOT:-/mnt/fcvm-btrfs}"
+RUNNER_WORK_ROOT="${RUNNER_WORK_ROOT:-/opt/actions-runner/_work}"
 
 # All logging goes to stderr: several stages pipe NUL-delimited candidate
 # paths between functions on stdout, and log lines must never enter that data
@@ -81,7 +92,12 @@ human() { numfmt --to=iec-i --suffix=B "$1"; }
 # podman storage). CI runners and dev boxes both have passwordless sudo; the
 # probe's stderr is suppressed only because we replace it with our own loud
 # error right below.
-if [[ $EUID -eq 0 ]]; then
+if ((TARGET_DIRS_ONLY)); then
+  # This mode is deliberately least-privilege: tests and operators point it at
+  # caller-owned roots.  The normal preflight still elevates for root-owned VM
+  # debris and caches.
+  SUDO=()
+elif [[ $EUID -eq 0 ]]; then
   SUDO=()
 else
   SUDO=(sudo -n)
@@ -241,35 +257,34 @@ stage_test_logs() {
     delete_candidates "stale test logs (>${LOG_AGE_DAYS}d)"
 }
 
-# Stage 3: cargo/nextest build artifacts. Deleting one costs a rebuild, never
-# correctness, so only dirs with no read/write activity for TARGET_AGE_DAYS
-# are pruned (the active checkout's target is touched on every build).
+# Stage 3: cargo/nextest build payloads. Each managed physical generation is
+# considered independently; the cargo-target parent is only a namespace and
+# must never be a candidate. Reclaim retires the old namespace before
+# truncating bytes, so the next Cargo wrapper publishes a fresh generation.
 stage_target_dirs() {
-  local candidates=() d
-  # Runner work-dir checkouts live at _work/<repo>/<repo>/target. -type d
-  # skips the target→btrfs symlink the Makefile creates; that case is the
-  # cargo-target* glob below.
-  if dir_exists /opt/actions-runner/_work; then
-    while IFS= read -r -d '' d; do
-      candidates+=("$d")
-    done < <("${SUDO[@]}" find /opt/actions-runner/_work -mindepth 3 -maxdepth 3 -type d -name target -print0)
+  local runner_root='' btrfs_target_root=''
+
+  # One privileged process enumerates every root, atomically opens and locks
+  # candidates as it discovers them, retains those fds until all enumeration
+  # has succeeded, and only then validates/reclaims. A pathname or dev:ino passed
+  # between two processes has an unavoidable replacement/ABA gap.
+  if dir_exists "$RUNNER_WORK_ROOT"; then
+    runner_root="$RUNNER_WORK_ROOT"
   fi
-  for d in "$BTRFS_ROOT"/cargo-target*; do
-    if [[ -d $d ]]; then
-      candidates+=("$d")
-    fi
-  done
-  if ((${#candidates[@]} == 0)); then
+  if dir_exists "$BTRFS_ROOT/cargo-target"; then
+    btrfs_target_root="$BTRFS_ROOT/cargo-target"
+  fi
+  if [[ -z $runner_root && -z $btrfs_target_root ]]; then
     log "no cargo target dirs found"
     return 0
   fi
-  for d in "${candidates[@]}"; do
-    if recently_used "$d" "$TARGET_CUTOFF"; then
-      log "  keeping (active within ${TARGET_AGE_DAYS}d): $d"
-    else
-      printf '%s\0' "$d"
-    fi
-  done | delete_candidates "idle cargo target dirs (>${TARGET_AGE_DAYS}d)"
+
+  "${SUDO[@]}" env \
+    -u FCVM_PRUNE_TEST_SYNC_SOCKET \
+    -u FCVM_PRUNE_TEST_AFTER_RELEASE_SOCKET \
+    -u FCVM_PRUNE_TEST_FAIL_AFTER_FINGERPRINTS \
+    "$TARGET_PRUNE_HELPER" \
+    "$TARGET_CUTOFF" "$DRY_RUN" "$runner_root" "$btrfs_target_root"
 }
 
 # Stage 4a helper: content-addressed image-cache entries
@@ -387,6 +402,10 @@ quarantine_runner() {
 }
 
 main() {
+  if ((TARGET_DIRS_ONLY)); then
+    stage_target_dirs
+    return
+  fi
   local runner_id="${RUNNER_NAME:-$(hostname)}"
   log "runner: $runner_id"
   log "monitored filesystems: ${MON[*]}"

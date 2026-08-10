@@ -34,7 +34,26 @@
 # build for no visible reason.
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/cargo-target-lib.sh
+. "$script_dir/cargo-target-lib.sh"
+
 BTRFS_ROOT="${BTRFS_ROOT:-/mnt/fcvm-btrfs}"
+FORCE_ROTATE=0
+case "$#" in
+	0) ;;
+	1)
+		if [[ $1 != --rotate ]]; then
+			echo "usage: $0 [--rotate]" >&2
+			exit 2
+		fi
+		FORCE_ROTATE=1
+		;;
+	*)
+		echo "usage: $0 [--rotate]" >&2
+		exit 2
+		;;
+esac
 
 # Serialization is what makes the sequence below safe; running without it would
 # reintroduce the race silently. Fail loudly instead.
@@ -63,36 +82,194 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 
 if [ -d "$BTRFS_ROOT" ]; then
 	mkdir -p "$WT_TARGET" || { echo "ERROR: cannot create $WT_TARGET" >&2; exit 1; }
-	if [ -L target ] && [ "$(readlink target)" != "$WT_TARGET" ]; then
-		echo "==> Repointing shared target/ → $WT_TARGET (per-worktree)"
-		rm -f target
-	fi
-	if ! [ -L target ]; then
-		if [ -d target ]; then
-			echo "==> Moving existing target/ to $WT_TARGET..."
-			# Never `rm -rf` the source on a partial move. A full volume, a
-			# permission error, or a plain `target/*` glob (which skips
-			# .rustc_info.json and other dotfiles) would otherwise discard build
-			# artifacts silently. Move everything, dotfiles included, and abort if
-			# any of it fails; `rmdir` then succeeds only if the move was complete.
-			shopt -s dotglob nullglob
-			entries=(target/*)
-			shopt -u dotglob nullglob
-			if [ ${#entries[@]} -gt 0 ]; then
-				mv -- "${entries[@]}" "$WT_TARGET"/ || {
-					echo "ERROR: could not migrate target/ to $WT_TARGET; leaving it in place" >&2
-					exit 1
-				}
-			fi
-			rmdir target || {
-				echo "ERROR: target/ is not empty after migration; leaving it in place" >&2
+
+retire_target() {
+	local fd="$1"
+	/usr/bin/python3 -c '
+import errno
+import os
+import sys
+
+directory_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    try:
+        value = os.getxattr(directory_fd, b"user.fcvm.retired")
+    except OSError as error:
+        if error.errno not in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)):
+            raise
+        os.setxattr(
+            directory_fd,
+            b"user.fcvm.retired",
+            b"v1",
+            flags=os.XATTR_CREATE,
+        )
+    else:
+        if value != b"v1":
+            raise RuntimeError(f"unsupported retired-generation marker: {value!r}")
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+' "/proc/$$/fd/$fd"
+}
+
+new_generation() {
+	local retired_rc
+	while :; do
+		FRESH_GENERATION="$(mktemp -d -- "${WT_TARGET}.generation-XXXXXXXX")"
+		exec {fresh_lease_fd}<"$FRESH_GENERATION"
+		flock -x "$fresh_lease_fd"
+		retired_rc=0
+		target_is_retired "$fresh_lease_fd" || retired_rc=$?
+		case "$retired_rc" in
+			0)
+				# The pruner acquired the new name between mkdir and flock. It
+				# retired that physical inode, so leave it untouched and try a
+				# different immutable sibling.
+				exec {fresh_lease_fd}<&-
+				;;
+			3)
+				break
+				;;
+			*)
+				echo "ERROR: cannot initialize target generation $FRESH_GENERATION (rc=$retired_rc)" >&2
 				exit 1
-			}
-		fi
-		ln -s "$WT_TARGET" target
-		echo "==> Symlinked target/ → $WT_TARGET"
+				;;
+		esac
+	done
+
+	# Initialize through the locked fd. A fresh generation must not qualify as
+	# idle in the link-to-wrapper gap; later Cargo writes provide the normal
+	# activity signal. Persist the sentinel before publishing the symlink.
+	/usr/bin/python3 -c '
+import os
+import sys
+
+directory_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    sentinel_fd = os.open(
+        ".fcvm-generation",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        os.write(sentinel_fd, b"v1\n")
+        os.fsync(sentinel_fd)
+    finally:
+        os.close(sentinel_fd)
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+' "/proc/$$/fd/$fresh_lease_fd"
+	flock -s "$fresh_lease_fd"
+}
+
+publish_target_link() {
+	local destination="$1" staging
+	staging="$(mktemp -d -- "$p/.fcvm-target-link.XXXXXXXX")"
+	ln -s -- "$destination" "$staging/target"
+	# The checkout lock excludes every cooperating resolver. Replacing only
+	# this symlink is atomic and never renames a physical target dentry (which
+	# could move a mount that exists solely in another namespace).
+	mv -Tf -- "$staging/target" target
+	rmdir -- "$staging"
+}
+
+mkdir -p -- "$(dirname "$WT_TARGET")"
+
+# A pre-protocol real target cannot be replaced safely: another mount
+# namespace may have a mount on that exact dentry. Keep it local and unmanaged;
+# the disk guard will fail its hard floor and quarantine the runner rather than
+# corrupt a hidden mount. Fresh checkouts always take the managed-symlink path.
+if [ -e target ] && ! [ -L target ]; then
+	if [ ! -d target ]; then
+		echo "ERROR: target exists but is not a usable directory:" >&2
+		ls -ld target >&2
+		exit 1
 	fi
+	if ((FORCE_ROTATE)); then
+		echo "ERROR: unmanaged local target/ cannot be atomically rotated; refusing unsafe clean" >&2
+		exit 1
+	fi
+	echo "==> WARNING: retaining unmanaged local target/; it cannot be atomically rotated" >&2
+	exit 0
+fi
+
+candidate="$WT_TARGET"
+old_target_lease_fd=""
+if [ -L target ] && [ -d target ]; then
+	linked="$(readlink target)"
+	# A Cargo wrapper that already crossed the checkout→target lock handoff no
+	# longer holds the checkout lease. Pin and exclusively lease its resolved
+	# generation before publishing any different symlink target.
+	exec {old_target_lease_fd}<target
+	flock -x "$old_target_lease_fd"
+	case "$linked" in
+		"$WT_TARGET"|"$WT_TARGET".generation-*)
+			candidate="$linked"
+			;;
+	esac
+fi
+
+mkdir -p -- "$candidate"
+if [[ -n $old_target_lease_fd && ${linked:-} == "$candidate" ]]; then
+	candidate_state_fd="$old_target_lease_fd"
 else
+	exec {candidate_lease_fd}<"$candidate"
+	if [[ -n $old_target_lease_fd ]] &&
+		[[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$old_target_lease_fd")" == \
+		"$(stat -Lc '%d:%i' -- "/proc/$$/fd/$candidate_lease_fd")" ]]; then
+		exec {candidate_lease_fd}<&-
+		candidate_lease_fd=""
+		candidate_state_fd="$old_target_lease_fd"
+	else
+		flock -x "$candidate_lease_fd"
+		candidate_state_fd="$candidate_lease_fd"
+	fi
+fi
+retired_rc=0
+target_is_retired "$candidate_state_fd" || retired_rc=$?
+if ((FORCE_ROTATE)); then
+	retire_target "$candidate_state_fd"
+	retired_rc=0
+fi
+case "$retired_rc" in
+	0)
+		new_generation
+		candidate="$FRESH_GENERATION"
+		final_lease_fd="$fresh_lease_fd"
+		echo "==> Rotating retired target/ → $candidate"
+		;;
+	3)
+		# Downgrade the exclusive inspection lease while publishing the link.
+		flock -s "$candidate_state_fd"
+		final_lease_fd="$candidate_state_fd"
+		;;
+	*)
+		echo "ERROR: cannot read target retirement state for $candidate (rc=$retired_rc)" >&2
+		exit 1
+		;;
+esac
+
+if ! [ -L target ] || [ "$(readlink target)" != "$candidate" ]; then
+	publish_target_link "$candidate"
+	echo "==> Symlinked target/ → $candidate"
+fi
+
+# Keep only the published generation's shared lease until script exit. In
+# particular, the old resolved target stays exclusively pinned through the
+# atomic symlink switch above.
+if [[ -n $old_target_lease_fd && $old_target_lease_fd != "$final_lease_fd" ]]; then
+	exec {old_target_lease_fd}<&-
+fi
+if [[ -n ${candidate_lease_fd:-} && $candidate_lease_fd != "$final_lease_fd" ]]; then
+	exec {candidate_lease_fd}<&-
+fi
+else
+	if ((FORCE_ROTATE)) && [ -d target ]; then
+		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
+		exit 1
+	fi
 	echo "==> NOTE: $BTRFS_ROOT is not a directory; build artifacts stay on the root filesystem"
 fi
 

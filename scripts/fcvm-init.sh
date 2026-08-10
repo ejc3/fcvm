@@ -29,7 +29,7 @@ echo "[init] firecracker installed to ${BIN}"
 
 # Build guest agent and copy into rootfs later
 echo "[init] building guest agent ..."
-( cd "$(dirname "$0")/.."; cargo build --release -p fc-agent )
+( cd "$(dirname "$0")/.."; make build-host-tools )
 AGENT_BIN="$(dirname "$0")/../target/release/fc-agent"
 
 # Build rootfs (Debian + Podman) and pack into ext4 image
