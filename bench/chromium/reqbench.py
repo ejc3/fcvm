@@ -2071,6 +2071,72 @@ def clip(text: str, limit: int) -> str:
     return text[:limit] + "\n...[truncated]"
 
 
+def live_group_members(pgid: int) -> list:
+    """Pids in `pgid` that are not zombies.
+
+    A zombie is dead, so it is not a survivor, but it does keep the group
+    present, which is why `killpg(pgid, 0)` cannot answer this question on a
+    host whose PID 1 does not reap. Reading each candidate's state answers it on
+    every host. One /proc walk, only ever on the timeout path.
+    """
+    live = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return live
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as handle:
+                raw = handle.read()
+        except OSError:
+            continue  # exited between listdir and open
+        try:
+            fields = raw.rsplit(") ", 1)[1].split()
+            state, group = fields[0], int(fields[2])
+        except (IndexError, ValueError):
+            continue
+        if group == pgid and state != "Z":
+            live.append(int(entry))
+    return live
+
+
+def kill_process_group(leader_pid: int, timeout_s: float = 2.0) -> dict:
+    """SIGKILL a group by its LEADER's pid, then verify no live member is left.
+
+    `start_new_session=True` makes the spawned child both session and process
+    group leader, so the group id IS that pid. That identifier stays valid for
+    as long as the group has any member, because a member's `pgid` reference
+    pins the number against reuse. Reading it back with
+    `os.getpgid(leader_pid)` instead asks the LEADER, which is precisely the
+    process that may already be gone: a wrapper that spawns its real work and
+    exits leaves `communicate()` blocked on the still-open pipe, so by the time
+    the timeout fires the leader can be reaped and `getpgid` raises ESRCH.
+    Falling back to `proc.kill()` there re-targets that same dead leader and
+    every descendant keeps running.
+    """
+    outcome: dict = {"pgid": leader_pid}
+    try:
+        os.killpg(leader_pid, signal.SIGKILL)
+        outcome["signalled"] = True
+    except ProcessLookupError:
+        # No member left to signal: the group is already gone.
+        outcome["signalled"] = False
+        outcome["survivors"] = []
+        return outcome
+    except OSError as error:
+        outcome["signalled"] = False
+        outcome["error"] = f"{type(error).__name__}: {error}"
+    deadline = time.monotonic() + timeout_s
+    while True:
+        survivors = live_group_members(leader_pid)
+        if not survivors or time.monotonic() >= deadline:
+            outcome["survivors"] = survivors
+            return outcome
+        time.sleep(0.01)
+
+
 def run_probe_command(argv, timeout_s: float, budget_limited: bool = False,
                       output_limit: int = PROBE_BATCH_LIMIT) -> dict:
     """Run one probe command in its own session; never raise, always record.
@@ -2110,13 +2176,7 @@ def run_probe_command(argv, timeout_s: float, budget_limited: bool = False,
         out, err = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        record["group_kill"] = kill_process_group(proc.pid)
         try:
             out, err = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
@@ -2237,7 +2297,7 @@ class FailureProbe:
     """
 
     # A control that failed to WRITE is not a control, so the next healthy clone
-    # gets another go -- bounded, because each attempt costs up to the full
+    # gets another go. Bounded, because each attempt costs up to the full
     # budget and perturbs the rep it lands on, and a systematically broken probe
     # would otherwise tax every healthy request in the run.
     CONTROL_ATTEMPTS = 3
@@ -2287,7 +2347,7 @@ class FailureProbe:
         A pending INT/TERM outranks the evidence. The signal handler only
         RECORDS the signal, so nothing here is interrupted asynchronously and a
         capture that began before the signal would run its full budget with the
-        clone still up and the harness's teardown behind it — long enough for a
+        clone still up and the harness's teardown behind it, long enough for a
         job runner to escalate to SIGKILL and leave behind exactly the clone this
         probe exists to diagnose. So a signal that is already pending skips the
         capture outright, and one that arrives mid-capture stops it at the next

@@ -4634,7 +4634,7 @@ class FailureProbeCapture(unittest.TestCase):
         command running inside the guest, so killing only the direct child would
         leave the real work behind. The bound therefore kills the process GROUP,
         and this asserts the grandchild was KILLED rather than asserting its
-        procfs entry went away — those are different claims, and the second one
+        procfs entry went away. Those are different claims, and the second one
         is about the reaper rather than about the kill. This test adopts the
         orphan and reads its exit status, so it says what it means.
         """
@@ -4660,6 +4660,118 @@ class FailureProbeCapture(unittest.TestCase):
             note = ("the timeout killed the exec wrapper but left its "
                     "guest-side work")
             assert_sigkilled(self, grandchild, reap_orphan(grandchild, note), note)
+
+    def test_a_zombie_group_member_is_not_counted_as_a_survivor(self):
+        """The kill's verification has to tell a corpse from a survivor.
+
+        `killpg(pgid, 0)` cannot: an unreaped zombie keeps the whole group
+        present, so on a host whose PID 1 does not reap it would report the
+        group alive forever. `live_group_members` reads each member's state, and
+        this checks it against a group holding one of each.
+        """
+        code = (
+            "import subprocess,sys,time;"
+            "corpse=subprocess.Popen(['true']);"          # never waited on
+            "live=subprocess.Popen(['sleep','300']);"
+            "open(sys.argv[1],'w').write(f'{corpse.pid} {live.pid}');"
+            "time.sleep(300)"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            pid_file = os.path.join(d, "members.pid")
+            leader = subprocess.Popen([sys.executable, "-c", code, pid_file],
+                                      start_new_session=True)
+            try:
+                deadline = time.monotonic() + 10
+                corpse = live = None
+                while time.monotonic() < deadline:
+                    try:
+                        with open(pid_file) as handle:
+                            corpse, live = (int(x) for x in
+                                            handle.read().split())
+                    except (OSError, ValueError):
+                        time.sleep(0.02)
+                        continue
+                    state = reqbench.proc_stat_fields(corpse)
+                    if state and state[0] == "Z":
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(corpse, "the group never came up")
+                # Without this the assertion below passes for the wrong reason.
+                self.assertEqual(reqbench.proc_stat_fields(corpse)[0], "Z",
+                                 "the corpse was reaped, so it proves nothing")
+                members = reqbench.live_group_members(leader.pid)
+                self.assertIn(leader.pid, members)
+                self.assertIn(live, members)
+                self.assertNotIn(corpse, members,
+                                 "a zombie is dead, so it is not a survivor")
+            finally:
+                outcome = reqbench.kill_process_group(leader.pid)
+                leader.wait(timeout=5)
+            self.assertEqual(outcome["survivors"], [],
+                             "the group outlived its own kill")
+
+    def test_the_bound_kills_the_group_when_the_leader_is_already_gone(self):
+        """RED BEFORE THE FIX: the group was named by asking the leader for it.
+
+        `os.getpgid(proc.pid)` raises ESRCH once the leader is gone, and the
+        `proc.kill()` fallback then re-signals that same dead leader while the
+        work it spawned keeps running:
+
+            AssertionError: the group kill missed the descendant the vanished
+            leader left behind: pid 4193142 is still running 5s later, state
+            ('S', 0, 0, 254146417)
+
+        The window is real and this reproduces it rather than racing for it. The
+        wrapper exits immediately, its child keeps the stdout pipe open, so
+        `communicate()` still blocks for the whole timeout. A SIGCHLD reaper
+        makes the leader's pid VANISH inside that window instead of lingering as
+        a zombie, which is what turns `getpgid` into ESRCH; any harness that
+        reaps its own children supplies one.
+        """
+        with tempfile.TemporaryDirectory() as d, child_subreaper():
+            survivor_pid_file = os.path.join(d, "survivor.pid")
+            wrapper = os.path.join(d, "vanishing-leader")
+            with open(wrapper, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    "sleep 300 &\n"
+                    f"echo $! > {shlex.quote(survivor_pid_file)}\n"
+                    "exit 0\n"
+                )
+            os.chmod(wrapper, 0o755)
+            statuses = {}
+
+            def reap_any_child(_signum, _frame):
+                while True:
+                    try:
+                        pid, status = os.waitpid(-1, os.WNOHANG)
+                    except ChildProcessError:
+                        return
+                    if pid == 0:
+                        return
+                    statuses[pid] = status
+
+            previous = signal.signal(signal.SIGCHLD, reap_any_child)
+            try:
+                record = reqbench.run_probe_command([wrapper], 1.0)
+            finally:
+                signal.signal(signal.SIGCHLD, previous)
+
+            self.assertIs(record["timed_out"], True)
+            self.assertTrue(
+                statuses,
+                "the leader was never reaped, so the ESRCH window never opened",
+            )
+            with open(survivor_pid_file) as f:
+                survivor = int(f.read().strip())
+            note = ("the group kill missed the descendant the vanished leader "
+                    "left behind")
+            status = statuses.get(survivor)
+            if status is None:
+                status = reap_orphan(survivor, note)
+            assert_sigkilled(self, survivor, status, note)
+            self.assertEqual(record["group_kill"]["survivors"], [],
+                             "the kill was not verified against the group")
 
     def test_a_pending_termination_signal_skips_the_probe_entirely(self):
         """A probe that delays a shutdown can leak the clone it came to explain.
