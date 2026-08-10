@@ -2297,9 +2297,9 @@ class FailureProbe:
     """
 
     # A control that failed to WRITE is not a control, so the next healthy clone
-    # gets another go. Bounded, because each attempt costs up to the full
-    # budget and perturbs the rep it lands on, and a systematically broken probe
-    # would otherwise tax every healthy request in the run.
+    # gets another go. Bounded, because each attempt costs up to the full budget
+    # and perturbs the rep it lands on, so an unbounded retry against a
+    # systematically broken probe would tax every healthy request in the run.
     CONTROL_ATTEMPTS = 3
 
     def __init__(self, fcvm: str, data_root: str, out_dir: str, run_id: str,

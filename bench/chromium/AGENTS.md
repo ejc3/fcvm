@@ -480,9 +480,29 @@ next to that request's clone log and references it from the JSONL record.
 
 Read the failure dump against the control; a dump with nothing to compare
 against proves little, which is why the control is captured whether or not the
-run ends up failing. Read `role`, `budget_exhausted` and each command's
+run ends up failing, and why a control whose dump fails to WRITE does not count
+as taken: the next healthy clone gets another go, bounded at three attempts so a
+systematically broken probe cannot tax every healthy rep in the run. Read
+`role`, `budget_exhausted`, `interrupted_by_signal` and each command's
 `budget_limited` before reading anything else: a `timed_out` step that was
-`budget_limited` is the probe running out of budget, not a wedged guest.
+`budget_limited` is the probe running out of budget, not a wedged guest, and a
+short dump carrying `interrupted_by_signal` is one that stood aside for a
+shutdown.
+
+**It stands aside for INT/TERM, and it is bounded by a process-group kill.** The
+harness's signal handler only records the signal, so nothing in the probe is
+interrupted asynchronously; without a check of its own a capture would spend its
+whole budget with the clone still up and the teardown queued behind it, which is
+long enough for a job runner to escalate to SIGKILL and leave behind exactly the
+clone the probe came to explain. A pending signal therefore skips the capture,
+and one arriving mid-capture stops it at the next step. Each probe command runs
+in its own session, so the timeout kills the whole process GROUP rather than the
+`fcvm exec` wrapper alone, and it names that group by the spawned pid rather
+than by asking the leader for it: a wrapper that exits while its child holds the
+pipe open makes `os.getpgid` raise ESRCH exactly when the kill is needed. The
+kill verifies itself, and `group_kill.survivors` on the command's record is what
+it found, with zombies excluded because a corpse keeps a group present without
+being alive in it.
 
 **What it cannot settle.** The passive capture is taken ~100 s after the request
 gave up, so it describes the STEADY state of the failure, not the moment it
