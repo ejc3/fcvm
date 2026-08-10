@@ -59,6 +59,12 @@ pub const VSOCK_TTY_PORT: u32 = 4996;
 /// `fc-agent::bootplan::BOOTPLAN_VSOCK_PORT`.
 pub const VSOCK_BOOTPLAN_PORT: u32 = 4995;
 
+/// Vsock port for the restored guest's exact restore-generation completion ACK.
+/// The host binds this before VMM resume and does not publish lifecycle readiness
+/// until fc-agent confirms the same UUID after all restore phases have succeeded.
+/// Must match `fc-agent::vsock::RESTORE_COMPLETE_PORT`.
+pub const VSOCK_RESTORE_COMPLETE_PORT: u32 = 4994;
+
 /// Minimum required Firecracker version for network_overrides support
 const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
 
@@ -1213,8 +1219,11 @@ pub struct SnapshotRestoreConfig {
     pub memory_backend: MemoryBackend,
     /// Source disk for CoW copy
     pub source_disk_path: PathBuf,
-    /// Original VM ID for vsock socket path redirect (from original cache creation)
+    /// Original VM lineage (from original cache creation), used for disk redirects.
     pub original_vm_id: String,
+    /// Exact vsock base path embedded in the source VMM state. Its parent is
+    /// redirected to the clone runtime directory before the VMM starts.
+    pub source_vsock_socket_path: PathBuf,
     /// Snapshot VM ID for disk path redirect (the VM that was snapshotted)
     /// This is needed because disk paths are patched during cache restore,
     /// so vmstate.bin has a different VM ID for disk than for vsock.
@@ -1236,6 +1245,11 @@ pub struct RestoreParams<'a> {
     pub runtime_config: &'a RuntimeConfig,
     pub restore_config: &'a SnapshotRestoreConfig,
     pub network_config: &'a NetworkConfig,
+    /// Restore generation already published by the caller's vsock listener
+    /// before VMM resume. Firecracker mirrors this exact value into MMDS after
+    /// resume so switching back to its normal transport cannot trigger a
+    /// duplicate restore.
+    pub restore_epoch: &'a str,
     /// For routed mode clones: the unique per-clone IPv6 that fc-agent should
     /// configure on eth0, replacing the snapshot's shared guest IPv6.
     pub clone_ipv6: Option<String>,
@@ -1303,6 +1317,34 @@ fn vmstate_contains_path(bytes: &[u8], needle: &Path) -> bool {
         return false;
     }
     bytes.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Refuse a restore whose metadata does not name the exact vsock path embedded
+/// in Firecracker's vmstate. Redirecting a guessed/default directory would make
+/// a custom `--vsock-dir` clone bind the source socket or fail with EADDRINUSE.
+fn assert_vmstate_vsock_source_matches(vmstate_path: &Path, source_path: &Path) -> Result<()> {
+    let bytes = std::fs::read(vmstate_path)
+        .with_context(|| format!("reading vmstate vsock source: {}", vmstate_path.display()))?;
+    anyhow::ensure!(
+        vmstate_contains_path(&bytes, source_path),
+        "refusing to restore: vmstate.bin does not contain recorded source vsock path {}; delete and recreate the snapshot",
+        source_path.display()
+    );
+    Ok(())
+}
+
+fn add_source_vsock_redirect_dir(
+    baseline_dirs: &mut Vec<PathBuf>,
+    source_path: &Path,
+) -> Result<()> {
+    let source_dir = source_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("source vsock path has no parent"))?
+        .to_path_buf();
+    if !baseline_dirs.contains(&source_dir) {
+        baseline_dirs.push(source_dir);
+    }
+    Ok(())
 }
 
 /// True if vmstate references a rootfs path under one of the baseline bind-mount dirs,
@@ -1443,6 +1485,38 @@ fn assert_ch_config_disks_covered(
             paths::data_dir().display(),
         );
     }
+    Ok(())
+}
+
+/// Refuse a Cloud Hypervisor restore whose snapshot config does not name the exact
+/// vsock socket recorded in fcvm's snapshot metadata.
+///
+/// Unlike Firecracker's binary vmstate, CH serializes the source socket directly in
+/// `config.json`. The mount redirect must cover that exact source directory before CH
+/// starts: accepting a guessed or stale path could make the clone bind the still-live
+/// source VM's socket, or fail with `EADDRINUSE`. This is deliberately a pure check so it
+/// can run before [`prepare_clone_substrate`] creates a holder, disk, or namespace.
+fn assert_ch_config_vsock_source_matches(
+    cfg: &serde_json::Value,
+    source_path: &Path,
+) -> Result<()> {
+    let configured_path = cfg
+        .get("vsock")
+        .and_then(|vsock| vsock.get("socket"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusing to restore: Cloud Hypervisor config.json has no vsock.socket; \
+                 delete and recreate the snapshot"
+            )
+        })?;
+    anyhow::ensure!(
+        Path::new(configured_path) == source_path,
+        "refusing to restore: Cloud Hypervisor config.json vsock socket {} does not match \
+         recorded source {}; delete and recreate the snapshot",
+        configured_path,
+        source_path.display()
+    );
     Ok(())
 }
 
@@ -1645,15 +1719,17 @@ async fn prepare_clone_substrate(
         anyhow::bail!("Unknown network type");
     }
 
-    // Mount-namespace redirect: the snapshot embeds the baseline VM's paths (vsock under
-    // original_vm_id; disk under snapshot_vm_id if different). Bind-mounting those baseline
-    // dirs over the clone's dir makes the VMM open the clone's CoW disk / bind its vsock.
+    // Mount-namespace redirect: disks are under the source VM runtime dirs, but
+    // vsock may be under an arbitrary dedicated `--vsock-dir`. Redirect every
+    // exact source parent to the clone dir so the VMM opens only clone-local
+    // disks and binds only the clone-local socket.
     let mut baseline_dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
     if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
         if snapshot_vm_id != &restore_config.original_vm_id {
             baseline_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
         }
     }
+    add_source_vsock_redirect_dir(&mut baseline_dirs, &restore_config.source_vsock_socket_path)?;
     info!(
         baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         clone_dir = %data_dir.display(),
@@ -1736,6 +1812,7 @@ pub async fn restore_from_snapshot(
         runtime_config,
         restore_config,
         network_config,
+        restore_epoch,
         clone_ipv6,
         track_dirty_pages,
     } = params;
@@ -1747,6 +1824,10 @@ pub async fn restore_from_snapshot(
         &restore_config.vmstate_path,
         &restore_config.original_vm_id,
         restore_config.snapshot_vm_id.as_deref(),
+    )?;
+    assert_vmstate_vsock_source_matches(
+        &restore_config.vmstate_path,
+        &restore_config.source_vsock_socket_path,
     )?;
 
     // Resolve the binary before acquiring a rootless namespace holder. This is
@@ -1928,14 +2009,14 @@ pub async fn restore_from_snapshot(
             "VM resume completed"
         );
 
-        // Signal fc-agent to flush ARP cache and reconnect output vsock via MMDS.
-        // MUST be after VM resume — Firecracker accepts PUT /mmds while paused but
-        // the guest-visible MMDS data isn't updated until after resume.
-        let restore_epoch = new_restore_epoch();
-
+        // Mirror the exact restore-only vsock epoch into MMDS. The guest latches
+        // the vsock generation that performed cookie cleanup and ignores the
+        // snapshot-old MMDS value until this acknowledgement arrives. MUST be
+        // after VM resume — Firecracker accepts PUT /mmds while paused but the
+        // guest-visible MMDS data isn't updated until after resume.
         let mut mmds_latest = serde_json::json!({
             "host-time": chrono::Utc::now().timestamp().to_string(),
-            "restore-epoch": restore_epoch.clone()
+            "restore-epoch": restore_epoch
         });
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
@@ -1967,6 +2048,8 @@ pub async fn restore_from_snapshot(
         // When this VM is later snapshotted, clones need to use this original_vm_id
         // for vsock redirect because vmstate.bin stores paths from this vm
         vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
+        vm_state.config.source_vsock_socket_path =
+            Some(restore_config.source_vsock_socket_path.clone());
 
         // Update extra_disks in clone state with clone-local paths
         if !restore_config.extra_disks.is_empty() {
@@ -2063,7 +2146,8 @@ pub async fn restore_from_snapshot_ch(
         runtime_config: _, // CH binary is resolved via find_cloud_hypervisor (env/PATH)
         restore_config,
         network_config,
-        clone_ipv6: _, // delivered to the guest via the boot-plan restore-epoch (caller)
+        restore_epoch: _,     // delivered by the caller's boot-plan vsock listener
+        clone_ipv6: _,        // delivered to the guest via the boot-plan restore-epoch (caller)
         track_dirty_pages: _, // CH has no dirty-page tracking
     } = params;
     let vm_dir = data_dir.join("disks");
@@ -2096,6 +2180,7 @@ pub async fn restore_from_snapshot_ch(
         &restore_config.original_vm_id,
         restore_config.snapshot_vm_id.as_deref(),
     )?;
+    assert_ch_config_vsock_source_matches(&cfg, &restore_config.source_vsock_socket_path)?;
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
     let mut substrate =
@@ -2212,6 +2297,8 @@ pub async fn restore_from_snapshot_ch(
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
         vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
+        vm_state.config.source_vsock_socket_path =
+            Some(restore_config.source_vsock_socket_path.clone());
         if !restore_config.extra_disks.is_empty() {
             vm_state.config.extra_disks = restore_config
                 .extra_disks
@@ -2373,18 +2460,46 @@ pub fn build_snapshot_config(
     snapshot_dir: &std::path::Path,
     volumes: Vec<crate::storage::SnapshotVolumeConfig>,
     extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
-) -> crate::storage::SnapshotConfig {
+) -> Result<crate::storage::SnapshotConfig> {
     let original_vsock_vm_id = vm_state
         .config
         .original_vsock_vm_id
         .clone()
         .unwrap_or_else(|| vm_state.vm_id.clone());
+    let source_vsock_socket_path = vm_state
+        .config
+        .source_vsock_socket_path
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "running VM {} has no recorded VMM source vsock socket path",
+                vm_state.vm_id
+            )
+        })?
+        .clone();
+    anyhow::ensure!(
+        source_vsock_socket_path.is_absolute(),
+        "running VM {} has non-absolute VMM source vsock socket path {}",
+        vm_state.vm_id,
+        source_vsock_socket_path.display()
+    );
+    anyhow::ensure!(
+        source_vsock_socket_path.file_name() == Some(std::ffi::OsStr::new("vsock.sock"))
+            && source_vsock_socket_path.parent().is_some()
+            && source_vsock_socket_path.parent() != Some(Path::new("/")),
+        "running VM {} has invalid VMM source vsock socket path {}; expected an absolute \
+         path named vsock.sock under a dedicated directory",
+        vm_state.vm_id,
+        source_vsock_socket_path.display()
+    );
 
-    crate::storage::SnapshotConfig {
+    Ok(crate::storage::SnapshotConfig {
         name: snapshot_key.to_string(),
         vm_id: vm_state.vm_id.clone(),
         generation_id: uuid::Uuid::new_v4(),
+        network_boundary_version: crate::storage::snapshot::SNAPSHOT_NETWORK_BOUNDARY_VERSION,
         original_vsock_vm_id: Some(original_vsock_vm_id),
+        source_vsock_socket_path,
         parent_snapshot: None, // Set by create_snapshot_core after determining diff base
         // Set by create_podman_snapshot, the only caller whose snapshot holds the
         // content of a cache key. `snapshot create` captures a live VM, not a config.
@@ -2421,7 +2536,7 @@ pub fn build_snapshot_config(
             image_disk_path: vm_state.config.image_disk_path.clone(),
             hypervisor: vm_state.config.hypervisor,
         },
-    }
+    })
 }
 
 /// Convert VolumeConfig objects to SnapshotVolumeConfig for snapshot metadata.
@@ -2699,8 +2814,8 @@ pub enum SnapshotSourceDisposition {
 /// `DiskOnly` snapshot. Clones cold-boot from this disk. See
 /// docs/disk-only-clone.html.
 ///
-/// `snapshot_config.kind` must already be `DiskOnly`. `vsock_socket` is the VM's
-/// exec vsock (`vm_runtime_dir/<vm_id>/vsock.sock`), used to run the quiesce
+/// `snapshot_config.kind` must already be `DiskOnly`. `vsock_socket` is the VM's exact
+/// recorded exec vsock (including a custom `--vsock-dir`), used to run the quiesce
 /// commands in the guest.
 ///
 /// # Locking
@@ -2934,6 +3049,80 @@ async fn record_vsock_reset_for_snapshot(vm_id: &str, snapshot_name: &str) {
     }
 }
 
+const FC_AGENT_PATH: &str = "/usr/local/bin/fc-agent";
+
+/// Return the exact host-side vsock socket recorded for a running VM.
+///
+/// A path reconstructed from `vm_id` is incorrect for VMs started with
+/// `--vsock-dir`. Missing data is therefore an error rather than a fallback to
+/// the conventional runtime path: snapshot bracketing must fail closed if it
+/// cannot address the guest that is about to be paused.
+pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
+    let path = vm_state
+        .config
+        .vsock_socket_path
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "running VM {} has no recorded vsock socket path",
+                vm_state.vm_id
+            )
+        })?;
+    anyhow::ensure!(
+        path.is_absolute(),
+        "running VM {} has non-absolute recorded vsock socket path {}",
+        vm_state.vm_id,
+        path.display()
+    );
+    Ok(path)
+}
+
+/// Run one side of the guest network boundary around a memory snapshot.
+///
+/// The caller supplies the exact socket recorded in the running VM's state.
+/// This is intentionally part of both snapshot APIs: deriving a conventional
+/// runtime path here would silently bypass `--vsock-dir`.
+async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
+    use crate::commands::exec::run_exec_in_vm_captured;
+
+    let command = vec![FC_AGENT_PATH.to_string(), flag.to_string()];
+    let output = run_exec_in_vm_captured(vsock_socket, &command, false, vm_id)
+        .await
+        .with_context(|| format!("running `{FC_AGENT_PATH} {flag}` in guest {vm_id}"))?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "`{FC_AGENT_PATH} {flag}` failed in guest {vm_id} with exit code {}: \
+         stdout={:?}, stderr={:?}",
+        output.exit_code,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}
+
+/// Preserve the primary snapshot error plus every recovery error in execution
+/// order. Cleanup failures must never replace the operation that made cleanup
+/// necessary, and a successful snapshot is still an error if either recovery
+/// step failed.
+fn combine_snapshot_boundary_results(
+    operation_result: Result<()>,
+    hypervisor_resume_result: Result<()>,
+    guest_network_resume_result: Result<()>,
+) -> Result<()> {
+    let mut combined = operation_result.err();
+    for recovery_result in [hypervisor_resume_result, guest_network_resume_result] {
+        if let Err(recovery_error) = recovery_result {
+            combined = Some(match combined {
+                Some(existing) => {
+                    anyhow::anyhow!("{existing:#}; additionally: {recovery_error:#}")
+                }
+                None => recovery_error,
+            });
+        }
+    }
+    combined.map_or(Ok(()), Err)
+}
+
 /// Create a snapshot of the running VM.
 ///
 /// # Locking
@@ -2948,6 +3137,7 @@ pub async fn create_snapshot_core(
     client: &crate::firecracker::FirecrackerClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
+    vsock_socket_path: &Path,
     parent_snapshot_dir: Option<&Path>,
     extra_files: SnapshotExtraFiles<'_>,
     source_disposition: SnapshotSourceDisposition,
@@ -3073,31 +3263,90 @@ pub async fn create_snapshot_core(
     let snapshot_client =
         client.with_timeout(std::time::Duration::from_secs(snapshot_timeout_secs));
 
-    // Pause VM before snapshotting (required by Firecracker).
-    // If Pause fails/times out, the VM is NOT paused — no resume needed.
-    // failpoint: widen the window just before the pause — makes "in-flight
-    // exec/curl/serial write collides with the VM pause" deterministic.
+    // Close the guest's new-flow gate immediately before pausing. The manifest
+    // written by this command is captured in guest memory, creating the exact
+    // socket-generation boundary that restore cleanup consumes.
+    //
+    // failpoint: widen the window before preparation — never sleep after the
+    // gate closes and before the pause.
     failpoint::hit_async("snapshot.pre_pause").await;
-    info!(snapshot = %snapshot_config.name, "pausing VM for snapshot");
-    if let Err(e) = pause_client
+    info!(snapshot = %snapshot_config.name, "preparing guest network and pausing VM for snapshot");
+    if let Err(error) = run_snapshot_network_command(
+        vsock_socket_path,
+        &snapshot_config.vm_id,
+        "--prepare-snapshot-network",
+    )
+    .await
+    {
+        // The exec transport can lose the reply after fc-agent has already
+        // closed the gate and brought eth0 down.  Recovery is safe to issue
+        // after every invoked prepare: the guest serializes both commands on
+        // one flock, so this blocks behind an in-flight prepare and then
+        // reopens the exact transaction it completed.  No hypervisor pause was
+        // invoked yet.
+        let operation_error =
+            error.context("preparing guest network boundary for Firecracker snapshot");
+        let guest_network_resume_result = run_snapshot_network_command(
+            vsock_socket_path,
+            &snapshot_config.vm_id,
+            "--resume-snapshot-network",
+        )
+        .await
+        .context("reopening guest network after Firecracker preparation failure");
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return combine_snapshot_boundary_results(
+            Err(operation_error),
+            Ok(()),
+            guest_network_resume_result,
+        );
+    }
+    let pause_result = pause_client
         .patch_vm_state(ApiVmState {
             state: "Paused".to_string(),
         })
         .await
-    {
+        .context("pausing VM for snapshot");
+
+    // A pause API error is ambiguous: the VMM may have paused before its reply
+    // failed. Attempt a hypervisor resume even on error, then reopen the guest
+    // gate only after that attempt so the command can run if the VM recovered.
+    if let Err(pause_error) = pause_result {
+        record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
+        let hypervisor_resume_result = snapshot_client
+            .patch_vm_state(ApiVmState {
+                state: "Resumed".to_string(),
+            })
+            .await
+            .context("resuming VM after Firecracker pause failure");
+        if let Err(error) = &hypervisor_resume_result {
+            error!(snapshot = %snapshot_config.name, error = %error,
+                "CRITICAL: failed to resume VM after pause error — VM may be paused!");
+        }
+        let guest_network_resume_result = run_snapshot_network_command(
+            vsock_socket_path,
+            &snapshot_config.vm_id,
+            "--resume-snapshot-network",
+        )
+        .await
+        .context("reopening guest network after Firecracker pause failure");
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("pausing VM for snapshot (VM still running, no data loss)");
+        return combine_snapshot_boundary_results(
+            Err(pause_error),
+            hypervisor_resume_result,
+            guest_network_resume_result,
+        );
     }
 
     // VM is now paused — we MUST resume it before returning, no matter what.
     let mut use_diff = has_base;
-    let snapshot_result = snapshot_client
+    let mut snapshot_result = snapshot_client
         .create_snapshot(SnapshotCreate {
             snapshot_type: Some(snapshot_type.to_string()),
             snapshot_path: temp_vmstate_path.display().to_string(),
             mem_file_path: temp_memory_path.display().to_string(),
         })
-        .await;
+        .await
+        .context("creating Firecracker snapshot");
 
     // Validate diff snapshot: detect KVM dirty page tracking failure.
     //
@@ -3149,22 +3398,10 @@ pub async fn create_snapshot_core(
                         );
                     }
                     Err(e) => {
-                        // Full retry failed — record the vsock reset, then either resume the
-                        // normal workload or leave the disposable prepare source paused.
-                        record_vsock_reset_for_snapshot(
-                            &snapshot_config.vm_id,
-                            &snapshot_config.name,
-                        )
-                        .await;
-                        if source_disposition == SnapshotSourceDisposition::Resume {
-                            let _ = snapshot_client
-                                .patch_vm_state(ApiVmState {
-                                    state: "Resumed".to_string(),
-                                })
-                                .await;
-                        }
-                        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-                        return Err(e)
+                        // Defer the error until the shared boundary recovery below
+                        // runs (vsock-reset record, disposition-aware resume, gate
+                        // reopen, result combination).
+                        snapshot_result = Err(e)
                             .context("Full snapshot retry failed after diff tracking failure");
                     }
                 }
@@ -3178,7 +3415,9 @@ pub async fn create_snapshot_core(
     // unaffected.
     let disk_copy_result = if snapshot_result.is_ok() {
         info!(snapshot = %snapshot_config.name, "copying disk (VM paused)");
-        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir).await
+        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir)
+            .await
+            .context("copying disk during snapshot")
     } else {
         Ok(()) // Skip disk copy if snapshot failed
     };
@@ -3197,40 +3436,56 @@ pub async fn create_snapshot_core(
     // makes "client observes a saved-but-still-paused VM" (stalled exec/curl/vsock
     // across an arbitrarily long pause) deterministic.
     failpoint::hit_async("snapshot.post_save_pre_resume").await;
-    let resume_result = match source_disposition {
-        SnapshotSourceDisposition::Resume => {
-            snapshot_client
-                .patch_vm_state(ApiVmState {
-                    state: "Resumed".to_string(),
-                })
-                .await
-        }
+    let hypervisor_resume_result = match source_disposition {
+        SnapshotSourceDisposition::Resume => snapshot_client
+            .patch_vm_state(ApiVmState {
+                state: "Resumed".to_string(),
+            })
+            .await
+            .context("resuming VM after snapshot"),
+        // A disposable prepare source must never run again; it stays paused
+        // until teardown, so there is nothing to resume.
         SnapshotSourceDisposition::LeavePaused => Ok(()),
     };
 
-    if let Err(e) = &resume_result {
+    if let Err(e) = &hypervisor_resume_result {
         // Resume failure is critical — VM may be stuck paused.
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to resume VM after snapshot — VM may be paused!");
     }
 
-    // Check results — clean up temp dir on failure
-    if let Err(e) = snapshot_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("creating Firecracker snapshot");
+    // Reopen the guest gate after the hypervisor resume attempt on every path
+    // that resumes. A LeavePaused source cannot execute the reopen (its vCPUs
+    // never run again), and must not: the closed gate inside the artifact IS
+    // the socket-generation boundary its restored clones consume.
+    let guest_network_resume_result = match source_disposition {
+        SnapshotSourceDisposition::Resume => run_snapshot_network_command(
+            vsock_socket_path,
+            &snapshot_config.vm_id,
+            "--resume-snapshot-network",
+        )
+        .await
+        .context("reopening guest network after Firecracker snapshot"),
+        SnapshotSourceDisposition::LeavePaused => Ok(()),
+    };
+    if let Err(e) = &guest_network_resume_result {
+        error!(snapshot = %snapshot_config.name, error = %e,
+            "CRITICAL: failed to reopen guest network after snapshot!");
     }
-    if let Err(e) = disk_copy_result {
+
+    let operation_result = snapshot_result.and(disk_copy_result);
+    if let Err(error) = combine_snapshot_boundary_results(
+        operation_result,
+        hypervisor_resume_result,
+        guest_network_resume_result,
+    ) {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("copying disk during snapshot");
-    }
-    if let Err(e) = resume_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("resuming VM after snapshot");
+        return Err(error);
     }
 
     match source_disposition {
         SnapshotSourceDisposition::Resume => {
-            info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
+            info!(snapshot = %snapshot_config.name, "VM and guest network resumed, processing snapshot");
         }
         SnapshotSourceDisposition::LeavePaused => {
             info!(snapshot = %snapshot_config.name, "disposable source remains paused, processing snapshot");
@@ -3348,6 +3603,7 @@ pub async fn create_snapshot_ch(
     client: &crate::hypervisor::cloud_hypervisor::api::ChClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
+    vsock_socket_path: &Path,
 ) -> Result<()> {
     // CH snapshots are always self-contained (no diff base / parent chain).
     snapshot_config.parent_snapshot = None;
@@ -3404,12 +3660,66 @@ pub async fn create_snapshot_ch(
         .await
         .context("creating temp CH snapshot directory")?;
 
-    info!(snapshot = %snapshot_config.name, "pausing Cloud Hypervisor VM for snapshot");
-    // Pause first (CH requires a paused VM to snapshot). If pause fails the VM is NOT
-    // paused, so there is nothing to resume.
-    if let Err(e) = client.pause_vm().await {
+    // As on Firecracker, no fallible or blocking work may separate successful
+    // guest preparation from the pause that captures its manifest.
+    info!(snapshot = %snapshot_config.name, "preparing guest network and pausing Cloud Hypervisor VM for snapshot");
+    if let Err(error) = run_snapshot_network_command(
+        vsock_socket_path,
+        &snapshot_config.vm_id,
+        "--prepare-snapshot-network",
+    )
+    .await
+    {
+        // A failed exec response does not prove that preparation did not run.
+        // Guest-side flock serialization makes an unconditional resume the
+        // exact recovery operation even if the prepare command is still
+        // finishing when this second exec arrives.
+        let operation_error =
+            error.context("preparing guest network boundary for Cloud Hypervisor snapshot");
+        let guest_network_resume_result = run_snapshot_network_command(
+            vsock_socket_path,
+            &snapshot_config.vm_id,
+            "--resume-snapshot-network",
+        )
+        .await
+        .context("reopening guest network after Cloud Hypervisor preparation failure");
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("pausing Cloud Hypervisor VM for snapshot (VM still running)");
+        return combine_snapshot_boundary_results(
+            Err(operation_error),
+            Ok(()),
+            guest_network_resume_result,
+        );
+    }
+    let pause_result = client
+        .pause_vm()
+        .await
+        .context("pausing Cloud Hypervisor VM for snapshot");
+
+    // A failed pause response can still mean CH reached Paused. Always attempt
+    // resume after invoking pause, then reopen the guest network gate.
+    if let Err(pause_error) = pause_result {
+        record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
+        let hypervisor_resume_result = client
+            .resume_vm()
+            .await
+            .context("resuming Cloud Hypervisor VM after pause failure");
+        if let Err(error) = &hypervisor_resume_result {
+            error!(snapshot = %snapshot_config.name, error = %error,
+                "CRITICAL: failed to resume Cloud Hypervisor VM after pause error — VM may be paused!");
+        }
+        let guest_network_resume_result = run_snapshot_network_command(
+            vsock_socket_path,
+            &snapshot_config.vm_id,
+            "--resume-snapshot-network",
+        )
+        .await
+        .context("reopening guest network after Cloud Hypervisor pause failure");
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return combine_snapshot_boundary_results(
+            Err(pause_error),
+            hypervisor_resume_result,
+            guest_network_resume_result,
+        );
     }
 
     // VM is paused — we MUST resume it before returning, regardless of outcome.
@@ -3422,13 +3732,16 @@ pub async fn create_snapshot_ch(
     let snapshot_result = client
         .with_timeout(snapshot_timeout)
         .snapshot_vm(&dest_url)
-        .await;
+        .await
+        .context("creating Cloud Hypervisor snapshot");
 
     // Reflink the disk(s) WHILE PAUSED so the disk image matches the captured memory
     // (a post-resume write would desync memory/disk and corrupt the clone's filesystem).
     let disk_copy_result = if snapshot_result.is_ok() {
         info!(snapshot = %snapshot_config.name, "copying disk (CH VM paused)");
-        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir).await
+        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir)
+            .await
+            .context("copying disk during Cloud Hypervisor snapshot")
     } else {
         Ok(())
     };
@@ -3438,26 +3751,38 @@ pub async fn create_snapshot_ch(
     record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
 
     // Resume ALWAYS, even if the snapshot or disk copy failed.
-    let resume_result = client.resume_vm().await;
-    if let Err(e) = &resume_result {
+    let hypervisor_resume_result = client
+        .resume_vm()
+        .await
+        .context("resuming Cloud Hypervisor VM after snapshot");
+    if let Err(e) = &hypervisor_resume_result {
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to resume Cloud Hypervisor VM after snapshot — VM may be paused!");
     }
 
-    if let Err(e) = snapshot_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("creating Cloud Hypervisor snapshot");
-    }
-    if let Err(e) = disk_copy_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("copying disk during Cloud Hypervisor snapshot");
-    }
-    if let Err(e) = resume_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("resuming Cloud Hypervisor VM after snapshot");
+    let guest_network_resume_result = run_snapshot_network_command(
+        vsock_socket_path,
+        &snapshot_config.vm_id,
+        "--resume-snapshot-network",
+    )
+    .await
+    .context("reopening guest network after Cloud Hypervisor snapshot");
+    if let Err(e) = &guest_network_resume_result {
+        error!(snapshot = %snapshot_config.name, error = %e,
+            "CRITICAL: failed to reopen guest network after Cloud Hypervisor snapshot!");
     }
 
-    info!(snapshot = %snapshot_config.name, "CH VM resumed, finalizing snapshot");
+    let operation_result = snapshot_result.and(disk_copy_result);
+    if let Err(error) = combine_snapshot_boundary_results(
+        operation_result,
+        hypervisor_resume_result,
+        guest_network_resume_result,
+    ) {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(error);
+    }
+
+    info!(snapshot = %snapshot_config.name, "CH VM and guest network resumed, finalizing snapshot");
 
     // Write fcvm's metadata config.json, then atomically swap the dir into place.
     let temp_config_path = temp_snapshot_dir.join("config.json");
@@ -3507,6 +3832,21 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_boundary_error_preserves_operation_and_both_recovery_failures() {
+        let error = combine_snapshot_boundary_results(
+            Err(anyhow::anyhow!("snapshot save failed")),
+            Err(anyhow::anyhow!("hypervisor resume failed")),
+            Err(anyhow::anyhow!("guest network reopen failed")),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "snapshot save failed; additionally: hypervisor resume failed; additionally: guest network reopen failed"
+        );
+    }
+
+    #[test]
     fn verified_cleanup_checks_exact_process_identity_is_gone() {
         let pid = std::process::id();
         let start = crate::utils::process_start_time(pid).unwrap();
@@ -3516,6 +3856,77 @@ mod tests {
         verify_process_reaped("test", Some((pid, start + 1)))
             .expect("a reused PID with a different start time is not the owned process");
         verify_process_reaped("test", None).expect("an unstarted process owns no resource");
+    }
+
+    #[test]
+    fn snapshot_boundary_recovery_failure_fails_successful_operation() {
+        let error = combine_snapshot_boundary_results(
+            Ok(()),
+            Ok(()),
+            Err(anyhow::anyhow!("guest network reopen failed")),
+        )
+        .unwrap_err();
+
+        assert_eq!(format!("{error:#}"), "guest network reopen failed");
+    }
+
+    #[test]
+    fn snapshot_boundary_uses_exact_recorded_custom_vsock_path() {
+        let mut state = make_vm_state("vm-custom-vsock", None);
+        state.config.vsock_socket_path =
+            Some(std::path::PathBuf::from("/srv/custom-vsock/vsock.sock"));
+
+        assert_eq!(
+            recorded_vsock_socket_path(&state).unwrap(),
+            Path::new("/srv/custom-vsock/vsock.sock")
+        );
+
+        state.config.vsock_socket_path = None;
+        let error = recorded_vsock_socket_path(&state).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "running VM vm-custom-vsock has no recorded vsock socket path"
+        );
+
+        state.config.vsock_socket_path = Some(std::path::PathBuf::from("relative/vsock.sock"));
+        let error = recorded_vsock_socket_path(&state).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-absolute recorded vsock socket path"));
+    }
+
+    #[test]
+    fn restore_redirect_covers_exact_custom_vsock_source_directory() {
+        let mut dirs = vec![PathBuf::from("/runtime/source-vm")];
+        add_source_vsock_redirect_dir(&mut dirs, Path::new("/srv/dedicated-vsock/vsock.sock"))
+            .unwrap();
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/runtime/source-vm"),
+                PathBuf::from("/srv/dedicated-vsock")
+            ]
+        );
+
+        // Adding the conventional path again must not create two bind mounts
+        // onto the same directory.
+        add_source_vsock_redirect_dir(&mut dirs, Path::new("/runtime/source-vm/vsock.sock"))
+            .unwrap();
+        assert_eq!(dirs.len(), 2);
+    }
+
+    #[test]
+    fn restore_rejects_vsock_metadata_that_does_not_match_vmstate() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"prefix/srv/right/vsock.sock/suffix").unwrap();
+        assert_vmstate_vsock_source_matches(temp.path(), Path::new("/srv/right/vsock.sock"))
+            .unwrap();
+        let error =
+            assert_vmstate_vsock_source_matches(temp.path(), Path::new("/srv/wrong/vsock.sock"))
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not contain recorded source"));
     }
 
     /// A health monitor that ignores cooperative cancellation must still be gone before the
@@ -3620,6 +4031,12 @@ mod tests {
         state.config.username = Some("testuser".to_string());
         state.config.user = Some("1000:1000".to_string());
         state.config.original_vsock_vm_id = original_vsock.map(|s| s.to_string());
+        state.config.vsock_socket_path =
+            Some(PathBuf::from(format!("/runtime/{vm_id}/vsock.sock")));
+        state.config.source_vsock_socket_path = Some(PathBuf::from(format!(
+            "/runtime/{}/vsock.sock",
+            original_vsock.unwrap_or(vm_id)
+        )));
         state
     }
 
@@ -3809,7 +4226,8 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
-        );
+        )
+        .unwrap();
         assert_eq!(config.vm_id, "vm-AAA");
         assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
         assert_eq!(config.metadata.image, "nginx:alpine");
@@ -3831,10 +4249,33 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
-        );
+        )
+        .unwrap();
         assert_eq!(config.vm_id, "vm-BBB");
         // Critical: original_vsock_vm_id must be vm-AAA (the ORIGINAL), not vm-BBB
         assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
+    }
+
+    #[test]
+    fn snapshot_config_preserves_vmm_source_vsock_path_not_clone_listener() {
+        let mut state = make_vm_state("vm-clone", Some("vm-source"));
+        state.config.vsock_socket_path = Some(PathBuf::from("/runtime/vm-clone/vsock.sock"));
+        state.config.source_vsock_socket_path =
+            Some(PathBuf::from("/srv/custom-source/vsock.sock"));
+
+        let config = build_snapshot_config(
+            &state,
+            "grand-clone-source",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            config.source_vsock_socket_path,
+            PathBuf::from("/srv/custom-source/vsock.sock")
+        );
     }
 
     #[test]
@@ -3847,7 +4288,8 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
-        );
+        )
+        .unwrap();
         assert_eq!(config.vm_id, "vm-CCC");
         assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
         assert!(matches!(config.snapshot_type, SnapshotType::User));
@@ -3863,7 +4305,8 @@ mod tests {
             Path::new("/mnt/snap/key"),
             vec![],
             vec![],
-        );
+        )
+        .unwrap();
         assert_eq!(config.memory_path, Path::new("/mnt/snap/key/memory.bin"));
         assert_eq!(config.vmstate_path, Path::new("/mnt/snap/key/vmstate.bin"));
         assert_eq!(config.disk_path, Path::new("/mnt/snap/key/disk.raw"));
@@ -4020,7 +4463,8 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
-        );
+        )
+        .unwrap();
         assert!(config.parent_snapshot.is_none());
     }
 
@@ -4035,7 +4479,8 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
-        );
+        )
+        .unwrap();
         config.parent_snapshot = Some("pre-start-abc123".to_string());
 
         let json = serde_json::to_string(&config).unwrap();
@@ -4054,6 +4499,8 @@ mod tests {
             "name": "old-snap",
             "vm_id": "vm-OLD",
             "generation_id": "3f53da72-8c67-4ec7-8f3d-d25367129872",
+            "network_boundary_version": 1,
+            "source_vsock_socket_path": "/runtime/vm-OLD/vsock.sock",
             "memory_path": "/tmp/memory.bin",
             "vmstate_path": "/tmp/vmstate.bin",
             "disk_path": "/tmp/disk.raw",
@@ -4103,7 +4550,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let state = make_vm_state(vm_id, None);
             let mut config =
-                build_snapshot_config(&state, name, SnapshotType::System, &dir, vec![], vec![]);
+                build_snapshot_config(&state, name, SnapshotType::System, &dir, vec![], vec![])
+                    .unwrap();
             config.parent_snapshot = parent.map(|s| s.to_string());
             let json = serde_json::to_string_pretty(&config).unwrap();
             std::fs::write(dir.join("config.json"), &json).unwrap();
@@ -4236,5 +4684,35 @@ mod tests {
 
         // No disks array -> nothing to open, nothing uncovered.
         assert!(ch_config_uncovered_writable_disk(&json!({}), &[PathBuf::from("/data")]).is_none());
+    }
+
+    #[test]
+    fn test_ch_config_requires_exact_recorded_source_vsock_path() {
+        use serde_json::json;
+
+        let source = Path::new("/srv/source-vsock/vsock.sock");
+        let matching = json!({
+            "vsock": {
+                "cid": 3,
+                "socket": "/srv/source-vsock/vsock.sock"
+            }
+        });
+        assert_ch_config_vsock_source_matches(&matching, source).unwrap();
+
+        let stale = json!({
+            "vsock": {
+                "cid": 3,
+                "socket": "/runtime/default/vsock.sock"
+            }
+        });
+        let error = assert_ch_config_vsock_source_matches(&stale, source).unwrap_err();
+        assert!(error.to_string().contains("does not match recorded source"));
+        assert!(error.to_string().contains("/runtime/default/vsock.sock"));
+        assert!(error.to_string().contains("/srv/source-vsock/vsock.sock"));
+
+        for invalid in [json!({}), json!({ "vsock": null }), json!({ "vsock": {} })] {
+            let error = assert_ch_config_vsock_source_matches(&invalid, source).unwrap_err();
+            assert!(error.to_string().contains("has no vsock.socket"));
+        }
     }
 }

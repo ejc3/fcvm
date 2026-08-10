@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
@@ -22,7 +22,10 @@ pub(crate) use types::{RebootSpec, VolumeMapping};
 // ID even when the tag is rebuilt mid-export).
 pub use image::export_image_archive;
 
-pub(crate) use listeners::{run_output_listener, run_status_listener, spawn_bootplan_listener};
+pub(crate) use listeners::{
+    run_output_listener, run_status_listener, spawn_bootplan_listener,
+    spawn_restore_completion_listener,
+};
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
@@ -141,6 +144,17 @@ where
     Ok(config)
 }
 
+/// Resolve a custom vsock directory into the exact socket path that all
+/// launcher components and later snapshot commands will share.
+fn resolve_custom_vsock_socket_path(configured_dir: &Path, current_dir: &Path) -> PathBuf {
+    let absolute_dir = if configured_dir.is_absolute() {
+        configured_dir.to_path_buf()
+    } else {
+        current_dir.join(configured_dir)
+    };
+    absolute_dir.join("vsock.sock")
+}
+
 /// Start a VM with the given args. Returns a handle to the running VM.
 ///
 /// The VM event loop runs in a background task. The handle's `Drop` impl cancels
@@ -160,6 +174,10 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
     let vm_id = ctx.vm_id.clone();
     let name = ctx.vm_name.clone();
     let log_tx = ctx.log_tx.clone();
+    let Some(vsock_socket_path) = ctx.vm_state.config.vsock_socket_path.clone() else {
+        cleanup_vm_context(ctx).await;
+        anyhow::bail!("prepared VM has no recorded vsock socket path");
+    };
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
@@ -189,6 +207,7 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
         vm_id,
         name,
         pid: actual_pid,
+        vsock_socket_path,
         cancel,
         task: Some(task),
         log_tx,
@@ -1373,24 +1392,43 @@ async fn prepare_vm_for_lifecycle(
     // Firecracker binds to vsock.sock, VolumeServers listen on vsock.sock_{port}
     // Use custom vsock_dir if provided (for predictable socket paths)
     let vsock_socket_path = if let Some(ref vsock_dir) = args.vsock_dir {
-        let vsock_dir = std::path::PathBuf::from(vsock_dir);
-        if let Err(e) = tokio::fs::create_dir_all(&vsock_dir)
-            .await
-            .with_context(|| format!("creating vsock dir: {:?}", vsock_dir))
-        {
-            if let Err(cleanup_err) = network.cleanup().await {
-                warn!(
-                    "failed to cleanup network after setup error: {}",
-                    cleanup_err
-                );
-            }
-            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
-            return Err(e);
+        let resolved: Result<PathBuf> = async {
+            let configured = PathBuf::from(vsock_dir);
+            let current_dir =
+                std::env::current_dir().context("resolving current directory for --vsock-dir")?;
+            let socket_path = resolve_custom_vsock_socket_path(&configured, &current_dir);
+            let absolute_dir = socket_path
+                .parent()
+                .expect("a custom vsock socket path always has a parent");
+            tokio::fs::create_dir_all(absolute_dir)
+                .await
+                .with_context(|| format!("creating vsock dir: {:?}", absolute_dir))?;
+            Ok(socket_path)
         }
-        vsock_dir.join("vsock.sock")
+        .await;
+        match resolved {
+            Ok(path) => path,
+            Err(e) => {
+                if let Err(cleanup_err) = network.cleanup().await {
+                    warn!(
+                        "failed to cleanup network after setup error: {}",
+                        cleanup_err
+                    );
+                }
+                cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+                return Err(e);
+            }
+        }
     } else {
         data_dir.join("vsock.sock")
     };
+    // Snapshot control must connect to the socket the VMM actually bound. In
+    // particular, `--vsock-dir` deliberately places it outside `data_dir`, so
+    // reconstructing the path from vm_id would target the wrong socket.
+    vm_state.config.vsock_socket_path = Some(vsock_socket_path.clone());
+    // A cold-boot VMM embeds the same exact path it binds. Restored clones keep
+    // this source path from snapshot metadata while using a clone-local listener.
+    vm_state.config.source_vsock_socket_path = Some(vsock_socket_path.clone());
 
     // Build VolumeConfigs and spawn VolumeServers BEFORE the VM starts
     // Each VolumeServer listens on vsock.sock_{port} (e.g., vsock.sock_5000)
@@ -2758,12 +2796,14 @@ mod tests {
         let snapshot_dir = temp.path().join(snapshot_key);
         tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
 
-        let vm_state = VmState::new(
+        let mut vm_state = VmState::new(
             "vm-prepare-verify".to_string(),
             "alpine:latest".to_string(),
             1,
             512,
         );
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
         let mut config = super::super::common::build_snapshot_config(
             &vm_state,
             snapshot_key,
@@ -2771,7 +2811,8 @@ mod tests {
             &snapshot_dir,
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap();
         config.content_key = Some(snapshot_key.to_string());
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
@@ -2845,12 +2886,14 @@ mod tests {
     ) -> crate::storage::SnapshotConfig {
         let dir = root.join(name);
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let vm_state = VmState::new(
+        let mut vm_state = VmState::new(
             "vm-prepare-target".to_string(),
             "alpine:latest".to_string(),
             1,
             512,
         );
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
         let mut config = super::super::common::build_snapshot_config(
             &vm_state,
             name,
@@ -2858,7 +2901,8 @@ mod tests {
             &dir,
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap();
         config.content_key = content_key.map(str::to_string);
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
@@ -2995,7 +3039,10 @@ mod tests {
     /// default, reclaim only the content-addressed cache.
     #[test]
     fn a_default_prune_keeps_a_tagged_prepare_and_reclaims_an_untagged_one() {
-        let vm_state = VmState::new("vm-prune".to_string(), "alpine:latest".to_string(), 1, 512);
+        let mut vm_state =
+            VmState::new("vm-prune".to_string(), "alpine:latest".to_string(), 1, 512);
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
         let config_for = |target: &PreparedTarget| {
             super::super::common::build_snapshot_config(
                 &vm_state,
@@ -3005,6 +3052,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             )
+            .unwrap()
         };
 
         let tagged_config =
@@ -3042,12 +3090,14 @@ mod tests {
             let snapshot_dir = temp.join(snapshot_key);
             tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
 
-            let vm_state = VmState::new(
+            let mut vm_state = VmState::new(
                 "vm-prepare-parts".to_string(),
                 "alpine:latest".to_string(),
                 1,
                 512,
             );
+            vm_state.config.source_vsock_socket_path =
+                Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
             let mut config = super::super::common::build_snapshot_config(
                 &vm_state,
                 snapshot_key,
@@ -3055,7 +3105,8 @@ mod tests {
                 &snapshot_dir,
                 Vec::new(),
                 Vec::new(),
-            );
+            )
+            .unwrap();
             config.content_key = Some(snapshot_key.to_string());
             config.metadata.extra_disks = extra_disks;
             config.metadata.volumes = volumes;
@@ -3266,6 +3317,19 @@ mod tests {
             ExistingGeneration::Replace,
             false
         ));
+    }
+
+    #[test]
+    fn custom_vsock_path_is_absolute_and_stable_across_launcher_directories() {
+        let launcher_dir = Path::new("/work/launcher");
+        assert_eq!(
+            resolve_custom_vsock_socket_path(Path::new("relative-vsock"), launcher_dir),
+            Path::new("/work/launcher/relative-vsock/vsock.sock")
+        );
+        assert_eq!(
+            resolve_custom_vsock_socket_path(Path::new("/srv/vsock"), launcher_dir),
+            Path::new("/srv/vsock/vsock.sock")
+        );
     }
 
     #[tokio::test]

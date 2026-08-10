@@ -533,6 +533,125 @@ async fn test_clone_while_baseline_running_rootless() -> Result<()> {
     clone_while_baseline_running_impl("rootless").await
 }
 
+/// A custom source vsock path is embedded verbatim in Firecracker vmstate. The
+/// restore mount namespace must redirect that exact directory while the source
+/// remains live, and every host control path must use each VM's persisted actual
+/// listener rather than reconstructing `vm_runtime_dir/vsock.sock`.
+#[tokio::test]
+async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, serve_name) =
+        common::unique_names("custom-vsock-live");
+    let custom_dir = tempfile::Builder::new()
+        .prefix("fcvm-custom-vsock-")
+        .tempdir()
+        .context("creating unique custom vsock directory")?;
+    let custom_dir_arg = custom_dir.path().display().to_string();
+    let expected_source = custom_dir.path().join("vsock.sock");
+
+    let mut cleanup_pids = Vec::new();
+    let mut snapshot_created = false;
+    let result: Result<()> = async {
+        let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--vsock-dir",
+                &custom_dir_arg,
+                common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning custom-vsock source VM")?;
+        cleanup_pids.push(baseline_pid);
+        common::poll_health_by_pid(baseline_pid, 120).await?;
+
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+        snapshot_created = true;
+        let snapshot = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&snapshot_name)
+            .await?;
+        assert_eq!(snapshot.source_vsock_socket_path, expected_source);
+
+        let (_serve_child, serve_pid) =
+            common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_name)
+                .await?;
+        cleanup_pids.push(serve_pid);
+        common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+        let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid.to_string(),
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("restoring clone while custom-vsock source remains live")?;
+        cleanup_pids.push(clone_pid);
+        common::poll_health_by_pid(clone_pid, 120).await?;
+
+        let source_exec = common::exec_in_vm(baseline_pid, &["echo", "source-control-ok"])
+            .await
+            .context("exec on still-live custom-vsock source")?;
+        let clone_exec = common::exec_in_vm(clone_pid, &["echo", "clone-control-ok"])
+            .await
+            .context("exec on restored clone")?;
+        assert!(source_exec.contains("source-control-ok"), "{source_exec}");
+        assert!(clone_exec.contains("clone-control-ok"), "{clone_exec}");
+        common::poll_health_by_pid(baseline_pid, 30).await?;
+        common::poll_health_by_pid(clone_pid, 30).await?;
+
+        let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+        let source_state = states.load_state_by_pid(baseline_pid).await?;
+        let clone_state = states.load_state_by_pid(clone_pid).await?;
+        assert_eq!(
+            source_state.config.vsock_socket_path.as_deref(),
+            Some(expected_source.as_path())
+        );
+        assert_eq!(
+            clone_state.config.source_vsock_socket_path.as_deref(),
+            Some(expected_source.as_path()),
+            "grand-clone metadata must retain the custom vmstate source"
+        );
+        assert_ne!(
+            clone_state.config.vsock_socket_path, clone_state.config.source_vsock_socket_path,
+            "clone control listener must be clone-local"
+        );
+        Ok(())
+    }
+    .await;
+
+    for pid in cleanup_pids.into_iter().rev() {
+        common::kill_process(pid).await;
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "cleanup left PID {pid} alive"
+        );
+    }
+    if snapshot_created {
+        common::delete_snapshot(&snapshot_name).await?;
+        assert!(!common::snapshot_exists(&snapshot_name));
+    }
+    // Custom socket paths are outside the VM runtime tree, so clean their
+    // dedicated test directory explicitly after every owned process is reaped.
+    if custom_dir.path().exists() {
+        tokio::fs::remove_dir_all(custom_dir.path())
+            .await
+            .context("removing custom vsock test directory")?;
+    }
+
+    result
+}
+
 /// Test cloning while baseline VM is still running (bridged)
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]

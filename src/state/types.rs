@@ -145,12 +145,29 @@ pub struct VmConfig {
     /// memory backend — the two ends of the handshake must agree.
     #[serde(default)]
     pub uffd_mode: Option<String>,
-    /// Original VM ID for vsock socket path redirect.
+    /// Original VM lineage for restored snapshots and disk redirects.
     /// Set when VM is restored from cache or snapshot. The vmstate.bin stores
     /// paths from the original VM, so when this VM is later snapshotted, we need
-    /// to preserve this original_vm_id for clones to use the correct redirect.
+    /// to preserve this original_vm_id. Exact vsock redirection uses
+    /// `source_vsock_socket_path`, since the source may use `--vsock-dir`.
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
+    /// Actual host-side base socket used for this running VM's vsock device.
+    ///
+    /// This may live outside the per-VM runtime directory when `--vsock-dir`
+    /// is used. Snapshot control commands must use this recorded path instead
+    /// of reconstructing one from `vm_id`. Serve-only states have no VM vsock
+    /// and leave this as `None`.
+    #[serde(default)]
+    pub vsock_socket_path: Option<std::path::PathBuf>,
+    /// Exact vsock base path embedded in this VM's VMM snapshot state.
+    ///
+    /// For a cold boot this equals `vsock_socket_path`. A restored clone listens
+    /// on its clone-local `vsock_socket_path`, while its VMM state still names
+    /// the ancestor path; carrying that source path is required for grand-clone
+    /// mount redirection, especially when the ancestor used `--vsock-dir`.
+    #[serde(default)]
+    pub source_vsock_socket_path: Option<std::path::PathBuf>,
     /// Published port mappings (host:guest)
     #[serde(default)]
     pub port_mappings: Vec<PortMapping>,
@@ -247,6 +264,8 @@ impl VmState {
                 serve_pid: None,
                 uffd_mode: None,
                 original_vsock_vm_id: None,
+                vsock_socket_path: None,
+                source_vsock_socket_path: None,
                 port_mappings: Vec::new(),
                 forward_localhost: Vec::new(),
                 network_mode: crate::firecracker::FcNetworkMode::default(),
@@ -286,13 +305,43 @@ mod tests {
 
     #[test]
     fn test_vm_state_serialization() {
-        let state = VmState::new("vm-456".to_string(), "redis:alpine".to_string(), 1, 256);
+        let mut state = VmState::new("vm-456".to_string(), "redis:alpine".to_string(), 1, 256);
+        state.config.vsock_socket_path =
+            Some(std::path::PathBuf::from("/custom/vsock-dir/vsock.sock"));
+        state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/custom/vsock-dir/vsock.sock"));
 
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: VmState = serde_json::from_str(&json).unwrap();
 
         assert_eq!(state.vm_id, deserialized.vm_id);
         assert_eq!(state.config.image, deserialized.config.image);
+        assert_eq!(
+            deserialized.config.vsock_socket_path.as_deref(),
+            Some(std::path::Path::new("/custom/vsock-dir/vsock.sock")),
+            "the exact custom vsock path must survive state persistence"
+        );
+        assert_eq!(
+            deserialized.config.source_vsock_socket_path.as_deref(),
+            Some(std::path::Path::new("/custom/vsock-dir/vsock.sock")),
+            "the VMM-embedded source path must survive state persistence"
+        );
+
+        let mut old_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old_json["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("vsock_socket_path");
+        old_json["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_vsock_socket_path");
+        let old_state: VmState = serde_json::from_value(old_json).unwrap();
+        assert!(
+            old_state.config.vsock_socket_path.is_none(),
+            "states without a running-VM vsock path must fail closed at snapshot time"
+        );
+        assert!(old_state.config.source_vsock_socket_path.is_none());
     }
 
     #[test]

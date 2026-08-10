@@ -139,6 +139,8 @@ pub struct VmHandle {
     pub name: String,
     /// Process ID of the fcvm process managing this VM
     pub pid: u32,
+    /// Exact host socket bound for this VM, including a custom `--vsock-dir`.
+    pub(super) vsock_socket_path: PathBuf,
     pub(super) cancel: CancellationToken,
     pub(super) task: Option<tokio::task::JoinHandle<Result<Option<i32>>>>,
     pub(super) log_tx: tokio::sync::broadcast::Sender<LogLine>,
@@ -152,7 +154,7 @@ impl VmHandle {
 
     /// Get the vsock socket path for this VM (used for exec/terminal connections).
     pub fn vsock_socket_path(&self) -> PathBuf {
-        crate::paths::vm_runtime_dir(&self.vm_id).join("vsock.sock")
+        self.vsock_socket_path.clone()
     }
 
     /// Gracefully stop the VM and wait for cleanup to complete.
