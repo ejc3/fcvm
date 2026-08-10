@@ -21,6 +21,47 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The identity `make` must run as, when the harness itself is root.
+///
+/// The Host-Root CI legs run this whole test binary as root (their nextest
+/// runner is `sudo -E`), and the Makefile refuses root on the host: its guard
+/// exists so build plumbing can never leave root-owned files in `target/`.
+/// A bypass variable would disarm that guard for real users, so the harness
+/// instead runs `make` as the user sudo recorded — the identity the guard
+/// tells a person to use. Inside containers the guard already permits root
+/// and no drop happens.
+fn harness_user() -> Option<(u32, u32)> {
+    if unsafe { libc::geteuid() } != 0
+        || Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
+    {
+        return None;
+    }
+    let parse = |key: &str| -> Option<u32> { std::env::var(key).ok()?.parse().ok() };
+    match (parse("SUDO_UID"), parse("SUDO_GID")) {
+        (Some(uid), Some(gid)) => Some((uid, gid)),
+        _ => panic!(
+            "BLOCKED: running as root on a host with no SUDO_UID/SUDO_GID; the Makefile \
+             refuses root and the harness has no user to hand make to"
+        ),
+    }
+}
+
+/// Hand the scratch tree to the user `make` will run as, so the cargo stub
+/// can record into it.
+fn chown_tree(root: &Path, uid: u32, gid: u32) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+            .unwrap_or_else(|e| panic!("chown {}: {e}", path.display()));
+        if path.is_dir() {
+            for entry in fs::read_dir(&path).unwrap() {
+                stack.push(entry.unwrap().path());
+            }
+        }
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -412,6 +453,11 @@ impl<'a> Harness<'a> {
         if self.criterion_home_missing {
             cmd.env("BENCH_STUB_NO_OUTPUT", "1");
         }
+        if let Some((uid, gid)) = harness_user() {
+            use std::os::unix::process::CommandExt;
+            chown_tree(scratch.path(), uid, gid);
+            cmd.uid(uid).gid(gid);
+        }
 
         let out = cmd.output().expect("run make");
         let read = |f: &str| fs::read_to_string(rec.join(f)).unwrap_or_default();
@@ -450,6 +496,11 @@ fn bench_quick_passes_criterion_flags_after_the_cargo_separator() {
     let control = Command::new(&cargo)
         .current_dir(empty.path())
         .args(["bench", "--bench", "throughput", "--sample-size", "10"])
+        // CI exports CARGO_TERM_COLOR=always, and cargo then wraps the argument
+        // name in ANSI codes INSIDE the quotes — `'\x1b[1m\x1b[33m--sample-size...'`
+        // — which broke the substring match below on every CI leg while passing
+        // locally, where cargo sees a pipe and turns color off on its own.
+        .env("CARGO_TERM_COLOR", "never")
         .output()
         .expect("run cargo");
     let control_err = String::from_utf8_lossy(&control.stderr);
