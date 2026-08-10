@@ -693,6 +693,7 @@ impl PastaNetwork {
         }
 
         debug!(cmd = ?cmd, "pasta command");
+        let stderr_tail = self.begin_stderr_attempt();
         let mut child = cmd.spawn().context("failed to spawn pasta")?;
 
         // Stream pasta's stderr: log every line and keep a tail so error paths
@@ -700,7 +701,6 @@ impl PastaNetwork {
         // silently discarded and a dead pasta only surfaces later as an
         // unrelated bridge setup failure.
         if let Some(stderr) = child.stderr.take() {
-            let stderr_tail = Arc::clone(&self.stderr_tail);
             self.stderr_reader = Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -722,6 +722,23 @@ impl PastaNetwork {
         self.pid_file = Some(pid_file);
 
         Ok(())
+    }
+
+    /// Start an attempt-local stderr capture.
+    ///
+    /// A failed attempt's pipe reader can outlive the child (for example, when a
+    /// descendant inherited stderr). Merely clearing the shared deque leaves a
+    /// race where that old reader appends after the next attempt starts. Give
+    /// every attempt a distinct tail and cancel any reader we no longer own so
+    /// stale output is structurally unable to enter the current diagnostic.
+    fn begin_stderr_attempt(&mut self) -> Arc<Mutex<VecDeque<String>>> {
+        if let Some(previous_reader) = self.stderr_reader.take() {
+            previous_reader.abort();
+        }
+
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        self.stderr_tail = Arc::clone(&stderr_tail);
+        stderr_tail
     }
 
     /// Wait until pasta publishes its readiness PID file while supervising the
@@ -1484,6 +1501,35 @@ mod tests {
             message.contains("stderr written immediately before timeout kill"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn pasta_retry_stderr_isolated_from_late_previous_attempt_output() {
+        let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
+
+        let previous_attempt = net.begin_stderr_attempt();
+        previous_attempt
+            .lock()
+            .expect("previous stderr tail lock")
+            .push_back("previous attempt before retry".to_string());
+
+        let current_attempt = net.begin_stderr_attempt();
+        previous_attempt
+            .lock()
+            .expect("previous stderr tail lock")
+            .push_back("previous attempt after retry".to_string());
+        current_attempt
+            .lock()
+            .expect("current stderr tail lock")
+            .push_back("current attempt output".to_string());
+
+        let message = net.stderr_tail_message();
+        assert!(
+            !Arc::ptr_eq(&previous_attempt, &current_attempt),
+            "a retry must publish a fresh tail so a detached old reader cannot append to it"
+        );
+        assert!(message.contains("current attempt output"), "{message}");
+        assert!(!message.contains("previous attempt"), "{message}");
     }
 
     #[test]
