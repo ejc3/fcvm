@@ -111,11 +111,19 @@ fn readme_only_names_targets_that_exist() {
 /// Both shapes are worth publishing; they just have to be named. This keeps a
 /// bare `fuse_256_readers` case from creeping back in, since its name would
 /// claim to be the round trip while measuring the cache.
+///
+/// Naming is not enough on its own, so each round-trip case also has to carry
+/// the runtime check that it reaches the server. The first attempt at one did
+/// not: it walked a pool of 20,000 distinct files, which produces cold lookups
+/// only until the walk wraps, and nothing in it could tell whether it had.
 #[test]
 fn metadata_benchmarks_name_the_cache_they_measure() {
     let src = repo_file("fuse-pipe/benches/operations.rs");
 
-    for op in ["bench_getattr", "bench_lookup"] {
+    for (op, check) in [
+        ("bench_getattr", "assert_forced_getattr_reaches_server("),
+        ("bench_lookup", "assert_missing_lookup_reaches_server("),
+    ] {
         let start = src
             .find(&format!("fn {op}("))
             .unwrap_or_else(|| panic!("operations.rs has no {op}"));
@@ -124,20 +132,58 @@ fn metadata_benchmarks_name_the_cache_they_measure() {
         let body = &body[..end];
 
         assert!(
-            body.contains("_uncached"),
-            "{op} has no `_uncached` case, so nothing in it measures a FUSE round trip: a \
+            body.contains("_cache_hit"),
+            "{op} no longer names its cached case for the cache it measures"
+        );
+        assert!(
+            body.contains("_round_trip"),
+            "{op} has no `_round_trip` case, so nothing in it measures a FUSE round trip: a \
              repeated path is answered by the kernel's attribute/dentry cache"
         );
         assert!(
-            body.contains("pool_file("),
-            "{op}'s uncached case must walk the distinct-file pool; restating one path \
-             measures the cache no matter what the case is called"
+            body.contains(check),
+            "{op}'s round-trip case must call {check}..) first. A case that is merely named \
+             for the round trip and never checked is how the cached measurement got published \
+             the first time."
         );
         assert!(
             !body.contains("\"fuse_256_readers\""),
             "{op} still has a case named plainly `fuse_256_readers`. Name it for the cache \
-             it measures (`_attr_cache_hit` / `_dentry_cache_hit`) or make it uncached; an \
-             unqualified name reads as the round-trip cost and is off by ~100x."
+             it measures (`_attr_cache_hit` / `_dentry_cache_hit`) or make it a checked round \
+             trip; an unqualified name reads as the round-trip cost and is off by ~300x."
+        );
+    }
+}
+
+/// No metadata case may depend on a finite pool of distinct paths.
+///
+/// `sample_size` bounds criterion's samples, not its `iter` calls, so a pool
+/// sized against the sample count does not bound anything. Measured on the
+/// merged version at criterion's defaults, `single_op/getattr`:
+///
+///     fuse_256_readers_attr_cache_hit: 17M iterations   [297.38 ns .. 310.12 ns]
+///     fuse_256_readers_uncached:       20k iterations   [181.50 µs .. 465.15 µs]
+///
+/// 20,000 measurement iterations against a 20,000-file pool, on top of a
+/// warm-up phase that is untimed, uncounted and had already walked thousands of
+/// entries. The walk wraps. Whether a revisited inode is then still cached
+/// depends on how long one pass takes against the mount's 1s entry_timeout,
+/// which is a property of the host and the flags rather than of the benchmark.
+/// The case reports whatever blend it got without being able to say so, and
+/// 17M against 20k is the scale it degrades toward as more revisits land inside
+/// the timeout.
+///
+/// The replacements have no pool and no such dependence: a forced statx cannot
+/// be served from the attribute cache, and an absent name is never cached.
+#[test]
+fn metadata_benchmarks_cannot_wrap_a_fixed_pool() {
+    let src = repo_file("fuse-pipe/benches/operations.rs");
+    for banned in ["METADATA_POOL", "pool_file("] {
+        assert!(
+            !src.contains(banned),
+            "operations.rs is back on a fixed path pool ({banned}). A pool only produces cold \
+             metadata operations until it wraps, and criterion runs orders of magnitude more \
+             iterations than a pool can hold."
         );
     }
 }

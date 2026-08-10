@@ -80,8 +80,8 @@ Individual FUSE operation overhead (256 readers):
 
 | Operation | Host | FUSE | Overhead |
 |-----------|------|------|----------|
-| getattr | 791ns | 832ns | 1.05× |
-| lookup | 784ns | 832ns | 1.06× |
+| getattr, attribute-cache hit | 791ns | 832ns | 1.05× |
+| lookup, dentry-cache hit | 784ns | 832ns | 1.06× |
 | read 4KB | 853ns | 796ns | **0.93× (faster!)** |
 | write 4KB | 1.0µs | 119µs | 119× |
 | open+close | 1.4µs | 98µs | 68× |
@@ -90,7 +90,16 @@ Individual FUSE operation overhead (256 readers):
 
 **Observations**:
 - **Cached reads are faster** than host due to kernel page cache
-- **Metadata ops** (getattr, lookup) have ~5% overhead
+- **The first two rows never reach the server.** A FUSE mount defaults to a 1s
+  attr_timeout and entry_timeout, so restating one path is answered by the
+  kernel's own caches. This table used to call them "getattr" and "lookup" and
+  conclude that metadata operations cost ~5% more than the host, which is a
+  claim about fuse-pipe drawn from a measurement fuse-pipe took no part in. The
+  round trips are two to three orders of magnitude dearer: `make
+  bench-operations` reports them as
+  `single_op/getattr/fuse_256_readers_forced_round_trip` and
+  `single_op/lookup/fuse_256_readers_miss_round_trip`, each of which asserts it
+  reached the server before it measures anything.
 - **Mutating ops** (write, create) have significant overhead due to fsync
 
 ---

@@ -7,7 +7,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
@@ -46,29 +47,124 @@ fn setup_test_files(dir: &PathBuf) {
         let path = subdir.join(format!("file_{}.txt", i));
         fs::write(&path, format!("content {}", i)).unwrap();
     }
-
-    // Distinct files for the uncached metadata probes. Restating a path the
-    // kernel already has cached measures the cache, so those benchmarks walk
-    // this pool instead, and the pool is larger than any run's sample count so
-    // a single iteration never revisits an entry.
-    let pool = dir.join(METADATA_POOL_DIR);
-    fs::create_dir_all(&pool).unwrap();
-    for i in 0..METADATA_POOL_FILES {
-        fs::write(pool.join(format!("m_{i}.dat")), b"m").unwrap();
-    }
 }
 
-/// Directory holding the uncached-metadata file pool.
-const METADATA_POOL_DIR: &str = "metadata_pool";
+/// Name the lookup benchmarks resolve to get a server round trip. Nothing ever
+/// creates it.
+const MISSING_NAME: &str = "no_such_file.dat";
 
-/// How many distinct files the uncached metadata probes rotate through.
-const METADATA_POOL_FILES: usize = 20_000;
+/// `statx` on an open descriptor, forcing the filesystem to answer rather than
+/// the kernel's cached attributes. Returns the reported permission bits.
+///
+/// `AT_STATX_FORCE_SYNC` makes fuse's `getattr` inode operation call
+/// `fuse_do_getattr()` unconditionally instead of serving the cached
+/// attributes, and `AT_EMPTY_PATH` keeps name resolution out of the
+/// measurement entirely. One call is therefore one GETATTR round trip and
+/// nothing else. On a local filesystem the flag has nothing to revalidate
+/// against; the `host_fs_forced` control prices that case so the FUSE figure
+/// can be attributed to the round trip rather than to the flag.
+///
+/// The mode is returned rather than the size because fuse-pipe negotiates
+/// `FUSE_WRITEBACK_CACHE`, under which the kernel owns `i_size` for regular
+/// files and discards whatever size the server reports. Size therefore cannot
+/// witness a round trip; permission bits are copied straight out of every
+/// reply.
+fn forced_statx_mode(fd: RawFd) -> u16 {
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    let empty = b"\0";
+    let rc = unsafe {
+        libc::statx(
+            fd,
+            empty.as_ptr() as *const libc::c_char,
+            libc::AT_EMPTY_PATH | libc::AT_STATX_FORCE_SYNC,
+            libc::STATX_BASIC_STATS,
+            &mut stx,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "forced statx failed: {}",
+        std::io::Error::last_os_error()
+    );
+    stx.stx_mode & 0o7777
+}
 
-/// Nth file in the pool, wrapping. Callers pass a monotonically increasing
-/// counter, so consecutive iterations touch different inodes.
-fn pool_file(root: &std::path::Path, n: u64) -> PathBuf {
-    root.join(METADATA_POOL_DIR)
-        .join(format!("m_{}.dat", (n as usize) % METADATA_POOL_FILES))
+/// Prove, before publishing a number from it, that [`forced_statx_mode`] on a
+/// FUSE descriptor reaches the server on every call.
+///
+/// Chmod the backing file behind the mount's back, then read the mode back two
+/// ways. A plain stat still reports the old mode, because the mount's 1s
+/// attr_timeout has not elapsed; the forced stat must report the new one. The
+/// first half is what makes the second half meaningful: it shows the cache was
+/// live and would have hidden the change.
+///
+/// Without this the benchmark could quietly become the attribute-cache
+/// measurement it was written to replace, because an unhonoured
+/// `AT_STATX_FORCE_SYNC` looks exactly like a very fast FUSE.
+fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: RawFd) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let before = 0o644;
+    fs::set_permissions(backing, fs::Permissions::from_mode(before)).unwrap();
+    assert_eq!(
+        forced_statx_mode(fd) as u32,
+        before,
+        "the mount does not agree with the backing file even before anything is changed \
+         behind its back, so neither half of this check would mean anything"
+    );
+
+    let after = 0o600;
+    fs::set_permissions(backing, fs::Permissions::from_mode(after)).unwrap();
+
+    let cached = fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        cached,
+        before,
+        "a plain stat through {} already saw the out-of-band chmod, so the attribute cache is \
+         not in play here and the forced case proves nothing",
+        via_mount.display()
+    );
+
+    let forced = forced_statx_mode(fd) as u32;
+    assert_eq!(
+        forced, after,
+        "AT_STATX_FORCE_SYNC returned the cached mode, so this benchmark would measure the \
+         attribute cache rather than a GETATTR round trip"
+    );
+}
+
+/// Prove that resolving [`MISSING_NAME`] reaches the server on every call.
+///
+/// fuse only caches a negative dentry when the server answers with a zero
+/// nodeid and an entry timeout. fuse-pipe answers a miss with a plain ENOENT,
+/// so `fuse_lookup()` invalidates the entry instead of caching it and every
+/// resolution of an absent name is a fresh LOOKUP, with no pool of distinct
+/// paths to exhaust and no dependence on how many iterations criterion decides
+/// to run.
+///
+/// Checked rather than assumed: resolve a probe name, create it behind the
+/// mount's back, resolve again. A cached negative answer still reports it
+/// missing. The probe uses its own name so the positive dentry it leaves
+/// behind cannot bleed into the benchmark's.
+fn assert_missing_lookup_reaches_server(mount: &Path, backing: &Path) {
+    let probe = "negative_cache_probe.dat";
+    let via_mount = mount.join(probe);
+    let via_backing = backing.join(probe);
+
+    assert!(
+        !via_mount.exists(),
+        "{} must start absent for this check to mean anything",
+        via_mount.display()
+    );
+    fs::write(&via_backing, b"x").unwrap();
+    assert!(
+        via_mount.exists(),
+        "the mount still reports {} absent after it was created behind its back, so misses are \
+         answered from a cached negative dentry and the benchmark below would measure that cache",
+        via_mount.display()
+    );
+    fs::remove_file(&via_backing).unwrap();
 }
 
 fn cleanup(data_dir: &PathBuf, mount_dir: &PathBuf) {
@@ -102,6 +198,18 @@ fn bench_getattr(c: &mut Criterion) {
         })
     });
 
+    // Control for the forced case below: the identical call on a local
+    // filesystem, which has nothing to revalidate against and so answers from
+    // its in-core inode either way. It is not directly comparable to `host_fs`
+    // (no name to resolve, so it comes out lower), and it is not meant to be.
+    // Its job is to price the syscall and the flag on their own, so that the
+    // FUSE figure below can be read as the round trip rather than as the cost
+    // of asking synchronously.
+    let host_fd = File::open(&test_file).unwrap();
+    group.bench_function("host_fs_forced", |b| {
+        b.iter(|| forced_statx_mode(host_fd.as_raw_fd()))
+    });
+
     // FUSE with 256 readers (our recommended default)
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
     let fuse_file = fuse.mount_path().join("test.dat");
@@ -116,17 +224,20 @@ fn bench_getattr(c: &mut Criterion) {
         })
     });
 
-    // The round trip. Each iteration stats a file this mount has not seen, so
-    // the request reaches the server.
-    let pool_root = fuse.mount_path().to_path_buf();
-    let counter = AtomicU64::new(0);
-    group.bench_function("fuse_256_readers_uncached", |b| {
-        b.iter(|| {
-            let n = counter.fetch_add(1, Ordering::Relaxed);
-            let _ = fs::metadata(pool_file(&pool_root, n)).unwrap();
-        })
+    // The GETATTR round trip.
+    //
+    // Statting a path the mount has not seen does NOT measure this: pathname
+    // resolution sends a LOOKUP whose reply already carries attributes, so the
+    // stat is satisfied without a GETATTR ever being issued. That is a LOOKUP
+    // measurement, and it lives in `single_op/lookup`. Isolating GETATTR takes
+    // a descriptor (no name to resolve) plus a forced revalidation.
+    let fuse_fd = File::open(&fuse_file).unwrap();
+    assert_forced_getattr_reaches_server(&test_file, &fuse_file, fuse_fd.as_raw_fd());
+    group.bench_function("fuse_256_readers_forced_round_trip", |b| {
+        b.iter(|| forced_statx_mode(fuse_fd.as_raw_fd()))
     });
 
+    drop(fuse_fd);
     drop(fuse);
     group.finish();
     cleanup(&data_dir, &mount_dir);
@@ -152,6 +263,15 @@ fn bench_lookup(c: &mut Criterion) {
         })
     });
 
+    // Control for the miss case below: what resolving an absent name costs
+    // when there is no server to ask.
+    let host_missing = data_dir.join(MISSING_NAME);
+    group.bench_function("host_fs_miss", |b| {
+        b.iter(|| {
+            let _ = host_missing.exists();
+        })
+    });
+
     // FUSE
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
     let fuse_file = fuse.mount_path().join("test.dat");
@@ -164,12 +284,24 @@ fn bench_lookup(c: &mut Criterion) {
         })
     });
 
-    let pool_root = fuse.mount_path().to_path_buf();
-    let counter = AtomicU64::new(0);
-    group.bench_function("fuse_256_readers_uncached", |b| {
+    // The LOOKUP round trip, via a name that does not exist.
+    //
+    // A pool of distinct existing files also produces cold lookups, but only
+    // until the walk wraps, and sizing the pool against `sample_size` does not
+    // prevent that: `sample_size` bounds criterion's samples, not its `iter`
+    // calls. Measured at criterion's defaults, a 20,000-file pool got 20,000
+    // measurement iterations plus an untimed warm-up that had already walked
+    // thousands. Past the wrap, whether a revisited inode is still cached comes
+    // down to how long one pass takes against the 1s entry_timeout, which is a
+    // property of the host rather than of the benchmark, and the case cannot
+    // report which blend it measured. An absent name has no such dependence:
+    // fuse-pipe answers a miss with a plain ENOENT, which fuse does not cache,
+    // so iteration one and iteration ten million both reach the server.
+    assert_missing_lookup_reaches_server(fuse.mount_path(), &data_dir);
+    let fuse_missing = fuse.mount_path().join(MISSING_NAME);
+    group.bench_function("fuse_256_readers_miss_round_trip", |b| {
         b.iter(|| {
-            let n = counter.fetch_add(1, Ordering::Relaxed);
-            let _ = pool_file(&pool_root, n).exists();
+            let _ = fuse_missing.exists();
         })
     });
 
