@@ -152,6 +152,17 @@ the egress proxy. The host side of any port is a `{uds_path}_{port}` Unix socket
 next to `vsock.sock` — the same `{uds_path}_{port}` convention for both Firecracker
 and Cloud Hypervisor.
 
+### UFFD queue depth is not observable today, and one `read(2)` per fault is why
+
+`drain_events` (`src/uffd/server.rs`) pulls faults with `uffd.read_event()`, which is
+one `read(2)` per message, inside a loop bounded by `MAX_EVENTS_PER_BATCH` (128). So
+the batch bound is the only depth signal available, and it cannot distinguish "128
+queued" from "10,000 queued" — a saturated server looks the same as a busy one. The
+userfaultfd crate's `read_events(EventBuffer)` fills a buffer in a single `read(2)`
+and returns how many messages came back, which both cuts the syscall count under load
+and makes true queue depth histogrammable. Worth doing when UFFD serving is next on
+the critical path; nothing in the tree measures it now.
+
 ### fc-agent's 2 s optimistic-accept fallback is a mio artifact, not a vsock law
 
 `fc-agent/src/vsock.rs::accept()` wakes every 2 s to retry a non-blocking `accept4`,
