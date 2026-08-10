@@ -35,6 +35,28 @@ pub struct RebootSpec {
     pub bootplan_over_vsock: bool,
 }
 
+/// Where one `podman prepare` installs its startup snapshot, and what an already-installed
+/// generation there has to look like to answer for that invocation.
+///
+/// Resolved once during setup and carried on [`VmContext`] so the pre-boot cache check and
+/// the post-health install cannot disagree about the name, the type, or the content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedTarget {
+    /// Snapshot name the generation is installed under: the content-addressed key, or the
+    /// caller's `--tag`. Every consumer that takes a snapshot name addresses this.
+    pub name: String,
+    /// Content-addressed key whose content the generation must hold.
+    pub content_key: String,
+    /// `System` for the content-addressed cache entry, `User` for a `--tag` artifact.
+    pub snapshot_type: crate::storage::SnapshotType,
+    /// Whether a matching installed generation may be published without booting.
+    /// Cleared by `--force`.
+    pub publish_installed: bool,
+    /// What to do with a generation already installed at `name` once the disposable
+    /// source is healthy.
+    pub existing: super::ExistingGeneration,
+}
+
 /// All state accumulated during VM setup, bundled for the event loop and cleanup.
 pub struct VmContext {
     pub vm_id: String,
@@ -64,6 +86,8 @@ pub struct VmContext {
     /// snapshot path must send (or drop) before the monitor publishes Healthy.
     pub startup_rx: Option<oneshot::Receiver<crate::health::StartupSnapshotAck>>,
     pub snapshot_key: Option<String>,
+    /// Set only for the `podman prepare` lifecycle: where its startup snapshot goes.
+    pub prepare_target: Option<PreparedTarget>,
     pub volume_configs: Vec<VolumeConfig>,
     pub args: RunArgs,
     pub disk_path: PathBuf,

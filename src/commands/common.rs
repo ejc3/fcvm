@@ -2375,6 +2375,9 @@ pub fn build_snapshot_config(
         generation_id: uuid::Uuid::new_v4(),
         original_vsock_vm_id: Some(original_vsock_vm_id),
         parent_snapshot: None, // Set by create_snapshot_core after determining diff base
+        // Set by create_podman_snapshot, the only caller whose snapshot holds the
+        // content of a cache key. `snapshot create` captures a live VM, not a config.
+        content_key: None,
         memory_path: snapshot_dir.join("memory.bin"),
         vmstate_path: snapshot_dir.join("vmstate.bin"),
         disk_path: snapshot_dir.join("disk.raw"),

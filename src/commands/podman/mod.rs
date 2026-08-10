@@ -13,7 +13,7 @@ mod snapshot;
 mod types;
 mod vm_config;
 
-pub use types::{CacheRequest, LogLine, SnapshotOutcome, VmContext, VmHandle};
+pub use types::{CacheRequest, LogLine, PreparedTarget, SnapshotOutcome, VmContext, VmHandle};
 // Re-exported for the snapshot restore path's up-front reboot plan (a rebooted VM
 // relaunches in place via the same shared primitive, on every lifecycle path).
 pub(crate) use types::{RebootSpec, VolumeMapping};
@@ -27,7 +27,7 @@ pub(crate) use listeners::{run_output_listener, run_status_listener, spawn_bootp
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
-    CreateSnapshotParams, SnapshotInstall,
+    CreateSnapshotParams, ExistingGeneration, SnapshotInstall,
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
@@ -203,18 +203,32 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PodmanLifecycle {
     Run,
-    Prepare,
+    Prepare(PrepareOptions),
+}
+
+impl PodmanLifecycle {
+    fn is_prepare(&self) -> bool {
+        matches!(self, PodmanLifecycle::Prepare(_))
+    }
+}
+
+/// The two `podman prepare` arguments that decide where the startup snapshot is
+/// installed and whether an installed one is rebuilt.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PrepareOptions {
+    tag: Option<String>,
+    force: bool,
 }
 
 fn snapshot_source_disposition(
-    lifecycle: PodmanLifecycle,
+    lifecycle: &PodmanLifecycle,
 ) -> super::common::SnapshotSourceDisposition {
     match lifecycle {
         PodmanLifecycle::Run => super::common::SnapshotSourceDisposition::Resume,
-        PodmanLifecycle::Prepare => super::common::SnapshotSourceDisposition::LeavePaused,
+        PodmanLifecycle::Prepare(_) => super::common::SnapshotSourceDisposition::LeavePaused,
     }
 }
 
@@ -255,11 +269,83 @@ fn should_arm_startup_snapshot(
     skip_snapshot_creation: bool,
     has_snapshot_key: bool,
     has_explicit_http_health_check: bool,
-    lifecycle: PodmanLifecycle,
+    lifecycle: &PodmanLifecycle,
 ) -> bool {
     !skip_snapshot_creation
         && has_snapshot_key
-        && (lifecycle == PodmanLifecycle::Prepare || has_explicit_http_health_check)
+        && (lifecycle.is_prepare() || has_explicit_http_health_check)
+}
+
+/// Where one `podman prepare` invocation installs its startup snapshot, and what an
+/// already-installed generation there has to look like to answer for it.
+///
+/// The content-addressed key is the identity either way. `--tag` only chooses the name
+/// it is installed under, so a tag whose generation holds different content is a miss
+/// and gets rebuilt, exactly as a changed cache key would be.
+fn prepare_install_target(options: &PrepareOptions, content_key: &str) -> Result<PreparedTarget> {
+    let (name, snapshot_type) = match options.tag.as_deref() {
+        // A caller-named artifact. It is a User snapshot because that is what naming one
+        // is for: `snapshots prune` must not reclaim a golden snapshot out from under the
+        // caller that asked for it by name.
+        Some(tag) => {
+            crate::storage::validate_snapshot_name(tag).context("invalid --tag")?;
+            (tag.to_string(), crate::storage::SnapshotType::User)
+        }
+        // The content-addressed cache entry `podman run` would have built. Prunable.
+        None => (
+            content_key.to_string(),
+            crate::storage::SnapshotType::System,
+        ),
+    };
+    Ok(PreparedTarget {
+        // `--force` is the only thing that rebuilds content whose cache key did not
+        // change, which is what a repointed remote image reference does.
+        publish_installed: !options.force,
+        // Under the content-addressed key, an installed generation holds this same
+        // content, so losing that race is a result worth reusing. A caller-chosen name is
+        // only reached past `publish_installed` when it held nothing or held other
+        // content, and `--force` asks for a rebuild either way.
+        existing: if options.tag.is_some() || options.force {
+            ExistingGeneration::Replace
+        } else {
+            ExistingGeneration::Reuse
+        },
+        name,
+        content_key: content_key.to_string(),
+        snapshot_type,
+    })
+}
+
+/// Whether an installed generation is the one this invocation asked for.
+///
+/// Returns the reason it is not, for the log line that explains a rebuild.
+fn prepared_generation_mismatch(
+    config: &crate::storage::SnapshotConfig,
+    target: &PreparedTarget,
+) -> Option<String> {
+    if config.name != target.name {
+        return Some(format!(
+            "config names snapshot {} instead of {}",
+            config.name, target.name
+        ));
+    }
+    if config.content_key() != target.content_key {
+        return Some(format!(
+            "holds content {} instead of {}",
+            config.content_key(),
+            target.content_key
+        ));
+    }
+    if config.snapshot_type != target.snapshot_type {
+        return Some(format!(
+            "is a {} snapshot instead of a {} snapshot",
+            config.snapshot_type, target.snapshot_type
+        ));
+    }
+    if config.kind != crate::storage::SnapshotKind::Full {
+        return Some(format!("is a {} snapshot, not a full one", config.kind));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
@@ -273,7 +359,13 @@ enum PreparedCache {
 struct PreparedSnapshotOutput {
     status: &'static str,
     cache: PreparedCache,
+    /// Snapshot name every other command addresses this artifact by.
     snapshot_key: String,
+    /// Content-addressed key whose content it holds. Equal to `snapshot_key` without `--tag`.
+    content_key: String,
+    /// `user` for a `--tag` artifact `snapshots prune` keeps, `system` for a prunable
+    /// cache entry.
+    snapshot_type: String,
     generation_id: String,
     config_digest: String,
 }
@@ -292,17 +384,25 @@ enum VmPreparation {
 }
 
 async fn verify_prepared_snapshot(
-    snapshot_key: &str,
+    target: &PreparedTarget,
     cache: PreparedCache,
 ) -> Result<Option<PreparedSnapshot>> {
-    verify_prepared_snapshot_in(&paths::snapshot_dir(), snapshot_key, cache).await
+    verify_prepared_snapshot_in(&paths::snapshot_dir(), target, cache).await
 }
 
+/// Verify the generation installed at `target.name`.
+///
+/// `Ok(None)` means this invocation has nothing to publish: either nothing is installed
+/// there, or a caller-chosen name holds something else. Both are cache misses and the
+/// caller rebuilds. `Err` means the generation cannot be published and rebuilding it
+/// would not help: it is truncated, points outside itself, or sits at the
+/// content-addressed key while describing different content.
 async fn verify_prepared_snapshot_in(
     snapshot_root: &std::path::Path,
-    snapshot_key: &str,
+    target: &PreparedTarget,
     cache: PreparedCache,
 ) -> Result<Option<PreparedSnapshot>> {
+    let snapshot_key = target.name.as_str();
     let snapshot_dir = snapshot_root.join(snapshot_key);
     tokio::fs::create_dir_all(snapshot_root)
         .await
@@ -323,25 +423,28 @@ async fn verify_prepared_snapshot_in(
         .await
         .with_context(|| format!("loading prepared snapshot {snapshot_key}"))?;
 
-    anyhow::ensure!(
-        config.name == snapshot_key,
-        "prepared snapshot key mismatch: requested {}, config names {}",
-        snapshot_key,
-        config.name
-    );
+    if let Some(reason) = prepared_generation_mismatch(&config, target) {
+        // A caller-chosen name can legitimately hold anything, so a generation that is
+        // not this one is a miss and gets rebuilt. The content-addressed key cannot hold
+        // anything else by construction, so a mismatch there is a hand-edited or corrupt
+        // generation: say so now instead of after a ten-minute rebuild that then refuses
+        // to publish it. `--force` skips this check entirely and replaces it.
+        anyhow::ensure!(
+            target.name != target.content_key,
+            "prepared snapshot {} {}",
+            snapshot_key,
+            reason
+        );
+        info!(
+            snapshot_key = %snapshot_key,
+            reason = %reason,
+            "installed snapshot does not answer for these arguments; rebuilding"
+        );
+        return Ok(None);
+    }
     anyhow::ensure!(
         config.generation_id != uuid::Uuid::nil(),
         "prepared snapshot {} has a nil generation ID",
-        snapshot_key
-    );
-    anyhow::ensure!(
-        config.snapshot_type == crate::storage::SnapshotType::System,
-        "prepared snapshot {} is not a system cache snapshot",
-        snapshot_key
-    );
-    anyhow::ensure!(
-        config.kind == crate::storage::SnapshotKind::Full,
-        "prepared snapshot {} is not a full memory snapshot",
         snapshot_key
     );
 
@@ -426,6 +529,8 @@ async fn verify_prepared_snapshot_in(
             status: "prepared",
             cache,
             snapshot_key: snapshot_key.to_string(),
+            content_key: config.content_key().to_string(),
+            snapshot_type: config.snapshot_type.to_string(),
             generation_id: generation.generation_id().to_string(),
             config_digest: generation.config_digest_hex(),
         },
@@ -554,7 +659,7 @@ async fn prepare_vm_for_lifecycle(
         "Starting fcvm podman lifecycle"
     );
 
-    if lifecycle == PodmanLifecycle::Prepare {
+    if lifecycle.is_prepare() {
         validate_prepare_args(&args)?;
     }
 
@@ -756,9 +861,10 @@ async fn prepare_vm_for_lifecycle(
         // restored VM (no exec rebind / output reconnect). Forcing the transport is a
         // test/debug path with no need to populate the shared cache, so skip caching for it.
         || std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock");
-    let (fc_config, snapshot_key): (
+    let (fc_config, snapshot_key, prepare_target): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
+        Option<PreparedTarget>,
     ) = if !no_snapshot {
         let resolved_mode = resolve_image_mode(&args);
         let config = build_firecracker_config(
@@ -776,22 +882,30 @@ async fn prepare_vm_for_lifecycle(
         // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot
         let startup_key = startup_snapshot_key(&key);
 
-        if lifecycle == PodmanLifecycle::Prepare {
-            if let Some(prepared) =
-                verify_prepared_snapshot(&startup_key, PreparedCache::Hit).await?
+        let mut prepare_target = None;
+        if let PodmanLifecycle::Prepare(options) = &lifecycle {
+            let target = prepare_install_target(options, &startup_key)?;
+            if !target.publish_installed {
+                info!(
+                    snapshot_key = %target.name,
+                    content_key = %target.content_key,
+                    "Rebuilding prepared startup snapshot (--force)"
+                );
+            } else if let Some(prepared) =
+                verify_prepared_snapshot(&target, PreparedCache::Hit).await?
             {
                 info!(
-                    snapshot_key = %startup_key,
+                    snapshot_key = %target.name,
                     generation_id = %prepared.output.generation_id,
                     "Prepared startup snapshot hit"
                 );
                 return Ok(VmPreparation::Prepared(prepared));
             }
+            prepare_target = Some(target);
         }
 
         // Check for startup snapshot first (fully initialized application)
-        if lifecycle == PodmanLifecycle::Run && check_podman_snapshot(&startup_key).await.is_some()
-        {
+        if !lifecycle.is_prepare() && check_podman_snapshot(&startup_key).await.is_some() {
             info!(
                 snapshot_key = %startup_key,
                 image = %args.image,
@@ -829,7 +943,7 @@ async fn prepare_vm_for_lifecycle(
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
-        if lifecycle == PodmanLifecycle::Run && check_podman_snapshot(&key).await.is_some() {
+        if !lifecycle.is_prepare() && check_podman_snapshot(&key).await.is_some() {
             info!(
                 snapshot_key = %key,
                 image = %args.image,
@@ -871,7 +985,7 @@ async fn prepare_vm_for_lifecycle(
             image = %args.image,
             "Snapshot miss, will create snapshot after image load"
         );
-        (Some(config), Some(key))
+        (Some(config), Some(key), prepare_target)
     } else {
         if std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
@@ -881,7 +995,7 @@ async fn prepare_vm_for_lifecycle(
         } else {
             info!("Snapshot disabled via --no-snapshot flag");
         }
-        (None, None)
+        (None, None, None)
     };
 
     // Generate VM ID
@@ -1263,7 +1377,7 @@ async fn prepare_vm_for_lifecycle(
     let (cache_tx, cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
-    ) = if !skip_snapshot_creation && lifecycle == PodmanLifecycle::Run {
+    ) = if !skip_snapshot_creation && !lifecycle.is_prepare() {
         let (tx, rx) = mpsc::channel(1);
         (Some(tx), Some(rx))
     } else {
@@ -1282,7 +1396,7 @@ async fn prepare_vm_for_lifecycle(
         skip_snapshot_creation,
         snapshot_key.is_some(),
         args.health_check.is_some(),
-        lifecycle,
+        &lifecycle,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
@@ -1358,7 +1472,7 @@ async fn prepare_vm_for_lifecycle(
                 log_tx_clone,
                 reconnect,
                 non_blocking_output,
-                lifecycle == PodmanLifecycle::Run,
+                !lifecycle.is_prepare(),
                 None,
             )
             .await
@@ -1487,6 +1601,7 @@ async fn prepare_vm_for_lifecycle(
         cache_rx,
         startup_rx,
         snapshot_key,
+        prepare_target,
         volume_configs,
         args,
         disk_path,
@@ -1752,18 +1867,18 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         .as_any()
                         .downcast_ref::<FirecrackerBackend>()
                         .context("snapshot creation requires the Firecracker backend")?;
-                    let snap = CreateSnapshotParams {
-                        vm_manager: fc_backend,
-                        snapshot_key: key,
-                        vm_state: &ctx.vm_state,
-                        disk_path: &ctx.disk_path,
-                        volume_configs: &ctx.volume_configs,
-                        remap_refs: &ctx.volume_servers.remap_refs,
-                    };
+                    let snap = CreateSnapshotParams::cache_entry(
+                        fc_backend,
+                        key,
+                        &ctx.vm_state,
+                        &ctx.disk_path,
+                        &ctx.volume_configs,
+                        &ctx.volume_servers.remap_refs,
+                    );
                     match create_snapshot_interruptible(
                         &snap,
                         &cancel,
-                        snapshot_source_disposition(PodmanLifecycle::Run),
+                        snapshot_source_disposition(&PodmanLifecycle::Run),
                     )
                     .await
                     {
@@ -1852,19 +1967,19 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             .as_any()
                             .downcast_ref::<FirecrackerBackend>()
                             .context("snapshot creation requires the Firecracker backend")?;
-                        let snap = CreateSnapshotParams {
-                            vm_manager: fc_backend,
-                            snapshot_key: &startup_key,
-                            vm_state: &ctx.vm_state,
-                            disk_path: &ctx.disk_path,
-                            volume_configs: &ctx.volume_configs,
-                            remap_refs: &ctx.volume_servers.remap_refs,
-                        };
+                        let snap = CreateSnapshotParams::cache_entry(
+                            fc_backend,
+                            &startup_key,
+                            &ctx.vm_state,
+                            &ctx.disk_path,
+                            &ctx.volume_configs,
+                            &ctx.volume_servers.remap_refs,
+                        );
                         tokio::select! {
                             outcome = create_snapshot_interruptible(
                                 &snap,
                                 &cancel,
-                                snapshot_source_disposition(PodmanLifecycle::Run),
+                                snapshot_source_disposition(&PodmanLifecycle::Run),
                             ) => {
                                 match outcome {
                                     SnapshotOutcome::Interrupted => {
@@ -1950,6 +2065,7 @@ where
 /// optional HTTP health check retain exactly the same authority as a normal run.
 async fn run_prepare_loop(
     ctx: &mut VmContext,
+    lifecycle: &PodmanLifecycle,
     cancel: &CancellationToken,
 ) -> Result<PreparedSnapshot> {
     let startup_rx = ctx
@@ -1960,12 +2076,18 @@ async fn run_prepare_loop(
     let vm_exited = ctx.vm_manager.wait();
     let startup_ack = await_prepare_healthy(startup_rx, cancel, vm_exited).await?;
 
-    let base_key = ctx
-        .snapshot_key
-        .as_deref()
-        .context("prepare lifecycle has no content-addressed snapshot key")?;
-    let startup_key = startup_snapshot_key(base_key);
-    info!(snapshot_key = %startup_key, "Creating prepared startup snapshot (VM healthy)");
+    // Resolved before the boot, so the generation this installs is the one the pre-boot
+    // cache check looked for.
+    let target = ctx
+        .prepare_target
+        .clone()
+        .context("prepare lifecycle has no snapshot install target")?;
+    info!(
+        snapshot_key = %target.name,
+        content_key = %target.content_key,
+        snapshot_type = %target.snapshot_type,
+        "Creating prepared startup snapshot (VM healthy)"
+    );
 
     let fc_backend = ctx
         .vm_manager
@@ -1974,18 +2096,18 @@ async fn run_prepare_loop(
         .context("podman prepare requires the Firecracker backend")?;
     let snap = CreateSnapshotParams {
         vm_manager: fc_backend,
-        snapshot_key: &startup_key,
+        snapshot_key: &target.name,
+        content_key: &target.content_key,
+        snapshot_type: target.snapshot_type,
+        existing: target.existing,
         vm_state: &ctx.vm_state,
         disk_path: &ctx.disk_path,
         volume_configs: &ctx.volume_configs,
         remap_refs: &ctx.volume_servers.remap_refs,
     };
-    let install = snapshot::create_podman_snapshot(
-        &snap,
-        snapshot_source_disposition(PodmanLifecycle::Prepare),
-    )
-    .await
-    .with_context(|| format!("creating prepared startup snapshot {startup_key}"))?;
+    let install = snapshot::create_podman_snapshot(&snap, snapshot_source_disposition(lifecycle))
+        .await
+        .with_context(|| format!("creating prepared startup snapshot {}", target.name))?;
 
     if cancel.is_cancelled() {
         bail!("interrupted while creating prepared startup snapshot");
@@ -1997,12 +2119,12 @@ async fn run_prepare_loop(
         SnapshotInstall::Created => PreparedCache::Created,
         SnapshotInstall::Existing => PreparedCache::Hit,
     };
-    let prepared = verify_prepared_snapshot(&startup_key, cache)
+    let prepared = verify_prepared_snapshot(&target, cache)
         .await?
         .with_context(|| {
             format!(
-                "prepared startup snapshot {} disappeared after atomic installation",
-                startup_key
+                "prepared startup snapshot {} no longer names the generation this prepare installed",
+                target.name
             )
         })?;
 
@@ -2234,12 +2356,16 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 /// a VM. A miss boots one disposable source, waits for normal health, atomically installs a
 /// startup snapshot while leaving the source paused, reaps every host resource, then emits one
 /// JSON record while holding a shared lease on that exact generation.
-pub async fn cmd_podman_prepare(args: RunArgs) -> Result<()> {
+pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
     spawn_lifecycle_signal_handler(&lifecycle_gate, "cancelling podman prepare")?;
 
-    match prepare_vm_for_lifecycle(args, PodmanLifecycle::Prepare).await? {
+    let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
+        tag: args.tag,
+        force: args.force,
+    });
+    match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -2253,7 +2379,7 @@ pub async fn cmd_podman_prepare(args: RunArgs) -> Result<()> {
                 }
                 // The source is an implementation detail, not a runnable workload. Leave its
                 // lifecycle barrier unpublished so external commands cannot adopt/snapshot it.
-                run_prepare_loop(&mut ctx, &cancel).await
+                run_prepare_loop(&mut ctx, &lifecycle, &cancel).await
             }
             .await;
 
@@ -2390,14 +2516,18 @@ mod tests {
         assert_eq!(resolve_image_mode(&args), ImageMode::Btrfs);
     }
 
+    fn prepare_lifecycle() -> PodmanLifecycle {
+        PodmanLifecycle::Prepare(PrepareOptions::default())
+    }
+
     #[test]
     fn prepare_and_run_have_explicit_source_dispositions() {
         assert_eq!(
-            snapshot_source_disposition(PodmanLifecycle::Run),
+            snapshot_source_disposition(&PodmanLifecycle::Run),
             super::super::common::SnapshotSourceDisposition::Resume
         );
         assert_eq!(
-            snapshot_source_disposition(PodmanLifecycle::Prepare),
+            snapshot_source_disposition(&prepare_lifecycle()),
             super::super::common::SnapshotSourceDisposition::LeavePaused
         );
     }
@@ -2408,19 +2538,19 @@ mod tests {
             false,
             true,
             false,
-            PodmanLifecycle::Prepare
+            &prepare_lifecycle()
         ));
         assert!(!should_arm_startup_snapshot(
             false,
             true,
             false,
-            PodmanLifecycle::Run
+            &PodmanLifecycle::Run
         ));
         assert!(should_arm_startup_snapshot(
             false,
             true,
             true,
-            PodmanLifecycle::Run
+            &PodmanLifecycle::Run
         ));
     }
 
@@ -2580,7 +2710,7 @@ mod tests {
             1,
             512,
         );
-        let config = super::super::common::build_snapshot_config(
+        let mut config = super::super::common::build_snapshot_config(
             &vm_state,
             snapshot_key,
             crate::storage::SnapshotType::System,
@@ -2588,6 +2718,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
+        config.content_key = Some(snapshot_key.to_string());
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
         }
@@ -2598,11 +2729,11 @@ mod tests {
         .await
         .unwrap();
 
-        let prepared =
-            verify_prepared_snapshot_in(temp.path(), snapshot_key, PreparedCache::Created)
-                .await
-                .unwrap()
-                .expect("complete installed generation should verify");
+        let target = prepare_install_target(&PrepareOptions::default(), snapshot_key).unwrap();
+        let prepared = verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Created)
+            .await
+            .unwrap()
+            .expect("complete installed generation should verify");
         assert_eq!(prepared.output.status, "prepared");
         assert_eq!(prepared.output.cache, PreparedCache::Created);
         assert_eq!(prepared.output.snapshot_key, snapshot_key);
@@ -2631,16 +2762,308 @@ mod tests {
         drop(exclusive);
 
         tokio::fs::remove_file(&config.disk_path).await.unwrap();
-        let error = match verify_prepared_snapshot_in(temp.path(), snapshot_key, PreparedCache::Hit)
-            .await
-        {
-            Ok(_) => panic!("missing disk artifact must fail verification"),
-            Err(error) => error,
-        };
+        let error =
+            match verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit).await {
+                Ok(_) => panic!("missing disk artifact must fail verification"),
+                Err(error) => error,
+            };
         assert!(
             format!("{error:#}").contains("disk artifact"),
             "unexpected verification error: {error:#}"
         );
+    }
+
+    const CONTENT_KEY: &str = "0123456789ab-startup";
+
+    fn tagged(tag: &str) -> PrepareOptions {
+        PrepareOptions {
+            tag: Some(tag.to_string()),
+            force: false,
+        }
+    }
+
+    /// Write one installed generation to `root/<name>` and return its config.
+    async fn install_generation(
+        root: &std::path::Path,
+        name: &str,
+        content_key: Option<&str>,
+        snapshot_type: crate::storage::SnapshotType,
+    ) -> crate::storage::SnapshotConfig {
+        let dir = root.join(name);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let vm_state = VmState::new(
+            "vm-prepare-target".to_string(),
+            "alpine:latest".to_string(),
+            1,
+            512,
+        );
+        let mut config = super::super::common::build_snapshot_config(
+            &vm_state,
+            name,
+            snapshot_type,
+            &dir,
+            Vec::new(),
+            Vec::new(),
+        );
+        config.content_key = content_key.map(str::to_string);
+        for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
+            tokio::fs::write(path, b"durable-artifact").await.unwrap();
+        }
+        tokio::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .await
+        .unwrap();
+        config
+    }
+
+    /// `--tag` puts the artifact where `snapshot serve`, `snapshot run --snapshot`,
+    /// `snapshots ls` and `snapshots delete` already look: a snapshot directory named by
+    /// the caller, with `config.name` matching, exactly as `snapshot create --tag` writes it.
+    #[test]
+    fn a_tag_names_the_installed_snapshot_and_no_tag_uses_the_content_key() {
+        let untagged = prepare_install_target(&PrepareOptions::default(), CONTENT_KEY).unwrap();
+        assert_eq!(untagged.name, CONTENT_KEY);
+        assert_eq!(untagged.content_key, CONTENT_KEY);
+
+        let tagged = prepare_install_target(&tagged("cb-req-golden"), CONTENT_KEY).unwrap();
+        assert_eq!(tagged.name, "cb-req-golden");
+        assert_eq!(
+            tagged.content_key, CONTENT_KEY,
+            "the tag renames the artifact, it does not change what identifies its content"
+        );
+    }
+
+    /// The tag becomes a directory name, so it takes the same validation every other
+    /// snapshot name takes rather than a second, weaker rule.
+    #[test]
+    fn a_tag_that_is_not_a_valid_snapshot_name_is_rejected() {
+        for bad in ["../escape", "has space", "", "."] {
+            let error = prepare_install_target(&tagged(bad), CONTENT_KEY)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "invalid --tag", "tag {bad:?} was accepted");
+        }
+    }
+
+    /// The tag composes with the content-addressed cache instead of replacing it: the
+    /// generation under the tag answers only for the content it was built from.
+    #[tokio::test]
+    async fn a_tag_hits_only_for_the_content_it_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        install_generation(
+            temp.path(),
+            "cb-req-golden",
+            Some(CONTENT_KEY),
+            crate::storage::SnapshotType::User,
+        )
+        .await;
+
+        let matching = prepare_install_target(&tagged("cb-req-golden"), CONTENT_KEY).unwrap();
+        let hit = verify_prepared_snapshot_in(temp.path(), &matching, PreparedCache::Hit)
+            .await
+            .unwrap()
+            .expect("a tag holding this content is a hit");
+        assert_eq!(hit.output.snapshot_key, "cb-req-golden");
+        assert_eq!(hit.output.content_key, CONTENT_KEY);
+        assert_eq!(hit.output.snapshot_type, "user");
+        drop(hit);
+
+        // The image changed, so the cache key changed, so the tag is stale.
+        let other_content =
+            prepare_install_target(&tagged("cb-req-golden"), "ffffffffffff-startup").unwrap();
+        assert!(
+            verify_prepared_snapshot_in(temp.path(), &other_content, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .is_none(),
+            "a tag holding other content must be a miss so prepare rebuilds it"
+        );
+    }
+
+    /// The content-addressed key cannot hold another config's content, so a generation
+    /// there that does not match is corrupt. Report it instead of rebuilding for ten
+    /// minutes and then refusing to publish the result.
+    #[tokio::test]
+    async fn a_mismatch_at_the_content_addressed_key_is_an_error_not_a_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = install_generation(
+            temp.path(),
+            CONTENT_KEY,
+            Some(CONTENT_KEY),
+            crate::storage::SnapshotType::System,
+        )
+        .await;
+        config.kind = crate::storage::SnapshotKind::DiskOnly;
+        tokio::fs::write(
+            temp.path().join(CONTENT_KEY).join("config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let target = prepare_install_target(&PrepareOptions::default(), CONTENT_KEY).unwrap();
+        let error =
+            match verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit).await {
+                Ok(_) => panic!("a disk-only generation at the cache key cannot be published"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            format!("{error:#}"),
+            format!("prepared snapshot {CONTENT_KEY} is a disk-only snapshot, not a full one")
+        );
+    }
+
+    /// A generation installed under its own content-addressed key self-identifies, so the
+    /// cache entries that exist on disk today keep hitting without a migration.
+    #[tokio::test]
+    async fn a_generation_without_a_recorded_content_key_falls_back_to_its_name() {
+        let temp = tempfile::tempdir().unwrap();
+        install_generation(
+            temp.path(),
+            CONTENT_KEY,
+            None,
+            crate::storage::SnapshotType::System,
+        )
+        .await;
+
+        let target = prepare_install_target(&PrepareOptions::default(), CONTENT_KEY).unwrap();
+        let hit = verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
+            .await
+            .unwrap()
+            .expect("a pre-existing cache entry named by its key must still hit");
+        assert_eq!(hit.output.content_key, CONTENT_KEY);
+    }
+
+    /// A `podman prepare --tag` artifact and a `snapshot create --tag` artifact are the
+    /// same kind of thing, so `snapshots prune` has to treat them the same: keep both by
+    /// default, reclaim only the content-addressed cache.
+    #[test]
+    fn a_default_prune_keeps_a_tagged_prepare_and_reclaims_an_untagged_one() {
+        let vm_state = VmState::new("vm-prune".to_string(), "alpine:latest".to_string(), 1, 512);
+        let config_for = |target: &PreparedTarget| {
+            super::super::common::build_snapshot_config(
+                &vm_state,
+                &target.name,
+                target.snapshot_type,
+                std::path::Path::new("/snapshots"),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+
+        let tagged_config =
+            config_for(&prepare_install_target(&tagged("cb-req-golden"), CONTENT_KEY).unwrap());
+        let untagged_config =
+            config_for(&prepare_install_target(&PrepareOptions::default(), CONTENT_KEY).unwrap());
+
+        assert!(
+            !crate::commands::snapshots::prune_reclaims(&tagged_config, false, None),
+            "a golden snapshot must not evaporate on the next prune"
+        );
+        assert!(crate::commands::snapshots::prune_reclaims(
+            &untagged_config,
+            false,
+            None
+        ));
+        assert!(
+            crate::commands::snapshots::prune_reclaims(&tagged_config, true, None),
+            "--all still reclaims it"
+        );
+    }
+
+    /// A generation whose type does not match what this invocation would install is not a
+    /// hit: a `snapshot create` artifact sitting on the tag cannot be republished as if
+    /// `prepare` had built it.
+    #[tokio::test]
+    async fn a_tag_holding_a_snapshot_this_prepare_did_not_build_is_a_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        // `snapshot create --tag cb-req-golden` writes exactly this: User type, no content key.
+        install_generation(
+            temp.path(),
+            "cb-req-golden",
+            None,
+            crate::storage::SnapshotType::User,
+        )
+        .await;
+
+        let target = prepare_install_target(&tagged("cb-req-golden"), CONTENT_KEY).unwrap();
+        assert!(
+            verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            target.existing,
+            ExistingGeneration::Replace,
+            "and the rebuild must replace it rather than short-circuit on it"
+        );
+    }
+
+    /// `--force` has to defeat both short circuits, or an installed generation still wins:
+    /// the pre-boot cache check that publishes without booting, and the under-lock check
+    /// that reuses whatever is installed once the source is healthy.
+    #[test]
+    fn force_rebuilds_instead_of_reusing_an_installed_generation() {
+        for tag in [None, Some("cb-req-golden")] {
+            let forced = PrepareOptions {
+                tag: tag.map(str::to_string),
+                force: true,
+            };
+            let target = prepare_install_target(&forced, CONTENT_KEY).unwrap();
+            assert!(
+                !target.publish_installed,
+                "--force must not publish an installed generation (tag {tag:?})"
+            );
+            assert_eq!(
+                target.existing,
+                ExistingGeneration::Replace,
+                "--force must install over whatever is there (tag {tag:?})"
+            );
+        }
+
+        let unforced = prepare_install_target(&PrepareOptions::default(), CONTENT_KEY).unwrap();
+        assert!(unforced.publish_installed);
+        assert_eq!(
+            unforced.existing,
+            ExistingGeneration::Reuse,
+            "without --force the content-addressed key reuses what is installed"
+        );
+
+        let unforced_tag = prepare_install_target(&tagged("cb-req-golden"), CONTENT_KEY).unwrap();
+        assert!(
+            unforced_tag.publish_installed,
+            "a tag holding the right content still skips the boot"
+        );
+        assert_eq!(
+            unforced_tag.existing,
+            ExistingGeneration::Replace,
+            "a caller-chosen name is only reached past the hit check when it held \
+             nothing or held other content"
+        );
+    }
+
+    /// The install decision `create_podman_snapshot` makes under the generation lock.
+    #[test]
+    fn only_a_reuse_policy_keeps_a_generation_installed_by_another_process() {
+        assert!(snapshot::keeps_installed_generation(
+            ExistingGeneration::Reuse,
+            true
+        ));
+        assert!(!snapshot::keeps_installed_generation(
+            ExistingGeneration::Reuse,
+            false
+        ));
+        assert!(!snapshot::keeps_installed_generation(
+            ExistingGeneration::Replace,
+            true
+        ));
+        assert!(!snapshot::keeps_installed_generation(
+            ExistingGeneration::Replace,
+            false
+        ));
     }
 
     #[tokio::test]

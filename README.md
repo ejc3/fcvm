@@ -105,6 +105,29 @@ Snapshot a running VM and restore clones from it. Two modes: UFFD (memory server
 ./fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
 ```
 
+### Building a Snapshot Without Leaving a VM Behind
+
+`podman prepare` takes the same arguments as `podman run`, boots one disposable VM,
+waits for the container to report healthy, installs the startup snapshot, and reaps
+every host resource. It prints one JSON line and exits; there is no VM to clean up.
+
+```bash
+# Build (or verify) the snapshot, then address it by name
+./fcvm podman prepare --name golden --tag nginx-warm nginx:alpine
+{"status":"prepared","cache":"created","snapshot_key":"nginx-warm",
+ "content_key":"a1b2c3d4e5f6-startup","snapshot_type":"user",
+ "generation_id":"...","config_digest":"..."}
+
+./fcvm snapshot serve nginx-warm
+./fcvm snapshot run --pid <serve_pid> --name clone1
+```
+
+The snapshot is keyed by the content of the arguments. Change the image or the VM
+shape and the next `prepare` rebuilds; change the image behind a tag that keeps the
+same reference and use `--force`. Without `--tag` the snapshot is installed under its
+content key as cache, which `snapshots prune` reclaims; with `--tag` it is a user
+snapshot that survives a prune.
+
 ### Disk-Only (Cold-Boot) Clones
 
 `--disk-only` captures just the disk — no vCPU pause, no memory image. The guest
@@ -341,6 +364,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm setup` | Download kernel and create rootfs (5-10 min first run, then cached) |
 | `fcvm setup --cloud-hypervisor` | Build the Cloud Hypervisor backend binary (content-addressed, on demand) |
 | `fcvm podman run` | Run container in a microVM (backend selected with `--hypervisor`, default `firecracker`) |
+| `fcvm podman prepare` | Build and verify a startup snapshot, then reap the VM that produced it (`--tag`, `--force`) |
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm ls` | List running VMs (`--json` for JSON) |
 | `fcvm snapshot create` | Snapshot a running VM |

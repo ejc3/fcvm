@@ -324,6 +324,26 @@ async fn cmd_snapshots_delete(args: SnapshotsDeleteArgs) -> Result<()> {
     Ok(())
 }
 
+/// Whether `snapshots prune` reclaims this snapshot.
+///
+/// Without `--all` it reclaims only the content-addressed cache, which is what `System`
+/// means. Anything a caller named — `snapshot create --tag`, `podman prepare --tag` — is a
+/// `User` snapshot and survives, because a golden snapshot that took ten minutes to build
+/// must not disappear on the next prune.
+pub(crate) fn prune_reclaims(
+    config: &SnapshotConfig,
+    prune_all: bool,
+    image: Option<&str>,
+) -> bool {
+    if !prune_all && config.snapshot_type != SnapshotType::System {
+        return false;
+    }
+    match image {
+        Some(image) => config.metadata.image == image,
+        None => true,
+    }
+}
+
 /// Delete snapshots (system-only by default, or all with --all)
 async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
     let prune_all = args.all;
@@ -339,17 +359,9 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
 
     for name in snapshot_names {
         if let Ok(config) = snapshot_manager.load_snapshot(&name).await {
-            // Filter by type
-            if !prune_all && config.snapshot_type != SnapshotType::System {
-                continue;
+            if prune_reclaims(&config, prune_all, args.image.as_deref()) {
+                snapshots_to_delete.push((name, config));
             }
-            // Filter by image if specified
-            if let Some(ref image) = args.image {
-                if config.metadata.image != *image {
-                    continue;
-                }
-            }
-            snapshots_to_delete.push((name, config));
         }
     }
 
@@ -420,4 +432,47 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(snapshot_type: SnapshotType, image: &str) -> SnapshotConfig {
+        let mut vm_state =
+            crate::state::VmState::new("vm-prune".to_string(), image.to_string(), 1, 512);
+        vm_state.config.image = image.to_string();
+        crate::commands::common::build_snapshot_config(
+            &vm_state,
+            "snap",
+            snapshot_type,
+            std::path::Path::new("/snapshots/snap"),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn default_prune_reclaims_the_cache_and_keeps_named_snapshots() {
+        let cache = config(SnapshotType::System, "nginx:alpine");
+        let named = config(SnapshotType::User, "nginx:alpine");
+
+        assert!(prune_reclaims(&cache, false, None));
+        assert!(!prune_reclaims(&named, false, None));
+        assert!(prune_reclaims(&named, true, None));
+    }
+
+    #[test]
+    fn the_image_filter_applies_to_both_types() {
+        let cache = config(SnapshotType::System, "nginx:alpine");
+
+        assert!(prune_reclaims(&cache, false, Some("nginx:alpine")));
+        assert!(!prune_reclaims(&cache, false, Some("redis:7")));
+        // --all widens the type, not the image.
+        assert!(!prune_reclaims(
+            &config(SnapshotType::User, "nginx:alpine"),
+            true,
+            Some("redis:7")
+        ));
+    }
 }

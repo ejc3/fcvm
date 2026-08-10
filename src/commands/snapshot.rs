@@ -2492,14 +2492,14 @@ async fn cmd_snapshot_run_inner(
                             // The diff parent is resolved inside create_podman_snapshot under
                             // the per-VM snapshot lock (re-read from the state file), so a
                             // concurrent `fcvm snapshot create` cannot leave us with a stale base.
-                            let snap = CreateSnapshotParams {
-                                vm_manager: fc_backend,
-                                snapshot_key: &startup_key,
-                                vm_state: &vm_state,
-                                disk_path: &disk_path,
-                                volume_configs: &volume_configs,
-                                remap_refs: &volume_servers.remap_refs,
-                            };
+                            let snap = CreateSnapshotParams::cache_entry(
+                                fc_backend,
+                                &startup_key,
+                                &vm_state,
+                                &disk_path,
+                                &volume_configs,
+                                &volume_servers.remap_refs,
+                            );
                             tokio::select! {
                                 outcome = create_snapshot_interruptible(
                                     &snap,
