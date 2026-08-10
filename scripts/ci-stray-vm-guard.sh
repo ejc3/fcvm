@@ -54,17 +54,24 @@ new_temporary_file() {
 # waiting would recreate the guard hang this script exists to diagnose.
 capture_all_threads() {
 	local destination=$1
-	local raw scan_pid deadline rc
+	local raw scan_stderr scan_pid deadline rc line
 	raw=$(new_temporary_file) || return 1
+	scan_stderr=$(new_temporary_file) || return 1
 	printf 'TGID\tTID\tPPID\tSTATE\tTHREAD\n' >"$destination"
 
-	ps -eL -o pid= -o lwp= -o ppid= -o state= -o comm= >"$raw" &
+	# Do not let the scanner inherit the report pipe. If ps wedges in D state,
+	# SIGKILL remains pending and every inherited pipe writer stays open, making
+	# the workflow caller wait forever for EOF even after this guard exits.
+	ps -eL -o pid= -o lwp= -o ppid= -o state= -o comm= >"$raw" 2>"$scan_stderr" &
 	scan_pid=$!
 	deadline=$((SECONDS + SCAN_TIMEOUT_SECONDS))
 	while kill -0 "$scan_pid" 2>/dev/null; do
 		if [ "$SECONDS" -ge "$deadline" ]; then
 			kill -9 "$scan_pid" 2>/dev/null || true
 			disown "$scan_pid" 2>/dev/null || true
+			while IFS= read -r line || [ -n "$line" ]; do
+				printf 'process/thread scanner stderr: %s\n' "$line"
+			done <"$scan_stderr"
 			echo "process/thread scan timed out after ${SCAN_TIMEOUT_SECONDS}s"
 			return 124
 		fi
@@ -73,6 +80,9 @@ capture_all_threads() {
 
 	wait "$scan_pid"
 	rc=$?
+	while IFS= read -r line || [ -n "$line" ]; do
+		printf 'process/thread scanner stderr: %s\n' "$line"
+	done <"$scan_stderr"
 	if [ "$rc" -ne 0 ]; then
 		echo "process/thread scan failed with status ${rc}"
 		return "$rc"
