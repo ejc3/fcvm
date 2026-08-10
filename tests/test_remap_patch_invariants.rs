@@ -29,6 +29,46 @@ fn patch_text() -> String {
     repo_file("kernel/patches/0001-fuse-add-remap_file_range-support.patch")
 }
 
+fn added_fuse_remap_callback(patch: &str) -> String {
+    let added: Vec<&str> = patch
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with("+++") {
+                None
+            } else {
+                line.strip_prefix('+')
+            }
+        })
+        .collect();
+    let start = added
+        .iter()
+        .position(|line| line.starts_with("static loff_t fuse_remap_file_range("))
+        .expect("added fuse_remap_file_range callback is missing");
+    let end = added[start..]
+        .iter()
+        .position(|line| *line == "}")
+        .map(|offset| start + offset)
+        .expect("added fuse_remap_file_range callback is unterminated");
+    added[start..=end].join("\n")
+}
+
+fn toml_section<'a>(config: &'a str, name: &str) -> &'a str {
+    let marker = format!("[{name}]");
+    let start = config
+        .lines()
+        .position(|line| line == marker)
+        .unwrap_or_else(|| panic!("missing TOML section {marker}"));
+    let lines: Vec<&str> = config.lines().collect();
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.starts_with('['))
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+    let byte_start: usize = lines[..=start].iter().map(|line| line.len() + 1).sum();
+    let byte_end: usize = lines[..end].iter().map(|line| line.len() + 1).sum();
+    &config[byte_start.min(config.len())..byte_end.min(config.len())]
+}
+
 /// The clone length must be derived from the REQUEST, not from the 32-bit reply.
 #[test]
 fn remap_patch_derives_length_from_the_request_not_the_u32_reply() {
@@ -130,10 +170,11 @@ fn remap_patch_does_not_size_the_destination_from_outarg() {
 #[test]
 fn remap_patch_rejects_dedupe_before_preparation_or_mutation() {
     let patch = patch_text();
-    let reject = patch
+    let callback = added_fuse_remap_callback(&patch);
+    let reject = callback
         .find("if (remap_flags & REMAP_FILE_DEDUP)")
         .expect("remap patch must explicitly reject REMAP_FILE_DEDUP");
-    let prepare = patch
+    let prepare = callback
         .find("generic_remap_file_range_prep")
         .expect("remap patch must use generic remap preparation");
 
@@ -150,13 +191,14 @@ fn remap_patch_rejects_dedupe_before_preparation_or_mutation() {
 #[test]
 fn remap_patch_prepares_the_range_under_canonical_two_inode_locking() {
     let patch = patch_text();
-    let lock = patch
+    let callback = added_fuse_remap_callback(&patch);
+    let lock = callback
         .find("lock_two_nondirectories(inode_in, inode_out)")
         .expect("remap patch must acquire the canonical two-inode lock");
-    let prepare = patch
+    let prepare = callback
         .find("generic_remap_file_range_prep(file_in, pos_in, file_out, pos_out,")
         .expect("remap patch must prepare and validate the caller's range");
-    let unlock = patch
+    let unlock = callback
         .find("unlock_two_nondirectories(inode_in, inode_out)")
         .expect("remap patch must release the canonical two-inode lock");
 
@@ -165,16 +207,45 @@ fn remap_patch_prepares_the_range_under_canonical_two_inode_locking() {
         "generic remap preparation must run while both inodes are locked"
     );
     assert!(
-        patch[prepare..unlock].contains("&len, remap_flags)"),
+        callback[prepare..unlock].contains("&len, remap_flags)"),
         "generic remap preparation must be allowed to adjust the concrete request length"
     );
     assert!(
-        !patch.lines().any(|line| {
-            line.starts_with('+')
-                && (line.contains("inode_lock(inode_in)") || line.contains("inode_lock(inode_out)"))
+        !callback.lines().any(|line| {
+            line.contains("inode_lock(inode_in)") || line.contains("inode_lock(inode_out)")
         }),
         "separate source/destination inode locks leave a source-change race; use \
          lock_two_nondirectories()"
+    );
+}
+
+/// Removed lines and added code outside the callback must not satisfy its
+/// semantic guards.
+#[test]
+fn added_remap_callback_scope_excludes_diff_decoys() {
+    let synthetic = r#"--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+-if (remap_flags & REMAP_FILE_DEDUP)
++static loff_t fuse_remap_file_range(void)
++{
++	return 0;
++}
++static void unrelated(void)
++{
++	lock_two_nondirectories(inode_in, inode_out);
++	generic_remap_file_range_prep(file_in, pos_in, file_out, pos_out, &len, remap_flags);
++	unlock_two_nondirectories(inode_in, inode_out);
++}
+"#;
+    let callback = added_fuse_remap_callback(synthetic);
+
+    assert!(
+        !callback.contains("REMAP_FILE_DEDUP"),
+        "removed lines must not satisfy callback semantic checks"
+    );
+    assert!(
+        !callback.contains("lock_two_nondirectories"),
+        "unrelated added functions must not satisfy callback semantic checks"
     );
 }
 
@@ -241,4 +312,21 @@ fn deployable_kernel_profiles_do_not_pin_eol_7_0_14() {
         !config.contains("kernel_version = \"7.0.14\""),
         "rootfs-config.toml still pins deployable profiles to EOL Linux 7.0.14"
     );
+
+    for profile in [
+        "kernel_profiles.nested.arm64",
+        "kernel_profiles.nested.arm64.host_kernel",
+        "kernel_profiles.nested.amd64",
+        "kernel_profiles.nested.amd64.host_kernel",
+        "kernel_profiles.btrfs.arm64",
+        "kernel_profiles.btrfs.amd64",
+    ] {
+        let section = toml_section(&config, profile);
+        assert!(
+            section
+                .lines()
+                .any(|line| line.trim() == "kernel_version = \"7.1.7\""),
+            "deployable profile [{profile}] must pin exact supported Linux 7.1.7"
+        );
+    }
 }

@@ -64,15 +64,13 @@ impl ImageCacheMount {
 /// L1 runs its nested fcvm process as root, so callers mount this directory at
 /// `/root/.config/fcvm` instead of letting L2 reopen a shared host config.
 fn active_fcvm_config_dir() -> std::path::PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|home| home.join(".config"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("/root/.config"))
-        .join("fcvm")
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(config_home).join("fcvm")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home).join(".config/fcvm")
+    } else {
+        std::path::PathBuf::from("/tmp/fcvm-config")
+    }
 }
 
 #[tokio::test]

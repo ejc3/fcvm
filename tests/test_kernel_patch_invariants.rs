@@ -161,3 +161,30 @@ fn kernel_patch_commands_do_not_mask_profile_lookup_failures() {
         "all four kernel-patch command flows must resolve patches_dir separately"
     );
 }
+
+/// A helper invoked from a checked command substitution runs in a context
+/// where `set -e` does not stop its body. Propagate the architecture lookup
+/// explicitly so an unsupported architecture cannot fall through to a
+/// different profile or patch directory.
+#[test]
+fn kernel_patch_helpers_propagate_architecture_lookup_failures() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", script_path.display()));
+
+    assert_eq!(
+        script
+            .matches("config_arch=$(get_config_arch) || return 1")
+            .count(),
+        2,
+        "both kernel-version and patch-directory helpers must return when architecture resolution fails"
+    );
+    assert_eq!(
+        script
+            .lines()
+            .filter(|line| line.trim() == "config_arch=$(get_config_arch)")
+            .count(),
+        0,
+        "a bare architecture assignment can continue with an empty architecture when the caller checks the helper status"
+    );
+}

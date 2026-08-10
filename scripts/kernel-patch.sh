@@ -54,7 +54,7 @@ get_kernel_version() {
         error "Config file not found: $config_file"
     fi
 
-    config_arch=$(get_config_arch)
+    config_arch=$(get_config_arch) || return 1
 
     # Match the exact architecture-specific TOML section. Treating the section
     # name as a grep regex makes its brackets a character class and silently
@@ -86,7 +86,7 @@ get_patches_dir() {
         error "Config file not found: $config_file"
     fi
 
-    config_arch=$(get_config_arch)
+    config_arch=$(get_config_arch) || return 1
 
     # A profile may name its own patches_dir, and the Rust build reads it
     # (src/setup/kernel.rs). This helper has to agree, or it edits and validates
