@@ -693,6 +693,7 @@ impl PastaNetwork {
         }
 
         debug!(cmd = ?cmd, "pasta command");
+        let stderr_tail = self.begin_stderr_attempt();
         let mut child = cmd.spawn().context("failed to spawn pasta")?;
 
         // Stream pasta's stderr: log every line and keep a tail so error paths
@@ -700,7 +701,6 @@ impl PastaNetwork {
         // silently discarded and a dead pasta only surfaces later as an
         // unrelated bridge setup failure.
         if let Some(stderr) = child.stderr.take() {
-            let stderr_tail = Arc::clone(&self.stderr_tail);
             self.stderr_reader = Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -715,7 +715,46 @@ impl PastaNetwork {
             }));
         }
 
-        // Wait for the PID file to appear (pasta writes it once ready).
+        self.wait_for_pid_file(&mut child, &pid_file, &mut pid_file_watch)
+            .await?;
+
+        self.pasta_process = Some(child);
+        self.pid_file = Some(pid_file);
+
+        Ok(())
+    }
+
+    /// Start an attempt-local stderr capture.
+    ///
+    /// A failed attempt's pipe reader can outlive the child (for example, when a
+    /// descendant inherited stderr). Merely clearing the shared deque leaves a
+    /// race where that old reader appends after the next attempt starts. Give
+    /// every attempt a distinct tail and cancel any reader we no longer own so
+    /// stale output is structurally unable to enter the current diagnostic.
+    fn begin_stderr_attempt(&mut self) -> Arc<Mutex<VecDeque<String>>> {
+        if let Some(previous_reader) = self.stderr_reader.take() {
+            previous_reader.abort();
+        }
+
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        self.stderr_tail = Arc::clone(&stderr_tail);
+        stderr_tail
+    }
+
+    /// Wait until pasta publishes its readiness PID file while supervising the
+    /// child and retaining a bounded polling fallback.
+    ///
+    /// The event source is a narrow injection boundary for deterministic tests;
+    /// production passes the inotify watch registered before pasta was spawned.
+    async fn wait_for_pid_file<E>(
+        &mut self,
+        child: &mut Child,
+        pid_file: &std::path::Path,
+        pid_file_events: &mut E,
+    ) -> Result<()>
+    where
+        E: crate::utils::DirEventSource,
+    {
         // Event-driven: the inotify watch registered before spawn wakes us the
         // instant the file lands (the old 50ms poll noticed a +2.3ms file at
         // +52.8ms on every rootless clone). pasta death interrupts the wait via
@@ -726,7 +765,7 @@ impl PastaNetwork {
         loop {
             if pid_file.exists() {
                 info!("pasta ready (PID file created)");
-                break;
+                return Ok(());
             }
 
             tokio::select! {
@@ -748,7 +787,7 @@ impl PastaNetwork {
                         Err(e) => anyhow::bail!("failed to check pasta status: {}", e),
                     }
                 }
-                event = crate::utils::DirWatch::next_event_opt(&mut pid_file_watch) => {
+                event = pid_file_events.next_event() => {
                     // Filesystem activity in the data dir — loop re-checks the
                     // PID file. A watch error degrades to the safety tick.
                     if event.is_err() {
@@ -757,6 +796,13 @@ impl PastaNetwork {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let _ = child.kill().await;
+                    // kill() reaped the child and closed its pipe; wait for the
+                    // reader to drain it before rendering the diagnostic tail.
+                    crate::utils::wait_for_stderr_eof(
+                        &mut self.stderr_reader,
+                        PASTA_STDERR_EOF_TIMEOUT,
+                    )
+                    .await;
                     anyhow::bail!(
                         "pasta did not become ready within {:?}{}",
                         PASTA_READY_TIMEOUT,
@@ -768,11 +814,6 @@ impl PastaNetwork {
                 }
             }
         }
-
-        self.pasta_process = Some(child);
-        self.pid_file = Some(pid_file);
-
-        Ok(())
     }
 
     /// Render the captured pasta stderr tail for error messages.
@@ -1250,6 +1291,246 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::{DirEventSource, ProcessWatch};
+    use std::future::{poll_fn, Future};
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    enum EventStep {
+        Wake,
+        ReadError,
+    }
+
+    struct PublishingEvents {
+        pid_file: PathBuf,
+        steps: VecDeque<EventStep>,
+        calls: usize,
+    }
+
+    impl PublishingEvents {
+        fn new(pid_file: PathBuf, steps: impl IntoIterator<Item = EventStep>) -> Self {
+            Self {
+                pid_file,
+                steps: steps.into_iter().collect(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl DirEventSource for PublishingEvents {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn next_event(&mut self) -> anyhow::Result<()> {
+            self.calls += 1;
+            let step = self.steps.pop_front().expect("event script exhausted");
+            let pid_file = self.pid_file.clone();
+            std::fs::write(pid_file, b"123\n").expect("publish pasta PID file");
+            match step {
+                EventStep::Wake => Ok(()),
+                EventStep::ReadError => Err(anyhow::anyhow!("injected inotify read failure")),
+            }
+        }
+    }
+
+    fn live_child() -> Child {
+        let mut command = Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.spawn().expect("spawn live child")
+    }
+
+    async fn assert_pending_once<F>(mut future: Pin<&mut F>)
+    where
+        F: Future,
+    {
+        poll_fn(|cx| match future.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("future completed before its required signal"),
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pid_file_event_queued_after_check_wakes_without_clock_fallback() {
+        let dir = tempfile::tempdir().expect("create PID-file directory");
+        let pid_file = dir.path().join("pasta.pid");
+        let mut events = PublishingEvents::new(pid_file.clone(), [EventStep::Wake]);
+        let mut child = live_child();
+        let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
+        let before = tokio::time::Instant::now();
+
+        net.wait_for_pid_file(&mut child, &pid_file, &mut events)
+            .await
+            .expect("queued PID-file event should trigger a condition recheck");
+
+        assert_eq!(events.calls, 1);
+        assert_eq!(tokio::time::Instant::now(), before, "safety tick fired");
+        child.kill().await.expect("stop live child");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pid_file_unavailable_watch_uses_safety_tick_fallback() {
+        let dir = tempfile::tempdir().expect("create PID-file directory");
+        let pid_file = dir.path().join("pasta.pid");
+        let publish_path = pid_file.clone();
+        let mut no_watch = None::<crate::utils::DirWatch>;
+        let mut child = live_child();
+        let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
+        let before = tokio::time::Instant::now();
+
+        let wait = net.wait_for_pid_file(&mut child, &pid_file, &mut no_watch);
+        let publish = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            std::fs::write(publish_path, b"123\n").expect("publish pasta PID file");
+        };
+        let (result, ()) = tokio::join!(wait, publish);
+        result.expect("safety tick should recheck without inotify");
+
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            std::time::Duration::from_millis(250)
+        );
+        child.kill().await.expect("stop live child");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pid_file_inotify_read_error_uses_poll_fallback() {
+        let dir = tempfile::tempdir().expect("create PID-file directory");
+        let pid_file = dir.path().join("pasta.pid");
+        let mut events = PublishingEvents::new(pid_file.clone(), [EventStep::ReadError]);
+        let mut child = live_child();
+        let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
+        let before = tokio::time::Instant::now();
+
+        net.wait_for_pid_file(&mut child, &pid_file, &mut events)
+            .await
+            .expect("watch read failure should degrade to polling");
+
+        assert_eq!(events.calls, 1);
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            std::time::Duration::from_millis(50)
+        );
+        child.kill().await.expect("stop live child");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pid_file_child_exit_waits_for_complete_stderr() {
+        let dir = tempfile::tempdir().expect("create PID-file directory");
+        let pid_file = dir.path().join("pasta.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 17")
+            .spawn()
+            .expect("spawn exited child");
+        let status = child.wait().await.expect("reap exited child");
+        assert_eq!(status.code(), Some(17));
+
+        let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let (release_reader_tx, release_reader_rx) = tokio::sync::oneshot::channel();
+        let stderr_tail = Arc::clone(&net.stderr_tail);
+        net.stderr_reader = Some(tokio::spawn(async move {
+            let _ = reader_started_tx.send(());
+            let _ = release_reader_rx.await;
+            stderr_tail
+                .lock()
+                .expect("stderr tail lock")
+                .push_back("final pasta stderr".to_string());
+        }));
+        reader_started_rx.await.expect("stderr reader parked");
+
+        let mut no_watch = None::<crate::utils::DirWatch>;
+        let mut wait = Box::pin(net.wait_for_pid_file(&mut child, &pid_file, &mut no_watch));
+        assert_pending_once(wait.as_mut()).await;
+        release_reader_tx.send(()).expect("release stderr reader");
+        let err = wait.await.expect_err("exited pasta cannot become ready");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("status: exit status: 17"), "{message}");
+        assert!(message.contains("final pasta stderr"), "{message}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pid_file_timeout_waits_for_complete_stderr() {
+        let dir = tempfile::tempdir().expect("create PID-file directory");
+        let pid_file = dir.path().join("pasta.pid");
+        let mut no_watch = None::<crate::utils::DirWatch>;
+        let mut child = live_child();
+        let child_pid = child.id().expect("live child PID");
+        let mut child_exit = ProcessWatch::open(child_pid)
+            .expect("open child pidfd")
+            .expect("child remains alive");
+
+        let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let (release_reader_tx, release_reader_rx) = tokio::sync::oneshot::channel();
+        let stderr_tail = Arc::clone(&net.stderr_tail);
+        net.stderr_reader = Some(tokio::spawn(async move {
+            let _ = reader_started_tx.send(());
+            let _ = release_reader_rx.await;
+            stderr_tail
+                .lock()
+                .expect("stderr tail lock")
+                .push_back("stderr written immediately before timeout kill".to_string());
+        }));
+        reader_started_rx.await.expect("stderr reader parked");
+
+        let mut wait = Box::pin(net.wait_for_pid_file(&mut child, &pid_file, &mut no_watch));
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(PASTA_READY_TIMEOUT).await;
+        // Drive the deadline arm far enough to signal the child, then use the
+        // pidfd edge instead of sleeping/retrying for process exit.
+        assert_pending_once(wait.as_mut()).await;
+        child_exit.exited().await;
+
+        // Even after kill/reap completes, the diagnostic must remain blocked on
+        // the stderr EOF reader. This assertion is red if the timeout branch
+        // formats the tail immediately after `child.kill()`.
+        assert_pending_once(wait.as_mut()).await;
+        release_reader_tx.send(()).expect("release stderr reader");
+        let err = wait.await.expect_err("missing PID file must time out");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("did not become ready"), "{message}");
+        assert!(
+            message.contains("stderr written immediately before timeout kill"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn pasta_retry_stderr_isolated_from_late_previous_attempt_output() {
+        let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
+
+        let previous_attempt = net.begin_stderr_attempt();
+        previous_attempt
+            .lock()
+            .expect("previous stderr tail lock")
+            .push_back("previous attempt before retry".to_string());
+
+        let current_attempt = net.begin_stderr_attempt();
+        previous_attempt
+            .lock()
+            .expect("previous stderr tail lock")
+            .push_back("previous attempt after retry".to_string());
+        current_attempt
+            .lock()
+            .expect("current stderr tail lock")
+            .push_back("current attempt output".to_string());
+
+        let message = net.stderr_tail_message();
+        assert!(
+            !Arc::ptr_eq(&previous_attempt, &current_attempt),
+            "a retry must publish a fresh tail so a detached old reader cannot append to it"
+        );
+        assert!(message.contains("current attempt output"), "{message}");
+        assert!(!message.contains("previous attempt"), "{message}");
+    }
 
     #[test]
     fn test_network_creation() {

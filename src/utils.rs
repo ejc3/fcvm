@@ -52,17 +52,6 @@ impl DirWatch {
         Ok(Self { async_fd, inotify })
     }
 
-    /// [`next_event`](Self::next_event) over an optional watch: a `None` watch
-    /// (inotify init failed — e.g. `fs.inotify.max_user_instances` exhausted by
-    /// many concurrent fcvm processes) never completes, so a `select!` caller
-    /// degrades to its safety-tick/deadline arms instead of failing hard.
-    pub async fn next_event_opt(watch: &mut Option<Self>) -> anyhow::Result<()> {
-        match watch {
-            Some(w) => w.next_event().await,
-            None => std::future::pending().await,
-        }
-    }
-
     /// Wait until at least one filesystem event has been consumed.
     ///
     /// Drains everything currently queued (the event batch is only a wakeup —
@@ -82,6 +71,32 @@ impl DirWatch {
                 }
                 Err(e) => return Err(anyhow::anyhow!("reading inotify events: {e}")),
             }
+        }
+    }
+}
+
+/// Filesystem-event source used by readiness loops.
+///
+/// Keeping the wait loops generic over this tiny boundary lets their rare
+/// inotify-unavailable and inotify-read-error paths be driven deterministically
+/// in unit tests. Production uses `Option<DirWatch>`: `None` is an unavailable
+/// watch whose event future never resolves, leaving the caller's safety tick and
+/// deadline as the correctness path.
+pub(crate) trait DirEventSource {
+    fn is_available(&self) -> bool;
+
+    async fn next_event(&mut self) -> anyhow::Result<()>;
+}
+
+impl DirEventSource for Option<DirWatch> {
+    fn is_available(&self) -> bool {
+        self.is_some()
+    }
+
+    async fn next_event(&mut self) -> anyhow::Result<()> {
+        match self {
+            Some(watch) => watch.next_event().await,
+            None => std::future::pending().await,
         }
     }
 }
@@ -330,10 +345,14 @@ pub async fn wait_for_stderr_eof(
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     timeout: Duration,
 ) {
-    let Some(handle) = reader.take() else {
+    let Some(mut handle) = reader.take() else {
         return;
     };
-    if tokio::time::timeout(timeout, handle).await.is_err() {
+    if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+        // Timing out must also stop the reader: dropping a JoinHandle only
+        // detaches the task, which would leave it consuming the pipe (and
+        // logging under this attempt's context) while the next attempt runs.
+        handle.abort();
         warn!(
             timeout_ms = timeout.as_millis() as u64,
             "stderr pipe did not reach EOF within the bound; error output may be truncated"
@@ -764,6 +783,23 @@ pub fn install_namespace_pre_exec(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn dir_watch_consumes_event_queued_between_check_and_park() {
+        let dir = tempfile::tempdir().expect("create watched directory");
+        let appeared = dir.path().join("appeared");
+        let mut watch = DirWatch::new(dir.path()).expect("register directory watch");
+
+        // This is the readiness-loop ordering: watch first, condition check,
+        // then the producer wins immediately before `next_event()` is polled.
+        assert!(!appeared.exists());
+        std::fs::write(&appeared, b"ready").expect("publish watched file");
+
+        tokio::time::timeout(Duration::from_secs(1), watch.next_event())
+            .await
+            .expect("queued inotify event was lost")
+            .expect("consume queued inotify event");
+    }
+
     #[test]
     fn test_is_process_alive_current_process() {
         // Current process should always be alive
@@ -832,5 +868,38 @@ mod tests {
     #[test]
     fn test_strip_firecracker_prefix_plain() {
         assert_eq!(strip_firecracker_prefix("plain message"), "plain message");
+    }
+
+    #[tokio::test]
+    async fn stderr_eof_timeout_aborts_the_reader() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A reader whose pipe never reaches EOF: the sender side stays held,
+        // standing in for a grandchild that inherited the write end.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_in_task = reads.clone();
+        let mut reader = Some(tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                reads_in_task.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        // The channel is still open, so this must take the timeout path.
+        wait_for_stderr_eof(&mut reader, Duration::from_millis(50)).await;
+        assert!(reader.is_none(), "the handle must be taken either way");
+
+        // The timed-out reader must be aborted, not detached: data arriving
+        // after the bound must never be consumed under the old attempt's
+        // context. Detached (the bug), the still-live task consumes the send
+        // immediately; aborted, its receiver is gone and the send just fails.
+        let _ = tx.send(1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "stderr reader survived its EOF timeout and kept consuming the pipe"
+        );
     }
 }

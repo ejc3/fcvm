@@ -1,103 +1,233 @@
 #!/usr/bin/env bash
-# Report and reap stray microVM processes on a self-hosted runner.
+# Report and reap stray microVM process groups on a self-hosted runner.
 #
-# Self-hosted runners are reused forever, so anything a job leaves behind is inherited by
-# every later job on that box. In August 2026 two ARM runners wedged for 21 hours with ~498
-# live `firecracker` processes (load average 523, 103 tasks in D-state, 420 zombies) that had
-# accumulated silently across runs — nothing in any job log ever mentioned them.
+# The guard deliberately reads only the process/thread identity fields exposed by
+# `ps`: TGID, TID, PPID, state, and thread name. In particular it never asks procfs
+# for argv/cmdline: reading /proc/<pid>/cmdline can block behind a wedged mm and made
+# the diagnostic guard itself hang after the ARM KVM failure in August 2026.
 #
-# This is defense in depth, NOT the fix: the leak itself is fixed by the kernel-enforced
-# PR_SET_PDEATHSIG chain (scripts/root-test-runner.sh, src/utils.rs::install_namespace_pre_exec).
-# It also acts only at job BOUNDARIES, so it cannot stop a host that wedges mid-job — that
-# remediation belongs on the AWS side (terminate and replace the instance).
-# Run this at the start of a job (what the previous job left) and at the end (what this job
-# left). Either way the count lands in the job log and, when non-zero, in a GitHub annotation.
+# Every thread in a matching task group is reported. A zombie leader is harmless
+# only when every sibling thread is also a zombie; a D-state vCPU sibling still owns
+# live KVM/MM resources and makes the whole group actionable.
 #
 # Usage: ci-stray-vm-guard.sh <pre|post> [--dry-run]
 #
-#   --dry-run  report only, kill nothing. The default mode SIGKILLs every match, which is
-#              correct on a dedicated CI runner and destructive anywhere else — use this to
-#              exercise the script on a shared dev box, where the matches are someone's
-#              running VMs, not garbage.
+#   --dry-run  report only, kill nothing. The default SIGKILL behavior is intended
+#              only for dedicated CI runners.
 set -uo pipefail
 
 PHASE="${1:-post}"
 DRY_RUN=0
 [ "${2:-}" = "--dry-run" ] && DRY_RUN=1
 
-# `comm` is the executable basename truncated to 15 chars, so the content-addressed
-# `firecracker-default-<sha>.bin` shows up as `firecracker-def`. Matching on comm (not the
-# full argv) means this can never match a grep/ps/pgrep of its own patterns.
-STRAY_RE='^(firecracker|cloud-hypervisor|fcvm)'
+SCAN_TIMEOUT_SECONDS="${FCVM_GUARD_SCAN_TIMEOUT_SECONDS:-10}"
+LOG_DIR="${FCVM_TEST_LOG_DIR:-/tmp/fcvm-test-logs}"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+	LOG_DIR="/tmp/fcvm-test-logs"
+	mkdir -p "$LOG_DIR"
+fi
 
-# Zombies are EXCLUDED ($4 is stat; Z may carry modifiers like `Z+`). A zombie is already
-# dead — it holds no memory, no KVM fd and no vCPU thread, only a process-table slot until
-# its parent reaps it. It is therefore not a leaked microVM, and more importantly it can
-# never be killed: SIGKILL to a zombie is a no-op, so counting them would put them in
-# SURVIVORS forever and fire the "survived SIGKILL, this runner needs a reboot" annotation
-# on every run. The 2026-08-06 incident had 420 zombies alongside the real leak, so this is
-# the difference between a signal and a permanent false alarm.
-list_strays() {
-	ps -eo pid=,ppid=,etimes=,stat=,comm=,args= |
-		awk -v re="$STRAY_RE" '$5 ~ re && $4 !~ /^Z/ { print }'
+REPORT="$LOG_DIR/stray-vm-guard-${PHASE}.log"
+THREADS_BEFORE="$LOG_DIR/stray-vm-threads-${PHASE}-before.tsv"
+THREADS_AFTER="$LOG_DIR/stray-vm-threads-${PHASE}-after.tsv"
+: >"$REPORT"
+: >"$THREADS_BEFORE"
+: >"$THREADS_AFTER"
+exec > >(tee -a "$REPORT") 2>&1
+
+# Linux comm is limited to 15 bytes. `cloud-hypervisor` is therefore observed as
+# `cloud-hypervis`; the prefix intentionally covers both that and the full spelling.
+STRAY_RE='^(firecracker|cloud-hypervis|fcvm)'
+
+TEMPORARY_PREFIX="$LOG_DIR/.stray-vm-guard.$$"
+cleanup_temporary_files() {
+	rm -f -- "${TEMPORARY_PREFIX}".*
+}
+trap cleanup_temporary_files EXIT
+
+new_temporary_file() {
+	mktemp "${TEMPORARY_PREFIX}.XXXXXX"
 }
 
-# Counted and reported, never killed: a high zombie count is a symptom worth seeing (it means
-# something is not reaping its children) but it is not actionable by this script.
-count_zombies() {
-	ps -eo stat=,comm= | awk -v re="$STRAY_RE" '$2 ~ re && $1 ~ /^Z/' | wc -l
+# Capture one process-table snapshot behind a hard deadline. We do not wait for a
+# timed-out reader after SIGKILL: if the kernel has already parked it in D state,
+# waiting would recreate the guard hang this script exists to diagnose.
+capture_all_threads() {
+	local destination=$1
+	local raw scan_stderr scan_pid deadline rc line
+	raw=$(new_temporary_file) || return 1
+	scan_stderr=$(new_temporary_file) || return 1
+	printf 'TGID\tTID\tPPID\tSTATE\tTHREAD\n' >"$destination"
+
+	# Do not let the scanner inherit the report pipe. If ps wedges in D state,
+	# SIGKILL remains pending and every inherited pipe writer stays open, making
+	# the workflow caller wait forever for EOF even after this guard exits.
+	ps -eL -o pid= -o lwp= -o ppid= -o state= -o comm= >"$raw" 2>"$scan_stderr" &
+	scan_pid=$!
+	deadline=$((SECONDS + SCAN_TIMEOUT_SECONDS))
+	while kill -0 "$scan_pid" 2>/dev/null; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			kill -9 "$scan_pid" 2>/dev/null || true
+			disown "$scan_pid" 2>/dev/null || true
+			while IFS= read -r line || [ -n "$line" ]; do
+				printf 'process/thread scanner stderr: %s\n' "$line"
+			done <"$scan_stderr"
+			echo "process/thread scan timed out after ${SCAN_TIMEOUT_SECONDS}s"
+			return 124
+		fi
+		sleep 0.05
+	done
+
+	wait "$scan_pid"
+	rc=$?
+	while IFS= read -r line || [ -n "$line" ]; do
+		printf 'process/thread scanner stderr: %s\n' "$line"
+	done <"$scan_stderr"
+	if [ "$rc" -ne 0 ]; then
+		echo "process/thread scan failed with status ${rc}"
+		return "$rc"
+	fi
+
+	# Normalize the variable-width comm column to a tab-separated artifact. Thread
+	# names can contain spaces, so fields 5..NF are joined back together.
+	awk '
+		BEGIN { OFS = "\t" }
+		NF >= 5 {
+			thread = $5
+			for (i = 6; i <= NF; i++)
+				thread = thread " " $i
+			print $1, $2, $3, $4, thread
+		}
+	' "$raw" >>"$destination"
 }
 
-mapfile -t STRAYS < <(list_strays)
-COUNT=${#STRAYS[@]}
-ZOMBIES=$(count_zombies)
-[ "$ZOMBIES" -gt 0 ] && echo "note (${PHASE}): ignoring ${ZOMBIES} unreaped zombie(s) — already dead, hold no resources, cannot be killed"
+# Select complete task groups whose leader name is a VM process. Outputs one TGID
+# per live group and one per zombie-only group; the thread artifact always contains
+# every sibling, including the zombie leader itself.
+select_vm_groups() {
+	local all_threads=$1
+	local selected_threads=$2
+	local live_groups=$3
+	local zombie_groups=$4
 
-echo "=== stray microVM guard (${PHASE}): ${COUNT} stray process(es) ==="
+	awk -F '\t' -v re="$STRAY_RE" \
+		-v selected="$selected_threads" \
+		-v live_out="$live_groups" \
+		-v zombie_out="$zombie_groups" '
+		BEGIN { OFS = "\t" }
+		NR == 1 { header = $0; next }
+		{
+			rows[++count] = $0
+			tgid[count] = $1
+			if ($1 == $2 && $5 ~ re)
+				target[$1] = 1
+			if ($4 !~ /^Z/)
+				live[$1] = 1
+		}
+		END {
+			print header > selected
+			for (i = 1; i <= count; i++)
+				if (tgid[i] in target)
+					print rows[i] >> selected
+			for (id in target) {
+				if (live[id])
+					print id > live_out
+				else
+					print id > zombie_out
+			}
+		}
+	' "$all_threads"
+}
+
+print_thread_table() {
+	local table=$1
+	printf '%8s %8s %8s %-5s %s\n' TGID TID PPID STATE THREAD
+	while IFS=$'\t' read -r tgid tid ppid state thread; do
+		[ "$tgid" = "TGID" ] && continue
+		printf '%8s %8s %8s %-5s %s\n' "$tgid" "$tid" "$ppid" "$state" "$thread"
+	done <"$table"
+}
+
+scan_vm_groups() {
+	local selected=$1
+	local live=$2
+	local zombies=$3
+	local all
+	all=$(new_temporary_file) || return 1
+	: >"$live"
+	: >"$zombies"
+	if ! capture_all_threads "$all"; then
+		# Preserve a syntactically useful artifact even when enumeration failed.
+		printf 'TGID\tTID\tPPID\tSTATE\tTHREAD\n' >"$selected"
+		return 1
+	fi
+	select_vm_groups "$all" "$selected" "$live" "$zombies"
+}
+
+LIVE_BEFORE=$(new_temporary_file)
+ZOMBIE_BEFORE=$(new_temporary_file)
+if ! scan_vm_groups "$THREADS_BEFORE" "$LIVE_BEFORE" "$ZOMBIE_BEFORE"; then
+	echo "=== stray microVM guard (${PHASE}): scan incomplete ==="
+	echo "::warning title=Stray microVM scan incomplete (${PHASE})::Process enumeration timed out or failed; no destructive cleanup attempted. Diagnostics were saved to ${LOG_DIR}."
+	[ -n "${GITHUB_STEP_SUMMARY:-}" ] &&
+		echo "- stray microVM guard (${PHASE}): scan incomplete; diagnostics saved" >>"$GITHUB_STEP_SUMMARY"
+	exit 0
+fi
+
+mapfile -t STRAY_TGIDS <"$LIVE_BEFORE"
+mapfile -t ZOMBIE_TGIDS <"$ZOMBIE_BEFORE"
+COUNT=${#STRAY_TGIDS[@]}
+ZOMBIES=${#ZOMBIE_TGIDS[@]}
+
+[ "$ZOMBIES" -gt 0 ] &&
+	echo "note (${PHASE}): ignoring ${ZOMBIES} zombie-only process group(s); every thread is already dead"
+
+echo "=== stray microVM guard (${PHASE}): ${COUNT} stray process group(s) ==="
 
 if [ "$COUNT" -eq 0 ]; then
-	echo "✓ no stray fcvm/firecracker/cloud-hypervisor processes"
+	echo "✓ no live fcvm/firecracker/cloud-hypervisor process groups"
 	[ -n "${GITHUB_STEP_SUMMARY:-}" ] &&
-		echo "- stray microVM guard (${PHASE}): 0" >>"$GITHUB_STEP_SUMMARY"
+		echo "- stray microVM guard (${PHASE}): 0; zombie-only groups ${ZOMBIES}" >>"$GITHUB_STEP_SUMMARY"
 	exit 0
 fi
 
-printf '%8s %8s %9s %-5s %s\n' PID PPID ELAPSED STAT COMMAND
-for row in "${STRAYS[@]}"; do
-	# shellcheck disable=SC2086 # deliberate word splitting into positional fields
-	set -- $row
-	printf '%8s %8s %8ss %-5s %s\n' "$1" "$2" "$3" "$4" "${*:5:12}"
-done
+print_thread_table "$THREADS_BEFORE"
 
-# A GitHub annotation surfaces on the run page, not just buried in the step log.
 if [ "$DRY_RUN" -eq 1 ]; then
-	echo "::warning title=Stray microVMs (${PHASE}, dry-run)::${COUNT} fcvm/firecracker process(es) are alive on this runner; NOT killing them (--dry-run)."
+	echo "::warning title=Stray microVMs (${PHASE}, dry-run)::${COUNT} live process group(s) found; NOT killing them (--dry-run)."
 	echo "--dry-run: reporting only, killing nothing"
 	[ -n "${GITHUB_STEP_SUMMARY:-}" ] &&
-		echo "- stray microVM guard (${PHASE}, dry-run): found ${COUNT}, zombies ${ZOMBIES}" >>"$GITHUB_STEP_SUMMARY"
+		echo "- stray microVM guard (${PHASE}, dry-run): found ${COUNT}, zombie-only groups ${ZOMBIES}" >>"$GITHUB_STEP_SUMMARY"
 	exit 0
 fi
 
-echo "::warning title=Stray microVMs (${PHASE})::${COUNT} fcvm/firecracker process(es) were alive on this runner; killing them. A non-zero 'post' count means this job leaked VMs."
+echo "::warning title=Stray microVMs (${PHASE})::${COUNT} live process group(s) were present; killing each TGID once. A non-zero post count means this job leaked VMs."
 
-for row in "${STRAYS[@]}"; do
-	# shellcheck disable=SC2086
-	set -- $row
-	sudo kill -9 "$1" 2>/dev/null || true
+for tgid in "${STRAY_TGIDS[@]}"; do
+	# `kill` needs only the numeric TGID and never reads the target mm/cmdline.
+	timeout --signal=KILL 2 sudo kill -9 -- "$tgid" 2>/dev/null || true
 done
 sleep 2
 
-mapfile -t SURVIVORS < <(list_strays)
-echo "killed ${COUNT}, still present after SIGKILL: ${#SURVIVORS[@]}"
-if [ "${#SURVIVORS[@]}" -gt 0 ]; then
-	# SIGKILL is not delivered to a task blocked in uninterruptible (D) state — that is the
-	# shape of the 21-hour wedge, and it needs a reboot, not another kill.
-	printf '%s\n' "${SURVIVORS[@]}"
-	echo "::warning title=Unkillable microVMs (${PHASE})::${#SURVIVORS[@]} process(es) survived SIGKILL (likely D-state); this runner needs a reboot."
+LIVE_AFTER=$(new_temporary_file)
+ZOMBIE_AFTER=$(new_temporary_file)
+if ! scan_vm_groups "$THREADS_AFTER" "$LIVE_AFTER" "$ZOMBIE_AFTER"; then
+	echo "post-kill process/thread scan timed out; survivor count is unknown"
+	echo "::warning title=Unkillable microVM scan incomplete (${PHASE})::Post-kill enumeration did not complete; runner replacement is required."
+	[ -n "${GITHUB_STEP_SUMMARY:-}" ] &&
+		echo "- stray microVM guard (${PHASE}): found ${COUNT}, survivor scan incomplete" >>"$GITHUB_STEP_SUMMARY"
+	exit 0
+fi
+
+mapfile -t SURVIVOR_TGIDS <"$LIVE_AFTER"
+echo "killed ${COUNT} process group(s), still live after SIGKILL: ${#SURVIVOR_TGIDS[@]}"
+if [ "${#SURVIVOR_TGIDS[@]}" -gt 0 ]; then
+	print_thread_table "$THREADS_AFTER"
+	echo "::warning title=Unkillable microVMs (${PHASE})::${#SURVIVOR_TGIDS[@]} process group(s) survived SIGKILL; D-state means this runner needs replacement."
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-	echo "- stray microVM guard (${PHASE}): found ${COUNT}, unkillable ${#SURVIVORS[@]}" >>"$GITHUB_STEP_SUMMARY"
+	echo "- stray microVM guard (${PHASE}): found ${COUNT}, unkillable ${#SURVIVOR_TGIDS[@]}" >>"$GITHUB_STEP_SUMMARY"
 fi
 
 exit 0
