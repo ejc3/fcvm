@@ -10,6 +10,7 @@ pub const HOST_CID: u32 = 2;
 pub const STATUS_PORT: u32 = 4999;
 pub const EXEC_PORT: u32 = 4998;
 pub const OUTPUT_PORT: u32 = 4997;
+pub const RESTORE_COMPLETE_PORT: u32 = 4994;
 pub const EGRESS_PROXY_PORT: u32 = 52000;
 
 /// Implement AsyncRead for a type with `inner: Arc<AsyncFd<OwnedFd>>`.
@@ -349,6 +350,27 @@ pub fn send_status(message: &[u8]) -> bool {
     let written = unsafe { libc::write(fd.as_raw_fd(), message.as_ptr().cast(), message.len()) };
     // fd closed automatically by OwnedFd Drop
     written == message.len() as isize
+}
+
+/// Acknowledge one exact restore generation after every guest-side restore phase
+/// and the shared Succeeded transition have completed.
+///
+/// This deliberately uses its own connection rather than the output or status
+/// transports: the host binds the matching one-shot listener before resume, and
+/// treats any missing/malformed/wrong-generation frame as a restore failure.
+pub async fn notify_restore_complete(restore_epoch: &str) -> Result<()> {
+    let stream = VsockStream::connect(HOST_CID, RESTORE_COMPLETE_PORT).with_context(|| {
+        format!(
+            "restore-completion ACK failed (phase=connect expected_epoch={restore_epoch} observed_epoch=<none>)"
+        )
+    })?;
+    let frame = format!("restore-complete:{restore_epoch}\n");
+    stream.write_all(frame.as_bytes()).await.with_context(|| {
+        format!(
+            "restore-completion ACK failed (phase=write-frame expected_epoch={restore_epoch} observed_epoch={restore_epoch})"
+        )
+    })?;
+    Ok(())
 }
 
 /// Notify host of container exit status.

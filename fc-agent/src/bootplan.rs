@@ -8,8 +8,9 @@
 //! Wire format (vsock): the host serves the same `latest` object MMDS would expose —
 //! `{ "container-plan": { ...Plan... }, "host-time": "<epoch>" }` — on
 //! [`BOOTPLAN_VSOCK_PORT`]. The guest connects to the host (CID 2), reads the JSON to
-//! EOF, and extracts the plan and metadata. Restore-epoch delivery over vsock (for CH
-//! clone/restore) is deferred to P2; the MMDS restore watcher stays Firecracker-only.
+//! EOF, and extracts the plan and metadata. Snapshot restore always exposes the
+//! restore epoch on this vsock port, including for Firecracker: a snapshot is
+//! captured with eth0 down, so restore control must not depend on MMDS ingress.
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;

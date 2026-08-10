@@ -47,6 +47,12 @@ impl OutputHandle {
         self.reconnect.notify_one();
     }
 
+    #[cfg(test)]
+    pub(crate) fn reconnect_requested(&self) -> bool {
+        self.reconnect_flag
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Signal shutdown.
     pub async fn shutdown(self) {
         let _ = self.tx.send(OutputMessage::Shutdown).await;

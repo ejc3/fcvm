@@ -1,17 +1,132 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::sync::{watch, Notify};
 
 use crate::network;
 use crate::output::OutputHandle;
+
+async fn wait_for_exec_rebind(
+    done: &AtomicBool,
+    done_notify: &Notify,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if done.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!(
+                "exec server did not re-register within {:?}; refusing restore readiness",
+                timeout
+            );
+        }
+        // The AtomicBool is authoritative. Notify only avoids polling latency,
+        // and the bounded wait lets us re-check the flag even if a notification
+        // was consumed by an older waiter.
+        let wait = (deadline - now).min(std::time::Duration::from_millis(50));
+        let _ = tokio::time::timeout(wait, done_notify.notified()).await;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestoreState {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+/// Shared restore outcome and the output-readiness edge it guards.
+#[derive(Clone)]
+pub struct RestoreStatus {
+    state: watch::Sender<RestoreState>,
+    output: OutputHandle,
+}
+
+impl RestoreStatus {
+    pub fn new(output: OutputHandle) -> Self {
+        let (state, _receiver) = watch::channel(RestoreState::Pending);
+        Self { state, output }
+    }
+
+    /// Start a new restore epoch. Failed is absorbing because the clone is
+    /// already shutting down and must never recover output readiness.
+    pub fn begin(&self) -> anyhow::Result<()> {
+        let mut failed = false;
+        self.state.send_if_modified(|state| match *state {
+            RestoreState::Pending => false,
+            RestoreState::Succeeded => {
+                *state = RestoreState::Pending;
+                true
+            }
+            RestoreState::Failed => {
+                failed = true;
+                false
+            }
+        });
+        if failed {
+            anyhow::bail!("cannot begin a restore after restore state Failed");
+        }
+        Ok(())
+    }
+
+    pub fn fail(&self) {
+        self.state.send_replace(RestoreState::Failed);
+    }
+
+    /// Complete the current restore and publish output readiness as one ordered
+    /// transition. The watch value is changed before `reconnect`, while waiters
+    /// are notified only after this closure returns, so every observer that sees
+    /// Succeeded also knows the reconnect request has already been issued.
+    pub fn succeed(&self) -> anyhow::Result<()> {
+        let mut previous = RestoreState::Pending;
+        let transitioned = self.state.send_if_modified(|state| {
+            previous = *state;
+            if *state != RestoreState::Pending {
+                return false;
+            }
+            *state = RestoreState::Succeeded;
+            self.output.reconnect();
+            true
+        });
+        if !transitioned {
+            anyhow::bail!(
+                "cannot complete pending restore: current state is {:?}",
+                previous
+            );
+        }
+        Ok(())
+    }
+
+    /// Wait until the restore handler has either published output readiness or
+    /// failed closed. This is the only WarmStart readiness gate.
+    pub async fn wait_for_output_readiness(&self) -> anyhow::Result<()> {
+        let mut state = self.state.subscribe();
+        loop {
+            match *state.borrow_and_update() {
+                RestoreState::Pending => {}
+                RestoreState::Succeeded => return Ok(()),
+                RestoreState::Failed => {
+                    anyhow::bail!("restore failed before output readiness")
+                }
+            }
+            state
+                .changed()
+                .await
+                .context("restore state publisher stopped before output readiness")?;
+        }
+    }
+}
 
 /// All signals needed for snapshot restore coordination.
 ///
 /// Groups the exec rebind, egress reconnect, and output reconnect signals
 /// that are passed between agent.rs, mmds.rs, and restore.rs.
 pub struct RestoreSignals {
-    pub output: OutputHandle,
+    pub restore_status: RestoreStatus,
     pub restore_flag: Arc<AtomicBool>,
     pub exec_rebind: Arc<Notify>,
     pub exec_rebind_needed: Arc<AtomicBool>,
@@ -33,13 +148,15 @@ pub struct RestoreSignals {
     pub nfs_mounts: Vec<crate::types::NfsMount>,
 }
 
-/// Handle clone restore: kill stale sockets, flush ARP, re-register exec, reconnect output.
+/// Handle clone restore: kill stale sockets, refresh gateway ARP, re-register exec,
+/// and prepare output readiness.
 ///
-/// CRITICAL ordering: exec re-register and egress reconnect MUST complete before output reconnect.
-/// The host uses the output connection as a readiness signal — once connected,
-/// it starts the health monitor which calls `fcvm exec`. If exec's AsyncFd epoll
-/// is still stale, health checks hang for ~60s. If egress proxy hasn't reconnected,
-/// tests that immediately use egress after health check will fail.
+/// CRITICAL ordering: exec re-register and egress reconnect MUST complete before
+/// this function returns. Its caller transitions [`RestoreStatus`] to Succeeded,
+/// which requests the output reconnect that the host treats as readiness. If
+/// exec's AsyncFd epoll is still stale, health checks hang for ~60s. If egress
+/// proxy hasn't reconnected, tests that immediately use egress after health
+/// check will fail.
 ///
 /// FUSE volumes are NOT remounted here. The reconnectable multiplexer
 /// detects the dead vsock and auto-reconnects to the clone's VolumeServer.
@@ -54,7 +171,8 @@ pub async fn handle_clone_restore(
     egress_gen_before: Option<u64>,
     restore_epoch: &str,
     transport: crate::bootplan::Transport,
-) {
+) -> anyhow::Result<()> {
+    let restore_started = std::time::Instant::now();
     eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
 
     // Sync clock FIRST — snapshot restore leaves the VM clock frozen at snapshot time.
@@ -78,9 +196,35 @@ pub async fn handle_clone_restore(
         network::reconfigure_ipv6(new_ipv6).await;
     }
 
-    network::kill_stale_tcp_connections().await;
-    network::flush_arp_cache().await;
-    network::send_gratuitous_arp().await;
+    let tcp_cleanup_started = std::time::Instant::now();
+    eprintln!(
+        "[fc-agent] restore phase=tcp-cleanup epoch={} begin",
+        restore_epoch
+    );
+    crate::snapshot_network::restore_snapshot_network()
+        .await
+        .context("restore phase tcp-cleanup")?;
+    eprintln!(
+        "[fc-agent] restore phase=tcp-cleanup epoch={} complete elapsed_ms={:.3}",
+        restore_epoch,
+        tcp_cleanup_started.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Do not flush the neighbor table. A client can already be using an entry
+    // while restore cleanup runs, and `ip neigh flush all` has no generation
+    // boundary. One active ARP exchange refreshes the gateway and teaches the
+    // new bridge/pasta path without deleting unrelated/current neighbors.
+    let neighbor_started = std::time::Instant::now();
+    eprintln!(
+        "[fc-agent] restore phase=neighbor-refresh epoch={} begin",
+        restore_epoch
+    );
+    network::refresh_gateway_arp().await;
+    eprintln!(
+        "[fc-agent] restore phase=neighbor-refresh epoch={} complete elapsed_ms={:.3}",
+        restore_epoch,
+        neighbor_started.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Remount NFS shares: their kernel TCP connections to the host's NFS
     // server died with the snapshot transport reset, and a hard NFS mount
@@ -121,22 +265,14 @@ pub async fn handle_clone_restore(
     // wait timed out before the rebind finished) must not let this restore proceed
     // before its own re-register has completed. The flag was reset above, so it only
     // reads true once the exec server has re-registered for THIS restore.
-    let rebind_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if signals.exec_rebind_done.load(Ordering::Acquire) {
-            eprintln!("[fc-agent] exec re-registered after restore");
-            break;
-        }
-        if tokio::time::Instant::now() >= rebind_deadline {
-            eprintln!("[fc-agent] WARNING: exec re-register timed out (5s)");
-            break;
-        }
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            signals.exec_rebind_done_notify.notified(),
-        )
-        .await;
-    }
+    wait_for_exec_rebind(
+        &signals.exec_rebind_done,
+        &signals.exec_rebind_done_notify,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .context("waiting for exec server re-registration after restore")?;
+    eprintln!("[fc-agent] exec re-registered after restore");
 
     // THIRD: Wait for egress proxy to reconnect (watch channel incremented after vsock connect).
     // No explicit signal needed — the proxy detects the dead vsock fd natively via
@@ -150,23 +286,22 @@ pub async fn handle_clone_restore(
             std::time::Duration::from_secs(5),
             "reconnected after restore",
         )
-        .await;
+        .await
+        .context("waiting for egress proxy reconnection after restore")?;
     }
 
-    // FOURTH: Reconnect output vsock (tells host we're alive + exec + egress are ready).
-    // FUSE vsock reconnection is handled automatically by the reconnectable multiplexer.
-    signals.output.reconnect();
-
-    // FIFTH: Restart journald. The journal file was mid-write when the snapshot
+    // FOURTH: Restart journald. The journal file was mid-write when the snapshot
     // was taken, so the restored journald finds a corrupted file and gets stuck.
     // systemd's watchdog would kill it after 3 min, but we restart it immediately
     // so other services can log via journald right away.
     restart_journald().await;
 
     eprintln!(
-        "[fc-agent] restore complete (epoch={}): exec + egress + output reconnected",
-        restore_epoch
+        "[fc-agent] restore phases complete (epoch={}): exec + egress ready elapsed_ms={:.3}",
+        restore_epoch,
+        restore_started.elapsed().as_secs_f64() * 1000.0
     );
+    Ok(())
 }
 
 /// Restart systemd-journald after snapshot restore.
@@ -191,5 +326,91 @@ async fn restart_journald() {
         Err(e) => {
             eprintln!("[fc-agent] WARNING: failed to restart journald: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_rebind_timeout_is_a_restore_readiness_error() {
+        let done = AtomicBool::new(false);
+        let notify = Notify::new();
+        // A stale permit must never substitute for this restore generation's
+        // authoritative completion flag.
+        notify.notify_one();
+
+        let error = wait_for_exec_rebind(&done, &notify, std::time::Duration::ZERO)
+            .await
+            .expect_err("missing exec re-registration must fail restore readiness");
+        assert!(
+            format!("{error:#}").contains("did not re-register"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_restore_cannot_publish_output_from_warm_start() {
+        let (output, writer, _reset_rx) = crate::output::create();
+        drop(writer);
+        let status = RestoreStatus::new(output.clone());
+        status.begin().expect("initial pending restore state");
+
+        // Put the WarmStart path on the executor while restore is still pending,
+        // then publish the cleanup failure. The failed outcome must win without
+        // emitting the output reconnect that the host treats as readiness.
+        let waiter_status = status.clone();
+        let waiter = tokio::spawn(async move { waiter_status.wait_for_output_readiness().await });
+        tokio::task::yield_now().await;
+        status.fail();
+
+        let result = waiter.await.expect("WarmStart readiness task panicked");
+        assert!(
+            result.is_err(),
+            "a failed restore must reject WarmStart output readiness"
+        );
+        assert!(
+            !output.reconnect_requested(),
+            "a failed restore must not request an output reconnect"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_restore_requests_reconnect_before_warm_start_wakes() {
+        let (output, writer, _reset_rx) = crate::output::create();
+        drop(writer);
+        let status = RestoreStatus::new(output.clone());
+
+        let waiter_status = status.clone();
+        let waiter = tokio::spawn(async move { waiter_status.wait_for_output_readiness().await });
+        tokio::task::yield_now().await;
+        status.succeed().expect("pending restore should succeed");
+
+        waiter
+            .await
+            .expect("WarmStart readiness task panicked")
+            .expect("successful restore should publish readiness");
+        assert!(
+            output.reconnect_requested(),
+            "Succeeded must request reconnect before waking WarmStart"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_start_success_is_retained_without_an_existing_waiter() {
+        let (output, writer, _reset_rx) = crate::output::create();
+        drop(writer);
+        let status = RestoreStatus::new(output.clone());
+
+        // ColdStart completes before any WarmStart waiter subscribes. The watch
+        // sender must retain Succeeded even with zero receivers, and the same
+        // transition must request the ordinary cold-start reconnect.
+        status.succeed().expect("pending cold start should succeed");
+        assert!(output.reconnect_requested());
+        status
+            .wait_for_output_readiness()
+            .await
+            .expect("late subscriber must observe retained Succeeded");
     }
 }
