@@ -129,6 +129,16 @@ fn isolated_config_mounts_the_active_xdg_config_into_nested_guests() {
 }
 
 #[test]
+fn nested_config_fallback_matches_config_generation_path() {
+    let source = nested_test_source();
+
+    assert!(
+        source.contains("/tmp/fcvm-config"),
+        "without XDG_CONFIG_HOME or HOME, nested launches must mount the same /tmp/fcvm-config directory where shared setup generates rootfs-config.toml"
+    );
+}
+
+#[test]
 fn test_unit_recipe_honors_its_filter() {
     let makefile = makefile_source();
 
