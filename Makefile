@@ -156,7 +156,31 @@ export CARGO_TARGET_DIR := target
 NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
 # Extra flags forwarded to every criterion bench recipe (see bench-quick).
+#
+# Criterion's flags belong to the BENCH BINARY, so they have to follow `--`.
+# Given to cargo directly they are rejected by its own argument parser before
+# any benchmark starts:
+#
+#     $ cargo bench -p fuse-pipe --bench throughput --sample-size 10
+#     error: unexpected argument '--sample-size' found
+#       tip: to pass '--sample-size' as a value, use '-- --sample-size'
+#     Usage: cargo bench --package [<SPEC>] --bench [<NAME>] [-- [ARGS]...]
+#
+# BENCH_SEPARATED is what the recipes interpolate, and it stays empty when
+# BENCH_ARGS is, so plain `make bench` carries no trailing separator.
 BENCH_ARGS ?=
+BENCH_SEPARATED = $(if $(strip $(BENCH_ARGS)),-- $(BENCH_ARGS))
+
+# Where criterion keeps baselines and reports. Pinned to an absolute path
+# because criterion's default is not the directory it looks like.
+#
+# Its second choice after CRITERION_HOME is `$CARGO_TARGET_DIR/criterion`, and
+# CARGO_TARGET_DIR here is the relative string `target`, which criterion
+# resolves inside the bench binary, whose working directory cargo sets to the
+# package root. Every suite was therefore writing to `fuse-pipe/target/criterion`
+# while the ownership repair scanned `target/` at the repo root and found
+# nothing to do. Overridable so tests can point it at a scratch directory.
+CRITERION_HOME ?= $(CURDIR)/target/criterion
 
 # cargo/nextest target runner for the privileged suites. cargo-nextest stays unprivileged
 # and only the test binary is elevated, so the `sudo` hop sits in the middle of the process
@@ -668,15 +692,9 @@ test-chromium-request:
 test-ci-infrastructure:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_ci_infrastructure.py'
 
-# The three fuse-pipe suites, in order. Prerequisites rather than recursive
-# $(MAKE) calls: a sub-make RUNS even under `make -n`, so the delegating form
-# turned a dry run into a real build. Do not run this under -j; concurrent
-# benchmarks measure each other.
-bench: bench-throughput bench-operations bench-protocol
-
-# throughput and operations mount a real FUSE filesystem, so they take the
-# privileged runner the root tests use; protocol is pure serialization and
-# stays unprivileged.
+# One criterion suite under the privileged runner. throughput and operations
+# mount a real FUSE filesystem, so they take the runner the root tests use;
+# protocol is pure serialization and stays unprivileged.
 #
 # Each privileged suite hands target/ back afterwards. criterion writes its
 # results from inside the bench binary, so under that runner target/criterion
@@ -687,33 +705,85 @@ bench: bench-throughput bench-operations bench-protocol
 # refuses to start until the ownership is repaired. The repair is inline rather
 # than a $(MAKE) call because a sub-make runs even under `make -n`, and this
 # one would invoke sudo.
-bench-throughput: build
+#
+# The repair's own status decides the recipe's. Keeping only the benchmark's
+# status reports the suite green while target/ is still root-owned, which is
+# precisely the state the repair exists to prevent, and the next unprivileged
+# run is the one that pays for it. The scan is treated the same way: a find
+# that cannot read target/ has not established that no repair is needed.
+define run_privileged_bench
+	CRITERION_HOME='$(CRITERION_HOME)' \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench -p fuse-pipe --bench throughput $(BENCH_ARGS); \
-	RC=$$?; \
-	if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
-		sudo chown -R $$(id -u):$$(id -g) target/; \
+	$(CARGO) bench -p fuse-pipe --bench $(1) $(BENCH_SEPARATED); \
+	bench_rc=$$?; \
+	if [ ! -d '$(CRITERION_HOME)' ]; then \
+		if [ $$bench_rc -eq 0 ]; then \
+			echo "ERROR: --bench $(1) exited 0 but $(CRITERION_HOME) does not exist. criterion logs persistence failures and still returns 0, so the suite printed timings and saved no sample.json, estimates.json or baseline: nothing can be compared and no regression can ever be reported" >&2; \
+			exit 1; \
+		fi; \
+		exit $$bench_rc; \
 	fi; \
-	exit $$RC
+	if ! root_owned=$$(find '$(CRITERION_HOME)' -user root -print -quit); then \
+		echo "ERROR: cannot scan $(CRITERION_HOME) for root-owned files, so the ownership repair after --bench $(1) never ran" >&2; \
+		exit 1; \
+	fi; \
+	if [ -n "$$root_owned" ] && ! sudo chown -R $$(id -u):$$(id -g) '$(CRITERION_HOME)'; then \
+		echo "ERROR: $(CRITERION_HOME) is still root-owned after --bench $(1); bench-protocol cannot persist criterion output and _test-root will refuse to start" >&2; \
+		exit 1; \
+	fi; \
+	exit $$bench_rc
+endef
+
+# One criterion suite as the invoking user. Nothing here writes as root, so
+# there is no ownership to repair.
+define run_unprivileged_bench
+	CRITERION_HOME='$(CRITERION_HOME)' $(CARGO) bench -p fuse-pipe --bench $(1) $(BENCH_SEPARATED); \
+	bench_rc=$$?; \
+	if [ ! -d '$(CRITERION_HOME)' ] && [ $$bench_rc -eq 0 ]; then \
+		echo "ERROR: --bench $(1) exited 0 but $(CRITERION_HOME) does not exist. criterion logs persistence failures and still returns 0, so the suite printed timings and saved no sample.json, estimates.json or baseline: nothing can be compared and no regression can ever be reported" >&2; \
+		exit 1; \
+	fi; \
+	exit $$bench_rc
+endef
+
+# The three fuse-pipe suites, in order.
+#
+# One target with three recipe lines, not three prerequisites. Make
+# parallelizes prerequisites but never the lines of a single recipe, so this
+# cannot start two suites at once under `make -j`, nor under a -j inherited
+# through MAKEFLAGS from a parent make. The prerequisite form did: with a stub
+# cargo under `make -j8 bench`, all three suites were running together.
+# Concurrent suites time each other, and the unprivileged protocol suite races
+# the privileged suites for ownership of target/criterion. A comment saying
+# "do not use -j" is not a control.
+#
+# GNU Make 4.3 is what this repo builds on, and neither of make's own
+# mechanisms is usable there: `.NOTPARALLEL` ignores its prerequisites before
+# 4.4 and serializes the whole makefile rather than this target, and `.WAIT`
+# arrived in 4.4.
+bench: build
+	@echo "==> Running fuse-pipe benchmarks: throughput, operations, protocol"
+	$(call run_privileged_bench,throughput)
+	$(call run_privileged_bench,operations)
+	$(call run_unprivileged_bench,protocol)
+
+bench-throughput: build
+	$(call run_privileged_bench,throughput)
 
 bench-operations: build
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench -p fuse-pipe --bench operations $(BENCH_ARGS); \
-	RC=$$?; \
-	if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
-		sudo chown -R $$(id -u):$$(id -g) target/; \
-	fi; \
-	exit $$RC
+	$(call run_privileged_bench,operations)
 
 bench-protocol: build
-	$(CARGO) bench -p fuse-pipe --bench protocol $(BENCH_ARGS)
+	$(call run_unprivileged_bench,protocol)
 
-# The same three suites at criterion's smallest honest sample count, for
-# iteration. A target-specific variable reaches the prerequisites, so this
-# needs no recursive make. Quote `make bench` in any report: a 10-sample
-# interval is wide.
+# The same three suites, shortened for iteration. A target-specific variable
+# reaches the prerequisite, so this needs no recursive make.
+#
+# Quote `make bench` in any report, never this: the intervals are wide. Note
+# also that a group calling `sample_size()` in code keeps its own count, so
+# --sample-size only reaches the groups that do not, while --warm-up-time and
+# --measurement-time reach all of them.
 bench-quick: BENCH_ARGS := --sample-size 10 --warm-up-time 1 --measurement-time 3
 bench-quick: bench
 
