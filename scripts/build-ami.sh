@@ -119,7 +119,7 @@ compute_hash() {
     return 1
   fi
 
-  # Only the host kernel this AMI bakes. rootfs-config.toml carries eight
+  # Only the host kernel this AMI bakes. rootfs-config.toml carries many
   # kernel_version assignments, so a bare grep also invalidated the key whenever
   # an unrelated profile (btrfs.arm64, nested.amd64, ...) changed, forcing a full
   # EC2 rebuild. The builder always selects [kernel_profiles.nested.arm64.host_kernel]

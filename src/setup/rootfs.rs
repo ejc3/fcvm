@@ -42,7 +42,6 @@ pub struct Plan {
     #[serde(default)]
     pub paths: PathsConfig,
     pub base: BaseConfig,
-    pub kernel: KernelConfig,
     pub packages: PackagesConfig,
     pub services: ServicesConfig,
     pub files: HashMap<String, FileConfig>,
@@ -118,9 +117,9 @@ fn default_branch() -> String {
 
 /// Kernel profile configuration
 ///
-/// Every kernel is delivered through a profile. The `[kernel]` config section
-/// is synthesized into a `"default"` profile at load time. Custom profiles
-/// (nested, btrfs) build kernels from source or download from GitHub releases.
+/// Every kernel is delivered through a profile. Source-built profiles download
+/// content-addressed artifacts from GitHub releases or build locally from the
+/// same inputs.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct KernelProfile {
     /// Human-readable description
@@ -157,6 +156,14 @@ pub struct KernelProfile {
     /// Example: ["kernel/build.sh", "kernel/nested.conf", "kernel/patches/*.patch"]
     #[serde(default)]
     pub build_inputs: Vec<String>,
+
+    /// Published artifact SHA (the first 12 hex digits of build_inputs).
+    ///
+    /// Source checkouts recompute and verify this value. Installed binaries use
+    /// it to resolve the content-addressed release without needing kernel source
+    /// files alongside the executable.
+    #[serde(default)]
+    pub kernel_sha: Option<String>,
 
     /// Base config URL for VM kernel (Firecracker's microvm config)
     /// {arch} is replaced with aarch64 or x86_64 at build time
@@ -285,45 +292,6 @@ pub struct BaseConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ArchConfig {
     pub url: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct KernelConfig {
-    pub arm64: KernelArchConfig,
-    pub amd64: KernelArchConfig,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct KernelArchConfig {
-    /// URL to the kernel archive (e.g., Kata release tarball)
-    /// Required unless `local_path` is provided
-    #[serde(default)]
-    pub url: String,
-    /// Path within the archive to extract (only used with URL)
-    #[serde(default)]
-    pub path: String,
-    /// Local filesystem path to kernel binary (overrides url if provided)
-    /// Use for custom-built kernels (e.g., profile kernel with CONFIG_KVM)
-    #[serde(default)]
-    pub local_path: Option<String>,
-}
-
-impl KernelArchConfig {
-    /// Check if this config uses a local path
-    pub fn is_local(&self) -> bool {
-        self.local_path.is_some()
-    }
-}
-
-impl KernelConfig {
-    /// Get the kernel config for the current architecture
-    pub fn current_arch(&self) -> anyhow::Result<&KernelArchConfig> {
-        match std::env::consts::ARCH {
-            "x86_64" => Ok(&self.amd64),
-            "aarch64" => Ok(&self.arm64),
-            other => anyhow::bail!("unsupported architecture: {}", other),
-        }
-    }
 }
 
 /// Package groups for rootfs. Each field must be added to all_packages().
@@ -922,9 +890,19 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     let mut config: Plan = toml::from_str(&config_content)
         .with_context(|| format!("parsing config file: {}", config_path.display()))?;
 
-    // Synthesize a "default" profile from the [kernel] section so all code
-    // paths use profiles uniformly — no more None vs Some branching.
-    synthesize_default_profile(&mut config);
+    // A profile may override the VMM selection. Otherwise the explicit default
+    // profile inherits the global Firecracker build just like every cold boot.
+    apply_default_firecracker_config(&mut config);
+
+    let arch = config_arch();
+    if config
+        .kernel_profiles
+        .get("default")
+        .and_then(|profiles| profiles.get(arch))
+        .is_none()
+    {
+        bail!("rootfs config must define [kernel_profiles.default.{arch}] for this architecture");
+    }
 
     info!(
         config_file = %config_path.display(),
@@ -955,48 +933,30 @@ fn setup_vm_firecracker_bin() -> Result<PathBuf> {
     )
 }
 
-/// Create a synthetic "default" kernel profile from the [kernel] config section.
+/// Apply the global Firecracker selection to explicit default profiles.
 ///
-/// This allows all kernel code to work with profiles uniformly. The [kernel]
-/// section in rootfs-config.toml stays as-is for backward compatibility.
-/// If a user explicitly defines [kernel_profiles.default], their definition wins.
-///
-/// Also injects [firecracker] config into the default profile so `fcvm setup`
-/// and `find_firecracker()` use the custom Firecracker without special handling.
-fn synthesize_default_profile(plan: &mut Plan) {
-    let arch = config_arch();
-    if let Ok(kernel_config) = plan.kernel.current_arch() {
-        let mut default_profile = KernelProfile {
-            description: "Default kernel (Kata Containers)".into(),
-            kernel_url: Some(kernel_config.url.clone()),
-            kernel_archive_path: Some(kernel_config.path.clone()),
-            kernel_local_path: kernel_config.local_path.clone(),
-            ..Default::default()
-        };
+/// A profile-level repository is an intentional override, so its repository,
+/// branch, and commit remain untouched. Otherwise all three come from
+/// `[firecracker]`; the commit travels with the repository so a profile build
+/// keeps the full Firecracker identity that `setup` verifies.
+fn apply_default_firecracker_config(plan: &mut Plan) {
+    let Some(firecracker) = plan.firecracker.as_ref() else {
+        return;
+    };
+    let Some(default_profiles) = plan.kernel_profiles.get_mut("default") else {
+        return;
+    };
 
-        // Inject [firecracker] config into default profile
-        if let Some(ref fc) = plan.firecracker {
-            apply_default_firecracker_config(&mut default_profile, fc);
+    for profile in default_profiles.values_mut() {
+        if profile.firecracker_repo.is_none() {
+            profile.firecracker_repo = Some(firecracker.repo.clone());
+            profile.firecracker_branch = Some(firecracker.branch.clone());
+            profile.firecracker_commit = firecracker.commit.clone();
         }
-
-        plan.kernel_profiles
-            .entry("default".into())
-            .or_default()
-            .entry(arch.into())
-            .or_insert(default_profile);
     }
 }
 
-fn apply_default_firecracker_config(
-    default_profile: &mut KernelProfile,
-    firecracker: &FirecrackerConfig,
-) {
-    default_profile.firecracker_repo = Some(firecracker.repo.clone());
-    default_profile.firecracker_branch = Some(firecracker.branch.clone());
-    default_profile.firecracker_commit = firecracker.commit.clone();
-}
-
-/// Legacy alias for load_config (for backward compatibility during migration)
+/// Load the discovered config path used by runtime helpers.
 pub fn load_plan() -> Result<(Plan, String, String)> {
     load_config(None)
 }
@@ -1134,20 +1094,16 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
     let init_script = generate_init_script(&install_script, &setup_script);
     let download_script = generate_download_script(&plan);
 
-    // Get kernel URL for the current architecture
-    let kernel_config = plan.kernel.current_arch()?;
-    let kernel_url = &kernel_config.url;
-
-    // Hash the complete init script + kernel URL + download script + rootfs_type
+    // Hash the complete init script + download script + rootfs_type. The setup
+    // kernel is deliberately excluded: it executes the initrd but is never
+    // installed into Layer 2, so changing its release cannot change rootfs
+    // contents and must not churn a multi-gigabyte rootfs artifact.
     // Any change to:
     // - init logic, install script, or setup script
-    // - kernel URL (different kernel version/release)
     // - download method (podman image, codename, packages)
     // - rootfs filesystem type (ext4 vs btrfs)
     // invalidates the cache
     let mut combined = init_script.clone();
-    combined.push_str("\n# KERNEL_URL: ");
-    combined.push_str(kernel_url);
     combined.push_str("\n# DOWNLOAD_SCRIPT:\n");
     combined.push_str(&download_script);
     combined.push_str("\n# FC_AGENT_SERVICE:\n");
@@ -1969,8 +1925,8 @@ async fn create_layer2_rootless(
 /// 4. Runs the setup script
 /// 5. Powers off the VM
 ///
-/// Packages are embedded directly in the initrd, no second disk needed.
-/// This allows using Kata's kernel which has FUSE but no ISO9660/SquashFS.
+/// Packages are embedded directly in the initrd, so the setup kernel does not
+/// need ISO9660 or SquashFS support and no second disk is required.
 async fn create_layer2_setup_initrd(
     install_script: &str,
     setup_script: &str,
@@ -2304,8 +2260,8 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
 /// - Runs the setup script
 /// - Powers off when complete
 ///
-/// Only one disk is needed - packages are embedded in the initrd.
-/// This allows using Kata's kernel which has FUSE but no ISO9660/SquashFS.
+/// Only one disk is needed because packages are embedded in the initrd; the
+/// setup kernel does not need ISO9660 or SquashFS support.
 async fn boot_vm_for_setup(
     disk_path: &Path,
     initrd_path: &Path,
@@ -2570,17 +2526,30 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
             Some("27305f49ab3a5d862dc56b5108713b6536d2baa7")
         );
 
-        let mut synthesized = KernelProfile::default();
-        apply_default_firecracker_config(&mut synthesized, &global);
-        assert_eq!(
-            synthesized.firecracker_repo.as_deref(),
-            Some("ejc3/firecracker")
-        );
-        assert_eq!(synthesized.firecracker_branch.as_deref(), Some("agent/nv2"));
-        assert_eq!(
-            synthesized.firecracker_commit.as_deref(),
-            Some("27305f49ab3a5d862dc56b5108713b6536d2baa7")
-        );
+        // The commit travels with the repository into every explicit default
+        // profile. Dropping it here would leave a profile build with a branch
+        // name and no pinned identity, which is what `setup` refuses to do.
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        plan.firecracker = Some(global);
+        apply_default_firecracker_config(&mut plan);
+
+        for (arch, profile) in plan.kernel_profiles.get("default").unwrap() {
+            assert_eq!(
+                profile.firecracker_repo.as_deref(),
+                Some("ejc3/firecracker"),
+                "default.{arch} lost the global Firecracker repository"
+            );
+            assert_eq!(
+                profile.firecracker_branch.as_deref(),
+                Some("agent/nv2"),
+                "default.{arch} lost the global Firecracker branch"
+            );
+            assert_eq!(
+                profile.firecracker_commit.as_deref(),
+                Some("27305f49ab3a5d862dc56b5108713b6536d2baa7"),
+                "default.{arch} lost the pinned Firecracker commit"
+            );
+        }
     }
 
     /// FCVM_FIRECRACKER_BIN is a process-global, so these run in one test.
@@ -2614,6 +2583,36 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
         assert!(
             err.contains("Config file not found"),
             "should refuse a missing --config, got: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_default_profiles_inherit_global_firecracker_without_overriding_profile() {
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let arm64 = plan
+            .kernel_profiles
+            .get_mut("default")
+            .unwrap()
+            .get_mut("arm64")
+            .unwrap();
+        arm64.firecracker_repo = Some("owner/profile-firecracker".to_string());
+        arm64.firecracker_branch = Some("profile-branch".to_string());
+
+        apply_default_firecracker_config(&mut plan);
+
+        let defaults = plan.kernel_profiles.get("default").unwrap();
+        let arm64 = defaults.get("arm64").unwrap();
+        assert_eq!(
+            arm64.firecracker_repo.as_deref(),
+            Some("owner/profile-firecracker")
+        );
+        assert_eq!(arm64.firecracker_branch.as_deref(), Some("profile-branch"));
+
+        let amd64 = defaults.get("amd64").unwrap();
+        assert_eq!(amd64.firecracker_repo.as_deref(), Some("ejc3/firecracker"));
+        assert_eq!(
+            amd64.firecracker_branch.as_deref(),
+            Some("bump-vsock-max-connections")
         );
     }
 }

@@ -2121,11 +2121,11 @@ The fuse-pipe library passes the pjdfstest POSIX compliance suite. Tests run via
 
 ## Kernel Profiles
 
-Every kernel in fcvm is delivered through a profile. The `[kernel]` config section is synthesized into a `"default"` profile at load time, so all code paths use profiles uniformly. Named profiles (e.g., `nested`, `btrfs`) can build custom kernels from source or download from GitHub releases.
+Every kernel in fcvm is delivered through an explicit profile. The shipped `default`, `nested`, and `btrfs` profiles are built from source and downloaded from content-addressed GitHub releases. User-defined profiles may instead use an archive URL.
 
 A profile delivers a kernel in one of three ways:
-1. **URL-based** (default profile): Downloads a pre-built kernel archive (e.g., Kata release)
-2. **Custom build**: Builds from source using `kernel_version`/`kernel_repo`
+1. **Source release** (the shipped profiles): Downloads a published kernel or builds it locally from `kernel_version`/`kernel_repo`
+2. **URL-based**: Downloads a pre-built kernel archive
 3. **Inherited**: Uses the default profile's kernel, adding only runtime overrides (boot_args, firecracker_args, etc.)
 
 ### Configuration Reference
@@ -2137,6 +2137,7 @@ description = "Minimal kernel for fast boot"
 kernel_version = "6.12"
 kernel_repo = "your-org/your-kernel-repo"
 build_inputs = ["kernel/minimal.conf", "kernel/patches/*.patch"]
+kernel_sha = "0123456789ab" # required when publishing the profile
 kernel_config = "kernel/minimal.conf"
 patches_dir = "kernel/patches"
 # firecracker_bin = "/usr/local/bin/firecracker-custom"
@@ -2152,6 +2153,7 @@ patches_dir = "kernel/patches"
 | `kernel_version` | Custom | Kernel version (e.g., "6.18.3") |
 | `kernel_repo` | Custom | GitHub repo for releases |
 | `build_inputs` | Custom | Files to hash for kernel SHA (supports globs) |
+| `kernel_sha` | Published custom | Verified 12-digit build-input hash used outside a source checkout |
 | `base_config_url` | Custom | Base kernel .config URL (e.g., Firecracker's microvm config) |
 | `kernel_config` | No | Kernel config fragment file path (applied on top of base) |
 | `patches_dir` | No | Directory containing kernel patches |
@@ -2163,7 +2165,7 @@ patches_dir = "kernel/patches"
 ### How It Works
 
 1. **Config is source of truth**: All kernel versions and build settings flow from `rootfs-config.toml`
-2. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
+2. **SHA computation**: fcvm hashes all files matching `build_inputs` and verifies a published profile's `kernel_sha`; installed binaries use that manifest value when source files are absent
 3. **Download first**: Tries `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
 4. **Build fallback**: If download fails and `--build-kernels` is set, Rust generates build scripts on-the-fly
 5. **Config sync**: `make build` syncs embedded config to `~/.config/fcvm/`

@@ -584,12 +584,12 @@ setup-default: build setup-btrfs
 		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
 		exit 1; \
 	fi
-	@echo "==> Running fcvm setup (default kernel)..."
+	@echo "==> Running fcvm setup (default kernel; builds only if release is absent)..."
 	@# Tests run fcvm via sudo, which reads /root/.config/fcvm — sync BOTH the
 	@# user and root configs or a rootfs-config.toml change silently boots the
 	@# previous rootfs under sudo (root keeps the stale SHA).
 	sudo ./target/release/fcvm setup --generate-config --force
-	./target/release/fcvm setup
+	./target/release/fcvm setup --kernel-profile default --build-kernels
 
 setup-fcvm: setup-default
 	@echo "==> Running fcvm setup --kernel-profile nested..."
@@ -617,7 +617,7 @@ _setup-fcvm:
 		exit 1; \
 	fi
 	sudo ./target/release/fcvm setup --generate-config --force
-	sudo ./target/release/fcvm setup
+	sudo ./target/release/fcvm setup --kernel-profile default --build-kernels
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
 	sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
 
