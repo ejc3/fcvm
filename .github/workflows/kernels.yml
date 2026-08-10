@@ -150,31 +150,21 @@ jobs:
             exit 1
           fi
 
-      - name: Setup btrfs for fcvm
-        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
-        run: |
-          if [ ! -d /mnt/fcvm-btrfs ]; then
-            sudo mkdir -p /mnt/fcvm-btrfs
-            sudo truncate -s 50G /var/fcvm-btrfs.img
-            sudo mkfs.btrfs /var/fcvm-btrfs.img
-            sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
-          fi
-          sudo chown $USER:$USER /mnt/fcvm-btrfs
-
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
+        env:
+          # A forced rebuild has to discard the cached content-addressed file, or
+          # `fcvm setup` returns immediately and the release step republishes the very
+          # artifact the operator asked to replace. The Make target owns that, along
+          # with btrfs setup and config synchronisation.
+          KERNEL_FILE: ${{ steps.kernel.outputs.filename }}
+          FORCE: ${{ inputs.force_build == true && '1' || '0' }}
         run: |
-          sudo ./target/release/fcvm setup --kernel-profile default --build-kernels --config "$PWD/rootfs-config.toml"
+          make release-default-kernel
 
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
-          BUILT_KERNEL="/mnt/fcvm-btrfs/kernels/${{ steps.kernel.outputs.filename }}"
-          if [ ! -f "$BUILT_KERNEL" ]; then
-            echo "ERROR: Built kernel not found at $BUILT_KERNEL"
-            ls -la /mnt/fcvm-btrfs/kernels/
-            exit 1
-          fi
-          cp "$BUILT_KERNEL" "$KERNEL_PATH"
+          cp "/mnt/fcvm-btrfs/kernels/${{ steps.kernel.outputs.filename }}" "$KERNEL_PATH"
           ls -lh "$KERNEL_PATH"
           file "$KERNEL_PATH"
 
