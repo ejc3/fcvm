@@ -684,6 +684,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     let server = UffdServer::new(
         args.snapshot_name.clone(),
         &snapshot_config.memory_path,
+        &paths::snapshot_dir()
+            .join(&args.snapshot_name)
+            .join("config.json"),
+        &super::common::snapshot_sibling(&paths::snapshot_dir().join(&args.snapshot_name), "lock"),
         &paths::data_dir(),
         backing,
         prefetch,
@@ -1629,6 +1633,13 @@ async fn cmd_snapshot_run_inner(
             let server = setup_try!(UffdServer::new(
                 "implicit".to_string(),
                 &snapshot_config.memory_path,
+                &paths::snapshot_dir()
+                    .join(&snapshot_name)
+                    .join("config.json"),
+                &super::common::snapshot_sibling(
+                    &paths::snapshot_dir().join(&snapshot_name),
+                    "lock",
+                ),
                 &data_dir,
                 backing,
                 prefetch,

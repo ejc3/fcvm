@@ -28,7 +28,8 @@
 //!
 //! The key exists to stop a set recorded against one memory image from being replayed against
 //! a different one. Because a mismatch can only waste work (see above), the key is sized to
-//! that harm: SHA-256 over the memory file's `(len, mtime, ino, dev)`, which is one `stat`.
+//! that harm: SHA-256 over the exact snapshot `config.json` digest plus the memory file's
+//! `(len, mtime, ino, dev)`, which is one small read and one `stat`.
 //! Hashing the image itself was measured at 1.5 GB/s on this host — 1.4 s for a 2 GiB snapshot,
 //! paid on every `snapshot serve` startup — which is a far bigger cost than the mis-prefetch it
 //! would prevent. Rewriting a snapshot (`snapshot create --tag` over an existing tag) always
@@ -63,16 +64,18 @@ const MAX_MEM_LEN: u64 = 1 << 40;
 
 /// Identity of the snapshot memory image a working set was recorded against.
 ///
-/// See the module docs for why this is a `stat` tuple rather than a digest of the image.
+/// See the module docs for why this combines the exact config digest with a `stat` tuple
+/// instead of hashing the multi-gigabyte memory image.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ImageKey([u8; 32]);
 
 impl ImageKey {
     /// Derive the key of the memory image at `path`.
-    pub fn of(path: &Path) -> Result<Self> {
+    pub fn of(path: &Path, config_digest: &[u8; 32]) -> Result<Self> {
         let meta = std::fs::metadata(path)
             .with_context(|| format!("stat-ing memory image {}", path.display()))?;
         let mut hasher = Sha256::new();
+        hasher.update(config_digest);
         hasher.update(meta.len().to_le_bytes());
         hasher.update(meta.mtime().to_le_bytes());
         hasher.update(meta.mtime_nsec().to_le_bytes());
@@ -153,7 +156,7 @@ impl PageSet {
     /// already handled (zero-filled) and must not become an error here.
     pub fn insert_range(&mut self, offset: u64, len: u64) {
         let first = offset / GRANULE;
-        let last = (offset + len.max(1) - 1) / GRANULE;
+        let last = offset.saturating_add(len.max(1) - 1) / GRANULE;
         for granule in first..=last.min(self.granules.saturating_sub(1)) {
             if granule >= self.granules {
                 break;
@@ -342,6 +345,17 @@ pub struct WorkingSetStore {
     /// The memory image this set describes. Kept so the identity can be re-checked at publish
     /// time — the path may name a different image by then (see `MergeOutcome::superseded`).
     mem_path: PathBuf,
+    /// Exact config bytes bind the hint to one atomically installed snapshot generation,
+    /// independently of filesystem inode reuse or timestamp granularity.
+    generation_config_path: PathBuf,
+    generation_config_digest: [u8; 32],
+    /// Stable sibling generation lock used by snapshot create/delete/restore.
+    ///
+    /// A merge takes this shared before it re-identifies the memory image and keeps it
+    /// through the atomic sidecar publication. Without that single critical section, a
+    /// creator could replace the snapshot after the identity check but before `rename`, and
+    /// the old server would publish its bitmap into the new generation.
+    generation_lock_path: PathBuf,
     lock_path: PathBuf,
     key: ImageKey,
     mem_len: u64,
@@ -359,14 +373,43 @@ impl WorkingSetStore {
     /// Open (and load, if present and applicable) the working set for a memory image.
     ///
     /// Never fails because of the recorded file: an unreadable, stale or corrupt one leaves an
-    /// empty store, which prefetches nothing and re-records from scratch.
-    pub fn open(mem_file_path: &Path, mem_len: u64) -> Result<Self> {
+    /// empty store, which prefetches nothing and re-records from scratch. The exact config,
+    /// memory identity, and sidecar are read under the snapshot's shared generation lease so
+    /// a creator cannot mix generations during startup.
+    pub fn open(
+        mem_file_path: &Path,
+        mem_len: u64,
+        generation_config_path: &Path,
+        generation_lock_path: &Path,
+    ) -> Result<Self> {
         anyhow::ensure!(
             mem_len <= MAX_MEM_LEN,
             "memory image {} is {mem_len} bytes, past the {MAX_MEM_LEN}-byte working-set limit",
             mem_file_path.display()
         );
-        let key = ImageKey::of(mem_file_path)?;
+        let generation_file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(generation_lock_path)
+            .with_context(|| {
+                format!(
+                    "opening snapshot generation lock {}",
+                    generation_lock_path.display()
+                )
+            })?;
+        let generation_lock = Flock::lock(generation_file, FlockArg::LockShared)
+            .map_err(|(_, err)| err)
+            .context("locking snapshot generation while opening its working set")?;
+        let generation_config = std::fs::read(generation_config_path).with_context(|| {
+            format!(
+                "reading snapshot generation config {}",
+                generation_config_path.display()
+            )
+        })?;
+        let generation_config_digest: [u8; 32] = Sha256::digest(&generation_config).into();
+        let key = ImageKey::of(mem_file_path, &generation_config_digest)?;
         let path = Self::path_for(mem_file_path);
         let mut lock_name = path.file_name().unwrap_or_default().to_os_string();
         lock_name.push(".lock");
@@ -386,10 +429,14 @@ impl WorkingSetStore {
             }
             None => PageSet::empty(mem_len),
         };
+        generation_lock.unlock().map_err(|(_, err)| err).ok();
 
         Ok(Self {
             path,
             mem_path: mem_file_path.to_path_buf(),
+            generation_config_path: generation_config_path.to_path_buf(),
+            generation_config_digest,
+            generation_lock_path: generation_lock_path.to_path_buf(),
             lock_path,
             key,
             mem_len,
@@ -415,10 +462,12 @@ impl WorkingSetStore {
     /// faulting in (whose truncated record is completed by the next clone rather than being
     /// baked in forever).
     ///
-    /// Race-free against other serve processes on the same snapshot: the whole
-    /// read-modify-write runs under an exclusive `flock` on a sidecar lock file, and the
-    /// result is published by atomic rename. Losing this to a crash is harmless — the file is
-    /// a cache, and the next clone re-records what is missing.
+    /// Race-free against both other servers and snapshot replacement: the whole
+    /// read-modify-write runs under an exclusive `flock` on a sidecar lock file, while a
+    /// shared snapshot-generation lease spans the final image-identity check and atomic
+    /// rename. Creators/deleters take that generation lease exclusively, so they cannot land
+    /// in the check/publish gap. Losing the cache to a crash is harmless — the next clone
+    /// re-records what is missing.
     ///
     /// The lock is taken blocking, on the clone's own teardown path: the critical section is
     /// one read and one write of a bitmap (32 KiB per GiB of guest RAM), and it is only ever
@@ -426,6 +475,26 @@ impl WorkingSetStore {
     /// moment.
     pub fn merge_and_persist(&self, observed: &PageSet) -> Result<MergeOutcome> {
         let mut known = self.known.lock().expect("working set mutex");
+
+        // Snapshot creators/deleters take this inode exclusively. Keep the shared lease from
+        // the image-identity check through the sidecar rename: checking first and locking
+        // later leaves a check/use race in which a replacement generation receives the old
+        // generation's bitmap.
+        let generation_file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.generation_lock_path)
+            .with_context(|| {
+                format!(
+                    "opening snapshot generation lock {}",
+                    self.generation_lock_path.display()
+                )
+            })?;
+        let generation_lock = Flock::lock(generation_file, FlockArg::LockShared)
+            .map_err(|(_, err)| err)
+            .context("locking snapshot generation for working-set publication")?;
 
         let lock_file = File::options()
             .create(true)
@@ -447,13 +516,11 @@ impl WorkingSetStore {
         let added = known.union_from(observed);
         let total = known.len();
 
-        // Publish ONLY if the path still names the image we served. A snapshot tag can be
-        // recreated while this serve process runs: we keep serving the old inode we already
-        // opened, but `self.path` resolves through the tag's directory and would now sit
-        // beside a NEW image. Writing our old-key bitmap there would overwrite the new
-        // generation's record with one the decoder must reject, sending later restores back
-        // to full demand paging. The `flock` cannot catch this — it serialises writers, it
-        // does not check WHAT is being written about.
+        // Publish ONLY if the path still names the image we served. A snapshot tag may have
+        // been recreated before this merge acquired its shared generation lease: we keep
+        // serving the old inode we already opened, but `self.path` would now sit beside a NEW
+        // image. The lease prevents any further replacement through the rename below; this
+        // identity check rejects a replacement that already completed.
         let superseded = !self.image_is_still_ours();
         let persisted = total > disk_len && !superseded;
         let result = if persisted {
@@ -462,10 +529,11 @@ impl WorkingSetStore {
             Ok(())
         };
 
-        // Release explicitly, so the lock demonstrably spans the whole read-modify-write
-        // above rather than ending wherever the borrow checker drops it. A failed unlock
-        // needs no handling: closing the fd releases the lock regardless.
+        // Release explicitly, so both locks demonstrably span the whole identity-check and
+        // publication transaction above rather than ending wherever the compiler last uses
+        // them. Failed unlocks need no special handling: closing each fd releases its lock.
         lock.unlock().map_err(|(_, err)| err).ok();
+        generation_lock.unlock().map_err(|(_, err)| err).ok();
 
         result?;
         Ok(MergeOutcome {
@@ -476,12 +544,29 @@ impl WorkingSetStore {
         })
     }
 
-    /// Whether the memory image at our path is still the one this set describes.
+    /// Whether the snapshot generation and memory image at our paths are still the ones this
+    /// set describes.
     ///
     /// A stat failure counts as "not ours": if the image cannot be identified we must not
     /// publish, because the file we would write next to is not one we can vouch for.
     fn image_is_still_ours(&self) -> bool {
-        match ImageKey::of(&self.mem_path) {
+        let current_config = match std::fs::read(&self.generation_config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                warn!(
+                    target: "uffd",
+                    path = %self.generation_config_path.display(),
+                    error = %error,
+                    "cannot re-identify the snapshot generation; not publishing its working set"
+                );
+                return false;
+            }
+        };
+        let current_config_digest: [u8; 32] = Sha256::digest(&current_config).into();
+        if current_config_digest != self.generation_config_digest {
+            return false;
+        }
+        match ImageKey::of(&self.mem_path, &current_config_digest) {
             Ok(now) => now == self.key,
             Err(e) => {
                 warn!(
@@ -499,8 +584,11 @@ impl WorkingSetStore {
 /// Read and validate a recorded set. `None` means "nothing usable here" — always a normal
 /// outcome, never an error.
 fn read_set(path: &Path, key: &ImageKey, mem_len: u64) -> Option<PageSet> {
+    let granules = mem_len.div_ceil(GRANULE);
+    let bitmap_bytes = granules.div_ceil(64).saturating_mul(8);
+    let max_len = (HEADER_LEN as u64).saturating_add(bitmap_bytes);
     let mut buf = Vec::new();
-    match File::open(path).and_then(|mut f| f.read_to_end(&mut buf)) {
+    match File::open(path).and_then(|f| f.take(max_len.saturating_add(1)).read_to_end(&mut buf)) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -512,6 +600,16 @@ fn read_set(path: &Path, key: &ImageKey, mem_len: u64) -> Option<PageSet> {
             );
             return None;
         }
+    }
+    if buf.len() as u64 > max_len {
+        warn!(
+            target: "uffd",
+            path = %path.display(),
+            bytes = buf.len(),
+            max_len,
+            "recorded working set is oversized - restore will fault on demand"
+        );
+        return None;
     }
     PageSet::decode(&buf, key, mem_len)
 }
@@ -564,6 +662,30 @@ mod tests {
         path
     }
 
+    fn generation_lock_for(image: &Path) -> PathBuf {
+        let mut name = image.file_name().unwrap_or_default().to_os_string();
+        name.push(".generation.lock");
+        image.with_file_name(name)
+    }
+
+    fn generation_config_for(image: &Path) -> PathBuf {
+        let mut name = image.file_name().unwrap_or_default().to_os_string();
+        name.push(".config.json");
+        image.with_file_name(name)
+    }
+
+    fn image_key(image: &Path) -> ImageKey {
+        ImageKey::of(image, &[0x42; 32]).unwrap()
+    }
+
+    fn open_store(image: &Path, mem_len: u64) -> WorkingSetStore {
+        let config = generation_config_for(image);
+        if !config.exists() {
+            std::fs::write(&config, b"generation-1").unwrap();
+        }
+        WorkingSetStore::open(image, mem_len, &config, &generation_lock_for(image)).unwrap()
+    }
+
     #[test]
     fn insert_range_marks_every_granule_it_spans() {
         let mut set = PageSet::empty(16 * GRANULE);
@@ -589,6 +711,10 @@ mod tests {
         set.insert_range(3 * GRANULE, 8 * GRANULE);
         assert_eq!(set.len(), 1);
         assert!(set.contains(3));
+
+        // A malformed mapping must not wrap the inclusive end back into the bitmap.
+        set.insert_range(u64::MAX - GRANULE, 4 * GRANULE);
+        assert_eq!(set.len(), 1, "overflowing ranges must remain out of bounds");
     }
 
     #[test]
@@ -652,7 +778,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trips() {
         let image = fake_image("roundtrip", 1024 * GRANULE);
-        let key = ImageKey::of(&image).unwrap();
+        let key = image_key(&image);
         let mem_len = 1024 * GRANULE;
 
         let mut set = PageSet::empty(mem_len);
@@ -672,8 +798,8 @@ mod tests {
         let mem_len = 64 * GRANULE;
         let image = fake_image("key-a", mem_len);
         let other = fake_image("key-b", mem_len);
-        let key = ImageKey::of(&image).unwrap();
-        let other_key = ImageKey::of(&other).unwrap();
+        let key = image_key(&image);
+        let other_key = image_key(&other);
         assert_ne!(
             key.0, other_key.0,
             "two distinct images must not share a key"
@@ -700,7 +826,7 @@ mod tests {
     fn decode_rejects_corrupt_and_truncated_files() {
         let mem_len = 64 * GRANULE;
         let image = fake_image("corrupt", mem_len);
-        let key = ImageKey::of(&image).unwrap();
+        let key = image_key(&image);
         let mut set = PageSet::empty(mem_len);
         set.insert_range(0, GRANULE);
         let good = set.encode(&key, mem_len);
@@ -739,7 +865,7 @@ mod tests {
         // point past the image.
         let mem_len = 100 * GRANULE;
         let image = fake_image("tail", mem_len);
-        let key = ImageKey::of(&image).unwrap();
+        let key = image_key(&image);
         let mut encoded = PageSet::empty(mem_len).encode(&key, mem_len);
         let last_word = encoded.len() - 8;
         encoded[last_word..].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -759,7 +885,7 @@ mod tests {
         let mem_len = 512 * GRANULE;
         let image = fake_image("store", mem_len);
 
-        let store = WorkingSetStore::open(&image, mem_len).unwrap();
+        let store = open_store(&image, mem_len);
         assert!(
             store.to_prefetch().is_empty(),
             "a snapshot with no recording prefetches nothing"
@@ -809,7 +935,7 @@ mod tests {
         );
 
         // A fresh server for the same image sees the union.
-        let reopened = WorkingSetStore::open(&image, mem_len).unwrap();
+        let reopened = open_store(&image, mem_len);
         let loaded = reopened.to_prefetch();
         assert_eq!(loaded.len(), 4);
         assert_eq!(
@@ -827,7 +953,9 @@ mod tests {
         );
 
         std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
-        let _ = std::fs::remove_file(store.lock_path);
+        let _ = std::fs::remove_file(&store.lock_path);
+        let _ = std::fs::remove_file(&store.generation_lock_path);
+        let _ = std::fs::remove_file(generation_config_for(&image));
         std::fs::remove_file(&image).unwrap();
     }
 
@@ -836,57 +964,78 @@ mod tests {
         let mem_len = 64 * GRANULE;
         let image = fake_image("rewrite", mem_len);
 
-        let store = WorkingSetStore::open(&image, mem_len).unwrap();
+        let store = open_store(&image, mem_len);
         let mut observed = store.recorder();
         observed.insert_range(0, 4 * GRANULE);
         store.merge_and_persist(&observed).unwrap();
-        assert_eq!(
-            WorkingSetStore::open(&image, mem_len)
-                .unwrap()
-                .to_prefetch()
-                .len(),
-            4
-        );
+        assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 4);
 
         // Rewriting the snapshot replaces the memory image: new inode, new mtime, new key.
         std::fs::remove_file(&image).unwrap();
         let f = File::create(&image).unwrap();
         f.set_len(mem_len).unwrap();
         drop(f);
+        std::fs::write(generation_config_for(&image), b"generation-2").unwrap();
 
-        let after = WorkingSetStore::open(&image, mem_len).unwrap();
+        let after = open_store(&image, mem_len);
         assert!(
             after.to_prefetch().is_empty(),
             "a working set from the previous snapshot must not be replayed"
         );
 
         std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
-        let _ = std::fs::remove_file(store.lock_path);
+        let _ = std::fs::remove_file(&store.lock_path);
+        let _ = std::fs::remove_file(&store.generation_lock_path);
+        let _ = std::fs::remove_file(generation_config_for(&image));
         std::fs::remove_file(&image).unwrap();
     }
 
-    /// A serve process keeps serving the inode it opened, but its working-set PATH resolves
-    /// through the snapshot tag. If the tag is recreated underneath it, a clone finishing
-    /// afterwards must NOT publish its old-generation bitmap over the new generation's record
-    /// — the decoder would reject the stale key and every later restore would fall back to
-    /// full demand paging. `flock` cannot prevent this: it serialises writers, it does not
-    /// check what they are writing about.
+    #[test]
+    fn store_binds_to_the_exact_snapshot_config_generation() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("config-generation", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut observed = store.recorder();
+        observed.insert_range(0, 2 * GRANULE);
+        assert!(store.merge_and_persist(&observed).unwrap().persisted);
+
+        // Leave memory.bin completely untouched. A different config.json alone represents a
+        // different atomically installed generation and must invalidate the old hint.
+        std::fs::write(generation_config_for(&image), b"generation-2").unwrap();
+        assert!(
+            open_store(&image, mem_len).to_prefetch().is_empty(),
+            "a new config generation must not replay the prior generation's bitmap"
+        );
+        let outcome = store.merge_and_persist(&observed).unwrap();
+        assert!(outcome.superseded && !outcome.persisted);
+
+        std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
+        let _ = std::fs::remove_file(&store.lock_path);
+        let _ = std::fs::remove_file(&store.generation_lock_path);
+        let _ = std::fs::remove_file(generation_config_for(&image));
+        std::fs::remove_file(&image).unwrap();
+    }
+
+    /// A server keeps serving the inode it opened, but its working-set PATH resolves through
+    /// the snapshot tag. If the tag was recreated before its merge acquired the generation
+    /// lease, the finishing old clone must NOT publish over the new generation's record.
     #[test]
     fn an_old_generation_clone_does_not_clobber_the_new_generations_record() {
         let mem_len = 64 * GRANULE;
         let image = fake_image("supersede", mem_len);
 
         // Generation 1: the serve process that is still running.
-        let old = WorkingSetStore::open(&image, mem_len).unwrap();
+        let old = open_store(&image, mem_len);
 
         // The tag is recreated in place: same path, new image.
         std::fs::remove_file(&image).unwrap();
         let f = File::create(&image).unwrap();
         f.set_len(mem_len).unwrap();
         drop(f);
+        std::fs::write(generation_config_for(&image), b"generation-2").unwrap();
 
         // Generation 2 records its own working set at the same path.
-        let new = WorkingSetStore::open(&image, mem_len).unwrap();
+        let new = open_store(&image, mem_len);
         assert_ne!(
             old.key, new.key,
             "test is vacuous unless rewriting the image changed its identity"
@@ -909,9 +1058,7 @@ mod tests {
         );
 
         // The new generation's record must be intact and still usable.
-        let reloaded = WorkingSetStore::open(&image, mem_len)
-            .unwrap()
-            .to_prefetch();
+        let reloaded = open_store(&image, mem_len).to_prefetch();
         assert_eq!(reloaded.len(), 3, "the new generation's set must survive");
         assert!(reloaded.contains(10) && reloaded.contains(12));
         assert!(
@@ -921,7 +1068,75 @@ mod tests {
 
         std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
         let _ = std::fs::remove_file(&old.lock_path);
+        let _ = std::fs::remove_file(&old.generation_lock_path);
+        let _ = std::fs::remove_file(generation_config_for(&image));
         std::fs::remove_file(&image).unwrap();
+    }
+
+    /// A creator must not be able to replace the snapshot after the old image is checked but
+    /// before its working set is atomically published. Hold the sidecar lock to park a real
+    /// merge after it acquires the generation lease, then prove a separate open file
+    /// description cannot acquire the creator's exclusive lease until that merge completes.
+    #[test]
+    fn working_set_publication_holds_the_snapshot_generation_lease() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("generation-lease", mem_len);
+        let store = open_store(&image, mem_len);
+        let working_set_path = WorkingSetStore::path_for(&image);
+        let sidecar_lock_path = store.lock_path.clone();
+        let generation_lock_path = store.generation_lock_path.clone();
+
+        let sidecar_file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&sidecar_lock_path)
+            .unwrap();
+        let sidecar_guard = Flock::lock(sidecar_file, FlockArg::LockExclusive).unwrap();
+
+        let mut observed = store.recorder();
+        observed.insert_range(0, GRANULE);
+        let merge = std::thread::spawn(move || store.merge_and_persist(&observed));
+
+        let generation_probe = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&generation_lock_path)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&generation_probe) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Ok(()) => {
+                    fs2::FileExt::unlock(&generation_probe).unwrap();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "merge never acquired its shared snapshot-generation lease"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("probing snapshot-generation lease: {error}"),
+            }
+        }
+
+        sidecar_guard.unlock().unwrap();
+        let outcome = merge.join().unwrap().unwrap();
+        assert!(
+            outcome.persisted,
+            "the parked merge must publish after release"
+        );
+        fs2::FileExt::try_lock_exclusive(&generation_probe)
+            .expect("creator's exclusive lease must become available after publication");
+        fs2::FileExt::unlock(&generation_probe).unwrap();
+
+        std::fs::remove_file(working_set_path).unwrap();
+        std::fs::remove_file(sidecar_lock_path).unwrap();
+        std::fs::remove_file(generation_lock_path).unwrap();
+        std::fs::remove_file(generation_config_for(&image)).unwrap();
+        std::fs::remove_file(image).unwrap();
     }
 
     #[test]
@@ -930,23 +1145,42 @@ mod tests {
         let image = fake_image("garbage", mem_len);
         std::fs::write(WorkingSetStore::path_for(&image), b"not a working set").unwrap();
 
-        let store = WorkingSetStore::open(&image, mem_len).unwrap();
+        let store = open_store(&image, mem_len);
         assert!(store.to_prefetch().is_empty());
 
         // ...and recording over it repairs the file.
         let mut observed = store.recorder();
         observed.insert_range(0, GRANULE);
         assert!(store.merge_and_persist(&observed).unwrap().persisted);
-        assert_eq!(
-            WorkingSetStore::open(&image, mem_len)
-                .unwrap()
-                .to_prefetch()
-                .len(),
-            1
+        assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 1);
+
+        std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
+        let _ = std::fs::remove_file(&store.lock_path);
+        let _ = std::fs::remove_file(&store.generation_lock_path);
+        let _ = std::fs::remove_file(generation_config_for(&image));
+        std::fs::remove_file(&image).unwrap();
+    }
+
+    #[test]
+    fn store_rejects_a_record_larger_than_the_exact_bitmap_shape() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("oversized", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut recorded = store.recorder();
+        recorded.insert_range(0, GRANULE);
+        let mut encoded = recorded.encode(&store.key, mem_len);
+        encoded.push(0);
+        std::fs::write(WorkingSetStore::path_for(&image), encoded).unwrap();
+
+        assert!(
+            open_store(&image, mem_len).to_prefetch().is_empty(),
+            "trailing bytes past the exact bitmap shape must invalidate the hint"
         );
 
         std::fs::remove_file(WorkingSetStore::path_for(&image)).unwrap();
-        let _ = std::fs::remove_file(store.lock_path);
+        let _ = std::fs::remove_file(&store.lock_path);
+        let _ = std::fs::remove_file(&store.generation_lock_path);
+        let _ = std::fs::remove_file(generation_config_for(&image));
         std::fs::remove_file(&image).unwrap();
     }
 }

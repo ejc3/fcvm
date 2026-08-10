@@ -83,7 +83,7 @@ pub fn plan(set: &PageSet, regions: &[Region], page_size: usize, mem_len: u64) -
             continue;
         }
         for region in regions {
-            let region_end = region.file_offset + region.size as u64;
+            let region_end = region.file_offset.saturating_add(region.size as u64);
             let start = run.offset.max(region.file_offset);
             let end = run_end.min(region_end).min(mem_len);
             if end <= start {
@@ -196,11 +196,11 @@ pub fn populate_chunk(
     };
 
     match result {
-        Ok(done) if done > 0 => Ok(done),
+        Ok(copied) if copied > 0 => Ok(copied),
         // The kernel never reports zero-byte success; treat it as no progress rather than
         // spinning on the same address forever.
         Ok(_) => Ok(page_size),
-        Err(userfaultfd::Error::PartiallyCopied(done)) if done > 0 => Ok(done),
+        Err(userfaultfd::Error::PartiallyCopied(copied)) if copied > 0 => Ok(copied),
         Err(e) => match errno_of(&e) {
             Some(libc::EEXIST) => Ok(page_size),
             Some(libc::ESRCH) => Err(Stop::VmGone),
@@ -631,7 +631,13 @@ mod tests {
                 "authentic header, truncated bitmap",
                 Box::new(|ws: &std::path::Path, len: u64| {
                     let image = ws.with_file_name("memory.bin");
-                    let store = WorkingSetStore::open(&image, len).unwrap();
+                    let store = WorkingSetStore::open(
+                        &image,
+                        len,
+                        &image.with_file_name("config.json"),
+                        &image.with_file_name("snapshot.lock"),
+                    )
+                    .unwrap();
                     let mut observed = store.recorder();
                     observed.insert_range(0, len);
                     assert!(store.merge_and_persist(&observed).unwrap().persisted);
@@ -645,11 +651,16 @@ mod tests {
         for (label, write_corrupt) in cases {
             let dir = tempfile::tempdir().unwrap();
             let image = dir.path().join("memory.bin");
+            let generation_config = dir.path().join("config.json");
+            std::fs::write(&generation_config, b"generation-1").unwrap();
             std::fs::write(&image, &snapshot).unwrap();
             write_corrupt(&WorkingSetStore::path_for(&image), len as u64);
 
             // 1. Nothing is replayed: the record is refused, so there is no plan at all.
-            let store = WorkingSetStore::open(&image, len as u64).unwrap();
+            let generation_lock = dir.path().join("snapshot.lock");
+            let store =
+                WorkingSetStore::open(&image, len as u64, &generation_config, &generation_lock)
+                    .unwrap();
             let recorded = store.to_prefetch();
             assert!(
                 recorded.is_empty(),
@@ -716,9 +727,10 @@ mod tests {
                 outcome.persisted && !outcome.superseded,
                 "[{label}] recording over a corrupt record must repair it"
             );
-            let repaired = WorkingSetStore::open(&image, len as u64)
-                .unwrap()
-                .to_prefetch();
+            let repaired =
+                WorkingSetStore::open(&image, len as u64, &generation_config, &generation_lock)
+                    .unwrap()
+                    .to_prefetch();
             assert_eq!(repaired.len(), 2, "[{label}] the repaired record must load");
 
             // SAFETY: unmapping our own mapping.

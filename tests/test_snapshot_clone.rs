@@ -2348,10 +2348,65 @@ async fn serve_log_until(
 
 async fn sha256_of(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let bytes = tokio::fs::read(path)
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+        .with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+async fn spawn_working_set_clone(
+    serve_pid: u32,
+    name: &str,
+) -> Result<(tokio::process::Child, u32)> {
+    let serve_pid = serve_pid.to_string();
+    let args = ["snapshot", "run", "--pid", &serve_pid, "--name", name];
+    let (mut child, pid) = common::spawn_fcvm_with_logs(&args, name).await?;
+
+    if let Err(error) = common::poll_health_by_pid(pid, 150)
+        .await
+        .with_context(|| format!("clone {name} never became healthy"))
+    {
+        return match terminate_and_reap(&mut child, pid, &format!("working-set clone {name}")).await
+        {
+            Ok(_) => Err(error),
+            Err(cleanup_error) => {
+                Err(error.context(format!("clone cleanup also failed: {cleanup_error:#}")))
+            }
+        };
+    }
+
+    Ok((child, pid))
+}
+
+async fn run_working_set_clone(serve_pid: u32, name: &str) -> Result<String> {
+    let (mut child, pid) = spawn_working_set_clone(serve_pid, name).await?;
+    let verdict = iso_md5(pid).await;
+    let cleanup = terminate_and_reap(&mut child, pid, &format!("working-set clone {name}"))
+        .await
+        .context("terminating measured working-set clone");
+
+    match (verdict, cleanup) {
+        (Ok(md5), Ok(_)) => Ok(md5),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(error.context(format!("clone cleanup also failed: {cleanup_error:#}")))
+        }
+    }
 }
 
 /// WORKING-SET REPLAY. One clone's faults are recorded beside the snapshot and replayed into
@@ -2363,94 +2418,72 @@ async fn sha256_of(path: &std::path::Path) -> Result<String> {
 #[tokio::test]
 async fn test_snapshot_clone_working_set_replay() -> Result<()> {
     let (baseline_name, _, snapshot_name, _) = common::unique_names("wsreplay");
-    let fcvm_path = common::find_fcvm_binary()?;
+    let snapshot_path = fcvm::paths::snapshot_dir().join(&snapshot_name);
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut iso_clones: Vec<(tokio::process::Child, u32)> = Vec::new();
+    let mut snapshot_cleanup_needed = false;
 
     println!("\n=== Working-set replay test ===");
 
-    // ---- baseline VM with a known 8 MiB pattern in guest RAM ------------------
-    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &[
-            "podman",
-            "run",
-            "--name",
-            &baseline_name,
-            "--network",
-            "rootless",
-            common::TEST_IMAGE,
-        ],
-        &baseline_name,
-    )
-    .await
-    .context("spawning baseline VM")?;
-    common::poll_health_by_pid(baseline_pid, 120).await?;
-
-    common::exec_in_vm(
-        baseline_pid,
-        &[&format!(
-            "yes ABCDEFGH | head -c {} > {} && sync",
-            ISO_BYTES, ISO_FILE
-        )],
-    )
-    .await
-    .context("writing baseline pattern")?;
-    let base_md5 = iso_md5(baseline_pid).await?;
-
-    common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
-
-    let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
-    let mem_path = snapshots.load_snapshot(&snapshot_name).await?.memory_path;
-    let mem_len = tokio::fs::metadata(&mem_path).await?.len();
-    let working_set_path = fcvm::uffd::WorkingSetStore::path_for(&mem_path);
-    anyhow::ensure!(
-        !working_set_path.exists(),
-        "a freshly created snapshot must not already carry a working set: {}",
-        working_set_path.display()
-    );
-
-    // ---- memory server --------------------------------------------------------
-    let (_serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_log_path(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-serve-wsreplay",
-    )
-    .await
-    .context("spawning memory server")?;
-    common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
-
-    let serve_pid_str = serve_pid.to_string();
-    let clone_args = |name: &str| -> Vec<String> {
-        ["snapshot", "run", "--pid", &serve_pid_str, "--name", name]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    };
-    // Clones created inside the verdict block below must stay reachable from the cleanup at
-    // the end: every `ensure!` in there returns early, and a leaked clone keeps holding the
-    // snapshot and can wedge later tests.
-    let mut iso_clones: Vec<(tokio::process::Child, u32)> = Vec::new();
-    let spawn_clone = |name: String| async move {
-        let args = clone_args(&name);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (child, pid) = common::spawn_fcvm_with_logs(&arg_refs, &name).await?;
-        common::poll_health_by_pid(pid, 150)
-            .await
-            .with_context(|| format!("clone {name} never became healthy"))?;
-        anyhow::Ok((child, pid))
-    };
-
-    // One clone's life, start to finish: restore, read the whole 8 MiB pattern, die. Both
-    // measured clones run EXACTLY this, so their fault counts are comparable — the only
-    // difference between them is whether a recorded working set existed to replay.
-    let run_one_clone = |name: String| async move {
-        let (child, pid) = spawn_clone(name).await?;
-        let md5 = iso_md5(pid).await?;
-        drop(child);
-        common::kill_process(pid).await;
-        anyhow::Ok(md5)
-    };
-
     let verdict = async {
+        // Every owned process is stored immediately after spawn, before the first fallible
+        // operation. The epilogue below therefore owns cleanup on every setup/assertion edge.
+        let (baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning baseline VM")?;
+        baseline = Some((baseline_child, baseline_pid));
+        common::poll_health_by_pid(baseline_pid, 120).await?;
+
+        common::exec_in_vm(
+            baseline_pid,
+            &[&format!(
+                "yes ABCDEFGH | head -c {} > {} && sync",
+                ISO_BYTES, ISO_FILE
+            )],
+        )
+        .await
+        .context("writing baseline pattern")?;
+        let base_md5 = iso_md5(baseline_pid).await?;
+
+        // A failed create may still have installed a partial generation, so cleanup owns this
+        // exact unique tag from before the operation begins.
+        snapshot_cleanup_needed = true;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+
+        let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
+        let mem_path = snapshots.load_snapshot(&snapshot_name).await?.memory_path;
+        let mem_len = tokio::fs::metadata(&mem_path).await?.len();
+        let working_set_path = fcvm::uffd::WorkingSetStore::path_for(&mem_path);
+        anyhow::ensure!(
+            !working_set_path.exists(),
+            "a freshly created snapshot must not already carry a working set: {}",
+            working_set_path.display()
+        );
+
+        let (serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_log_path(
+            &["snapshot", "serve", &snapshot_name],
+            "uffd-serve-wsreplay",
+        )
+        .await
+        .context("spawning memory server")?;
+        serve = Some((serve_child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
         // ---- clone 1 records: nothing to replay, so it faults everything in ----
-        let rec_md5 = run_one_clone(format!("{}-rec", snapshot_name)).await?;
+        let rec_name = format!("{}-rec", snapshot_name);
+        let rec_md5 = run_working_set_clone(serve_pid, &rec_name).await?;
         anyhow::ensure!(
             rec_md5 == base_md5,
             "recording clone restored WRONG memory: {rec_md5} != {base_md5}"
@@ -2466,9 +2499,23 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
             "the first clone must leave a working set at {}",
             working_set_path.display()
         );
-        let recorded_pages = fcvm::uffd::WorkingSetStore::open(&mem_path, mem_len)?
-            .to_prefetch()
-            .len();
+        let snapshot_dir = mem_path
+            .parent()
+            .context("snapshot memory path has no parent directory")?;
+        let snapshot_dir_name = snapshot_dir
+            .file_name()
+            .context("snapshot directory has no name")?;
+        let mut generation_lock_name = snapshot_dir_name.to_os_string();
+        generation_lock_name.push(".lock");
+        let generation_lock_path = snapshot_dir.with_file_name(generation_lock_name);
+        let recorded_pages = fcvm::uffd::WorkingSetStore::open(
+            &mem_path,
+            mem_len,
+            &snapshot_dir.join("config.json"),
+            &generation_lock_path,
+        )?
+        .to_prefetch()
+        .len();
         anyhow::ensure!(
             recorded_pages > 0,
             "the recorded working set must not be empty"
@@ -2479,7 +2526,8 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
         let mem_before = sha256_of(&mem_path).await?;
 
         // ---- clone 2 replays it: same workload, same lifetime -----------------
-        let replay_md5 = run_one_clone(format!("{}-replay", snapshot_name)).await?;
+        let replay_name = format!("{}-replay", snapshot_name);
+        let replay_md5 = run_working_set_clone(serve_pid, &replay_name).await?;
         anyhow::ensure!(
             replay_md5 == base_md5,
             "replaying clone restored WRONG memory: {replay_md5} != {base_md5}"
@@ -2517,9 +2565,11 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
         );
 
         // ---- isolation, with two live clones that BOTH replayed ---------------
-        let (b_child, b) = spawn_clone(format!("{}-b", snapshot_name)).await?;
+        let b_name = format!("{}-b", snapshot_name);
+        let (b_child, b) = spawn_working_set_clone(serve_pid, &b_name).await?;
         iso_clones.push((b_child, b));
-        let (c_child, c) = spawn_clone(format!("{}-c", snapshot_name)).await?;
+        let c_name = format!("{}-c", snapshot_name);
+        let (c_child, c) = spawn_working_set_clone(serve_pid, &c_name).await?;
         iso_clones.push((c_child, c));
 
         // Replay must not change what the guest sees.
@@ -2564,20 +2614,53 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
     // ---- cleanup --------------------------------------------------------------
     // Clones first, then the server they depend on. Reached whether the block succeeded or
     // returned early from any assertion.
-    for (child, pid) in iso_clones {
-        drop(child);
-        common::kill_process(pid).await;
+    let mut cleanup_errors = Vec::new();
+    for (mut child, pid) in iso_clones {
+        if let Err(error) = terminate_and_reap(&mut child, pid, "isolation clone").await {
+            cleanup_errors.push(format!("isolation clone {pid}: {error:#}"));
+        }
     }
-    common::kill_process(serve_pid).await;
-    common::kill_process(baseline_pid).await;
-    let _ = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshots", "delete", &snapshot_name])
-        .output()
-        .await;
+    if let Some((mut child, pid)) = serve.take() {
+        if let Err(error) = terminate_and_reap(&mut child, pid, "memory server").await {
+            cleanup_errors.push(format!("memory server {pid}: {error:#}"));
+        }
+    }
+    if let Some((mut child, pid)) = baseline.take() {
+        if let Err(error) = terminate_and_reap(&mut child, pid, "baseline VM").await {
+            cleanup_errors.push(format!("baseline VM {pid}: {error:#}"));
+        }
+    }
+    if snapshot_cleanup_needed {
+        match std::fs::symlink_metadata(&snapshot_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => cleanup_errors.push(format!(
+                "checking working-set snapshot {} before cleanup: {error:#}",
+                snapshot_path.display()
+            )),
+            Ok(_) => {
+                if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+                    cleanup_errors.push(format!("snapshot {snapshot_name}: {error:#}"));
+                } else if let Err(error) = ensure_path_absent(
+                    &snapshot_path,
+                    "working-set snapshot after production-backed deletion",
+                ) {
+                    cleanup_errors.push(format!("{error:#}"));
+                }
+            }
+        }
+    }
 
-    verdict?;
-    println!("✅ WORKING-SET REPLAY TEST PASSED");
-    Ok(())
+    if cleanup_errors.is_empty() {
+        verdict?;
+        println!("✅ WORKING-SET REPLAY TEST PASSED");
+        Ok(())
+    } else {
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(error) => Err(error.context(format!("cleanup also failed: {cleanup}"))),
+        }
+    }
 }
 
 async fn clone_isolation_impl(uffd_mode: &str) -> Result<()> {

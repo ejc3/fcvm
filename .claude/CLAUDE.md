@@ -1778,21 +1778,21 @@ records the SET and replays it.
   `<memory.bin>.working-set` beside the snapshot, under an `flock` + atomic rename, and only
   written when the union actually grew — so the steady state writes nothing, and a clone that
   was killed mid-restore gets completed by the next one instead of baking in a truncated set.
-  Publication is also gated on the image identity STILL matching under the lock: a serve
-  process keeps serving the inode it opened, but its working-set path resolves through the
-  snapshot tag, so a tag recreated underneath a running server would otherwise let an old
-  clone overwrite the new generation's record with one the decoder must reject. `flock`
-  serialises writers; it does not check what they are writing about.
+  Publication also takes the snapshot generation lock shared from the final image-identity
+  check through the atomic rename. Snapshot replacement takes that lock exclusively, so it
+  either finishes before the check (the old clone declines to publish) or waits until the old
+  generation's sidecar publication is complete; it cannot land in between.
 - **Replay**: at handshake the recorded set is coalesced into runs, mapped into that clone's
   regions, aligned to its page size, and populated in 2 MiB `UFFDIO_COPY`/`UFFDIO_CONTINUE`
   chunks. This runs before the guest's first instruction (fcvm loads with `resume_vm: false`),
   but it is NOT a barrier — the resume comes from the clone process — so a drain of real
   faults precedes every chunk and demand always beats speculation.
-- **Invalidation**: keyed by the memory image's identity (`len, mtime, ino, dev`), not a
-  content hash — SHA-256 of a 2 GiB image measures 1.4 s at 1.5 GB/s here, which costs more
-  than the mis-prefetch it would prevent. Safe because a working set only says WHICH offsets
-  to copy; the BYTES always come from the file being served, so a stale set wastes a copy and
-  can never corrupt a guest.
+- **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
+  (`len, mtime, ino, dev`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
+  image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would
+  prevent. The config digest makes atomically installed generations distinct even under inode
+  reuse. Safe because a working set only says WHICH offsets to copy; the BYTES always come
+  from the file being served, so a stale set wastes a copy and can never corrupt a guest.
 - **Isolation**: replay touches pages the guest never asked for, so it must stay private.
   `UFFDIO_COPY` writes into the clone's own anonymous memory, and `UFFDIO_CONTINUE` installs a
   read-only PTE that copies on write. Proven by `prefetched_pages_are_private_to_each_clone`
@@ -1809,20 +1809,15 @@ records the SET and replays it.
   only what they faulted) still hold per page — replay changes WHEN, not WHAT. Turn it off for
   workloads that spawn many clones which never run.
 
-**End of clone (`CloneExit`)**: a userfaultfd reports nothing when the process that created it
-dies — measured on this kernel, `poll` returns 0/revents=0 forever, `read` returns EAGAIN, and
-only `UFFDIO_COPY` reveals it with `ESRCH` — because the server holds its own reference so
-`userfaultfd_release` never runs. The server therefore takes `SO_PEERCRED` on the handshake
-socket and watches the connecting Firecracker with a `pidfd`. That is what ends a handler (and
-what lets the working set be recorded); before it, `VM exited` had never once been logged and
-every finished clone pinned its task and uffd until the server stopped.
-
-The three outcomes are distinct and must stay that way. `pidfd_open` returning `ESRCH` means
-the clone died between `connect` and the watch — a process we KNOW is dead, so it resolves
-IMMEDIATELY; folding it into "cannot watch" reintroduces exactly the hang this section
-describes (quiet uffd, pinned task, no recorded set, shutdown blocked on the `JoinSet` drain).
-"Cannot watch" (no peer pid, registration failed) must instead wait forever, because resolving
-early would tear down a LIVE clone's handler and hang its guest.
+**End of clone (`PeerVmm`)**: a userfaultfd reports nothing when the process that created it
+dies — measured on this kernel, `poll` returns 0/revents=0 forever and `read` returns EAGAIN —
+because the server still holds its own reference. The server therefore obtains the connecting
+Firecracker's pidfd atomically from the accepted socket with `SO_PEERPIDFD`, before handshake
+or admission, and selects that exact handle alongside UFFD readiness. PIDs are never
+re-resolved, so process reuse cannot redirect observation or the fail-closed SIGKILL. The pidfd
+edge ends a normal handler and triggers the awaited working-set merge; any handshake, event,
+replay, or merge-task service failure follows the existing fail-closed path and terminates the
+pinned VMM rather than leaving its guest wedged on an unserved fault.
 
 ### FUSE Parallelism (fuse-pipe)
 
