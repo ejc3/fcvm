@@ -122,3 +122,42 @@ struct virtio_vsock {
         "the DSB must execute after rx_lock acquisition and before the rx_run guard"
     );
 }
+
+/// Bash's `local value=$(command)` reports the status of `local`, not of the
+/// command substitution. A failed profile lookup must therefore be assigned
+/// separately or validation can incorrectly treat the missing value as an
+/// intentionally empty `patches_dir` and return success.
+#[test]
+fn kernel_patch_commands_do_not_mask_profile_lookup_failures() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", script_path.display()));
+
+    assert!(
+        !script.contains("local version=$(get_kernel_version \"$profile\")"),
+        "`local version=$(...)` masks a failed kernel-version lookup"
+    );
+    assert!(
+        !script.contains("local patches_dir=$(get_patches_dir \"$profile\")"),
+        "`local patches_dir=$(...)` masks a failed patch-directory lookup"
+    );
+    assert_eq!(
+        script.matches("local version patches_dir").count(),
+        4,
+        "create, finish, edit, and validate must declare lookup results before assignment"
+    );
+    assert_eq!(
+        script
+            .matches("version=$(get_kernel_version \"$profile\")")
+            .count(),
+        4,
+        "all four kernel-patch command flows must resolve the version separately"
+    );
+    assert_eq!(
+        script
+            .matches("patches_dir=$(get_patches_dir \"$profile\")")
+            .count(),
+        4,
+        "all four kernel-patch command flows must resolve patches_dir separately"
+    );
+}

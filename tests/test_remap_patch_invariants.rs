@@ -14,8 +14,9 @@
 //! the runtime path needs the patched guest kernel built and booted, which makes
 //! it a poor guard against the thing that actually went wrong — a rebase
 //! dropping a hunk. This catches that at `cargo test` speed, with no kernel.
-//! `test_ficlone_above_u32_boundary` (same commit) covers the runtime behaviour
-//! and skips when the kernel lacks support.
+//! `test_ficlone_cp_reflink_in_vm` covers the runtime behaviour by booting the
+//! exact patched nested-profile kernel; it never substitutes the runner's
+//! potentially older host kernel for the artifact under test.
 
 use std::path::PathBuf;
 
@@ -39,6 +40,41 @@ fn remap_patch_derives_length_from_the_request_not_the_u32_reply() {
          from `fuse_write_out.size`, a u32 that saturates above 4 GiB, so a \
          >4 GiB FICLONE records ~4 GiB and later reads come back short. This \
          hunk was dropped once already by the 6.18.3 -> 7.0.14 rebase."
+    );
+}
+
+/// The token alone is not enough: preserve the complete request-derived data
+/// flow so `effective = outarg.size` cannot satisfy the regression guard.
+#[test]
+fn remap_patch_propagates_the_prepared_length_through_inode_updates() {
+    let patch = patch_text();
+    let added: Vec<&str> = patch
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .map(|line| line.trim_start_matches('+').trim())
+        .collect();
+
+    assert!(
+        added.contains(&"effective = len;"),
+        "the clone result must come from the length prepared in the request"
+    );
+    assert!(
+        !added
+            .iter()
+            .any(|line| line.contains("effective = outarg.size")),
+        "the 32-bit reply must never feed the effective clone length"
+    );
+    assert!(
+        added
+            .iter()
+            .any(|line| line.contains("ALIGN(pos_out + effective, PAGE_SIZE)")),
+        "cache invalidation must cover the request-derived effective length"
+    );
+    assert!(
+        added.iter().any(|line| {
+            line.contains("fuse_write_update_attr(inode_out, pos_out + effective, effective)")
+        }),
+        "the destination inode update must use the request-derived effective length"
     );
 }
 
@@ -153,6 +189,44 @@ fn nested_profile_remap_test_does_not_skip_enosys() {
         !test.contains("code == 38"),
         "the nested-profile VM remap test still treats ENOSYS (exit 38) as a \
          skip, so CI can pass without exercising FICLONE end to end"
+    );
+}
+
+/// Runtime coverage must keep both sides of the 32-bit boundary proof on the
+/// branch-built guest kernel: exact length plus readable data at the last byte.
+#[test]
+fn nested_profile_remap_test_covers_request_lengths_above_u32() {
+    let test = repo_file("tests/test_remap_file_range.rs");
+    let helper_start = test
+        .find("async fn run_remap_test_in_vm")
+        .expect("nested-profile VM test helper is missing");
+    let test_start = test
+        .find("async fn test_ficlone_cp_reflink_in_vm")
+        .expect("FICLONE VM regression is missing");
+    let next_test = test[test_start + 1..]
+        .find("#[tokio::test]")
+        .map(|offset| test_start + 1 + offset)
+        .unwrap_or(test.len());
+    let helper = &test[helper_start..test_start];
+    let regression = &test[test_start..next_test];
+
+    assert!(
+        helper.contains("\"--kernel-profile\"") && helper.contains("\"nested\""),
+        "the >4 GiB regression must boot the branch-built nested-profile kernel"
+    );
+    assert!(
+        regression.contains("size=5368709120"),
+        "the runtime clone must remain larger than u32::MAX"
+    );
+    assert!(
+        regression.contains("stat -c %s dest.bin")
+            && regression.contains("test \"$actual\" -eq \"$size\""),
+        "the runtime regression must verify the exact destination length"
+    );
+    assert!(
+        regression.contains("tail -c 1 dest.bin")
+            && regression.contains("cmp source.tail dest.tail"),
+        "the runtime regression must read data beyond the 4 GiB boundary"
     );
 }
 
