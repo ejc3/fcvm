@@ -10,6 +10,12 @@
 # only when every sibling thread is also a zombie; a D-state vCPU sibling still owns
 # live KVM/MM resources and makes the whole group actionable.
 #
+# Every reported group also gets per-TID evidence (kernel stack, wchan, status)
+# captured BEFORE the kill attempt, and SIGKILL survivors get a second capture
+# plus reclaim/compaction diagnostics — see scripts/lib/vm-evidence.sh. The one
+# time this class struck (a SIGKILLed firecracker stuck non-zombie in D state),
+# the stacks were read by hand and lost with the recycled runner.
+#
 # Usage: ci-stray-vm-guard.sh <pre|post> [--dry-run]
 #
 #   --dry-run  report only, kill nothing. The default SIGKILL behavior is intended
@@ -27,6 +33,9 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
 	mkdir -p "$LOG_DIR"
 fi
 
+# shellcheck source=scripts/lib/vm-evidence.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/vm-evidence.sh"
+
 REPORT="$LOG_DIR/stray-vm-guard-${PHASE}.log"
 THREADS_BEFORE="$LOG_DIR/stray-vm-threads-${PHASE}-before.tsv"
 THREADS_AFTER="$LOG_DIR/stray-vm-threads-${PHASE}-after.tsv"
@@ -35,11 +44,12 @@ THREADS_AFTER="$LOG_DIR/stray-vm-threads-${PHASE}-after.tsv"
 : >"$THREADS_AFTER"
 exec > >(tee -a "$REPORT") 2>&1
 
-# Linux comm is limited to 15 bytes. `cloud-hypervisor` is therefore observed as
-# `cloud-hypervis`; the prefix intentionally covers both that and the full spelling.
-STRAY_RE='^(firecracker|cloud-hypervis|fcvm)'
+# The thread scan and group selection live in scripts/lib/vm-evidence.sh
+# (vm_scan_all_threads / vm_select_vm_groups), shared with the in-job D-state
+# watchdog so both report from the identical snapshot discipline.
 
 TEMPORARY_PREFIX="$LOG_DIR/.stray-vm-guard.$$"
+# shellcheck disable=SC2317  # reached via `trap ... EXIT`, not fall-through
 cleanup_temporary_files() {
 	rm -f -- "${TEMPORARY_PREFIX}".*
 }
@@ -47,96 +57,6 @@ trap cleanup_temporary_files EXIT
 
 new_temporary_file() {
 	mktemp "${TEMPORARY_PREFIX}.XXXXXX"
-}
-
-# Capture one process-table snapshot behind a hard deadline. We do not wait for a
-# timed-out reader after SIGKILL: if the kernel has already parked it in D state,
-# waiting would recreate the guard hang this script exists to diagnose.
-capture_all_threads() {
-	local destination=$1
-	local raw scan_stderr scan_pid deadline rc line
-	raw=$(new_temporary_file) || return 1
-	scan_stderr=$(new_temporary_file) || return 1
-	printf 'TGID\tTID\tPPID\tSTATE\tTHREAD\n' >"$destination"
-
-	# Do not let the scanner inherit the report pipe. If ps wedges in D state,
-	# SIGKILL remains pending and every inherited pipe writer stays open, making
-	# the workflow caller wait forever for EOF even after this guard exits.
-	ps -eL -o pid= -o lwp= -o ppid= -o state= -o comm= >"$raw" 2>"$scan_stderr" &
-	scan_pid=$!
-	deadline=$((SECONDS + SCAN_TIMEOUT_SECONDS))
-	while kill -0 "$scan_pid" 2>/dev/null; do
-		if [ "$SECONDS" -ge "$deadline" ]; then
-			kill -9 "$scan_pid" 2>/dev/null || true
-			disown "$scan_pid" 2>/dev/null || true
-			while IFS= read -r line || [ -n "$line" ]; do
-				printf 'process/thread scanner stderr: %s\n' "$line"
-			done <"$scan_stderr"
-			echo "process/thread scan timed out after ${SCAN_TIMEOUT_SECONDS}s"
-			return 124
-		fi
-		sleep 0.05
-	done
-
-	wait "$scan_pid"
-	rc=$?
-	while IFS= read -r line || [ -n "$line" ]; do
-		printf 'process/thread scanner stderr: %s\n' "$line"
-	done <"$scan_stderr"
-	if [ "$rc" -ne 0 ]; then
-		echo "process/thread scan failed with status ${rc}"
-		return "$rc"
-	fi
-
-	# Normalize the variable-width comm column to a tab-separated artifact. Thread
-	# names can contain spaces, so fields 5..NF are joined back together.
-	awk '
-		BEGIN { OFS = "\t" }
-		NF >= 5 {
-			thread = $5
-			for (i = 6; i <= NF; i++)
-				thread = thread " " $i
-			print $1, $2, $3, $4, thread
-		}
-	' "$raw" >>"$destination"
-}
-
-# Select complete task groups whose leader name is a VM process. Outputs one TGID
-# per live group and one per zombie-only group; the thread artifact always contains
-# every sibling, including the zombie leader itself.
-select_vm_groups() {
-	local all_threads=$1
-	local selected_threads=$2
-	local live_groups=$3
-	local zombie_groups=$4
-
-	awk -F '\t' -v re="$STRAY_RE" \
-		-v selected="$selected_threads" \
-		-v live_out="$live_groups" \
-		-v zombie_out="$zombie_groups" '
-		BEGIN { OFS = "\t" }
-		NR == 1 { header = $0; next }
-		{
-			rows[++count] = $0
-			tgid[count] = $1
-			if ($1 == $2 && $5 ~ re)
-				target[$1] = 1
-			if ($4 !~ /^Z/)
-				live[$1] = 1
-		}
-		END {
-			print header > selected
-			for (i = 1; i <= count; i++)
-				if (tgid[i] in target)
-					print rows[i] >> selected
-			for (id in target) {
-				if (live[id])
-					print id > live_out
-				else
-					print id > zombie_out
-			}
-		}
-	' "$all_threads"
 }
 
 print_thread_table() {
@@ -156,12 +76,12 @@ scan_vm_groups() {
 	all=$(new_temporary_file) || return 1
 	: >"$live"
 	: >"$zombies"
-	if ! capture_all_threads "$all"; then
+	if ! vm_scan_all_threads "$all" "$SCAN_TIMEOUT_SECONDS" "$TEMPORARY_PREFIX"; then
 		# Preserve a syntactically useful artifact even when enumeration failed.
 		printf 'TGID\tTID\tPPID\tSTATE\tTHREAD\n' >"$selected"
 		return 1
 	fi
-	select_vm_groups "$all" "$selected" "$live" "$zombies"
+	vm_select_vm_groups "$all" "$selected" "$live" "$zombies"
 }
 
 LIVE_BEFORE=$(new_temporary_file)
@@ -193,6 +113,11 @@ fi
 
 print_thread_table "$THREADS_BEFORE"
 
+# Evidence first, kill second: SIGKILL destroys exactly the state (stacks,
+# wchan, pending-signal masks) that explains a survivor, and the survivor case
+# is the one that recycles the runner before anything else can look.
+vm_evidence_group "$THREADS_BEFORE" "pre-kill, ${PHASE}" "${STRAY_TGIDS[@]}"
+
 if [ "$DRY_RUN" -eq 1 ]; then
 	echo "::warning title=Stray microVMs (${PHASE}, dry-run)::${COUNT} live process group(s) found; NOT killing them (--dry-run)."
 	echo "--dry-run: reporting only, killing nothing"
@@ -223,6 +148,12 @@ mapfile -t SURVIVOR_TGIDS <"$LIVE_AFTER"
 echo "killed ${COUNT} process group(s), still live after SIGKILL: ${#SURVIVOR_TGIDS[@]}"
 if [ "${#SURVIVOR_TGIDS[@]}" -gt 0 ]; then
 	print_thread_table "$THREADS_AFTER"
+	# A survivor is a task the kernel could not reap: its status now shows the
+	# pending SIGKILL bit on a non-zombie task, and whatever owns it (the ARM
+	# case: kcompactd holding a folio lock under do_swap_page) is visible only
+	# while the survivor exists. Capture both before this runner disappears.
+	vm_evidence_group "$THREADS_AFTER" "post-SIGKILL survivors, ${PHASE}" "${SURVIVOR_TGIDS[@]}"
+	vm_evidence_mm_diagnostics 150
 	echo "::warning title=Unkillable microVMs (${PHASE})::${#SURVIVOR_TGIDS[@]} process group(s) survived SIGKILL; D-state means this runner needs replacement."
 fi
 

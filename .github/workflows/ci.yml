@@ -641,6 +641,11 @@ jobs:
       - name: test-root
         working-directory: fcvm
         run: |
+          # Stream teardown-wedge evidence into THIS step's live log. When a
+          # SIGKILLed VMM wedges the runner (run 31363886999), the ephemeral
+          # instance is terminated with its artifacts — the live log pipe is
+          # the only channel that survives, so the watchdog must share it.
+          sudo ./scripts/ci-dstate-watchdog.sh & WD=$!
           SNAPSHOT_DIR="${FCVM_DATA_DIR:-/mnt/fcvm-btrfs/root}/snapshots"
           for i in $(seq 1 ${{ matrix.test_runs }}); do
             echo ""
@@ -659,6 +664,7 @@ jobs:
               echo "✓ Run 2 complete - snapshot hit paths tested"
             fi
           done
+          sudo kill $WD 2>/dev/null || true
       - name: bench-vm
         if: matrix.mode == 'SnapshotEnabled'
         working-directory: fcvm
