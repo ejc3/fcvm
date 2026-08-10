@@ -177,6 +177,25 @@ def reap_orphan(pid, note, timeout=5.0):
         time.sleep(0.01)
 
 
+@contextmanager
+def pending_harness_signal(signum):
+    """Leave the harness in the state a real INT/TERM leaves it in, then clear.
+
+    `record_harness_interrupt` is the harness's own handler, so this is the same
+    module state a delivered signal produces; `signum=0` arms nothing and only
+    guarantees the flag is cleared afterwards for whoever injects it later. The
+    flag is global, so an uncleared one would make every later test in the
+    process behave as though the run were shutting down.
+    """
+    reqbench._pending_harness_signal = 0
+    if signum:
+        reqbench.record_harness_interrupt(signum, None)
+    try:
+        yield
+    finally:
+        reqbench._pending_harness_signal = 0
+
+
 def assert_sigkilled(test, pid, status, note):
     """Assert `pid` was KILLED, from its exit status where we have one.
 
@@ -4563,6 +4582,93 @@ class FailureProbeCapture(unittest.TestCase):
             note = ("the timeout killed the exec wrapper but left its "
                     "guest-side work")
             assert_sigkilled(self, grandchild, reap_orphan(grandchild, note), note)
+
+    def test_a_pending_termination_signal_skips_the_probe_entirely(self):
+        """A probe that delays a shutdown can leak the clone it came to explain.
+
+        RED BEFORE THE FIX: the handler only RECORDS INT/TERM, so a signal that
+        landed after the request's last interrupt poll left the probe free to
+        spend its whole budget before teardown started, which is where a job
+        runner escalates to SIGKILL:
+
+            AssertionError: 2.017 not less than 0.5 : the probe ran with a
+            termination signal pending
+
+        The signal is injected through the harness's own handler, so this is the
+        state a real INT/TERM leaves behind, not a stand-in for it.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            os.makedirs(state_dir)
+            stub, _, _, _ = self._stub_clone(d, state_dir, "rb-x-0-fast", 9222,
+                                             exec_mode="hang")
+            probe = reqbench.FailureProbe(
+                fcvm=stub, data_root=d, out_dir=d, run_id="0" * 32, cdp_port=9222,
+                command_timeout_s=1.0, budget_s=60.0,
+            )
+            rec = {"arm": "cdp", "rep": 0, "ok": False, "error": "TimeoutError"}
+            with pending_harness_signal(signal.SIGTERM):
+                started = time.monotonic()
+                probe.observe(rec, name="rb-x-0-fast", fcvm_pid=os.getpid(),
+                              state_path="", log_path="", endpoint="")
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.5,
+                            "the probe ran with a termination signal pending")
+            self.assertEqual(rec["probe"]["skipped"],
+                             f"termination signal {int(signal.SIGTERM)} pending")
+            self.assertEqual(rec["probe"]["path"], "")
+            self.assertEqual(
+                [n for n in os.listdir(d) if n.endswith(".probe.json")], [],
+                "a skipped probe must not leave a half-written dump",
+            )
+
+    def test_a_signal_arriving_mid_capture_stops_the_remaining_steps(self):
+        """RED BEFORE THE FIX: nothing inside `capture` looked at the pending
+        signal, so a capture already under way kept going step by step:
+
+            AssertionError: 'active_mutating' unexpectedly found in
+            dict_keys(['passive', 'active_mutating'])
+             : the steps after the signal must not run
+
+        The signal is injected from inside the first probe command, which is
+        where a capture spends nearly all of its time and therefore where a real
+        one is most likely to land.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            probe = reqbench.FailureProbe(
+                fcvm="/nonexistent/fcvm", data_root=d, out_dir=d,
+                run_id="0" * 32, cdp_port=9222, command_timeout_s=1.0,
+                budget_s=60.0,
+            )
+            real_run = reqbench.run_probe_command
+            fired = []
+
+            def signal_during_the_first_command(*args, **kwargs):
+                if not fired:
+                    fired.append(True)
+                    reqbench.record_harness_interrupt(signal.SIGINT, None)
+                return real_run(*args, **kwargs)
+
+            reqbench.run_probe_command = signal_during_the_first_command
+            try:
+                with pending_harness_signal(0):
+                    dump = probe.capture(
+                        role="failure", rec={"arm": "cdp", "rep": 0, "ok": False},
+                        name="rb-x-0-fast", fcvm_pid=os.getpid(), state_path="",
+                        log_path="", endpoint="127.0.0.1:9",
+                    )
+            finally:
+                reqbench.run_probe_command = real_run
+            self.assertTrue(fired, "no probe command ran, so nothing was injected")
+            self.assertIn("passive", dump["guest"],
+                          "the step that was already running must be kept")
+            self.assertNotIn("active_mutating", dump["guest"],
+                             "the steps after the signal must not run")
+            self.assertEqual(dump["interrupted_by_signal"], int(signal.SIGINT))
+            self.assertTrue(
+                [e for e in dump["errors"] if "termination signal" in e],
+                f"the skipped steps must name the signal: {dump['errors']}",
+            )
 
     def test_the_capture_stops_at_its_budget_and_says_so(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1175,6 +1175,18 @@ def record_harness_interrupt(signum, _frame):
         _pending_harness_signal = signum
 
 
+def harness_interrupt_pending() -> int:
+    """The recorded INT/TERM, or 0. For work that must yield without unwinding.
+
+    `raise_if_harness_interrupted` is for the request scope, which owns a clone
+    and has to reach its teardown before it unwinds. Anything OPTIONAL that runs
+    between the request and that teardown has the opposite obligation: get out
+    of the way, because the shutdown clock is already running and whoever sent
+    the signal may escalate to SIGKILL.
+    """
+    return _pending_harness_signal
+
+
 def raise_if_harness_interrupted() -> None:
     if _pending_harness_signal:
         raise HarnessInterrupted(f"received signal {_pending_harness_signal}")
@@ -2263,9 +2275,26 @@ class FailureProbe:
 
         Wrapped whole: a probe that raises would abort a request that had
         already produced its answer, which is strictly worse than no probe.
+
+        A pending INT/TERM outranks the evidence. The signal handler only
+        RECORDS the signal, so nothing here is interrupted asynchronously and a
+        capture that began before the signal would run its full budget with the
+        clone still up and the harness's teardown behind it — long enough for a
+        job runner to escalate to SIGKILL and leave behind exactly the clone this
+        probe exists to diagnose. So a signal that is already pending skips the
+        capture outright, and one that arrives mid-capture stops it at the next
+        step (`capture`'s `interrupted`).
         """
         role = self.role_for(rec)
         if role is None:
+            return
+        pending = harness_interrupt_pending()
+        if pending:
+            rec["probe"] = {
+                "role": role,
+                "path": "",
+                "skipped": f"termination signal {pending} pending",
+            }
             return
         try:
             dump = self.capture(
@@ -2284,6 +2313,7 @@ class FailureProbe:
                 "control_path": dump.get("control_path", ""),
                 "elapsed_ms": dump.get("elapsed_ms"),
                 "budget_exhausted": dump.get("budget_exhausted", False),
+                "interrupted_by_signal": dump.get("interrupted_by_signal", 0),
                 "errors": errors[:10],
                 "error_count": len(errors),
             }
@@ -2350,13 +2380,29 @@ class FailureProbe:
         def remaining():
             return deadline - time.monotonic()
 
+        def interrupted(step):
+            """Has a termination signal arrived since the capture began?
+
+            Every step is optional evidence and the teardown waiting behind them
+            is not, so the first step to notice ends the capture. Recorded on the
+            dump, so a short dump reads as "we left early" rather than as a guest
+            that answered nothing.
+            """
+            pending = harness_interrupt_pending()
+            if pending:
+                dump["interrupted_by_signal"] = pending
+                note(step, f"skipped, termination signal {pending} pending")
+            return bool(pending)
+
         def budget_for(step):
-            """Timeout for one step, or None when the budget is spent.
+            """Timeout for one step, or None when the step must not run.
 
             Returns `(timeout, budget_limited)` so a step that got a shortened
             timeout can say so on its own record instead of reporting an
             indistinguishable `timed_out`.
             """
+            if interrupted(step):
+                return None
             left = remaining()
             if left <= 0:
                 dump["budget_exhausted"] = True
@@ -2416,9 +2462,10 @@ class FailureProbe:
         else:
             note("holder_procfs", f"no holder pid in state: {holder_pid!r}")
 
-        dump["host"]["cdp_connect_now"] = probe_tcp_connect(
-            dump["endpoint"], min(2.0, max(0.1, remaining()))
-        )
+        if not interrupted("cdp_connect_now"):
+            dump["host"]["cdp_connect_now"] = probe_tcp_connect(
+                dump["endpoint"], min(2.0, max(0.1, remaining()))
+            )
 
         # ---- guest, passive. The reason this probe exists: vsock exec still
         # works while the IP path does not, so the broken guest can be asked.
@@ -2464,6 +2511,7 @@ class FailureProbe:
         dump["host"]["log_markers"] = probe_log_markers(log_path)
         dump["elapsed_ms"] = (time.monotonic() - started) * 1000
         dump.setdefault("budget_exhausted", False)
+        dump.setdefault("interrupted_by_signal", 0)
         return dump
 
     def guest_active_sections(self):
@@ -2531,6 +2579,13 @@ class FailureProbe:
         attempts = []
         resolved = None
         for variant, flags in variants:
+            pending = harness_interrupt_pending()
+            if pending:
+                attempts.append({
+                    "nsenter_variant": variant,
+                    "error": f"skipped, termination signal {pending} pending",
+                })
+                continue
             timeout = min(self.command_timeout_s, deadline - time.monotonic())
             if timeout <= 0:
                 attempts.append({"nsenter_variant": variant,
