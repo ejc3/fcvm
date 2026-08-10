@@ -1115,6 +1115,88 @@ async fn wait_for_peer_vmm_exit(
     Ok(())
 }
 
+/// Per-fault trace, enabled only by `FCVM_UFFD_FAULT_TRACE=<dir>`.
+///
+/// Records `(guest_file_offset, ns_before_resolve, ns_after_resolve)` for every fault this
+/// handler serves and writes them to `<dir>/<serve_pid>-<vm_id>.faults` as little-endian u64
+/// triples when the handler exits. The offset is into the snapshot memory file, NOT a host
+/// virtual address: host addresses differ per clone, so only the file offset can be compared
+/// between clones of the same snapshot.
+///
+/// This is what `bench/chromium/faultbench.py` collects and `faultanalyze.py` reduces; it is
+/// the instrument behind the fault-count, cross-clone Jaccard and sequentiality figures the
+/// `working_set` module cites.
+///
+/// It is a measurement facility, not part of serving: it costs one `Vec::push` and two
+/// `Instant::elapsed()` calls per fault, and is entirely inert unless the env var is set.
+/// The flush lives in `Drop` so that every handler exit path — clean VM exit, `VmGone`
+/// mid-CONTINUE, or an error return — writes the trace.
+struct FaultTrace {
+    path: PathBuf,
+    origin: std::time::Instant,
+    records: Vec<[u64; 3]>,
+}
+
+impl FaultTrace {
+    fn from_env(vm_id: &str, origin: std::time::Instant) -> Option<Self> {
+        let dir = PathBuf::from(std::env::var(FAULT_TRACE_ENV).ok()?);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(
+                target: "uffd",
+                dir = %dir.display(),
+                error = %e,
+                "FCVM_UFFD_FAULT_TRACE directory not usable - fault tracing disabled"
+            );
+            return None;
+        }
+        Some(Self {
+            path: dir.join(format!("{}-{}.faults", std::process::id(), vm_id)),
+            origin,
+            // 2GiB of 4KiB granules is 512Ki faults worst case; start big enough that
+            // the hot path does not reallocate for a typical restore working set.
+            records: Vec::with_capacity(1 << 16),
+        })
+    }
+
+    #[inline]
+    fn now_ns(&self) -> u64 {
+        self.origin.elapsed().as_nanos() as u64
+    }
+
+    #[inline]
+    fn record(&mut self, file_offset: u64, before_ns: u64, after_ns: u64) {
+        self.records.push([file_offset, before_ns, after_ns]);
+    }
+}
+
+impl Drop for FaultTrace {
+    fn drop(&mut self) {
+        let mut buf = Vec::with_capacity(self.records.len() * 24);
+        for rec in &self.records {
+            for v in rec {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        match std::fs::write(&self.path, &buf) {
+            Ok(()) => info!(
+                target: "uffd",
+                path = %self.path.display(),
+                faults = self.records.len(),
+                "wrote UFFD fault trace"
+            ),
+            Err(e) => warn!(
+                target: "uffd",
+                path = %self.path.display(),
+                error = %e,
+                "failed to write UFFD fault trace"
+            ),
+        }
+    }
+}
+
+/// Record every served fault into `<dir>` as a binary trace. Unset means no tracing.
+pub const FAULT_TRACE_ENV: &str = "FCVM_UFFD_FAULT_TRACE";
+
 struct VmContext<'a> {
     vm_id: &'a str,
     mappings: &'a [GuestRegionUffdMapping],
@@ -1129,6 +1211,8 @@ struct VmState {
     pending_continues: std::collections::BTreeMap<usize, std::time::Instant>,
     recorded: Option<PageSet>,
     started: std::time::Instant,
+    /// `Some` only under `FCVM_UFFD_FAULT_TRACE`; see [`FaultTrace`].
+    trace: Option<FaultTrace>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1229,11 +1313,13 @@ async fn handle_vm_page_faults(
         page_mask,
         mem_size,
     };
+    let started = std::time::Instant::now();
     let mut state = VmState {
         fault_count: 0,
         pending_continues: std::collections::BTreeMap::new(),
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
-        started: std::time::Instant::now(),
+        started,
+        trace: FaultTrace::from_env(&vm_id, started),
     };
 
     let result = replay_then_serve(
@@ -1564,6 +1650,10 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         recorder.insert_range(offset_in_file as u64, page_size as u64);
                     }
 
+                    // Stamped before the resolve so each trace record brackets exactly the
+                    // ioctl that releases the faulting vCPU. Zero when tracing is off.
+                    let trace_t0 = state.trace.as_ref().map(FaultTrace::now_ns).unwrap_or(0);
+
                     let mmap = match source {
                         PageSource::Minor { .. } => {
                             // MINOR mode: the page is already in the page cache of the shared
@@ -1605,6 +1695,10 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                         .or_insert_with(std::time::Instant::now);
                                 }
                             }
+                            if let Some(t) = state.trace.as_mut() {
+                                let t1 = t.now_ns();
+                                t.record(offset_in_file as u64, trace_t0, t1);
+                            }
                             continue;
                         }
                         PageSource::Copy { mmap } => mmap,
@@ -1642,6 +1736,10 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                 "UFFD zero-page copy failed"
                             );
                             return Err(e.into());
+                        }
+                        if let Some(t) = state.trace.as_mut() {
+                            let t1 = t.now_ns();
+                            t.record(offset_in_file as u64, trace_t0, t1);
                         }
                         continue;
                     }
@@ -1689,6 +1787,10 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                     fault_addr = format!("0x{:x}", fault_page),
                                     "UFFD copy skipped - page already filled (EEXIST)"
                                 );
+                                if let Some(t) = state.trace.as_mut() {
+                                    let t1 = t.now_ns();
+                                    t.record(offset_in_file as u64, trace_t0, t1);
+                                }
                                 continue;
                             }
                         }
@@ -1717,6 +1819,11 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                             "UFFD copy failed"
                         );
                         return Err(e.into());
+                    }
+
+                    if let Some(t) = state.trace.as_mut() {
+                        let t1 = t.now_ns();
+                        t.record(offset_in_file as u64, trace_t0, t1);
                     }
                 }
                 Event::Remove { start, end } => {
@@ -2268,6 +2375,41 @@ pub fn preflight_clone_hugepages(memory_mib: usize) -> Result<()> {
 mod tests {
     use super::*;
     use nix::fcntl::{Flock, FlockArg};
+
+    /// The fault trace is only useful if `faultanalyze.py` can read it, and that reader is
+    /// hardcoded to `struct.unpack_from("<QQQ", data, i * 24)`. Encoding drift here would not
+    /// fail anything — it would silently reinterpret offsets as timestamps and yield a
+    /// confident wrong answer, so the layout is pinned against the exact reader.
+    #[test]
+    fn fault_trace_writes_the_little_endian_triples_faultanalyze_reads() {
+        const RECORD_BYTES: usize = 24;
+        let dir = tempfile::tempdir().expect("create trace directory");
+        let path = dir.path().join("trace.faults");
+
+        let mut trace = FaultTrace {
+            path: path.clone(),
+            origin: std::time::Instant::now(),
+            records: Vec::new(),
+        };
+        trace.record(0x1000, 10, 20);
+        trace.record(u64::MAX, 0, u64::MAX);
+        drop(trace);
+
+        let raw = std::fs::read(&path).expect("trace file written on drop");
+        assert_eq!(raw.len(), 2 * RECORD_BYTES, "one 24-byte triple per fault");
+
+        // Decode exactly as faultanalyze.py does.
+        let decoded: Vec<[u64; 3]> = raw
+            .chunks_exact(RECORD_BYTES)
+            .map(|rec| {
+                let field = |i: usize| {
+                    u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().expect("8-byte field"))
+                };
+                [field(0), field(1), field(2)]
+            })
+            .collect();
+        assert_eq!(decoded, vec![[0x1000, 10, 20], [u64::MAX, 0, u64::MAX]]);
+    }
 
     /// A full demand batch means events remain queued. Speculative replay must not issue an
     /// ioctl until those faults have had another bounded drain turn.
