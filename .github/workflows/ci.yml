@@ -927,10 +927,15 @@ jobs:
       - uses: actions/checkout@v7
         if: needs.skip-check.outputs.skip != 'true'
       - name: Download all artifacts
-        if: needs.skip-check.outputs.skip != 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
         uses: actions/download-artifact@v7
         with:
           path: /tmp/ci-artifacts
+      # Also gated on `changes`: this analyses the VM matrix's artifacts, and a
+      # docs-only PR skips that matrix, so there is nothing to analyse and the
+      # script exits non-zero on the empty directory. Summary must still be
+      # green for those PRs — it is the required check that proves the gate
+      # ran, not a claim that the matrix did.
       - name: Analyze CI run
-        if: needs.skip-check.outputs.skip != 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
