@@ -907,6 +907,10 @@ async fn handle_vm_page_faults(
 
     let mut fault_count = 0u64;
     let start_time = std::time::Instant::now();
+    // PROF (temporary, local only)
+    let mut prof = ProfStats::default();
+    let mut evbuf = userfaultfd::EventBuffer::new(MAX_EVENTS_PER_BATCH);
+    let mut next_prof_dump = PROF_DUMP_EVERY;
 
     // MINOR faults whose UFFDIO_CONTINUE came back `EAGAIN` (`mmap_changing` was set),
     // keyed by page address, value = retry attempts so far. The faulting vCPU sleeps
@@ -960,8 +964,13 @@ async fn handle_vm_page_faults(
                 &mut fault_count,
                 &mut pending_continues,
                 start_time,
+                &mut prof,
+                &mut evbuf,
             )? {
-                DrainOutcome::VmExited => return Ok(()),
+                DrainOutcome::VmExited => {
+                    prof.dump(&vm_id, fault_count, "exit");
+                    return Ok(());
+                }
                 DrainOutcome::QueueDrained => guard.clear_ready(),
                 // Events are still queued. Deliberately do NOT clear readiness: AsyncFd is
                 // edge-triggered, and the kernel raises no new edge for events already
@@ -1004,6 +1013,12 @@ async fn handle_vm_page_faults(
             }
         }
 
+        // PROF: periodic dump so a long-lived clone still reports.
+        if fault_count >= next_prof_dump {
+            prof.dump(&vm_id, fault_count, "periodic");
+            next_prof_dump = fault_count + PROF_DUMP_EVERY;
+        }
+
         // Fairness: one clone's fault storm must not own a runtime worker forever. The
         // events left in the queue are picked up on the next pass (readiness was left set).
         if yield_after_batch {
@@ -1011,6 +1026,91 @@ async fn handle_vm_page_faults(
         }
     }
 }
+
+// ===================== TEMPORARY LOCAL-ONLY PROFILING INSTRUMENTATION =====================
+// DO NOT COMMIT. Measures (a) how many uffd events are actually queued at once and
+// (b) how long UFFDIO_COPY takes (a proxy for blocking on a page-cache miss).
+// Dumped to the log every PROF_DUMP_EVERY faults and once when the clone exits.
+
+const PROF_DUMP_EVERY: u64 = 1_000;
+
+#[derive(Default)]
+struct ProfStats {
+    /// Number of `uffd_msg` structs returned by a single read(2) — the true instantaneous
+    /// queue depth. Buckets: 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-127, 128+
+    msgs_per_read: [u64; 9],
+    /// Number of events handled in one `drain_events` call, same bucketing.
+    events_per_drain: [u64; 9],
+    /// UFFDIO_COPY duration, log2 microsecond buckets:
+    /// <1us, 1-2, 2-4, 4-8, 8-16, 16-32, 32-64, 64-128, 128-256, 256-512, 512-1024, >=1024us
+    copy_us: [u64; 12],
+    reads: u64,
+    empty_reads: u64,
+    drains: u64,
+    copies: u64,
+    copy_ns_total: u64,
+    copy_ns_max: u64,
+}
+
+fn prof_bucket(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        65..=127 => 7,
+        _ => 8,
+    }
+}
+
+fn prof_us_bucket(ns: u64) -> usize {
+    let us = ns / 1000;
+    match us {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        4..=7 => 3,
+        8..=15 => 4,
+        16..=31 => 5,
+        32..=63 => 6,
+        64..=127 => 7,
+        128..=255 => 8,
+        256..=511 => 9,
+        512..=1023 => 10,
+        _ => 11,
+    }
+}
+
+impl ProfStats {
+    fn dump(&self, vm_id: &str, fault_count: u64, tag: &str) {
+        let avg_ns = if self.copies > 0 {
+            self.copy_ns_total / self.copies
+        } else {
+            0
+        };
+        info!(
+            target: "uffd",
+            vm_id = %vm_id,
+            tag,
+            faults = fault_count,
+            reads = self.reads,
+            empty_reads = self.empty_reads,
+            drains = self.drains,
+            copies = self.copies,
+            copy_avg_ns = avg_ns,
+            copy_max_ns = self.copy_ns_max,
+            msgs_per_read = ?self.msgs_per_read,
+            events_per_drain = ?self.events_per_drain,
+            copy_us_hist = ?self.copy_us,
+            "PROF"
+        );
+    }
+}
+// =================== END TEMPORARY LOCAL-ONLY PROFILING INSTRUMENTATION ===================
 
 /// How a [`drain_events`] pass ended.
 enum DrainOutcome {
@@ -1036,18 +1136,47 @@ fn drain_events(
     fault_count: &mut u64,
     pending_continues: &mut std::collections::BTreeMap<usize, u32>,
     start_time: std::time::Instant,
+    prof: &mut ProfStats,
+    evbuf: &mut userfaultfd::EventBuffer,
 ) -> Result<DrainOutcome> {
     {
         let mut handled = 0usize;
+        // PROF: events read from the kernel in one read(2) but not yet processed.
+        let mut ready: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
+        let mut read_err = false;
         // Read available events (non-blocking), bounded by the batch size
         loop {
             if handled >= MAX_EVENTS_PER_BATCH {
+                prof.drains += 1;
+                prof.events_per_drain[prof_bucket(handled)] += 1;
                 return Ok(DrainOutcome::BatchFull);
             }
-            let event = match guard.get_inner().read_event() {
-                Ok(Some(event)) => event,
-                Ok(None) => break, // No more events ready
-                Err(_) => {
+            if ready.is_empty() && !read_err {
+                match guard.get_inner().read_events(evbuf) {
+                    Ok(iter) => {
+                        for ev in iter {
+                            match ev {
+                                Ok(ev) => ready.push_back(ev),
+                                Err(_) => {
+                                    read_err = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if ready.is_empty() {
+                            prof.empty_reads += 1;
+                        } else {
+                            prof.reads += 1;
+                            prof.msgs_per_read[prof_bucket(ready.len())] += 1;
+                        }
+                    }
+                    Err(_) => read_err = true,
+                }
+            }
+            let event = match ready.pop_front() {
+                Some(event) => event,
+                None if !read_err => break, // No more events ready
+                None => {
                     // UFFD closed = VM exited
                     let elapsed = start_time.elapsed();
                     let rate = if elapsed.as_secs_f64() > 0.0 {
@@ -1113,7 +1242,17 @@ fn drain_events(
                                     fault_page
                                 ));
                             }
-                            match continue_page(guard.get_inner(), vm_id, fault_page, page_size)? {
+                            // PROF: time UFFDIO_CONTINUE the same way UFFDIO_COPY is timed,
+                            // so the two modes are directly comparable.
+                            let t0 = std::time::Instant::now();
+                            let outcome =
+                                continue_page(guard.get_inner(), vm_id, fault_page, page_size)?;
+                            let ns = t0.elapsed().as_nanos() as u64;
+                            prof.copies += 1;
+                            prof.copy_ns_total += ns;
+                            prof.copy_ns_max = prof.copy_ns_max.max(ns);
+                            prof.copy_us[prof_us_bucket(ns)] += 1;
+                            match outcome {
                                 ContinueOutcome::Resolved => {}
                                 ContinueOutcome::VmGone => return Ok(DrainOutcome::VmExited),
                                 ContinueOutcome::Retry => {
@@ -1180,14 +1319,23 @@ fn drain_events(
 
                     let copy_result = if bytes_available >= page_size {
                         let page_data = &mmap[offset_in_file..offset_in_file + page_size];
-                        unsafe {
+                        // PROF: time the ioctl alone. A cold page-cache miss on the source
+                        // mapping is taken INSIDE this call (copy_from_user on the mmap).
+                        let t0 = std::time::Instant::now();
+                        let r = unsafe {
                             guard.get_inner().copy(
                                 page_data.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
                                 page_size,
                                 true,
                             )
-                        }
+                        };
+                        let ns = t0.elapsed().as_nanos() as u64;
+                        prof.copies += 1;
+                        prof.copy_ns_total += ns;
+                        prof.copy_ns_max = prof.copy_ns_max.max(ns);
+                        prof.copy_us[prof_us_bucket(ns)] += 1;
+                        r
                     } else {
                         // Partial page at end of file: copy available data, zero-fill rest
                         // Heap-allocate (2MB on stack would overflow for hugepages)
@@ -1366,6 +1514,8 @@ fn drain_events(
                 }
             }
         }
+        prof.drains += 1;
+        prof.events_per_drain[prof_bucket(handled)] += 1;
     }
     Ok(DrainOutcome::QueueDrained)
 }
