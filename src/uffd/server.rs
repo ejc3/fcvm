@@ -219,6 +219,19 @@ struct PeerVmm {
     pidfd: OwnedFd,
 }
 
+/// A non-owning view that lets Tokio register [`PeerVmm::pidfd`] without duplicating it.
+///
+/// `AsyncFd` only needs `AsRawFd`, but this toolchain does not implement that trait for
+/// `&OwnedFd`. The `PeerVmm` borrowed by the handler outlives this wrapper, so the raw fd
+/// remains valid until `AsyncFd` is dropped.
+struct PidfdRef<'a>(&'a OwnedFd);
+
+impl AsRawFd for PidfdRef<'_> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 impl PeerVmm {
     /// Pin the process that opened `stream`, atomically.
     ///
@@ -665,7 +678,7 @@ impl UffdServer {
         }
 
         // Stop accepting new connections, but keep serving page faults for VMs that are
-        // already connected until each one closes its uffd (i.e. its Firecracker exits).
+        // already connected until each Firecracker exit is observed through its pidfd.
         // Aborting the handlers here would close the uffds while those VMs are still
         // running. Firecracker holds its OWN uffd reference for the VM's lifetime, so the
         // kernel never falls through to zero-fill; those guests would WEDGE instead, both
@@ -715,7 +728,7 @@ async fn serve_clone_fail_closed(
     source: Arc<PageSource>,
     peer: PeerVmm,
 ) {
-    match serve_clone(vm_id, stream, source).await {
+    match serve_clone(vm_id, stream, source, &peer).await {
         Ok(()) => info!(
             target: "uffd",
             vm_id = %vm_id,
@@ -745,7 +758,12 @@ async fn serve_clone_fail_closed(
 /// means we hold an fd we cannot use), and the fault handler can fail after serving for
 /// hours. In both cases the uffd ends up closed while the guest is alive, which the kernel
 /// turns into zero-filled pages.
-async fn serve_clone(vm_id: &str, stream: UnixStream, source: Arc<PageSource>) -> Result<()> {
+async fn serve_clone(
+    vm_id: &str,
+    stream: UnixStream,
+    source: Arc<PageSource>,
+    peer: &PeerVmm,
+) -> Result<()> {
     let (uffd, mappings) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(stream, &source))
         .await
         .map_err(|_| anyhow!("UFFD handshake did not complete within {HANDSHAKE_TIMEOUT:?}"))?
@@ -759,7 +777,7 @@ async fn serve_clone(vm_id: &str, stream: UnixStream, source: Arc<PageSource>) -
         mappings.len()
     );
 
-    handle_vm_page_faults(vm_id.to_string(), uffd, mappings, source).await
+    handle_vm_page_faults(vm_id.to_string(), uffd, mappings, source, peer).await
 }
 
 /// Whether a UFFDIO_ZEROPAGE error means the range (or part of it) is already populated.
@@ -906,6 +924,7 @@ async fn handle_vm_page_faults(
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
     source: Arc<PageSource>,
+    peer: &PeerVmm,
 ) -> Result<()> {
     // Derive page size from mappings (all regions use the same page size)
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
@@ -927,6 +946,14 @@ async fn handle_vm_page_faults(
 
     // Wrap UFFD in AsyncFd for tokio integration
     let async_uffd = AsyncFd::new(uffd).context("creating AsyncFd for UFFD")?;
+    // Firecracker keeps its own UFFD reference for the VMM's lifetime, and this handler
+    // owns another one. Consequently, a normal VMM exit does not make OUR UFFD readable
+    // or close it: without a separate lifetime signal this task parks forever, retaining
+    // both fds and the server's admitted-clone slot. The pidfd already pins the exact VMM
+    // process, so wait on that same handle alongside page faults. A pidfd stays readable
+    // after exit, which also closes the race where the VMM dies before this registration.
+    let async_peer_pidfd = AsyncFd::new(PidfdRef(&peer.pidfd))
+        .context("registering peer VMM pidfd with the reactor")?;
 
     let mut fault_count = 0u64;
     let start_time = std::time::Instant::now();
@@ -950,22 +977,54 @@ async fn handle_vm_page_faults(
         // Wait for UFFD to be readable — but never park indefinitely while resolved-later
         // faults are waiting, because no new event will ever arrive for THEM.
         let maybe_guard = if pending_continues.is_empty() {
-            match async_uffd.readable().await {
-                Ok(guard) => Some(guard),
-                Err(e) => {
-                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
-                    return Err(e.into());
+            tokio::select! {
+                // If both descriptors become ready while the VMM is exiting, its pidfd is
+                // authoritative: this is an ordinary end of life, not a UFFD-service
+                // failure that should enter the fail-closed kill path.
+                biased;
+                peer_ready = async_peer_pidfd.readable() => {
+                    let _peer_ready = peer_ready.context("waiting for peer VMM exit")?;
+                    info!(
+                        target: "uffd",
+                        vm_id = %vm_id,
+                        peer_pid = peer.pid,
+                        "peer VMM exited; stopping page-fault handler"
+                    );
+                    return Ok(());
+                }
+                uffd_ready = async_uffd.readable() => match uffd_ready {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
+                        return Err(e.into());
+                    }
                 }
             }
         } else {
-            match tokio::time::timeout(CONTINUE_RETRY_DELAY, async_uffd.readable()).await {
-                Ok(Ok(guard)) => Some(guard),
-                Ok(Err(e)) => {
-                    error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
-                    return Err(e.into());
+            tokio::select! {
+                biased;
+                peer_ready = async_peer_pidfd.readable() => {
+                    let _peer_ready = peer_ready.context("waiting for peer VMM exit")?;
+                    info!(
+                        target: "uffd",
+                        vm_id = %vm_id,
+                        peer_pid = peer.pid,
+                        "peer VMM exited; stopping page-fault handler"
+                    );
+                    return Ok(());
                 }
-                // Timeout: no new events. Fall through and retry the parked faults.
-                Err(_) => None,
+                uffd_ready = tokio::time::timeout(
+                    CONTINUE_RETRY_DELAY,
+                    async_uffd.readable(),
+                ) => match uffd_ready {
+                    Ok(Ok(guard)) => Some(guard),
+                    Ok(Err(e)) => {
+                        error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
+                        return Err(e.into());
+                    }
+                    // Timeout: no new events. Fall through and retry the parked faults.
+                    Err(_) => None,
+                }
             }
         };
 

@@ -2451,6 +2451,287 @@ async fn a_clone_dies_when_its_memory_server_dies() -> Result<()> {
     Ok(())
 }
 
+/// An exited clone must release the memory server's concurrency slot.
+///
+/// Firecracker keeps a reference to its userfaultfd, but the server owns a separate copy.
+/// The server therefore cannot learn that Firecracker exited by waiting for its own UFFD:
+/// that descriptor remains open and quiet forever. Before the handler also watched the
+/// already-pinned VMM pidfd, every completed clone leaked one handler, one UFFD, one pidfd,
+/// and one admitted-clone slot. A long-lived server eventually refused all new work even
+/// though it had no live clones.
+///
+/// A cap of one makes that production failure deterministic: reap one real restored clone,
+/// then immediately require a second real clone to become healthy through the same server.
+#[tokio::test]
+async fn an_exited_clone_returns_its_server_slot() -> Result<()> {
+    async fn force_reap(child: &mut tokio::process::Child, pid: u32, label: &str) -> Result<()> {
+        // `start_kill` can race a natural exit. Either way, `wait` is authoritative and
+        // reaps the direct child; only a bounded failure to reap is an error here.
+        let _ = child.start_kill();
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .with_context(|| format!("{label} PID {pid} could not be reaped after SIGKILL"))?
+            .with_context(|| format!("reaping SIGKILLed {label} PID {pid}"))?;
+        Ok(())
+    }
+
+    async fn terminate_and_reap(
+        child: &mut tokio::process::Child,
+        pid: u32,
+        label: &str,
+    ) -> Result<std::process::ExitStatus> {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+
+        match nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => {
+                if let Err(cleanup_error) = force_reap(child, pid, label).await {
+                    return Err(cleanup_error.context(format!(
+                        "could not SIGTERM {label} PID {pid}: {e}; forced cleanup also failed"
+                    )));
+                }
+                anyhow::bail!("could not SIGTERM {label} PID {pid}: {e}; SIGKILLed and reaped it");
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
+            Ok(status) => status.with_context(|| format!("reaping {label} PID {pid}")),
+            Err(_) => match force_reap(child, pid, label).await {
+                Ok(()) => anyhow::bail!(
+                    "{label} PID {pid} did not exit within 60s after SIGTERM; SIGKILLed and reaped it"
+                ),
+                Err(cleanup_error) => Err(cleanup_error.context(format!(
+                    "{label} PID {pid} did not exit within 60s after SIGTERM"
+                ))),
+            },
+        }
+    }
+
+    /// Wait for an exact server lifecycle event without adding a timing delay or retrying
+    /// the operation under test. The inotify watch is installed before the first content
+    /// check, so a write racing setup is observed either in the file or as an event.
+    async fn wait_for_log_marker(
+        log_path: &std::path::Path,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: inotify_init1 returns a fresh owned fd on success.
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error()).context("creating inotify instance");
+        }
+        // SAFETY: `raw` is a fresh valid fd owned by this function.
+        let inotify = unsafe { OwnedFd::from_raw_fd(raw) };
+        let c_path = CString::new(log_path.as_os_str().as_bytes())
+            .context("log path contains an interior NUL")?;
+        // SAFETY: `inotify` and `c_path` are live for the call; the kernel copies the path.
+        let watch = unsafe {
+            libc::inotify_add_watch(
+                inotify.as_raw_fd(),
+                c_path.as_ptr(),
+                libc::IN_MODIFY | libc::IN_CLOSE_WRITE,
+            )
+        };
+        if watch < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("watching test log {}", log_path.display()));
+        }
+
+        let async_inotify = tokio::io::unix::AsyncFd::new(inotify)
+            .context("registering test-log inotify fd with the reactor")?;
+        let wait = async {
+            loop {
+                let contents = tokio::fs::read_to_string(log_path)
+                    .await
+                    .with_context(|| format!("reading test log {}", log_path.display()))?;
+                if contents.contains(marker) {
+                    return Ok(());
+                }
+
+                let mut ready = async_inotify
+                    .readable()
+                    .await
+                    .context("waiting for test-log modification")?;
+                match ready.try_io(|fd| {
+                    let mut events = [0u8; 4096];
+                    // SAFETY: `events` is writable for its full length and the inotify fd
+                    // is valid. O_NONBLOCK turns an empty queue into EAGAIN.
+                    let read = unsafe {
+                        libc::read(fd.as_raw_fd(), events.as_mut_ptr().cast(), events.len())
+                    };
+                    if read < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    Ok(result) => result.context("reading test-log inotify events")?,
+                    // Readiness was consumed by another reactor turn; await the next real
+                    // file event rather than spinning or sleeping.
+                    Err(_) => continue,
+                }
+            }
+        };
+
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(result) => result,
+            Err(_) => {
+                let contents = tokio::fs::read_to_string(log_path)
+                    .await
+                    .unwrap_or_default();
+                let tail = contents
+                    .lines()
+                    .rev()
+                    .take(30)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                anyhow::bail!(
+                    "marker {marker:?} did not appear in {} within {timeout:?}\n--- log tail ---\n{tail}",
+                    log_path.display()
+                )
+            }
+        }
+    }
+
+    let (baseline_name, first_clone_name, snapshot_name, _) =
+        common::unique_names("uffd-slot-exit");
+    let second_clone_name = format!("{first_clone_name}-next");
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut first_clone: Option<(tokio::process::Child, u32)> = None;
+    let mut second_clone: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_created = false;
+
+    let verdict: Result<()> = async {
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    common::TEST_IMAGE,
+                ],
+                &baseline_name,
+            )
+            .await?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
+        common::poll_health(baseline_child, 120).await?;
+        common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
+        snapshot_created = true;
+
+        let (serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_env_and_log_path(
+            &["snapshot", "serve", &snapshot_name],
+            &[("FCVM_UFFD_MAX_CLONES", "1")],
+        )
+        .await?;
+        serve = Some((serve_child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+        let serve_pid_string = serve_pid.to_string();
+        first_clone = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &first_clone_name,
+                ],
+                &first_clone_name,
+            )
+            .await?,
+        );
+        let (first_child, first_pid) = first_clone.as_mut().unwrap();
+        common::poll_health(first_child, 120).await?;
+
+        let first_status = terminate_and_reap(first_child, *first_pid, "first clone").await?;
+        anyhow::ensure!(
+            first_status.success(),
+            "first clone did not shut down cleanly: {first_status}"
+        );
+        first_clone = None;
+
+        // The outer fcvm process can finish reaping Firecracker before the server task is
+        // scheduled to consume pidfd readiness. Sequence on the server's completed-task
+        // event, emitted only after SlotGuard dropped, so this is deterministic under load.
+        // This waits for the root-cause fix; it does not delay or retry the second clone.
+        wait_for_log_marker(
+            &serve_log,
+            "VM exited active_vms=0",
+            Duration::from_secs(30),
+        )
+        .await?;
+
+        second_clone = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &second_clone_name,
+                ],
+                &second_clone_name,
+            )
+            .await?,
+        );
+        let (second_child, _) = second_clone.as_mut().unwrap();
+        common::poll_health(second_child, 120)
+            .await
+            .context("second clone was not admitted after the first clone exited")?;
+
+        Ok(())
+    }
+    .await;
+
+    // Run cleanup after either outcome. PR_SET_PDEATHSIG prevents process leaks after the
+    // whole test exits, but it cannot reap these direct children or delete the snapshot.
+    let mut cleanup_errors = Vec::new();
+    for (entry, label) in [
+        (&mut second_clone, "second clone"),
+        (&mut first_clone, "first clone"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
+    }
+    if snapshot_created {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {e:#}"));
+        }
+    }
+
+    if cleanup_errors.is_empty() {
+        verdict
+    } else {
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+        }
+    }
+}
+
 /// A panicking clone handler must not permanently consume a concurrency slot.
 ///
 /// The server caps concurrent clones with an atomic counter. That counter was decremented
