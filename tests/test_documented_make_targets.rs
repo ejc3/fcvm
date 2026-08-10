@@ -263,6 +263,9 @@ struct Harness<'a> {
     scratch_criterion_home: bool,
     find_reports_root_owned: bool,
     sudo_succeeds: bool,
+    /// Leave `CRITERION_HOME` uncreated, standing in for a criterion that
+    /// could not write it (a read-only or root-squashed mount).
+    criterion_home_missing: bool,
 }
 
 impl<'a> Harness<'a> {
@@ -274,7 +277,13 @@ impl<'a> Harness<'a> {
             scratch_criterion_home: true,
             find_reports_root_owned: false,
             sudo_succeeds: true,
+            criterion_home_missing: false,
         }
+    }
+
+    fn without_criterion_output(mut self) -> Self {
+        self.criterion_home_missing = true;
+        self
     }
 
     fn make_flags(mut self, flags: &'a [&'a str]) -> Self {
@@ -305,7 +314,9 @@ impl<'a> Harness<'a> {
         let scratch = Scratch::new(self.name);
         let rec = scratch.path().join("rec");
         let criterion_home = scratch.path().join("criterion");
-        fs::create_dir_all(&criterion_home).unwrap();
+        if !self.criterion_home_missing {
+            fs::create_dir_all(&criterion_home).unwrap();
+        }
 
         scratch.write_exec(
             "cargo-stub.sh",
@@ -599,4 +610,43 @@ fn a_failed_ownership_repair_fails_the_privileged_bench_target() {
         "bench-throughput failed with no root-owned files to repair: {}",
         nothing_to_repair.stderr
     );
+}
+
+/// A criterion run that persisted nothing must not report success.
+///
+/// criterion logs its persistence failures and still exits 0, so if
+/// `CRITERION_HOME` points somewhere it cannot create — a read-only or
+/// root-squashed mount — the suite prints timings, writes no `sample.json`,
+/// no `estimates.json` and no baseline, and the recipe passes that 0 straight
+/// through. Nothing can then be compared against the run and no regression can
+/// ever be reported against it, which is the same shape as the defect this
+/// file already guards on the ownership side: a benchmark that looks like it
+/// ran and left nothing behind.
+#[test]
+fn a_bench_that_persisted_nothing_fails_its_target() {
+    for goal in ["bench-throughput", "bench-protocol"] {
+        let missing = Harness::new("criterion-home-missing", &[goal])
+            .without_criterion_output()
+            .run();
+        assert!(
+            !missing.ok,
+            "{goal} reported success with no criterion output directory, so the suite              persisted nothing and its numbers cannot be compared against anything.              stderr: {}",
+            missing.stderr
+        );
+        assert!(
+            missing.stderr.contains("does not exist"),
+            "{goal}'s failure must name the missing criterion output; stderr was: {}",
+            missing.stderr
+        );
+
+        // Control: the same run passes when criterion did write its directory,
+        // so the failure above is attributable to the missing output and not
+        // to the harness.
+        let present = Harness::new("criterion-home-present", &[goal]).run();
+        assert!(
+            present.ok,
+            "{goal} failed even though the criterion output directory exists: {}",
+            present.stderr
+        );
+    }
 }

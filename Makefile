@@ -717,15 +717,20 @@ define run_privileged_bench
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
 	$(CARGO) bench -p fuse-pipe --bench $(1) $(BENCH_SEPARATED); \
 	bench_rc=$$?; \
-	if [ -d '$(CRITERION_HOME)' ]; then \
-		if ! root_owned=$$(find '$(CRITERION_HOME)' -user root -print -quit); then \
-			echo "ERROR: cannot scan $(CRITERION_HOME) for root-owned files, so the ownership repair after --bench $(1) never ran" >&2; \
+	if [ ! -d '$(CRITERION_HOME)' ]; then \
+		if [ $$bench_rc -eq 0 ]; then \
+			echo "ERROR: --bench $(1) exited 0 but $(CRITERION_HOME) does not exist. criterion logs persistence failures and still returns 0, so the suite printed timings and saved no sample.json, estimates.json or baseline: nothing can be compared and no regression can ever be reported" >&2; \
 			exit 1; \
 		fi; \
-		if [ -n "$$root_owned" ] && ! sudo chown -R $$(id -u):$$(id -g) '$(CRITERION_HOME)'; then \
-			echo "ERROR: $(CRITERION_HOME) is still root-owned after --bench $(1); bench-protocol cannot persist criterion output and _test-root will refuse to start" >&2; \
-			exit 1; \
-		fi; \
+		exit $$bench_rc; \
+	fi; \
+	if ! root_owned=$$(find '$(CRITERION_HOME)' -user root -print -quit); then \
+		echo "ERROR: cannot scan $(CRITERION_HOME) for root-owned files, so the ownership repair after --bench $(1) never ran" >&2; \
+		exit 1; \
+	fi; \
+	if [ -n "$$root_owned" ] && ! sudo chown -R $$(id -u):$$(id -g) '$(CRITERION_HOME)'; then \
+		echo "ERROR: $(CRITERION_HOME) is still root-owned after --bench $(1); bench-protocol cannot persist criterion output and _test-root will refuse to start" >&2; \
+		exit 1; \
 	fi; \
 	exit $$bench_rc
 endef
@@ -733,7 +738,13 @@ endef
 # One criterion suite as the invoking user. Nothing here writes as root, so
 # there is no ownership to repair.
 define run_unprivileged_bench
-	CRITERION_HOME='$(CRITERION_HOME)' $(CARGO) bench -p fuse-pipe --bench $(1) $(BENCH_SEPARATED)
+	CRITERION_HOME='$(CRITERION_HOME)' $(CARGO) bench -p fuse-pipe --bench $(1) $(BENCH_SEPARATED); \
+	bench_rc=$$?; \
+	if [ ! -d '$(CRITERION_HOME)' ] && [ $$bench_rc -eq 0 ]; then \
+		echo "ERROR: --bench $(1) exited 0 but $(CRITERION_HOME) does not exist. criterion logs persistence failures and still returns 0, so the suite printed timings and saved no sample.json, estimates.json or baseline: nothing can be compared and no regression can ever be reported" >&2; \
+		exit 1; \
+	fi; \
+	exit $$bench_rc
 endef
 
 # The three fuse-pipe suites, in order.
