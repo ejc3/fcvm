@@ -202,7 +202,7 @@ remove_dirs = [
 description = "Default fcvm guest kernel"
 kernel_version = "6.18.44"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "ed70224e2038"
+kernel_sha = "aabb4e064783"
 build_inputs = [
     "kernel/default-arm64.build.toml",
     "kernel/default.conf",
@@ -217,7 +217,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 description = "Default fcvm guest kernel (x86_64)"
 kernel_version = "6.18.44"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "30f539a815b9"
+kernel_sha = "3e4584a92571"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
