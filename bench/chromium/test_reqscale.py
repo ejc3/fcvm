@@ -733,6 +733,44 @@ print(child.pid, flush=True)
                 finally:
                     os.close(pidfd)
 
+    def test_guardsupervise_sweeps_the_cgroup_when_the_child_exits_normally(self):
+        """A child exiting says nothing about the hops it spawned.
+
+        Chromium's zygote, utility and crash-handler processes cannot arm
+        PR_SET_PDEATHSIG, which is the whole reason this wrapper owns a cgroup. If
+        cleanup only ran from the signal handler, a normal exit would leave them
+        running while the harness treated the request as finished.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cgroup_procs = os.path.join(tmp, "cgroup.procs")
+            # A cgroup v2 directory always carries cgroup.kill; the wrapper uses its
+            # presence to tell a real cgroup from an ordinary directory.
+            open(os.path.join(tmp, "cgroup.kill"), "w").close()
+            # The wrapper writes its child's pid here on startup, and nothing removes
+            # it from an ordinary file, so this stands in for a member that outlives
+            # the child.
+            open(cgroup_procs, "w").close()
+
+            done = subprocess.run(
+                [
+                    sys.executable,
+                    reqscale.GUARDSUPERVISE,
+                    "--expected-parent", str(os.getpid()),
+                    "--cgroup-procs", cgroup_procs,
+                    "--", sys.executable, "-c", "raise SystemExit(0)",
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                done.returncode, 126,
+                "a cgroup that will not empty must fail the request, not report the "
+                f"child's own status: {done.stderr}",
+            )
+            self.assertRegex(
+                done.stderr, r"process\(es\) still in .* after cgroup\.kill: \['\d+'\]",
+                "the survivors must be named so they can be chased",
+            )
+
     def test_guardsupervise_terminates_the_third_party_process_group(self):
         with tempfile.TemporaryDirectory() as d:
             cgroup_procs = os.path.join(d, "cgroup.procs")
@@ -754,19 +792,35 @@ print(child.pid, flush=True)
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            target_pid = int(supervisor.stdout.readline().strip())
-            target_pidfd = reqscale.reqbench.pidfd_open(target_pid)
-            supervisor.send_signal(15)
-            self.assertEqual(supervisor.wait(timeout=5), 0, supervisor.stderr.read())
-            if target_pidfd is not None:
-                try:
-                    poller = select.poll()
-                    poller.register(target_pidfd, select.POLLIN)
-                    self.assertTrue(
-                        poller.poll(2000), "supervised process survived supervisor shutdown"
-                    )
-                finally:
-                    os.close(target_pidfd)
+            try:
+                # A target that never prints its pid would otherwise block the whole
+                # suite here, with a 30 second child still running behind it.
+                handshake = select.poll()
+                handshake.register(supervisor.stdout, select.POLLIN)
+                self.assertTrue(
+                    handshake.poll(10_000),
+                    "supervisor did not report the target pid within 10s",
+                )
+                target_pid = int(supervisor.stdout.readline().strip())
+                target_pidfd = reqscale.reqbench.pidfd_open(target_pid)
+                supervisor.send_signal(15)
+                self.assertEqual(supervisor.wait(timeout=5), 0, supervisor.stderr.read())
+                if target_pidfd is not None:
+                    try:
+                        poller = select.poll()
+                        poller.register(target_pidfd, select.POLLIN)
+                        self.assertTrue(
+                            poller.poll(2000), "supervised process survived supervisor shutdown"
+                        )
+                    finally:
+                        os.close(target_pidfd)
+            finally:
+                # Any failure above leaks the supervisor and its 30 second target.
+                if supervisor.poll() is None:
+                    supervisor.kill()
+                    supervisor.wait(timeout=5)
+                supervisor.stdout.close()
+                supervisor.stderr.close()
 
     def test_tracer_abort_kills_waits_and_closes_all_streams(self):
         class Process:

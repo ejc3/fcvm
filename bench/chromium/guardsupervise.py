@@ -13,9 +13,16 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 
 PR_SET_PDEATHSIG = 1
+
+
+# `cgroup.kill` is synchronous for the signal delivery but not for the reaping, so a
+# short drain is needed to tell "killed" from "still running". A signal handler is
+# running against someone else's shutdown clock, so this stays small.
+KILL_DRAIN_SECONDS = 2.0
 
 
 def main() -> int:
@@ -55,10 +62,28 @@ def main() -> int:
         return 125
 
     child = None
+    cgroup_dir = os.path.dirname(cgroup_procs)
 
-    def terminate(_signum, _frame):
-        kill_path = os.path.join(os.path.dirname(cgroup_procs), "cgroup.kill")
+    def kill_cgroup():
+        """Kill everything left in the owned cgroup, and say whether it emptied.
+
+        The browser process exiting does not mean its tree has: the zygote, utility
+        and crash-handler hops cannot arm PR_SET_PDEATHSIG, which is why this wrapper
+        owns a cgroup at all. Those survivors keep running while the harness believes
+        the request is over.
+
+        Draining is only checked when `cgroup.kill` actually took. Without a real
+        cgroup there is nothing that empties `cgroup.procs`, so polling it would just
+        burn the shutdown budget and report survivors that the fallback already
+        killed.
+        """
+        kill_path = os.path.join(cgroup_dir, "cgroup.kill")
+        # Opening for write CREATES a regular file, so a successful write proves
+        # nothing. Every cgroup v2 directory already has this attribute; a path that
+        # does not is not a cgroup and has no kill semantics at all.
         try:
+            if not os.path.exists(kill_path):
+                raise OSError(f"{kill_path} is not a cgroup v2 attribute")
             with open(kill_path, "w") as stream:
                 stream.write("1\n")
         except OSError:
@@ -67,13 +92,35 @@ def main() -> int:
                     os.killpg(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+            return []
+        deadline = time.monotonic() + KILL_DRAIN_SECONDS
+        while True:
+            try:
+                with open(cgroup_procs) as stream:
+                    remaining = [line for line in stream.read().split() if line]
+            except OSError:
+                return []
+            if not remaining or time.monotonic() >= deadline:
+                return remaining
+            time.sleep(0.01)
+
+    def terminate(_signum, _frame):
+        kill_cgroup()
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     try:
         child = subprocess.Popen(command, start_new_session=True)
-        return child.wait()
+        rc = child.wait()
+        # The normal path needs the same sweep as the signal path: the child exiting
+        # says nothing about the hops it spawned.
+        remaining = kill_cgroup()
+        if remaining:
+            print(f"guardsupervise: {len(remaining)} process(es) still in {cgroup_dir} "
+                  f"after cgroup.kill: {remaining}", file=sys.stderr)
+            return 126
+        return rc
     except (OSError, subprocess.SubprocessError) as error:
         print(f"guardsupervise: cannot run child: {error}", file=sys.stderr)
         return 125

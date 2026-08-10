@@ -841,8 +841,16 @@ mod tests {
         write_final_tx
             .send(())
             .expect("stderr waiter dropped the final-line gate");
-        let remaining_reader = waiter.await.expect("stderr waiter panicked");
-        writer.await.expect("stderr writer panicked");
+        // Bounded: a regression that never reaches EOF would otherwise hang the whole
+        // suite here instead of failing this test.
+        let remaining_reader = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("stderr waiter did not finish within 10s of the final line")
+            .expect("stderr waiter panicked");
+        tokio::time::timeout(Duration::from_secs(10), writer)
+            .await
+            .expect("stderr writer did not finish within 10s")
+            .expect("stderr writer panicked");
         assert!(
             remaining_reader.is_none(),
             "stderr waiter must consume its reader handle"
@@ -880,7 +888,10 @@ mod tests {
             .expect("writing stderr before EOF");
         write_end.shutdown().await.expect("closing stderr writer");
         drop(write_end);
-        eof_rx.await.expect("stderr reader exited before EOF");
+        tokio::time::timeout(Duration::from_secs(10), eof_rx)
+            .await
+            .expect("stderr reader did not observe EOF within 10s")
+            .expect("stderr reader exited before EOF");
         assert!(
             reader.is_finished(),
             "reader must be terminal before waiting"

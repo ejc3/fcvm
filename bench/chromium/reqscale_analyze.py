@@ -1749,7 +1749,7 @@ def analyze(run_dir: str) -> dict:
     control_warmup = _load_json(os.path.join(run_dir, "host-control-warmup.json"))
     uffd_serve = _load_json(os.path.join(run_dir, "uffd-serve.json"))
 
-    _validate_schedule(schedule)
+    config = _validate_schedule(schedule)
     generation_id, config_sha256 = _validate_provenance(provenance, schedule)
     _validate_status(status, schedule, provenance)
     _validate_uffd_serve(uffd_serve, schedule, provenance, status)
@@ -1921,6 +1921,28 @@ def analyze(run_dir: str) -> dict:
         "run_id": run_id,
         "snapshot_generation_id": generation_id,
         "publishable": True,
+        # The report is the publication document, so the numbers that describe HOW the
+        # run was scheduled, and on WHAT, have to come from the validated artifacts
+        # rather than from prose written when the defaults happened to be these.
+        "schedule": {
+            "ramp_seconds": config.ramp_seconds,
+            "score_seconds": config.score_seconds,
+            "warmup_bursts": config.warmup_bursts,
+            "scored_bursts": config.scored_bursts,
+            "seed": config.seed,
+        },
+        "provenance": {
+            "hostname": provenance["host"]["hostname"],
+            "kernel": provenance["host"]["kernel"],
+            "machine": provenance["host"]["machine"],
+            "cpu_count": provenance["host"]["cpu_count"],
+            "fcvm_version": provenance["fcvm_version"],
+            "fcvm_sha256": provenance["fcvm_sha256"],
+            "source_revision": provenance["source_revision"],
+            "source_dirty": provenance["source_dirty"],
+            "chromium_version": provenance["host_control"]["chromium_version"],
+            "hostinfo": "provenance.json",
+        },
         "experimental_unit": "burst",
         "analysis_seed": analysis_seed,
         "bootstrap_draws": BOOTSTRAP_DRAWS,
@@ -1937,7 +1959,15 @@ def analyze(run_dir: str) -> dict:
     }
 
 
+def _format_seconds(value):
+    """`15 second` / `2.5 second`, without a trailing `.0` on whole numbers."""
+    return f"{int(value)} second" if float(value).is_integer() else f"{value} second"
+
+
 def markdown_report(analysis: dict) -> str:
+    sched = analysis["schedule"]
+    prov = analysis["provenance"]
+    warmup = sched["warmup_bursts"]
     lines = [
         "# Chromium request scalability",
         "",
@@ -1945,11 +1975,27 @@ def markdown_report(analysis: dict) -> str:
         f"`{analysis['snapshot_generation_id']}`. The run passed its provenance, "
         "continuous-accounting, and host drift-control checks.",
         "",
+        f"Measured on `{prov['hostname']}` ({prov['machine']}, {prov['cpu_count']} CPUs, "
+        f"kernel `{prov['kernel']}`) with fcvm `{prov['fcvm_version']}` "
+        f"(`{prov['fcvm_sha256'][:12]}`) at source revision "
+        f"`{prov['source_revision'][:12]}`"
+        f"{' with a DIRTY tree' if prov['source_dirty'] else ''}, driving "
+        f"Chromium `{prov['chromium_version']}`. Full host and binary provenance is in "
+        f"`{prov['hostinfo']}`.",
+        "",
         "FILE and UFFD were offered the same per-backend rate in one mixed stream. "
         "Each rate interval contained one request for each backend, separated by "
-        "half an interval with seeded order. One warmup burst was excluded. Each "
-        "scored burst used a 15 second ramp and 60 second score, and confidence "
+        f"half an interval with seeded order (seed `{sched['seed']}`). "
+        f"{warmup} warmup burst{'' if warmup == 1 else 's'} per rate "
+        f"{'was' if warmup == 1 else 'were'} excluded, leaving "
+        f"{sched['scored_bursts']} scored per cell. Each scored burst used a "
+        f"{_format_seconds(sched['ramp_seconds'])} ramp and "
+        f"{_format_seconds(sched['score_seconds'])} score, and confidence "
         "intervals resample whole bursts rather than requests.",
+        "",
+        "Every figure below is computed from `requests.jsonl` and `bursts.jsonl` in "
+        "this run directory; the analysis field backing each table is named in its "
+        "caption.",
         "",
         "## Capacity gates",
         "",

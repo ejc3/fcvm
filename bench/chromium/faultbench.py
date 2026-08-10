@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -49,6 +50,10 @@ SNAP_DIR = Path("/mnt/fcvm-btrfs/snapshots")
 
 PAGE = 4096
 HUGE = 2 * 1024 * 1024
+
+# A busy host moves every latency number in the run, and the effect is invisible in
+# the results afterwards. One idle core's worth of background work is the ceiling.
+MAX_START_LOAD = 1.0
 
 # ---------------------------------------------------------------------------
 # driver: reuse bench.sh's DRIVER_TEMPLATE verbatim so the workload measured here
@@ -126,9 +131,11 @@ def guest_ram_vmas(pid: int, want_bytes: int):
     copy arm  : anonymous
     minor arm : MAP_PRIVATE of a memfd (shmem or hugetlb)
 
-    Selected by size, not by name, so one rule covers all three. Firecracker may
-    split guest RAM into several regions; every large VMA is returned and the caller
-    checks the total against the configured guest RAM.
+    Selected by size, not by name, so one rule covers all three. Firecracker may split
+    guest RAM into several regions, so every large VMA is returned; the caller records
+    the total and whether it matches the configured guest RAM
+    (`vma_total_matches_guest`), because a mismatch means this snapshot is not
+    comparable with the other arms.
     """
     vmas = [v for v in read_maps(pid) if (v["end"] - v["start"]) >= 64 * 1024 * 1024]
     vmas = [v for v in vmas if "memory.bin" in v["path"] or "memfd" in v["path"] or v["path"] == ""]
@@ -246,9 +253,31 @@ def ftrace_stop_dump(dest: Path):
         subprocess.run(["sudo", "cat", str(FTRACE / "trace")], stdout=f, check=False)
     # overflow check: a dropped event silently truncates the fault set, which would
     # understate every downstream number. Surface it rather than average it away.
-    st = subprocess.run(["sudo", "cat", str(FTRACE / "per_cpu/cpu0/stats")],
-                        capture_output=True, text=True, check=False)
-    return st.stdout
+    # Every CPU has its own ring buffer and guest faults arrive on the vCPU threads,
+    # which are not pinned to cpu0. Reading cpu0 alone reports "no drops" while another
+    # CPU's buffer overran, which silently truncates the fault set.
+    st = subprocess.run(
+        ["sudo", "sh", "-c",
+         f'for s in {FTRACE}/per_cpu/cpu*/stats; do echo "== $s"; cat "$s"; done'],
+        capture_output=True, text=True, check=False)
+    return {"raw": st.stdout, "lost": ftrace_lost_events(st.stdout)}
+
+
+def ftrace_lost_events(stats_text):
+    """Total `overrun` + `dropped events` across every CPU's ring buffer.
+
+    Non-zero means the fault set is incomplete, so every count derived from it is a
+    lower bound rather than a measurement.
+    """
+    lost = 0
+    for line in stats_text.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("overrun", "dropped events"):
+            try:
+                lost += int(value.strip())
+            except ValueError:
+                continue
+    return lost
 
 
 # ---------------------------------------------------------------------------
@@ -270,14 +299,24 @@ def firecracker_pids():
     return out
 
 
-def serve_pid_for(tag: str):
+def serve_pid_for(tag: str, umode: str):
+    """The pid of the serve for this tag AND this UFFD mode.
+
+    The tag alone is not an identity: the same snapshot is served in both `copy` and
+    `minor` mode, and matching on the tag would return whichever serve happened to be
+    running. The harness would then sample serve CPU on a process it did not start and
+    later signal it, so both the measurement and the teardown would land on a stranger.
+    `uffd_mode` is written into the serve's own state entry by `snapshot serve`.
+    """
     for p in STATE_DIR.glob("*.json"):
         try:
             st = json.loads(p.read_text())
         except (OSError, json.JSONDecodeError):
             continue
         cfg = st.get("config") or {}
-        if cfg.get("process_type") == "serve" and cfg.get("snapshot_name") == tag:
+        if (cfg.get("process_type") == "serve"
+                and cfg.get("snapshot_name") == tag
+                and (cfg.get("uffd_mode") or "copy") == umode):
             return st.get("pid")
     return None
 
@@ -304,6 +343,11 @@ class Sampler(threading.Thread):
         self.fc_pid = None
         self.series = []          # (t_wall, min_flt, maj_flt, utime, stime)
         self.snapshot = None      # pagemap/smaps at hold
+        # Every thread this firecracker ran during the request. kvm:kvm_guest_fault is
+        # emitted in vCPU thread context, so its ftrace pid is a TID, not the process
+        # id: without this set the analyzer cannot tell this VM's faults from another
+        # VM's in a host-wide trace.
+        self.fc_tids = set()
         self.first_seen = None
         self.last = None
         self.error = None
@@ -332,6 +376,10 @@ class Sampler(threading.Thread):
             st = proc_stat(pid)
             if st is None:
                 break
+            try:
+                self.fc_tids.update(int(t) for t in os.listdir(f"/proc/{pid}/task"))
+            except OSError:
+                pass  # the process exited between the stat and the task listing
             self.series.append((time.time(), *st))
             self.last = st
             if self.hold_evt.is_set() and not took_snapshot:
@@ -341,8 +389,15 @@ class Sampler(threading.Thread):
                 pm = pagemap_resident(pid, vmas)
                 sm = smaps_rss(pid, vmas)
                 st2 = proc_stat(pid)
+                # The selector takes any anonymous VMA of 64 MiB or more, so a large
+                # non-guest mapping can displace a real guest-RAM region. When the
+                # total does not match, pagemap and smaps are measuring a different
+                # accounting base than the other arms and must not be compared.
+                vma_total = sum(v["end"] - v["start"] for v in vmas)
                 self.snapshot = {
                     "t": time.time(),
+                    "vma_total_bytes": vma_total,
+                    "vma_total_matches_guest": vma_total == self.guest_bytes,
                     "vmas": [{"start": v["start"], "size": v["end"] - v["start"], "path": v["path"]} for v in vmas],
                     "pagemap": pm,
                     "smaps": {str(k): v for k, v in sm.items()},
@@ -408,6 +463,7 @@ def run_request(*, cell, tag, memarm, umode, serve_pid, url, name, out_dir, hold
         "t0": t0, "t1": t1, "wall_ms": (t1 - t0) * 1000.0,
         "marks": marks,
         "fc_pid": sampler.fc_pid,
+        "fc_tids": sorted(sampler.fc_tids),
         "fc_first_seen": sampler.first_seen,
         "sampler_error": sampler.error,
         "stat_series": sampler.series,
@@ -417,7 +473,8 @@ def run_request(*, cell, tag, memarm, umode, serve_pid, url, name, out_dir, hold
         "serve_stat_after": serve_after,
         "ftrace": bool(ftrace),
         "kvm_trace": str(kvm_trace_path) if kvm_trace_path else None,
-        "ftrace_cpu0_stats": ftrace_stats,
+        "ftrace_stats": ftrace_stats,
+        "ftrace_lost_events": (ftrace_stats or {}).get("lost"),
         "render_line": next((ln for _, ln in lines if ln.startswith("RENDER_OK")), None),
     }
     return rec
@@ -438,16 +495,32 @@ def start_serve(tag, umode, trace_dir, log_dir):
     proc = subprocess.Popen(args, stdout=lf, stderr=subprocess.STDOUT, env=env)
     t_dead = time.time() + 60
     while time.time() < t_dead:
-        pid = serve_pid_for(tag)
-        if pid and Path(f"/proc/{pid}").exists():
+        pid = serve_pid_for(tag, umode)
+        # Only the process this call spawned may be measured or signalled later.
+        if pid == proc.pid and Path(f"/proc/{pid}").exists():
             return proc, pid
+        if pid is not None and pid != proc.pid:
+            proc.kill()
+            proc.wait()
+            sys.exit(
+                f"serve for {tag} ({umode}) is already running as pid {pid}; this run "
+                f"spawned {proc.pid} and will not measure or signal a process it does "
+                f"not own"
+            )
         if proc.poll() is not None:
             sys.exit(f"serve for {tag} ({umode}) exited early rc={proc.returncode}")
         time.sleep(0.2)
     sys.exit(f"serve for {tag} ({umode}) did not register in state")
 
 
-def stop_serve(proc, pid):
+def stop_serve(proc, pid, tag=None, umode=None):
+    """Stop a serve and prove it is gone: process reaped, state entry removed.
+
+    A serve that outlives its cell keeps its UFFD socket and state entry, so the next
+    cell's `start_serve` can bind to it and measure the wrong process. Returning
+    silently after a `kill()` that was never reaped leaves a zombie holding the state
+    entry, which looks exactly like a live serve to `serve_pid_for`.
+    """
     if proc is None:
         return
     try:
@@ -463,6 +536,26 @@ def stop_serve(proc, pid):
         proc.kill()
     except ProcessLookupError:
         pass
+    # SIGKILL is not instant and an unreaped corpse still owns its pid.
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"[faultbench] serve pid {pid} did not die within 10s of SIGKILL; refusing "
+            f"to continue with a serve still holding its UFFD socket"
+        )
+    t_dead = time.time() + 10
+    while time.time() < t_dead and not serve_pid_for_pid_gone(pid):
+        time.sleep(0.2)
+    if not serve_pid_for_pid_gone(pid):
+        raise SystemExit(
+            f"[faultbench] serve pid {pid} is gone but /proc/{pid} remains after 10s"
+        )
+    if tag is not None and serve_pid_for(tag, umode) is not None:
+        raise SystemExit(
+            f"[faultbench] serve state entry for {tag} ({umode}) outlived pid {pid}; a "
+            f"later cell would bind to a serve this run already stopped"
+        )
 
 
 def serve_pid_for_pid_gone(pid):
@@ -518,6 +611,73 @@ def wait_clones_gone(prefix, timeout=120):
     return False
 
 
+def build_schedule(cells, pages, reps, warmup, seed):
+    """The (cell, page, rep) request list, shuffled from a recorded seed.
+
+    Walking cells in argument order attributes any host drift during the run entirely
+    to whichever cell ran last, which is indistinguishable from a real difference
+    between the arms. Shuffling spreads drift across all of them.
+
+    Warmups stay in front, and in cell order: they exist to reach steady state, and
+    interleaving them would leave a cell measured before it is warm.
+    """
+    warm = [(c, p, i, True)
+            for c in cells for p in pages for i in range(1, warmup + 1)]
+    measured = [(c, p, warmup + i, False)
+                for c in cells for p in pages for i in range(1, reps + 1)]
+    random.Random(seed).shuffle(measured)
+    return warm + measured
+
+
+def host_precheck(expected_firecrackers=0):
+    """Refuse to start on a host that is already busy or already running VMs.
+
+    A foreign Firecracker competes for CPU and shows up in a host-wide ftrace dump;
+    background load moves every latency number. Both are invisible after the fact,
+    which is why this runs before the first request rather than being reported with
+    the results.
+    """
+    load1 = os.getloadavg()[0]
+    foreign = firecracker_pids()
+    info = {"loadavg_1m": load1, "firecracker_pids": sorted(foreign),
+            "uptime_s": float(Path("/proc/uptime").read_text().split()[0])}
+    if len(foreign) > expected_firecrackers:
+        raise SystemExit(
+            f"[faultbench] {len(foreign)} firecracker processes already running "
+            f"({sorted(foreign)}); they would compete for CPU and pollute the host-wide "
+            f"ftrace dump. Stop them first."
+        )
+    if load1 > MAX_START_LOAD:
+        raise SystemExit(
+            f"[faultbench] 1-minute load average is {load1:.2f}, above {MAX_START_LOAD}; "
+            f"every latency number would be measuring the other workload too"
+        )
+    return info
+
+
+class LoadSampler(threading.Thread):
+    """Append /proc/loadavg to samples/loadavg.jsonl for the life of the run.
+
+    Drift that a precheck cannot see is only detectable against a continuous record.
+    """
+
+    def __init__(self, dest: Path, stop_evt, period_s=1.0):
+        super().__init__(daemon=True)
+        self.dest = dest
+        self.stop_evt = stop_evt
+        self.period_s = period_s
+
+    def run(self):
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.dest, "a") as f:
+            while not self.stop_evt.is_set():
+                one, five, fifteen = os.getloadavg()
+                f.write(json.dumps({"t": time.time(), "load1": one, "load5": five,
+                                    "load15": fifteen}) + "\n")
+                f.flush()
+                self.stop_evt.wait(self.period_s)
+
+
 def prewarm(tag):
     """Pull memory.bin into the page cache so the file arm is measured warm.
 
@@ -563,6 +723,9 @@ def main():
                     help="capture kvm:kvm_guest_fault (exact per-backend fault events + IPAs). "
                          "Perturbs latency, so run it as a SEPARATE pass from the timing pass.")
     ap.add_argument("--label", default="", help="tag written into every record")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="request-order shuffle seed; recorded in run.json and in every "
+                         "record so a run can be replayed in the same order")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -590,53 +753,82 @@ def main():
     runid = time.strftime("%H%M%S")
     results = []
     pages = [p.strip() for p in args.pages.split(",") if p.strip()] or [args.page]
+    # The seed is recorded, so a suspicious run can be replayed in the same order.
+    seed = args.seed if args.seed is not None else int(time.time())
+    cells = [c.strip() for c in args.cells.split(",") if c.strip()]
+    unknown = [c for c in cells if c not in CELLS]
+    if unknown:
+        raise SystemExit(f"[faultbench] unknown cells {unknown}; known: {sorted(CELLS)}")
+    for c in [c for c in cells if not tags.get(CELLS[c][2])]:
+        print(f"[faultbench] SKIP {c}: no golden snapshot for {CELLS[c][2]}", flush=True)
+    cells = [c for c in cells if tags.get(CELLS[c][2])]
+    if not cells:
+        raise SystemExit("[faultbench] no cell has a golden snapshot; nothing to measure")
+
+    precheck = host_precheck()
+    print(f"[faultbench] host at start: load1={precheck['loadavg_1m']:.2f} "
+          f"firecrackers={len(precheck['firecracker_pids'])}", flush=True)
+    (out / "run.json").write_text(json.dumps({
+        "runid": runid, "seed": seed, "cells": cells, "pages": pages,
+        "reps": args.reps, "warmup": args.warmup, "label": args.label,
+        "precheck": precheck,
+    }, indent=2))
+
+    load_stop = threading.Event()
+    load_sampler = LoadSampler(out / "samples" / "loadavg.jsonl", load_stop)
+    load_sampler.start()
     if args.ftrace:
         ftrace_setup()
 
+    # Every serve is started up front and torn down on the way out, whatever happens in
+    # between: the schedule interleaves cells, and an exception between start and stop
+    # used to leave the serve, its trace directory and its state entry behind.
+    serves = {}
     try:
-        for cell in [c.strip() for c in args.cells.split(",") if c.strip()]:
+        for cell in cells:
             memarm, umode, snapkey, granule = CELLS[cell]
-            tag = tags.get(snapkey)
-            if not tag:
-                print(f"[faultbench] SKIP {cell}: no golden snapshot for {snapkey}", flush=True)
-                continue
-
+            tag = tags[snapkey]
             trace_dir = out / "traces" / cell
             trace_dir.mkdir(parents=True, exist_ok=True)
-            serve_proc = serve_pid = None
             if memarm == "uffd":
-                serve_proc, serve_pid = start_serve(tag, umode, trace_dir, out / "logs")
-                print(f"[faultbench] {cell}: serve pid={serve_pid} tag={tag} mode={umode}", flush=True)
+                proc, pid = start_serve(tag, umode, trace_dir, out / "logs")
+                serves[cell] = (proc, pid, tag, umode)
+                print(f"[faultbench] {cell}: serve pid={pid} tag={tag} mode={umode}", flush=True)
             else:
                 prewarm(tag)
                 print(f"[faultbench] {cell}: file-backed, memory.bin prewarmed", flush=True)
 
-            for page in pages:
-                url = f"http://{host4}:{args.http_port}/{page}"
-                for i in range(1, args.reps + args.warmup + 1):
-                    name = f"fb-{runid}-{cell}-{page.split('.')[0]}-{i}"
-                    rec = run_request(
-                        cell=cell, tag=tag, memarm=memarm, umode=umode,
-                        serve_pid=serve_pid, url=url, name=name, out_dir=out,
-                        hold=args.hold, guest_bytes=args.guest_mib << 20,
-                        ftrace=args.ftrace)
-                    rec["rep"] = i
-                    rec["page"] = page
-                    rec["label"] = args.label
-                    rec["warmup"] = i <= args.warmup
-                    rec["granule"] = granule
-                    rec["guest_bytes"] = args.guest_mib << 20
-                    results.append(rec)
-                    with open(out / "requests.jsonl", "a") as f:
-                        f.write(json.dumps(rec) + "\n")
-                    print(f"[faultbench] {cell} {page} rep{i}{' (warmup)' if rec['warmup'] else ''}: "
-                          f"rc={rec['rc']} wall={rec['wall_ms']:.0f}ms fc_pid={rec['fc_pid']}", flush=True)
-                    require_clones_gone(f"fb-{runid}", 120, f"{cell} {page} rep{i}")
-                    time.sleep(1.0)
-
-            if memarm == "uffd":
-                stop_serve(serve_proc, serve_pid)
+        schedule = build_schedule(cells, pages, args.reps, args.warmup, seed)
+        for cell, page, i, is_warmup in schedule:
+            memarm, umode, snapkey, granule = CELLS[cell]
+            tag = tags[snapkey]
+            serve_pid = serves.get(cell, (None, None, None, None))[1]
+            url = f"http://{host4}:{args.http_port}/{page}"
+            name = f"fb-{runid}-{cell}-{page.split('.')[0]}-{i}"
+            rec = run_request(
+                cell=cell, tag=tag, memarm=memarm, umode=umode,
+                serve_pid=serve_pid, url=url, name=name, out_dir=out,
+                hold=args.hold, guest_bytes=args.guest_mib << 20,
+                ftrace=args.ftrace)
+            rec["rep"] = i
+            rec["page"] = page
+            rec["label"] = args.label
+            rec["warmup"] = is_warmup
+            rec["granule"] = granule
+            rec["guest_bytes"] = args.guest_mib << 20
+            rec["seed"] = seed
+            results.append(rec)
+            with open(out / "requests.jsonl", "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            print(f"[faultbench] {cell} {page} rep{i}{' (warmup)' if is_warmup else ''}: "
+                  f"rc={rec['rc']} wall={rec['wall_ms']:.0f}ms fc_pid={rec['fc_pid']}", flush=True)
+            require_clones_gone(f"fb-{runid}", 120, f"{cell} {page} rep{i}")
+            time.sleep(1.0)
     finally:
+        for cell, (proc, pid, tag, umode) in serves.items():
+            stop_serve(proc, pid, tag, umode)
+        load_stop.set()
+        load_sampler.join(timeout=5)
         srv.terminate()
         if args.ftrace:
             ftrace_teardown()

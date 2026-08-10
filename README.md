@@ -403,7 +403,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to disable FUSE writeback cache |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
-| `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius; splitting across a second serve process does not |
+| `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
 | `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
 | `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |

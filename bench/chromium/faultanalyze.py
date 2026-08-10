@@ -144,6 +144,25 @@ def match_trace(traces, t0, t1):
     return None, [c.name for c in cands]
 
 
+def kvm_events_for_request(events, fc_tids):
+    """This request's kvm faults, as `(events, discarded)`.
+
+    ftrace runs host-wide with no pid filter, so any other Firecracker alive during
+    the window lands in the same dump and inflates every count derived from it. The
+    tracepoint fires in vCPU thread context, so its pid field is a TID: comparing it
+    against the firecracker PID would discard everything. `faultbench.py` records the
+    process's thread ids while the request runs, and that set is the filter.
+
+    Without a recorded tid set (a run from before this was captured) the events cannot
+    be attributed at all, so none are returned and every one is counted as discarded.
+    """
+    wanted = set(fc_tids or ())
+    if not wanted:
+        return [], len(events)
+    kept = [e for e in events if e[1] in wanted]
+    return kept, len(events) - len(kept)
+
+
 def jaccard(a, b):
     if not a and not b:
         return 1.0
@@ -304,8 +323,15 @@ def main():
                     item["serve_cpu_us_per_fault"] = item["serve_cpu_ms"] * 1000.0 / item["uffd_faults"]
 
             # --- instrument 4: kvm:kvm_guest_fault (exact, every backend)
-            if r.get("kvm_trace") and Path(r["kvm_trace"]).exists():
-                ev = read_kvm_trace(Path(r["kvm_trace"]))
+            lost = r.get("ftrace_lost_events")
+            if lost:
+                # A ring-buffer overrun truncates the fault set, so every count derived
+                # from it is a lower bound. Report the loss instead of the numbers.
+                item["kvm_trace_lossy"] = lost
+            elif r.get("kvm_trace") and Path(r["kvm_trace"]).exists():
+                ev, discarded = kvm_events_for_request(
+                    read_kvm_trace(Path(r["kvm_trace"])), r.get("fc_tids"))
+                item["kvm_events_other_pids"] = discarded
                 item["kvm_guest_faults"] = len(ev)
                 if ev:
                     ipas = [e[4] for e in ev]
