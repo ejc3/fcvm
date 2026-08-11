@@ -3522,34 +3522,29 @@ exec /bin/bash "$@"
                 env["RESULTS"], "runtime", os.path.basename(bundle),
             )))
 
-    def test_fcvm_no_snapshot_survives_sudo(self):
-        """RED BEFORE THE FIX: `FCVM_NO_SNAPSHOT=1 $SUDO env RUST_LOG=... fcvm ...`
-        binds the assignment to SUDO, whose default env_reset drops it. RUST_LOG
-        survives only because it rides the `env` AFTER sudo. The sibling harness
-        already does it right (bench.sh: `sudo env FCVM_NO_SNAPSHOT=1 RUST_LOG=...`),
-        so this is a local divergence, not house style. With the variable dropped,
-        `src/commands/podman/mod.rs` takes the snapshot-cache path and the phase
-        documented as `golden: cold boot` would RESTORE from a stale cached
-        snapshot and then snapshot THAT as $TAG — contaminating every arm.
-        Observed with an env_reset-emulating sudo stub: FCVM_NO_SNAPSHOT=<unset>.
+    def test_golden_delegates_the_cold_build_to_prepare(self):
+        """golden's cold-boot guarantee now lives inside `podman prepare`.
+
+        The previous flow exported FCVM_NO_SNAPSHOT=1 around a hand-rolled
+        `podman run`, and a sudo env_reset once silently dropped the assignment,
+        turning "cold boot" into a restore from a stale cached snapshot. prepare
+        forces the cold build internally (src/commands/podman/mod.rs sets
+        no_snapshot before any cache lookup), so the knob must be GONE from the
+        invocation: its reappearance would mean someone reintroduced the
+        env-sensitive dance this rework deleted. Run under an env_reset sudo to
+        hold the original failure conditions in place.
         """
         with tempfile.TemporaryDirectory() as d:
-            # Staged, like the sibling shell tests: the unstaged path re-execs
-            # itself through a content-addressed copy and first requires real
-            # fcvm and fc-agent binaries for THIS host's arch. That is a
-            # property of the box, not of the quoting under test, and on an
-            # x86 checkout of an arm64 tree it stops the phase before fcvm.
             env, binx = self._env(d, REQBENCH_STAGED="1")
             seen = os.path.join(d, "seen.txt")
+            # Record the knob at the sudo boundary, BEFORE env -i wipes it: the
+            # fake fcvm's own recording can only ever read <unset> behind the
+            # reset, so it would keep this test green even if the harness
+            # regressed to `FCVM_NO_SNAPSHOT=1 $SUDO ...`.
             self._write(os.path.join(binx, "sudo"),
-                        '#!/bin/bash\nexec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
-            # `golden` inspects the benchmark image before it ever reaches fcvm.
-            # Without this stub the test needs a real podman AND a real
-            # localhost/chromium-bench-req on the box: where either is missing
-            # the phase returns at the inspect, fcvm is never invoked, and the
-            # assertion below reports "the assignment did not survive sudo"
-            # about a command that never ran. Seen on a box whose podman had no
-            # crun: `default OCI runtime "crun" not found`.
+                        f'#!/bin/bash\n'
+                        f'echo "sudo-saw FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}\n'
+                        f'exec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
             self._write(os.path.join(binx, "podman"), '''#!/bin/bash
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
@@ -3559,38 +3554,27 @@ exit 1
 ''')
             fcvm = os.path.join(d, "fcvm")
             self._write(fcvm, f"""#!/bin/bash
-case "$1 $2" in
-  "podman run")
-      echo "FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}
-      echo $$ > {d}/golden.pid
-      echo CHROMIUM_BENCH_READY; exec sleep 30 ;;
-  "snapshot create") echo created ;;
-  "snapshots delete") ;;
-  "ls --json")
-      pid=$(cat {d}/golden.pid)
-      if [ "$3" = "--pid" ]; then
-          echo "[{{\"pid\": $pid, \"vm_id\": \"vm-11111111111111111111111111111111\", \"health_status\": \"healthy\"}}]"
-      else
-          echo "[{{\"name\": \"cb-req-g-{self.RUN_ID}\", \"pid\": $pid}}]"
-      fi ;;
-esac
+if [ "$1 $2" = "podman prepare" ]; then
+    echo "argv=$* FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}
+    exit 1  # stop before the provenance step; the invocation is the evidence
+fi
+exit 1
 """)
-            r = subprocess.run([self.SH, "golden"], env=dict(env, SUDO="sudo", FCVM=fcvm),
-                               capture_output=True, text=True, timeout=120)
+            subprocess.run([self.SH, "golden"], env=dict(env, SUDO="sudo", FCVM=fcvm),
+                           capture_output=True, text=True, timeout=120)
             got = self._read_if_exists(seen, "<no invocation>")
-            # Separate "fcvm never ran" from "fcvm ran without the variable".
-            # One is a broken harness, the other is the defect under test, and
-            # attributing the first to the second sends the reader after sudo's
-            # env_reset for a phase that returned long before sudo.
             self.assertNotEqual(
                 got, "<no invocation>",
-                "golden never invoked fcvm, so this test observed nothing about "
-                f"the assignment: {r.stderr[-800:]}")
-            self.assertIn("FCVM_NO_SNAPSHOT=1", got,
-                          f"the assignment did not survive sudo: {got}\n{r.stderr[-800:]}")
+                "golden never invoked `fcvm podman prepare`, so this test observed nothing")
+            self.assertIn("--tag cb-req-golden", got)
+            self.assertIn("--force", got)
+            self.assertIn("FCVM_NO_SNAPSHOT=<unset>", got,
+                          f"the retired cold-boot env knob is back: {got}")
+            self.assertIn("sudo-saw FCVM_NO_SNAPSHOT=<unset>", got,
+                          f"the harness handed the retired knob to sudo: {got}")
 
-    def test_golden_fails_when_fcvm_exits_before_readiness(self):
-        """A dead cold-boot child is attributed immediately, not after 300s."""
+    def test_golden_fails_when_prepare_fails(self):
+        """A failed prepare is attributed immediately, not after a poll timeout."""
         with tempfile.TemporaryDirectory() as d:
             env, binx = self._env(d, REQBENCH_STAGED="1")
             fcvm = os.path.join(d, "fcvm")
@@ -3607,37 +3591,30 @@ exit 1
                 capture_output=True, text=True, timeout=10,
             )
             self.assertNotEqual(result.returncode, 0, result.stderr)
-            self.assertIn("golden: fcvm exited before readiness (rc=42)", result.stderr)
-            self.assertNotIn("BOOT TIMEOUT", result.stderr)
+            self.assertIn("golden: PREPARE FAILED", result.stderr)
 
     def _golden_image_identity_fixture(self, d, snapshot_cache_key):
         env, binx = self._env(d, DATA_ROOT=d)
         argv = os.path.join(d, "fcvm-argv.log")
-        pid_file = os.path.join(d, "golden.pid")
         digest = "a" * 64
         image_id = "b" * 64
         fcvm = os.path.join(d, "fcvm")
+        # The prepare stub installs what the real one installs: the snapshot
+        # generation directory with its config.json, under the tag's lock.
         self._write(fcvm, f'''#!/bin/bash
 echo "$*" >> {argv}
 case "$1 $2" in
-  "snapshots delete") exit 0 ;;
-  "podman run")
-      echo $$ > {pid_file}
-      echo CHROMIUM_BENCH_READY
-      exec sleep 30
-      ;;
-  "ls --json")
-      pid=$(cat {pid_file})
-      cat <<EOF
-[{{"name":"cb-req-g-{self.RUN_ID}","pid":$pid,"vm_id":"vm-11111111111111111111111111111111","health_status":"healthy"}}]
-EOF
-      ;;
-  "snapshot create")
+  "podman prepare")
       mkdir -p "$DATA_ROOT/snapshots/$TAG"
       : > "$DATA_ROOT/snapshots/$TAG.lock"
       cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
 {{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"}}}}
 EOF
+      # Real prepare reports the generation it installed on stdout; the harness
+      # binds its provenance record to exactly that generation.
+      digest=$(sha256sum "$DATA_ROOT/snapshots/$TAG/config.json" | cut -d" " -f1)
+      printf '{{"status":"prepared","generation_id":"%s","config_digest":"%s"}}\n' \
+          "${{GENERATION_OVERRIDE:-12345678-1234-4234-8234-123456789abc}}" "$digest"
       ;;
 esac
 ''')
@@ -3662,13 +3639,15 @@ exit 1
                 d, "a" * 64,
             )
             self.assertEqual(result.returncode, 0, result.stderr[-1600:])
-            podman_run = next(
-                line for line in argv.splitlines() if line.startswith("podman run ")
+            prepare_line = next(
+                line for line in argv.splitlines() if line.startswith("podman prepare ")
             )
             self.assertTrue(
-                podman_run.endswith(" localhost/chromium-bench-req"), podman_run,
+                prepare_line.endswith(" localhost/chromium-bench-req"), prepare_line,
             )
-            self.assertNotIn(image_id, podman_run)
+            self.assertIn("--tag cb-req-golden", prepare_line)
+            self.assertIn("--force", prepare_line)
+            self.assertNotIn(image_id, prepare_line)
             with open(os.path.join(
                 d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
             )) as source:
@@ -3688,6 +3667,102 @@ exit 1
                 self.assertEqual(
                     provenance["snapshot_config_sha256"],
                     hashlib.sha256(source.read()).hexdigest(),
+                )
+
+    def test_golden_rejects_a_generation_installed_by_someone_else(self):
+        """Provenance must name the generation prepare reported, not the tag's.
+
+        Any other fcvm command can replace the tag between prepare exiting and
+        the provenance write. A replacement carrying the same image passes every
+        content check, so without this binding the record would stamp another
+        process's snapshot with this run's creator hashes and source revision.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, DATA_ROOT=d)
+            fcvm = os.path.join(d, "fcvm")
+            digest = "a" * 64
+            image_id = "b" * 64
+            self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{{"Digest":"sha256:{digest}","Id":"{image_id}"}}]'
+    exit 0
+fi
+exit 1
+''')
+            self._write(fcvm, '''#!/bin/bash
+case "$1 $2" in
+  "podman prepare")
+      mkdir -p "$DATA_ROOT/snapshots/$TAG"
+      : > "$DATA_ROOT/snapshots/$TAG.lock"
+      cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
+{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.storage-v2.img"}}
+EOF
+      digest=$(sha256sum "$DATA_ROOT/snapshots/$TAG/config.json" | cut -d" " -f1)
+      # prepare installed one generation; the tag now holds a different one.
+      printf '{"status":"prepared","generation_id":"%s","config_digest":"%s"}\n' \
+          "99999999-9999-4999-8999-999999999999" "$digest"
+      ;;
+esac
+''')
+            self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
+            result = subprocess.run(
+                [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("is not the one prepare installed", result.stderr)
+
+    def test_a_non_debug_log_level_is_refused_before_anything_runs(self):
+        """Measuring at info drops the records every phase reads, silently.
+
+        The lookalike values are the reviewer-caught false accepts: a substring
+        test lets `notfcvm=debug` (a different target) and `fcvm=debugging` (an
+        invalid level tracing ignores) through a gate whose whole job is
+        refusing configurations that produce no fcvm debug records.
+        """
+        for bad in ("fcvm=info", "notfcvm=debug", "fcvm=debugging"):
+            with self.subTest(fcvm_log=bad), tempfile.TemporaryDirectory() as d:
+                env, _ = self._env(d, FCVM_LOG=bad)
+                marker = os.path.join(d, "fcvm-was-invoked")
+                fcvm = os.path.join(d, "fcvm")
+                self._write(fcvm, f"#!/bin/bash\ntouch {marker}\n")
+                result = subprocess.run(
+                    [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("must select fcvm=debug", result.stderr)
+                self.assertFalse(
+                    os.path.exists(marker),
+                    "the harness ran fcvm before refusing the log level",
+                )
+
+    def test_log_directives_that_enable_fcvm_debug_are_accepted(self):
+        """The exact-directive gate must not refuse values that DO work."""
+        for good in ("fcvm=debug", "fcvm=trace", "warn,fcvm=debug", "fcvm=debug,hyper=warn",
+                     "warn, fcvm=debug"):
+            with self.subTest(fcvm_log=good), tempfile.TemporaryDirectory() as d:
+                env, binx = self._env(d, FCVM_LOG=good, REQBENCH_STAGED="1")
+                self._write(os.path.join(binx, "podman"), """#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+    exit 0
+fi
+exit 1
+""")
+                marker = os.path.join(d, "fcvm-was-invoked")
+                fcvm = os.path.join(d, "fcvm")
+                # An invoked fcvm is the proof the gate was passed; exiting
+                # non-zero right after keeps the run short.
+                self._write(fcvm, f"#!/bin/bash\ntouch {marker}\nexit 42\n")
+                result = subprocess.run(
+                    [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertNotIn("must select fcvm=debug", result.stderr)
+                self.assertTrue(
+                    os.path.exists(marker),
+                    f"the gate refused a working directive: {result.stderr}",
                 )
 
     def test_golden_rejects_a_tag_repointed_before_fcvm_resolved_it(self):
