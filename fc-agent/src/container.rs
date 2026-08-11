@@ -1869,6 +1869,12 @@ mod tests {
         /// Write these chunks (possibly split mid-verb), then keep the
         /// connection open until the guest drops its end.
         Answer(Vec<&'static [u8]>),
+        /// Like `Answer`, but waits for the guest's hang-up after the first
+        /// chunk. The guest acts on a verb the instant it is unambiguous, so
+        /// a chunk boundary between a verb and its newline leaves the rest of
+        /// the script writing into a closed peer. Reading to EOF is what
+        /// sequences this — no sleeps.
+        AnswerAcrossHangup(Vec<&'static [u8]>),
         /// Read the ask, then close without answering (a snapshot boundary).
         Sever,
         /// Never read at all; close after the guest's first extra byte
@@ -1881,17 +1887,8 @@ mod tests {
     /// it read (empty for CloseOnProbe).
     fn spawn_host(mut host: UnixStream, script: HostScript) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || match script {
-            HostScript::Answer(chunks) => {
-                let ask = read_ask(&mut host);
-                for chunk in chunks {
-                    host.write_all(chunk).expect("scripted host write");
-                }
-                // Hold the connection open (mirroring the real listener's
-                // positive-close drain) until the guest closes.
-                let mut sink = [0u8; 64];
-                while matches!(host.read(&mut sink), Ok(n) if n > 0) {}
-                ask
-            }
+            HostScript::Answer(chunks) => answer(&mut host, chunks, false),
+            HostScript::AnswerAcrossHangup(chunks) => answer(&mut host, chunks, true),
             HostScript::Sever => {
                 let ask = read_ask(&mut host);
                 drop(host);
@@ -1907,6 +1904,44 @@ mod tests {
                 String::new()
             }
         })
+    }
+
+    /// Reads the ask, writes the script's chunks, then holds the connection
+    /// open (mirroring the real listener's positive-close drain) until the
+    /// guest closes.
+    fn answer(
+        host: &mut UnixStream,
+        chunks: Vec<&'static [u8]>,
+        hang_up_after_first: bool,
+    ) -> String {
+        let ask = read_ask(host);
+        for (i, chunk) in chunks.iter().enumerate() {
+            if !write_chunk(host, chunk) {
+                break;
+            }
+            if hang_up_after_first && i == 0 {
+                drain_to_close(host);
+            }
+        }
+        drain_to_close(host);
+        ask
+    }
+
+    /// Writes one chunk, reporting whether the guest is still on the other end.
+    /// A verdict is complete as soon as its verb is unambiguous, so the guest
+    /// may hang up before the host has written the rest of the script. That is
+    /// the guest behaving correctly, not a broken host.
+    fn write_chunk(host: &mut UnixStream, chunk: &[u8]) -> bool {
+        match host.write_all(chunk) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => false,
+            Err(e) => panic!("scripted host write: {e:?}"),
+        }
+    }
+
+    fn drain_to_close(host: &mut UnixStream) {
+        let mut sink = [0u8; 64];
+        while matches!(host.read(&mut sink), Ok(n) if n > 0) {}
     }
 
     fn read_ask(host: &mut UnixStream) -> String {
@@ -2093,6 +2128,32 @@ mod tests {
             &flag,
         );
         assert_eq!(result, CacheResult::ColdStart);
+    }
+
+    /// The guest acts on a verb the instant it is unambiguous, which is before
+    /// the newline whenever the host's write splits there. Every verdict must
+    /// still map exactly, and the host must survive discovering the guest
+    /// already hung up on the rest of its script.
+    #[test]
+    fn a_verdict_split_before_its_newline_maps_and_survives_the_hang_up() {
+        for (verb, expected) in [
+            (b"cache-ack".as_slice(), CacheResult::ColdStart),
+            (b"cache-restored".as_slice(), CacheResult::WarmStart),
+            (b"cache-doomed".as_slice(), CacheResult::Doomed),
+        ] {
+            let flag = AtomicBool::new(false);
+            let (result, asks) = handshake(
+                vec![HostScript::AnswerAcrossHangup(vec![verb, b"\n"])],
+                &flag,
+            );
+            assert_eq!(
+                result,
+                expected,
+                "verb {} lost its verdict when the newline landed after the hang-up",
+                String::from_utf8_lossy(verb)
+            );
+            assert_eq!(asks, vec!["cache-ready:sha256:test"]);
+        }
     }
 
     /// Seeded protocol fuzz: random host scripts, exact-verdict invariants.
