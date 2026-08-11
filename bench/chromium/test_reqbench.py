@@ -3602,6 +3602,11 @@ case "$1 $2" in
       cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
 {{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"}}}}
 EOF
+      # Real prepare reports the generation it installed on stdout; the harness
+      # binds its provenance record to exactly that generation.
+      digest=$(sha256sum "$DATA_ROOT/snapshots/$TAG/config.json" | cut -d" " -f1)
+      printf '{{"status":"prepared","generation_id":"%s","config_digest":"%s"}}\n' \
+          "${{GENERATION_OVERRIDE:-12345678-1234-4234-8234-123456789abc}}" "$digest"
       ;;
 esac
 ''')
@@ -3655,6 +3660,67 @@ exit 1
                     provenance["snapshot_config_sha256"],
                     hashlib.sha256(source.read()).hexdigest(),
                 )
+
+    def test_golden_rejects_a_generation_installed_by_someone_else(self):
+        """Provenance must name the generation prepare reported, not the tag's.
+
+        Any other fcvm command can replace the tag between prepare exiting and
+        the provenance write. A replacement carrying the same image passes every
+        content check, so without this binding the record would stamp another
+        process's snapshot with this run's creator hashes and source revision.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, DATA_ROOT=d)
+            fcvm = os.path.join(d, "fcvm")
+            digest = "a" * 64
+            image_id = "b" * 64
+            self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{{"Digest":"sha256:{digest}","Id":"{image_id}"}}]'
+    exit 0
+fi
+exit 1
+''')
+            self._write(fcvm, '''#!/bin/bash
+case "$1 $2" in
+  "podman prepare")
+      mkdir -p "$DATA_ROOT/snapshots/$TAG"
+      : > "$DATA_ROOT/snapshots/$TAG.lock"
+      cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
+{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.storage-v2.img"}}
+EOF
+      digest=$(sha256sum "$DATA_ROOT/snapshots/$TAG/config.json" | cut -d" " -f1)
+      # prepare installed one generation; the tag now holds a different one.
+      printf '{"status":"prepared","generation_id":"%s","config_digest":"%s"}\n' \
+          "99999999-9999-4999-8999-999999999999" "$digest"
+      ;;
+esac
+''')
+            self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
+            result = subprocess.run(
+                [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("is not the one prepare installed", result.stderr)
+
+    def test_a_non_debug_log_level_is_refused_before_anything_runs(self):
+        """Measuring at info drops the records every phase reads, silently."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _ = self._env(d, FCVM_LOG="fcvm=info")
+            marker = os.path.join(d, "fcvm-was-invoked")
+            fcvm = os.path.join(d, "fcvm")
+            self._write(fcvm, f"#!/bin/bash\ntouch {marker}\n")
+            result = subprocess.run(
+                [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("must select fcvm=debug", result.stderr)
+            self.assertFalse(
+                os.path.exists(marker),
+                "the harness ran fcvm before refusing the log level",
+            )
 
     def test_golden_rejects_a_tag_repointed_before_fcvm_resolved_it(self):
         """The snapshot disk key must match the harness's atomic image inspect."""

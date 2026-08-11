@@ -57,6 +57,15 @@ if [ "$TAG" = . ] || [ "$TAG" = .. ] || [ "${#TAG}" -gt 128 ] \
     exit 2
 fi
 FCVM_LOG="${FCVM_LOG:-fcvm=debug}"   # AGENTS.md defect 4: never measure at info
+# Fail closed rather than trusting the default: an override that selects info
+# drops the per-request fcvm records every phase here reads, and the run still
+# produces numbers, so the loss is silent. Guarding the variable covers every
+# call site in this file, not just the one a reviewer happened to be looking at.
+case "$FCVM_LOG" in
+    *fcvm=debug*|*fcvm=trace*) ;;
+    *) echo "FCVM_LOG must select fcvm=debug or fcvm=trace (got '$FCVM_LOG'): the harness reads fcvm's debug records" >&2
+       exit 2 ;;
+esac
 URL="${URL:-http://127.0.0.1:8000/medium.html}"
 
 STATE_DIR="${STATE_DIR:-/mnt/fcvm-btrfs/state}"
@@ -459,24 +468,33 @@ cmd_golden() {
     # installed artifact, and tears the source VM down with verified cleanup.
     # --force replaces a stale tag, which also retires the explicit
     # `snapshots delete` this phase used to need.
+    # prepare's stdout is a one-line JSON record of the generation it installed,
+    # captured separately from the log so the provenance below can be bound to
+    # THAT generation rather than to whatever currently sits under the tag.
+    local prepared_json="$RESULTS/logs/golden-prepared.json"
     $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force \
         --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
-        --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" >"$lf" 2>&1 \
+        --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" 2>"$lf" >"$prepared_json" \
         || { log "golden: PREPARE FAILED"; tail -20 "$lf" >&2; return 1; }
+    local prepared_generation prepared_digest
+    prepared_generation=$(jq -er '.generation_id' <"$prepared_json") \
+        || { log "golden: prepare reported no generation_id"; return 1; }
+    prepared_digest=$(jq -er '.config_digest' <"$prepared_json") \
+        || { log "golden: prepare reported no config_digest"; return 1; }
     # Bind the mutable image tag to the exact content captured by this snapshot.
     # The file lives inside the atomically replaced snapshot directory and names
     # its generation, so a recreated tag cannot inherit stale provenance.
     $SUDO python3 - "$DATA_ROOT/snapshots/$TAG/config.json" \
         "$DATA_ROOT/snapshots/$TAG/reqbench-provenance.json" \
         "$DATA_ROOT/snapshots/$TAG.lock" "$IMAGE" "$image_id" "$image_digest" \
-        "$image_cache_key" \
+        "$image_cache_key" "$prepared_generation" "$prepared_digest" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
         "${REQBENCH_SOURCE_REVISION:-}" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
-    image_cache_key,
+    image_cache_key, prepared_generation, prepared_digest,
     fcvm_sha256, runtime_bundle_sha256, source_revision,
 ) = sys.argv[1:]
 lock = open(lock_path, "a+")
@@ -505,11 +523,21 @@ if not os.path.basename(image_disk_path).startswith(image_cache_key + "."):
         f"snapshot image disk {image_disk_path!r} does not match inspected "
         f"cache key {image_cache_key!r}; the image tag changed during golden creation"
     )
-# The source VM identity comes from the installed generation itself: prepare
-# writes config.json atomically with the generation, and the reader validates
-# provenance against the config in the SAME directory, so a tag replaced
-# between this read and the provenance write strands the record in an orphaned
-# generation and the reader fails closed asking for a fresh golden.
+# Bind the record to the generation `podman prepare` reported installing, not
+# merely to whatever sits under the tag now. Any other fcvm command may replace
+# the tag between prepare exiting and this shared lock being taken, and a
+# replacement carrying the same image would otherwise pass every check here and
+# be stamped with this run's creator hashes and source revision.
+if generation_id != prepared_generation:
+    raise SystemExit(
+        f"snapshot generation {generation_id!r} is not the one prepare installed "
+        f"({prepared_generation!r}); the tag was replaced before provenance was committed"
+    )
+if config_sha256 != prepared_digest:
+    raise SystemExit(
+        f"snapshot config digest {config_sha256!r} does not match prepare's "
+        f"({prepared_digest!r}); the generation changed in place"
+    )
 record = {
     "snapshot_generation_id": generation_id,
     "snapshot_config_sha256": config_sha256,
