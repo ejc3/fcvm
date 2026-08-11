@@ -1978,6 +1978,14 @@ pub async fn restore_from_snapshot(
             "disk patch completed"
         );
 
+        // Failpoint: snapshot loaded and paused, network post-start done (pasta
+        // and its published-port listeners are live), guest not yet running, PID
+        // not yet published. This is the adversarial window a client can reach
+        // the host listener in while nothing behind it can serve — held here so
+        // a harness can drive that connect deterministically. The CH restore
+        // path holds at the mirror-image point (post_start, pre resume).
+        failpoint::hit_async("restore.post_network_pre_resume").await;
+
         // FCVM_KVM_TRACE: enable KVM ftrace around VM resume for debugging snapshot restore.
         let kvm_trace = if std::env::var("FCVM_KVM_TRACE").is_ok() {
             match crate::kvm_trace::KvmTrace::start(&vm_state.vm_id) {
@@ -2288,6 +2296,11 @@ pub async fn restore_from_snapshot_ch(
             .post_start(post_start_pid)
             .await
             .context("post-start network setup")?;
+
+        // Mirror of the Firecracker restore hold: snapshot loaded and paused,
+        // pasta's published-port listeners live, guest not yet running, PID not
+        // yet published. See the Firecracker path for the full rationale.
+        failpoint::hit_async("restore.post_network_pre_resume").await;
 
         backend
             .resume()

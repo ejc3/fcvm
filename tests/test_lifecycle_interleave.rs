@@ -322,8 +322,10 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 
 /// Find the one state file belonging to `vm_name` and derive its exact lock
 /// and runtime-data paths from the deserialized VM ID. State files are keyed by
-/// VM ID, not name or PID; in particular, a rootless clone parked at
-/// `restore.pre_resume` intentionally still has `pid = null`.
+/// VM ID, not name or PID; in particular, a rootless clone parked at either
+/// restore failpoint (`restore.pre_resume`, `restore.post_network_pre_resume`)
+/// intentionally still has `pid = null`, because the PID is published only
+/// after the VMM resumes.
 fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
     let state_dir = fcvm::paths::state_dir();
     let mut found = None;
@@ -1543,7 +1545,10 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
             .context("stopping baseline before clone restore")?;
         baseline = None;
 
-        let failpoint_spec = format!("restore.pre_resume:block_until_file:{}", go_file.display());
+        let failpoint_spec = format!(
+            "restore.post_network_pre_resume:block_until_file:{}",
+            go_file.display()
+        );
         let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
             &[
                 "snapshot",
@@ -1562,7 +1567,7 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
 
         let reached_at = wait_for_marker(
             &clone_log,
-            "FAILPOINT restore.pre_resume reached",
+            "FAILPOINT restore.post_network_pre_resume reached",
             0,
             Duration::from_secs(120),
         )
@@ -1586,9 +1591,11 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
             .context("held rootless clone has no published loopback IP")?;
         clone_artifacts = Some(artifacts);
 
-        // Non-vacuity: pasta's host listener is live while the VMM is still
-        // blocked. This connect+close is the adversarial pre-resume flow; no
-        // retry is allowed, and the marker proves the VMM cannot have run yet.
+        // Non-vacuity: the hold is placed after the restore path's network
+        // post-start, so pasta and its published-port listener are live, and
+        // before the VMM resume, so the guest behind that listener has not run.
+        // This connect+close is the adversarial flow; no retry is allowed, and
+        // the absence of the release marker proves the guest cannot have run.
         let mut early = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::net::TcpStream::connect(format!("{loopback_ip}:{host_port}")),
@@ -1604,17 +1611,17 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
         anyhow::ensure!(
             search_log_from(
                 &clone_log,
-                "FAILPOINT restore.pre_resume released",
+                "FAILPOINT restore.post_network_pre_resume released",
                 reached_at
             )
             .is_none(),
             "the VMM resumed before the adversarial connection completed"
         );
 
-        std::fs::write(&go_file, b"go").context("releasing restore.pre_resume")?;
+        std::fs::write(&go_file, b"go").context("releasing restore.post_network_pre_resume")?;
         let released_at = wait_for_marker(
             &clone_log,
-            "FAILPOINT restore.pre_resume released",
+            "FAILPOINT restore.post_network_pre_resume released",
             reached_at,
             Duration::from_secs(10),
         )

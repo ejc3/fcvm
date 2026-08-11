@@ -1980,10 +1980,14 @@ async fn cmd_snapshot_run_inner(
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
-    // failpoint: hold right before the restore resumes/unblocks the VM (the resume
-    // happens inside restore_from_snapshot{,_ch} below) — clone infra (state file,
-    // status listener, network) is already live, so "client arrives before the
-    // restored guest ever runs" becomes deterministic.
+    // failpoint: hold before the VMM process even starts. The state file and
+    // status listener exist and the network is *configured*, but pasta itself
+    // (and therefore any published-port listener) only starts in the
+    // post_start call inside restore_from_snapshot{,_ch} below, so nothing is
+    // listening on the host port here. Use this point to test shutdown and
+    // pre-publication invariants; for "a client connects to a live host
+    // listener while the guest has not run yet", hold at
+    // `restore.post_network_pre_resume` instead.
     failpoint::hit_async("restore.pre_resume").await;
     if cancel.is_cancelled() {
         info!(vm_id = %vm_id, "shutdown requested before snapshot restore started");
