@@ -82,6 +82,10 @@ pub struct VmContext {
     /// Egress proxy task (rootless mode only); aborted during cleanup.
     pub egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
     pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,
+    /// What this process knows the guest to be (see [`CacheVerdict`]). Written
+    /// by the run loop BEFORE it resolves any cache oneshot; read by the
+    /// status listener to answer every "cache-ready" ask.
+    pub cache_verdict: SharedCacheVerdict,
     /// Startup-snapshot trigger from the health monitor. Carries the ack the
     /// snapshot path must send (or drop) before the monitor publishes Healthy.
     pub startup_rx: Option<oneshot::Receiver<crate::health::StartupSnapshotAck>>,
@@ -203,6 +207,50 @@ pub struct CacheRequest {
     pub digest: String,
     /// Oneshot channel to signal completion back to status listener
     pub ack_tx: oneshot::Sender<()>,
+}
+
+/// What the owning fcvm process knows the guest to be, for answering
+/// "cache-ready" asks on the status port.
+///
+/// fc-agent cannot classify itself from transport events: the VMM queues a
+/// vsock TRANSPORT_RESET into the guest at snapshot SAVE, so a resumed source
+/// and a restored clone observe identical connection death. The guest instead
+/// (re-)sends "cache-ready" until it gets a verdict, and the status listener
+/// answers from this state — which the process that owns the VM maintains
+/// from what it actually did:
+///
+/// - the podman-run loop starts at `Pending` (or `Continue` when snapshots
+///   are disabled), moves to `Continue` once the snapshot decision is "keep
+///   running this VM" (created-and-resumed, creation failed, or no snapshot
+///   key), and to `Doomed` when the VM is being replaced by a restore of the
+///   snapshot it just produced (the NV2 miss path) or shut down mid-decision;
+/// - the restore path binds its listener with `Restored` BEFORE resuming the
+///   clone, so a restored guest's re-ask can never be told to start cold;
+/// - an in-place reboot resets to `Continue`: the rebooted guest cold-boots,
+///   regardless of how its predecessor was classified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheVerdict {
+    /// The snapshot decision has not been made — forward the ask to the run
+    /// loop and keepalive until it answers.
+    Pending,
+    /// Continue cold in this VM: answer "cache-ack".
+    Continue,
+    /// This VM is a restored clone: answer "cache-restored" (the restore
+    /// machinery in this same process drives readiness).
+    Restored,
+    /// This VM is being replaced or torn down: answer "cache-doomed", never
+    /// "cache-ack" — a container launched here races the replacement clone.
+    Doomed,
+}
+
+/// Shared verdict cell between the run/restore loop (writer) and the status
+/// listener (reader). A plain mutex: transitions are rare and never held
+/// across awaits.
+pub type SharedCacheVerdict = Arc<std::sync::Mutex<CacheVerdict>>;
+
+/// Fresh verdict cell.
+pub fn shared_cache_verdict(initial: CacheVerdict) -> SharedCacheVerdict {
+    Arc::new(std::sync::Mutex::new(initial))
 }
 
 /// Result of a snapshot creation attempt that can be interrupted by signals.

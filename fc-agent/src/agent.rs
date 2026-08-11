@@ -357,8 +357,13 @@ pub async fn run() -> Result<()> {
             match cache_result {
                 container::CacheResult::ColdStart => {
                     eprintln!("[fc-agent] cache ready: cold start (cache-ack received)");
-                    // Pause/resume does NOT reset vsock — reconnect is harmless
-                    // (just cycles the connection). No egress wait needed.
+                    // A cold verdict can still arrive after a snapshot boundary
+                    // severed our established vsock connections (the VMM queues
+                    // a transport reset at snapshot SAVE, processed when the
+                    // resumed source runs again). The output writer detects its
+                    // dead connection natively and reconnects; requesting the
+                    // reconnect here is harmless when no boundary was crossed
+                    // (it just cycles the connection). No egress wait needed.
                     restore_status
                         .succeed()
                         .context("publishing cold-start output readiness")?;
@@ -373,6 +378,18 @@ pub async fn run() -> Result<()> {
                         .wait_for_output_readiness()
                         .await
                         .context("waiting for warm-start restore readiness")?;
+                }
+                container::CacheResult::Doomed => {
+                    // The host answered "cache-doomed": this VM produced the
+                    // pre-start snapshot and is being replaced by a restore of
+                    // it. Launching the container here would race the
+                    // replacement clone's startup against shared volumes and
+                    // double-run container startup. Park; the host tears this
+                    // VMM down momentarily (and the health deadline reaps us
+                    // if it somehow does not).
+                    eprintln!("[fc-agent] cache ready: doomed (VM being replaced); parking");
+                    std::future::pending::<()>().await;
+                    unreachable!("std::future::pending never resolves");
                 }
                 container::CacheResult::Failed => {
                     eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");

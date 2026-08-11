@@ -13,7 +13,10 @@ mod snapshot;
 mod types;
 mod vm_config;
 
-pub use types::{CacheRequest, LogLine, PreparedTarget, SnapshotOutcome, VmContext, VmHandle};
+pub use types::{
+    shared_cache_verdict, CacheRequest, CacheVerdict, LogLine, PreparedTarget, SharedCacheVerdict,
+    SnapshotOutcome, VmContext, VmHandle,
+};
 // Re-exported for the snapshot restore path's up-front reboot plan (a rebooted VM
 // relaunches in place via the same shared primitive, on every lifecycle path).
 pub(crate) use types::{RebootSpec, VolumeMapping};
@@ -1477,6 +1480,16 @@ async fn prepare_vm_for_lifecycle(
         (None, None)
     };
 
+    // What this process knows the guest to be, for answering (re-)asked
+    // "cache-ready" messages. With snapshots disabled no boundary can sever
+    // the handshake and no snapshot decision exists — the verdict is Continue
+    // from the start; otherwise it is Pending until the run loop decides.
+    let cache_verdict = shared_cache_verdict(if skip_snapshot_creation {
+        CacheVerdict::Continue
+    } else {
+        CacheVerdict::Pending
+    });
+
     // Create startup snapshot channel for health-triggered snapshot creation
     // Only create startup snapshots if:
     // - Not skipping snapshots (no --no-snapshot)
@@ -1512,12 +1525,14 @@ async fn prepare_vm_for_lifecycle(
         let vm_id_clone = vm_id.clone();
         let reboot_flag = reboot_requested.clone();
         let exit_flag = container_exit_seen.clone();
+        let verdict = cache_verdict.clone();
         tokio::spawn(async move {
             if let Err(e) = run_status_listener(
                 &socket_path,
                 &runtime_dir,
                 &vm_id_clone,
                 cache_tx,
+                verdict,
                 reboot_flag,
                 exit_flag,
             )
@@ -1673,6 +1688,7 @@ async fn prepare_vm_for_lifecycle(
 
     Ok(VmPreparation::Active(Box::new(VmContext {
         restore_from_cache: None,
+        cache_verdict,
         vm_id,
         vm_name,
         data_dir,
@@ -1865,11 +1881,17 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     info!("guest rebooted — relaunching VM in place");
                     // A reboot is a clean cold boot from the already-provisioned disk
                     // (disk-only-clone semantics) — don't re-create the pre-start /
-                    // startup snapshot. Dropping the receivers makes the relaunched
-                    // fc-agent's cache-ready resolve to a cold start (the status
-                    // listener still acks), so it proceeds straight to the container.
+                    // startup snapshot. The Continue verdict set below makes the
+                    // relaunched fc-agent's cache-ready resolve to a cold start,
+                    // so it proceeds straight to the container.
                     ctx.cache_rx = None;
                     ctx.startup_rx = None;
+                    // The relaunched fc-agent re-sends cache-ready; a rebooted
+                    // guest cold-boots from the provisioned disk regardless of
+                    // how its predecessor was classified (a restored clone that
+                    // reboots is NOT restored again — nothing will publish
+                    // restore readiness to it).
+                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Continue;
                     // The rebooted VM's memory is a fresh boot, not a descendant of
                     // any snapshot — a later diff snapshot against the recorded
                     // parent would mix incompatible memory lineages. Clear it so a
@@ -1975,6 +1997,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     .await
                     {
                         SnapshotOutcome::Interrupted => {
+                            // Shutdown mid-decision: the guest must not launch
+                            // its container into the teardown.
+                            *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
                             return Ok(None);
                         }
                         SnapshotOutcome::Created => {
@@ -1999,6 +2024,11 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                     "Pre-start snapshot created; relaunching by restoring it \
                                      (NV2 miss path converges on the hit path)"
                                 );
+                                // Recorded BEFORE the return drops the oneshot: a
+                                // re-asking guest must hear "cache-doomed", never
+                                // silence read as "maybe ack later" or a bare ack
+                                // from a raced teardown.
+                                *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
                                 ctx.restore_from_cache = Some(key.clone());
                                 return Ok(None);
                             }
@@ -2017,10 +2047,22 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
                         }
                     }
-                    // Send ack back on failure/interruption (fc-agent should continue)
+                    // Continue cold in this VM (snapshot kept alongside a
+                    // resumed source, or creation failed). Recorded BEFORE the
+                    // oneshot resolves so the listener's answer can never race
+                    // ahead of the decision.
+                    //
+                    // failpoint: widen the resume→ack window. The snapshot save
+                    // queued a vsock TRANSPORT_RESET into the guest, so on
+                    // resume the guest's handshake session is severed while
+                    // this ack is still on its way — the interleaving that
+                    // hung the source until the re-ask protocol (#799).
+                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Continue;
+                    failpoint::hit_async("cache.pre_ack").await;
                     let _ = cache_request.ack_tx.send(());
                 } else {
-                    // Should not happen if channel exists, but send ack anyway
+                    // No snapshot key: nothing to decide, continue cold.
+                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Continue;
                     let _ = cache_request.ack_tx.send(());
                 }
                 // Continue waiting for VM exit or cancellation

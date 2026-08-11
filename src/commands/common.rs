@@ -3492,13 +3492,19 @@ pub async fn create_snapshot_core(
         }
     }
 
-    // NOTE: Do NOT bump restore-epoch here. Snapshot create (pause → dump → resume)
-    // does NOT reset vsock connections — empirically verified with scratch VMs.
-    // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET only occurs on snapshot RESTORE (loading
-    // a new VM from snapshot files), not on create. Bumping restore-epoch here
-    // would trigger handle_clone_restore() in fc-agent, which kills TCP connections
-    // and reconnects FUSE/output vsock unnecessarily, crashing the running container.
-    // restore-epoch is bumped in the restore path (snapshot.rs) where it's needed.
+    // NOTE: Do NOT bump restore-epoch here. Snapshot create DOES sever the guest's
+    // established vsock connections — Firecracker's `Vsock::prepare_save` queues a
+    // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET into the (paused) guest during the save,
+    // and the resumed source processes it exactly like a restored clone would
+    // (this is what made a transport reset useless as a restore classifier; the
+    // guest now re-asks the status listener, which answers from CacheVerdict).
+    // But a severed connection is all it is: bumping restore-epoch here would
+    // additionally trigger handle_clone_restore() in fc-agent, which kills TCP
+    // connections and remounts NFS as if the whole VM had been replaced,
+    // crashing the running container. Connection-level recovery (output/egress/
+    // FUSE reconnect, exec rebind via the vsock_epoch below) is sufficient and
+    // already happens. restore-epoch is bumped only in the restore path
+    // (snapshot.rs) where a clone genuinely needs full restore handling.
     //
     // The HOST-side `vsock_epoch` (VmState) bumped above is a different mechanism:
     // it never reaches the guest. It only tells host exec clients that byte streams

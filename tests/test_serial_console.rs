@@ -80,7 +80,8 @@ async fn test_serial_console_after_restore() -> Result<()> {
     common::poll_health_by_pid(pid2, 120).await?;
     println!("  Phase 2 VM healthy (PID: {})", pid2);
 
-    // Wait for restore to complete — poll the log until "restore complete" appears.
+    // Wait for restore to complete — poll the log until fc-agent's phase
+    // summary line appears (renamed when the phases gained timings).
     // The restore path includes clock sync + chronyc + gateway ping which can take
     // several seconds, so poll rather than sleep a fixed duration.
     println!("  Waiting for restore to complete...");
@@ -93,7 +94,7 @@ async fn test_serial_console_after_restore() -> Result<()> {
             );
         }
         if let Ok(contents) = std::fs::read_to_string(&log_path) {
-            if contents.contains("[fc-agent] restore complete") {
+            if contents.contains("[fc-agent] restore phases complete") {
                 println!("  Restore complete detected in log");
                 break;
             }
@@ -167,7 +168,7 @@ async fn test_serial_console_after_restore() -> Result<()> {
 
     // Check for fc-agent restore messages (only relevant on warm start)
     let found_restore_msg = contents.contains("[fc-agent] handling restore")
-        || contents.contains("[fc-agent] restore complete");
+        || contents.contains("[fc-agent] restore phases complete");
     println!(
         "  fc-agent restore messages in host log: {}",
         found_restore_msg

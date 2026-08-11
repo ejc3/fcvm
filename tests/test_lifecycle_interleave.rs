@@ -17,6 +17,12 @@
 //! - `serial-safe-snapshots` — the guest quiesces its console before the
 //!   cache-ready notification, so the pre-start snapshot can never capture the
 //!   UART mid-transmit (which would poison every restore's serial console).
+//! - `cache-verdict-re-ask` — a resumed source's severed cache handshake is
+//!   re-asked instead of read as "I was restored": the snapshot save queues a
+//!   vsock TRANSPORT_RESET the source processes at resume exactly like a
+//!   restored clone would, so the host's verdict — not the transport event —
+//!   classifies the VM. Without the re-ask the source never launches its
+//!   container (4/4 forced misses hung, ack sent into the dead session).
 //!
 //! All VMs run rootless (no sudo needed beyond what `make test-root` does for
 //! the runner). Test names contain `lifecycle_interleave` so
@@ -1996,5 +2002,126 @@ async fn test_lifecycle_interleave_snapshot_run_sigterm_before_resume_cleans_exa
     if !cleanup_errors.is_empty() {
         anyhow::bail!("fixture cleanup failed:\n- {}", cleanup_errors.join("\n- "));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// cache-verdict-re-ask
+// ---------------------------------------------------------------------------
+
+/// A pre-start snapshot MISS on the resume flow, with the resume→ack window
+/// deliberately widened (`cache.pre_ack:sleep:3000`). The snapshot save queues
+/// a vsock TRANSPORT_RESET into the guest, so on resume the guest's handshake
+/// session is severed 3s before the host's cache-ack can arrive — the guest
+/// MUST classify from the host's verdict (re-ask → "cache-ack"), never from
+/// the severed transport. Pre-protocol code read the severance as "I was
+/// restored" and waited forever for a restore epoch no one publishes to a
+/// source: this test then fails with the VM never Healthy and a single
+/// cache-ready in the log.
+#[tokio::test]
+async fn test_lifecycle_interleave_resumed_source_survives_late_ack() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("ilv-reask");
+    // Unique env → unique snapshot key → the pre-start snapshot is CREATED
+    // this run (a hit would restore instead and never cross the resume flow).
+    let env_unique = format!("ILV_ID={}", vm_name);
+
+    let (mut child, pid, vm_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--env",
+            &env_unique,
+            common::TEST_IMAGE,
+        ],
+        &[("FCVM_FAILPOINT", "cache.pre_ack:sleep:3000")],
+    )
+    .await?;
+
+    // The boundary this test exists for: the miss path must actually create
+    // the pre-start snapshot (pause → save → resume) this run.
+    let created_at = wait_for_marker(
+        &vm_log,
+        "Pre-start snapshot created successfully",
+        0,
+        Duration::from_secs(300),
+    )
+    .await
+    .context("pre-start snapshot was never created — the miss path did not run")?;
+
+    // Outcome: the resumed source must still launch its container and become
+    // Healthy. This is the line that hangs without the re-ask protocol.
+    let vm_id = loop {
+        if let Some(state) = ls_vm_by_pid(pid).await? {
+            break state.vm_id;
+        }
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "fcvm exited before creating VM state; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let state_path = fcvm::paths::state_dir().join(format!("{}.json", vm_id));
+    let poll_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let healthy = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<fcvm::state::VmState>(&c).ok())
+            .map(|s| s.health_status == fcvm::state::HealthStatus::Healthy)
+            .unwrap_or(false);
+        if healthy {
+            break;
+        }
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "fcvm exited before Healthy; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        );
+        anyhow::ensure!(
+            Instant::now() <= poll_deadline,
+            "resumed source never became Healthy after its pre-start snapshot — \
+             the severed handshake was read as a classification again; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Non-vacuity, from the host's own markers:
+    // (1) the widened window was actually armed and hit;
+    let pre_ack_hit = log_contains(&vm_log, "FAILPOINT cache.pre_ack reached");
+    // (2) the guest actually RE-ASKED after the severed session — the second
+    //     "Cache-ready notification received" is the mechanism under test,
+    //     and it must come after the snapshot boundary.
+    let reask_after_boundary =
+        search_log_from(&vm_log, "Cache-ready notification received", created_at).is_some();
+    let ask_count = {
+        let content = std::fs::read_to_string(&vm_log).unwrap_or_default();
+        count_occurrences(&content, "Cache-ready notification received")
+    };
+    let base_key = ls_vm_by_pid(pid)
+        .await?
+        .and_then(|s| s.config.snapshot_name);
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    cleanup_snapshot_keys(&[base_key]).await;
+
+    assert!(
+        pre_ack_hit,
+        "the cache.pre_ack failpoint never fired — the widened window was not exercised; \
+         log tail:\n{}",
+        log_tail(&vm_log, 40)
+    );
+    assert!(
+        reask_after_boundary && ask_count >= 2,
+        "expected a re-asked cache-ready after the snapshot boundary (got {} asks, \
+         re-ask-after-boundary={}); the healthy outcome would be vacuous without it; \
+         log tail:\n{}",
+        ask_count,
+        reask_after_boundary,
+        log_tail(&vm_log, 40)
+    );
     Ok(())
 }

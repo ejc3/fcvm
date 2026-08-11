@@ -1896,18 +1896,30 @@ async fn cmd_snapshot_run_inner(
     let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let status_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_STATUS_PORT);
+    // Restored, and bound BEFORE the VMM resumes: the clone wakes mid-handshake
+    // (the snapshot captured fc-agent waiting for its cache verdict), observes
+    // the transport reset, and re-asks on a fresh connection. The answer must
+    // be "cache-restored" — a bare ack here would launch the container cold,
+    // racing the restore cleanup this process is about to drive. This standing
+    // verdict is what makes the re-ask safe under every ordering of the guest's
+    // re-ask vs the restore-epoch machinery. An in-place guest reboot resets it
+    // to Continue (a rebooted clone cold-boots; nothing will publish restore
+    // readiness to it again).
+    let cache_verdict = super::podman::shared_cache_verdict(super::podman::CacheVerdict::Restored);
     setup.status_handle = Some({
         let socket_path = status_socket_path.clone();
         let runtime_dir = data_dir.clone();
         let vm_id_clone = vm_id.clone();
         let reboot_flag = reboot_requested.clone();
         let exit_flag = container_exit_seen.clone();
+        let verdict = cache_verdict.clone();
         tokio::spawn(async move {
             if let Err(e) = run_status_listener(
                 &socket_path,
                 &runtime_dir,
                 &vm_id_clone,
                 None,
+                verdict,
                 reboot_flag,
                 exit_flag,
             )
@@ -2504,6 +2516,13 @@ async fn cmd_snapshot_run_inner(
                         container_exit_seen.store(false, std::sync::atomic::Ordering::Release);
                         let _ = std::fs::remove_file(data_dir.join("container-exit"));
                         let _ = std::fs::remove_file(data_dir.join("container-ready"));
+                        // The relaunched fc-agent cold-boots and re-sends cache-ready.
+                        // Its predecessor's Restored verdict must not answer it —
+                        // nothing will publish restore readiness to a rebooted clone,
+                        // so "cache-restored" here would hang it exactly the way the
+                        // resumed source used to hang (#799).
+                        *cache_verdict.lock().unwrap() =
+                            super::podman::CacheVerdict::Continue;
                         // Build the cold-boot relaunch plan ON DEMAND: only a rebooting
                         // clone needs it, and assembling it (kernel/initrd resolution,
                         // launch config) cost ~19ms up front on EVERY clone — waste for
