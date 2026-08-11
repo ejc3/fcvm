@@ -61,11 +61,24 @@ FCVM_LOG="${FCVM_LOG:-fcvm=debug}"   # AGENTS.md defect 4: never measure at info
 # drops the per-request fcvm records every phase here reads, and the run still
 # produces numbers, so the loss is silent. Guarding the variable covers every
 # call site in this file, not just the one a reviewer happened to be looking at.
-case "$FCVM_LOG" in
-    *fcvm=debug*|*fcvm=trace*) ;;
-    *) echo "FCVM_LOG must select fcvm=debug or fcvm=trace (got '$FCVM_LOG'): the harness reads fcvm's debug records" >&2
-       exit 2 ;;
-esac
+# Exact comma-separated directives, not a substring test: `notfcvm=debug` is a
+# different target and `fcvm=debugging` is a level tracing ignores — both would
+# pass a substring gate and still produce none of the records this harness reads.
+# Spaces are dropped first because tracing trims around each directive, so
+# `warn, fcvm=debug` does select fcvm=debug and must not be refused. No valid
+# directive contains a space, which makes deleting them all safe here.
+fcvm_log_ok=0
+IFS=',' read -ra fcvm_log_parts <<< "${FCVM_LOG// /}"
+for fcvm_log_part in "${fcvm_log_parts[@]}"; do
+    case "$fcvm_log_part" in
+        fcvm=debug|fcvm=trace) fcvm_log_ok=1 ;;
+    esac
+done
+if [ "$fcvm_log_ok" -ne 1 ]; then
+    echo "FCVM_LOG must select fcvm=debug or fcvm=trace as an exact directive (got '$FCVM_LOG'): the harness reads fcvm's debug records" >&2
+    exit 2
+fi
+unset fcvm_log_ok fcvm_log_parts fcvm_log_part
 URL="${URL:-http://127.0.0.1:8000/medium.html}"
 
 STATE_DIR="${STATE_DIR:-/mnt/fcvm-btrfs/state}"

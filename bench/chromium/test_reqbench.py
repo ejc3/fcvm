@@ -3537,8 +3537,14 @@ exec /bin/bash "$@"
         with tempfile.TemporaryDirectory() as d:
             env, binx = self._env(d, REQBENCH_STAGED="1")
             seen = os.path.join(d, "seen.txt")
+            # Record the knob at the sudo boundary, BEFORE env -i wipes it: the
+            # fake fcvm's own recording can only ever read <unset> behind the
+            # reset, so it would keep this test green even if the harness
+            # regressed to `FCVM_NO_SNAPSHOT=1 $SUDO ...`.
             self._write(os.path.join(binx, "sudo"),
-                        '#!/bin/bash\nexec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
+                        f'#!/bin/bash\n'
+                        f'echo "sudo-saw FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}\n'
+                        f'exec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
             self._write(os.path.join(binx, "podman"), '''#!/bin/bash
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
@@ -3564,6 +3570,8 @@ exit 1
             self.assertIn("--force", got)
             self.assertIn("FCVM_NO_SNAPSHOT=<unset>", got,
                           f"the retired cold-boot env knob is back: {got}")
+            self.assertIn("sudo-saw FCVM_NO_SNAPSHOT=<unset>", got,
+                          f"the harness handed the retired knob to sudo: {got}")
 
     def test_golden_fails_when_prepare_fails(self):
         """A failed prepare is attributed immediately, not after a poll timeout."""
@@ -3705,22 +3713,57 @@ esac
             self.assertIn("is not the one prepare installed", result.stderr)
 
     def test_a_non_debug_log_level_is_refused_before_anything_runs(self):
-        """Measuring at info drops the records every phase reads, silently."""
-        with tempfile.TemporaryDirectory() as d:
-            env, _ = self._env(d, FCVM_LOG="fcvm=info")
-            marker = os.path.join(d, "fcvm-was-invoked")
-            fcvm = os.path.join(d, "fcvm")
-            self._write(fcvm, f"#!/bin/bash\ntouch {marker}\n")
-            result = subprocess.run(
-                [self.SH, "golden"], env=dict(env, FCVM=fcvm),
-                capture_output=True, text=True, timeout=30,
-            )
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("must select fcvm=debug", result.stderr)
-            self.assertFalse(
-                os.path.exists(marker),
-                "the harness ran fcvm before refusing the log level",
-            )
+        """Measuring at info drops the records every phase reads, silently.
+
+        The lookalike values are the reviewer-caught false accepts: a substring
+        test lets `notfcvm=debug` (a different target) and `fcvm=debugging` (an
+        invalid level tracing ignores) through a gate whose whole job is
+        refusing configurations that produce no fcvm debug records.
+        """
+        for bad in ("fcvm=info", "notfcvm=debug", "fcvm=debugging"):
+            with self.subTest(fcvm_log=bad), tempfile.TemporaryDirectory() as d:
+                env, _ = self._env(d, FCVM_LOG=bad)
+                marker = os.path.join(d, "fcvm-was-invoked")
+                fcvm = os.path.join(d, "fcvm")
+                self._write(fcvm, f"#!/bin/bash\ntouch {marker}\n")
+                result = subprocess.run(
+                    [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("must select fcvm=debug", result.stderr)
+                self.assertFalse(
+                    os.path.exists(marker),
+                    "the harness ran fcvm before refusing the log level",
+                )
+
+    def test_log_directives_that_enable_fcvm_debug_are_accepted(self):
+        """The exact-directive gate must not refuse values that DO work."""
+        for good in ("fcvm=debug", "fcvm=trace", "warn,fcvm=debug", "fcvm=debug,hyper=warn",
+                     "warn, fcvm=debug"):
+            with self.subTest(fcvm_log=good), tempfile.TemporaryDirectory() as d:
+                env, binx = self._env(d, FCVM_LOG=good, REQBENCH_STAGED="1")
+                self._write(os.path.join(binx, "podman"), """#!/bin/bash
+if [ "$1 $2" = "image inspect" ]; then
+    echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+    exit 0
+fi
+exit 1
+""")
+                marker = os.path.join(d, "fcvm-was-invoked")
+                fcvm = os.path.join(d, "fcvm")
+                # An invoked fcvm is the proof the gate was passed; exiting
+                # non-zero right after keeps the run short.
+                self._write(fcvm, f"#!/bin/bash\ntouch {marker}\nexit 42\n")
+                result = subprocess.run(
+                    [self.SH, "golden"], env=dict(env, FCVM=fcvm),
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertNotIn("must select fcvm=debug", result.stderr)
+                self.assertTrue(
+                    os.path.exists(marker),
+                    f"the gate refused a working directive: {result.stderr}",
+                )
 
     def test_golden_rejects_a_tag_repointed_before_fcvm_resolved_it(self):
         """The snapshot disk key must match the harness's atomic image inspect."""
