@@ -591,8 +591,12 @@ pub struct NamespaceParams {
     pub user_namespace_path: Option<std::path::PathBuf>,
     /// Net namespace path for rootless clones (`/proc/<pid>/ns/net`).
     pub net_namespace_path: Option<std::path::PathBuf>,
-    /// Mount-namespace redirects `(baseline_dirs, clone_dir)` for clone isolation.
-    pub mount_redirects: Option<(Vec<std::path::PathBuf>, std::path::PathBuf)>,
+    /// Ordered mount-namespace redirects for clone isolation: each
+    /// `(mountpoint, source)` pair bind-mounts `source` over `mountpoint`, in
+    /// order. Order is load-bearing: a later pair may target a path inside an
+    /// earlier pair's mount (e.g. the source runtime dir is redirected to a
+    /// custom vsock dir first, then the clone's `disks/` is bound back on top).
+    pub mount_redirects: Option<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
 }
 
 /// Install `pre_exec` hooks on a VMM command that (1) enter the configured user/mount/network
@@ -613,13 +617,16 @@ pub fn install_namespace_pre_exec(
     let user_ns_path_clone = ns.user_namespace_path.clone();
     let net_ns_path_clone = ns.net_namespace_path.clone();
 
-    // Ensure baseline directories exist for bind mount targets. The baseline VMs may have
-    // been cleaned up, but we need the directories present as mount targets.
-    if let Some((ref baseline_dirs, _)) = mount_redirects_clone {
-        for baseline_dir in baseline_dirs {
-            if !baseline_dir.exists() {
-                std::fs::create_dir_all(baseline_dir)
-                    .context("creating baseline directory for mount redirect")?;
+    // Ensure mountpoint directories exist for the bind mounts. The baseline VMs may
+    // have been cleaned up, but the directories must be present as mount targets.
+    // A nested mountpoint (inside an earlier pair's mount) resolves inside that
+    // pair's SOURCE at mount time; its backing directory there is the caller's
+    // responsibility — creating the host-side path here is harmless either way.
+    if let Some(ref redirects) = mount_redirects_clone {
+        for (mountpoint, _) in redirects {
+            if !mountpoint.exists() {
+                std::fs::create_dir_all(mountpoint)
+                    .context("creating mountpoint directory for mount redirect")?;
             }
         }
     }
@@ -663,21 +670,24 @@ pub fn install_namespace_pre_exec(
             None
         };
 
-        let mount_paths = if let Some((ref baseline_dirs, ref clone_dir)) = mount_redirects_clone {
+        let mount_paths = if let Some(ref redirects) = mount_redirects_clone {
             info!(target: "vm", vm_id = %vm_id,
-                baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-                clone = %clone_dir.display(),
+                redirects = ?redirects
+                    .iter()
+                    .map(|(m, s)| format!("{} <- {}", m.display(), s.display()))
+                    .collect::<Vec<_>>(),
                 "setting up mount namespace for mount redirects");
-            let clone_cstr = CString::new(clone_dir.to_string_lossy().as_bytes())
-                .context("clone path contains invalid characters")?;
-            let baseline_cstrs: Vec<CString> = baseline_dirs
+            let pair_cstrs: Vec<(CString, CString)> = redirects
                 .iter()
-                .map(|p| {
-                    CString::new(p.to_string_lossy().as_bytes())
-                        .context("baseline path contains invalid characters")
+                .map(|(mountpoint, source)| {
+                    let mountpoint_cstr = CString::new(mountpoint.to_string_lossy().as_bytes())
+                        .context("mountpoint path contains invalid characters")?;
+                    let source_cstr = CString::new(source.to_string_lossy().as_bytes())
+                        .context("redirect source path contains invalid characters")?;
+                    Ok((mountpoint_cstr, source_cstr))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            Some((baseline_cstrs, clone_cstr))
+            Some(pair_cstrs)
         } else {
             None
         };
@@ -711,7 +721,7 @@ pub fn install_namespace_pre_exec(
                 }
 
                 // Step 1: Mount namespace for path redirects (before entering network ns).
-                if let Some((ref baseline_cstrs, ref clone_cstr)) = mount_paths {
+                if let Some(ref pair_cstrs) = mount_paths {
                     unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
                         std::io::Error::other(format!("failed to unshare mount namespace: {}", e))
                     })?;
@@ -726,12 +736,13 @@ pub fn install_namespace_pre_exec(
                     .map_err(|e| {
                         std::io::Error::other(format!("failed to make mount private: {}", e))
                     })?;
-                    // Bind mount clone_dir over each baseline_dir so the VMM sees the clone's
-                    // files when accessing any baseline's path.
-                    for baseline_cstr in baseline_cstrs {
+                    // Bind each pair's source over its mountpoint, IN ORDER: a later
+                    // mountpoint may resolve inside an earlier pair's mount (that is how
+                    // the clone's disks are bound back inside a custom vsock target).
+                    for (mountpoint_cstr, source_cstr) in pair_cstrs {
                         mount(
-                            Some(clone_cstr.as_c_str()),
-                            baseline_cstr.as_c_str(),
+                            Some(source_cstr.as_c_str()),
+                            mountpoint_cstr.as_c_str(),
                             None::<&str>,
                             MsFlags::MS_BIND,
                             None::<&str>,
@@ -739,7 +750,7 @@ pub fn install_namespace_pre_exec(
                         .map_err(|e| {
                             std::io::Error::other(format!(
                                 "failed to bind mount {:?} over {:?}: {}",
-                                clone_cstr, baseline_cstr, e
+                                source_cstr, mountpoint_cstr, e
                             ))
                         })?;
                     }

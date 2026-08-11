@@ -45,6 +45,26 @@ another what changed and why. Say that and stop.
 - Read it back as if a colleague sent it to you. If it reads like marketing or an essay,
   rewrite it.
 
+## MAXIMUM REUSE / CACHEABILITY
+
+**The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,
+rootfs images, initrds, container exports, and snapshots are content-addressed precisely
+so nothing is built or booted twice when it doesn't have to be.
+
+- **No snapshot-cache opt-outs unless absolutely required.** An invocation may skip the
+  cache only when a cached artifact would BEHAVE differently for it and the difference
+  cannot be reconciled at restore time. Every entry in `snapshot_cache_opt_out`
+  (`src/commands/podman/mod.rs`) carries that justification next to it; an entry without
+  one is a bug.
+- **Flags that change WHERE something binds are honored at restore time, not by
+  bypassing the cache.** Example: `--vsock-dir` retargets the restore mount redirect so a
+  cache hit places the clone's listener in the caller's directory; it does not force a
+  cold boot.
+- **Never add per-caller data to the content key when restore can reconcile it.**
+  Fragmenting the key silently kills sharing between behaviorally identical artifacts.
+- Before adding an opt-out or a key ingredient, ask: can the restore path absorb this
+  difference? If yes, that is the fix.
+
 ## VERIFY PLAN AND RUN NEW TESTS LOCALLY
 
 **Before committing, ALWAYS:**

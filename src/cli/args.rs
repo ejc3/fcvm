@@ -462,6 +462,12 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub no_swap: bool,
 
+    /// Place the clone's vsock control socket at DIR/vsock.sock instead of its
+    /// runtime directory (predictable path for external tooling). The restore
+    /// mount redirect retargets the snapshot's embedded vsock directory here.
+    #[arg(long)]
+    pub vsock_dir: Option<String>,
+
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================

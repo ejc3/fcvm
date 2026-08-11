@@ -90,9 +90,8 @@ impl Hypervisor for FirecrackerBackend {
         if let Some(path) = &spec.net_namespace_path {
             self.vm.set_net_namespace_path(path.clone());
         }
-        if let Some((baseline_dirs, clone_dir)) = &spec.mount_redirects {
-            self.vm
-                .set_mount_redirects(baseline_dirs.clone(), clone_dir.clone());
+        if let Some(redirects) = &spec.mount_redirects {
+            self.vm.set_mount_redirects(redirects.clone());
         }
         self.vm
             .start(&spec.binary, None, spec.extra_args.as_deref())

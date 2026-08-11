@@ -149,7 +149,10 @@ where
 
 /// Resolve a custom vsock directory into the exact socket path that all
 /// launcher components and later snapshot commands will share.
-fn resolve_custom_vsock_socket_path(configured_dir: &Path, current_dir: &Path) -> PathBuf {
+pub(crate) fn resolve_custom_vsock_socket_path(
+    configured_dir: &Path,
+    current_dir: &Path,
+) -> PathBuf {
     let absolute_dir = if configured_dir.is_absolute() {
         configured_dir.to_path_buf()
     } else {
@@ -296,6 +299,40 @@ fn should_arm_startup_snapshot(
     !skip_snapshot_creation
         && has_snapshot_key
         && (lifecycle.is_prepare() || has_explicit_http_health_check)
+}
+
+/// Whether this invocation must stay out of the snapshot cache entirely — no
+/// lookup, no creation. `env_no_snapshot` is `FCVM_NO_SNAPSHOT` set non-empty;
+/// `env_forced_vsock_bootplan` is `FCVM_BOOTPLAN=vsock`.
+///
+/// MAXIMUM REUSE / CACHEABILITY is a core fcvm principle: an entry joins this
+/// list only when a cached artifact would BEHAVE differently for this
+/// invocation and the difference cannot be reconciled at restore time. Flags
+/// that only change WHERE something binds (e.g. `--vsock-dir`) are honored by
+/// the restore path instead of opting out.
+fn snapshot_cache_opt_out(
+    args: &RunArgs,
+    env_no_snapshot: bool,
+    env_forced_vsock_bootplan: bool,
+) -> bool {
+    args.no_snapshot
+        // A disk-only clone cold-boots from the captured disk and must never divert
+        // into the snapshot-cache / UFFD restore path.
+        || args.rootfs_override.is_some()
+        // Cloud Hypervisor supports explicit `snapshot create`/`run` (P2), but the
+        // automatic pre-start snapshot cache for `podman run` is not wired up for CH yet
+        // (a follow-on) — so never enter the snapshot-cache / restore path for it here.
+        || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
+        || env_no_snapshot
+        // A FORCED boot-plan transport override (FCVM_BOOTPLAN=vsock on Firecracker, which
+        // natively uses MMDS) produces a guest whose fc-agent took the vsock path and never
+        // spawned the MMDS restore-epoch watcher. The snapshot cache key is a hash of
+        // FirecrackerConfig, which does NOT encode the boot-plan transport, so a cached
+        // vsock-built snapshot would be restored by a later NORMAL (MMDS) run under the same
+        // key — the host then signals restore over MMDS that nobody polls, wedging the
+        // restored VM (no exec rebind / output reconnect). Forcing the transport is a
+        // test/debug path with no need to populate the shared cache, so skip caching for it.
+        || env_forced_vsock_bootplan
 }
 
 /// Where one `podman prepare` invocation installs its startup snapshot, and what an
@@ -916,28 +953,16 @@ async fn prepare_vm_for_lifecycle(
         (image_ref.cache_key, image_ref.image_id)
     };
 
-    // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
+    // Check for snapshot cache (unless the invocation opts out — see
+    // snapshot_cache_opt_out for the full list and rationale).
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
-    // A disk-only clone cold-boots from the captured disk and must never divert
-    // into the snapshot-cache / UFFD restore path.
-    let no_snapshot = args.no_snapshot
-        || args.rootfs_override.is_some()
-        // Cloud Hypervisor supports explicit `snapshot create`/`run` (P2), but the
-        // automatic pre-start snapshot cache for `podman run` is not wired up for CH yet
-        // (a follow-on) — so never enter the snapshot-cache / restore path for it here.
-        || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
-        || std::env::var("FCVM_NO_SNAPSHOT")
+    let no_snapshot = snapshot_cache_opt_out(
+        &args,
+        std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        // A FORCED boot-plan transport override (FCVM_BOOTPLAN=vsock on Firecracker, which
-        // natively uses MMDS) produces a guest whose fc-agent took the vsock path and never
-        // spawned the MMDS restore-epoch watcher. The snapshot cache key is a hash of
-        // FirecrackerConfig, which does NOT encode the boot-plan transport, so a cached
-        // vsock-built snapshot would be restored by a later NORMAL (MMDS) run under the same
-        // key — the host then signals restore over MMDS that nobody polls, wedging the
-        // restored VM (no exec rebind / output reconnect). Forcing the transport is a
-        // test/debug path with no need to populate the shared cache, so skip caching for it.
-        || std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock");
+            .unwrap_or(false),
+        std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock"),
+    );
     let (fc_config, snapshot_key, prepare_target): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
@@ -999,6 +1024,7 @@ async fn prepare_vm_for_lifecycle(
                 exec: None,
                 no_dirty_tracking: false, // podman needs dirty tracking for future snapshots
                 no_swap: false,
+                vsock_dir: args.vsock_dir.clone(),
                 startup_snapshot_base_key: None, // Already using startup snapshot
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
@@ -1037,6 +1063,7 @@ async fn prepare_vm_for_lifecycle(
                 exec: None,
                 no_dirty_tracking: false, // podman needs dirty tracking for startup snapshot
                 no_swap: false,
+                vsock_dir: args.vsock_dir.clone(),
                 // Create startup snapshot if this config has a health check URL
                 startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
                 cpu: Some(args.cpu),
@@ -2451,6 +2478,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         exec: None,
         no_dirty_tracking: false,
         no_swap: false,
+        vsock_dir: ctx.args.vsock_dir.clone(),
         startup_snapshot_base_key: ctx.args.health_check.as_ref().map(|_| key.clone()),
         cpu: Some(ctx.args.cpu),
         mem: Some(ctx.args.mem),
@@ -2709,6 +2737,48 @@ mod tests {
         args.vsock_dir = Some("/tmp/external-vsock".to_string());
         let error = validate_prepare_args(&args).unwrap_err();
         assert!(format!("{error:#}").contains("does not support --vsock-dir"));
+    }
+
+    /// MAXIMUM REUSE / CACHEABILITY: `--vsock-dir` must NOT opt the run out of
+    /// the snapshot cache. It only changes WHERE the clone's listener binds,
+    /// and the restore mount redirect retargets the cached vmstate's embedded
+    /// vsock directory to the caller-owned one (end-to-end pin:
+    /// test_vsock_dir_honored_on_snapshot_cache_hit).
+    #[test]
+    fn a_custom_vsock_dir_still_participates_in_the_snapshot_cache() {
+        let mut args = test_args();
+        args.no_snapshot = false;
+        args.vsock_dir = Some("/tmp/external-vsock".to_string());
+        assert!(
+            !snapshot_cache_opt_out(&args, false, false),
+            "--vsock-dir must keep using the snapshot cache; the restore redirect honors it"
+        );
+    }
+
+    /// Each opt-out trigger stands alone; none depends on another being set.
+    #[test]
+    fn every_snapshot_cache_opt_out_trigger_stands_alone() {
+        let baseline = || {
+            let mut args = test_args();
+            args.no_snapshot = false;
+            args
+        };
+        assert!(!snapshot_cache_opt_out(&baseline(), false, false));
+
+        let mut args = baseline();
+        args.no_snapshot = true;
+        assert!(snapshot_cache_opt_out(&args, false, false));
+
+        let mut args = baseline();
+        args.rootfs_override = Some(std::path::PathBuf::from("disk-only.raw"));
+        assert!(snapshot_cache_opt_out(&args, false, false));
+
+        let mut args = baseline();
+        args.hypervisor = crate::cli::args::Hypervisor::CloudHypervisor;
+        assert!(snapshot_cache_opt_out(&args, false, false));
+
+        assert!(snapshot_cache_opt_out(&baseline(), true, false));
+        assert!(snapshot_cache_opt_out(&baseline(), false, true));
     }
 
     #[test]

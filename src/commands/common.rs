@@ -1222,8 +1222,13 @@ pub struct SnapshotRestoreConfig {
     /// Original VM lineage (from original cache creation), used for disk redirects.
     pub original_vm_id: String,
     /// Exact vsock base path embedded in the source VMM state. Its parent is
-    /// redirected to the clone runtime directory before the VMM starts.
+    /// redirected to the clone's vsock target directory before the VMM starts.
     pub source_vsock_socket_path: PathBuf,
+    /// Where the redirected vsock sockets land — the clone's actual host-side
+    /// listener directory. `None` means the clone runtime directory; a custom
+    /// `--vsock-dir` lands here so snapshot-cache hits and clones honor the
+    /// flag instead of silently ignoring it.
+    pub vsock_target_dir: Option<PathBuf>,
     /// Snapshot VM ID for disk path redirect (the VM that was snapshotted)
     /// This is needed because disk paths are patched during cache restore,
     /// so vmstate.bin has a different VM ID for disk than for vsock.
@@ -1333,18 +1338,66 @@ fn assert_vmstate_vsock_source_matches(vmstate_path: &Path, source_path: &Path) 
     Ok(())
 }
 
-fn add_source_vsock_redirect_dir(
-    baseline_dirs: &mut Vec<PathBuf>,
-    source_path: &Path,
-) -> Result<()> {
-    let source_dir = source_path
+/// Build the ordered `(mountpoint, source)` bind pairs that isolate a clone.
+///
+/// Every disk dir the vmstate references is redirected to the clone runtime
+/// dir. The source vsock directory (parent of the vmstate-embedded socket) is
+/// redirected to `vsock_target_dir` — the clone runtime dir by default, or a
+/// caller-owned `--vsock-dir`. When the source colocated its vsock with its
+/// disks AND the clone wants a different vsock target, the pair list splits at
+/// the existing `disks/` directory boundary: the whole source dir goes to the
+/// vsock target first, then the clone's `disks/` is bound back on top (order
+/// matters — the second mountpoint resolves inside the first mount).
+fn build_clone_mount_redirects(
+    disk_dirs: &[PathBuf],
+    source_vsock_socket_path: &Path,
+    clone_dir: &Path,
+    vsock_target_dir: &Path,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let source_vsock_dir = source_vsock_socket_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("source vsock path has no parent"))?
         .to_path_buf();
-    if !baseline_dirs.contains(&source_dir) {
-        baseline_dirs.push(source_dir);
+    // Reject aliased layouts outright — snapshot metadata is an on-disk
+    // artifact, so the restore must not trust it to be well-formed. A source
+    // vsock dir nested INSIDE a disk dir would be appended after it and its
+    // bind would shadow the clone's disks (mounts apply in order); one that
+    // CONTAINS a disk dir would shadow the disk binds the same way; relative
+    // components dodge both prefix checks.
+    anyhow::ensure!(
+        source_vsock_dir.components().all(|component| matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )),
+        "source vsock dir {} carries relative components; refusing to build mount redirects",
+        source_vsock_dir.display()
+    );
+    for dir in disk_dirs {
+        anyhow::ensure!(
+            *dir == source_vsock_dir
+                || (!source_vsock_dir.starts_with(dir) && !dir.starts_with(&source_vsock_dir)),
+            "source vsock dir {} nests with disk dir {}; the ordered binds would shadow the \
+             clone's disks",
+            source_vsock_dir.display(),
+            dir.display()
+        );
     }
-    Ok(())
+    let mut redirects: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for dir in disk_dirs {
+        if *dir == source_vsock_dir && vsock_target_dir != clone_dir {
+            redirects.push((dir.clone(), vsock_target_dir.to_path_buf()));
+            redirects.push((dir.join("disks"), clone_dir.join("disks")));
+        } else {
+            redirects.push((dir.clone(), clone_dir.to_path_buf()));
+        }
+    }
+    // A dedicated source vsock dir gets its own pair. Skip the identity case
+    // (source dir IS the target, e.g. a converged relaunch reusing the same
+    // `--vsock-dir`): the VMM then binds the real directory directly.
+    if !disk_dirs.contains(&source_vsock_dir) && source_vsock_dir != vsock_target_dir {
+        redirects.push((source_vsock_dir, vsock_target_dir.to_path_buf()));
+    }
+    Ok(redirects)
 }
 
 /// True if vmstate references a rootfs path under one of the baseline bind-mount dirs,
@@ -1720,22 +1773,42 @@ async fn prepare_clone_substrate(
     }
 
     // Mount-namespace redirect: disks are under the source VM runtime dirs, but
-    // vsock may be under an arbitrary dedicated `--vsock-dir`. Redirect every
-    // exact source parent to the clone dir so the VMM opens only clone-local
-    // disks and binds only the clone-local socket.
-    let mut baseline_dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
+    // vsock may be under an arbitrary dedicated `--vsock-dir` — on the source
+    // side (the path embedded in vmstate) AND on the clone side (where this
+    // clone's actual listener should live). Ordered (mountpoint, source) pairs
+    // make the VMM open only clone-local disks while binding its socket in the
+    // clone's vsock target directory.
+    let mut disk_dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
     if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
         if snapshot_vm_id != &restore_config.original_vm_id {
-            baseline_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
+            disk_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
         }
     }
-    add_source_vsock_redirect_dir(&mut baseline_dirs, &restore_config.source_vsock_socket_path)?;
+    let vsock_target_dir = restore_config
+        .vsock_target_dir
+        .clone()
+        .unwrap_or_else(|| data_dir.to_path_buf());
+    let redirects = build_clone_mount_redirects(
+        &disk_dirs,
+        &restore_config.source_vsock_socket_path,
+        data_dir,
+        &vsock_target_dir,
+    )?;
+    // A split pair binds the clone's disks back INSIDE the vsock target mount,
+    // so the nested mountpoint needs a backing directory there.
+    if redirects
+        .iter()
+        .any(|(mountpoint, _)| mountpoint.file_name() == Some(std::ffi::OsStr::new("disks")))
+    {
+        tokio::fs::create_dir_all(vsock_target_dir.join("disks"))
+            .await
+            .context("creating disks backing dir inside the vsock target")?;
+    }
     info!(
-        baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-        clone_dir = %data_dir.display(),
+        redirects = ?redirects.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
         "enabling mount namespace for path isolation"
     );
-    namespace.mount_redirects = Some((baseline_dirs, data_dir.to_path_buf()));
+    namespace.mount_redirects = Some(redirects);
 
     // Copy extra disk images (disk-dir) from snapshot to the clone's disk directory so the
     // redirected baseline paths resolve to real files.
@@ -1864,8 +1937,8 @@ pub async fn restore_from_snapshot(
     if let Some(p) = &ns.net_namespace_path {
         vm_manager.set_net_namespace_path(p.clone());
     }
-    if let Some((baseline_dirs, clone_dir)) = &ns.mount_redirects {
-        vm_manager.set_mount_redirects(baseline_dirs.clone(), clone_dir.clone());
+    if let Some(redirects) = &ns.mount_redirects {
+        vm_manager.set_mount_redirects(redirects.clone());
     }
 
     if let Err(error) = vm_manager
@@ -3916,22 +3989,133 @@ mod tests {
 
     #[test]
     fn restore_redirect_covers_exact_custom_vsock_source_directory() {
-        let mut dirs = vec![PathBuf::from("/runtime/source-vm")];
-        add_source_vsock_redirect_dir(&mut dirs, Path::new("/srv/dedicated-vsock/vsock.sock"))
-            .unwrap();
+        let disk_dirs = vec![PathBuf::from("/runtime/source-vm")];
+        let redirects = build_clone_mount_redirects(
+            &disk_dirs,
+            Path::new("/srv/dedicated-vsock/vsock.sock"),
+            Path::new("/runtime/clone"),
+            Path::new("/runtime/clone"),
+        )
+        .unwrap();
         assert_eq!(
-            dirs,
+            redirects,
             vec![
-                PathBuf::from("/runtime/source-vm"),
-                PathBuf::from("/srv/dedicated-vsock")
+                (
+                    PathBuf::from("/runtime/source-vm"),
+                    PathBuf::from("/runtime/clone")
+                ),
+                (
+                    PathBuf::from("/srv/dedicated-vsock"),
+                    PathBuf::from("/runtime/clone")
+                ),
             ]
         );
 
-        // Adding the conventional path again must not create two bind mounts
+        // The conventional colocated source must not create two bind mounts
         // onto the same directory.
-        add_source_vsock_redirect_dir(&mut dirs, Path::new("/runtime/source-vm/vsock.sock"))
-            .unwrap();
-        assert_eq!(dirs.len(), 2);
+        let redirects = build_clone_mount_redirects(
+            &disk_dirs,
+            Path::new("/runtime/source-vm/vsock.sock"),
+            Path::new("/runtime/clone"),
+            Path::new("/runtime/clone"),
+        )
+        .unwrap();
+        assert_eq!(redirects.len(), 1);
+    }
+
+    /// A custom clone-side vsock target with a COLOCATED source splits at the
+    /// existing `disks/` boundary: whole source dir -> vsock target first, the
+    /// clone's disks bound back on top. The order is load-bearing — the second
+    /// mountpoint resolves inside the first mount.
+    #[test]
+    fn custom_clone_vsock_target_splits_colocated_source_at_the_disks_boundary() {
+        let disk_dirs = vec![PathBuf::from("/runtime/source-vm")];
+        let redirects = build_clone_mount_redirects(
+            &disk_dirs,
+            Path::new("/runtime/source-vm/vsock.sock"),
+            Path::new("/runtime/clone"),
+            Path::new("/srv/custom-vsock"),
+        )
+        .unwrap();
+        assert_eq!(
+            redirects,
+            vec![
+                (
+                    PathBuf::from("/runtime/source-vm"),
+                    PathBuf::from("/srv/custom-vsock")
+                ),
+                (
+                    PathBuf::from("/runtime/source-vm/disks"),
+                    PathBuf::from("/runtime/clone/disks")
+                ),
+            ]
+        );
+
+        // Dedicated source dir + custom target: one direct pair, disks stay in
+        // the clone runtime dir.
+        let redirects = build_clone_mount_redirects(
+            &disk_dirs,
+            Path::new("/srv/dedicated-vsock/vsock.sock"),
+            Path::new("/runtime/clone"),
+            Path::new("/srv/custom-vsock"),
+        )
+        .unwrap();
+        assert_eq!(
+            redirects,
+            vec![
+                (
+                    PathBuf::from("/runtime/source-vm"),
+                    PathBuf::from("/runtime/clone")
+                ),
+                (
+                    PathBuf::from("/srv/dedicated-vsock"),
+                    PathBuf::from("/srv/custom-vsock")
+                ),
+            ]
+        );
+
+        // Identity case (converged relaunch reusing the same --vsock-dir): the
+        // VMM binds the real directory directly, no self-bind pair.
+        let redirects = build_clone_mount_redirects(
+            &disk_dirs,
+            Path::new("/srv/custom-vsock/vsock.sock"),
+            Path::new("/runtime/clone"),
+            Path::new("/srv/custom-vsock"),
+        )
+        .unwrap();
+        assert_eq!(
+            redirects,
+            vec![(
+                PathBuf::from("/runtime/source-vm"),
+                PathBuf::from("/runtime/clone")
+            )]
+        );
+    }
+
+    /// Aliased layouts are rejected outright: a source vsock dir nested inside
+    /// a disk dir (or containing one) would let a later-ordered bind shadow
+    /// the clone's disks (mounts apply in order), and relative components
+    /// dodge the prefix checks entirely. Snapshot metadata is an on-disk
+    /// artifact, so the restore must not trust it to be well-formed.
+    #[test]
+    fn nested_or_relative_source_vsock_dirs_are_rejected() {
+        let disk_dirs = vec![PathBuf::from("/runtime/source-vm")];
+        for bad in [
+            // inside a disk dir: its bind would shadow clone_dir/disks
+            "/runtime/source-vm/disks/vsock.sock",
+            // parent of a disk dir: its bind would shadow the disk binds
+            "/runtime/vsock.sock",
+            // relative components dodge prefix checks
+            "/runtime/source-vm/../escape/vsock.sock",
+        ] {
+            let result = build_clone_mount_redirects(
+                &disk_dirs,
+                Path::new(bad),
+                Path::new("/runtime/clone"),
+                Path::new("/srv/custom-vsock"),
+            );
+            assert!(result.is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]

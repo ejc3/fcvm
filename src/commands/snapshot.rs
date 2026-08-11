@@ -1396,8 +1396,36 @@ async fn cmd_snapshot_run_inner(
     // - VolumeServers listen on the clone's actual socket paths
     // Clone's vsock socket base path
     // With mount namespace isolation, Firecracker will create sockets here
-    // (it thinks it's writing to baseline's path but bind mount redirects to clone's)
-    let clone_vsock_base = data_dir.join("vsock.sock");
+    // (it thinks it's writing to baseline's path but bind mount redirects to
+    // clone's). `--vsock-dir` retargets the redirect to a caller-owned
+    // directory so the clone's listener lands at a predictable path — cache
+    // hits and clones honor the flag rather than silently ignoring it.
+    let clone_vsock_base = match args.vsock_dir.as_deref() {
+        Some(dir) => {
+            let current_dir =
+                std::env::current_dir().context("resolving current directory for --vsock-dir")?;
+            let socket_path = super::podman::resolve_custom_vsock_socket_path(
+                std::path::Path::new(dir),
+                &current_dir,
+            );
+            let parent = socket_path
+                .parent()
+                .expect("a custom vsock socket path always has a parent");
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating vsock dir: {:?}", parent))?;
+            // A caller-owned directory can hold a stale socket from a previous
+            // VM: teardown SIGKILLs the VMM, which never unlinks its socket, so
+            // reusing one --vsock-dir across runs leaves the old file behind.
+            // Firecracker's restore bind — unlike every host-side listener —
+            // does not unlink first, and the failed hit would fall back to a
+            // cold boot, silently throwing the cache away. Same semantics as
+            // the cold-boot set_vsock.
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            socket_path
+        }
+        None => data_dir.join("vsock.sock"),
+    };
     // Persist the clone's actual host-side socket before restore publishes its
     // state. A later snapshot of this clone must address this socket, not the
     // ancestor path embedded in the restored VMM state.
@@ -1866,6 +1894,7 @@ async fn cmd_snapshot_run_inner(
         source_disk_path: snapshot_config.disk_path.clone(),
         original_vm_id,
         source_vsock_socket_path: snapshot_config.source_vsock_socket_path.clone(),
+        vsock_target_dir: clone_vsock_base.parent().map(std::path::Path::to_path_buf),
         snapshot_vm_id,
         hugepages,
         extra_disks: snapshot_config.metadata.extra_disks.clone(),
@@ -3443,6 +3472,7 @@ mod tests {
             non_blocking_output: false,
             no_dirty_tracking: false,
             no_swap: false,
+            vsock_dir: None,
         };
 
         let runtime = snapshot_restore_runtime_config(&args, Some("nested"))
@@ -3470,6 +3500,7 @@ mod tests {
             non_blocking_output: false,
             no_dirty_tracking: false,
             no_swap: false,
+            vsock_dir: None,
         }
     }
 
