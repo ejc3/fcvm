@@ -152,6 +152,17 @@ the egress proxy. The host side of any port is a `{uds_path}_{port}` Unix socket
 next to `vsock.sock` — the same `{uds_path}_{port}` convention for both Firecracker
 and Cloud Hypervisor.
 
+### UFFD queue depth is not observable today, and one `read(2)` per fault is why
+
+`drain_events` (`src/uffd/server.rs`) pulls faults with `uffd.read_event()`, which is
+one `read(2)` per message, inside a loop bounded by `MAX_EVENTS_PER_BATCH` (128). So
+the batch bound is the only depth signal available, and it cannot distinguish "128
+queued" from "10,000 queued" — a saturated server looks the same as a busy one. The
+userfaultfd crate's `read_events(EventBuffer)` fills a buffer in a single `read(2)`
+and returns how many messages came back, which both cuts the syscall count under load
+and makes true queue depth histogrammable. Worth doing when UFFD serving is next on
+the critical path; nothing in the tree measures it now.
+
 ### fc-agent's 2 s optimistic-accept fallback is a mio artifact, not a vsock law
 
 `fc-agent/src/vsock.rs::accept()` wakes every 2 s to retry a non-blocking `accept4`,
@@ -369,10 +380,14 @@ to rootless for this reason.
 With no `--health-check` URL, fcvm's `Healthy` = container running AND podman's
 `HEALTHCHECK` healthy (`src/health.rs`, "AND logic"). So the image's HEALTHCHECK
 decides what gets frozen. `cdp_health.py` requires BOTH a warm marker (entry.sh
-touches it only after a full navigate+screenshot) AND a live CDP round trip that
-finds a page target. Healthy therefore means *provably able to screenshot*, not
-*port is open*. Caveat to verify: podman healthchecks need systemd timers in the
-guest; `src/health.rs` notes they can fail to schedule in some rootless setups.
+touches it only after a full navigate+screenshot and a loader-correlated
+`about:blank` lifecycle `load`; render.py then verifies `location.href` and
+`document.readyState == complete`) AND a live CDP round trip that finds a page
+target. The blank transition is fail-closed: its timeout is not best-effort, and
+entry.sh's `set -e` exits before publishing the marker. Healthy therefore means
+*warm, quiescent, and provably able to screenshot*, not *port is open*. Caveat to
+verify: podman healthchecks need systemd timers in the guest; `src/health.rs`
+notes they can fail to schedule in some rootless setups.
 
 ### Fast teardown: one signal, kernel-enforced — scope the guarantee, don't blanket it
 
@@ -540,6 +555,34 @@ this list now points at it rather than contradicting it.
   `pasta 704 ms` straggler are all withdrawn; do not quote any of them.
 
 `REVIEW.md` is the ledger of what holds and what doesn't. **Update it every run.**
+
+## The fault harness refuses to report a number it cannot stand behind
+
+`faultbench.py` measures per-request page faults and `faultanalyze.py` reduces them.
+Both instruments attribute costs to a specific request, so each one has a rule about
+when it must report NOTHING rather than something plausible. A wrong number here is
+worse than a missing one, because it reads exactly like a real one and `agg` would
+average it in. `make test-chromium-fault` guards all four.
+
+- **An ambiguous UFFD trace attributes to neither request.** A trace is written when
+  its handler exits, so it trails `t1` by the clone's teardown, and its filename
+  carries the serve process's own connection counter, which nothing in the request
+  record maps to. With two candidates inside one window there is no identity to break
+  the tie, so `match_trace` returns None and stamps `trace_ambiguous`. Taking the
+  newest would hand a request the NEXT one's faults and corrupt counts, locality and
+  service time together. `agg` then reports a smaller `n`, which is the honest signal.
+- **A clone that outlives its request stops the run.** Serial isolation is what makes
+  attribution possible; a surviving clone keeps faulting and burning CPU while the next
+  request is measured. `require_clones_gone` raises rather than letting the run
+  continue, and the records already written stay valid.
+- **An output directory is used once.** `requests.jsonl` is appended to and traces are
+  matched by mtime, so reusing `--out` blends two runs, possibly taken with different
+  arguments, into one analysis. `require_fresh_out_dir` refuses anything non-empty.
+- **A parked CONTINUE is timed to its retry.** When `UFFDIO_CONTINUE` returns EAGAIN
+  the vCPU stays blocked, so `src/uffd/server.rs` keeps the trace interval open across
+  the park and closes it at the retry that actually resolved the fault. Closing it
+  around the failed ioctl would report the EAGAIN as the resolution cost, and these
+  intervals are read as exact ioctl service time.
 
 ## Deliverables
 
