@@ -576,6 +576,40 @@ fn spawn_exec_capture(vm_pid: u32, script: &str) -> Result<tokio::process::Child
     cmd.spawn().context("spawning fcvm exec")
 }
 
+/// Same as [`spawn_exec_capture`], but stderr goes to a FILE so a test can
+/// wait on a failpoint marker mid-flight (a piped stderr is only readable
+/// after exit), and extra env (e.g. `FCVM_FAILPOINT`) can be armed on the
+/// exec process alone.
+fn spawn_exec_stderr_to_file(
+    vm_pid: u32,
+    script: &str,
+    stderr_path: &Path,
+    env: &[(&str, &str)],
+) -> Result<tokio::process::Child> {
+    let fcvm_path = common::find_fcvm_binary()?;
+    let stderr_file =
+        std::fs::File::create(stderr_path).context("creating exec stderr capture file")?;
+    let mut cmd = tokio::process::Command::new(fcvm_path);
+    cmd.args([
+        "exec",
+        "--pid",
+        &vm_pid.to_string(),
+        "--vm",
+        "--",
+        "sh",
+        "-c",
+        script,
+    ])
+    .env("RUST_LOG", "debug")
+    .stdout(Stdio::piped())
+    .stderr(std::process::Stdio::from(stderr_file))
+    .kill_on_drop(true);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.spawn().context("spawning fcvm exec")
+}
+
 /// Exactly-once oracle for the nonce file written through a `--map`ed volume:
 /// wait (≤10s) for the nonce to appear, then a 2s settle so a phantom second
 /// execution would have landed too, then count matching lines.
@@ -619,38 +653,41 @@ fn count_occurrences(hay: &str, needle: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// CASE: exec_resend_across_agent_stall
+// CASE: exec_resend_across_snapshot_pause
 // ---------------------------------------------------------------------------
 
 /// Pins: the exec handshake RESEND path against a REAL VM — an exec request
-/// orphaned by a snapshot pause is resent on a fresh connection and executes
-/// exactly once (fixed by the `exec-ready-ack` branch: request → ACK → GO;
-/// fc-agent never executes before consuming GO, so an un-ACKed request is
-/// provably safe to resend).
+/// whose connection is killed by a snapshot pause is resent on a fresh
+/// connection and executes exactly once (request → ACK → GO; fc-agent never
+/// executes before consuming GO, so a request that was never sent, let alone
+/// ACKed, is provably safe to resend).
 ///
-/// Interleaving (fully marker-sequenced, no timing guesses):
-/// 1. Guest arms `exec.post_accept_pre_read:sleep:2000` — every exec accept
-///    parks 2s before reading the request. 2s is deliberately UNDER the
-///    client's 3s ACK timeout: a stall above 3s would time out every one of
-///    the 5 resend attempts by construction (each accept re-parks), so the
-///    exec could never exit 0 — the pause below, not the stall alone, is what
-///    forces the resend.
-/// 2. Host arms `snapshot.pre_pause:block_until_file` on a `fcvm snapshot
-///    create` process, which parks fully-prepared, right before the Pause API
-///    call ("FAILPOINT snapshot.pre_pause reached" on its stderr).
-/// 3. One exec (nonce append via a --map'd dir) is launched; its accept marker
-///    in the VM log proves connection #1 is parked INSIDE the agent's window.
-/// 4. The go-file is created → the pause lands within the ~1.8s left of the
-///    guest hold → the snapshot's vsock reset orphans connection #1 (its
-///    request was consumed by nobody: the agent was parked pre-read).
-/// 5. The client gets no ACK → reconnects and resends; the post-resume accept
-///    parks 2s again, ACKs at +2s (< 3s timeout), GO authorizes execution.
+/// The interleaving is ORDER-ONLY — no actor has to win a race:
+/// 1. One exec (nonce append via a --map'd dir) parks at
+///    `exec.post_connect_pre_send`: connection #1 exists and NOTHING has been
+///    sent on it. The agent side sits in its natural request read.
+/// 2. `fcvm snapshot create --pid` runs TO COMPLETION while the client is
+///    parked. The pause resets vsock, killing connection #1 with certainty;
+///    the agent's pending read fails and it returns to accept, having
+///    consumed nothing.
+/// 3. The go-file releases the client into the dead connection: the request
+///    write fails (or the ACK read sees EOF) → "reconnecting to resend" →
+///    connection #2 → ACK → GO → the command runs exactly once.
 ///
-/// Oracle: exec exits 0; the client log shows the resend actually happened;
-/// the nonce appears EXACTLY once (the double-execution tripwire: if fc-agent
-/// ever executed connection #1's request without GO, the count would be 2).
+/// The previous version manufactured its in-flight window with a guest-side
+/// 2s stall the host had to outrun (guest marker propagation + go-file poll +
+/// the Pause call, all inside 2s). CI runners lost that race on all 8 jobs of
+/// run 31470581069, both tries, at the "reconnecting to resend" assert. A
+/// test that only passes when the machine is fast enough pins nothing; this
+/// version replaces the sleep with a client-side hold and a COMPLETED
+/// snapshot, so the orphan exists by construction at any machine speed.
+///
+/// Oracle: create exits 0; exec exits 0; the client log shows the resend
+/// happened and the resent request completed ACK/GO; the nonce appears
+/// EXACTLY once (double-execution tripwire: if fc-agent ever executed without
+/// GO, or the client resent a consumed request, the count would be 2).
 #[tokio::test]
-async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()> {
+async fn test_lifecycle_interleave_exec_resend_across_snapshot_pause() -> Result<()> {
     let (vm_name, _, snap_tag, _) = common::unique_names("ilv-resend");
     let host_dir = PathBuf::from(format!("/tmp/{}-map", vm_name));
     std::fs::create_dir_all(&host_dir)?;
@@ -658,7 +695,7 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
     // Unique env → unique snapshot key → deterministic cold boot every run.
     let env_unique = format!("ILV_ID={}", vm_name);
 
-    let (mut child, pid, vm_log) = common::spawn_fcvm_with_env_and_log_path(
+    let (mut child, pid, _vm_log) = common::spawn_fcvm_with_env_and_log_path(
         &[
             "podman",
             "run",
@@ -668,67 +705,68 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
             &map_arg,
             "--env",
             &env_unique,
-            // HTTP health checks: with a health URL the monitor never uses
-            // `fcvm exec` (podman-inspect) probes, so the ONLY exec.* failpoint
-            // hits in the VM log are this test's own exec.
             "--health-check",
             "http://localhost/",
             common::TEST_IMAGE,
         ],
-        &[(
-            "FCVM_GUEST_FAILPOINT",
-            "exec.post_accept_pre_read:sleep:2000",
-        )],
+        &[],
     )
     .await?;
-
     common::poll_health_by_pid(pid, 300).await?;
     let base_key = ls_vm_by_pid(pid)
         .await?
         .and_then(|s| s.config.snapshot_name);
 
-    // Park a manual snapshot create right before its Pause call.
-    let go_file = PathBuf::from(format!("/tmp/{}-go", vm_name));
-    let _ = std::fs::remove_file(&go_file);
-    let pid_str = pid.to_string();
-    let failpoint_spec = format!("snapshot.pre_pause:block_until_file:{}", go_file.display());
-    let (mut create_child, _create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
-        &["snapshot", "create", "--pid", &pid_str, "--tag", &snap_tag],
-        &[("FCVM_FAILPOINT", &failpoint_spec)],
-    )
-    .await?;
-    wait_for_marker(
-        &create_log,
-        "FAILPOINT snapshot.pre_pause reached",
-        0,
-        Duration::from_secs(90),
-    )
-    .await?;
-
-    // Launch the exec and wait until its connection is parked inside the
-    // agent's post-accept window (manual creates do NOT quiesce the guest
-    // console, so the guest marker streams to the VM log immediately).
+    // Launch the exec and wait until it is parked with connection #1 open and
+    // the request unsent (the failpoint marker goes to its stderr FILE, which
+    // is readable mid-flight, unlike a pipe).
     let nonce = format!("nonce-{}", vm_name);
     let script = format!("echo {} >> /mnt/test/nonce.txt", nonce);
-    let vm_cursor = log_len(&vm_log);
-    let exec_child = spawn_exec_capture(pid, &script)?;
+    let go_file = PathBuf::from(format!("/tmp/{}-exec-go", vm_name));
+    let _ = std::fs::remove_file(&go_file);
+    let exec_stderr_path = PathBuf::from(format!("/tmp/{}-exec-stderr.log", vm_name));
+    let failpoint_spec = format!(
+        "exec.post_connect_pre_send:block_until_file:{}",
+        go_file.display()
+    );
+    let exec_child = spawn_exec_stderr_to_file(
+        pid,
+        &script,
+        &exec_stderr_path,
+        &[("FCVM_FAILPOINT", &failpoint_spec)],
+    )?;
     wait_for_marker(
-        &vm_log,
-        "FAILPOINT exec.post_accept_pre_read reached",
-        vm_cursor,
+        &exec_stderr_path,
+        "FAILPOINT exec.post_connect_pre_send reached",
+        0,
         Duration::from_secs(30),
     )
     .await?;
 
-    // Release the pause INTO the parked window.
-    std::fs::write(&go_file, b"go").context("creating go-file")?;
-
+    // Snapshot create runs TO COMPLETION while the client is parked: after
+    // this line, connection #1 is dead by construction — order, not timing.
+    let (mut create_child, _create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            &snap_tag,
+        ],
+        &[],
+    )
+    .await?;
     let create_status = wait_exit(&mut create_child, Duration::from_secs(180)).await?;
+
+    // Release the client into the dead connection.
+    std::fs::write(&go_file, b"go").context("creating exec go-file")?;
     let exec_output = tokio::time::timeout(Duration::from_secs(120), exec_child.wait_with_output())
         .await
         .context("exec did not finish within 120s")?
         .context("collecting exec output")?;
-    let exec_stderr = String::from_utf8_lossy(&exec_output.stderr).to_string();
+    let exec_stderr =
+        std::fs::read_to_string(&exec_stderr_path).context("reading exec stderr file")?;
     let nonce_count = settled_nonce_count(&host_dir.join("nonce.txt"), &nonce).await;
 
     // Teardown before asserting so a failed assert can't leak the VM.
@@ -737,6 +775,7 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
     let _ = child.wait().await;
     cleanup_snapshot_keys(&[base_key, Some(snap_tag.clone())]).await;
     let _ = std::fs::remove_dir_all(&host_dir);
+    let _ = std::fs::remove_file(&exec_stderr_path);
 
     assert!(
         create_status.success(),
@@ -751,9 +790,16 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
         exec_stderr
     );
     assert!(
+        !exec_stderr.contains("RELEASED BY TIMEOUT"),
+        "the failpoint hold expired before the go-file — the snapshot create \
+         outlived the hold cap and the interleaving degraded back into a race; \
+         exec stderr:\n{}",
+        exec_stderr
+    );
+    assert!(
         exec_stderr.contains("reconnecting to resend"),
-        "the pause must orphan connection #1 and force a resend — without it \
-         this test pins nothing; exec stderr:\n{}",
+        "the completed snapshot must have killed connection #1 and forced a \
+         resend — without it this test pins nothing; exec stderr:\n{}",
         exec_stderr
     );
     assert!(

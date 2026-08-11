@@ -492,6 +492,14 @@ pub fn connect_and_start_exec(
         // Read timeouts are armed by read_ack_line (handshake) and below (post-GO).
         stream.set_write_timeout(Some(EXEC_WRITE_TIMEOUT))?;
 
+        // Failpoint: this attempt's connection exists and NOTHING has been sent
+        // on it. Holding here lets a harness run a whole snapshot create against
+        // the VM, so the connection is provably dead before the request goes out
+        // — the order-only way to force the resend path (no request consumed
+        // anywhere, so the resend is safe by construction, and no actor has to
+        // win a timing race for the interleaving to occur).
+        failpoint::hit("exec.post_connect_pre_send");
+
         // Phase 1: send the request line.
         if let Err(e) = writeln!(stream, "{}", request_json).and_then(|()| stream.flush()) {
             if attempt < MAX_ACK_ATTEMPTS {
