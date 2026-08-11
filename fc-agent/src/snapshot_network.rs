@@ -19,6 +19,7 @@ use tokio::process::Command;
 
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_PATH: &str = "/run/fcvm/snapshot-network.json";
+const SYSFS_NET_PATH: &str = "/sys/class/net";
 const BOUNDARY_LOCK_PATH: &str = "/run/fcvm/snapshot-network.lock";
 const GATE_INPUT_CHAIN: &str = "FCVM_SNAPSHOT_IN";
 const GATE_OUTPUT_CHAIN: &str = "FCVM_SNAPSHOT_OUT";
@@ -147,7 +148,7 @@ impl TcpSocketIdentity {
 struct SnapshotNetworkManifest {
     version: u32,
     sockets: Vec<TcpSocketIdentity>,
-    /// Routes the kernel will NOT put back when eth0 comes up again.
+    /// Routes the kernel will NOT put back when the external link comes up again.
     ///
     /// Taking the link down purges the whole route table. Measured on a bridged
     /// guest (Graviton3, 6.18.44): after down/up the kernel restores only its
@@ -333,19 +334,67 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
+/// Name the guest's one external interface by asking sysfs which netdev is
+/// backed by a bus device.
+///
+/// The name is not fixed across hypervisors, so hardcoding one silently breaks
+/// the other: Firecracker's MMIO virtio-net keeps the kernel's `eth0`, while
+/// Cloud Hypervisor's PCI virtio-net is renamed by udev under predictable
+/// naming to `enp0s4` (both measured). The kernel `ip=` boot argument names
+/// `eth0` because it runs before that rename, so the address survives and every
+/// later by-name operation does not.
+///
+/// Only `lo` lacks the `device` symlink, so this also stays correct if the netns
+/// ever gains a bridge or veth. Unlike reading an address or a default route it
+/// is valid mid-boundary, where the link is down and the routes are purged.
+fn external_interface_in(sysfs_net: &Path) -> Result<String> {
+    let entries = std::fs::read_dir(sysfs_net)
+        .with_context(|| format!("listing network interfaces in {}", sysfs_net.display()))?;
+    let mut all = Vec::new();
+    let mut backed = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "reading a network interface entry in {}",
+                sysfs_net.display()
+            )
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.path().join("device").exists() {
+            backed.push(name.clone());
+        }
+        all.push(name);
+    }
+    all.sort();
+    backed.sort();
+    match backed.len() {
+        1 => Ok(backed.remove(0)),
+        _ => bail!(
+            "expected exactly one device-backed external interface, found {:?} among {:?}",
+            backed,
+            all
+        ),
+    }
+}
+
+fn external_interface() -> Result<String> {
+    external_interface_in(Path::new(SYSFS_NET_PATH))
+}
+
 struct IpLink<R> {
     runner: R,
+    interface: String,
 }
 
 impl<R> IpLink<R> {
-    fn new(runner: R) -> Self {
-        Self { runner }
+    fn new(runner: R, interface: String) -> Self {
+        Self { runner, interface }
     }
 }
 
 impl<R: CommandRunner + Sync> IpLink<R> {
     async fn set(&self, state: &str) -> Result<()> {
-        let args = ["link", "set", "dev", "eth0", state];
+        let args = ["link", "set", "dev", self.interface.as_str(), state];
         let output = self
             .runner
             .output("ip", &args)
@@ -453,7 +502,7 @@ impl PacketReceiveBarrier for SystemPacketReceiveBarrier {
 
         // packet_release() executes synchronize_net(), whose kernel contract is
         // to wait until every packet already in receive processing is done.
-        // The NEW-flow gate is installed first and eth0 is down, so packets
+        // The NEW-flow gate is installed first and the link is down, so packets
         // that begin after this grace period cannot create an uncaptured TCP
         // socket. Merely waiting or taking repeated dumps cannot prove this.
         let raw = unsafe {
@@ -1129,22 +1178,22 @@ async fn reopen_with<G: FirewallGate, L: ExternalLink, T: RouteTable>(
     routes: &T,
     captured: &[CapturedRoute],
 ) -> Result<()> {
-    // Remove both family-specific hooks while eth0 is still down, then make
+    // Remove both family-specific hooks while the link is still down, then make
     // the link visible as the final publication step.  Removing IPv4 and IPv6
     // hooks cannot be one iptables transaction; doing it behind link-down
     // prevents a partial gate removal from publishing either family.
     gate.open()
         .await
-        .context("opening the snapshot TCP NEW-flow gate while eth0 is down")?;
+        .context("opening the snapshot TCP NEW-flow gate while the link is down")?;
     link.up()
         .await
-        .context("bringing eth0 up after opening the snapshot TCP NEW-flow gate")?;
+        .context("bringing the external link up after opening the snapshot TCP NEW-flow gate")?;
     // Only now: a route needs its device up, and the kernel has just put back
     // the connected routes these ones depend on.
     routes
         .reinstate(captured)
         .await
-        .context("reinstating the routes eth0's link-down purged")
+        .context("reinstating the routes the link-down purged")
 }
 
 async fn rollback_preparation<G: FirewallGate, L: ExternalLink, T: RouteTable>(
@@ -1198,7 +1247,7 @@ async fn prepare_with<
     if let Err(error) = link
         .down()
         .await
-        .context("bringing eth0 down before snapshot")
+        .context("bringing the external link down before snapshot")
     {
         return Err(rollback_preparation(error, gate, link, route_table, &captured_routes).await);
     }
@@ -1264,7 +1313,7 @@ async fn restore_with<
         .context("ensuring restored snapshot TCP NEW-flow gate is closed")?;
     link.down()
         .await
-        .context("ensuring restored eth0 remains down during socket cleanup")?;
+        .context("ensuring the restored external link remains down during socket cleanup")?;
     receive_barrier
         .synchronize()
         .context("waiting for restored packet receive processing to quiesce")?;
@@ -1306,7 +1355,7 @@ async fn restore_with<
 pub async fn prepare_snapshot_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(SystemCommandRunner);
+    let link = IpLink::new(SystemCommandRunner, external_interface()?);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic;
     let route_table = IpRoutes::new(SystemCommandRunner);
@@ -1329,7 +1378,7 @@ pub async fn prepare_snapshot_network() -> Result<()> {
 pub async fn resume_source_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(SystemCommandRunner);
+    let link = IpLink::new(SystemCommandRunner, external_interface()?);
     let route_table = IpRoutes::new(SystemCommandRunner);
     let store = FileManifestStore::default();
     // Read the routes out before retiring the manifest that holds them: this
@@ -1362,7 +1411,7 @@ pub async fn resume_source_network() -> Result<()> {
 pub async fn restore_snapshot_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(SystemCommandRunner);
+    let link = IpLink::new(SystemCommandRunner, external_interface()?);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic;
     let route_table = IpRoutes::new(SystemCommandRunner);
@@ -1386,9 +1435,9 @@ pub async fn restore_snapshot_network() -> Result<()> {
 
 /// Whether this process image was captured behind the snapshot network
 /// boundary.  Firecracker normally obtains restore metadata through MMDS on
-/// eth0, but a current snapshot deliberately captures eth0 down.  The restore
-/// watcher uses this marker to select the host's restore-only vsock control
-/// plane before touching MMDS.
+/// its external interface, but a current snapshot deliberately captures that
+/// link down.  The restore watcher uses this marker to select the host's
+/// restore-only vsock control plane before touching MMDS.
 pub fn boundary_is_armed() -> bool {
     Path::new(MANIFEST_PATH).exists()
 }
@@ -1565,7 +1614,10 @@ mod tests {
                 state.gate_closed,
                 "receive barrier ran before the NEW-flow gate"
             );
-            assert!(state.link_down, "receive barrier ran before eth0 was down");
+            assert!(
+                state.link_down,
+                "receive barrier ran before the link was down"
+            );
             state.events.push("rx-barrier");
             if state.fail_barrier {
                 bail!("injected receive barrier failure");
@@ -1599,7 +1651,7 @@ mod tests {
             );
             assert!(
                 state.link_down,
-                "restore brought eth0 up before destroying sockets"
+                "restore brought the link up before destroying sockets"
             );
             state.events.push("cookie-destroy");
             if state.fail_destroy {
@@ -1652,6 +1704,68 @@ mod tests {
         );
     }
 
+    /// Build a `/sys/class/net` where the `backed` interfaces carry the
+    /// `device` symlink a bus-attached netdev has and the others do not.
+    fn fake_sysfs_net(interfaces: &[(&str, bool)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let devices = dir.path().join("devices");
+        std::fs::create_dir_all(&devices).unwrap();
+        for (name, backed) in interfaces {
+            let interface = dir.path().join(name);
+            std::fs::create_dir_all(&interface).unwrap();
+            if *backed {
+                let device = devices.join(name);
+                std::fs::create_dir_all(&device).unwrap();
+                std::os::unix::fs::symlink(&device, interface.join("device")).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn external_interface_is_the_device_backed_netdev_under_either_hypervisor() {
+        // Measured in live guests: Cloud Hypervisor's PCI virtio-net is renamed
+        // to enp0s4, Firecracker's MMIO virtio-net keeps eth0, and on both only
+        // `lo` lacks the device symlink.
+        let cloud_hypervisor = fake_sysfs_net(&[("enp0s4", true), ("lo", false)]);
+        assert_eq!(
+            external_interface_in(cloud_hypervisor.path()).unwrap(),
+            "enp0s4"
+        );
+
+        let firecracker = fake_sysfs_net(&[("eth0", true), ("lo", false)]);
+        assert_eq!(external_interface_in(firecracker.path()).unwrap(), "eth0");
+    }
+
+    #[test]
+    fn an_ambiguous_interface_set_fails_instead_of_guessing() {
+        let loopback_only = fake_sysfs_net(&[("lo", false)]);
+        let err = external_interface_in(loopback_only.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("found []"), "{err}");
+
+        let two = fake_sysfs_net(&[("enp0s4", true), ("eth0", true), ("lo", false)]);
+        let err = external_interface_in(two.path()).unwrap_err().to_string();
+        assert!(err.contains("enp0s4") && err.contains("eth0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn link_state_changes_address_the_discovered_interface() {
+        let runner = RecordingRunner::default();
+        let calls = runner.0.clone();
+        let link = IpLink::new(runner, "enp0s4".to_string());
+
+        link.down().await.unwrap();
+        link.up().await.unwrap();
+
+        let calls = calls.lock().unwrap().join("\n");
+        assert_eq!(
+            calls, "ip link set dev enp0s4 down\nip link set dev enp0s4 up",
+            "the boundary drove an interface the guest does not have"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_boundary_closes_new_flows_before_cookie_dump() {
         let state = Arc::new(Mutex::new(ModelState {
@@ -1691,7 +1805,7 @@ mod tests {
 
     /// The boundary must hand back the route table it took away.
     ///
-    /// Taking eth0 down purges every route; bringing it up restores only the
+    /// Taking the link down purges every route; bringing it up restores only the
     /// kernel's own. Measured on a bridged guest (Graviton3, 6.18.44), a
     /// prepare/resume cycle left `default via 172.30.95.37` and the MMDS route
     /// `169.254.169.254` permanently gone — the guest's only path off-box and
