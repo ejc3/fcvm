@@ -87,6 +87,10 @@ pub fn assets_dir_if_initialized() -> Option<PathBuf> {
 }
 
 // === Content-addressed assets (use assets_dir) ===
+//
+// The asset store subdirectories listed here are also enumerated in
+// scripts/normalize-store-ownership.sh (the root-owned-entry heal); keep the
+// two lists in sync when adding a store.
 
 /// Directory for kernel images (vmlinux-*.bin files).
 pub fn kernel_dir() -> PathBuf {

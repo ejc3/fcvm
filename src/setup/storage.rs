@@ -235,21 +235,10 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
         }
     }
 
-    // Set ownership to the user who invoked sudo (if SUDO_USER is set)
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        info!("Setting ownership to {}", sudo_user);
-        // Chown the mount point itself (non-recursive since we just created it)
-        let status = Command::new("chown")
-            .arg(format!("{}:{}", sudo_user, sudo_user))
-            .arg(&mount_point)
-            .status()
-            .context("executing chown")?;
-
-        if !status.success() {
-            // Non-fatal, just warn
-            tracing::warn!("Failed to set ownership to {}", sudo_user);
-        }
-    }
+    // Hand the mount point back to the user who invoked sudo (non-recursive:
+    // we just created it). Uses the shared helper, which resolves the real
+    // primary group from passwd instead of assuming group == user name.
+    super::give_store_entry_to_invoker(&mount_point);
 
     info!(
         "✓ btrfs storage ready at {} ({})",

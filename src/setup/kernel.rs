@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use glob::glob;
-use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -99,21 +98,11 @@ pub async fn rebuild_kernel_from_source(profile_name: &str) -> Result<PathBuf> {
     let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join(&filename);
 
-    tokio::fs::create_dir_all(&kernel_dir)
-        .await
-        .context("creating kernel directory")?;
-    let lock_file = kernel_dir.join(format!("{}.lock", filename));
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening kernel lock file")?;
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for kernel")?;
+    let flock = super::lock_store_dir(
+        &kernel_dir.join(format!("{}.lock", filename)),
+        "kernel rebuild",
+    )
+    .await?;
 
     // Build to a unique sibling and rename into place, so a build that fails
     // partway leaves the existing artifact untouched instead of destroying a
@@ -125,15 +114,7 @@ pub async fn rebuild_kernel_from_source(profile_name: &str) -> Result<PathBuf> {
     println!("⚙️  Rebuilding kernel from source (profile: {profile_name})...");
     info!(profile = %profile_name, path = %kernel_path.display(), staging = %staging_path.display(), "forced source rebuild, skipping release download");
     let publish_result = match build_kernel_locally(&profile, profile_name, &staging_path).await {
-        Ok(()) => tokio::fs::rename(&staging_path, &kernel_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "publishing rebuilt kernel {} -> {}",
-                    staging_path.display(),
-                    kernel_path.display()
-                )
-            }),
+        Ok(()) => super::publish_store_entry(&staging_path, &kernel_path, "rebuilt kernel").await,
         Err(error) => {
             let _ = tokio::fs::remove_file(&staging_path).await;
             Err(error)
@@ -245,23 +226,11 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     }
 
     // Create directory and acquire lock
-    tokio::fs::create_dir_all(&kernel_dir)
-        .await
-        .context("creating kernel directory")?;
-
-    let lock_file = kernel_dir.join(format!("vmlinux-{}.lock", url_hash));
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening kernel lock file")?;
-
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for kernel download")?;
+    let flock = super::lock_store_dir(
+        &kernel_dir.join(format!("vmlinux-{}.lock", url_hash)),
+        "kernel download",
+    )
+    .await?;
 
     // Double-check after lock
     if kernel_path.exists() {
@@ -276,6 +245,7 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
 
     let cache_dir = paths::cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
+    super::give_store_entry_to_invoker(&cache_dir);
 
     let tarball_path = cache_dir.join(format!("kernel-{}.tar.zst", url_hash));
     let tarball_temp = cache_dir.join(format!("kernel-{}.tar.zst.downloading", url_hash));
@@ -301,9 +271,8 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
         }
 
         // Atomic rename on success
-        tokio::fs::rename(&tarball_temp, &tarball_path)
-            .await
-            .context("renaming downloaded tarball")?;
+        super::publish_store_entry(&tarball_temp, &tarball_path, "downloaded kernel tarball")
+            .await?;
     } else {
         info!(path = %tarball_path.display(), "using cached tarball");
     }
@@ -313,6 +282,9 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     let extract_temp = cache_dir.join(format!("kernel-{}-extract", url_hash));
     let _ = tokio::fs::remove_dir_all(&extract_temp).await;
     tokio::fs::create_dir_all(&extract_temp).await?;
+    // Deterministic name: a killed root run would otherwise leave a directory
+    // whose contents the next rootless run's remove_dir_all cannot unlink.
+    super::give_store_entry_to_invoker(&extract_temp);
 
     let extract_path = format!("./{}", archive_path);
     let output = Command::new("tar")
@@ -356,11 +328,13 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
         let _ = flock.unlock();
         return Err(e).context("copying kernel to staging location");
     }
-    if let Err(e) = tokio::fs::rename(&kernel_temp, &kernel_path).await {
+    if let Err(e) =
+        super::publish_store_entry(&kernel_temp, &kernel_path, "downloaded kernel").await
+    {
         let _ = tokio::fs::remove_file(&kernel_temp).await;
         let _ = tokio::fs::remove_dir_all(&extract_temp).await;
         let _ = flock.unlock();
-        return Err(e).context("moving kernel to final location");
+        return Err(e);
     }
 
     // Clean up temp extraction dir
@@ -416,23 +390,8 @@ async fn ensure_custom_kernel(
     }
 
     // Create directory and acquire lock
-    tokio::fs::create_dir_all(&kernel_dir)
-        .await
-        .context("creating kernel directory")?;
-
-    let lock_file = kernel_dir.join(format!("{}.lock", filename));
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening kernel lock file")?;
-
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for kernel")?;
+    let flock =
+        super::lock_store_dir(&kernel_dir.join(format!("{}.lock", filename)), "kernel").await?;
 
     // Double-check after lock
     if kernel_path.exists() {
@@ -736,9 +695,7 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
         bail!("Downloaded file is not a valid kernel: {}", file_type);
     }
 
-    tokio::fs::rename(&temp_path, dest)
-        .await
-        .context("moving kernel to final location")?;
+    super::publish_store_entry(&temp_path, dest, "release kernel").await?;
 
     Ok(())
 }
@@ -1054,7 +1011,12 @@ async fn build_kernel_locally(
 
     info!(script = %script_path.display(), "generated kernel build script");
 
-    let cmd = Command::new(&script_path);
+    // Kernel compilation needs no privilege (the rootless Makefile path runs
+    // this same script as the user); under sudo, drop the child so a failed
+    // build cannot leave a root-owned /tmp build tree that blocks the next
+    // rootless build of the same profile.
+    let mut cmd = Command::new(&script_path);
+    super::run_build_as_sudo_invoker(&mut cmd);
     let status = run_streaming(cmd, "kernel_build")
         .await
         .context("running build script")?;
@@ -1391,6 +1353,8 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     info!(script = %script_path.display(), "generated host kernel build script");
 
+    // Stays root by design: this interactive EC2 flow pairs the build with
+    // dpkg -i and update-grub, which require root anyway.
     let cmd = Command::new(&script_path);
     let status = run_streaming(cmd, "host_kernel_build")
         .await
@@ -2013,7 +1977,98 @@ fn write_json_atomic<T: serde::Serialize>(final_path: &Path, value: &T) -> Resul
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("renaming into {}", final_path.display()));
     }
+    super::give_store_entry_to_invoker(final_path);
     Ok(())
+}
+
+/// Locate `cargo` for source builds (firecracker, cloud-hypervisor).
+///
+/// `sudo fcvm setup` runs with root's PATH, which does not carry the invoking
+/// user's rustup cargo, so spawning bare "cargo" dies with ENOENT (proven by
+/// the Build Btrfs Kernel job: `building firecracker: No such file or
+/// directory`). Resolution order: `$CARGO`, then PATH, then `.cargo/bin/cargo`
+/// under `$HOME` and under the sudo invoker's home.
+fn cargo_program() -> Result<PathBuf> {
+    let homes = cargo_fallback_homes();
+    resolve_cargo(std::env::var_os("CARGO"), std::env::var_os("PATH"), &homes).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cargo not found: not in $CARGO, not on PATH, and no .cargo/bin/cargo under {}. \
+             Building this component needs a Rust toolchain — install rustup, or when running \
+             under sudo keep the invoking user's rustup install in place",
+            homes
+                .iter()
+                .map(|h| h.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    })
+}
+
+fn cargo_fallback_homes() -> Vec<PathBuf> {
+    fallback_homes_for(
+        crate::setup::sudo_invoker().map(|user| user.dir.clone()),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Resolve for the identity that will execute. With a sudo invoker, the build
+/// child drops to that user, so only their home is a usable fallback: root's
+/// $HOME (/root) is typically 0700 and a cargo found there would fail the
+/// dropped child's spawn with EACCES despite the invoker's own cargo working.
+fn fallback_homes_for(invoker_home: Option<PathBuf>, env_home: Option<PathBuf>) -> Vec<PathBuf> {
+    match invoker_home {
+        Some(home) => vec![home],
+        None => env_home.into_iter().collect(),
+    }
+}
+
+/// Absolutize a candidate against the caller's cwd, then require a regular
+/// executable file. The build command sets current_dir(build_dir), so a
+/// relative candidate must be pinned to the file that was validated — the
+/// child would otherwise re-resolve it inside the cloned repo. The exec check
+/// matches execvp, which skips a PATH candidate it cannot execute and keeps
+/// searching.
+fn absolute_executable(candidate: &Path) -> Option<PathBuf> {
+    let candidate = std::path::absolute(candidate).ok()?;
+    let executable = std::fs::metadata(&candidate)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+        .unwrap_or(false);
+    executable.then_some(candidate)
+}
+
+/// The `which` crate is not used here on purpose: `which_in` implements the
+/// full POSIX rule where an empty PATH entry means the working directory, and
+/// this resolver frequently runs as root — it must never pick up a ./cargo
+/// from whatever directory setup happens to run in. Empty entries are skipped
+/// instead, and the five tests below pin the rest of the ladder.
+fn resolve_cargo(
+    cargo_env: Option<std::ffi::OsString>,
+    path_env: Option<std::ffi::OsString>,
+    homes: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(cargo) = cargo_env {
+        if !cargo.is_empty() {
+            if let Some(cargo) = absolute_executable(&PathBuf::from(cargo)) {
+                return Some(cargo);
+            }
+        }
+    }
+    if let Some(path) = path_env {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            if let Some(cargo) = absolute_executable(&dir.join("cargo")) {
+                return Some(cargo);
+            }
+        }
+    }
+    for home in homes {
+        if let Some(cargo) = absolute_executable(&home.join(".cargo/bin/cargo")) {
+            return Some(cargo);
+        }
+    }
+    None
 }
 
 /// Get the content-addressed path for profile firecracker binary.
@@ -2266,25 +2321,16 @@ pub async fn ensure_profile_firecracker(
         return Ok(Some(bin_path));
     }
 
-    // Create directory
-    tokio::fs::create_dir_all(&firecracker_dir)
-        .await
-        .context("creating firecracker directory")?;
+    // Resolve the build toolchain before creating anything: a missing cargo
+    // must not cost a network clone or leave a fresh dir/lock behind.
+    let cargo = cargo_program()?;
 
-    // Acquire lock
-    let lock_file = firecracker_dir.join(format!("{}.lock", filename));
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening firecracker lock file")?;
-
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for firecracker build")?;
+    // Create directory and acquire lock
+    let flock = super::lock_store_dir(
+        &firecracker_dir.join(format!("{}.lock", filename)),
+        "firecracker build",
+    )
+    .await?;
 
     // Double-check after lock (another process may have built it)
     if bin_path.exists() {
@@ -2313,19 +2359,21 @@ pub async fn ensure_profile_firecracker(
             .context("removing old firecracker build directory")?;
     }
 
-    // Clone repo
+    // Clone repo (as the sudo invoker, so the checkout is not root-owned)
     let clone_url = format!("https://github.com/{}", repo);
-    let status = Command::new("git")
-        .args([
-            "clone",
-            "--depth=1",
-            "--single-branch",
-            "--no-tags",
-            "-b",
-            branch,
-            &clone_url,
-            build_dir.to_str().unwrap(),
-        ])
+    let mut clone_cmd = Command::new("git");
+    clone_cmd.args([
+        "clone",
+        "--depth=1",
+        "--single-branch",
+        "--no-tags",
+        "-b",
+        branch,
+        &clone_url,
+        build_dir.to_str().unwrap(),
+    ]);
+    super::run_build_as_sudo_invoker(&mut clone_cmd);
+    let status = clone_cmd
         .status()
         .await
         .context("cloning firecracker repo")?;
@@ -2356,12 +2404,12 @@ pub async fn ensure_profile_firecracker(
     }
 
     // Build firecracker
-    let status = Command::new("cargo")
+    let mut build_cmd = Command::new(&cargo);
+    build_cmd
         .args(["build", "--release", "-p", "firecracker"])
-        .current_dir(&build_dir)
-        .status()
-        .await
-        .context("building firecracker")?;
+        .current_dir(&build_dir);
+    super::run_build_as_sudo_invoker(&mut build_cmd);
+    let status = build_cmd.status().await.context("building firecracker")?;
 
     if !status.success() {
         flock.unlock().map_err(|(_, err)| err)?;
@@ -2395,10 +2443,10 @@ pub async fn ensure_profile_firecracker(
         let _ = flock.unlock();
         return Err(e).context("installing firecracker binary");
     }
-    if let Err(e) = tokio::fs::rename(&temp_path, &bin_path).await {
+    if let Err(e) = super::publish_store_entry(&temp_path, &bin_path, "firecracker binary").await {
         let _ = tokio::fs::remove_file(&temp_path).await;
         let _ = flock.unlock();
-        return Err(e).context("moving firecracker binary into place");
+        return Err(e);
     }
 
     // Clean up the build tree on success (failures keep it for debugging)
@@ -2497,24 +2545,16 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
         return Ok(bin_path);
     }
 
-    tokio::fs::create_dir_all(&ch_dir)
-        .await
-        .context("creating cloud-hypervisor directory")?;
+    // Resolve the build toolchain before creating anything: a missing cargo
+    // must not cost a network clone or leave a fresh dir/lock behind.
+    let cargo = cargo_program()?;
 
     // Acquire per-filename lock so concurrent setups don't collide
-    let lock_file = ch_dir.join(format!("{}.lock", filename));
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening cloud-hypervisor lock file")?;
-
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for cloud-hypervisor build")?;
+    let flock = super::lock_store_dir(
+        &ch_dir.join(format!("{}.lock", filename)),
+        "cloud-hypervisor build",
+    )
+    .await?;
 
     // Double-check after lock (another process may have built it)
     if bin_path.exists() {
@@ -2545,17 +2585,20 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
             .context("removing old cloud-hypervisor build directory")?;
     }
 
-    // Clone repo (shallow, single branch)
+    // Clone repo (shallow, single branch, as the sudo invoker so the
+    // checkout is not root-owned)
     let clone_url = format!("https://github.com/{}", repo);
-    let status = Command::new("git")
-        .args([
-            "clone",
-            "--depth=1",
-            "-b",
-            branch,
-            &clone_url,
-            build_dir.to_str().unwrap(),
-        ])
+    let mut clone_cmd = Command::new("git");
+    clone_cmd.args([
+        "clone",
+        "--depth=1",
+        "-b",
+        branch,
+        &clone_url,
+        build_dir.to_str().unwrap(),
+    ]);
+    super::run_build_as_sudo_invoker(&mut clone_cmd);
+    let status = clone_cmd
         .status()
         .await
         .context("cloning cloud-hypervisor repo")?;
@@ -2600,9 +2643,12 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
     }
 
     // Build cloud-hypervisor
-    let status = Command::new("cargo")
+    let mut build_cmd = Command::new(&cargo);
+    build_cmd
         .args(["build", "--release", "--bin", "cloud-hypervisor"])
-        .current_dir(&build_dir)
+        .current_dir(&build_dir);
+    super::run_build_as_sudo_invoker(&mut build_cmd);
+    let status = build_cmd
         .status()
         .await
         .context("building cloud-hypervisor")?;
@@ -2628,10 +2674,12 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
         let _ = flock.unlock();
         return Err(e).context("installing cloud-hypervisor binary");
     }
-    if let Err(e) = tokio::fs::rename(&temp_path, &bin_path).await {
+    if let Err(e) =
+        super::publish_store_entry(&temp_path, &bin_path, "cloud-hypervisor binary").await
+    {
         let _ = tokio::fs::remove_file(&temp_path).await;
         let _ = flock.unlock();
-        return Err(e).context("moving cloud-hypervisor binary into place");
+        return Err(e);
     }
 
     // Clean up the build tree on success (failures keep it for debugging)
@@ -3466,5 +3514,132 @@ cp vmlinux arch/arm64/boot/Image
             parse_resolve_ttl(Some("")),
             FIRECRACKER_RESOLVE_TTL_DEFAULT_SECS
         );
+    }
+
+    // resolve_cargo: `sudo fcvm setup` gets root's PATH, which has no cargo,
+    // and the old bare Command::new("cargo") died with ENOENT there (the
+    // Build Btrfs Kernel job). These pin the fallback ladder.
+
+    fn fake_cargo_in(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let cargo = dir.join("cargo");
+        write_executable(&cargo, "#!/bin/sh\nexit 0\n");
+        cargo
+    }
+
+    #[test]
+    fn resolve_cargo_prefers_cargo_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_cargo = fake_cargo_in(&tmp.path().join("env-bin"));
+        let path_cargo_dir = tmp.path().join("path-bin");
+        fake_cargo_in(&path_cargo_dir);
+        let found = resolve_cargo(
+            Some(env_cargo.clone().into_os_string()),
+            Some(path_cargo_dir.into_os_string()),
+            &[],
+        );
+        assert_eq!(found, Some(env_cargo));
+    }
+
+    #[test]
+    fn resolve_cargo_ignores_dangling_cargo_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_dir = tmp.path().join("path-bin");
+        let path_cargo = fake_cargo_in(&path_dir);
+        let found = resolve_cargo(
+            Some(tmp.path().join("missing/cargo").into_os_string()),
+            Some(path_dir.into_os_string()),
+            &[],
+        );
+        assert_eq!(found, Some(path_cargo));
+    }
+
+    #[test]
+    fn resolve_cargo_scans_path_entries_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let without = tmp.path().join("without-cargo");
+        std::fs::create_dir_all(&without).unwrap();
+        let with = tmp.path().join("with-cargo");
+        let path_cargo = fake_cargo_in(&with);
+        let joined = std::env::join_paths([without, with]).unwrap();
+        let found = resolve_cargo(None, Some(joined), &[]);
+        assert_eq!(found, Some(path_cargo));
+    }
+
+    #[test]
+    fn resolve_cargo_falls_back_to_home_rustup_install() {
+        // The sudo case: PATH carries no cargo, but the invoking user's home
+        // has the standard rustup layout. The old code had no fallback at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_path_dir = tmp.path().join("no-cargo-here");
+        std::fs::create_dir_all(&empty_path_dir).unwrap();
+        let home = tmp.path().join("home");
+        let home_cargo = fake_cargo_in(&home.join(".cargo/bin"));
+        let found = resolve_cargo(None, Some(empty_path_dir.into_os_string()), &[home]);
+        assert_eq!(found, Some(home_cargo));
+    }
+
+    #[test]
+    fn resolve_cargo_skips_non_executable_candidates() {
+        // execvp skips a PATH entry it cannot execute and keeps searching;
+        // resolution must do the same or a stray non-executable "cargo"
+        // file turns into a hard EACCES at spawn time.
+        let tmp = tempfile::tempdir().unwrap();
+        let broken_dir = tmp.path().join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(broken_dir.join("cargo"), "not a program").unwrap();
+        let good_dir = tmp.path().join("good");
+        let good = fake_cargo_in(&good_dir);
+        let joined = std::env::join_paths([broken_dir, good_dir]).unwrap();
+        let found = resolve_cargo(None, Some(joined), &[]);
+        assert_eq!(found, Some(good));
+    }
+
+    #[test]
+    fn resolve_cargo_returns_absolute_paths_for_relative_candidates() {
+        // The build command sets current_dir(build_dir), so a relative
+        // candidate validated against the caller's cwd would be re-resolved
+        // by the child inside the cloned repo — a different file entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        fake_cargo_in(&tmp.path().join("bin"));
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let found = resolve_cargo(None, Some(std::ffi::OsString::from("bin")), &[]);
+        std::env::set_current_dir(prev).unwrap();
+        let found = found.expect("relative PATH entry with a real cargo resolves");
+        assert!(
+            found.is_absolute(),
+            "resolved cargo must be absolute, got {}",
+            found.display()
+        );
+    }
+
+    #[test]
+    fn fallback_homes_prefer_the_identity_that_executes() {
+        // With a sudo invoker the child drops to that user, who typically
+        // cannot traverse root's 0700 $HOME — root's cargo would spawn-fail
+        // EACCES for the child, so it must not even be a candidate.
+        let invoker = PathBuf::from("/home/operator");
+        let root_home = PathBuf::from("/root");
+        assert_eq!(
+            fallback_homes_for(Some(invoker.clone()), Some(root_home.clone())),
+            vec![invoker]
+        );
+        assert_eq!(
+            fallback_homes_for(None, Some(root_home.clone())),
+            vec![root_home]
+        );
+        assert!(fallback_homes_for(None, None).is_empty());
+    }
+
+    #[test]
+    fn resolve_cargo_reports_nothing_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let bare_home = tmp.path().join("bare-home");
+        std::fs::create_dir_all(&bare_home).unwrap();
+        let found = resolve_cargo(None, Some(empty.into_os_string()), &[bare_home]);
+        assert_eq!(found, None);
     }
 }

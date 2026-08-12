@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use directories::ProjectDirs;
-use nix::fcntl::{Flock, FlockArg};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -1141,26 +1140,9 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
         bail!("Rootfs not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
-    // Create directory for lock file
-    tokio::fs::create_dir_all(&rootfs_dir)
-        .await
-        .context("creating rootfs directory")?;
-
     // Acquire lock to prevent concurrent rootfs creation
     info!("acquiring rootfs creation lock");
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening rootfs creation lock file")?;
-
-    use nix::fcntl::{Flock, FlockArg};
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring rootfs creation lock")?;
+    let flock = super::lock_store_dir(&lock_file, "rootfs creation").await?;
 
     // Check again after acquiring lock
     if rootfs_path.exists() {
@@ -1194,9 +1176,7 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
     .await;
 
     if result.is_ok() {
-        tokio::fs::rename(&temp_rootfs_path, &rootfs_path)
-            .await
-            .context("renaming temp rootfs to final path")?;
+        super::publish_store_entry(&temp_rootfs_path, &rootfs_path, "rootfs").await?;
         info!(
             path = %rootfs_path.display(),
             script_sha = %script_sha_short,
@@ -1521,25 +1501,12 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
         bail!("fc-agent initrd not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
-    // Create initrd directory (needed for lock file)
-    tokio::fs::create_dir_all(&initrd_dir)
-        .await
-        .context("creating initrd directory")?;
-
     // Acquire exclusive lock to prevent race conditions
-    let lock_file = initrd_dir.join(format!("fc-agent-{}.lock", initrd_sha_short));
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening initrd lock file")?;
-
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for initrd creation")?;
+    let flock = super::lock_store_dir(
+        &initrd_dir.join(format!("fc-agent-{}.lock", initrd_sha_short)),
+        "initrd creation",
+    )
+    .await?;
 
     // Double-check after acquiring lock - another process may have created it
     if initrd_path.exists() {
@@ -1570,6 +1537,9 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     ));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
+    // A killed root run would otherwise leave a directory whose contents a
+    // rootless run's remove_dir_all cannot unlink.
+    super::give_store_entry_to_invoker(&temp_dir);
 
     // Create directory structure
     for dir in &["bin", "sbin", "dev", "proc", "sys", "newroot"] {
@@ -1637,7 +1607,7 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     }
 
     // Rename to final path (atomic)
-    tokio::fs::rename(&temp_initrd, &initrd_path).await?;
+    super::publish_store_entry(&temp_initrd, &initrd_path, "initrd").await?;
 
     // Cleanup temp directory
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -2073,6 +2043,7 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     let _ = tokio::fs::remove_dir_all(&packages_dir).await;
     let _ = tokio::fs::remove_dir_all(&download_dir).await;
     tokio::fs::create_dir_all(&download_dir).await?;
+    super::give_store_entry_to_invoker(&cache_dir);
 
     let codename = &plan.base.codename;
     let container_image = format!("ubuntu:{}", codename);
@@ -2164,10 +2135,11 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         );
     }
 
-    // Atomically publish the completed download as the cache directory
-    tokio::fs::rename(&download_dir, &packages_dir)
-        .await
-        .context("renaming downloaded packages directory into place")?;
+    // Atomically publish the completed download as the cache directory.
+    // The .deb files inside may stay root-owned after a sudo run; that is
+    // fine — the handed-back parent directory is what governs a rootless
+    // run's ability to read, replace, or unlink them.
+    super::publish_store_entry(&download_dir, &packages_dir, "downloaded packages").await?;
 
     info!(path = %packages_dir.display(), count = count, "packages downloaded");
     Ok(packages_dir)
@@ -2179,6 +2151,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .context("creating cache directory")?;
+    super::give_store_entry_to_invoker(&cache_dir);
 
     // Get arch-specific config
     let arch_config = match std::env::consts::ARCH {
@@ -2239,9 +2212,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
     }
 
     // Rename to final path
-    tokio::fs::rename(&temp_path, &image_path)
-        .await
-        .context("renaming downloaded image")?;
+    super::publish_store_entry(&temp_path, &image_path, "downloaded cloud image").await?;
 
     info!(
         path = %image_path.display(),

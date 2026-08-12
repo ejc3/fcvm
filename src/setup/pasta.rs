@@ -18,7 +18,6 @@
 //!   flock, double-checked after acquisition.
 
 use anyhow::{bail, Context, Result};
-use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -99,24 +98,8 @@ pub async fn ensure_pasta(config: Option<&PastaConfig>) -> Result<Option<PathBuf
         return Ok(Some(bin_path));
     }
 
-    let pasta_dir = bin_path.parent().expect("pasta path has parent");
-    tokio::fs::create_dir_all(&pasta_dir)
-        .await
-        .context("creating pasta assets directory")?;
-
     // Serialize concurrent builds of the same binary (parallel `fcvm setup`).
-    let lock_file = bin_path.with_extension("lock");
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_fd = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening pasta build lock file")?;
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for pasta build")?;
+    let flock = super::lock_store_dir(&bin_path.with_extension("lock"), "pasta build").await?;
 
     // Another process may have finished the build while we waited.
     if bin_path.exists() {
@@ -163,21 +146,30 @@ async fn build_pasta(
     // arbitrary SHA need uploadpack.allowReachableSHA1InWant on the server,
     // which passt.top does not advertise. The repo is ~15MB; correctness
     // over cleverness.
-    let status = Command::new("git")
-        .args(["clone", &config.repo, build_dir.to_str().unwrap()])
-        .status()
-        .await
-        .context("cloning pasta repo")?;
+    // The whole build runs as the sudo invoker (see run_build_as_sudo_invoker):
+    // the deterministic /tmp/pasta-build-{sha} tree must never be left
+    // root-owned by a failed root build, or the next rootless build dies
+    // removing it.
+    let status = super::run_build_as_sudo_invoker(Command::new("git").args([
+        "clone",
+        &config.repo,
+        build_dir.to_str().unwrap(),
+    ]))
+    .status()
+    .await
+    .context("cloning pasta repo")?;
     if !status.success() {
         bail!("failed to clone pasta repo from {}", config.repo);
     }
 
-    let status = Command::new("git")
-        .args(["checkout", "--detach", &config.commit])
-        .current_dir(build_dir)
-        .status()
-        .await
-        .context("checking out pinned pasta commit")?;
+    let status = super::run_build_as_sudo_invoker(
+        Command::new("git")
+            .args(["checkout", "--detach", &config.commit])
+            .current_dir(build_dir),
+    )
+    .status()
+    .await
+    .context("checking out pinned pasta commit")?;
     if !status.success() {
         bail!(
             "pinned pasta commit {} not found in {} — the pin and repo must agree",
@@ -191,12 +183,14 @@ async fn build_pasta(
         tokio::fs::write(&patch_path, content)
             .await
             .with_context(|| format!("writing embedded patch {}", name))?;
-        let status = Command::new("git")
-            .args(["apply", "--verbose", name])
-            .current_dir(build_dir)
-            .status()
-            .await
-            .with_context(|| format!("applying pasta patch {}", name))?;
+        let status = super::run_build_as_sudo_invoker(
+            Command::new("git")
+                .args(["apply", "--verbose", name])
+                .current_dir(build_dir),
+        )
+        .status()
+        .await
+        .with_context(|| format!("applying pasta patch {}", name))?;
         if !status.success() {
             bail!(
                 "pasta patch {} does not apply to {} @ {} — rebase the patch or move the pin",
@@ -207,12 +201,11 @@ async fn build_pasta(
         }
     }
 
-    let status = Command::new("make")
-        .arg("pasta")
-        .current_dir(build_dir)
-        .status()
-        .await
-        .context("building pasta (is a C toolchain installed? apt install gcc make)")?;
+    let status =
+        super::run_build_as_sudo_invoker(Command::new("make").arg("pasta").current_dir(build_dir))
+            .status()
+            .await
+            .context("building pasta (is a C toolchain installed? apt install gcc make)")?;
     if !status.success() {
         bail!(
             "pasta build failed (build tree kept at {})",
@@ -232,8 +225,6 @@ async fn build_pasta(
     tokio::fs::copy(&built, &temp_path)
         .await
         .context("staging pasta binary")?;
-    tokio::fs::rename(&temp_path, bin_path)
-        .await
-        .context("installing pasta binary")?;
+    super::publish_store_entry(&temp_path, bin_path, "pasta binary").await?;
     Ok(())
 }
