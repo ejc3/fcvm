@@ -43,6 +43,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 import random
@@ -102,11 +103,16 @@ class Result:
 class Harness:
     def __init__(self, args):
         self.fcvm = str(args.fcvm)
-        self.out = Path(args.out)
+        self.run_id = uuid.uuid4().hex[:12]
+        # Everything this run writes lives under its own run_id directory:
+        # two overlapping invocations otherwise truncate each other's
+        # serve-<tag>.log (corrupting the OTHER run's readiness poll with this
+        # run's PID) and the shared matrix.jsonl.
+        self.out = Path(args.out) / self.run_id
         self.out.mkdir(parents=True, exist_ok=True)
         self.data_root = Path(args.data_root)
         self.state_dir = self.data_root / "state"
-        self.run_id = uuid.uuid4().hex[:12]
+        self.prepared_tags: set = set()
         self.records = []
 
     # ---- infrastructure -------------------------------------------------
@@ -127,7 +133,16 @@ class Harness:
         return None
 
     def make_golden(self, tag, network, volumes):
-        """One cold VM, snapshotted at its health gate, reused by every rep."""
+        """One cold VM, snapshotted at its health gate, reused by every rep.
+
+        Prepared once per (tag, run): the tag's content key does not change
+        within a run, so later cells take `podman prepare`'s verified cache hit
+        instead of cold-building the same snapshot 33 times for 4 distinct tags.
+        `--force` applies only to the first build, to shed a stale
+        previous-run entry.
+        """
+        if tag in self.prepared_tags:
+            return []
         mapping = []
         if volumes:
             host_dir = Path(f"/mnt/fcvm-btrfs/matrix-vol-{self.run_id}")
@@ -143,6 +158,7 @@ class Harness:
         out = run(argv, timeout=900)
         if out.returncode != 0:
             raise RuntimeError(f"golden failed for {tag}: {out.stderr[-2000:]}")
+        self.prepared_tags.add(tag)
         return mapping
 
     def start_serve(self, tag):
@@ -161,6 +177,14 @@ class Harness:
             if proc.poll() is not None:
                 raise RuntimeError(f"serve exited: {log.read_text()[-2000:]}")
             time.sleep(0.1)
+        # The caller never learns this proc's handle (the assignment it would
+        # land in does not complete), so reap it HERE or it outlives the cell.
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=15)
         raise RuntimeError("serve never became ready")
 
     # ---- one repetition -------------------------------------------------
@@ -256,54 +280,151 @@ class Harness:
             time.sleep(0.25)
         failures.append(f"{clone['name']}: teardown left {leftovers}")
 
-    def run_cell(self, cell, tag, serve_pid, rep) -> Result:
-        failures = []
-        clones = [
-            self.restore_clone(cell, tag, serve_pid, i, rep)
-            for i in range(cell.concurrency)
-        ]
-        phases, ready = [], []
+    RESTORE_STARTED = re.compile(r"starting pasta for rootless networking|network namespace configured")
 
-        if cell.lifecycle == "kill-mid-restore":
-            # SIGKILL inside the restore window: the host must not leave a
-            # clone half-published, and the NEXT clone must be unaffected.
-            time.sleep(0.05)
-            for clone in clones:
-                clone["proc"].kill()
-                clone["proc"].wait(timeout=30)
-            for clone in clones:
-                self.teardown(clone, failures, expect_clean=False)
-            survivor = self.restore_clone(cell, tag, serve_pid, 99, rep)
+    def validate_ready_clone(self, clone, cell, phases, ready, failures):
+        """The full per-clone contract: telemetry present, verified fast path,
+        exec round trip, mapped volume readable. One place, so the
+        kill-mid-restore survivor cannot silently get a weaker check than an
+        ordinary clone."""
+        if not clone["phases"]:
+            failures.append(f"{clone['name']}: ACK carried no phase telemetry")
+        elif not clone["phases"].get("tcp_verified"):
+            failures.append(
+                f"{clone['name']}: boundary took the repair path "
+                f"(tcp_verified=false) on an untampered snapshot"
+            )
+        phases.append(clone["phases"])
+        ready.append(clone["ready_ms"])
+        self.assert_live(clone, cell, failures)
+
+    def kill_mid_restore(self, cell, tag, serve_pid, rep, clones, phases, ready, failures):
+        """SIGKILL inside a PROVEN restore window, then prove the aftermath.
+
+        The window is pinned by observation, not by a sleep: each clone must
+        have logged the start of its network setup (restore underway) and must
+        NOT yet have ACKed its restore generation. A kill before restore starts
+        or after the ACK exercises a different, easier property, and the cell
+        says so instead of passing vacuously.
+
+        What SIGKILL is ASSERTED to leave behind follows what fcvm promises
+        (AGENTS.md "PROCESS TEARDOWN IS PER-HOP" + "Stale State File
+        Handling"): the process TREE dies with the killed fcvm — pdeathsig is
+        kernel-enforced and survives SIGKILL — but cleanup CODE does not run,
+        so the state file and disk may legitimately remain, as documented, for
+        the next run's stale-state handling to collect. Asserting "no
+        artifacts" here would assert a property fcvm deliberately does not
+        have. The load-bearing assertions are: no VMM/pasta process outlives
+        its killed fcvm, and the survivor restores with the FULL ordinary
+        contract despite the stale residue. The residue is then removed so
+        later cells start clean.
+        """
+        for clone in clones:
+            deadline = time.monotonic() + 30
+            started = False
+            while time.monotonic() < deadline:
+                text = clone["log"].read_text(errors="replace")
+                if ACK.search(text):
+                    break
+                if self.RESTORE_STARTED.search(text):
+                    started = True
+                    break
+                if clone["proc"].poll() is not None:
+                    break
+                time.sleep(0.01)
+            text = clone["log"].read_text(errors="replace")
+            if ACK.search(text):
+                failures.append(
+                    f"{clone['name']}: ACKed before the kill could land — this rep "
+                    f"did not exercise a mid-restore kill"
+                )
+            elif not started:
+                failures.append(
+                    f"{clone['name']}: restore never observably started before kill"
+                )
+        victims = []
+        for clone in clones:
+            vm = self.vm_by_name(clone["name"])
+            victims.append((clone, (vm or {}).get("vm_id")))
+        for clone in clones:
+            clone["proc"].kill()
+            clone["proc"].wait(timeout=30)
+
+        # pdeathsig must reap the whole subtree of each killed fcvm.
+        deadline = time.monotonic() + 15
+        stragglers = []
+        while time.monotonic() < deadline:
+            ps = run(["ps", "-eo", "args"], timeout=30).stdout
+            stragglers = [
+                clone["name"] for clone in clones if clone["name"] in ps
+            ]
+            if not stragglers:
+                break
+            time.sleep(0.25)
+        if stragglers:
+            failures.append(
+                f"processes outlived their SIGKILLed fcvm (pdeathsig hole): {stragglers}"
+            )
+
+        survivor = self.restore_clone(cell, tag, serve_pid, 99, rep)
+        try:
             if not self.wait_ready(survivor):
                 failures.append("a clone after a killed restore never became ready")
             else:
-                phases.append(survivor["phases"])
-                ready.append(survivor["ready_ms"])
-                self.assert_live(survivor, cell, failures)
+                self.validate_ready_clone(survivor, cell, phases, ready, failures)
+        finally:
             self.teardown(survivor, failures)
-            return Result(cell.name(), rep, not failures, failures, phases, ready)
 
-        for clone in clones:
-            if not self.wait_ready(clone):
-                failures.append(
-                    f"{clone['name']}: never ACKed a restore generation; "
-                    f"log tail: {clone['log'].read_text(errors='replace')[-400:]}"
-                )
+        # Sweep the documented crash residue so later cells start clean.
+        for _clone, vm_id in victims:
+            if not vm_id:
                 continue
-            if not clone["phases"]:
-                failures.append(f"{clone['name']}: ACK carried no phase telemetry")
-            elif not clone["phases"].get("tcp_verified"):
-                failures.append(
-                    f"{clone['name']}: boundary took the repair path "
-                    f"(tcp_verified=false) on an untampered snapshot"
-                )
-            phases.append(clone["phases"])
-            ready.append(clone["ready_ms"])
-            self.assert_live(clone, cell, failures)
+            for path in (
+                self.state_dir / f"{vm_id}.json",
+                self.state_dir / f"{vm_id}.json.lock",
+            ):
+                path.unlink(missing_ok=True)
+            disk = self.data_root / "vm-disks" / vm_id
+            if disk.exists():
+                subprocess.run(["rm", "-rf", str(disk)], timeout=60, check=False)
 
-        for clone in clones:
-            self.teardown(clone, failures)
-        return Result(cell.name(), rep, not failures, failures, phases, ready)
+    def run_cell(self, cell, tag, serve_pid, rep) -> Result:
+        failures = []
+        phases, ready = [], []
+        clones = []
+        try:
+            # Launched incrementally: if a later spawn raises, every clone
+            # started before it is still in `clones` for the finally below.
+            for i in range(cell.concurrency):
+                clones.append(self.restore_clone(cell, tag, serve_pid, i, rep))
+
+            if cell.lifecycle == "kill-mid-restore":
+                self.kill_mid_restore(
+                    cell, tag, serve_pid, rep, clones, phases, ready, failures
+                )
+                return Result(cell.name(), rep, not failures, failures, phases, ready)
+
+            for clone in clones:
+                if not self.wait_ready(clone):
+                    failures.append(
+                        f"{clone['name']}: never ACKed a restore generation; "
+                        f"log tail: {clone['log'].read_text(errors='replace')[-400:]}"
+                    )
+                    continue
+                self.validate_ready_clone(clone, cell, phases, ready, failures)
+            return Result(cell.name(), rep, not failures, failures, phases, ready)
+        finally:
+            # Every launched clone is torn down on EVERY path — the ordinary
+            # return, the kill-cell return, and any exception out of
+            # restore_clone/wait_ready/assert_live. Idempotent for clones the
+            # kill path already reaped (their proc has exited; teardown then
+            # only checks residue).
+            for clone in clones:
+                self.teardown(
+                    clone,
+                    failures,
+                    expect_clean=(cell.lifecycle != "kill-mid-restore"),
+                )
 
 
 def build_cells(selected):
@@ -318,8 +439,33 @@ def build_cells(selected):
     cells.append(Cell("file", "rootless", 1, True, "ordinary"))
     cells.append(Cell("uffd", "rootless", 4, False, "kill-mid-restore"))
     if selected:
-        wanted = set(selected.split(","))
-        cells = [c for c in cells if any(w in c.name() for w in wanted)]
+        # Selectors are matrix DIMENSION VALUES (uffd, file, rootless, bridged,
+        # ordinary, kill-mid-restore, vol, novol, c1/c4/c16), matched as whole
+        # facts about a cell rather than substrings of its name — "c1" must not
+        # select c16. Every token must be known and the result non-empty:
+        # a selection that evaluates nothing must not report success.
+        known = {
+            "uffd": lambda c: c.backend == "uffd",
+            "file": lambda c: c.backend == "file",
+            "rootless": lambda c: c.network == "rootless",
+            "bridged": lambda c: c.network == "bridged",
+            "ordinary": lambda c: c.lifecycle == "ordinary",
+            "kill-mid-restore": lambda c: c.lifecycle == "kill-mid-restore",
+            "vol": lambda c: c.volumes,
+            "novol": lambda c: not c.volumes,
+            "c1": lambda c: c.concurrency == 1,
+            "c4": lambda c: c.concurrency == 4,
+            "c16": lambda c: c.concurrency == 16,
+        }
+        tokens = [t for t in selected.split(",") if t]
+        unknown = [t for t in tokens if t not in known]
+        if unknown:
+            raise SystemExit(
+                f"--cells: unknown selector(s) {unknown}; valid: {sorted(known)}"
+            )
+        cells = [c for c in cells if any(known[t](c) for t in tokens)]
+        if not cells:
+            raise SystemExit(f"--cells {selected!r} selects no cells")
     return cells
 
 
@@ -331,18 +477,28 @@ def summarise(records):
         totals = sorted(
             p.get("total_ms", 0.0) for r in rows for p in r["phases"] if p
         )
+        # Spawn-to-ACK, measured host-side from process spawn to the ACK line:
+        # includes snapshot load, VMM startup and delivery — the guest-only
+        # phase total below starts inside fc-agent and hides exactly the
+        # backend overhead this matrix compares.
+        spawn_acks = sorted(ms for r in rows for ms in r["ready_ms"])
         verified = sum(
             1 for r in rows for p in r["phases"] if p.get("tcp_verified")
         )
         observed = sum(len(r["phases"]) for r in rows)
-        if totals:
-            p50 = totals[len(totals) // 2]
-            p95 = totals[max(0, int(len(totals) * 0.95) - 1)]
-        else:
-            p50 = p95 = float("nan")
+        def pct(sorted_values, q):
+            # Ceiling rank: with 3 samples p95 is the maximum, not the median.
+            if not sorted_values:
+                return float("nan")
+            rank = max(0, math.ceil(q * len(sorted_values)) - 1)
+            return sorted_values[rank]
+
         lines.append(
             f"{name:44s} reps={len(rows):2d} restores={observed:3d} "
-            f"verified={verified:3d} ack_p50={p50:7.1f} ack_p95={p95:7.1f} "
+            f"verified={verified:3d} "
+            f"spawn_ack_p50={pct(spawn_acks, 0.50):7.1f} "
+            f"spawn_ack_p95={pct(spawn_acks, 0.95):7.1f} "
+            f"guest_p50={pct(totals, 0.50):7.1f} "
             f"{'FAIL x' + str(len(failed)) if failed else 'ok'}"
         )
     return "\n".join(lines)
