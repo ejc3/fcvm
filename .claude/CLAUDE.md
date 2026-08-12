@@ -240,6 +240,54 @@ means the reviewer never started.
 Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces a
 `branches:`/`branches-ignore:` filter on `pull_request`, or if a gating job leaves that file.
 
+## Fresh Bare-Metal Box Quickstart
+
+Bring up a new ARM (or x86) KVM-capable box to building-and-benching in ~20 minutes.
+The ordering below matters; each step's trap is noted inline.
+
+```bash
+# 1. KVM access (new login session required after; a live ssh master keeps old groups)
+sudo usermod -aG kvm $USER
+
+# 2. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
+#    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable root.
+lsblk -d -o NAME,SIZE,MODEL          # identify instance-store drives BEFORE mkfs
+sudo mkfs.btrfs -f -d raid0 -m raid0 /dev/nvme0n1 /dev/nvme1n1   # your names WILL differ
+sudo mkdir -p /mnt/fcvm-btrfs && sudo mount /dev/nvme0n1 /mnt/fcvm-btrfs
+sudo chown $USER:$USER /mnt/fcvm-btrfs
+
+# 3. Packages (Ubuntu 24.04)
+sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
+    pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt
+
+# 4. Rust. If ~/.cargo is a dangling symlink left from a wiped NVMe (make
+#    check-disk moves it there), recreate the target first: mkdir -p /mnt/fcvm-btrfs/cargo
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# 5. Sources on the DURABLE disk, sibling layout is required (fuse-pipe uses
+#    a ../fuse-backend-rs path dependency)
+mkdir -p ~/src && cd ~/src
+git clone https://github.com/ejc3/fcvm.git
+git clone https://github.com/ejc3/fuse-backend-rs.git
+git clone https://github.com/ejc3/fuser.git
+
+# 6. Build + full setup (downloads released kernels, builds pasta + the
+#    firecracker fork, creates the rootfs; ~10 min on 64 cores when the kernel
+#    releases exist, plus a local kernel build when one does not)
+cd ~/src/fcvm && make build && make setup-fcvm
+```
+
+Run everything as the unprivileged user; `make` shells out to sudo exactly where
+root is needed. `sudo fcvm setup` also works — builds drop back to the invoking
+user and store entries are handed back to them (see src/setup/mod.rs) — but the
+rootless path is the default one CI exercises.
+
+Sanity check the result before benching:
+
+```bash
+make test-root FILTER=sanity
+```
+
 ## Sending Email
 
 Use `aws ses send-email --region us-east-1` (recipient must be verified in SES sandbox).
