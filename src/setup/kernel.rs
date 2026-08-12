@@ -2767,6 +2767,84 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Whether a finished child failed only because a fixture executable was
+    /// still open for writing somewhere.
+    ///
+    /// The outer script execs fixtures of its own (the fake `curl`, `make`,
+    /// `cargo` on its PATH), and a shell reports that as exit 126 with "Text
+    /// file busy" on stderr. Retrying only the direct spawn error misses
+    /// every one of those, which is the shape that actually flakes.
+    fn child_hit_text_file_busy(output: &std::process::Output) -> bool {
+        output.status.code() == Some(126)
+            && String::from_utf8_lossy(&output.stderr).contains("Text file busy")
+    }
+
+    /// Run a freshly written script, retrying "Text file busy" briefly.
+    ///
+    /// A sibling test thread can fork while `write_executable`'s descriptor is
+    /// open; until that child execs (closing its CLOEXEC copy), execve of the
+    /// script fails with ETXTBSY. The window cannot be closed from here: the
+    /// libtest harness runs tests as threads in one process, so an unrelated
+    /// test's `Command::spawn` can fork at any instant, and neither writing
+    /// through a temp file nor renaming helps (an inherited descriptor names
+    /// the same inode). Retrying both shapes — the direct spawn error and a
+    /// child's 126 — covers what is observable; a still-busy fixture after
+    /// the deadline fails loudly with the child's own output rather than an
+    /// unwrap panic that names neither.
+    fn output_retrying_etxtbsy(command: &mut std::process::Command) -> std::process::Output {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let retryable = match command.output() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => None,
+                Err(error) => panic!("running the generated kernel build script: {error}"),
+                Ok(output) if child_hit_text_file_busy(&output) => Some(output),
+                Ok(output) => return output,
+            };
+            if std::time::Instant::now() >= deadline {
+                match retryable {
+                    Some(output) => panic!(
+                        "a fixture executable stayed busy for the whole retry budget\n\
+                         stdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    None => panic!(
+                        "the generated kernel build script stayed busy for the whole \
+                         retry budget"
+                    ),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_busy_fixture_is_recognised_from_the_childs_own_report() {
+        use std::os::unix::process::ExitStatusExt;
+        let busy = std::process::Output {
+            status: std::process::ExitStatus::from_raw(126 << 8),
+            stdout: Vec::new(),
+            stderr: b"/tmp/bin/curl: Text file busy\n".to_vec(),
+        };
+        assert!(child_hit_text_file_busy(&busy));
+
+        // A genuine 126 (not executable) must NOT be retried away.
+        let not_executable = std::process::Output {
+            status: std::process::ExitStatus::from_raw(126 << 8),
+            stdout: Vec::new(),
+            stderr: b"/tmp/bin/curl: Permission denied\n".to_vec(),
+        };
+        assert!(!child_hit_text_file_busy(&not_executable));
+
+        // Nor may an ordinary failure be mistaken for it.
+        let ordinary = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Text file busy\n".to_vec(),
+        };
+        assert!(!child_hit_text_file_busy(&ordinary));
+    }
+
     #[test]
     fn vm_kernel_build_replaces_interrupted_cached_source_archive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2852,16 +2930,16 @@ cp vmlinux arch/arm64/boot/Image
         write_executable(&script_path, &script);
 
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let status = std::process::Command::new(&script_path)
-            .env("BUILD_DIR", &build_dir)
-            .env("FCVM_TEST_CACHED_TARBALL", &cached_tarball)
-            .env("FCVM_TEST_KERNEL_TARBALL", &valid_tarball)
-            .env(
-                "PATH",
-                format!("{}:{}", fake_bin.display(), path.to_string_lossy()),
-            )
-            .output()
-            .unwrap();
+        let status = output_retrying_etxtbsy(
+            std::process::Command::new(&script_path)
+                .env("BUILD_DIR", &build_dir)
+                .env("FCVM_TEST_CACHED_TARBALL", &cached_tarball)
+                .env("FCVM_TEST_KERNEL_TARBALL", &valid_tarball)
+                .env(
+                    "PATH",
+                    format!("{}:{}", fake_bin.display(), path.to_string_lossy()),
+                ),
+        );
 
         assert!(
             status.status.success(),
