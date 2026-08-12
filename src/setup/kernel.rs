@@ -2282,6 +2282,35 @@ pub async fn get_configured_firecracker_for_profile(
 /// resolution (`git ls-remote`), then rewrites the launch-time resolution cache
 /// read by [`get_profile_firecracker_path`]. That is what makes an updated fork
 /// take effect for VM launches immediately rather than after the cache TTL —
+/// What setup should do after trying to resolve the remote firecracker commit.
+#[derive(Debug)]
+enum RemoteResolutionOutcome {
+    /// The remote answered; build or reuse against this commit.
+    Resolved(String),
+    /// The remote did not answer, but this machine already has a recorded
+    /// binary for the profile. Keep it, and say why.
+    ReuseCached { path: PathBuf, error: anyhow::Error },
+}
+
+/// Decide between the freshly resolved commit and an already-built binary.
+///
+/// Split out from `ensure_profile_firecracker` so the degrade-on-unreachable
+/// decision is testable without a network or the global assets dir.
+fn resolve_or_reuse_cached(
+    fetched: Result<String>,
+    cached: impl FnOnce() -> Result<Option<PathBuf>>,
+) -> Result<RemoteResolutionOutcome> {
+    match fetched {
+        Ok(commit) => Ok(RemoteResolutionOutcome::Resolved(commit)),
+        Err(error) => match cached()? {
+            Some(path) => Ok(RemoteResolutionOutcome::ReuseCached { path, error }),
+            // Nothing cached: an unreachable remote really is fatal here,
+            // because there is no binary to fall back to.
+            None => Err(error),
+        },
+    }
+}
+
 /// `fcvm setup` is the sanctioned way to pick up a new firecracker build.
 pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
@@ -2298,8 +2327,36 @@ pub async fn ensure_profile_firecracker(
 
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
-    // Fetch latest commit hash to detect updates
-    let resolved_commit = fetch_remote_firecracker_commit(repo, branch).await?;
+    // Fetch latest commit hash to detect updates. A transient failure to
+    // reach the remote is not a reason to fail setup when this machine has
+    // already built and recorded a binary for this profile: setup exists to
+    // make the assets present, and they are. `get_firecracker_for_profile`
+    // has always degraded this way; the ensure path failing hard on the same
+    // blip took a CI job down with every asset already on disk (all 764 unit
+    // tests had passed; `git ls-remote` then could not reach GitHub).
+    let fetched = fetch_remote_firecracker_commit(repo, branch).await;
+    let firecracker_dir = paths::assets_dir().join("firecracker");
+    let resolved_commit = match resolve_or_reuse_cached(fetched, || {
+        offline_cached_firecracker_resolution_in(
+            &firecracker_dir,
+            profile_name,
+            repo,
+            branch,
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        )
+    })? {
+        RemoteResolutionOutcome::Resolved(commit) => commit,
+        RemoteResolutionOutcome::ReuseCached { path, error } => {
+            warn!(
+                profile = %profile_name,
+                %error,
+                path = %path.display(),
+                "could not query remote firecracker commit; keeping the cached binary"
+            );
+            return Ok(Some(path));
+        }
+    };
     let commit_hash =
         select_firecracker_commit(profile.firecracker_commit.as_deref(), &resolved_commit)?;
     let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
@@ -3395,6 +3452,59 @@ cp vmlinux arch/arm64/boot/Image
             "offline launch must not select an arbitrary same-profile binary: {}",
             unidentified.display()
         );
+    }
+
+    #[test]
+    fn an_unreachable_remote_keeps_the_binary_this_machine_already_built() {
+        // The CI shape: every asset present, `git ls-remote` momentarily
+        // unable to reach GitHub. Setup exists to make the assets present,
+        // and they are, so it must not fail the job.
+        let cached = PathBuf::from("/assets/firecracker/firecracker-default-abc.bin");
+        let outcome = resolve_or_reuse_cached(
+            Err(anyhow::anyhow!(
+                "git ls-remote failed: could not resolve host"
+            )),
+            || Ok(Some(cached.clone())),
+        )
+        .expect("a cached binary must satisfy setup when the remote is unreachable");
+        match outcome {
+            RemoteResolutionOutcome::ReuseCached { path, error } => {
+                assert_eq!(path, cached);
+                assert!(
+                    format!("{error:#}").contains("ls-remote"),
+                    "the degrade must carry why the remote failed: {error:#}"
+                );
+            }
+            RemoteResolutionOutcome::Resolved(commit) => {
+                panic!("an unreachable remote must not yield a commit: {commit}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreachable_remote_with_nothing_cached_still_fails() {
+        // No binary to fall back to: degrading here would report success and
+        // leave the caller without firecracker.
+        let error = resolve_or_reuse_cached(
+            Err(anyhow::anyhow!(
+                "git ls-remote failed: could not resolve host"
+            )),
+            || Ok(None),
+        )
+        .expect_err("an unreachable remote with no cached binary must fail setup");
+        assert!(format!("{error:#}").contains("ls-remote"), "{error:#}");
+    }
+
+    #[test]
+    fn a_reachable_remote_always_wins_over_the_cache() {
+        let outcome = resolve_or_reuse_cached(Ok("deadbeef".to_string()), || {
+            panic!("the cache must not be consulted when the remote answered")
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RemoteResolutionOutcome::Resolved(commit) if commit == "deadbeef"
+        ));
     }
 
     #[test]
