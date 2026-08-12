@@ -2282,6 +2282,35 @@ pub async fn get_configured_firecracker_for_profile(
 /// resolution (`git ls-remote`), then rewrites the launch-time resolution cache
 /// read by [`get_profile_firecracker_path`]. That is what makes an updated fork
 /// take effect for VM launches immediately rather than after the cache TTL —
+/// What setup should do after trying to resolve the remote firecracker commit.
+#[derive(Debug)]
+enum RemoteResolutionOutcome {
+    /// The remote answered; build or reuse against this commit.
+    Resolved(String),
+    /// The remote did not answer, but this machine already has a recorded
+    /// binary for the profile. Keep it, and say why.
+    ReuseCached { path: PathBuf, error: anyhow::Error },
+}
+
+/// Decide between the freshly resolved commit and an already-built binary.
+///
+/// Split out from `ensure_profile_firecracker` so the degrade-on-unreachable
+/// decision is testable without a network or the global assets dir.
+fn resolve_or_reuse_cached(
+    fetched: Result<String>,
+    cached: impl FnOnce() -> Result<Option<PathBuf>>,
+) -> Result<RemoteResolutionOutcome> {
+    match fetched {
+        Ok(commit) => Ok(RemoteResolutionOutcome::Resolved(commit)),
+        Err(error) => match cached()? {
+            Some(path) => Ok(RemoteResolutionOutcome::ReuseCached { path, error }),
+            // Nothing cached: an unreachable remote really is fatal here,
+            // because there is no binary to fall back to.
+            None => Err(error),
+        },
+    }
+}
+
 /// `fcvm setup` is the sanctioned way to pick up a new firecracker build.
 pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
@@ -2298,8 +2327,36 @@ pub async fn ensure_profile_firecracker(
 
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
-    // Fetch latest commit hash to detect updates
-    let resolved_commit = fetch_remote_firecracker_commit(repo, branch).await?;
+    // Fetch latest commit hash to detect updates. A transient failure to
+    // reach the remote is not a reason to fail setup when this machine has
+    // already built and recorded a binary for this profile: setup exists to
+    // make the assets present, and they are. `get_firecracker_for_profile`
+    // has always degraded this way; the ensure path failing hard on the same
+    // blip took a CI job down with every asset already on disk (all 764 unit
+    // tests had passed; `git ls-remote` then could not reach GitHub).
+    let fetched = fetch_remote_firecracker_commit(repo, branch).await;
+    let firecracker_dir = paths::assets_dir().join("firecracker");
+    let resolved_commit = match resolve_or_reuse_cached(fetched, || {
+        offline_cached_firecracker_resolution_in(
+            &firecracker_dir,
+            profile_name,
+            repo,
+            branch,
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        )
+    })? {
+        RemoteResolutionOutcome::Resolved(commit) => commit,
+        RemoteResolutionOutcome::ReuseCached { path, error } => {
+            warn!(
+                profile = %profile_name,
+                %error,
+                path = %path.display(),
+                "could not query remote firecracker commit; keeping the cached binary"
+            );
+            return Ok(Some(path));
+        }
+    };
     let commit_hash =
         select_firecracker_commit(profile.firecracker_commit.as_deref(), &resolved_commit)?;
     let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
@@ -2767,6 +2824,84 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Whether a finished child failed only because a fixture executable was
+    /// still open for writing somewhere.
+    ///
+    /// The outer script execs fixtures of its own (the fake `curl`, `make`,
+    /// `cargo` on its PATH), and a shell reports that as exit 126 with "Text
+    /// file busy" on stderr. Retrying only the direct spawn error misses
+    /// every one of those, which is the shape that actually flakes.
+    fn child_hit_text_file_busy(output: &std::process::Output) -> bool {
+        output.status.code() == Some(126)
+            && String::from_utf8_lossy(&output.stderr).contains("Text file busy")
+    }
+
+    /// Run a freshly written script, retrying "Text file busy" briefly.
+    ///
+    /// A sibling test thread can fork while `write_executable`'s descriptor is
+    /// open; until that child execs (closing its CLOEXEC copy), execve of the
+    /// script fails with ETXTBSY. The window cannot be closed from here: the
+    /// libtest harness runs tests as threads in one process, so an unrelated
+    /// test's `Command::spawn` can fork at any instant, and neither writing
+    /// through a temp file nor renaming helps (an inherited descriptor names
+    /// the same inode). Retrying both shapes — the direct spawn error and a
+    /// child's 126 — covers what is observable; a still-busy fixture after
+    /// the deadline fails loudly with the child's own output rather than an
+    /// unwrap panic that names neither.
+    fn output_retrying_etxtbsy(command: &mut std::process::Command) -> std::process::Output {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let retryable = match command.output() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => None,
+                Err(error) => panic!("running the generated kernel build script: {error}"),
+                Ok(output) if child_hit_text_file_busy(&output) => Some(output),
+                Ok(output) => return output,
+            };
+            if std::time::Instant::now() >= deadline {
+                match retryable {
+                    Some(output) => panic!(
+                        "a fixture executable stayed busy for the whole retry budget\n\
+                         stdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    None => panic!(
+                        "the generated kernel build script stayed busy for the whole \
+                         retry budget"
+                    ),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_busy_fixture_is_recognised_from_the_childs_own_report() {
+        use std::os::unix::process::ExitStatusExt;
+        let busy = std::process::Output {
+            status: std::process::ExitStatus::from_raw(126 << 8),
+            stdout: Vec::new(),
+            stderr: b"/tmp/bin/curl: Text file busy\n".to_vec(),
+        };
+        assert!(child_hit_text_file_busy(&busy));
+
+        // A genuine 126 (not executable) must NOT be retried away.
+        let not_executable = std::process::Output {
+            status: std::process::ExitStatus::from_raw(126 << 8),
+            stdout: Vec::new(),
+            stderr: b"/tmp/bin/curl: Permission denied\n".to_vec(),
+        };
+        assert!(!child_hit_text_file_busy(&not_executable));
+
+        // Nor may an ordinary failure be mistaken for it.
+        let ordinary = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Text file busy\n".to_vec(),
+        };
+        assert!(!child_hit_text_file_busy(&ordinary));
+    }
+
     #[test]
     fn vm_kernel_build_replaces_interrupted_cached_source_archive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2852,16 +2987,16 @@ cp vmlinux arch/arm64/boot/Image
         write_executable(&script_path, &script);
 
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let status = std::process::Command::new(&script_path)
-            .env("BUILD_DIR", &build_dir)
-            .env("FCVM_TEST_CACHED_TARBALL", &cached_tarball)
-            .env("FCVM_TEST_KERNEL_TARBALL", &valid_tarball)
-            .env(
-                "PATH",
-                format!("{}:{}", fake_bin.display(), path.to_string_lossy()),
-            )
-            .output()
-            .unwrap();
+        let status = output_retrying_etxtbsy(
+            std::process::Command::new(&script_path)
+                .env("BUILD_DIR", &build_dir)
+                .env("FCVM_TEST_CACHED_TARBALL", &cached_tarball)
+                .env("FCVM_TEST_KERNEL_TARBALL", &valid_tarball)
+                .env(
+                    "PATH",
+                    format!("{}:{}", fake_bin.display(), path.to_string_lossy()),
+                ),
+        );
 
         assert!(
             status.status.success(),
@@ -3317,6 +3452,59 @@ cp vmlinux arch/arm64/boot/Image
             "offline launch must not select an arbitrary same-profile binary: {}",
             unidentified.display()
         );
+    }
+
+    #[test]
+    fn an_unreachable_remote_keeps_the_binary_this_machine_already_built() {
+        // The CI shape: every asset present, `git ls-remote` momentarily
+        // unable to reach GitHub. Setup exists to make the assets present,
+        // and they are, so it must not fail the job.
+        let cached = PathBuf::from("/assets/firecracker/firecracker-default-abc.bin");
+        let outcome = resolve_or_reuse_cached(
+            Err(anyhow::anyhow!(
+                "git ls-remote failed: could not resolve host"
+            )),
+            || Ok(Some(cached.clone())),
+        )
+        .expect("a cached binary must satisfy setup when the remote is unreachable");
+        match outcome {
+            RemoteResolutionOutcome::ReuseCached { path, error } => {
+                assert_eq!(path, cached);
+                assert!(
+                    format!("{error:#}").contains("ls-remote"),
+                    "the degrade must carry why the remote failed: {error:#}"
+                );
+            }
+            RemoteResolutionOutcome::Resolved(commit) => {
+                panic!("an unreachable remote must not yield a commit: {commit}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreachable_remote_with_nothing_cached_still_fails() {
+        // No binary to fall back to: degrading here would report success and
+        // leave the caller without firecracker.
+        let error = resolve_or_reuse_cached(
+            Err(anyhow::anyhow!(
+                "git ls-remote failed: could not resolve host"
+            )),
+            || Ok(None),
+        )
+        .expect_err("an unreachable remote with no cached binary must fail setup");
+        assert!(format!("{error:#}").contains("ls-remote"), "{error:#}");
+    }
+
+    #[test]
+    fn a_reachable_remote_always_wins_over_the_cache() {
+        let outcome = resolve_or_reuse_cached(Ok("deadbeef".to_string()), || {
+            panic!("the cache must not be consulted when the remote answered")
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RemoteResolutionOutcome::Resolved(commit) if commit == "deadbeef"
+        ));
     }
 
     #[test]
