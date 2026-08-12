@@ -249,23 +249,38 @@ The ordering below matters; each step's trap is noted inline.
 # 1. KVM access (new login session required after; a live ssh master keeps old groups)
 sudo usermod -aG kvm $USER
 
-# 2. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
-#    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable root.
-lsblk -d -o NAME,SIZE,MODEL          # identify instance-store drives BEFORE mkfs
-sudo mkfs.btrfs -f -d raid0 -m raid0 /dev/nvme0n1 /dev/nvme1n1   # your names WILL differ
-sudo mkdir -p /mnt/fcvm-btrfs && sudo mount /dev/nvme0n1 /mnt/fcvm-btrfs
+# 2. Packages (Ubuntu 24.04). btrfs-progs is needed by the very next step;
+#    bc/bison/flex/libelf-dev are the kernel fallback build's dependencies —
+#    setup builds a kernel locally whenever a profile's release artifact is
+#    absent, and a fresh box hits that path.
+sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
+    pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
+    btrfs-progs bc bison flex libelf-dev
+
+# 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
+#    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
+#    root. NEVER hardcode device names: the EBS/root disk is also an nvme
+#    device and its number is NOT stable across boxes (this box's root is
+#    nvme2n1). The guard below refuses to run mkfs rather than printing a
+#    warning and formatting anyway, because the failure mode is a destroyed
+#    operating system disk.
+ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)")
+mapfile -t STORE_DEVS < <(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print "/dev/"$1}')
+printf 'root=/dev/%s  store=%s\n' "$ROOT_DISK" "${STORE_DEVS[*]:-<none>}"
+[ "${#STORE_DEVS[@]}" -gt 0 ] || { echo "no instance-store devices; do NOT format anything"; return 2>/dev/null || exit 1; }
+for dev in "${STORE_DEVS[@]}"; do
+  [ "$dev" != "/dev/$ROOT_DISK" ] || { echo "REFUSING: $dev backs /"; return 2>/dev/null || exit 1; }
+done
+sudo mkfs.btrfs -f -d raid0 -m raid0 "${STORE_DEVS[@]}"
+sudo mkdir -p /mnt/fcvm-btrfs && sudo mount "${STORE_DEVS[0]}" /mnt/fcvm-btrfs
 sudo chown $USER:$USER /mnt/fcvm-btrfs
 
-# 3. Rootless UFFD (snapshot restores). The device is 0600 root by default,
+# 4. Rootless UFFD (snapshot restores). The device is 0600 root by default,
 #    so every rootless clone restore fails with "Error accessing
 #    /dev/userfaultfd: Permission denied" until this runs (CI does the same):
 [ -e /dev/userfaultfd ] || sudo mknod /dev/userfaultfd c 10 126
 sudo chmod 666 /dev/userfaultfd
 sudo sysctl -w vm.unprivileged_userfaultfd=1
-
-# 4. Packages (Ubuntu 24.04)
-sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
-    pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt
 
 # 5. Rust. If ~/.cargo is a dangling symlink left from a wiped NVMe (make
 #    check-disk moves it there), recreate the target first: mkdir -p /mnt/fcvm-btrfs/cargo
