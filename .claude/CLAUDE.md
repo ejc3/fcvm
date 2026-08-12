@@ -240,6 +240,76 @@ means the reviewer never started.
 Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces a
 `branches:`/`branches-ignore:` filter on `pull_request`, or if a gating job leaves that file.
 
+## Fresh Bare-Metal Box Quickstart
+
+Bring up a new ARM (or x86) KVM-capable box to building-and-benching in ~20 minutes.
+The ordering below matters; each step's trap is noted inline.
+
+```bash
+# 1. KVM access (new login session required after; a live ssh master keeps old groups)
+sudo usermod -aG kvm $USER
+
+# 2. Packages (Ubuntu 24.04). btrfs-progs is needed by the very next step;
+#    bc/bison/flex/libelf-dev are the kernel fallback build's dependencies —
+#    setup builds a kernel locally whenever a profile's release artifact is
+#    absent, and a fresh box hits that path.
+sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
+    pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
+    btrfs-progs bc bison flex libelf-dev
+
+# 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
+#    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
+#    root. NEVER hardcode device names: the EBS/root disk is also an nvme
+#    device and its number is NOT stable across boxes (this box's root is
+#    nvme2n1). The guard below refuses to run mkfs rather than printing a
+#    warning and formatting anyway, because the failure mode is a destroyed
+#    operating system disk.
+ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)")
+mapfile -t STORE_DEVS < <(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print "/dev/"$1}')
+printf 'root=/dev/%s  store=%s\n' "$ROOT_DISK" "${STORE_DEVS[*]:-<none>}"
+[ "${#STORE_DEVS[@]}" -gt 0 ] || { echo "no instance-store devices; do NOT format anything"; return 2>/dev/null || exit 1; }
+for dev in "${STORE_DEVS[@]}"; do
+  [ "$dev" != "/dev/$ROOT_DISK" ] || { echo "REFUSING: $dev backs /"; return 2>/dev/null || exit 1; }
+done
+sudo mkfs.btrfs -f -d raid0 -m raid0 "${STORE_DEVS[@]}"
+sudo mkdir -p /mnt/fcvm-btrfs && sudo mount "${STORE_DEVS[0]}" /mnt/fcvm-btrfs
+sudo chown $USER:$USER /mnt/fcvm-btrfs
+
+# 4. Rootless UFFD (snapshot restores). The device is 0600 root by default,
+#    so every rootless clone restore fails with "Error accessing
+#    /dev/userfaultfd: Permission denied" until this runs (CI does the same):
+[ -e /dev/userfaultfd ] || sudo mknod /dev/userfaultfd c 10 126
+sudo chmod 666 /dev/userfaultfd
+sudo sysctl -w vm.unprivileged_userfaultfd=1
+
+# 5. Rust. If ~/.cargo is a dangling symlink left from a wiped NVMe (make
+#    check-disk moves it there), recreate the target first: mkdir -p /mnt/fcvm-btrfs/cargo
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# 6. Sources on the DURABLE disk, sibling layout is required (fuse-pipe uses
+#    a ../fuse-backend-rs path dependency)
+mkdir -p ~/src && cd ~/src
+git clone https://github.com/ejc3/fcvm.git
+git clone https://github.com/ejc3/fuse-backend-rs.git
+git clone https://github.com/ejc3/fuser.git
+
+# 7. Build + full setup (downloads released kernels, builds pasta + the
+#    firecracker fork, creates the rootfs; ~10 min on 64 cores when the kernel
+#    releases exist, plus a local kernel build when one does not)
+cd ~/src/fcvm && make build && make setup-fcvm
+```
+
+Run everything as the unprivileged user; `make` shells out to sudo exactly where
+root is needed. `sudo fcvm setup` also works — builds drop back to the invoking
+user and store entries are handed back to them (see src/setup/mod.rs) — but the
+rootless path is the default one CI exercises.
+
+Sanity check the result before benching:
+
+```bash
+make test-root FILTER=sanity
+```
+
 ## Sending Email
 
 Use `aws ses send-email --region us-east-1` (recipient must be verified in SES sandbox).
@@ -261,6 +331,27 @@ git log --oneline --graph --all --decorate | head -120
 Shows which branch you're on and what it's based on.
 
 **Don't confuse local vs remote:** After rebasing locally, `origin/<branch>` shows the old history until you force-push. They're the same branch at different points in time.
+
+## fc-agent is a MUSL BINARY: check it against musl, not the host target
+
+`cargo check -p fc-agent` builds for the host's glibc target and proves
+nothing about the binary that actually ships in the guest, which `make build`
+cross-compiles for `*-unknown-linux-musl`. The two libcs disagree on real
+signatures: `ioctl`'s request argument is `i32` on musl and `c_ulong` on
+glibc, so an ioctl call that compiles cleanly on the host fails the guest
+build with a type error. A host-only check let exactly that reach CI, where
+it broke every job that builds the guest agent.
+
+Before believing fc-agent compiles:
+
+```bash
+cargo check -p fc-agent --target x86_64-unknown-linux-musl
+cargo check -p fc-agent --target aarch64-unknown-linux-musl
+```
+
+Or just run `make build`, which does the real thing. When calling libc from
+fc-agent, prefer `as _` over a named integer type on any argument whose width
+or signedness the libc chooses.
 
 ## ALWAYS USE THE MAKEFILE
 

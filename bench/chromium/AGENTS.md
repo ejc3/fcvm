@@ -11,6 +11,29 @@ memory density, egress-mode ordering, throughput, and part of the file-vs-UFFD g
 all failed review. The measurements were real; the *methodology* made them mean
 nothing. Every rule below exists because one of them broke.
 
+## Running the gated request benchmark end to end
+
+The phases are separate subcommands and the order is not optional. `golden`
+does NOT build the image — on a box that has never built it, `golden` dies
+with `localhost/chromium-bench-req: image not known`, so `build` comes first:
+
+```bash
+cd ~/src/fcvm            # phases resolve the repo root from the script path
+bash bench/chromium/reqbench.sh build    # podman build --format docker (HEALTHCHECK is load-bearing)
+bash bench/chromium/reqbench.sh golden   # podman prepare: cold build, snapshot at the health gate
+bash bench/chromium/reqbench.sh verify   # prove all three hops on a RESTORED clone before measuring
+BACKEND=uffd REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-uffd-200 bash bench/chromium/reqbench.sh run
+BACKEND=file REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-file-200 bash bench/chromium/reqbench.sh run
+```
+
+The acceptance gate is >=200 measured requests PER BACKEND (`uffd` and `file`)
+at zero failures. For anything long-running on a remote box, write the chain
+into a script file, run it detached with output to a log, and append an
+explicit `RC=$?` marker line the poller can key on — a dropped ssh/SSM session
+must not kill the run, and "the log stopped growing" is not a completion
+signal. Fresh-box prerequisites (packages, NVMe store, sibling checkouts) are
+in the repo-root AGENTS.md quickstart.
+
 ## Six methodology defects — do not reintroduce
 
 1. **Matched accounting basis.** Sum memory over the SAME process set for every
