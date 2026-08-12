@@ -336,6 +336,8 @@ jobs:
             sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
           fi
           sudo chown $USER:$USER /mnt/fcvm-btrfs
+          # Heal root-owned store entries (see the script header for why)
+          ./fcvm/scripts/normalize-store-ownership.sh /mnt/fcvm-btrfs
 
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
@@ -559,6 +561,8 @@ jobs:
             sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
           fi
           sudo chown $USER:$USER /mnt/fcvm-btrfs
+          # Heal root-owned store entries (see the script header for why)
+          ./fcvm/scripts/normalize-store-ownership.sh /mnt/fcvm-btrfs
 
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
