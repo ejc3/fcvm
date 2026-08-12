@@ -422,24 +422,43 @@ wait_for_build() {
 
     # Show progress
     echo "[$i/$timeout] Build status: $status (instance: $instance_id)"
-    if [ "$status" = "building" ]; then
-      # Try SSM first
+    if [ "$status" = "building" ] && [ "${SSM_LOG_FETCH_DENIED:-0}" != 1 ]; then
+      # Try SSM first. The `|| true` matters even though this function's only
+      # call site is an `if !` condition (which already suppresses `set -e`):
+      # a future direct call must not turn a failed advisory fetch into a
+      # build abort.
       echo "  Fetching logs via SSM..."
       cmd_id=$(aws ssm send-command \
         --region "$REGION" \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
         --parameters 'commands=["tail -15 /var/log/ami-build.log"]' \
-        --query 'Command.CommandId' --output text 2>&1)
+        --query 'Command.CommandId' --output text 2>&1) || true
       echo "  SSM command: $cmd_id"
+      # The progress fetch is advisory. When the workflow role lacks
+      # ssm:SendCommand, every poll prints the same AccessDeniedException;
+      # note it once and stop asking instead of spamming 100+ error lines.
+      if [[ "$cmd_id" == *AccessDeniedException* ]]; then
+        echo "  SSM log fetch not authorized for this role; skipping further fetches"
+        SSM_LOG_FETCH_DENIED=1
+        cmd_id=""
+      fi
       if [ -n "$cmd_id" ] && [[ ! "$cmd_id" =~ "error" ]]; then
         sleep 5
         echo "  Getting SSM output..."
-        aws ssm get-command-invocation \
+        ssm_output=$(aws ssm get-command-invocation \
           --region "$REGION" \
           --command-id "$cmd_id" \
           --instance-id "$instance_id" \
-          --output text 2>&1 | head -20
+          --output text 2>&1) || true
+        # A role allowed SendCommand but denied GetCommandInvocation would
+        # otherwise spam the same denial on every poll.
+        if [[ "$ssm_output" == *AccessDeniedException* ]]; then
+          echo "  SSM invocation fetch not authorized for this role; skipping further fetches"
+          SSM_LOG_FETCH_DENIED=1
+        else
+          printf '%s\n' "$ssm_output" | head -20
+        fi
       fi
     fi
 
@@ -551,10 +570,11 @@ main() {
     exit 1
   fi
 
-  # Stop instance for AMI creation
-  echo "Stopping instance..."
-  aws ec2 stop-instances --region "$REGION" --instance-ids "$instance_id"
-  aws ec2 wait instance-stopped --region "$REGION" --instance-ids "$instance_id"
+  # No stop before create-image: the builder is launched as a one-time spot
+  # instance when spot capacity exists, and AWS rejects StopInstances on
+  # one-time spot requests (UnsupportedOperation). create-image's default
+  # reboot is permitted on spot and gives the same filesystem consistency a
+  # stopped instance would.
 
   # Get kernel version from instance tags
   kernel_version=$(aws ec2 describe-tags \
