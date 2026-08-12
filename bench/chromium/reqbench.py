@@ -2607,9 +2607,11 @@ class FailureProbe:
              "printf 'GET /latest HTTP/1.0\\r\\nX-metadata-token: %s\\r\\n"
              "Accept: application/json\\r\\nConnection: close\\r\\n\\r\\n' \"$tok\" "
              "| nc -w 2 169.254.169.254 80 | tr -d '\\r' | tail -5"),
-            # The same arping `handle_clone_restore` sends. iputils-arping is in
-            # the VM rootfs. A gateway that does not answer this, 100 s after the
-            # request gave up, is a persistent L2 break rather than a race.
+            # The reply-verified form of the probe `handle_clone_restore`
+            # broadcasts natively (fc-agent sends the ARP request and does not
+            # wait; this probe does). iputils-arping is in the VM rootfs. A
+            # gateway that does not answer this, 100 s after the request gave
+            # up, is a persistent L2 break rather than a race.
             ("arping_gateway",
              "gw=$(ip route show default | awk '/via/{print $3; exit}'); "
              "echo \"gateway=$gw\"; arping -c 1 -w 2 -I eth0 \"$gw\""),

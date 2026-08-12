@@ -16,8 +16,13 @@ use super::types::{CacheRequest, CacheVerdict, LogLine, SharedCacheVerdict};
 /// releases the connection instead of holding it for the process's lifetime.
 const CACHE_ACK_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-const RESTORE_COMPLETION_PREFIX: &str = "restore-complete:";
-const RESTORE_COMPLETION_MAX_FRAME_BYTES: usize = 128;
+// The frame shape and budget live in exec-proto, shared with the fc-agent
+// producer, so the two binaries cannot drift: the producer drops telemetry
+// that would overflow the budget this consumer enforces.
+use exec_proto::{
+    RESTORE_COMPLETE_MAX_FRAME_BYTES as RESTORE_COMPLETION_MAX_FRAME_BYTES,
+    RESTORE_COMPLETE_PREFIX as RESTORE_COMPLETION_PREFIX,
+};
 const RESTORE_COMPLETION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Listen for fc-agent status messages on the status vsock port.
@@ -449,6 +454,10 @@ async fn serve_bootplan(listener: tokio::net::UnixListener, payload: Vec<u8>) {
     }
 }
 
+/// Resolves once with the validated ACK's outcome: the guest's optional
+/// phase-timing telemetry on success, the protocol failure otherwise.
+pub(crate) type RestoreCompletionReceiver = tokio::sync::oneshot::Receiver<Result<Option<String>>>;
+
 /// Bind the one-shot restored-guest completion listener before the VMM resumes.
 ///
 /// The output, TTY, and exec sockets are workload transports, not proof that the
@@ -459,10 +468,7 @@ async fn serve_bootplan(listener: tokio::net::UnixListener, payload: Vec<u8>) {
 pub(crate) fn spawn_restore_completion_listener(
     socket_path: &str,
     expected_epoch: &str,
-) -> Result<(
-    tokio::task::JoinHandle<()>,
-    tokio::sync::oneshot::Receiver<Result<()>>,
-)> {
+) -> Result<(tokio::task::JoinHandle<()>, RestoreCompletionReceiver)> {
     use tokio::net::UnixListener;
 
     let _ = std::fs::remove_file(socket_path);
@@ -494,7 +500,7 @@ pub(crate) fn spawn_restore_completion_listener(
 async fn receive_restore_completion(
     listener: tokio::net::UnixListener,
     expected_epoch: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     let (stream, _) = listener.accept().await.with_context(|| {
@@ -528,7 +534,13 @@ async fn receive_restore_completion(
     validate_restore_completion_frame(&frame, expected_epoch)
 }
 
-fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Result<()> {
+/// Validate one ACK frame against the expected restore generation.
+///
+/// Frame shape: `restore-complete:<epoch>[ <telemetry>]\n`. Only the epoch is
+/// identity; everything after the first space is the guest's phase-timing
+/// telemetry, returned for logging and never interpreted. An agent that sends
+/// no telemetry (the frame ends at the epoch) is fully valid.
+fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Result<Option<String>> {
     if frame.len() > RESTORE_COMPLETION_MAX_FRAME_BYTES {
         anyhow::bail!(
             "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<oversized> bytes={})",
@@ -541,7 +553,7 @@ fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Resu
             "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<invalid-utf8>): {error}"
         )
     })?;
-    let observed_epoch = message
+    let payload = message
         .strip_prefix(RESTORE_COMPLETION_PREFIX)
         .and_then(|value| value.strip_suffix('\n'))
         .filter(|value| !value.is_empty() && !value.contains('\n'))
@@ -550,11 +562,22 @@ fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Resu
                 "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<malformed> frame={message:?})"
             )
         })?;
+    let (observed_epoch, telemetry) = match payload.split_once(' ') {
+        Some((epoch, telemetry)) => (
+            epoch,
+            (!telemetry.is_empty()).then(|| telemetry.to_string()),
+        ),
+        None => (payload, None),
+    };
+    anyhow::ensure!(
+        !observed_epoch.is_empty(),
+        "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<malformed> frame={message:?})"
+    );
     anyhow::ensure!(
         observed_epoch == expected_epoch,
         "restore-completion protocol rejected generation (phase=validate-epoch expected_epoch={expected_epoch} observed_epoch={observed_epoch})"
     );
-    Ok(())
+    Ok(telemetry)
 }
 
 /// Bidirectional I/O listener for container stdin/stdout/stderr.
@@ -776,6 +799,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restore_completion_accepts_a_bare_epoch_without_telemetry() {
+        let telemetry = validate_restore_completion_frame(b"restore-complete:epoch-1\n", "epoch-1")
+            .expect("a bare-epoch frame is fully valid");
+        assert_eq!(telemetry, None);
+    }
+
+    #[test]
+    fn restore_completion_returns_phase_telemetry_after_the_epoch() {
+        let telemetry = validate_restore_completion_frame(
+            b"restore-complete:epoch-1 {\"tcp_cleanup_ms\":12.5,\"total_ms\":40.2}\n",
+            "epoch-1",
+        )
+        .expect("telemetry after the epoch must not fail validation");
+        assert_eq!(
+            telemetry.as_deref(),
+            Some("{\"tcp_cleanup_ms\":12.5,\"total_ms\":40.2}")
+        );
+    }
+
+    #[test]
+    fn every_producer_frame_passes_the_consumer_including_the_overflow_clamp() {
+        // The producer and this parser share exec-proto's budget; a frame the
+        // guest can build must never fail the host on size. The oversized
+        // case exercises the producer's drop-to-{} clamp end to end.
+        for telemetry in ["", "{\"total_ms\":40.2}", &"x".repeat(4096)] {
+            let frame = exec_proto::restore_complete_frame("epoch-1", telemetry);
+            validate_restore_completion_frame(frame.as_bytes(), "epoch-1")
+                .expect("a producer-built frame must always validate");
+        }
+    }
+
+    #[test]
+    fn restore_completion_validates_only_the_epoch_ahead_of_telemetry() {
+        // Telemetry is never identity: a wrong epoch fails no matter what
+        // rides behind it, and telemetry content is returned verbatim, not
+        // parsed.
+        let error = validate_restore_completion_frame(
+            b"restore-complete:stale-generation {\"total_ms\":1.0}\n",
+            "expected-generation",
+        )
+        .expect_err("telemetry must not rescue a stale generation");
+        assert!(
+            format!("{error:#}").contains("observed_epoch=stale-generation"),
+            "unexpected diagnostic: {error:#}"
+        );
+
+        // A frame that is all telemetry and no epoch is malformed.
+        let error = validate_restore_completion_frame(b"restore-complete: {}\n", "epoch-1")
+            .expect_err("an empty epoch must fail closed");
+        assert!(
+            format!("{error:#}").contains("<malformed>"),
+            "unexpected diagnostic: {error:#}"
+        );
+    }
+
     /// Verify that writeln! to a broken pipe doesn't panic (returns Err),
     /// while println! would panic with "failed printing to stdout".
     #[test]
@@ -783,13 +862,21 @@ mod tests {
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
-        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        // O_CLOEXEC, and a bounded retry below: a sibling test thread can
+        // fork between pipe() and drop(), and until that child execs it holds
+        // a copy of the read end, so the very first write may not see EPIPE.
+        let (read_fd, write_fd) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
         drop(read_fd);
 
         let mut writer = unsafe {
             std::fs::File::from_raw_fd(std::os::unix::io::IntoRawFd::into_raw_fd(write_fd))
         };
-        let result = writeln!(writer, "test output");
+        let mut result = writeln!(writer, "test output");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while result.is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            result = writeln!(writer, "test output");
+        }
 
         assert!(result.is_err(), "writeln! should return Err on broken pipe");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);

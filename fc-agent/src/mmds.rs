@@ -317,7 +317,7 @@ pub async fn watch_restore_epoch(
                         &signals,
                         egress_gen_at_last_stable,
                         metadata.clone_ipv6.as_deref(),
-                        metadata_transport,
+                        &metadata.host_time,
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -339,7 +339,7 @@ pub async fn watch_restore_epoch(
                         &signals,
                         egress_gen_at_last_stable,
                         metadata.clone_ipv6.as_deref(),
-                        metadata_transport,
+                        &metadata.host_time,
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -380,7 +380,7 @@ async fn apply_restore_epoch(
     signals: &crate::restore::RestoreSignals,
     egress_gen_at_last_stable: Option<u64>,
     clone_ipv6: Option<&str>,
-    metadata_transport: crate::bootplan::Transport,
+    host_time: &str,
 ) {
     if let Err(error) = signals.restore_status.begin() {
         eprintln!(
@@ -394,24 +394,29 @@ async fn apply_restore_epoch(
     signals
         .restore_flag
         .store(true, std::sync::atomic::Ordering::Release);
-    if let Err(error) = crate::restore::handle_clone_restore(
+    let phases = match crate::restore::handle_clone_restore(
         signals,
         clone_ipv6,
         egress_gen_at_last_stable,
         current,
-        metadata_transport,
+        host_time,
     )
     .await
     {
-        signals.restore_status.fail();
-        eprintln!(
-            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}. \
-             Output/exec readiness will not be published; shutting down clone",
-            current, error
-        );
-        crate::system::shutdown_vm(1).await;
-    }
-    if let Err(error) = crate::vsock::notify_restore_complete(current).await {
+        Ok(phases) => phases,
+        Err(error) => {
+            signals.restore_status.fail();
+            eprintln!(
+                "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}. \
+                 Output/exec readiness will not be published; shutting down clone",
+                current, error
+            );
+            crate::system::shutdown_vm(1).await
+        }
+    };
+    if let Err(error) =
+        crate::vsock::notify_restore_complete(current, &phases.to_frame_json()).await
+    {
         signals.restore_status.fail();
         eprintln!(
             "[fc-agent] FATAL: restore-completion ACK failed closed \
@@ -545,7 +550,8 @@ pub async fn sync_clock_from_host() -> Result<()> {
     let metadata: LatestMetadata =
         serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
-    crate::bootplan::set_system_clock(&metadata.host_time).await
+    crate::bootplan::set_system_clock(&metadata.host_time);
+    Ok(())
 }
 
 #[cfg(test)]

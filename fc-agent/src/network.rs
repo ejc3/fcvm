@@ -1,64 +1,198 @@
-use tokio::process::Command;
+use std::net::Ipv4Addr;
+use std::os::fd::OwnedFd;
 
-/// Send ARP to the gateway and verify layer 2 reachability.
-///
-/// After snapshot restore, the bridge/network has stale MAC→port mappings from
-/// the baseline VM. Sending an ARP request to the gateway accomplishes:
-/// 1. The ARP REQUEST broadcast teaches the network (bridge/pasta) our MAC
-/// 2. Waiting for the ARP REPLY ensures the L2 path is operational
-///
-/// Uses `arping` instead of `ping` because ping requires ICMP raw sockets which
-/// fail in rootless mode (pasta doesn't respond to ICMP), causing a 3s timeout.
-/// `arping` operates at layer 2 — pasta responds to ARP even in rootless mode.
-pub async fn refresh_gateway_arp() {
-    let route_output = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .await;
+use crate::snapshot_network::SYSFS_NET_PATH;
 
-    let gateway = match route_output {
-        Ok(o) if o.status.success() => {
-            let output = String::from_utf8_lossy(&o.stdout);
-            output
-                .split_whitespace()
-                .skip_while(|&s| s != "via")
-                .nth(1)
-                .map(|s| s.to_string())
+/// Open a raw kernel socket as an owned descriptor, SOCK_CLOEXEC always set.
+/// The one unsafe socket(2) call shared by this crate's raw-socket users
+/// (AF_PACKET barrier, AF_PACKET ARP probe, NETLINK_SOCK_DIAG).
+pub(crate) fn open_raw_socket(
+    domain: libc::c_int,
+    socket_type: libc::c_int,
+    protocol: libc::c_int,
+) -> std::io::Result<OwnedFd> {
+    // SAFETY: socket(2) takes plain integer arguments.
+    let raw = unsafe { libc::socket(domain, socket_type | libc::SOCK_CLOEXEC, protocol) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a newly-created descriptor owned solely by us.
+    Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) })
+}
+
+/// One row of the kernel's IPv4 route table that names a default gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefaultRoute {
+    interface: String,
+    gateway: Ipv4Addr,
+}
+
+/// Find the IPv4 default gateway (and its interface) from `/proc/net/route`.
+///
+/// Columns are `Iface Destination Gateway Flags ...`; addresses are
+/// little-endian hex, and the default route has destination `00000000` with a
+/// non-zero gateway. Reading the table directly keeps the restore hot path
+/// free of an `ip route show` process spawn.
+fn parse_default_route(route_table: &str) -> Option<DefaultRoute> {
+    for line in route_table.lines().skip(1) {
+        // A malformed or blank line skips that line, never the whole table.
+        let mut fields = line.split_whitespace();
+        let (Some(interface), Some(destination), Some(gateway)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if destination != "00000000" {
+            continue;
         }
-        _ => None,
-    };
+        let Some(raw) = u32::from_str_radix(gateway, 16)
+            .ok()
+            .filter(|raw| *raw != 0)
+        else {
+            continue;
+        };
+        return Some(DefaultRoute {
+            interface: interface.to_string(),
+            gateway: Ipv4Addr::from(raw.to_le_bytes()),
+        });
+    }
+    None
+}
 
-    let Some(gateway) = gateway else {
+/// Build one broadcast ARP who-has frame for `target`, sourced from us.
+///
+/// Byte-identical to the request `arping -c 1` sends: Ethernet header to
+/// ff:ff:ff:ff:ff:ff, ethertype 0x0806, then a 28-byte IPv4 ARP request.
+fn build_arp_request(source_mac: [u8; 6], source_ip: Ipv4Addr, target: Ipv4Addr) -> [u8; 42] {
+    let mut frame = [0u8; 42];
+    frame[0..6].copy_from_slice(&[0xff; 6]); // destination: broadcast
+    frame[6..12].copy_from_slice(&source_mac);
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes()); // ethertype: ARP
+    frame[14..16].copy_from_slice(&1u16.to_be_bytes()); // htype: ethernet
+    frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes()); // ptype: IPv4
+    frame[18] = 6; // hlen
+    frame[19] = 4; // plen
+    frame[20..22].copy_from_slice(&1u16.to_be_bytes()); // op: request
+    frame[22..28].copy_from_slice(&source_mac);
+    frame[28..32].copy_from_slice(&source_ip.octets());
+    // target hardware address stays zero for a who-has
+    frame[38..42].copy_from_slice(&target.octets());
+    frame
+}
+
+/// Read an interface's MAC from sysfs (`aa:bb:cc:dd:ee:ff\n`).
+fn interface_mac(interface: &str) -> Option<[u8; 6]> {
+    let text = std::fs::read_to_string(format!("{SYSFS_NET_PATH}/{interface}/address")).ok()?;
+    parse_mac(&text)
+}
+
+/// Parse a colon-separated MAC, requiring exactly six octets.
+fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let mut parts = text.trim().split(':');
+    let mut mac = [0u8; 6];
+    for slot in &mut mac {
+        *slot = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
+/// Find our IPv4 address on `interface` via getifaddrs (no process spawn).
+fn interface_ipv4(interface: &str) -> Option<Ipv4Addr> {
+    for entry in nix::ifaddrs::getifaddrs().ok()? {
+        if entry.interface_name != interface {
+            continue;
+        }
+        if let Some(address) = entry.address.and_then(|a| a.as_sockaddr_in().copied()) {
+            return Some(address.ip());
+        }
+    }
+    None
+}
+
+/// Send the broadcast frame on `interface` through an AF_PACKET socket.
+fn send_ethernet_broadcast(interface: &str, frame: &[u8]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    const ETH_P_ARP: u16 = 0x0806;
+    let index = nix::net::if_::if_nametoindex(interface)
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    let fd = open_raw_socket(libc::AF_PACKET, libc::SOCK_RAW, ETH_P_ARP.to_be() as i32)?;
+    // SAFETY: sockaddr_ll is fully zero-initialized before the fields we set.
+    let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    address.sll_family = libc::AF_PACKET as u16;
+    address.sll_protocol = ETH_P_ARP.to_be();
+    address.sll_ifindex = index as i32;
+    address.sll_halen = 6;
+    address.sll_addr[..6].copy_from_slice(&[0xff; 6]);
+    // SAFETY: the frame buffer and address are valid for the duration of the call.
+    let sent = unsafe {
+        libc::sendto(
+            fd.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            0,
+            (&address as *const libc::sockaddr_ll).cast(),
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if sent as usize != frame.len() {
+        return Err(std::io::Error::other(format!(
+            "short ARP send: {sent} of {} bytes",
+            frame.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Broadcast one ARP request for the gateway, natively and without waiting.
+///
+/// After snapshot restore, the bridge/pasta on the host side has no MAC→port
+/// mapping for this clone. The broadcast's source teaches it, and the
+/// gateway's ARP stack learns our sender mapping from the request itself.
+/// That teaching is carried entirely by the outbound frame, so nothing here
+/// waits for the reply; the kernel resolves its own neighbor entry on the
+/// first real packet regardless, and a reply wait on the restore critical
+/// path can stall up to a full second when the gateway stays silent. ARP
+/// rather than ICMP ping because pasta doesn't answer ICMP in rootless mode.
+pub fn refresh_gateway_arp() {
+    let route_table = match std::fs::read_to_string("/proc/net/route") {
+        Ok(table) => table,
+        Err(error) => {
+            eprintln!("[fc-agent] WARNING: cannot read route table for ARP: {error}");
+            return;
+        }
+    };
+    let Some(route) = parse_default_route(&route_table) else {
         eprintln!("[fc-agent] WARNING: could not determine gateway for ARP");
         return;
     };
-
-    // arping -c 1 -w 1 -I eth0 <gateway>
-    // Sends an ARP request and waits for a reply. This verifies L2 connectivity
-    // and teaches the bridge/pasta our MAC→port mapping via the request's source.
-    match Command::new("arping")
-        .args(["-c", "1", "-w", "1", "-I", "eth0", &gateway])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            eprintln!("[fc-agent] gateway {} ARP resolved", gateway);
-        }
-        Ok(output) => {
-            eprintln!(
-                "[fc-agent] WARNING: gateway {} arping failed (exit {})",
-                gateway,
-                output.status.code().unwrap_or(-1)
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "[fc-agent] WARNING: arping not available ({}), skipping ARP",
-                e
-            );
-        }
+    let Some(mac) = interface_mac(&route.interface) else {
+        eprintln!(
+            "[fc-agent] WARNING: no MAC for {}, skipping ARP",
+            route.interface
+        );
+        return;
+    };
+    let Some(source_ip) = interface_ipv4(&route.interface) else {
+        eprintln!(
+            "[fc-agent] WARNING: no IPv4 on {}, skipping ARP",
+            route.interface
+        );
+        return;
+    };
+    let frame = build_arp_request(mac, source_ip, route.gateway);
+    match send_ethernet_broadcast(&route.interface, &frame) {
+        Ok(()) => eprintln!(
+            "[fc-agent] gateway {} ARP probe sent from {} ({})",
+            route.gateway, source_ip, route.interface
+        ),
+        Err(error) => eprintln!(
+            "[fc-agent] WARNING: gateway {} ARP probe failed: {error}",
+            route.gateway
+        ),
     }
 }
 
@@ -695,6 +829,89 @@ fn enable_route_localnet() -> bool {
             eprintln!("[fc-agent] WARNING: could not run sysctl for {key}: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_arp_tests {
+    use super::*;
+
+    #[test]
+    fn default_route_parses_from_proc_net_route() {
+        // Verbatim shape of /proc/net/route on a bridged Firecracker guest:
+        // little-endian hex addresses, default row = zero destination.
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     eth0\t00005EAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\n\
+                     eth0\t00000000\t25055EAC\t0003\t0\t0\t0\t00000000\n";
+        assert_eq!(
+            parse_default_route(table),
+            Some(DefaultRoute {
+                interface: "eth0".to_string(),
+                gateway: Ipv4Addr::new(172, 94, 5, 37),
+            })
+        );
+    }
+
+    #[test]
+    fn a_table_without_a_gateway_yields_none() {
+        // A connected-only table (destination rows, zero gateways) must not
+        // produce a probe target; the caller logs and skips.
+        let table = "Iface\tDestination\tGateway \tFlags\n\
+                     eth0\t000210AC\t00000000\t0001\n";
+        assert_eq!(parse_default_route(table), None);
+    }
+
+    #[test]
+    fn mac_parse_requires_exactly_six_octets() {
+        assert_eq!(
+            parse_mac("02:00:00:00:00:01\n"),
+            Some([0x02, 0, 0, 0, 0, 0x01])
+        );
+        assert_eq!(parse_mac("02:00:00:00:00"), None, "five octets");
+        assert_eq!(parse_mac("02:00:00:00:00:01:07"), None, "seven octets");
+        assert_eq!(parse_mac("02:00:00:00:00:zz"), None, "non-hex octet");
+    }
+
+    #[test]
+    fn arp_request_frame_matches_the_wire_format_arping_sends() {
+        let frame = build_arp_request(
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            Ipv4Addr::new(10, 0, 2, 100),
+            Ipv4Addr::new(10, 0, 2, 2),
+        );
+        // All 42 bytes, pinned literally: the point of the native probe is
+        // byte parity with the frame arping sent, and a partially asserted
+        // frame lets a zeroed htype/ptype (which every gateway drops) pass.
+        let expected: [u8; 42] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // ethernet destination: broadcast
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // ethernet source
+            0x08, 0x06, // ethertype: ARP
+            0x00, 0x01, // htype: ethernet
+            0x08, 0x00, // ptype: IPv4
+            0x06, // hlen
+            0x04, // plen
+            0x00, 0x01, // op: request
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // sender MAC
+            10, 0, 2, 100, // sender IP
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // target MAC: zero for who-has
+            10, 0, 2, 2, // target IP
+        ];
+        assert_eq!(frame, expected);
+    }
+
+    #[test]
+    fn a_malformed_route_line_skips_the_line_not_the_table() {
+        let table = "Iface\tDestination\tGateway \tFlags\n\
+                     \n\
+                     eth0\t00005EAC\n\
+                     eth0\t00000000\t25055EAC\t0003\n";
+        assert_eq!(
+            parse_default_route(table),
+            Some(DefaultRoute {
+                interface: "eth0".to_string(),
+                gateway: Ipv4Addr::new(172, 94, 5, 37),
+            })
+        );
     }
 }
 

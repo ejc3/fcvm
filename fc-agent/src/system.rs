@@ -198,9 +198,20 @@ fn vmm_wants_acpi_shutdown() -> bool {
         .unwrap_or(false)
 }
 
+/// How long shutdown waits for a restore's background jobs to finish.
+/// Long enough for an ordinary systemd job, short enough that a wedged
+/// service manager cannot hold the VM open for the caller's whole deadline.
+const RESTORE_JOB_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Shutdown the VM. This function never returns.
 pub async fn shutdown_vm(exit_code: i32) -> ! {
     eprintln!("[fc-agent] shutting down VM (exit_code={})", exit_code);
+
+    // Settle the background jobs a restore started (journald restart, chrony
+    // makestep) before asking systemd to power the machine off. A container
+    // that exits within a few hundred milliseconds of readiness
+    // (`podman run ... true`) reaches here while they can still be in flight.
+    crate::restore::settle_restore_side_jobs(RESTORE_JOB_SETTLE_TIMEOUT).await;
 
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
         let fuse_mounts: Vec<&str> = mounts.lines().filter(|l| l.contains("fuse")).collect();
