@@ -2417,10 +2417,13 @@ async fn cmd_snapshot_run_inner(
 
     // Verify the restored guest is reachable before starting the health monitor.
     // After snapshot restore, pasta may not have learned the guest's MAC yet.
-    // Readiness requires an echo reply from the guest AND a resolved ARP entry,
-    // then probes each forwarded TCP port. The echo reply is what observes the
-    // guest: pasta answers a host-side connect on its own, and the neighbour
-    // entry outlives the guest going quiet, so neither can fail on a silent guest.
+    // Readiness requires a TCP answer from the guest on a published port (SYN-ACK
+    // or RST — either proves the guest's kernel spoke) AND a resolved ARP entry,
+    // then probes each forwarded port via pasta. The guest-side TCP answer is what
+    // observes the guest: pasta answers a host-side connect on its own, the
+    // neighbour entry outlives the guest going quiet, and an ICMP echo requirement
+    // would fail a guest that legitimately sets icmp_echo_ignore_all=1 — the
+    // policy test_clone_port_forward_rootless deliberately snapshots.
     //
     // On failure (the VM crashed during the wait above, or pasta's port probe timed out)
     // skip the monitor/wait section and fall through to the shared cleanup below before
