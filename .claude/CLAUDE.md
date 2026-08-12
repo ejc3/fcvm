@@ -332,6 +332,27 @@ Shows which branch you're on and what it's based on.
 
 **Don't confuse local vs remote:** After rebasing locally, `origin/<branch>` shows the old history until you force-push. They're the same branch at different points in time.
 
+## fc-agent is a MUSL BINARY: check it against musl, not the host target
+
+`cargo check -p fc-agent` builds for the host's glibc target and proves
+nothing about the binary that actually ships in the guest, which `make build`
+cross-compiles for `*-unknown-linux-musl`. The two libcs disagree on real
+signatures: `ioctl`'s request argument is `i32` on musl and `c_ulong` on
+glibc, so an ioctl call that compiles cleanly on the host fails the guest
+build with a type error. A host-only check let exactly that reach CI, where
+it broke every job that builds the guest agent.
+
+Before believing fc-agent compiles:
+
+```bash
+cargo check -p fc-agent --target x86_64-unknown-linux-musl
+cargo check -p fc-agent --target aarch64-unknown-linux-musl
+```
+
+Or just run `make build`, which does the real thing. When calling libc from
+fc-agent, prefer `as _` over a named integer type on any argument whose width
+or signedness the libc chooses.
+
 ## ALWAYS USE THE MAKEFILE
 
 **Never run raw cargo/podman commands. Use make targets.**
