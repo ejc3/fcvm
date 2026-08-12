@@ -8,10 +8,14 @@
 
 FROM docker.io/library/debian:bookworm-slim
 
-# Install only what's needed for pjdfstest
+# Install only what's needed for pjdfstest. ca-certificates is explicit:
+# the git clone below is https, and leaving the CA store to git's apt
+# recommends chain produced a CI runner where the clone died with
+# "server certificate verification failed. CAfile: none".
 RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
+    ca-certificates \
     libtool \
     gcc \
     make \
