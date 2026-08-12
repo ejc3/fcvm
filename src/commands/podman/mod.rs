@@ -27,7 +27,7 @@ pub use image::export_image_archive;
 
 pub(crate) use listeners::{
     run_output_listener, run_status_listener, spawn_bootplan_listener,
-    spawn_restore_completion_listener,
+    spawn_restore_completion_listener, RestoreCompletionReceiver,
 };
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};

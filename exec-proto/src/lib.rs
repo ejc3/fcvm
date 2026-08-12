@@ -252,6 +252,65 @@ pub fn write_stdin<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
+// ---- Restore-completion ACK framing ----
+//
+// Shared by fc-agent (producer) and fcvm's restore listener (consumer) so the
+// frame budget cannot drift between the two binaries: the consumer fails any
+// frame over the cap, so the producer must be structurally unable to build
+// one.
+
+/// Frame prefix; the restore epoch follows, then optional telemetry after one
+/// space, then a newline.
+pub const RESTORE_COMPLETE_PREFIX: &str = "restore-complete:";
+
+/// Whole-frame cap, prefix through newline. Sized for a UUID epoch plus the
+/// guest's phase-timing telemetry JSON with generous headroom (a dozen
+/// float-valued phases render near 450 bytes).
+pub const RESTORE_COMPLETE_MAX_FRAME_BYTES: usize = 1024;
+
+/// Build the restore-completion ACK frame.
+///
+/// Telemetry is advisory and must never cost a healthy clone its ACK: when it
+/// does not fit the budget alongside the epoch, it is dropped (replaced by
+/// `{}`) rather than truncated, so the consumer always sees either complete
+/// JSON or none.
+pub fn restore_complete_frame(epoch: &str, telemetry: &str) -> String {
+    let frame = if telemetry.is_empty() {
+        format!("{RESTORE_COMPLETE_PREFIX}{epoch}\n")
+    } else {
+        format!("{RESTORE_COMPLETE_PREFIX}{epoch} {telemetry}\n")
+    };
+    if frame.len() <= RESTORE_COMPLETE_MAX_FRAME_BYTES {
+        return frame;
+    }
+    format!("{RESTORE_COMPLETE_PREFIX}{epoch} {{}}\n")
+}
+
+#[cfg(test)]
+mod restore_frame_tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_within_budget_rides_after_the_epoch() {
+        assert_eq!(
+            restore_complete_frame("epoch-1", "{\"total_ms\":40.2}"),
+            "restore-complete:epoch-1 {\"total_ms\":40.2}\n"
+        );
+        assert_eq!(
+            restore_complete_frame("epoch-1", ""),
+            "restore-complete:epoch-1\n"
+        );
+    }
+
+    #[test]
+    fn oversized_telemetry_is_dropped_never_truncated() {
+        let oversized = "x".repeat(RESTORE_COMPLETE_MAX_FRAME_BYTES);
+        let frame = restore_complete_frame("epoch-1", &oversized);
+        assert_eq!(frame, "restore-complete:epoch-1 {}\n");
+        assert!(frame.len() <= RESTORE_COMPLETE_MAX_FRAME_BYTES);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

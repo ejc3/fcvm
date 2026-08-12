@@ -358,8 +358,15 @@ pub fn send_status(message: &[u8]) -> bool {
 /// This deliberately uses its own connection rather than the output or status
 /// transports: the host binds the matching one-shot listener before resume, and
 /// treats any missing/malformed/wrong-generation frame as a restore failure.
-pub async fn notify_restore_complete(restore_epoch: &str) -> Result<()> {
-    /// Deadline for writing the (tiny) ACK frame to a host that has already
+///
+/// `telemetry` rides after the epoch, separated by one space: the per-phase
+/// restore timings as compact JSON. The host logs it verbatim so every clone's
+/// restore critical path is attributed without guest console capture. It is
+/// telemetry, never identity; the host validates only the epoch, and
+/// [`exec_proto::restore_complete_frame`] drops telemetry that would overflow
+/// the shared frame budget so advisory data can never cost the clone its ACK.
+pub async fn notify_restore_complete(restore_epoch: &str, telemetry: &str) -> Result<()> {
+    /// Deadline for writing the (small) ACK frame to a host that has already
     /// accepted the connection.
     const RESTORE_COMPLETE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -368,12 +375,12 @@ pub async fn notify_restore_complete(restore_epoch: &str) -> Result<()> {
             "restore-completion ACK failed (phase=connect expected_epoch={restore_epoch} observed_epoch=<none>)"
         )
     })?;
-    let frame = format!("restore-complete:{restore_epoch}\n");
+    let frame = exec_proto::restore_complete_frame(restore_epoch, telemetry);
     // Bounded: a host that accepts and then stops reading (or a wedged
     // transport) would otherwise block this write forever, leaving the clone
     // alive, unpublished and silent. The caller treats an ACK error as fatal
     // and shuts the clone down, so a deadline converts a silent hang into a
-    // diagnosable failure. The frame is a few dozen bytes.
+    // diagnosable failure. The frame is a few hundred bytes at most.
     tokio::time::timeout(
         RESTORE_COMPLETE_ACK_TIMEOUT,
         stream.write_all(frame.as_bytes()),

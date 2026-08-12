@@ -9,7 +9,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -19,7 +19,7 @@ use tokio::process::Command;
 
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_PATH: &str = "/run/fcvm/snapshot-network.json";
-const SYSFS_NET_PATH: &str = "/sys/class/net";
+pub(crate) const SYSFS_NET_PATH: &str = "/sys/class/net";
 const BOUNDARY_LOCK_PATH: &str = "/run/fcvm/snapshot-network.lock";
 const GATE_INPUT_CHAIN: &str = "FCVM_SNAPSHOT_IN";
 const GATE_OUTPUT_CHAIN: &str = "FCVM_SNAPSHOT_OUT";
@@ -303,6 +303,10 @@ impl ManifestStore for FileManifestStore {
 trait FirewallGate {
     async fn close(&self) -> Result<()>;
     async fn open(&self) -> Result<()>;
+    /// Report whether the gate is already fully installed: both directional
+    /// chains present with exactly the boundary rules, each hooked from its
+    /// built-in chain, in both address families.
+    async fn is_closed(&self) -> Result<bool>;
 }
 
 trait ExternalLink {
@@ -324,6 +328,18 @@ trait RouteTable {
 
 trait CommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output>;
+
+    /// Run with `input` piped to stdin. Exists for the batch tools
+    /// (`iptables-restore`, `ip -batch -`) that let one process spawn carry
+    /// what would otherwise be a dozen: on a freshly restored clone every
+    /// spawn faults its text and libraries back in through the memory
+    /// backend, so spawn count is the boundary's dominant cost.
+    async fn output_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+    ) -> io::Result<std::process::Output>;
 }
 
 struct SystemCommandRunner;
@@ -331,6 +347,28 @@ struct SystemCommandRunner;
 impl CommandRunner for SystemCommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output> {
         Command::new(program).args(args).output().await
+    }
+
+    async fn output_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+    ) -> io::Result<std::process::Output> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::other(format!("{program} child has no stdin despite piped()"))
+        })?;
+        stdin.write_all(input).await?;
+        drop(stdin);
+        child.wait_with_output().await
     }
 }
 
@@ -381,42 +419,77 @@ fn external_interface() -> Result<String> {
     external_interface_in(Path::new(SYSFS_NET_PATH))
 }
 
-struct IpLink<R> {
-    runner: R,
+/// The guest's one external interface, driven through direct syscalls.
+struct IpLink {
     interface: String,
 }
 
-impl<R> IpLink<R> {
-    fn new(runner: R, interface: String) -> Self {
-        Self { runner, interface }
+impl IpLink {
+    fn new(interface: String) -> Self {
+        Self { interface }
     }
 }
 
-impl<R: CommandRunner + Sync> IpLink<R> {
-    async fn set(&self, state: &str) -> Result<()> {
-        let args = ["link", "set", "dev", self.interface.as_str(), state];
-        let output = self
-            .runner
-            .output("ip", &args)
-            .await
-            .context("spawning ip to change snapshot network link state")?;
-        if !output.status.success() {
-            bail!(
-                "snapshot network link command failed: {}",
-                command_failure("ip", &args, &output)
-            );
-        }
-        Ok(())
+/// Set or clear IFF_UP on an interface with SIOCSIFFLAGS.
+///
+/// The kernel call `ip link set dev X up|down` makes, without the process
+/// spawn. The boundary drives the link on every clone restore, where a spawn
+/// costs far more than the syscall: the restored process image faults its
+/// text and libraries back in through the memory backend. Spawn-free is also
+/// what makes re-asserting the link-down on every restore affordable, and
+/// that re-assert is what keeps the cleanup sound against a privileged
+/// workload sharing this namespace.
+fn set_interface_up(interface: &str, up: bool) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // `as _` on the request numbers is load-bearing across targets: the guest
+    // binary is musl, whose `ioctl` takes an i32 request, while glibc takes a
+    // c_ulong. A host-target build hides that difference entirely.
+
+    let fd = crate::network::open_raw_socket(libc::AF_INET, libc::SOCK_DGRAM, 0)
+        .context("opening a control socket for the snapshot network link")?;
+    // SAFETY: ifreq is a plain C struct; zeroing is its valid empty state.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name = interface.as_bytes();
+    if name.len() >= request.ifr_name.len() {
+        bail!("interface name {interface:?} does not fit in an ifreq");
     }
+    for (slot, byte) in request.ifr_name.iter_mut().zip(name) {
+        *slot = *byte as libc::c_char;
+    }
+    // SAFETY: the fd is a live AF_INET socket and `request` is initialized
+    // with a NUL-terminated name; SIOCGIFFLAGS fills the flags union member.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut request) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading interface flags for {interface}"));
+    }
+    // SAFETY: SIOCGIFFLAGS just populated the flags member of the union.
+    let flags = unsafe { request.ifr_ifru.ifru_flags } as libc::c_int;
+    let updated = if up {
+        flags | libc::IFF_UP
+    } else {
+        flags & !libc::IFF_UP
+    };
+    request.ifr_ifru.ifru_flags = updated as libc::c_short;
+    // SAFETY: same fd and struct, now carrying the flags to install.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request) } < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "setting interface {interface} {}",
+                if up { "up" } else { "down" }
+            )
+        });
+    }
+    Ok(())
 }
 
-impl<R: CommandRunner + Sync> ExternalLink for IpLink<R> {
+impl ExternalLink for IpLink {
     async fn down(&self) -> Result<()> {
-        self.set("down").await
+        set_interface_up(&self.interface, false)
     }
 
     async fn up(&self) -> Result<()> {
-        self.set("up").await
+        set_interface_up(&self.interface, true)
     }
 }
 
@@ -482,13 +555,32 @@ impl<R: CommandRunner + Sync> RouteTable for IpRoutes<R> {
     }
 
     async fn reinstate(&self, routes: &[CapturedRoute]) -> Result<()> {
-        for route in routes {
-            let flag = if route.family == 6 { "-6" } else { "-4" };
-            let mut args = vec![flag, "route", "replace"];
-            args.extend(route.spec.split_whitespace());
-            self.run(&args)
+        // One `ip -batch -` spawn per family instead of one per route: the
+        // family flag is global to the ip invocation, and each avoided spawn
+        // is restore latency on a cold clone.
+        for family in [4u8, 6u8] {
+            let lines: Vec<String> = routes
+                .iter()
+                .filter(|route| route.family == family)
+                .map(|route| format!("route replace {}", route.spec))
+                .collect();
+            if lines.is_empty() {
+                continue;
+            }
+            let flag = if family == 6 { "-6" } else { "-4" };
+            let payload = lines.join("\n") + "\n";
+            let args = [flag, "-batch", "-"];
+            let output = self
+                .runner
+                .output_with_input("ip", &args, payload.as_bytes())
                 .await
-                .with_context(|| format!("reinstating route `{}`", route.spec))?;
+                .context("spawning ip to reinstate the snapshot route table")?;
+            if !output.status.success() {
+                bail!(
+                    "snapshot network route batch failed: {} (batch input {payload:?})",
+                    command_failure("ip", &args, &output)
+                );
+            }
         }
         Ok(())
     }
@@ -505,32 +597,37 @@ impl PacketReceiveBarrier for SystemPacketReceiveBarrier {
         // The NEW-flow gate is installed first and the link is down, so packets
         // that begin after this grace period cannot create an uncaptured TCP
         // socket. Merely waiting or taking repeated dumps cannot prove this.
-        let raw = unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                ETH_P_ALL.to_be() as i32,
-            )
-        };
-        if raw < 0 {
-            return Err(io::Error::last_os_error()).context(
-                "opening AF_PACKET receive-path barrier (guest kernel needs CONFIG_PACKET=y)",
-            );
-        }
-        // SAFETY: `raw` is a newly-created owned fd. Dropping it invokes the
-        // packet socket release path and its synchronize_net() grace period.
-        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+        // Dropping the fd invokes the packet socket release path and its
+        // synchronize_net() grace period.
+        let fd = crate::network::open_raw_socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            ETH_P_ALL.to_be() as i32,
+        )
+        .context("opening AF_PACKET receive-path barrier (guest kernel needs CONFIG_PACKET=y)")?;
+        drop(fd);
         Ok(())
     }
 }
 
 struct IptablesGate<R> {
     runner: R,
+    /// Per-program `-S` parse retained from verification for the removal that
+    /// follows it in the same transaction, dropped by every gate mutation
+    /// this module makes. No other fc-agent transaction can invalidate it:
+    /// they serialize on the guest-wide boundary lock. A privileged workload
+    /// can, and then the computed removal names a rule that no longer
+    /// matches, which fails the batch and fails the restore closed.
+    /// Guards the map only, never held across an await.
+    state_cache: std::sync::Mutex<std::collections::HashMap<String, FamilyGateState>>,
 }
 
 impl<R> IptablesGate<R> {
     fn new(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            state_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 }
 
@@ -546,6 +643,165 @@ fn command_failure(program: &str, args: &[&str], output: &std::process::Output) 
         String::from_utf8_lossy(&output.stdout).trim(),
         String::from_utf8_lossy(&output.stderr).trim(),
     )
+}
+
+/// The loopback exemptions the two families preserve across the boundary.
+const IPV4_LOOPBACK: &str = "127.0.0.0/8";
+const IPV6_LOOPBACK: &str = "::1/128";
+
+/// The exact rule bodies a gate chain carries, without the `-A <chain>`
+/// prefix. Shared by installation and verification so the two can never
+/// drift: what close() appends is literally what is_closed() expects.
+fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> [Vec<String>; 3] {
+    let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
+    [
+        owned(&["-p", "tcp", loopback_flag, loopback_network, "-j", "RETURN"]),
+        owned(&[
+            "-p",
+            "tcp",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "NEW",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            "tcp-reset",
+        ]),
+        owned(&["-j", "RETURN"]),
+    ]
+}
+
+/// The one rule that routes a built-in chain into a gate chain, as `-S`
+/// prints it. Shared by installation, verification, and removal so the three
+/// can never drift: a hook changed in one of them alone would silently kill
+/// the verified fast path (verification stops matching) and break removal
+/// (`-X` on a still-referenced chain).
+fn hook_jump_args(chain: &str) -> [&str; 2] {
+    ["-j", chain]
+}
+
+fn hook_install_args<'a>(hook: &'a str, chain: &'a str) -> [&'a str; 6] {
+    let [jump, target] = hook_jump_args(chain);
+    ["-w", "-I", hook, "1", jump, target]
+}
+
+fn hook_check_args<'a>(hook: &'a str, chain: &'a str) -> [&'a str; 5] {
+    let [jump, target] = hook_jump_args(chain);
+    ["-w", "-C", hook, jump, target]
+}
+
+/// One family's observed gate state, parsed from a single `iptables -S` dump.
+///
+/// `None` rule lists mean the chain is not declared at all; an empty list is a
+/// declared-but-empty chain. Hook counts tally `-A INPUT -j <chain>` (and the
+/// OUTPUT twin) exactly — a jump carrying extra matches is not our hook.
+/// The first-rule flags record whether the hook is the built-in chain's FIRST
+/// rule (`-S` prints rules in evaluation order): the gate only governs packets
+/// that reach it, so a hook shadowed by any earlier rule is not a closed gate.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FamilyGateState {
+    input_rules: Option<Vec<Vec<String>>>,
+    output_rules: Option<Vec<Vec<String>>>,
+    input_hooks: usize,
+    output_hooks: usize,
+    input_hook_is_first_rule: bool,
+    output_hook_is_first_rule: bool,
+}
+
+fn parse_gate_state(dump: &str) -> FamilyGateState {
+    let mut state = FamilyGateState::default();
+    let mut input_rules_seen = 0usize;
+    let mut output_rules_seen = 0usize;
+    for line in dump.lines() {
+        let tokens: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        let [command, chain, rest @ ..] = tokens.as_slice() else {
+            continue;
+        };
+        match (command.as_str(), chain.as_str()) {
+            ("-N", GATE_INPUT_CHAIN) => {
+                state.input_rules.get_or_insert_with(Vec::new);
+            }
+            ("-N", GATE_OUTPUT_CHAIN) => {
+                state.output_rules.get_or_insert_with(Vec::new);
+            }
+            ("-A", GATE_INPUT_CHAIN) => {
+                state
+                    .input_rules
+                    .get_or_insert_with(Vec::new)
+                    .push(rest.to_vec());
+            }
+            ("-A", GATE_OUTPUT_CHAIN) => {
+                state
+                    .output_rules
+                    .get_or_insert_with(Vec::new)
+                    .push(rest.to_vec());
+            }
+            ("-A", "INPUT") => {
+                input_rules_seen += 1;
+                if rest == hook_jump_args(GATE_INPUT_CHAIN) {
+                    state.input_hooks += 1;
+                    if input_rules_seen == 1 {
+                        state.input_hook_is_first_rule = true;
+                    }
+                }
+            }
+            ("-A", "OUTPUT") => {
+                output_rules_seen += 1;
+                if rest == hook_jump_args(GATE_OUTPUT_CHAIN) {
+                    state.output_hooks += 1;
+                    if output_rules_seen == 1 {
+                        state.output_hook_is_first_rule = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+/// Compare one rule as a sorted token multiset. `iptables -S` reorders
+/// arguments relative to what was appended (measured on iptables v1.8.10
+/// nf_tables: `-A C -p tcp -s 127.0.0.0/8 -j RETURN` prints as
+/// `-A C -s 127.0.0.0/8 -p tcp -j RETURN`), and pinning the exact print order
+/// would couple verification to one iptables version's renderer.
+fn sorted_tokens(tokens: &[String]) -> Vec<String> {
+    let mut sorted = tokens.to_vec();
+    sorted.sort();
+    sorted
+}
+
+/// Whether one family's observed state is the fully armed gate: both chains
+/// carrying exactly the boundary rules, each hooked as the FIRST rule of its
+/// built-in chain. First position is part of the invariant — close() inserts
+/// with `-I 1`, and a hook shadowed by any earlier rule would let that rule
+/// admit NEW flows the manifest never captured. Extra duplicate hooks below
+/// the first are still closed (the gate verdict is unchanged); any deviation
+/// inside a chain is not.
+///
+/// Scope: this sees exactly what `iptables -S` renders. A rule injected with
+/// native nft tooling into a separate higher-priority nft chain is invisible
+/// here and bypasses the gate at packet time regardless; that holds equally
+/// for the unconditional re-assert path, which installs into the same
+/// iptables-visible chains.
+fn family_gate_is_closed(state: &FamilyGateState, loopback_network: &str) -> bool {
+    let chain_matches = |observed: &Option<Vec<Vec<String>>>, loopback_flag: &str| {
+        let expected = gate_chain_rules(loopback_flag, loopback_network);
+        observed.as_ref().is_some_and(|rules| {
+            rules.len() == expected.len()
+                && rules
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(observed_rule, expected_rule)| {
+                        sorted_tokens(observed_rule) == sorted_tokens(expected_rule)
+                    })
+        })
+    };
+    chain_matches(&state.input_rules, "-s")
+        && chain_matches(&state.output_rules, "-d")
+        && state.input_hook_is_first_rule
+        && state.output_hook_is_first_rule
 }
 
 impl<R: CommandRunner> IptablesGate<R> {
@@ -570,6 +826,34 @@ impl<R: CommandRunner> IptablesGate<R> {
         Ok(output.status.success())
     }
 
+    async fn read_family_state(&self, program: &str) -> Result<FamilyGateState> {
+        let args = ["-w", "-S"];
+        let output = self
+            .runner
+            .output(program, &args)
+            .await
+            .with_context(|| format!("spawning {program}"))?;
+        if !output.status.success() {
+            bail!(
+                "snapshot network gate state read failed: {}",
+                command_failure(program, &args, &output)
+            );
+        }
+        Ok(parse_gate_state(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    async fn family_is_closed(&self, program: &str, loopback_network: &str) -> Result<bool> {
+        let state = self.read_family_state(program).await?;
+        let closed = family_gate_is_closed(&state, loopback_network);
+        // Retain the parse for the removal that follows verification in the
+        // same locked transaction, saving that removal's own `-S` spawn.
+        self.state_cache
+            .lock()
+            .unwrap()
+            .insert(program.to_string(), state);
+        Ok(closed)
+    }
+
     async fn configure_gate_chain(
         &self,
         program: &str,
@@ -581,53 +865,24 @@ impl<R: CommandRunner> IptablesGate<R> {
             self.required(program, &["-w", "-N", chain]).await?;
         }
         self.required(program, &["-w", "-F", chain]).await?;
-        self.required(
-            program,
-            &[
-                "-w",
-                "-A",
-                chain,
-                "-p",
-                "tcp",
-                loopback_flag,
-                loopback_network,
-                "-j",
-                "RETURN",
-            ],
-        )
-        .await?;
-        self.required(
-            program,
-            &[
-                "-w",
-                "-A",
-                chain,
-                "-p",
-                "tcp",
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "NEW",
-                "-j",
-                "REJECT",
-                "--reject-with",
-                "tcp-reset",
-            ],
-        )
-        .await?;
-        self.required(program, &["-w", "-A", chain, "-j", "RETURN"])
-            .await?;
+        for rule in gate_chain_rules(loopback_flag, loopback_network) {
+            let mut args: Vec<&str> = vec!["-w", "-A", chain];
+            args.extend(rule.iter().map(String::as_str));
+            self.required(program, &args).await?;
+        }
         Ok(())
     }
 
     async fn install_hook(&self, program: &str, hook: &str, chain: &str) -> Result<()> {
-        let check = ["-w", "-C", hook, "-j", chain];
-        let output = self.runner.output(program, &check).await?;
-        if !output.status.success() {
-            self.required(program, &["-w", "-I", hook, "1", "-j", chain])
-                .await?;
-        }
-        self.required(program, &check).await?;
+        // Always insert at position 1. `-C` can only prove the jump exists
+        // SOMEWHERE, and a jump below a foreign rule is a gate that foreign
+        // rule can bypass, so close() must put a copy ahead of everything.
+        // A duplicate left lower in the chain is harmless (the first match
+        // governs) and remove_family retires every counted copy.
+        self.required(program, &hook_install_args(hook, chain))
+            .await?;
+        self.required(program, &hook_check_args(hook, chain))
+            .await?;
         Ok(())
     }
 
@@ -645,57 +900,104 @@ impl<R: CommandRunner> IptablesGate<R> {
             .await?;
         self.install_hook(program, "OUTPUT", GATE_OUTPUT_CHAIN)
             .await?;
+        // This family's rules just changed; a parse retained from an earlier
+        // verification no longer describes them.
+        self.state_cache.lock().unwrap().remove(program);
         Ok(())
     }
 
-    async fn remove_chain(&self, program: &str, hook: &str, chain: &str) -> Result<()> {
-        if !self.chain_exists(program, chain).await? {
-            return Ok(());
-        }
-        // A hook can legitimately carry the jump more than once (an interrupted
-        // close leaves one behind), so removal repeats. It is bounded: an
-        // iptables chain that still matches after this many deletions is not
-        // converging, and looping forever there would hang restore instead of
-        // reporting the stuck rule.
+    /// Remove one family's gate with one `iptables-restore --noflush` batch,
+    /// computed from a single `-S` read: exactly the counted hook deletions,
+    /// then flush and delete each chain that exists. When the same locked
+    /// transaction already read the state to verify, that parse is reused and
+    /// the removal spends no read at all. Explicit `-D`/`-F`/`-X` lines in
+    /// restore input are accepted (verified live on the guest's iptables
+    /// v1.8.10 nf_tables build, which removed both duplicate jumps and the
+    /// chain in one commit). One spawn instead of a dozen matters here: on a
+    /// freshly restored clone every spawn faults its pages back in through
+    /// the memory backend.
+    ///
+    /// The plan is computed rather than probed, so it assumes the observed
+    /// state still holds. Other fc-agent transactions cannot break that (the
+    /// guest-wide lock serializes them); a privileged workload sharing this
+    /// namespace can, and then a `-D` or `-X` names something that no longer
+    /// matches and the batch fails, which fails the restore closed.
+    async fn remove_family(&self, program: &str) -> Result<()> {
+        // Bounded: a hook carrying more duplicate jumps than any interrupted
+        // sequence could leave is tampering, not drift, and deleting without
+        // bound would hang restore instead of reporting it.
         const MAX_DUPLICATE_HOOKS: usize = 64;
-        let check = ["-w", "-C", hook, "-j", chain];
-        let mut removed = 0usize;
-        while self.runner.output(program, &check).await?.status.success() {
-            if removed == MAX_DUPLICATE_HOOKS {
+        let cached = self.state_cache.lock().unwrap().remove(program);
+        let state = match cached {
+            Some(state) => state,
+            None => self.read_family_state(program).await?,
+        };
+        let mut lines = vec!["*filter".to_string()];
+        let hooks = [
+            ("INPUT", GATE_INPUT_CHAIN, state.input_hooks),
+            ("OUTPUT", GATE_OUTPUT_CHAIN, state.output_hooks),
+        ];
+        for (hook, chain, count) in hooks {
+            if count > MAX_DUPLICATE_HOOKS {
                 bail!(
-                    "{program} {hook} still jumps to {chain} after removing \
-                     {MAX_DUPLICATE_HOOKS} references; refusing to loop"
+                    "{program} {hook} jumps to {chain} {count} times \
+                     (limit {MAX_DUPLICATE_HOOKS}); refusing cleanup"
                 );
             }
-            self.required(program, &["-w", "-D", hook, "-j", chain])
-                .await?;
-            removed += 1;
+            for _ in 0..count {
+                lines.push(format!("-D {hook} {}", hook_jump_args(chain).join(" ")));
+            }
         }
-        self.required(program, &["-w", "-F", chain]).await?;
-        self.required(program, &["-w", "-X", chain]).await?;
-        Ok(())
-    }
-
-    async fn remove_family(&self, program: &str) -> Result<()> {
-        self.remove_chain(program, "INPUT", GATE_INPUT_CHAIN)
-            .await?;
-        self.remove_chain(program, "OUTPUT", GATE_OUTPUT_CHAIN)
-            .await?;
+        let chains = [
+            (GATE_INPUT_CHAIN, state.input_rules.is_some()),
+            (GATE_OUTPUT_CHAIN, state.output_rules.is_some()),
+        ];
+        for (chain, declared) in chains {
+            if declared {
+                lines.push(format!("-F {chain}"));
+                lines.push(format!("-X {chain}"));
+            }
+        }
+        if lines.len() == 1 {
+            return Ok(());
+        }
+        lines.push("COMMIT".to_string());
+        let payload = lines.join("\n") + "\n";
+        let restore_program = format!("{program}-restore");
+        let args = ["-w", "--noflush"];
+        let output = self
+            .runner
+            .output_with_input(&restore_program, &args, payload.as_bytes())
+            .await
+            .with_context(|| format!("spawning {restore_program}"))?;
+        if !output.status.success() {
+            bail!(
+                "snapshot network gate batch removal failed: {} (batch input {payload:?})",
+                command_failure(&restore_program, &args, &output)
+            );
+        }
         Ok(())
     }
 }
 
 impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
     async fn close(&self) -> Result<()> {
-        self.install_family("iptables", "127.0.0.0/8")
+        self.install_family("iptables", IPV4_LOOPBACK)
             .await
             .context("installing IPv4 snapshot network gate")?;
-        self.install_family("ip6tables", "::1/128")
+        self.install_family("ip6tables", IPV6_LOOPBACK)
             .await
             .context("installing IPv6 snapshot network gate")
     }
 
     async fn open(&self) -> Result<()> {
+        // Mutations stay sequential on purpose. iptables-nft has no shared
+        // userspace lock (`-w` is a no-op there) and commits race the
+        // kernel's per-netns generation counter, where a lost retry surfaces
+        // as EAGAIN; through required() that would fail the restore and kill
+        // the clone, a poor trade for one process spawn of overlap. Both
+        // verdicts are still collected so one family's failure cannot mask
+        // the other's.
         let ipv4 = self.remove_family("iptables").await;
         let ipv6 = self.remove_family("ip6tables").await;
         match (ipv4, ipv6) {
@@ -706,6 +1008,15 @@ impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
                 "IPv4 gate cleanup: {a:#}; IPv6 gate cleanup: {b:#}"
             )),
         }
+    }
+
+    async fn is_closed(&self) -> Result<bool> {
+        // Reads only: safe to overlap regardless of backend.
+        let (ipv4, ipv6) = tokio::join!(
+            self.family_is_closed("iptables", IPV4_LOOPBACK),
+            self.family_is_closed("ip6tables", IPV6_LOOPBACK)
+        );
+        Ok(ipv4? && ipv6?)
     }
 }
 
@@ -725,6 +1036,27 @@ enum DestroyOutcome {
 struct CleanupTally {
     destroyed: usize,
     already_gone: usize,
+}
+
+/// What one restore-side boundary transaction did, surfaced to the restore
+/// orchestrator so the host-visible ACK telemetry can attribute the path
+/// taken (verified fast path versus full re-assert).
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreNetworkReport {
+    /// True when the snapshot's armed boundary verified intact and the
+    /// re-close/link-down/receive-barrier re-assert was skipped.
+    pub verified_armed: bool,
+    /// Milliseconds probing the gate rules and link flags.
+    pub verify_ms: f64,
+    /// Milliseconds re-asserting close/link-down/barrier; zero on the
+    /// verified fast path.
+    pub reassert_ms: f64,
+    /// Milliseconds loading the manifest and retiring its sockets.
+    pub destroy_ms: f64,
+    /// Milliseconds removing the gate, raising the link, and reinstating
+    /// routes.
+    pub reopen_ms: f64,
+    tally: CleanupTally,
 }
 
 /// Total budget for retiring every socket named by the manifest.
@@ -827,20 +1159,8 @@ fn netlink_align(length: usize) -> usize {
 fn open_diag_socket() -> Result<OwnedFd> {
     use std::os::fd::AsRawFd;
 
-    // SAFETY: libc socket arguments are constants from the Linux UAPI.
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            NETLINK_SOCK_DIAG,
-        )
-    };
-    if raw < 0 {
-        return Err(io::Error::last_os_error())
-            .context("opening NETLINK_SOCK_DIAG socket (guest kernel needs CONFIG_INET_DIAG=y)");
-    }
-    // SAFETY: `raw` is a newly-created owned fd.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fd = crate::network::open_raw_socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_SOCK_DIAG)
+        .context("opening NETLINK_SOCK_DIAG socket (guest kernel needs CONFIG_INET_DIAG=y)")?;
     let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     address.nl_family = libc::AF_NETLINK as u16;
     // SAFETY: address points to a fully initialized sockaddr_nl.
@@ -1304,19 +1624,64 @@ async fn restore_with<
     store: &S,
     route_table: &T,
     budget: std::time::Duration,
-) -> Result<CleanupTally> {
-    // A current snapshot already contains a closed gate and down link.  Repeat
-    // both operations idempotently so a malformed/older snapshot cannot be
-    // published by the cleanup path before its manifest is rejected.
-    gate.close()
-        .await
-        .context("ensuring restored snapshot TCP NEW-flow gate is closed")?;
+) -> Result<RestoreNetworkReport> {
+    // The gate chains are VERIFIED rather than reinstalled; the link-down and
+    // the receive barrier are always re-asserted.
+    //
+    // Verifying the chains is sound because a restored image was captured
+    // behind them and reinstalling identical rules changes nothing: the check
+    // reads what `close()` would have written and skips the write when they
+    // match. That is where the cost was, roughly 25 process spawns.
+    //
+    // The link and the barrier are not verified, because reading them proves
+    // less than asserting them. A `--privileged` workload resumes in this
+    // network namespace holding CAP_NET_ADMIN, so between any observation and
+    // the socket cleanup below it can raise the link itself; the guest-wide
+    // lock this transaction holds excludes other fc-agent transactions, not
+    // the workload. Downing the link and taking a fresh grace period costs no
+    // process spawn (both are direct syscalls) and restores the property the
+    // cleanup depends on: no receive processing is in flight, and none can
+    // start, while the manifest's sockets are retired.
+    //
+    // A workload with CAP_NET_ADMIN can still raise the link again afterwards;
+    // nothing inside the guest can prevent that, and it was equally true
+    // before this fast path existed. What the re-assert guarantees is that the
+    // boundary holds across the cleanup itself.
+    //
+    // Chain verification that FAILS, or that cannot be read at all, falls back
+    // to reinstalling them: a malformed or tampered image cannot publish
+    // early, and a transient probe failure must never become a dead clone the
+    // spawn-free path would have restored.
+    let verify_started = std::time::Instant::now();
+    let verified_armed = match gate.is_closed().await {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            eprintln!(
+                "[fc-agent] WARNING: boundary gate unreadable, reinstalling \
+                 instead: {error:#}"
+            );
+            false
+        }
+    };
+    let verify_ms = verify_started.elapsed().as_secs_f64() * 1000.0;
+    let reassert_started = std::time::Instant::now();
+    if !verified_armed {
+        gate.close()
+            .await
+            .context("ensuring restored snapshot TCP NEW-flow gate is closed")?;
+    }
     link.down()
         .await
-        .context("ensuring the restored external link remains down during socket cleanup")?;
+        .context("ensuring the restored external link is down during socket cleanup")?;
     receive_barrier
         .synchronize()
         .context("waiting for restored packet receive processing to quiesce")?;
+    let reassert_ms = if verified_armed {
+        0.0
+    } else {
+        reassert_started.elapsed().as_secs_f64() * 1000.0
+    };
+    let destroy_started = std::time::Instant::now();
     let manifest = store.load()?;
     let started = std::time::Instant::now();
     let mut tally = CleanupTally::default();
@@ -1346,16 +1711,25 @@ async fn restore_with<
     store
         .remove()
         .context("retiring snapshot network manifest after cookie-bound cleanup")?;
+    let destroy_ms = destroy_started.elapsed().as_secs_f64() * 1000.0;
+    let reopen_started = std::time::Instant::now();
     reopen_with(gate, link, route_table, &manifest.routes)
         .await
         .context("publishing restored network after cookie-bound cleanup")?;
-    Ok(tally)
+    Ok(RestoreNetworkReport {
+        tally,
+        verified_armed,
+        verify_ms,
+        reassert_ms,
+        destroy_ms,
+        reopen_ms: reopen_started.elapsed().as_secs_f64() * 1000.0,
+    })
 }
 
 pub async fn prepare_snapshot_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(SystemCommandRunner, external_interface()?);
+    let link = IpLink::new(external_interface()?);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic;
     let route_table = IpRoutes::new(SystemCommandRunner);
@@ -1378,7 +1752,7 @@ pub async fn prepare_snapshot_network() -> Result<()> {
 pub async fn resume_source_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(SystemCommandRunner, external_interface()?);
+    let link = IpLink::new(external_interface()?);
     let route_table = IpRoutes::new(SystemCommandRunner);
     let store = FileManifestStore::default();
     // Read the routes out before retiring the manifest that holds them: this
@@ -1408,14 +1782,14 @@ pub async fn resume_source_network() -> Result<()> {
     Ok(())
 }
 
-pub async fn restore_snapshot_network() -> Result<()> {
+pub async fn restore_snapshot_network() -> Result<RestoreNetworkReport> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(SystemCommandRunner, external_interface()?);
+    let link = IpLink::new(external_interface()?);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic;
     let route_table = IpRoutes::new(SystemCommandRunner);
-    let tally = restore_with(
+    let report = restore_with(
         &gate,
         &link,
         &receive_barrier,
@@ -1427,10 +1801,10 @@ pub async fn restore_snapshot_network() -> Result<()> {
     .await?;
     eprintln!(
         "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
-         link=up gate=open",
-        tally.destroyed, tally.already_gone
+         verified_armed={} link=up gate=open",
+        report.tally.destroyed, report.tally.already_gone, report.verified_armed
     );
-    Ok(())
+    Ok(report)
 }
 
 /// Whether this process image was captured behind the snapshot network
@@ -1510,6 +1884,7 @@ mod tests {
         events: Vec<&'static str>,
         live: Vec<TcpSocketIdentity>,
         fail_gate_close: bool,
+        fail_gate_verify: bool,
         fail_barrier: bool,
         fail_dump: bool,
         fail_destroy: bool,
@@ -1534,6 +1909,15 @@ mod tests {
             state.gate_closed = false;
             state.events.push("gate-open");
             Ok(())
+        }
+
+        async fn is_closed(&self) -> Result<bool> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("gate-verify");
+            if state.fail_gate_verify {
+                bail!("injected gate verification read failure");
+            }
+            Ok(state.gate_closed)
         }
     }
 
@@ -1681,6 +2065,24 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &[u8],
+        ) -> io::Result<std::process::Output> {
+            self.0.lock().unwrap().push(format!(
+                "{program} {} <<< {:?}",
+                args.join(" "),
+                String::from_utf8_lossy(input)
+            ));
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
     }
 
     #[tokio::test]
@@ -1702,6 +2104,260 @@ mod tests {
             !calls.contains("10.0.2.") && !calls.contains("fd00:"),
             "gateway exemptions let routed external clients cross the generation boundary:\n{calls}"
         );
+    }
+
+    /// Runner that answers `-S` with a canned dump and records every call.
+    #[derive(Clone)]
+    struct ScriptedRunner {
+        dump: String,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            let stdout = if args == ["-w", "-S"] {
+                self.dump.clone().into_bytes()
+            } else {
+                Vec::new()
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &[u8],
+        ) -> io::Result<std::process::Output> {
+            self.calls.lock().unwrap().push(format!(
+                "{program} {} <<< {:?}",
+                args.join(" "),
+                String::from_utf8_lossy(input)
+            ));
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// Verbatim `iptables -w -S` output of an armed IPv4 gate, captured on
+    /// iptables v1.8.10 (nf_tables), Ubuntu 24.04 aarch64. Note the renderer
+    /// prints `-s`/`-d` BEFORE `-p tcp`, the reverse of the appended argument
+    /// order; verification must accept the renderer's form.
+    const ARMED_V4_DUMP: &str = "-P INPUT ACCEPT\n\
+        -P FORWARD ACCEPT\n\
+        -P OUTPUT ACCEPT\n\
+        -N FCVM_SNAPSHOT_IN\n\
+        -N FCVM_SNAPSHOT_OUT\n\
+        -A INPUT -j FCVM_SNAPSHOT_IN\n\
+        -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
+        -A FCVM_SNAPSHOT_IN -s 127.0.0.0/8 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_IN -j RETURN\n\
+        -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_OUT -j RETURN\n";
+
+    /// Same capture for the IPv6 family (`-d ::1/128 -p tcp -j RETURN` etc.).
+    const ARMED_V6_DUMP: &str = "-P INPUT ACCEPT\n\
+        -P FORWARD ACCEPT\n\
+        -P OUTPUT ACCEPT\n\
+        -N FCVM_SNAPSHOT_IN\n\
+        -N FCVM_SNAPSHOT_OUT\n\
+        -A INPUT -j FCVM_SNAPSHOT_IN\n\
+        -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
+        -A FCVM_SNAPSHOT_IN -s ::1/128 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_IN -j RETURN\n\
+        -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_OUT -j RETURN\n";
+
+    #[test]
+    fn armed_gate_verifies_from_the_live_iptables_rendering() {
+        assert!(family_gate_is_closed(
+            &parse_gate_state(ARMED_V4_DUMP),
+            IPV4_LOOPBACK
+        ));
+        assert!(family_gate_is_closed(
+            &parse_gate_state(ARMED_V6_DUMP),
+            IPV6_LOOPBACK
+        ));
+    }
+
+    #[test]
+    fn any_deviation_from_the_armed_gate_fails_verification() {
+        // Missing hook: the chain exists but nothing routes packets into it.
+        let unhooked = ARMED_V4_DUMP.replace("-A INPUT -j FCVM_SNAPSHOT_IN\n", "");
+        assert!(!family_gate_is_closed(
+            &parse_gate_state(&unhooked),
+            IPV4_LOOPBACK
+        ));
+
+        // A foreign rule inside the gate chain is not our gate.
+        let extra_rule = format!("{ARMED_V4_DUMP}-A FCVM_SNAPSHOT_IN -p udp -j ACCEPT\n");
+        assert!(!family_gate_is_closed(
+            &parse_gate_state(&extra_rule),
+            IPV4_LOOPBACK
+        ));
+
+        // A pristine table has no boundary at all.
+        assert!(!family_gate_is_closed(
+            &parse_gate_state("-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n"),
+            IPV4_LOOPBACK
+        ));
+
+        // The wrong loopback exemption (v6 rules under the v4 expectation)
+        // must not verify.
+        assert!(!family_gate_is_closed(
+            &parse_gate_state(ARMED_V6_DUMP),
+            IPV4_LOOPBACK
+        ));
+    }
+
+    #[test]
+    fn a_rule_ahead_of_the_gate_hook_fails_verification() {
+        // The gate only governs packets that reach it. An ACCEPT sitting
+        // above the jump admits NEW flows the manifest never captured, so a
+        // hook anywhere but position 1 must force the full re-assert path.
+        let shadowed = ARMED_V4_DUMP.replace(
+            "-A INPUT -j FCVM_SNAPSHOT_IN\n",
+            "-A INPUT -p tcp -j ACCEPT\n-A INPUT -j FCVM_SNAPSHOT_IN\n",
+        );
+        assert!(!family_gate_is_closed(
+            &parse_gate_state(&shadowed),
+            IPV4_LOOPBACK
+        ));
+
+        let shadowed_output = ARMED_V4_DUMP.replace(
+            "-A OUTPUT -j FCVM_SNAPSHOT_OUT\n",
+            "-A OUTPUT -p tcp -j ACCEPT\n-A OUTPUT -j FCVM_SNAPSHOT_OUT\n",
+        );
+        assert!(!family_gate_is_closed(
+            &parse_gate_state(&shadowed_output),
+            IPV4_LOOPBACK
+        ));
+    }
+
+    #[test]
+    fn duplicate_hooks_still_verify_as_closed() {
+        // An interrupted close can leave a second jump; the gate verdict for
+        // packets is unchanged, so verification must not force a repair.
+        let doubled = format!("{ARMED_V4_DUMP}-A INPUT -j FCVM_SNAPSHOT_IN\n");
+        assert!(family_gate_is_closed(
+            &parse_gate_state(&doubled),
+            IPV4_LOOPBACK
+        ));
+    }
+
+    #[tokio::test]
+    async fn computed_removal_issues_exactly_the_observed_deletions() {
+        let doubled = format!("{ARMED_V4_DUMP}-A INPUT -j FCVM_SNAPSHOT_IN\n");
+        let runner = ScriptedRunner {
+            dump: doubled,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let calls = runner.calls.clone();
+        IptablesGate::new(runner)
+            .remove_family("iptables")
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "iptables -w -S",
+                "iptables-restore -w --noflush <<< \"*filter\\n\
+-D INPUT -j FCVM_SNAPSHOT_IN\\n\
+-D INPUT -j FCVM_SNAPSHOT_IN\\n\
+-D OUTPUT -j FCVM_SNAPSHOT_OUT\\n\
+-F FCVM_SNAPSHOT_IN\\n\
+-X FCVM_SNAPSHOT_IN\\n\
+-F FCVM_SNAPSHOT_OUT\\n\
+-X FCVM_SNAPSHOT_OUT\\n\
+COMMIT\\n\"",
+            ],
+            "removal must be one computed batch, never a probe or spawn per step"
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_reuses_the_verification_read_in_one_transaction() {
+        let runner = ScriptedRunner {
+            dump: ARMED_V4_DUMP.to_string(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let calls = runner.calls.clone();
+        let gate = IptablesGate::new(runner);
+        assert!(gate
+            .family_is_closed("iptables", IPV4_LOOPBACK)
+            .await
+            .unwrap());
+        gate.remove_family("iptables").await.unwrap();
+        let reads = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.as_str() == "iptables -w -S")
+            .count();
+        assert_eq!(
+            reads, 1,
+            "verify-then-remove under one lock must spend one state read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gate_mutation_invalidates_the_retained_state_read() {
+        let runner = ScriptedRunner {
+            dump: ARMED_V4_DUMP.to_string(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let calls = runner.calls.clone();
+        let gate = IptablesGate::new(runner);
+        assert!(gate
+            .family_is_closed("iptables", IPV4_LOOPBACK)
+            .await
+            .unwrap());
+        // The repair path re-closes after a failed verification; the removal
+        // that follows must observe the post-close state, not the retained
+        // pre-close parse.
+        gate.install_family("iptables", IPV4_LOOPBACK)
+            .await
+            .unwrap();
+        gate.remove_family("iptables").await.unwrap();
+        let reads = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.as_str() == "iptables -w -S")
+            .count();
+        assert_eq!(
+            reads, 2,
+            "a close between verify and remove must force a fresh read"
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_of_an_absent_gate_is_a_read_and_nothing_else() {
+        let runner = ScriptedRunner {
+            dump: "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n".to_string(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let calls = runner.calls.clone();
+        IptablesGate::new(runner)
+            .remove_family("iptables")
+            .await
+            .unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), ["iptables -w -S"]);
     }
 
     /// Build a `/sys/class/net` where the `backed` interfaces carry the
@@ -1750,19 +2406,16 @@ mod tests {
         assert!(err.contains("enp0s4") && err.contains("eth0"), "{err}");
     }
 
-    #[tokio::test]
-    async fn link_state_changes_address_the_discovered_interface() {
-        let runner = RecordingRunner::default();
-        let calls = runner.0.clone();
-        let link = IpLink::new(runner, "enp0s4".to_string());
-
-        link.down().await.unwrap();
-        link.up().await.unwrap();
-
-        let calls = calls.lock().unwrap().join("\n");
-        assert_eq!(
-            calls, "ip link set dev enp0s4 down\nip link set dev enp0s4 up",
-            "the boundary drove an interface the guest does not have"
+    #[test]
+    fn an_overlong_interface_name_is_refused_rather_than_truncated() {
+        // ifreq's name field is fixed-size; a silently truncated name would
+        // drive the WRONG interface's flags.
+        let too_long = "x".repeat(64);
+        let error = set_interface_up(&too_long, false)
+            .expect_err("an interface name that cannot fit must be refused");
+        assert!(
+            format!("{error:#}").contains("does not fit"),
+            "unexpected diagnostic: {error:#}"
         );
     }
 
@@ -2032,28 +2685,258 @@ mod tests {
         // replacement. A cookie-bound destroy must therefore report
         // already_gone and leave the replacement alone; a tuple-based one would
         // report a destroy and take the wrong socket with it.
+        let report = restore_with(
+            &gate,
+            &link,
+            &barrier,
+            &mut diag,
+            &store,
+            &route_table,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            restore_with(
-                &gate,
-                &link,
-                &barrier,
-                &mut diag,
-                &store,
-                &route_table,
-                CLEANUP_BUDGET
-            )
-            .await
-            .unwrap(),
+            report.tally,
             CleanupTally {
                 destroyed: 0,
                 already_gone: 1,
             }
         );
+        assert!(report.verified_armed);
         let state = state.lock().unwrap();
         assert_eq!(state.live, vec![replacement]);
         assert_eq!(
             state.events,
             vec![
+                "gate-verify",
+                "link-down",
+                "rx-barrier",
+                "cookie-destroy",
+                "gate-open",
+                "link-up",
+                "routes-reinstate"
+            ]
+        );
+        assert!(!state.gate_closed);
+        assert!(!state.link_down);
+    }
+
+    /// A gate probe that cannot READ the chains is not a verdict about them:
+    /// it must reinstall, exactly as if verification had failed, never kill
+    /// an otherwise healthy clone. The spawn-free path has no reads to fail,
+    /// so a read error failing the restore would be a new fatality this
+    /// optimization introduced.
+    #[tokio::test]
+    async fn a_failed_verification_read_demotes_to_the_full_reassert() {
+        let stale = socket(28, [198, 51, 100, 8]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            link_down: true,
+            live: vec![stale],
+            fail_gate_verify: true,
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let link = ModelLink(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        let route_table = ModelRoutes(state.clone());
+        let mut diag = ModelDiag(state.clone());
+
+        let report = restore_with(
+            &gate,
+            &link,
+            &barrier,
+            &mut diag,
+            &store,
+            &route_table,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect("an unverifiable boundary must repair, not fail the restore");
+        assert!(!report.verified_armed);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "gate-close",
+                "link-down",
+                "rx-barrier",
+                "cookie-destroy",
+                "gate-open",
+                "link-up",
+                "routes-reinstate"
+            ]
+        );
+    }
+
+    /// A raised link is exactly what a privileged workload can produce, and
+    /// packets can arrive on it: the boundary must down it and take a fresh
+    /// grace period before retiring any socket, whatever the gate says.
+    #[tokio::test]
+    async fn a_raised_link_is_downed_and_re_barriered_before_cleanup() {
+        let stale = socket(29, [198, 51, 100, 8]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            link_down: false,
+            live: vec![stale],
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let link = ModelLink(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        let route_table = ModelRoutes(state.clone());
+        let mut diag = ModelDiag(state.clone());
+
+        let report = restore_with(
+            &gate,
+            &link,
+            &barrier,
+            &mut diag,
+            &store,
+            &route_table,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
+        assert!(report.verified_armed, "the gate itself was intact");
+        let events = state.lock().unwrap().events.clone();
+        let barrier = events
+            .iter()
+            .position(|e| *e == "rx-barrier")
+            .expect("barrier");
+        let down = events
+            .iter()
+            .position(|e| *e == "link-down")
+            .expect("link-down");
+        let destroy = events
+            .iter()
+            .position(|e| *e == "cookie-destroy")
+            .expect("cleanup");
+        assert!(
+            down < barrier && barrier < destroy,
+            "a raised link must be downed and re-barriered BEFORE cleanup: {events:?}"
+        );
+    }
+
+    /// The gate chains frozen into a current snapshot are verified, not
+    /// reinstalled. The link-down and the receive barrier are asserted
+    /// regardless, because a privileged workload sharing this namespace can
+    /// raise the link between any observation and the cleanup.
+    #[tokio::test]
+    async fn restore_verifies_the_armed_boundary_instead_of_reasserting_it() {
+        let stale = socket(26, [198, 51, 100, 8]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            link_down: true,
+            live: vec![stale],
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let link = ModelLink(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        let route_table = ModelRoutes(state.clone());
+        let mut diag = ModelDiag(state.clone());
+
+        let report = restore_with(
+            &gate,
+            &link,
+            &barrier,
+            &mut diag,
+            &store,
+            &route_table,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
+        assert!(report.verified_armed);
+        let state = state.lock().unwrap();
+        assert!(
+            !state.events.contains(&"gate-close"),
+            "a verified gate was reinstalled: {:?}",
+            state.events
+        );
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "link-down",
+                "rx-barrier",
+                "cookie-destroy",
+                "gate-open",
+                "link-up",
+                "routes-reinstate"
+            ],
+            "the link and the barrier must be re-asserted even on the fast path"
+        );
+    }
+
+    /// A snapshot whose boundary does not verify (here: gate open and link up
+    /// under a live manifest) must get the full re-assert, receive barrier
+    /// included, before any socket is touched.
+    #[tokio::test]
+    async fn restore_repairs_an_unverified_boundary_before_cleanup() {
+        let stale = socket(27, [198, 51, 100, 8]);
+        let state = Arc::new(Mutex::new(ModelState {
+            live: vec![stale],
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let link = ModelLink(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        let route_table = ModelRoutes(state.clone());
+        let mut diag = ModelDiag(state.clone());
+
+        let report = restore_with(
+            &gate,
+            &link,
+            &barrier,
+            &mut diag,
+            &store,
+            &route_table,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
+        assert!(!report.verified_armed);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
                 "gate-close",
                 "link-down",
                 "rx-barrier",
@@ -2106,7 +2989,7 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-close", "link-down", "rx-barrier", "cookie-destroy"]
+            vec!["gate-verify", "link-down", "rx-barrier", "cookie-destroy"]
         );
         assert!(state.gate_closed, "failed restore published ingress");
         assert!(state.link_down, "failed restore raised the external link");
@@ -2158,7 +3041,7 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-close", "link-down", "rx-barrier", "cookie-destroy"]
+            vec!["gate-verify", "link-down", "rx-barrier", "cookie-destroy"]
         );
         assert!(state.gate_closed);
         assert!(state.link_down);
@@ -2209,7 +3092,7 @@ mod tests {
         );
 
         let state = state.lock().unwrap();
-        assert_eq!(state.events, vec!["gate-close", "link-down", "rx-barrier"]);
+        assert_eq!(state.events, vec!["gate-verify", "link-down", "rx-barrier"]);
         assert!(state.gate_closed, "a timed-out cleanup published ingress");
         assert!(
             state.link_down,

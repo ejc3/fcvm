@@ -14,7 +14,6 @@
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use crate::types::{LatestMetadata, Plan};
 use crate::vsock::{VsockStream, HOST_CID};
@@ -105,29 +104,69 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
             let doc = read_vsock_doc().await?;
             let meta: LatestMetadata =
                 serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
-            set_system_clock(&meta.host_time).await
+            set_system_clock(&meta.host_time);
+            Ok(())
         }
     }
 }
 
 /// Set the system clock to `host_time` (UTC epoch seconds). Shared by both transports.
-pub(crate) async fn set_system_clock(host_time: &str) -> Result<()> {
+///
+/// Steps the clock with `clock_settime(2)` directly: fc-agent holds
+/// CAP_SYS_TIME, and this runs on the restore critical path where a process
+/// spawn is pure latency. Failure is soft by construction (this returns
+/// nothing): chronyd converges the clock eventually, and refusing restore
+/// over a clock step would trade a one-second skew for a dead clone.
+pub(crate) fn set_system_clock(host_time: &str) {
     eprintln!("[fc-agent] received host time: {host_time}");
-    let output = Command::new("date")
-        .arg("-u")
-        .arg("-s")
-        .arg(format!("@{host_time}"))
-        .output()
-        .await
-        .context("setting system clock")?;
-    if !output.status.success() {
-        eprintln!(
-            "[fc-agent] WARNING: failed to set clock: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
-    } else {
-        eprintln!("[fc-agent] system clock synchronized from host");
+    match parse_epoch_seconds(host_time) {
+        Ok(seconds) => {
+            let spec = libc::timespec {
+                tv_sec: seconds as _,
+                tv_nsec: 0,
+            };
+            // SAFETY: `spec` is fully initialized and outlives the call.
+            let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &spec) };
+            if rc != 0 {
+                eprintln!(
+                    "[fc-agent] WARNING: failed to set clock: {}",
+                    std::io::Error::last_os_error()
+                );
+                eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
+            } else {
+                eprintln!("[fc-agent] system clock synchronized from host");
+            }
+        }
+        Err(error) => {
+            eprintln!("[fc-agent] WARNING: failed to set clock: {error:#}");
+            eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
+        }
     }
-    Ok(())
+}
+
+/// Parse the host's clock value: non-negative decimal epoch seconds.
+///
+/// Returns i64 rather than `libc::time_t`, which is deprecated because musl
+/// widened it; the cast at the one call site adapts to whatever the target's
+/// `timespec` field actually is.
+fn parse_epoch_seconds(host_time: &str) -> Result<i64> {
+    let seconds: i64 = host_time
+        .trim()
+        .parse()
+        .with_context(|| format!("host time {host_time:?} is not decimal epoch seconds"))?;
+    anyhow::ensure!(seconds >= 0, "host time {host_time:?} is before the epoch");
+    Ok(seconds)
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn epoch_seconds_parse_rejects_garbage_and_pre_epoch_values() {
+        assert_eq!(parse_epoch_seconds("1786000000\n").unwrap(), 1786000000);
+        assert!(parse_epoch_seconds("-1").is_err(), "before the epoch");
+        assert!(parse_epoch_seconds("").is_err(), "empty");
+        assert!(parse_epoch_seconds("1786000000.5").is_err(), "fractional");
+    }
 }

@@ -27,7 +27,10 @@ use super::common::{
     MemoryBackend, RestoreParams, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT,
     VSOCK_RESTORE_COMPLETE_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT,
 };
-use super::podman::{run_output_listener, run_status_listener, spawn_restore_completion_listener};
+use super::podman::{
+    run_output_listener, run_status_listener, spawn_restore_completion_listener,
+    RestoreCompletionReceiver,
+};
 
 const SNAPSHOT_LINEAGE_RETRY_LIMIT: usize = 64;
 // Restore work can legitimately take minutes on a CPU-starved guest, but a live
@@ -66,7 +69,7 @@ struct CloneSetupResources {
     status_handle: Option<tokio::task::JoinHandle<()>>,
     bootplan_handle: Option<tokio::task::JoinHandle<()>>,
     restore_completion_handle: Option<tokio::task::JoinHandle<()>>,
-    restore_completion_rx: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    restore_completion_rx: Option<RestoreCompletionReceiver>,
 }
 
 impl CloneSetupResources {
@@ -386,7 +389,7 @@ where
 async fn wait_for_restore_completion<F>(
     vm_id: &str,
     expected_epoch: &str,
-    completion_rx: &mut tokio::sync::oneshot::Receiver<Result<()>>,
+    completion_rx: &mut RestoreCompletionReceiver,
     cancel: &tokio_util::sync::CancellationToken,
     timeout: Duration,
     liveness_interval: &mut tokio::time::Interval,
@@ -401,10 +404,14 @@ where
         tokio::select! {
             result = &mut *completion_rx => {
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(guest_phases)) => {
+                        // guest_phases is the agent's per-phase restore timing
+                        // telemetry (compact JSON), the only host-visible
+                        // attribution of the guest's ACK critical path.
                         info!(
                             vm_id = %vm_id,
                             restore_epoch = %expected_epoch,
+                            guest_phases = %guest_phases.as_deref().unwrap_or("<none>"),
                             "fc-agent acknowledged exact restore generation"
                         );
                         return Ok(true);
@@ -3637,7 +3644,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_completion_timeout_fails_with_generation_and_phase() {
-        let (_sender, mut receiver) = tokio::sync::oneshot::channel::<Result<()>>();
+        let (_sender, mut receiver) = tokio::sync::oneshot::channel::<Result<Option<String>>>();
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut liveness = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(60),
@@ -3673,7 +3680,7 @@ mod tests {
     }
 
     async fn assert_restore_consumer_waits_for_ack(consumer: &'static str) {
-        let (sender, mut receiver) = tokio::sync::oneshot::channel::<Result<()>>();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel::<Result<Option<String>>>();
         let cancel = tokio_util::sync::CancellationToken::new();
         let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let published_after_ack = published.clone();
@@ -3713,7 +3720,7 @@ mod tests {
             "{consumer} ran before the exact restore ACK"
         );
         sender
-            .send(Ok(()))
+            .send(Ok(None))
             .expect("consumer must retain the restore ACK receiver");
         waiter.await.expect("consumer task panicked");
         assert!(

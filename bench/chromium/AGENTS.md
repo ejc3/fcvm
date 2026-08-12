@@ -15,10 +15,15 @@ nothing. Every rule below exists because one of them broke.
 
 The phases are separate subcommands and the order is not optional. `golden`
 does NOT build the image — on a box that has never built it, `golden` dies
-with `localhost/chromium-bench-req: image not known`, so `build` comes first:
+with `localhost/chromium-bench-req: image not known`, so `build` comes first.
+After rebuilding fcvm or fc-agent, `make setup-fcvm` must run before `golden`:
+the initrd is content-addressed by the fc-agent binary's SHA, `make build`
+does not create it, and `podman prepare` refuses rather than auto-creating
+("fc-agent initrd not found. Run 'fcvm setup' first"):
 
 ```bash
 cd ~/src/fcvm            # phases resolve the repo root from the script path
+make build && make setup-fcvm            # setup-fcvm creates the initrd for the NEW fc-agent SHA
 bash bench/chromium/reqbench.sh build    # podman build --format docker (HEALTHCHECK is load-bearing)
 bash bench/chromium/reqbench.sh golden   # podman prepare: cold build, snapshot at the health gate
 bash bench/chromium/reqbench.sh verify   # prove all three hops on a RESTORED clone before measuring
