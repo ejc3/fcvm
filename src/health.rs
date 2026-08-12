@@ -225,7 +225,7 @@ pub fn spawn_health_monitor_full(
             } else {
                 consecutive_failures += 1;
                 // Log at WARN every 10 failures (~30-50s) so CI logs show something
-                if consecutive_failures == 10 || consecutive_failures % 30 == 0 {
+                if consecutive_failures == 10 || consecutive_failures.is_multiple_of(30) {
                     warn!(target: "health-monitor",
                         consecutive_failures,
                         status = ?health_status,

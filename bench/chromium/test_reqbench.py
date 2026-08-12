@@ -5105,3 +5105,73 @@ class NoConfusableIdentifiers(unittest.TestCase):
             "it is a homoglyph trap: the name reads as ASCII and is not.\n"
             + "\n".join(offenders),
         )
+
+
+class TimedWsUpgradeDiagnostics(unittest.TestCase):
+    """A WebSocket-upgrade failure must still report the socket it failed on.
+
+    `ws = TimedWs(...)` binds `ws` only when the constructor RETURNS, so a
+    failure during the HTTP upgrade left the name unbound and cdpdrive's
+    handler emitted a transport failure with no `socket_local`, `socket_peer`
+    or `socket_so_error` — the three fields that say WHICH connection died.
+    Red before the fix: `AssertionError: socket diagnostics missing: []`.
+    """
+
+    def _serve_once(self, respond: bytes):
+        import socket as _socket
+        import threading as _threading
+
+        listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        def run():
+            conn, _ = listener.accept()
+            try:
+                conn.recv(4096)
+                conn.sendall(respond)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+                listener.close()
+
+        thread = _threading.Thread(target=run, daemon=True)
+        thread.start()
+        return port, thread
+
+    def test_upgrade_rejection_carries_socket_diagnostics(self):
+        import importlib.util
+        import pathlib
+        import socket as _socket
+
+        here = pathlib.Path(__file__).parent
+        spec = importlib.util.spec_from_file_location("cdpdrive", here / "cdpdrive.py")
+        cdpdrive = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cdpdrive)
+        render = importlib.import_module("render") if False else None
+        spec_r = importlib.util.spec_from_file_location("render", here / "render.py")
+        render = importlib.util.module_from_spec(spec_r)
+        spec_r.loader.exec_module(render)
+
+        # A server that completes TCP and then REJECTS the upgrade: the failure
+        # lands after self.sock exists, which is the case that lost diagnostics.
+        port, thread = self._serve_once(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+        with self.assertRaises(ConnectionError) as caught:
+            cdpdrive.TimedWs(render, f"ws://127.0.0.1:{port}/devtools/page/x", time.monotonic() + 5)
+        thread.join(timeout=5)
+
+        diagnostics = getattr(caught.exception, "fcvm_socket_diagnostics", {})
+        self.assertEqual(
+            sorted(diagnostics),
+            ["socket_local", "socket_peer", "socket_so_error"],
+            f"socket diagnostics missing: {sorted(diagnostics)}. An upgrade failure "
+            "must still say which connection died; the values have to be read while "
+            "the socket is open, since a closed one raises EBADF and drive() "
+            "swallows that.",
+        )
+        self.assertEqual(diagnostics["socket_local"][0], "127.0.0.1")
+        self.assertEqual(diagnostics["socket_peer"][1], port)
+        self.assertIsInstance(diagnostics["socket_so_error"], int)

@@ -177,6 +177,29 @@ def resolve_target(cdp_host: str, deadline: float, retries: int,
     raise ConnectionError(msg)
 
 
+def socket_diagnostics(sock) -> dict:
+    """The three fields that identify WHICH connection failed.
+
+    Each is read independently: a socket can answer getsockname() and not
+    getpeername() (never connected), and every one of them raises once the
+    socket is closed — so this must run while it is still open.
+    """
+    out = {}
+    try:
+        out["socket_local"] = list(sock.getsockname())
+    except OSError:
+        pass
+    try:
+        out["socket_peer"] = list(sock.getpeername())
+    except OSError:
+        pass
+    try:
+        out["socket_so_error"] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    except OSError:
+        pass
+    return out
+
+
 class TimedWs:
     """RFC 6455 client whose TCP connect and HTTP upgrade are timed separately.
 
@@ -190,9 +213,31 @@ class TimedWs:
         host, port = u.hostname, u.port or 80
 
         t = time.monotonic()
+        # A connect failure has no socket to describe. Everything after this
+        # line does, and the handler in drive() reads the diagnostics off the
+        # EXCEPTION rather than off `ws` — the name `ws` is only bound once the
+        # constructor returns, so an upgrade failure would otherwise report a
+        # WebSocket failure with no socket_local/socket_peer/socket_so_error.
         self.sock = socket.create_connection(
             (host, port), timeout=max(0.05, deadline - time.monotonic())
         )
+        try:
+            self._handshake(render_mod, u, host, port, deadline, t)
+        except BaseException as e:
+            # Read the diagnostics off the LIVE socket and attach the values,
+            # not the socket: closing it first makes every getsockname/
+            # getpeername/getsockopt raise EBADF, which drive()'s handler
+            # swallows, so handing over a closed socket reports nothing at all.
+            # Then close, because an abandoned CLOSE_WAIT socket per failed rep
+            # is a leak.
+            e.fcvm_socket_diagnostics = socket_diagnostics(self.sock)
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            raise
+
+    def _handshake(self, render_mod, u, host, port, deadline: float, t: float):
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.tcp_ms = (time.monotonic() - t) * 1000
 
@@ -390,20 +435,14 @@ def drive(args) -> dict:
         out["transport_signal"] = transport_signal(e, render)
         if isinstance(e, OSError):
             out["socket_errno"] = e.errno
+        # `ws` is bound only after the constructor RETURNS, so an upgrade-phase
+        # failure leaves it None. The constructor reads the same three fields
+        # off its live socket and attaches them to the exception for that case.
         sock = getattr(ws, "sock", None)
         if sock is not None:
-            try:
-                out["socket_local"] = list(sock.getsockname())
-            except OSError:
-                pass
-            try:
-                out["socket_peer"] = list(sock.getpeername())
-            except OSError:
-                pass
-            try:
-                out["socket_so_error"] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-            except OSError:
-                pass
+            out.update(socket_diagnostics(sock))
+        else:
+            out.update(getattr(e, "fcvm_socket_diagnostics", {}))
         # Classify, so downstream can gate on it instead of substring-matching the
         # message. A `WsClosed` is the PEER closing the TCP connection — it is NOT
         # this driver's own timeout (render.py raises TimeoutError for that), so a

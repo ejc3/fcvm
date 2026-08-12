@@ -127,11 +127,18 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             profile_name, profile.description
         );
 
-        // Download or build the profile kernel
-        let profile_kernel_path =
+        // Download or build the profile kernel. --force-build-kernels bypasses
+        // the download so a release refresh cannot republish the artifact it
+        // was asked to replace.
+        let profile_kernel_path = if args.force_build_kernels {
+            crate::setup::rebuild_kernel_from_source(profile_name)
+                .await
+                .context("rebuilding profile kernel from source")?
+        } else {
             crate::setup::ensure_kernel(profile_name, true, args.build_kernels)
                 .await
-                .context("setting up profile kernel")?;
+                .context("setting up profile kernel")?
+        };
         println!(
             "  ✓ Profile kernel ready: {}",
             profile_kernel_path.display()

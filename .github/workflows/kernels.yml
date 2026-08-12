@@ -47,6 +47,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+          # This job holds `contents: write` and then runs checkout-controlled
+          # `make build` plus Rust build scripts. Persisting the token in
+          # fcvm/.git/config would put a write-capable credential where any of
+          # that code can read it; the release steps scope GH_TOKEN themselves.
+          persist-credentials: false
 
       - uses: ./fcvm/.github/actions/checkout-deps
 
@@ -224,6 +229,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+          # This job holds `contents: write` and then runs checkout-controlled
+          # `make build` plus Rust build scripts. Persisting the token in
+          # fcvm/.git/config would put a write-capable credential where any of
+          # that code can read it; the release steps scope GH_TOKEN themselves.
+          persist-credentials: false
 
       - uses: ./fcvm/.github/actions/checkout-deps
 
@@ -442,6 +452,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+          # This job holds `contents: write` and then runs checkout-controlled
+          # `make build` plus Rust build scripts. Persisting the token in
+          # fcvm/.git/config would put a write-capable credential where any of
+          # that code can read it; the release steps scope GH_TOKEN themselves.
+          persist-credentials: false
 
       - uses: ./fcvm/.github/actions/checkout-deps
 

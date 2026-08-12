@@ -359,13 +359,33 @@ pub fn send_status(message: &[u8]) -> bool {
 /// transports: the host binds the matching one-shot listener before resume, and
 /// treats any missing/malformed/wrong-generation frame as a restore failure.
 pub async fn notify_restore_complete(restore_epoch: &str) -> Result<()> {
+    /// Deadline for writing the (tiny) ACK frame to a host that has already
+    /// accepted the connection.
+    const RESTORE_COMPLETE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     let stream = VsockStream::connect(HOST_CID, RESTORE_COMPLETE_PORT).with_context(|| {
         format!(
             "restore-completion ACK failed (phase=connect expected_epoch={restore_epoch} observed_epoch=<none>)"
         )
     })?;
     let frame = format!("restore-complete:{restore_epoch}\n");
-    stream.write_all(frame.as_bytes()).await.with_context(|| {
+    // Bounded: a host that accepts and then stops reading (or a wedged
+    // transport) would otherwise block this write forever, leaving the clone
+    // alive, unpublished and silent. The caller treats an ACK error as fatal
+    // and shuts the clone down, so a deadline converts a silent hang into a
+    // diagnosable failure. The frame is a few dozen bytes.
+    tokio::time::timeout(
+        RESTORE_COMPLETE_ACK_TIMEOUT,
+        stream.write_all(frame.as_bytes()),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "restore-completion ACK failed (phase=write-frame expected_epoch={restore_epoch} reason=timed out after {:?})",
+            RESTORE_COMPLETE_ACK_TIMEOUT
+        )
+    })?
+    .with_context(|| {
         format!(
             "restore-completion ACK failed (phase=write-frame expected_epoch={restore_epoch} observed_epoch={restore_epoch})"
         )

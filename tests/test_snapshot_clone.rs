@@ -553,10 +553,10 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
     let custom_dir_arg = custom_dir.path().display().to_string();
     let expected_source = custom_dir.path().join("vsock.sock");
 
-    let mut cleanup_pids = Vec::new();
+    let mut cleanup_procs: Vec<(u32, tokio::process::Child)> = Vec::new();
     let mut snapshot_created = false;
     let result: Result<()> = async {
-        let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        let (baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
             &[
                 "podman",
                 "run",
@@ -573,7 +573,7 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
         )
         .await
         .context("spawning custom-vsock source VM")?;
-        cleanup_pids.push(baseline_pid);
+        cleanup_procs.push((baseline_pid, baseline_child));
         common::poll_health_by_pid(baseline_pid, 120).await?;
 
         common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
@@ -583,13 +583,13 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
             .await?;
         assert_eq!(snapshot.source_vsock_socket_path, expected_source);
 
-        let (_serve_child, serve_pid) =
+        let (serve_child, serve_pid) =
             common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_name)
                 .await?;
-        cleanup_pids.push(serve_pid);
+        cleanup_procs.push((serve_pid, serve_child));
         common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
-        let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        let (clone_child, clone_pid) = common::spawn_fcvm_with_logs(
             &[
                 "snapshot",
                 "run",
@@ -602,7 +602,7 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
         )
         .await
         .context("restoring clone while custom-vsock source remains live")?;
-        cleanup_pids.push(clone_pid);
+        cleanup_procs.push((clone_pid, clone_child));
         common::poll_health_by_pid(clone_pid, 120).await?;
 
         let source_exec = common::exec_in_vm(baseline_pid, &["echo", "source-control-ok"])
@@ -636,26 +636,61 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
     }
     .await;
 
-    for pid in cleanup_pids.into_iter().rev() {
+    let mut cleanup_errors: Vec<String> = Vec::new();
+    for (pid, mut child) in cleanup_procs.into_iter().rev() {
         common::kill_process(pid).await;
-        assert!(
-            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-            "cleanup left PID {pid} alive"
-        );
+        // Reap before the liveness check: a zombie still satisfies /proc/<pid>,
+        // and a recorded failure must not abort the remaining cleanup.
+        if let Err(error) = child.wait().await {
+            cleanup_errors.push(format!("reaping PID {pid}: {error:#}"));
+        }
+        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            cleanup_errors.push(format!("cleanup left PID {pid} alive"));
+        }
     }
     if snapshot_created {
-        common::delete_snapshot(&snapshot_name).await?;
-        assert!(!common::snapshot_exists(&snapshot_name));
+        match common::delete_snapshot(&snapshot_name).await {
+            Ok(()) => {
+                if common::snapshot_exists(&snapshot_name) {
+                    cleanup_errors.push(format!("snapshot {snapshot_name} still exists"));
+                }
+            }
+            Err(error) => {
+                cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"))
+            }
+        }
     }
     // Custom socket paths are outside the VM runtime tree, so clean their
     // dedicated test directory explicitly after every owned process is reaped.
     if custom_dir.path().exists() {
-        tokio::fs::remove_dir_all(custom_dir.path())
-            .await
-            .context("removing custom vsock test directory")?;
+        if let Err(error) = tokio::fs::remove_dir_all(custom_dir.path()).await {
+            cleanup_errors.push(format!("removing custom vsock test directory: {error:#}"));
+        }
     }
 
-    result
+    combine_with_cleanup(result, cleanup_errors)
+}
+
+/// Combine an exercise result with fixture-cleanup failures so a cleanup error
+/// can never SHADOW the assertion failure it followed: the exercise error stays
+/// primary and cleanup failures ride along as context, while a clean exercise
+/// still fails loudly on a cleanup leak.
+fn combine_with_cleanup(result: Result<()>, cleanup_errors: Vec<String>) -> Result<()> {
+    match result {
+        Err(error) if cleanup_errors.is_empty() => Err(error),
+        Err(error) => Err(error.context(format!(
+            "fixture cleanup also failed:\n- {}",
+            cleanup_errors.join("\n- ")
+        ))),
+        Ok(()) => {
+            anyhow::ensure!(
+                cleanup_errors.is_empty(),
+                "fixture cleanup failed:\n- {}",
+                cleanup_errors.join("\n- ")
+            );
+            Ok(())
+        }
+    }
 }
 
 /// MAXIMUM REUSE / CACHEABILITY: a snapshot-cache hit must HONOR `--vsock-dir`
@@ -807,6 +842,7 @@ async fn test_vsock_dir_honored_on_snapshot_cache_hit() -> Result<()> {
     }
     .await;
 
+    let mut cleanup_errors: Vec<String> = Vec::new();
     for pid in cleanup_pids.into_iter().rev() {
         common::kill_process(pid).await;
     }
@@ -814,11 +850,11 @@ async fn test_vsock_dir_honored_on_snapshot_cache_hit() -> Result<()> {
         let _ = common::delete_snapshot(key).await;
     }
     if custom_dir.path().exists() {
-        tokio::fs::remove_dir_all(custom_dir.path())
-            .await
-            .context("removing custom vsock test dir")?;
+        if let Err(error) = tokio::fs::remove_dir_all(custom_dir.path()).await {
+            cleanup_errors.push(format!("removing custom vsock test dir: {error:#}"));
+        }
     }
-    result
+    combine_with_cleanup(result, cleanup_errors)
 }
 
 /// `--vsock-dir` with the snapshot lifecycle enabled end to end: the VM
@@ -889,6 +925,7 @@ async fn test_vsock_dir_survives_the_snapshot_lifecycle() -> Result<()> {
     }
     .await;
 
+    let mut cleanup_errors: Vec<String> = Vec::new();
     if let Some(pid) = cleanup_pid {
         common::kill_process(pid).await;
     }
@@ -896,11 +933,11 @@ async fn test_vsock_dir_survives_the_snapshot_lifecycle() -> Result<()> {
         let _ = common::delete_snapshot(key).await;
     }
     if custom_dir.path().exists() {
-        tokio::fs::remove_dir_all(custom_dir.path())
-            .await
-            .context("removing custom vsock test dir")?;
+        if let Err(error) = tokio::fs::remove_dir_all(custom_dir.path()).await {
+            cleanup_errors.push(format!("removing custom vsock test dir: {error:#}"));
+        }
     }
-    result
+    combine_with_cleanup(result, cleanup_errors)
 }
 
 /// Test cloning while baseline VM is still running (bridged)

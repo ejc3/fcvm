@@ -316,7 +316,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM as part of the boo
 - AWS: c6g.metal (ARM64) or c5.metal (x86_64)
 
 **Dependencies:**
-- Rust 1.75+ with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
+- Rust 1.93 (pinned by `rust-toolchain.toml`) with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH (default backend)
 - Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): build the pinned fork with `fcvm setup --cloud-hypervisor`, or set `FCVM_CLOUD_HYPERVISOR_BIN`, or put `cloud-hypervisor` in PATH (resolved in that order)
 - For rootless: `passt` package (provides `pasta`)

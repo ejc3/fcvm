@@ -64,6 +64,13 @@ pub struct SetupArgs {
     #[arg(long)]
     pub build_kernels: bool,
 
+    /// Rebuild the profile kernel from source, skipping the release download.
+    /// `--build-kernels` only builds after a download FAILS, so it cannot
+    /// refresh content whose release is still published. Requires
+    /// --kernel-profile.
+    #[arg(long, requires = "kernel_profile")]
+    pub force_build_kernels: bool,
+
     /// Override rootfs filesystem type from kernel profile config (for testing).
     #[arg(long, value_enum, hide = true)]
     pub rootfs_type: Option<RootfsType>,

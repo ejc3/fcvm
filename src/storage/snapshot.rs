@@ -455,7 +455,7 @@ fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotCon
         "kind",
     ]
     .into_iter()
-    .filter(|field| object.get(*field).map_or(true, serde_json::Value::is_null))
+    .filter(|field| object.get(*field).is_none_or(serde_json::Value::is_null))
     .collect();
     if !missing_or_null.is_empty() {
         anyhow::bail!(

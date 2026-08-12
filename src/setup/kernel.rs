@@ -64,6 +64,87 @@ pub async fn ensure_kernel(
     }
 }
 
+/// Rebuild a source-built profile's kernel from source, bypassing the release
+/// download entirely, and return its content-addressed path.
+///
+/// [`ensure_kernel`] prefers a published release and only builds after a FAILED
+/// download, so a release-refresh job cannot force a rebuild by deleting the
+/// cached file: the release it is about to replace is still published, the
+/// download succeeds, and the job republishes the exact artifact the operator
+/// asked to replace. A post-run "the file exists" assertion cannot catch that,
+/// because a download produces the same file. This is the path for "the
+/// published content is wrong, build it again from source".
+pub async fn rebuild_kernel_from_source(profile_name: &str) -> Result<PathBuf> {
+    let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "kernel profile '{}' not found in config. \
+             Add [kernel_profiles.{}] section to rootfs-config.toml",
+            profile_name,
+            profile_name
+        )
+    })?;
+    anyhow::ensure!(
+        !profile.inherits_kernel(),
+        "kernel profile '{}' inherits its kernel; rebuild the profile it inherits from instead",
+        profile_name
+    );
+    anyhow::ensure!(
+        !profile.is_url_based(),
+        "kernel profile '{}' is URL-based; there is no source to rebuild from",
+        profile_name
+    );
+
+    let sha = compute_profile_kernel_sha(&profile)?;
+    let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
+    let kernel_dir = paths::kernel_dir();
+    let kernel_path = kernel_dir.join(&filename);
+
+    tokio::fs::create_dir_all(&kernel_dir)
+        .await
+        .context("creating kernel directory")?;
+    let lock_file = kernel_dir.join(format!("{}.lock", filename));
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening kernel lock file")?;
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring exclusive lock for kernel")?;
+
+    // Build to a unique sibling and rename into place, so a build that fails
+    // partway leaves the existing artifact untouched instead of destroying a
+    // usable cached kernel (measured: an early version deleted first, and a
+    // build that died on a DNS failure took the cache with it). Unique per
+    // builder via uuid, not pid — separate PID namespaces reuse numbers — and
+    // the rename is atomic and happens under the same lock.
+    let staging_path = kernel_dir.join(format!("{}.rebuild-{}", filename, uuid::Uuid::new_v4()));
+    println!("⚙️  Rebuilding kernel from source (profile: {profile_name})...");
+    info!(profile = %profile_name, path = %kernel_path.display(), staging = %staging_path.display(), "forced source rebuild, skipping release download");
+    let publish_result = match build_kernel_locally(&profile, profile_name, &staging_path).await {
+        Ok(()) => tokio::fs::rename(&staging_path, &kernel_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "publishing rebuilt kernel {} -> {}",
+                    staging_path.display(),
+                    kernel_path.display()
+                )
+            }),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            Err(error)
+        }
+    };
+    flock.unlock().map_err(|(_, err)| err)?;
+    publish_result?;
+    println!("  ✓ Kernel rebuilt from source (profile: {profile_name})");
+    Ok(kernel_path)
+}
+
 /// Get kernel path (without downloading/building).
 ///
 /// Returns the path where the kernel should exist.

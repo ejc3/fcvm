@@ -663,7 +663,7 @@ pub(crate) async fn run_output_listener(
                     }
                     Ok(n) => {
                         lines_read += 1;
-                        if lines_read <= 3 || lines_read % 1000 == 0 {
+                        if lines_read <= 3 || lines_read.is_multiple_of(1000) {
                             debug!(vm_id = %vm_id, lines_read, bytes = n, "Output line received");
                         }
                         let line = line_buf.trim_end();

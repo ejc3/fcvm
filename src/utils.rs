@@ -537,7 +537,7 @@ pub async fn wait_for_namespace_ready(
                 }
 
                 // Log what we're waiting for
-                if iterations == 1 || iterations % 50 == 0 {
+                if iterations == 1 || iterations.is_multiple_of(50) {
                     debug!(
                         holder_pid = holder_pid,
                         iterations = iterations,

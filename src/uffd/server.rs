@@ -2050,9 +2050,9 @@ impl GuestRegionUffdMapping {
         })?;
 
         let page_size = self.page_size as u64;
-        if self.base_host_virt_addr % page_size != 0
+        if !self.base_host_virt_addr.is_multiple_of(page_size)
             || size % page_size != 0
-            || self.offset % page_size != 0
+            || !self.offset.is_multiple_of(page_size)
         {
             anyhow::bail!(
                 "mapping is not page-aligned: base 0x{:x}, size {}, offset {}, page_size {}",

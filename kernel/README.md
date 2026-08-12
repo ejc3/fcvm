@@ -9,13 +9,27 @@ The default profile is part of snapshot correctness. Every shipped guest config
 must enable:
 
 - `CONFIG_FUSE_FS=y` for host-backed volumes
-- `CONFIG_INET_DIAG=y`
-- `CONFIG_INET_DIAG_DESTROY=y` for selective `SOCK_DESTROY`
-- `CONFIG_PACKET=y` for the guest agent's netlink transport
+- `CONFIG_INET_DIAG=y` and `CONFIG_INET_DIAG_DESTROY=y`, to enumerate sockets by
+  kernel cookie and retire exactly that set with `SOCK_DESTROY`
+- `CONFIG_PACKET=y`, whose AF_PACKET receive path supplies the grace period that
+  closes the capture boundary
+- the directional NEW-flow REJECT gate that holds the boundary shut while
+  cookies are captured and retired: `CONFIG_NETFILTER_XTABLES=y`,
+  `CONFIG_NF_TABLES=y`, `CONFIG_NFT_COMPAT=y`, `CONFIG_NF_CONNTRACK=y`,
+  `CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y`, and both address families
+  (`CONFIG_IP_NF_IPTABLES=y`, `CONFIG_IP_NF_TARGET_REJECT=y`,
+  `CONFIG_IP6_NF_IPTABLES=y`, `CONFIG_IP6_NF_TARGET_REJECT=y`) — the guest runs
+  iptables and ip6tables, so a missing family means the gate cannot install and
+  snapshot creation fails closed
 
-The last three options let the guest capture the pre-snapshot socket set and
-destroy exactly that set before memory is persisted. A kernel without them
-cannot safely create a restorable network snapshot.
+`tests/test_default_kernel_release.rs` asserts this exact list against every
+`kernel/*.conf`, so it is the contract rather than a summary of one.
+
+The capture side runs at snapshot time, before memory is persisted: the guest
+holds the boundary shut, enumerates its sockets, and retires them. The captured
+sockets are destroyed again on the RESTORE side, before the clone is published,
+because the restored memory image still contains them. A kernel without these
+options cannot safely create a restorable network snapshot.
 
 ## Release identity
 

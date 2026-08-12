@@ -306,149 +306,129 @@ pub async fn watch_restore_epoch(
             match &last_epoch {
                 None => {
                     eprintln!("[fc-agent] detected restore-epoch: {}", current,);
-                    if let Err(error) = signals.restore_status.begin() {
-                        eprintln!(
-                            "[fc-agent] FATAL: cannot begin clone restore (epoch={}): {:#}; \
-                             shutting down clone",
-                            current, error
-                        );
-                        signals.restore_status.fail();
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    // Signal notify_cache_ready_and_wait to stop waiting.
-                    // Must be set BEFORE handle_clone_restore so the poll loop
-                    // exits before output reconnect changes vsock state.
-                    signals
-                        .restore_flag
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    if let Err(error) = crate::restore::handle_clone_restore(
-                        &signals,
-                        metadata.clone_ipv6.as_deref(),
-                        egress_gen_at_last_stable,
+                    // Publish the handled generation in watcher state BEFORE the
+                    // sequence publishes readiness: the host can request another
+                    // snapshot as soon as readiness appears, and that snapshot must
+                    // not capture an old `last_epoch` and mistake its existing
+                    // listener for a new restore control generation.
+                    last_epoch = Some(current.clone());
+                    apply_restore_epoch(
                         current,
+                        &signals,
+                        egress_gen_at_last_stable,
+                        metadata.clone_ipv6.as_deref(),
                         metadata_transport,
                     )
-                    .await
-                    {
-                        signals.restore_status.fail();
-                        eprintln!(
-                            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}. \
-                             Output/exec readiness will not be published; shutting down clone",
-                            current, error
-                        );
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    // Publish the handled generation in watcher state before
-                    // reconnecting output. The host can request another snapshot
-                    // as soon as readiness appears; that snapshot must not capture
-                    // an old `last_epoch` and mistake its existing listener for a
-                    // new restore control generation.
-                    last_epoch = Some(current.clone());
-                    // The host ACK comes FIRST, because `succeed()` releases the
-                    // WarmStart gate in `agent::run()` and starts the container. An ACK
-                    // that fails after that point has already let a workload touch
-                    // shared volumes and external services on a clone the host is about
-                    // to reject, which is fail-OPEN inside the guest. Exec does not go
-                    // through `RestoreStatus`, so releasing the host first costs
-                    // nothing: there is no container output to miss, because there is
-                    // no container yet.
-                    if let Err(error) = crate::vsock::notify_restore_complete(current).await {
-                        signals.restore_status.fail();
-                        eprintln!(
-                            "[fc-agent] FATAL: restore-completion ACK failed closed \
-                             (epoch={} phase=notify-host): {:#}; host lifecycle/exec \
-                             readiness will not be published; shutting down clone",
-                            current, error
-                        );
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    // Only now, with the host's boundary acknowledged, may the guest
-                    // start its workload.
-                    if let Err(error) = signals.restore_status.succeed() {
-                        signals.restore_status.fail();
-                        eprintln!(
-                            "[fc-agent] FATAL: cannot publish clone restore readiness \
-                             (epoch={}): {:#}; shutting down clone",
-                            current, error
-                        );
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    // Update stable generation after successful restore handling
+                    .await;
+                    // Update the stable generation and stop fast-polling only
+                    // after the whole sequence succeeded.
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
-                    // Epoch found and handled — the fast window did its job.
                     schedule.clear_fast_window();
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
-                    if let Err(error) = signals.restore_status.begin() {
-                        eprintln!(
-                            "[fc-agent] FATAL: cannot begin clone restore (epoch={}): {:#}; \
-                             shutting down clone",
-                            current, error
-                        );
-                        signals.restore_status.fail();
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    signals
-                        .restore_flag
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    if let Err(error) = crate::restore::handle_clone_restore(
-                        &signals,
-                        metadata.clone_ipv6.as_deref(),
-                        egress_gen_at_last_stable,
+                    // Publish the handled generation in watcher state BEFORE the
+                    // sequence publishes readiness: the host can request another
+                    // snapshot as soon as readiness appears, and that snapshot must
+                    // not capture an old `last_epoch` and mistake its existing
+                    // listener for a new restore control generation.
+                    last_epoch = Some(current.clone());
+                    apply_restore_epoch(
                         current,
+                        &signals,
+                        egress_gen_at_last_stable,
+                        metadata.clone_ipv6.as_deref(),
                         metadata_transport,
                     )
-                    .await
-                    {
-                        signals.restore_status.fail();
-                        eprintln!(
-                            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}. \
-                             Output/exec readiness will not be published; shutting down clone",
-                            current, error
-                        );
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    last_epoch = Some(current.clone());
-                    // The host ACK comes FIRST, because `succeed()` releases the
-                    // WarmStart gate in `agent::run()` and starts the container. An ACK
-                    // that fails after that point has already let a workload touch
-                    // shared volumes and external services on a clone the host is about
-                    // to reject, which is fail-OPEN inside the guest. Exec does not go
-                    // through `RestoreStatus`, so releasing the host first costs
-                    // nothing: there is no container output to miss, because there is
-                    // no container yet.
-                    if let Err(error) = crate::vsock::notify_restore_complete(current).await {
-                        signals.restore_status.fail();
-                        eprintln!(
-                            "[fc-agent] FATAL: restore-completion ACK failed closed \
-                             (epoch={} phase=notify-host): {:#}; host lifecycle/exec \
-                             readiness will not be published; shutting down clone",
-                            current, error
-                        );
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    // Only now, with the host's boundary acknowledged, may the guest
-                    // start its workload.
-                    if let Err(error) = signals.restore_status.succeed() {
-                        signals.restore_status.fail();
-                        eprintln!(
-                            "[fc-agent] FATAL: cannot publish clone restore readiness \
-                             (epoch={}): {:#}; shutting down clone",
-                            current, error
-                        );
-                        crate::system::shutdown_vm(1).await;
-                    }
-                    // Update stable generation after successful restore handling
+                    .await;
+                    // Update the stable generation and stop fast-polling only
+                    // after the whole sequence succeeded.
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
-                    // Epoch found and handled — the fast window did its job.
                     schedule.clear_fast_window();
                 }
                 _ => {}
             }
         }
+    }
+}
+
+/// Carry one restore generation through the whole guest-side sequence, in the
+/// one order that is fail-CLOSED, and shut the clone down on any failure.
+///
+/// Both dispatch sites (first epoch seen, and epoch changed) run exactly this;
+/// keeping one copy is what stops the ordering contract below from drifting
+/// between them. Returns only on success — every failure path shuts the VM
+/// down after marking the restore failed, so readiness is never published for a
+/// generation that did not complete.
+///
+/// The order is load-bearing:
+/// 1. `begin()` — the watcher owns this generation.
+/// 2. `restore_flag` — makes `notify_cache_ready_and_wait` stop polling BEFORE
+///    output reconnect changes vsock state under it.
+/// 3. `handle_clone_restore` — rebind exec, reconnect egress.
+/// 4. Host ACK BEFORE `succeed()`: `succeed()` releases the WarmStart gate in
+///    `agent::run()` and starts the container, so an ACK that fails after it
+///    has already let a workload touch shared volumes and external services on
+///    a clone the host is about to reject — fail-OPEN inside the guest. Exec
+///    does not go through `RestoreStatus`, so ACKing first costs nothing:
+///    there is no container output to miss, because there is no container yet.
+/// 5. `succeed()` — with the boundary acknowledged, the workload may start.
+async fn apply_restore_epoch(
+    current: &str,
+    signals: &crate::restore::RestoreSignals,
+    egress_gen_at_last_stable: Option<u64>,
+    clone_ipv6: Option<&str>,
+    metadata_transport: crate::bootplan::Transport,
+) {
+    if let Err(error) = signals.restore_status.begin() {
+        eprintln!(
+            "[fc-agent] FATAL: cannot begin clone restore (epoch={}): {:#}; \
+             shutting down clone",
+            current, error
+        );
+        signals.restore_status.fail();
+        crate::system::shutdown_vm(1).await;
+    }
+    signals
+        .restore_flag
+        .store(true, std::sync::atomic::Ordering::Release);
+    if let Err(error) = crate::restore::handle_clone_restore(
+        signals,
+        clone_ipv6,
+        egress_gen_at_last_stable,
+        current,
+        metadata_transport,
+    )
+    .await
+    {
+        signals.restore_status.fail();
+        eprintln!(
+            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}. \
+             Output/exec readiness will not be published; shutting down clone",
+            current, error
+        );
+        crate::system::shutdown_vm(1).await;
+    }
+    if let Err(error) = crate::vsock::notify_restore_complete(current).await {
+        signals.restore_status.fail();
+        eprintln!(
+            "[fc-agent] FATAL: restore-completion ACK failed closed \
+             (epoch={} phase=notify-host): {:#}; host lifecycle/exec \
+             readiness will not be published; shutting down clone",
+            current, error
+        );
+        crate::system::shutdown_vm(1).await;
+    }
+    if let Err(error) = signals.restore_status.succeed() {
+        signals.restore_status.fail();
+        eprintln!(
+            "[fc-agent] FATAL: cannot publish clone restore readiness \
+             (epoch={}): {:#}; shutting down clone",
+            current, error
+        );
+        crate::system::shutdown_vm(1).await;
     }
 }
 

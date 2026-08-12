@@ -781,7 +781,7 @@ async fn prepare_vm_for_lifecycle(
     validate_vm_name(&args.name).context("invalid VM name")?;
 
     // Validate hugepages memory alignment (2MB pages require even MiB)
-    if args.hugepages && args.mem % 2 != 0 {
+    if args.hugepages && !args.mem.is_multiple_of(2) {
         bail!(
             "--mem {} is not divisible by 2: hugepages requires 2MB-aligned memory size",
             args.mem

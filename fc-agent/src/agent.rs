@@ -3,6 +3,12 @@ use tokio::time::{sleep, Duration};
 
 use crate::{bootplan, container, exec, lock_test, mmds, mounts, network, output, proxy, system};
 
+/// Deadline for a warm start's restore-readiness publication. Generous: the
+/// watcher's own work (exec rebind, egress reconnect) is sub-second, so this
+/// only has to exceed a slow host's restore, and its job is to convert an
+/// indefinite stall into a diagnosable failure.
+const WARM_START_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Main agent logic — fetches plan, runs container, triggers shutdown.
 pub async fn run() -> Result<()> {
     // Route fd 1/2 through the wedge-proof console pipe (writer thread →
@@ -374,10 +380,27 @@ pub async fn run() -> Result<()> {
                     // ready, and requests output reconnect before waking this wait.
                     // Failed is terminal and propagates to main(), which shuts the clone
                     // down without ever publishing host-visible readiness.
-                    restore_status
-                        .wait_for_output_readiness()
-                        .await
-                        .context("waiting for warm-start restore readiness")?;
+                    //
+                    // Bounded: the watcher publishes NEITHER verdict if it never
+                    // observes a restore epoch (e.g. every MMDS fetch fails, which
+                    // mmds.rs logs and retries forever). Without a deadline this
+                    // await never returns, so the guest neither starts the container
+                    // nor reports a failure — the host just sees silence until its
+                    // own health timeout. Fail closed inside the guest instead, so
+                    // the reason reaches the serial console.
+                    tokio::time::timeout(
+                        WARM_START_READINESS_TIMEOUT,
+                        restore_status.wait_for_output_readiness(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "warm-start restore readiness was not published within {:?}: \
+                             the restore watcher never observed a restore epoch",
+                            WARM_START_READINESS_TIMEOUT
+                        )
+                    })
+                    .context("waiting for warm-start restore readiness")??;
                 }
                 container::CacheResult::Doomed => {
                     // The host answered "cache-doomed": this VM produced the

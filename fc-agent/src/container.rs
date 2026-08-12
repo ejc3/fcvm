@@ -1110,11 +1110,14 @@ fn run_cache_handshake(
                     return CacheResult::Failed;
                 }
                 // Re-ask send failed: the transport died again under us.
-                // Treat like a severed session and go around.
+                // Treat like a severed session and go around. Delay like the
+                // refused-connect path so a host that accepts and immediately
+                // resets cannot drive this loop hot for the whole absolute cap.
                 eprintln!(
                     "[fc-agent] cache handshake: re-ask send failed ({:?}), reconnecting",
                     other
                 );
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
         }
@@ -1160,6 +1163,11 @@ fn run_cache_handshake(
                 // A snapshot boundary passed over this connection. Ask again —
                 // the owner (resumed-source run loop, restored clone's host, or
                 // a teardown that will kill us) answers from what it knows.
+                // Delay like the refused-connect path: a host that accepts and
+                // closes at once returns Severed with no poll timeout consumed,
+                // and an undelayed loop would burn a guest vCPU until the
+                // absolute deadline.
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
             SessionOutcome::Silent => {
