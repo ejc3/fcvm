@@ -25,8 +25,9 @@ fn compute_sha256_short(data: &[u8]) -> String {
 
 /// Ensure kernel exists, downloading or building if needed.
 ///
-/// Every kernel is a profile: "default" is the Kata kernel (URL-based),
-/// named profiles (nested, btrfs) build from source.
+/// Every kernel is a profile. The shipped default, nested, and btrfs profiles
+/// are source-built and normally downloaded as content-addressed releases;
+/// user profiles may also point at an archive URL.
 ///
 /// If `allow_create` is false, bails if kernel doesn't exist.
 /// If `allow_build` is true, falls back to local build for custom profiles.
@@ -63,6 +64,87 @@ pub async fn ensure_kernel(
     }
 }
 
+/// Rebuild a source-built profile's kernel from source, bypassing the release
+/// download entirely, and return its content-addressed path.
+///
+/// [`ensure_kernel`] prefers a published release and only builds after a FAILED
+/// download, so a release-refresh job cannot force a rebuild by deleting the
+/// cached file: the release it is about to replace is still published, the
+/// download succeeds, and the job republishes the exact artifact the operator
+/// asked to replace. A post-run "the file exists" assertion cannot catch that,
+/// because a download produces the same file. This is the path for "the
+/// published content is wrong, build it again from source".
+pub async fn rebuild_kernel_from_source(profile_name: &str) -> Result<PathBuf> {
+    let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "kernel profile '{}' not found in config. \
+             Add [kernel_profiles.{}] section to rootfs-config.toml",
+            profile_name,
+            profile_name
+        )
+    })?;
+    anyhow::ensure!(
+        !profile.inherits_kernel(),
+        "kernel profile '{}' inherits its kernel; rebuild the profile it inherits from instead",
+        profile_name
+    );
+    anyhow::ensure!(
+        !profile.is_url_based(),
+        "kernel profile '{}' is URL-based; there is no source to rebuild from",
+        profile_name
+    );
+
+    let sha = compute_profile_kernel_sha(&profile)?;
+    let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
+    let kernel_dir = paths::kernel_dir();
+    let kernel_path = kernel_dir.join(&filename);
+
+    tokio::fs::create_dir_all(&kernel_dir)
+        .await
+        .context("creating kernel directory")?;
+    let lock_file = kernel_dir.join(format!("{}.lock", filename));
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening kernel lock file")?;
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring exclusive lock for kernel")?;
+
+    // Build to a unique sibling and rename into place, so a build that fails
+    // partway leaves the existing artifact untouched instead of destroying a
+    // usable cached kernel (measured: an early version deleted first, and a
+    // build that died on a DNS failure took the cache with it). Unique per
+    // builder via uuid, not pid — separate PID namespaces reuse numbers — and
+    // the rename is atomic and happens under the same lock.
+    let staging_path = kernel_dir.join(format!("{}.rebuild-{}", filename, uuid::Uuid::new_v4()));
+    println!("⚙️  Rebuilding kernel from source (profile: {profile_name})...");
+    info!(profile = %profile_name, path = %kernel_path.display(), staging = %staging_path.display(), "forced source rebuild, skipping release download");
+    let publish_result = match build_kernel_locally(&profile, profile_name, &staging_path).await {
+        Ok(()) => tokio::fs::rename(&staging_path, &kernel_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "publishing rebuilt kernel {} -> {}",
+                    staging_path.display(),
+                    kernel_path.display()
+                )
+            }),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            Err(error)
+        }
+    };
+    flock.unlock().map_err(|(_, err)| err)?;
+    publish_result?;
+    println!("  ✓ Kernel rebuilt from source (profile: {profile_name})");
+    Ok(kernel_path)
+}
+
 /// Get kernel path (without downloading/building).
 ///
 /// Returns the path where the kernel should exist.
@@ -90,7 +172,7 @@ pub fn get_kernel_path(profile_name: &str) -> Result<PathBuf> {
 
 /// Get the kernel identity hash for a profile.
 /// For URL-based profiles, this is the URL hash.
-/// Used to include in Layer 2 SHA calculation.
+/// Used by callers that need the selected kernel's content identity.
 pub fn get_kernel_url_hash(profile_name: &str) -> Result<String> {
     let profile = get_kernel_profile(profile_name)?
         .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
@@ -113,7 +195,7 @@ pub fn get_kernel_url_hash(profile_name: &str) -> Result<String> {
 }
 
 // ============================================================================
-// URL-Based Kernel (default profile — Kata releases)
+// URL-Based Kernel (profiles backed by an archive URL)
 // ============================================================================
 
 fn get_url_kernel_path(profile: &KernelProfile) -> Result<PathBuf> {
@@ -292,7 +374,7 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
 }
 
 // ============================================================================
-// Custom Kernel (built from source — named profiles like nested, btrfs)
+// Source-Built Kernel (default and named profiles such as nested or btrfs)
 // ============================================================================
 
 fn get_custom_kernel_path(profile: &KernelProfile, profile_name: &str) -> Result<PathBuf> {
@@ -467,14 +549,67 @@ fn find_repo_root() -> Option<PathBuf> {
 /// matched file cannot be read). Silently degrading the cache key would make the
 /// content-addressed kernel name stop reflecting the configured patches/config.
 pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> Result<String> {
+    compute_profile_kernel_sha_at_root(profile, find_repo_root().as_deref())
+}
+
+/// Resolve a profile's content-addressed artifact SHA.
+///
+/// In a source checkout the manifest value is never trusted blindly: the
+/// configured inputs are hashed and must match. A packaged binary has no
+/// `kernel/` tree, so a published profile's validated manifest SHA is the
+/// authoritative release identifier there.
+fn compute_profile_kernel_sha_at_root(
+    profile: &KernelProfile,
+    repo_root: Option<&Path>,
+) -> Result<String> {
+    let manifest_sha = profile
+        .kernel_sha
+        .as_deref()
+        .map(validate_manifest_kernel_sha)
+        .transpose()?;
+
+    if repo_root.is_none() {
+        if let Some(sha) = manifest_sha {
+            return Ok(sha.to_string());
+        }
+    }
+
+    let computed = compute_profile_kernel_sha_from_inputs(profile, repo_root)?;
+    if let Some(expected) = manifest_sha {
+        if computed != expected {
+            bail!(
+                "kernel_sha '{}' does not match build_inputs hash '{}'; update the manifest and publish the new artifact",
+                expected,
+                computed
+            );
+        }
+    }
+
+    Ok(computed)
+}
+
+fn validate_manifest_kernel_sha(sha: &str) -> Result<&str> {
+    if sha.len() != 12
+        || !sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("kernel_sha must be exactly 12 lowercase hexadecimal characters, got '{sha}'");
+    }
+    Ok(sha)
+}
+
+fn compute_profile_kernel_sha_from_inputs(
+    profile: &KernelProfile,
+    repo_root: Option<&Path>,
+) -> Result<String> {
     if profile.build_inputs.is_empty() {
         warn!("kernel profile has no build_inputs, using empty SHA");
         return Ok("000000000000".to_string());
     }
 
-    // Find repo root for relative path resolution
-    let repo_root = find_repo_root();
-    if let Some(ref root) = repo_root {
+    // Resolve relative inputs from the supplied source checkout.
+    if let Some(root) = repo_root {
         debug!(repo_root = %root.display(), "found repo root for build_inputs");
     } else {
         debug!("repo root not found, using CWD for build_inputs");
@@ -485,7 +620,7 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> Result<String> {
     for pattern in &profile.build_inputs {
         // If pattern is relative and we have a repo root, prepend it
         let full_pattern = if !pattern.starts_with('/') {
-            if let Some(ref root) = repo_root {
+            if let Some(root) = repo_root {
                 root.join(pattern).to_string_lossy().into_owned()
             } else {
                 pattern.clone()
@@ -537,7 +672,6 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> Result<String> {
              repository or fix build_inputs in rootfs-config.toml",
             profile.build_inputs,
             repo_root
-                .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "not found".to_string()),
         );
@@ -766,10 +900,30 @@ curl -fSL "$BASE_CONFIG_URL" -o .config
 # Update config with defaults for new options
 make ARCH="$KERNEL_ARCH" olddefconfig
 
+# Every requested built-in option is part of the artifact contract. Kconfig can
+# silently turn an option off when a dependency is missing; catch that before a
+# kernel which cannot implement its profile is published.
+if [[ -n "${{KERNEL_CONFIG:-}}" ]] && [[ -f "$KERNEL_CONFIG" ]]; then
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^(CONFIG_[A-Z0-9_]+)=y ]]; then
+            opt="${{BASH_REMATCH[1]}}"
+            if ! grep -qx "${{opt}}=y" .config; then
+                # To stderr: the runner only surfaces the script's stderr, so an
+                # error on stdout leaves CI failing with no visible reason.
+                echo "ERROR: requested kernel option ${{opt}}=y was disabled by Kconfig" >&2
+                exit 1
+            fi
+        fi
+    done < "$KERNEL_CONFIG"
+fi
+
 # Show enabled options
 echo ""
 echo "Verifying configuration:"
-grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS|TUN|VETH)=" .config || true
+if ! grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS|TUN|VETH|INET_DIAG|INET_DIAG_DESTROY|PACKET)=" .config; then
+    echo "ERROR: built kernel exposes none of the profile summary options" >&2
+    exit 1
+fi
 echo ""
 
 # Build kernel
@@ -2722,6 +2876,51 @@ cp vmlinux arch/arm64/boot/Image
         assert_eq!(
             compute_profile_kernel_sha(&profile).unwrap(),
             "000000000000"
+        );
+    }
+
+    #[test]
+    fn published_profile_uses_manifest_without_source_checkout() {
+        let profile = KernelProfile {
+            build_inputs: vec!["kernel/not-installed.conf".to_string()],
+            kernel_sha: Some("0123456789ab".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            compute_profile_kernel_sha_at_root(&profile, None).unwrap(),
+            "0123456789ab"
+        );
+    }
+
+    #[test]
+    fn published_profile_rejects_manifest_that_disagrees_with_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("kernel.conf");
+        std::fs::write(&input, "CONFIG_FUSE_FS=y\n").unwrap();
+
+        let profile = KernelProfile {
+            build_inputs: vec![input.display().to_string()],
+            kernel_sha: Some("000000000000".to_string()),
+            ..Default::default()
+        };
+        let err = compute_profile_kernel_sha_at_root(&profile, Some(dir.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match build_inputs hash"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn published_profile_rejects_malformed_manifest_sha() {
+        let profile = KernelProfile {
+            kernel_sha: Some("NOT-A-SHA".to_string()),
+            ..Default::default()
+        };
+        let err = compute_profile_kernel_sha_at_root(&profile, None).unwrap_err();
+        assert!(
+            err.to_string().contains("12 lowercase hexadecimal"),
+            "unexpected error: {err:#}"
         );
     }
 

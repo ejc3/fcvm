@@ -26,6 +26,189 @@ env:
   FUSER: ${{ github.workspace }}/fuser
 
 jobs:
+  build-default-kernel:
+    name: Build Default Kernel (${{ matrix.config_arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config_arch: arm64
+            runner_arch: ARM64
+          - config_arch: amd64
+            runner_arch: X64
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    permissions:
+      contents: write
+    steps:
+      - name: Fix workspace permissions (pre-checkout)
+        run: |
+          sudo chown -R $USER:$USER ${{ github.workspace }}
+
+      - uses: actions/checkout@v7
+        with:
+          path: fcvm
+          # This job holds `contents: write` and then runs checkout-controlled
+          # `make build` plus Rust build scripts. Persisting the token in
+          # fcvm/.git/config would put a write-capable credential where any of
+          # that code can read it; the release steps scope GH_TOKEN themselves.
+          persist-credentials: false
+
+      - uses: ./fcvm/.github/actions/checkout-deps
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+
+      - name: Build fcvm and fc-agent
+        working-directory: fcvm
+        run: |
+          make build
+
+      - name: Compute and verify release identity
+        id: kernel
+        working-directory: fcvm
+        env:
+          CONFIG_ARCH: ${{ matrix.config_arch }}
+        run: |
+          mapfile -t METADATA < <(python3 - <<'PY'
+          import glob
+          import hashlib
+          import os
+          import pathlib
+          import tomllib
+
+          config = tomllib.load(open("rootfs-config.toml", "rb"))
+          profile = config["kernel_profiles"]["default"][os.environ["CONFIG_ARCH"]]
+          digest = hashlib.sha256()
+          for pattern in profile["build_inputs"]:
+              matches = sorted(pathlib.Path(path) for path in glob.glob(pattern))
+              if not matches:
+                  raise SystemExit(f"build input matched no files: {pattern}")
+              for path in matches:
+                  if not str(path).endswith(".disabled"):
+                      digest.update(path.read_bytes())
+          print(profile["kernel_version"])
+          print(digest.hexdigest()[:12])
+          print(profile["kernel_sha"])
+          PY
+          )
+
+          VERSION="${METADATA[0]}"
+          SHA="${METADATA[1]}"
+          MANIFEST_SHA="${METADATA[2]}"
+          if [ "$SHA" != "$MANIFEST_SHA" ]; then
+            echo "ERROR: kernel_sha $MANIFEST_SHA does not match build_inputs hash $SHA"
+            exit 1
+          fi
+
+          ARCH=$(uname -m)
+          case "$CONFIG_ARCH" in
+            arm64) EXPECTED_ARCH=aarch64 ;;
+            amd64) EXPECTED_ARCH=x86_64 ;;
+            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
+          esac
+          if [ "$ARCH" != "$EXPECTED_ARCH" ]; then
+            echo "ERROR: $CONFIG_ARCH matrix entry ran on $ARCH, expected $EXPECTED_ARCH"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "arch=$ARCH" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "tag=kernel-default-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
+          echo "filename=vmlinux-default-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
+
+      - name: Install GitHub CLI
+        run: |
+          if ! command -v gh &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          else
+            echo "GitHub CLI already installed: $(gh --version)"
+          fi
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${{ steps.kernel.outputs.tag }}"
+          set +e
+          OUT=$(gh release view "$TAG" --json tagName 2>&1)
+          RC=$?
+          set -e
+          if [ $RC -eq 0 ]; then
+            echo "Release $TAG already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          elif printf '%s' "$OUT" | grep -qi 'release not found\|not found'; then
+            echo "Release $TAG does not exist"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "::error::cannot determine whether release $TAG exists (rc=$RC): $OUT"
+            exit 1
+          fi
+
+      - name: Build kernel using fcvm
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
+        env:
+          # A forced rebuild has to discard the cached content-addressed file, or
+          # `fcvm setup` returns immediately and the release step republishes the very
+          # artifact the operator asked to replace. The Make target owns that, along
+          # with btrfs setup and config synchronisation.
+          KERNEL_FILE: ${{ steps.kernel.outputs.filename }}
+          FORCE: ${{ inputs.force_build == true && '1' || '0' }}
+        run: |
+          make release-default-kernel
+
+          KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
+          cp "/mnt/fcvm-btrfs/kernels/${{ steps.kernel.outputs.filename }}" "$KERNEL_PATH"
+          ls -lh "$KERNEL_PATH"
+          file "$KERNEL_PATH"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.kernel.outputs.tag }}"
+          FILENAME="${{ steps.kernel.outputs.filename }}"
+          VERSION="${{ steps.kernel.outputs.version }}"
+          SHA="${{ steps.kernel.outputs.sha }}"
+          ARCH="${{ steps.kernel.outputs.arch }}"
+
+          if [ "${{ inputs.force_build }}" == "true" ] && [ "${{ steps.check.outputs.exists }}" == "true" ]; then
+            gh release delete "$TAG" --yes
+          fi
+
+          gh release create "$TAG" \
+            --title "Default Kernel ${VERSION} (${ARCH}) - ${SHA}" \
+            --notes "Default fcvm guest kernel with FUSE and snapshot-safe selective socket cleanup support.
+
+          Required snapshot options: CONFIG_INET_DIAG=y, CONFIG_INET_DIAG_DESTROY=y, CONFIG_PACKET=y.
+          The Firecracker base config is pinned by the hashed build recipe." \
+            "/tmp/$FILENAME"
+
+      - name: Summary
+        run: |
+          echo "### Default Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.kernel.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | ${{ steps.kernel.outputs.arch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA | ${{ steps.kernel.outputs.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ steps.kernel.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
+
   build-nested-kernel:
     name: Build Nested Kernel
     runs-on: [self-hosted, Linux, ARM64]
@@ -46,6 +229,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+          # This job holds `contents: write` and then runs checkout-controlled
+          # `make build` plus Rust build scripts. Persisting the token in
+          # fcvm/.git/config would put a write-capable credential where any of
+          # that code can read it; the release steps scope GH_TOKEN themselves.
+          persist-credentials: false
 
       - uses: ./fcvm/.github/actions/checkout-deps
 
@@ -264,6 +452,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: fcvm
+          # This job holds `contents: write` and then runs checkout-controlled
+          # `make build` plus Rust build scripts. Persisting the token in
+          # fcvm/.git/config would put a write-capable credential where any of
+          # that code can read it; the release steps scope GH_TOKEN themselves.
+          persist-credentials: false
 
       - uses: ./fcvm/.github/actions/checkout-deps
 

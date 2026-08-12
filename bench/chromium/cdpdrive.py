@@ -16,7 +16,9 @@ per-request setup cost and a lumped number would hide which hop to attack:
     tcp_ms       TCP connect to the WebSocket endpoint
     upgrade_ms   RFC 6455 handshake (the 101 exchange)
     enable_ms    Page.enable + Page.setLifecycleEventsEnabled
-    navigate_ms  Page.navigate -> Page.loadEventFired
+    navigate_command_ms  Page.navigate send -> command response
+    navigate_load_event_ms command response -> Page.loadEventFired
+    navigate_ms  Sum of the two navigation phases above
     screenshot_ms Page.captureScreenshot (base64 image arrives here)
     decode_ms    base64 decode + magic/dimension check on the host
 
@@ -175,6 +177,29 @@ def resolve_target(cdp_host: str, deadline: float, retries: int,
     raise ConnectionError(msg)
 
 
+def socket_diagnostics(sock) -> dict:
+    """The three fields that identify WHICH connection failed.
+
+    Each is read independently: a socket can answer getsockname() and not
+    getpeername() (never connected), and every one of them raises once the
+    socket is closed — so this must run while it is still open.
+    """
+    out = {}
+    try:
+        out["socket_local"] = list(sock.getsockname())
+    except OSError:
+        pass
+    try:
+        out["socket_peer"] = list(sock.getpeername())
+    except OSError:
+        pass
+    try:
+        out["socket_so_error"] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    except OSError:
+        pass
+    return out
+
+
 class TimedWs:
     """RFC 6455 client whose TCP connect and HTTP upgrade are timed separately.
 
@@ -188,9 +213,31 @@ class TimedWs:
         host, port = u.hostname, u.port or 80
 
         t = time.monotonic()
+        # A connect failure has no socket to describe. Everything after this
+        # line does, and the handler in drive() reads the diagnostics off the
+        # EXCEPTION rather than off `ws` — the name `ws` is only bound once the
+        # constructor returns, so an upgrade failure would otherwise report a
+        # WebSocket failure with no socket_local/socket_peer/socket_so_error.
         self.sock = socket.create_connection(
             (host, port), timeout=max(0.05, deadline - time.monotonic())
         )
+        try:
+            self._handshake(render_mod, u, host, port, deadline, t)
+        except BaseException as e:
+            # Read the diagnostics off the LIVE socket and attach the values,
+            # not the socket: closing it first makes every getsockname/
+            # getpeername/getsockopt raise EBADF, which drive()'s handler
+            # swallows, so handing over a closed socket reports nothing at all.
+            # Then close, because an abandoned CLOSE_WAIT socket per failed rep
+            # is a leak.
+            e.fcvm_socket_diagnostics = socket_diagnostics(self.sock)
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            raise
+
+    def _handshake(self, render_mod, u, host, port, deadline: float, t: float):
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.tcp_ms = (time.monotonic() - t) * 1000
 
@@ -243,6 +290,25 @@ def nav_timing(cdp, deadline: float) -> dict:
     }
 
 
+def transport_signal(error: BaseException, render_mod) -> str:
+    """Classify the observable close signal without guessing its network hop."""
+    if isinstance(error, ConnectionResetError) or getattr(error, "errno", None) == 104:
+        return "tcp-rst"
+    if isinstance(error, BrokenPipeError) or getattr(error, "errno", None) == 32:
+        return "tcp-write-closed"
+    if isinstance(error, render_mod.WsClosed):
+        if "close frame" in str(error):
+            return "websocket-close-frame"
+        # recv() returned EOF. This proves an orderly TCP close reached the
+        # client, but not whether Chromium, pasta, or another hop originated it.
+        return "tcp-eof"
+    if isinstance(error, TimeoutError):
+        return "local-deadline"
+    if isinstance(error, OSError):
+        return "socket-os-error"
+    return "not-transport"
+
+
 def drive(args) -> dict:
     render = load_render(args.render_module)
     t0 = time.monotonic()
@@ -250,6 +316,7 @@ def drive(args) -> dict:
     out: dict = {"ok": False, "cdp_host": args.cdp_host, "url": args.url, "format": args.format}
     stages: dict[str, float] = {}
     stage = "resolve"
+    stage_started = t0
     ws = None
     try:
         if args.ws_url:
@@ -274,12 +341,14 @@ def drive(args) -> dict:
         out["ws_url"] = ws_url
 
         stage = "connect"
+        stage_started = time.monotonic()
         ws = TimedWs(render, ws_url, deadline)
         stages["tcp_ms"] = ws.tcp_ms
         stages["upgrade_ms"] = ws.upgrade_ms
         cdp = render.Cdp(ws)
 
         stage = "enable"
+        stage_started = time.monotonic()
         t = time.monotonic()
         cdp.cmd("Page.enable", deadline=deadline)
         if args.idle_wait_ms > 0:
@@ -287,16 +356,23 @@ def drive(args) -> dict:
         stages["enable_ms"] = (time.monotonic() - t) * 1000
         stages["connect_total_ms"] = (time.monotonic() - t0) * 1000
 
-        stage = "navigate"
-        t = time.monotonic()
+        stage = "navigate-command-response"
+        stage_started = time.monotonic()
+        t = stage_started
         nav = cdp.cmd("Page.navigate", {"url": args.url}, deadline=deadline)
+        stages["navigate_command_ms"] = (time.monotonic() - stage_started) * 1000
         if "errorText" in nav:
             raise RuntimeError(f"navigation failed: {nav['errorText']}")
         loader = nav.get("loaderId")
+
+        stage = "navigate-load-event"
+        stage_started = time.monotonic()
         cdp.wait_event(lambda ev: ev["method"] == "Page.loadEventFired", deadline)
+        stages["navigate_load_event_ms"] = (time.monotonic() - stage_started) * 1000
         stages["navigate_ms"] = (time.monotonic() - t) * 1000
 
         stage = "network-idle"
+        stage_started = time.monotonic()
         t = time.monotonic()
         out["idle_timeout"] = 0
         if args.idle_wait_ms > 0:
@@ -312,6 +388,7 @@ def drive(args) -> dict:
         stages["idle_ms"] = (time.monotonic() - t) * 1000
 
         stage = "screenshot"
+        stage_started = time.monotonic()
         t = time.monotonic()
         params = {"format": args.format}
         if args.format == "jpeg":
@@ -320,6 +397,7 @@ def drive(args) -> dict:
         stages["screenshot_ms"] = (time.monotonic() - t) * 1000
 
         stage = "decode"
+        stage_started = time.monotonic()
         t = time.monotonic()
         raw = base64.b64decode(shot["data"])
         magic = b"\x89PNG" if args.format == "png" else b"\xff\xd8\xff"
@@ -340,6 +418,7 @@ def drive(args) -> dict:
 
         if args.nav_timing:
             stage = "nav-timing"
+            stage_started = time.monotonic()
             t = time.monotonic()
             out["nav"] = nav_timing(cdp, deadline)
             stages["nav_timing_ms"] = (time.monotonic() - t) * 1000
@@ -348,6 +427,22 @@ def drive(args) -> dict:
     except (OSError, RuntimeError, TimeoutError, KeyError, ValueError, render.WsClosed) as e:
         out["error"] = f"{type(e).__name__}: {e}"
         out["stage"] = stage
+        out["failure_operation"] = {
+            "navigate-command-response": "Page.navigate response",
+            "navigate-load-event": "Page.loadEventFired wait",
+        }.get(stage, stage)
+        out["failure_phase_elapsed_ms"] = (time.monotonic() - stage_started) * 1000
+        out["transport_signal"] = transport_signal(e, render)
+        if isinstance(e, OSError):
+            out["socket_errno"] = e.errno
+        # `ws` is bound only after the constructor RETURNS, so an upgrade-phase
+        # failure leaves it None. The constructor reads the same three fields
+        # off its live socket and attaches them to the exception for that case.
+        sock = getattr(ws, "sock", None)
+        if sock is not None:
+            out.update(socket_diagnostics(sock))
+        else:
+            out.update(getattr(e, "fcvm_socket_diagnostics", {}))
         # Classify, so downstream can gate on it instead of substring-matching the
         # message. A `WsClosed` is the PEER closing the TCP connection — it is NOT
         # this driver's own timeout (render.py raises TimeoutError for that), so a

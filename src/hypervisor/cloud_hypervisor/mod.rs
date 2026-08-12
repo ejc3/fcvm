@@ -623,7 +623,7 @@ mod tests {
             namespace_id: Some("ns-abc".to_string()),
             user_namespace_path: Some(PathBuf::from("/proc/123/ns/user")),
             net_namespace_path: Some(PathBuf::from("/proc/123/ns/net")),
-            mount_redirects: Some((vec![PathBuf::from("/base")], PathBuf::from("/clone"))),
+            mount_redirects: Some(vec![(PathBuf::from("/base"), PathBuf::from("/clone"))]),
             ..Default::default()
         });
         // Reboot relaunch: only the binary + args, everything else default/None.

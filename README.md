@@ -316,7 +316,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM as part of the boo
 - AWS: c6g.metal (ARM64) or c5.metal (x86_64)
 
 **Dependencies:**
-- Rust 1.75+ with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
+- Rust 1.93 (pinned by `rust-toolchain.toml`) with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH (default backend)
 - Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): build the pinned fork with `fcvm setup --cloud-hypervisor`, or set `FCVM_CLOUD_HYPERVISOR_BIN`, or put `cloud-hypervisor` in PATH (resolved in that order)
 - For rootless: `passt` package (provides `pasta`)
@@ -429,7 +429,7 @@ Btrfs mode requires a btrfs kernel profile: `./fcvm setup --kernel-profile btrfs
 
 ### Guest OS and Kernel
 
-Guest VMs run Ubuntu 24.04 LTS with Podman, crun, and fuse-overlayfs. The default kernel is from [Kata Containers](https://github.com/kata-containers/kata-containers) (6.12.x, `CONFIG_FUSE_FS=y`). Both are built during `fcvm setup` and content-addressed — changing config triggers a rebuild. Custom kernels via `--kernel-profile`; see [DESIGN.md](DESIGN.md#kernel-profiles).
+Guest VMs run Ubuntu 24.04 LTS with Podman, crun, and fuse-overlayfs. fcvm publishes its default kernel for arm64 and amd64 with FUSE plus the socket-diagnostic options required for safe snapshot cleanup. `fcvm setup` downloads the content-addressed artifact; release jobs build it from the pinned profile recipe. Custom kernels use `--kernel-profile`; see [DESIGN.md](DESIGN.md#kernel-profiles).
 
 ---
 

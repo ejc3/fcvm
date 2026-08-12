@@ -82,6 +82,8 @@ async fn test_health_monitor_behaviors() {
             serve_pid: None,
             uffd_mode: None,
             original_vsock_vm_id: None,
+            vsock_socket_path: None,
+            source_vsock_socket_path: None,
             port_mappings: vec![],
             forward_localhost: vec![],
             network_mode: Default::default(),

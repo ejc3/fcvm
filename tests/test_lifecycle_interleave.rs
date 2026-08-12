@@ -17,6 +17,12 @@
 //! - `serial-safe-snapshots` — the guest quiesces its console before the
 //!   cache-ready notification, so the pre-start snapshot can never capture the
 //!   UART mid-transmit (which would poison every restore's serial console).
+//! - `cache-verdict-re-ask` — a resumed source's severed cache handshake is
+//!   re-asked instead of read as "I was restored": the snapshot save queues a
+//!   vsock TRANSPORT_RESET the source processes at resume exactly like a
+//!   restored clone would, so the host's verdict — not the transport event —
+//!   classifies the VM. Without the re-ask the source never launches its
+//!   container (4/4 forced misses hung, ack sent into the dead session).
 //!
 //! All VMs run rootless (no sudo needed beyond what `make test-root` does for
 //! the runner). Test names contain `lifecycle_interleave` so
@@ -316,8 +322,10 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 
 /// Find the one state file belonging to `vm_name` and derive its exact lock
 /// and runtime-data paths from the deserialized VM ID. State files are keyed by
-/// VM ID, not name or PID; in particular, a rootless clone parked at
-/// `restore.pre_resume` intentionally still has `pid = null`.
+/// VM ID, not name or PID; in particular, a rootless clone parked at either
+/// restore failpoint (`restore.pre_resume`, `restore.post_network_pre_resume`)
+/// intentionally still has `pid = null`, because the PID is published only
+/// after the VMM resumes.
 fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
     let state_dir = fcvm::paths::state_dir();
     let mut found = None;
@@ -568,6 +576,40 @@ fn spawn_exec_capture(vm_pid: u32, script: &str) -> Result<tokio::process::Child
     cmd.spawn().context("spawning fcvm exec")
 }
 
+/// Same as [`spawn_exec_capture`], but stderr goes to a FILE so a test can
+/// wait on a failpoint marker mid-flight (a piped stderr is only readable
+/// after exit), and extra env (e.g. `FCVM_FAILPOINT`) can be armed on the
+/// exec process alone.
+fn spawn_exec_stderr_to_file(
+    vm_pid: u32,
+    script: &str,
+    stderr_path: &Path,
+    env: &[(&str, &str)],
+) -> Result<tokio::process::Child> {
+    let fcvm_path = common::find_fcvm_binary()?;
+    let stderr_file =
+        std::fs::File::create(stderr_path).context("creating exec stderr capture file")?;
+    let mut cmd = tokio::process::Command::new(fcvm_path);
+    cmd.args([
+        "exec",
+        "--pid",
+        &vm_pid.to_string(),
+        "--vm",
+        "--",
+        "sh",
+        "-c",
+        script,
+    ])
+    .env("RUST_LOG", "debug")
+    .stdout(Stdio::piped())
+    .stderr(std::process::Stdio::from(stderr_file))
+    .kill_on_drop(true);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.spawn().context("spawning fcvm exec")
+}
+
 /// Exactly-once oracle for the nonce file written through a `--map`ed volume:
 /// wait (≤10s) for the nonce to appear, then a 2s settle so a phantom second
 /// execution would have landed too, then count matching lines.
@@ -611,38 +653,41 @@ fn count_occurrences(hay: &str, needle: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// CASE: exec_resend_across_agent_stall
+// CASE: exec_resend_across_snapshot_pause
 // ---------------------------------------------------------------------------
 
 /// Pins: the exec handshake RESEND path against a REAL VM — an exec request
-/// orphaned by a snapshot pause is resent on a fresh connection and executes
-/// exactly once (fixed by the `exec-ready-ack` branch: request → ACK → GO;
-/// fc-agent never executes before consuming GO, so an un-ACKed request is
-/// provably safe to resend).
+/// whose connection is killed by a snapshot pause is resent on a fresh
+/// connection and executes exactly once (request → ACK → GO; fc-agent never
+/// executes before consuming GO, so a request that was never sent, let alone
+/// ACKed, is provably safe to resend).
 ///
-/// Interleaving (fully marker-sequenced, no timing guesses):
-/// 1. Guest arms `exec.post_accept_pre_read:sleep:2000` — every exec accept
-///    parks 2s before reading the request. 2s is deliberately UNDER the
-///    client's 3s ACK timeout: a stall above 3s would time out every one of
-///    the 5 resend attempts by construction (each accept re-parks), so the
-///    exec could never exit 0 — the pause below, not the stall alone, is what
-///    forces the resend.
-/// 2. Host arms `snapshot.pre_pause:block_until_file` on a `fcvm snapshot
-///    create` process, which parks fully-prepared, right before the Pause API
-///    call ("FAILPOINT snapshot.pre_pause reached" on its stderr).
-/// 3. One exec (nonce append via a --map'd dir) is launched; its accept marker
-///    in the VM log proves connection #1 is parked INSIDE the agent's window.
-/// 4. The go-file is created → the pause lands within the ~1.8s left of the
-///    guest hold → the snapshot's vsock reset orphans connection #1 (its
-///    request was consumed by nobody: the agent was parked pre-read).
-/// 5. The client gets no ACK → reconnects and resends; the post-resume accept
-///    parks 2s again, ACKs at +2s (< 3s timeout), GO authorizes execution.
+/// The interleaving is ORDER-ONLY — no actor has to win a race:
+/// 1. One exec (nonce append via a --map'd dir) parks at
+///    `exec.post_connect_pre_send`: connection #1 exists and NOTHING has been
+///    sent on it. The agent side sits in its natural request read.
+/// 2. `fcvm snapshot create --pid` runs TO COMPLETION while the client is
+///    parked. The pause resets vsock, killing connection #1 with certainty;
+///    the agent's pending read fails and it returns to accept, having
+///    consumed nothing.
+/// 3. The go-file releases the client into the dead connection: the request
+///    write fails (or the ACK read sees EOF) → "reconnecting to resend" →
+///    connection #2 → ACK → GO → the command runs exactly once.
 ///
-/// Oracle: exec exits 0; the client log shows the resend actually happened;
-/// the nonce appears EXACTLY once (the double-execution tripwire: if fc-agent
-/// ever executed connection #1's request without GO, the count would be 2).
+/// The previous version manufactured its in-flight window with a guest-side
+/// 2s stall the host had to outrun (guest marker propagation + go-file poll +
+/// the Pause call, all inside 2s). CI runners lost that race on all 8 jobs of
+/// run 31470581069, both tries, at the "reconnecting to resend" assert. A
+/// test that only passes when the machine is fast enough pins nothing; this
+/// version replaces the sleep with a client-side hold and a COMPLETED
+/// snapshot, so the orphan exists by construction at any machine speed.
+///
+/// Oracle: create exits 0; exec exits 0; the client log shows the resend
+/// happened and the resent request completed ACK/GO; the nonce appears
+/// EXACTLY once (double-execution tripwire: if fc-agent ever executed without
+/// GO, or the client resent a consumed request, the count would be 2).
 #[tokio::test]
-async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()> {
+async fn test_lifecycle_interleave_exec_resend_across_snapshot_pause() -> Result<()> {
     let (vm_name, _, snap_tag, _) = common::unique_names("ilv-resend");
     let host_dir = PathBuf::from(format!("/tmp/{}-map", vm_name));
     std::fs::create_dir_all(&host_dir)?;
@@ -650,7 +695,7 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
     // Unique env → unique snapshot key → deterministic cold boot every run.
     let env_unique = format!("ILV_ID={}", vm_name);
 
-    let (mut child, pid, vm_log) = common::spawn_fcvm_with_env_and_log_path(
+    let (mut child, pid, _vm_log) = common::spawn_fcvm_with_env_and_log_path(
         &[
             "podman",
             "run",
@@ -660,67 +705,68 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
             &map_arg,
             "--env",
             &env_unique,
-            // HTTP health checks: with a health URL the monitor never uses
-            // `fcvm exec` (podman-inspect) probes, so the ONLY exec.* failpoint
-            // hits in the VM log are this test's own exec.
             "--health-check",
             "http://localhost/",
             common::TEST_IMAGE,
         ],
-        &[(
-            "FCVM_GUEST_FAILPOINT",
-            "exec.post_accept_pre_read:sleep:2000",
-        )],
+        &[],
     )
     .await?;
-
     common::poll_health_by_pid(pid, 300).await?;
     let base_key = ls_vm_by_pid(pid)
         .await?
         .and_then(|s| s.config.snapshot_name);
 
-    // Park a manual snapshot create right before its Pause call.
-    let go_file = PathBuf::from(format!("/tmp/{}-go", vm_name));
-    let _ = std::fs::remove_file(&go_file);
-    let pid_str = pid.to_string();
-    let failpoint_spec = format!("snapshot.pre_pause:block_until_file:{}", go_file.display());
-    let (mut create_child, _create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
-        &["snapshot", "create", "--pid", &pid_str, "--tag", &snap_tag],
-        &[("FCVM_FAILPOINT", &failpoint_spec)],
-    )
-    .await?;
-    wait_for_marker(
-        &create_log,
-        "FAILPOINT snapshot.pre_pause reached",
-        0,
-        Duration::from_secs(90),
-    )
-    .await?;
-
-    // Launch the exec and wait until its connection is parked inside the
-    // agent's post-accept window (manual creates do NOT quiesce the guest
-    // console, so the guest marker streams to the VM log immediately).
+    // Launch the exec and wait until it is parked with connection #1 open and
+    // the request unsent (the failpoint marker goes to its stderr FILE, which
+    // is readable mid-flight, unlike a pipe).
     let nonce = format!("nonce-{}", vm_name);
     let script = format!("echo {} >> /mnt/test/nonce.txt", nonce);
-    let vm_cursor = log_len(&vm_log);
-    let exec_child = spawn_exec_capture(pid, &script)?;
+    let go_file = PathBuf::from(format!("/tmp/{}-exec-go", vm_name));
+    let _ = std::fs::remove_file(&go_file);
+    let exec_stderr_path = PathBuf::from(format!("/tmp/{}-exec-stderr.log", vm_name));
+    let failpoint_spec = format!(
+        "exec.post_connect_pre_send:block_until_file:{}",
+        go_file.display()
+    );
+    let exec_child = spawn_exec_stderr_to_file(
+        pid,
+        &script,
+        &exec_stderr_path,
+        &[("FCVM_FAILPOINT", &failpoint_spec)],
+    )?;
     wait_for_marker(
-        &vm_log,
-        "FAILPOINT exec.post_accept_pre_read reached",
-        vm_cursor,
+        &exec_stderr_path,
+        "FAILPOINT exec.post_connect_pre_send reached",
+        0,
         Duration::from_secs(30),
     )
     .await?;
 
-    // Release the pause INTO the parked window.
-    std::fs::write(&go_file, b"go").context("creating go-file")?;
-
+    // Snapshot create runs TO COMPLETION while the client is parked: after
+    // this line, connection #1 is dead by construction — order, not timing.
+    let (mut create_child, _create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            &snap_tag,
+        ],
+        &[],
+    )
+    .await?;
     let create_status = wait_exit(&mut create_child, Duration::from_secs(180)).await?;
+
+    // Release the client into the dead connection.
+    std::fs::write(&go_file, b"go").context("creating exec go-file")?;
     let exec_output = tokio::time::timeout(Duration::from_secs(120), exec_child.wait_with_output())
         .await
         .context("exec did not finish within 120s")?
         .context("collecting exec output")?;
-    let exec_stderr = String::from_utf8_lossy(&exec_output.stderr).to_string();
+    let exec_stderr =
+        std::fs::read_to_string(&exec_stderr_path).context("reading exec stderr file")?;
     let nonce_count = settled_nonce_count(&host_dir.join("nonce.txt"), &nonce).await;
 
     // Teardown before asserting so a failed assert can't leak the VM.
@@ -729,6 +775,7 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
     let _ = child.wait().await;
     cleanup_snapshot_keys(&[base_key, Some(snap_tag.clone())]).await;
     let _ = std::fs::remove_dir_all(&host_dir);
+    let _ = std::fs::remove_file(&exec_stderr_path);
 
     assert!(
         create_status.success(),
@@ -743,9 +790,16 @@ async fn test_lifecycle_interleave_exec_resend_across_agent_stall() -> Result<()
         exec_stderr
     );
     assert!(
+        !exec_stderr.contains("RELEASED BY TIMEOUT"),
+        "the failpoint hold expired before the go-file — the snapshot create \
+         outlived the hold cap and the interleaving degraded back into a race; \
+         exec stderr:\n{}",
+        exec_stderr
+    );
+    assert!(
         exec_stderr.contains("reconnecting to resend"),
-        "the pause must orphan connection #1 and force a resend — without it \
-         this test pins nothing; exec stderr:\n{}",
+        "the completed snapshot must have killed connection #1 and forced a \
+         resend — without it this test pins nothing; exec stderr:\n{}",
         exec_stderr
     );
     assert!(
@@ -1473,6 +1527,242 @@ async fn test_lifecycle_interleave_cancellation_wins_before_lifecycle_ready_clai
 }
 
 // ---------------------------------------------------------------------------
+// CASE: early_published_connection_cannot_poison_restored_ingress
+// ---------------------------------------------------------------------------
+
+/// Pins the external-flow generation boundary against the exact hostile
+/// ordering that used to wedge a later request for roughly one TCP timeout:
+/// rootless pasta has already published the clone's host port, but the restored
+/// VMM has not resumed yet. One client completes a host-side TCP connect and
+/// closes it inside that window. After release, the clone must finish
+/// cookie-bound cleanup and the first fresh HTTP request must succeed within a
+/// short bound; retrying for 108 seconds would hide the failure.
+#[tokio::test]
+async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingress() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-early-ingress");
+    let go_file = PathBuf::from(format!("/tmp/{clone_name}-restore-go"));
+    remove_file_if_exists(&go_file).context("removing stale restore go-file")?;
+    let host_port = common::find_available_high_port()?;
+    let publish_arg = format!("{host_port}:80");
+
+    let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut clone: Option<(tokio::process::Child, PinnedProcess, PathBuf)> = None;
+    let mut clone_artifacts: Option<VmArtifacts> = None;
+    let mut snapshot_created = false;
+
+    let exercise: Result<()> = async {
+        let (baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--no-snapshot",
+                "--publish",
+                &publish_arg,
+                "--health-check",
+                "http://localhost:80",
+                common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning published baseline")?;
+        let baseline_process =
+            PinnedProcess::capture(baseline_pid).context("pinning published baseline")?;
+        baseline = Some((baseline_child, baseline_process));
+        let (baseline_child, _) = baseline.as_mut().expect("baseline stored above");
+        common::poll_health(baseline_child, 180)
+            .await
+            .context("waiting for published baseline health")?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
+            .await
+            .context("creating published manual snapshot")?;
+        snapshot_created = true;
+
+        let (baseline_child, baseline_process) =
+            baseline.as_mut().context("baseline fixture disappeared")?;
+        stop_test_child(baseline_child, baseline_process)
+            .await
+            .context("stopping baseline before clone restore")?;
+        baseline = None;
+
+        let failpoint_spec = format!(
+            "restore.post_network_pre_resume:block_until_file:{}",
+            go_file.display()
+        );
+        let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &[("FCVM_FAILPOINT", &failpoint_spec)],
+        )
+        .await
+        .context("spawning clone held before VMM resume")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning held clone")?;
+        clone = Some((clone_child, clone_process, clone_log.clone()));
+
+        let reached_at = wait_for_marker(
+            &clone_log,
+            "FAILPOINT restore.post_network_pre_resume reached",
+            0,
+            Duration::from_secs(120),
+        )
+        .await?;
+        let (clone_child, _, _) = clone.as_mut().context("clone fixture disappeared")?;
+        let artifacts = wait_for_artifacts(&clone_name, clone_child, Duration::from_secs(10))
+            .await
+            .context("waiting for held clone network state")?;
+        anyhow::ensure!(
+            artifacts.state.pid.is_none() && !artifacts.state.lifecycle_ready,
+            "restore hold must precede VMM/lifecycle publication: pid={:?} ready={}",
+            artifacts.state.pid,
+            artifacts.state.lifecycle_ready
+        );
+        let loopback_ip = artifacts
+            .state
+            .config
+            .network
+            .loopback_ip
+            .clone()
+            .context("held rootless clone has no published loopback IP")?;
+        clone_artifacts = Some(artifacts);
+
+        // Non-vacuity: the hold is placed after the restore path's network
+        // post-start, so pasta and its published-port listener are live, and
+        // before the VMM resume, so the guest behind that listener has not run.
+        // This connect+close is the adversarial flow; no retry is allowed, and
+        // the absence of the release marker proves the guest cannot have run.
+        let mut early = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(format!("{loopback_ip}:{host_port}")),
+        )
+        .await
+        .context("early published-port connect timed out")?
+        .context("early published-port connect failed")?;
+        early
+            .shutdown()
+            .await
+            .context("closing adversarial early connection")?;
+        drop(early);
+        anyhow::ensure!(
+            search_log_from(
+                &clone_log,
+                "FAILPOINT restore.post_network_pre_resume released",
+                reached_at
+            )
+            .is_none(),
+            "the VMM resumed before the adversarial connection completed"
+        );
+
+        std::fs::write(&go_file, b"go").context("releasing restore.post_network_pre_resume")?;
+        let released_at = wait_for_marker(
+            &clone_log,
+            "FAILPOINT restore.post_network_pre_resume released",
+            reached_at,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let (clone_child, _, _) = clone.as_mut().context("clone fixture disappeared")?;
+        common::poll_health(clone_child, 180)
+            .await
+            .with_context(|| {
+                format!(
+                    "clone did not become healthy; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+        wait_for_marker(
+            &clone_log,
+            "snapshot network cleanup complete",
+            released_at,
+            Duration::from_secs(30),
+        )
+        .await
+        .context("missing exact cookie-cleanup completion diagnostic")?;
+
+        // One fresh request is the oracle. The regression stalls this request
+        // for ~108s; retries or a matching timeout would conceal it.
+        let fresh = common::curl_check_with_diag(&loopback_ip, host_port, 5, Some(clone_pid)).await;
+        anyhow::ensure!(
+            fresh.success && fresh.body_len > 0,
+            "the first post-restore request was poisoned by the early connection: {}",
+            fresh.error
+        );
+        Ok(())
+    }
+    .await;
+
+    // Release first so fixture teardown can never wait for the failpoint's
+    // hard cap. Stop exact pinned children before deleting their snapshot.
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = std::fs::write(&go_file, b"cleanup") {
+        cleanup_errors.push(format!("releasing restore failpoint: {error}"));
+    }
+    let mut all_children_stopped = true;
+    if let Some((child, process, _)) = clone.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping clone: {error:#}"));
+        }
+    }
+    if let Some((child, process)) = baseline.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping baseline: {error:#}"));
+        }
+    }
+    if all_children_stopped {
+        if let Some(artifacts) = &clone_artifacts {
+            if let Err(error) = wait_for_artifacts_removed(artifacts, Duration::from_secs(15)).await
+            {
+                cleanup_errors.push(format!("clone production cleanup: {error:#}"));
+                if exercise.is_err() {
+                    if let Err(cleanup_error) = cleanup_exact_artifacts(artifacts) {
+                        cleanup_errors.push(format!(
+                            "cleaning exact failed clone artifacts: {cleanup_error:#}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if snapshot_created && all_children_stopped {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    if let Err(error) = remove_file_if_exists(&go_file) {
+        cleanup_errors.push(format!("removing restore go-file: {error:#}"));
+    }
+
+    if let Err(error) = exercise {
+        if cleanup_errors.is_empty() {
+            return Err(error);
+        }
+        return Err(error.context(format!(
+            "fixture cleanup also failed:\n- {}",
+            cleanup_errors.join("\n- ")
+        )));
+    }
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "fixture cleanup failed:\n- {}",
+        cleanup_errors.join("\n- ")
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // CASE: snapshot_run_sigterm_before_resume_cleans_exact_artifacts
 // ---------------------------------------------------------------------------
 
@@ -1765,5 +2055,126 @@ async fn test_lifecycle_interleave_snapshot_run_sigterm_before_resume_cleans_exa
     if !cleanup_errors.is_empty() {
         anyhow::bail!("fixture cleanup failed:\n- {}", cleanup_errors.join("\n- "));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// cache-verdict-re-ask
+// ---------------------------------------------------------------------------
+
+/// A pre-start snapshot MISS on the resume flow, with the resume→ack window
+/// deliberately widened (`cache.pre_ack:sleep:3000`). The snapshot save queues
+/// a vsock TRANSPORT_RESET into the guest, so on resume the guest's handshake
+/// session is severed 3s before the host's cache-ack can arrive — the guest
+/// MUST classify from the host's verdict (re-ask → "cache-ack"), never from
+/// the severed transport. Pre-protocol code read the severance as "I was
+/// restored" and waited forever for a restore epoch no one publishes to a
+/// source: this test then fails with the VM never Healthy and a single
+/// cache-ready in the log.
+#[tokio::test]
+async fn test_lifecycle_interleave_resumed_source_survives_late_ack() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("ilv-reask");
+    // Unique env → unique snapshot key → the pre-start snapshot is CREATED
+    // this run (a hit would restore instead and never cross the resume flow).
+    let env_unique = format!("ILV_ID={}", vm_name);
+
+    let (mut child, pid, vm_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--env",
+            &env_unique,
+            common::TEST_IMAGE,
+        ],
+        &[("FCVM_FAILPOINT", "cache.pre_ack:sleep:3000")],
+    )
+    .await?;
+
+    // The boundary this test exists for: the miss path must actually create
+    // the pre-start snapshot (pause → save → resume) this run.
+    let created_at = wait_for_marker(
+        &vm_log,
+        "Pre-start snapshot created successfully",
+        0,
+        Duration::from_secs(300),
+    )
+    .await
+    .context("pre-start snapshot was never created — the miss path did not run")?;
+
+    // Outcome: the resumed source must still launch its container and become
+    // Healthy. This is the line that hangs without the re-ask protocol.
+    let vm_id = loop {
+        if let Some(state) = ls_vm_by_pid(pid).await? {
+            break state.vm_id;
+        }
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "fcvm exited before creating VM state; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let state_path = fcvm::paths::state_dir().join(format!("{}.json", vm_id));
+    let poll_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let healthy = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<fcvm::state::VmState>(&c).ok())
+            .map(|s| s.health_status == fcvm::state::HealthStatus::Healthy)
+            .unwrap_or(false);
+        if healthy {
+            break;
+        }
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "fcvm exited before Healthy; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        );
+        anyhow::ensure!(
+            Instant::now() <= poll_deadline,
+            "resumed source never became Healthy after its pre-start snapshot — \
+             the severed handshake was read as a classification again; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Non-vacuity, from the host's own markers:
+    // (1) the widened window was actually armed and hit;
+    let pre_ack_hit = log_contains(&vm_log, "FAILPOINT cache.pre_ack reached");
+    // (2) the guest actually RE-ASKED after the severed session — the second
+    //     "Cache-ready notification received" is the mechanism under test,
+    //     and it must come after the snapshot boundary.
+    let reask_after_boundary =
+        search_log_from(&vm_log, "Cache-ready notification received", created_at).is_some();
+    let ask_count = {
+        let content = std::fs::read_to_string(&vm_log).unwrap_or_default();
+        count_occurrences(&content, "Cache-ready notification received")
+    };
+    let base_key = ls_vm_by_pid(pid)
+        .await?
+        .and_then(|s| s.config.snapshot_name);
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    cleanup_snapshot_keys(&[base_key]).await;
+
+    assert!(
+        pre_ack_hit,
+        "the cache.pre_ack failpoint never fired — the widened window was not exercised; \
+         log tail:\n{}",
+        log_tail(&vm_log, 40)
+    );
+    assert!(
+        reask_after_boundary && ask_count >= 2,
+        "expected a re-asked cache-ready after the snapshot boundary (got {} asks, \
+         re-ask-after-boundary={}); the healthy outcome would be vacuous without it; \
+         log tail:\n{}",
+        ask_count,
+        reask_after_boundary,
+        log_tail(&vm_log, 40)
+    );
     Ok(())
 }

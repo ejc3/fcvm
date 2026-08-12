@@ -64,6 +64,13 @@ pub struct SetupArgs {
     #[arg(long)]
     pub build_kernels: bool,
 
+    /// Rebuild the profile kernel from source, skipping the release download.
+    /// `--build-kernels` only builds after a download FAILS, so it cannot
+    /// refresh content whose release is still published. Requires
+    /// --kernel-profile.
+    #[arg(long, requires = "kernel_profile")]
+    pub force_build_kernels: bool,
+
     /// Override rootfs filesystem type from kernel profile config (for testing).
     #[arg(long, value_enum, hide = true)]
     pub rootfs_type: Option<RootfsType>,
@@ -461,6 +468,12 @@ pub struct SnapshotRunArgs {
     /// degrade performance.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Place the clone's vsock control socket at DIR/vsock.sock instead of its
+    /// runtime directory (predictable path for external tooling). The restore
+    /// mount redirect retargets the snapshot's embedded vsock directory here.
+    #[arg(long)]
+    pub vsock_dir: Option<String>,
 
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support

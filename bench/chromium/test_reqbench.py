@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.request
 from contextlib import contextmanager, redirect_stdout
@@ -1710,6 +1711,80 @@ class CdpDriveResolveThrottling(unittest.TestCase):
         self.assertGreater(out.get("resolve_attempts", 0), 1,
                            "the attempt count must be recorded so a retried "
                            "resolve_ms is separable from a first-try one")
+
+
+class CdpDriveNavigationFailurePhases(unittest.TestCase):
+    """A transport close must identify which navigation wait observed it.
+
+    `Page.navigate` has two independent waits: the command response and the later
+    `Page.loadEventFired` event. Both used to report only `stage=navigate`, making
+    the preserved 108-second failures incapable of distinguishing a renderer that
+    never answered the command from one that answered and then lost its lifecycle
+    event or transport.
+    """
+
+    @staticmethod
+    def _args():
+        return argparse.Namespace(
+            cdp_host="127.0.0.1:1", url="http://x/", format="jpeg", quality=80,
+            timeout=1.0, idle_wait_ms=0.0, out_prefix="", ws_url="ws://unused",
+            connect_retries=1, nav_timing=False, print_target=False,
+            host_header="", render_module=os.path.join(HERE, "render.py"),
+        )
+
+    @staticmethod
+    def _drive(fail_at):
+        import cdpdrive
+
+        class FakeWsClosed(Exception):
+            pass
+
+        class FakeWs:
+            tcp_ms = 0.1
+            upgrade_ms = 0.2
+
+            def close(self):
+                pass
+
+        class FakeCdp:
+            def __init__(self, _ws):
+                pass
+
+            def cmd(self, method, _params=None, deadline=0):
+                del deadline
+                if method == "Page.navigate":
+                    if fail_at == "command":
+                        raise ConnectionResetError(104, "Connection reset by peer")
+                    return {"loaderId": "loader-1"}
+                return {}
+
+            def wait_event(self, _pred, _deadline):
+                raise FakeWsClosed("connection closed mid-frame")
+
+        fake_render = types.SimpleNamespace(Cdp=FakeCdp, WsClosed=FakeWsClosed)
+        real_load = cdpdrive.load_render
+        real_ws = cdpdrive.TimedWs
+        cdpdrive.load_render = lambda _path: fake_render
+        cdpdrive.TimedWs = lambda _render, _url, _deadline: FakeWs()
+        try:
+            return cdpdrive.drive(CdpDriveNavigationFailurePhases._args())
+        finally:
+            cdpdrive.load_render = real_load
+            cdpdrive.TimedWs = real_ws
+
+    def test_reset_waiting_for_page_navigate_response_is_identified(self):
+        out = self._drive("command")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["stage"], "navigate-command-response")
+        self.assertEqual(out["failure_operation"], "Page.navigate response")
+        self.assertEqual(out["transport_signal"], "tcp-rst")
+
+    def test_peer_eof_waiting_for_load_event_is_identified(self):
+        out = self._drive("lifecycle")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["stage"], "navigate-load-event")
+        self.assertEqual(out["failure_operation"], "Page.loadEventFired wait")
+        self.assertEqual(out["transport_signal"], "tcp-eof")
 
 
 class SnapshotGenerationIdentity(unittest.TestCase):
@@ -3399,6 +3474,10 @@ class ReqbenchShell(unittest.TestCase):
     def _env(self, d, **extra):
         binx = os.path.join(d, "bin")
         os.makedirs(binx, exist_ok=True)
+        fcvm = os.path.join(d, "fcvm")
+        fc_agent = os.path.join(d, "fc-agent")
+        self._write(fcvm, "#!/bin/bash\nexit 0\n")
+        self._write(fc_agent, "#!/bin/bash\nexit 0\n")
         env = dict(os.environ)
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
@@ -3406,6 +3485,8 @@ class ReqbenchShell(unittest.TestCase):
             STATE_DIR=os.path.join(d, "state"),
             ALLOW_BUSY="1",
             RUNID=self.RUN_ID,
+            FCVM=fcvm,
+            FC_AGENT=fc_agent,
         )
         env.update(extra)
         os.makedirs(env["STATE_DIR"], exist_ok=True)
@@ -5099,3 +5180,73 @@ class NoConfusableIdentifiers(unittest.TestCase):
             "it is a homoglyph trap: the name reads as ASCII and is not.\n"
             + "\n".join(offenders),
         )
+
+
+class TimedWsUpgradeDiagnostics(unittest.TestCase):
+    """A WebSocket-upgrade failure must still report the socket it failed on.
+
+    `ws = TimedWs(...)` binds `ws` only when the constructor RETURNS, so a
+    failure during the HTTP upgrade left the name unbound and cdpdrive's
+    handler emitted a transport failure with no `socket_local`, `socket_peer`
+    or `socket_so_error` — the three fields that say WHICH connection died.
+    Red before the fix: `AssertionError: socket diagnostics missing: []`.
+    """
+
+    def _serve_once(self, respond: bytes):
+        import socket as _socket
+        import threading as _threading
+
+        listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        def run():
+            conn, _ = listener.accept()
+            try:
+                conn.recv(4096)
+                conn.sendall(respond)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+                listener.close()
+
+        thread = _threading.Thread(target=run, daemon=True)
+        thread.start()
+        return port, thread
+
+    def test_upgrade_rejection_carries_socket_diagnostics(self):
+        import importlib.util
+        import pathlib
+        import socket as _socket
+
+        here = pathlib.Path(__file__).parent
+        spec = importlib.util.spec_from_file_location("cdpdrive", here / "cdpdrive.py")
+        cdpdrive = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cdpdrive)
+        render = importlib.import_module("render") if False else None
+        spec_r = importlib.util.spec_from_file_location("render", here / "render.py")
+        render = importlib.util.module_from_spec(spec_r)
+        spec_r.loader.exec_module(render)
+
+        # A server that completes TCP and then REJECTS the upgrade: the failure
+        # lands after self.sock exists, which is the case that lost diagnostics.
+        port, thread = self._serve_once(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+        with self.assertRaises(ConnectionError) as caught:
+            cdpdrive.TimedWs(render, f"ws://127.0.0.1:{port}/devtools/page/x", time.monotonic() + 5)
+        thread.join(timeout=5)
+
+        diagnostics = getattr(caught.exception, "fcvm_socket_diagnostics", {})
+        self.assertEqual(
+            sorted(diagnostics),
+            ["socket_local", "socket_peer", "socket_so_error"],
+            f"socket diagnostics missing: {sorted(diagnostics)}. An upgrade failure "
+            "must still say which connection died; the values have to be read while "
+            "the socket is open, since a closed one raises EBADF and drive() "
+            "swallows that.",
+        )
+        self.assertEqual(diagnostics["socket_local"][0], "127.0.0.1")
+        self.assertEqual(diagnostics["socket_peer"][1], port)
+        self.assertIsInstance(diagnostics["socket_so_error"], int)

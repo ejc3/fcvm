@@ -71,7 +71,7 @@ pub struct VmManager {
     holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
     user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
-    mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
+    mount_redirects: Option<Vec<(PathBuf, PathBuf)>>, // ordered (mountpoint, source) binds for mount namespace isolation
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
     // Reader task for the child's stderr pipe. Awaited (bounded) before rendering
@@ -166,14 +166,19 @@ impl VmManager {
     /// from the same snapshot to each have their own vsock socket and disk file bindings,
     /// even though vmstate.bin stores the baseline's paths.
     ///
-    /// Multiple baseline_dirs are needed because:
+    /// Each `(mountpoint, source)` pair bind-mounts `source` over `mountpoint`,
+    /// in order (a later mountpoint may resolve inside an earlier pair's mount).
+    /// Multiple pairs are needed because:
     /// - Vsock paths in vmstate.bin reference the original cache VM's directory
     /// - Disk paths in vmstate.bin reference the snapshotted VM's directory (after patch_drive)
+    /// - A custom `--vsock-dir` retargets only the vsock directory, with the
+    ///   clone's `disks/` bound back on top
     ///
-    /// The bind mount makes Firecracker see clone's directory contents when
-    /// accessing any baseline's path, so each clone binds to its own socket files.
-    pub fn set_mount_redirects(&mut self, baseline_dirs: Vec<PathBuf>, clone_dir: PathBuf) {
-        self.mount_redirects = Some((baseline_dirs, clone_dir));
+    /// The bind mounts make Firecracker see the clone's (or the caller's vsock)
+    /// directory contents when accessing any baseline path, so each clone binds
+    /// its own socket files.
+    pub fn set_mount_redirects(&mut self, redirects: Vec<(PathBuf, PathBuf)>) {
+        self.mount_redirects = Some(redirects);
     }
 
     /// Start the Firecracker process

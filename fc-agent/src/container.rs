@@ -863,18 +863,83 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Result of notify_cache_ready_and_wait: distinguishes cold start from warm start.
+/// Result of notify_cache_ready_and_wait: what this VM is, per the host.
 #[derive(Debug, PartialEq)]
 pub enum CacheResult {
-    /// Host sent "cache-ack" — cold start, vsock connections are alive.
+    /// Host answered "cache-ack" — continue cold in this VM and launch the
+    /// container.
     ColdStart,
-    /// POLLHUP, write-probe, or restore-epoch detected — warm start,
-    /// vsock connections are dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
+    /// This VM was restored from a snapshot: the owning host process answered
+    /// "cache-restored", or the restore-epoch watcher fired. The restore
+    /// machinery in that same process drives (or fails closed) the readiness
+    /// this VM waits on, so the WarmStart wait is guaranteed to resolve.
     WarmStart,
-    /// Handshake failed (console quiesce failure — cache-ready deliberately
-    /// not sent so the host cannot snapshot a mid-transmit UART — or connect
-    /// error, send error, timeout, etc.). The VM continues cold.
+    /// Host answered "cache-doomed" — this VM produced a pre-start snapshot
+    /// and is being replaced by a restore of it. The container must never
+    /// launch here; the host tears this VM down momentarily.
+    Doomed,
+    /// Handshake failed: console quiesce failure (cache-ready deliberately not
+    /// sent so the host cannot snapshot a mid-transmit UART), the first
+    /// connect/send failing (the host never learned we were ready, so it will
+    /// never pause us), a host that went silent AND unreachable, or the
+    /// absolute deadline. The VM continues cold.
     Failed,
+}
+
+/// One handshake connection's terminal state.
+///
+/// `Severed` is deliberately NOT a classification. The VMM queues a
+/// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET into the guest's event queue during
+/// snapshot SAVE (`Vsock::prepare_save` in Firecracker), so the event is
+/// processed when vCPUs next run — which happens both when the SOURCE resumes
+/// and when a CLONE is restored. The resumed source and the restored clone
+/// therefore observe byte-identical connection death, and no timer can tell
+/// them apart (guessing hung the source for its whole health deadline, #799).
+/// The only party that knows which one we are is the host process that owns
+/// this VM, so a severed session always leads back to asking it again.
+#[derive(Debug, PartialEq)]
+enum SessionOutcome {
+    /// "cache-ack": continue cold.
+    Ack,
+    /// "cache-restored" from the host, or the restore-epoch watcher fired.
+    Restored,
+    /// "cache-doomed": this VM is being replaced; never launch.
+    Doomed,
+    /// Transport severed with no verdict read — a snapshot boundary passed
+    /// over this connection (or its close raced an unread probe, #627).
+    Severed,
+    /// No keepalive within the deadline: the host is silent.
+    Silent,
+    /// Unrecoverable local error (poll error, buffer overflow, absolute cap).
+    Fatal,
+}
+
+/// Opens connections to the host status port. A seam: the handshake protocol
+/// below is fd-generic (nix poll/read/write), so unit tests drive it over
+/// Unix socketpairs with a scripted host instead of a vsock device.
+pub(crate) trait StatusConnector {
+    fn connect(&mut self) -> Result<std::os::fd::OwnedFd, nix::errno::Errno>;
+}
+
+/// The production connector: vsock to the host's status listener.
+struct VsockStatusConnector;
+
+impl StatusConnector for VsockStatusConnector {
+    fn connect(&mut self) -> Result<std::os::fd::OwnedFd, nix::errno::Errno> {
+        use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+        use std::os::fd::AsRawFd;
+        let sock = socket(
+            AddressFamily::Vsock,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )?;
+        connect(
+            sock.as_raw_fd(),
+            &VsockAddr::new(vsock::HOST_CID, vsock::STATUS_PORT),
+        )?;
+        Ok(sock)
+    }
 }
 
 /// Notify host that image is cached, wait for snapshot ack.
@@ -910,12 +975,6 @@ pub fn notify_cache_ready_and_wait(
     digest: &str,
     restore_flag: &std::sync::atomic::AtomicBool,
 ) -> CacheResult {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
-    use nix::unistd::{read, write};
-    use std::os::fd::{AsFd, AsRawFd};
-
     // Receiving "cache-ready" makes the host PAUSE this VM for the pre-start
     // snapshot. A snapshot that captures the UART mid-transmit is poisoned:
     // EVERY restore of it has a dead serial console (the guest 8250 driver
@@ -923,7 +982,7 @@ pub fn notify_cache_ready_and_wait(
     // delivers). So: announce FIRST, then make the console provably quiet
     // (flush + gate + TIOCOUTQ drain — structural, not probabilistic), and
     // only THEN let the host know we are ready to be paused. On success the
-    // gate holds until this function returns (every path: ack, restore,
+    // gate holds until this function returns (every path: verdict, restore,
     // failure), so no concurrent task can put a byte in UART TX while the
     // pause can happen — lines logged meanwhile are buffered and flushed when
     // the guard drops. If the console CANNOT be proven quiet, the handshake
@@ -945,56 +1004,195 @@ pub fn notify_cache_ready_and_wait(
         }
     };
 
-    let sock = match socket(
-        AddressFamily::Vsock,
-        SockType::Stream,
-        SockFlag::empty(),
-        None,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
+    run_cache_handshake(&mut VsockStatusConnector, digest, restore_flag)
+}
+
+/// The cache handshake protocol: ask the host what this VM is, and keep
+/// asking until the owner answers.
+///
+/// Wire protocol on the status port, all lines newline-terminated:
+///   guest -> host  "cache-ready:<digest>"   the (idempotent, re-sendable) ask
+///   host  -> guest "cache-wait"             keepalive while the verdict is pending
+///   host  -> guest "cache-ack"              verdict: continue cold, launch the container
+///   host  -> guest "cache-restored"         verdict: this VM is a restored clone
+///   host  -> guest "cache-doomed"           verdict: this VM is being replaced — never launch
+///
+/// A connection severed without a verdict is a snapshot boundary, not an
+/// answer (see [`SessionOutcome::Severed`]): reconnect and re-send the same
+/// ask. Every fcvm process that can own this VM keeps a verdict for it — the
+/// run loop (Pending until the snapshot decision, then Continue or Doomed)
+/// and the restore path (Restored, bound before the clone resumes) — so the
+/// re-ask is answered by whichever process actually owns the guest now, from
+/// state that process KNOWS. No transport event or timer is ever read as a
+/// classification.
+///
+/// Failure exits (all continue cold, preserving pre-protocol semantics):
+/// the FIRST connect/send failing (the host never saw the ask, so it will
+/// never pause us), the host going silent for 30s AND then refusing the
+/// reconnect (host process gone), or the 10-minute absolute cap.
+fn run_cache_handshake(
+    connector: &mut dyn StatusConnector,
+    digest: &str,
+    restore_flag: &std::sync::atomic::AtomicBool,
+) -> CacheResult {
+    use nix::unistd::write;
+
+    let started = std::time::Instant::now();
+    let absolute_deadline = started + std::time::Duration::from_secs(600);
+    let mut asked_before = false;
+    let mut went_silent = false;
+
+    loop {
+        if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!("[fc-agent] cache handshake: restore detected via epoch watcher");
+            return CacheResult::WarmStart;
+        }
+        if std::time::Instant::now() >= absolute_deadline {
+            eprintln!("[fc-agent] cache handshake absolute deadline expired (10 min)");
+            return CacheResult::Failed;
+        }
+
+        let sock = match connector.connect() {
+            Ok(sock) => sock,
+            Err(e) if !asked_before => {
+                eprintln!(
+                    "[fc-agent] WARNING: failed to connect vsock for cache: {}",
+                    e
+                );
+                return CacheResult::Failed;
+            }
+            Err(e) if went_silent => {
+                // Silent for 30s AND unreachable: the host process is gone
+                // (crash/teardown without a verdict). Continue cold — if the
+                // VM is in fact being torn down, it dies before the container
+                // matters; if the host crashed, cold is the only useful state.
+                eprintln!(
+                    "[fc-agent] cache handshake: host silent and unreachable ({}); continuing cold",
+                    e
+                );
+                return CacheResult::Failed;
+            }
+            Err(e) => {
+                // Mid-protocol reconnect refused: the owner may still be
+                // binding its listener (a restore binds before resume, but a
+                // teardown-in-progress can also present this way). Retry; the
+                // restore_flag/absolute-deadline checks above bound the loop.
+                eprintln!(
+                    "[fc-agent] cache handshake: reconnect failed ({}), retrying",
+                    e
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+        };
+
+        // failpoint: hold AFTER the console quiesce completed and immediately
+        // BEFORE announcing cache-ready (which triggers the host's pre-start
+        // snapshot pause) — proves the quiesce gate keeps the UART idle across
+        // an arbitrarily long pre-pause window. Sync context (this fn is
+        // blocking). Only the first ask holds: re-asks happen after the
+        // boundary, where the hold would prove nothing. Note: the marker line
+        // is buffered by the quiesced console and reaches the host log only
+        // after the guard drops — a hold, not a host-visible sync point.
+        if !asked_before {
+            failpoint::hit("cache_ready.pre_send");
+        }
+
+        let msg = format!("cache-ready:{}\n", digest);
+        match write(&sock, msg.as_bytes()) {
+            Ok(n) if n == msg.len() => {}
+            other => {
+                if !asked_before {
+                    eprintln!(
+                        "[fc-agent] WARNING: failed to send cache-ready message: {:?}",
+                        other
+                    );
+                    return CacheResult::Failed;
+                }
+                // Re-ask send failed: the transport died again under us.
+                // Treat like a severed session and go around. Delay like the
+                // refused-connect path so a host that accepts and immediately
+                // resets cannot drive this loop hot for the whole absolute cap.
+                eprintln!(
+                    "[fc-agent] cache handshake: re-ask send failed ({:?}), reconnecting",
+                    other
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+        }
+        if asked_before {
             eprintln!(
-                "[fc-agent] WARNING: failed to create vsock socket for cache: {}",
-                e
+                "[fc-agent] re-sent cache-ready:{} after severed session, waiting for verdict...",
+                digest
             );
-            return CacheResult::Failed;
+        } else {
+            eprintln!("[fc-agent] sent cache-ready:{}, waiting for ack...", digest);
         }
-    };
+        asked_before = true;
+        went_silent = false;
 
-    let addr = VsockAddr::new(vsock::HOST_CID, vsock::STATUS_PORT);
-    if let Err(e) = connect(sock.as_raw_fd(), &addr) {
-        eprintln!(
-            "[fc-agent] WARNING: failed to connect vsock for cache: {}",
-            e
-        );
-        return CacheResult::Failed;
+        match wait_for_verdict(&sock, restore_flag, absolute_deadline) {
+            SessionOutcome::Ack => {
+                // Positive close handshake: close our end FIRST, before any
+                // logging, so the host's drain sees EOF as early as possible.
+                // The host holds this connection open until then precisely so
+                // it never closes with one of our 500ms liveness probes still
+                // unread — an unread byte at close becomes a vsock RST that
+                // flushes this receive buffer, and the ack we just read would
+                // have been lost to a spurious severed session (#627). Our
+                // close is what tells the host the ack landed.
+                drop(sock);
+                eprintln!("[fc-agent] received cache-ack from host (handshake closed)");
+                return CacheResult::ColdStart;
+            }
+            SessionOutcome::Restored => {
+                drop(sock);
+                eprintln!("[fc-agent] cache handshake verdict: restored clone (warm start)");
+                return CacheResult::WarmStart;
+            }
+            SessionOutcome::Doomed => {
+                drop(sock);
+                eprintln!(
+                    "[fc-agent] cache handshake verdict: VM is being replaced by a restore; \
+                     the container will not be launched"
+                );
+                return CacheResult::Doomed;
+            }
+            SessionOutcome::Severed => {
+                // A snapshot boundary passed over this connection. Ask again —
+                // the owner (resumed-source run loop, restored clone's host, or
+                // a teardown that will kill us) answers from what it knows.
+                // Delay like the refused-connect path: a host that accepts and
+                // closes at once returns Severed with no poll timeout consumed,
+                // and an undelayed loop would burn a guest vCPU until the
+                // absolute deadline.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            SessionOutcome::Silent => {
+                // No keepalive for 30s. One reconnect distinguishes a wedged
+                // host (answers or keeps keepaliving) from a dead one (refuses
+                // the connect -> Failed above).
+                went_silent = true;
+                continue;
+            }
+            SessionOutcome::Fatal => return CacheResult::Failed,
+        }
     }
+}
 
-    // failpoint: hold AFTER the console quiesce completed and immediately BEFORE
-    // announcing cache-ready (which triggers the host's pre-start snapshot pause) —
-    // proves the quiesce gate keeps the UART idle across an arbitrarily long
-    // pre-pause window. Sync context (this fn is blocking). Note: the marker line
-    // is buffered by the quiesced console and reaches the host log only after the
-    // guard drops — a hold, not a host-visible sync point.
-    failpoint::hit("cache_ready.pre_send");
-
-    let msg = format!("cache-ready:{}\n", digest);
-    match write(&sock, msg.as_bytes()) {
-        Ok(n) if n == msg.len() => {}
-        Ok(_) => {
-            eprintln!("[fc-agent] WARNING: failed to send complete cache-ready message");
-            return CacheResult::Failed;
-        }
-        Err(e) => {
-            eprintln!(
-                "[fc-agent] WARNING: failed to send cache-ready message: {}",
-                e
-            );
-            return CacheResult::Failed;
-        }
-    }
-
-    eprintln!("[fc-agent] sent cache-ready:{}, waiting for ack...", digest);
+/// Wait on one handshake connection until a verdict, a severed transport, or
+/// a deadline. See [`run_cache_handshake`] for the wire protocol.
+fn wait_for_verdict(
+    sock: &std::os::fd::OwnedFd,
+    restore_flag: &std::sync::atomic::AtomicBool,
+    absolute_deadline: std::time::Instant,
+) -> SessionOutcome {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::unistd::{read, write};
+    use std::os::fd::{AsFd, AsRawFd};
 
     if let Ok(flags) = fcntl(sock.as_raw_fd(), FcntlArg::F_GETFL) {
         let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
@@ -1004,98 +1202,84 @@ pub fn notify_cache_ready_and_wait(
     let mut buf = [0u8; 64];
     let mut total_read = 0;
 
-    // Use a 30s deadline with 500ms poll intervals.
-    // The host takes ~740ms between receiving cache-ready and reaching the
-    // Pause API (directory creation, flock acquisition, setup). A 100ms
-    // timeout caused fc-agent to give up before the snapshot could start,
-    // leading to the container launching and exiting while the host was
-    // still setting up the snapshot — killing the VM mid-pause.
+    // 30s keepalive deadline with 500ms poll intervals. The host emits a
+    // "cache-wait" keepalive every 5s while the verdict is pending (queued on
+    // the global snapshot semaphore, or writing the snapshot), and each
+    // keepalive extends this deadline (#627): under the SnapshotEnabled CI
+    // matrix the semaphore queue alone can exceed a fixed 30s while the host
+    // is perfectly alive. The deadline expires only when the host has gone
+    // genuinely silent; the caller then probes with a reconnect. The absolute
+    // cap bounds a wedged host that keeps ticking keepalives forever.
     //
-    // Valid exit conditions:
-    // 1. "cache-ack" received — host says no snapshot needed (cold start)
-    // 2. POLLHUP / read returns 0 — vsock reset from snapshot RESTORE
-    //    (warm start: VM was restored from cached pre-start snapshot)
-    // 3. restore_flag set by restore-epoch watcher (warm start, POLLHUP not delivered)
-    // 4. 30s since the last sign of host liveness — failsafe timeout. The host
-    //    emits a "cache-wait" keepalive every 5s while it is queued on the global
-    //    snapshot semaphore (and while the snapshot runs), and each keepalive
-    //    extends this deadline (#627): under the SnapshotEnabled CI matrix the
-    //    semaphore queue alone can exceed a fixed 30s while the host is perfectly
-    //    alive, and abandoning the wait launches the container out of step with
-    //    the host's pause. The deadline expires only when the host has gone
-    //    genuinely silent — bounded by an absolute 10-minute cap so a wedged host
-    //    that keeps ticking keepalives can't stall container launch forever.
-    //
-    //    Ordering matters: the deadline is checked AFTER each poll/drain cycle,
-    //    never before. Keepalives can queue while the VM is paused for the
-    //    snapshot, and the guest clock can jump forward across the pause (the ARM
-    //    virtual counter keeps running) — checking expiry before draining would
-    //    discard extensions that are already sitting in the socket buffer.
-    let started = std::time::Instant::now();
-    let absolute_deadline = started + std::time::Duration::from_secs(600);
-    let mut deadline = started + std::time::Duration::from_secs(30);
+    // Ordering matters: deadlines are checked AFTER each poll/drain cycle,
+    // never before. Keepalives can queue while the VM is paused for the
+    // snapshot, and the guest clock can jump forward across the pause (the
+    // ARM virtual counter keeps running) — checking expiry before draining
+    // would discard extensions already sitting in the socket buffer.
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     loop {
-        // Check if the restore-epoch watcher detected a snapshot restore.
-        // This breaks the loop when POLLHUP is not delivered (observed in
-        // rootless mode after pre-start snapshot restore).
+        // The restore-epoch watcher is an equally authoritative source of the
+        // Restored verdict (the host publishes the epoch over its restore
+        // control plane). Checked every cycle so a clone whose re-ask is stuck
+        // behind a slow listener still classifies promptly.
         if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
-            eprintln!("[fc-agent] cache-ack: restore detected via epoch watcher, skipping wait");
-            return CacheResult::WarmStart;
+            return SessionOutcome::Restored;
         }
 
-        // Fixed 500ms poll; expiry is evaluated after the poll/drain below.
         let poll_ms = 500u16;
         let mut poll_fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
 
         match poll(&mut poll_fds, PollTimeout::from(poll_ms)) {
             Err(e) => {
                 eprintln!("[fc-agent] cache-ack poll error: {}", e);
-                return CacheResult::Failed;
+                return SessionOutcome::Fatal;
             }
             Ok(0) => {
-                // Poll timeout — actively probe the vsock connection.
-                // After snapshot restore, the vsock transport is reset but the kernel
-                // may not deliver POLLHUP on the restored fd (observed in rootless mode).
-                // A write to a dead connection fails immediately with EPIPE or ECONNRESET,
-                // which reliably detects that a snapshot was taken and we've been restored.
-                match write(&sock, b"\n") {
+                // Poll timeout — actively probe the connection. After a
+                // snapshot boundary the vsock transport is reset but the
+                // kernel may not deliver POLLHUP on the old fd (observed in
+                // rootless mode). A write to a dead connection fails
+                // immediately, which reliably detects the severance.
+                match write(sock, b"\n") {
                     Err(nix::errno::Errno::EPIPE)
                     | Err(nix::errno::Errno::ECONNRESET)
                     | Err(nix::errno::Errno::ENOTCONN)
                     | Err(nix::errno::Errno::ECONNREFUSED) => {
-                        eprintln!("[fc-agent] cache-ack connection dead (write probe), snapshot was taken");
-                        return CacheResult::WarmStart;
+                        eprintln!(
+                            "[fc-agent] cache handshake connection dead (write probe): \
+                             snapshot boundary crossed"
+                        );
+                        return SessionOutcome::Severed;
                     }
                     Err(nix::errno::Errno::EAGAIN) => {
-                        // Connection alive but can't write now — continue polling
+                        // Connection alive but can't write now — keep polling.
                     }
                     _ => {
-                        // Write succeeded or other error — connection still alive, continue
+                        // Write succeeded or other error — connection alive.
                     }
                 }
-                // No data arrived this cycle — judge expiry now (never before a
+                // No data this cycle — judge expiry now (never before a
                 // drain: queued keepalives must be consumed first).
                 let now = std::time::Instant::now();
                 if now >= absolute_deadline {
-                    eprintln!("[fc-agent] cache-ack absolute deadline expired (10 min)");
-                    return CacheResult::Failed;
+                    eprintln!("[fc-agent] cache handshake absolute deadline expired (10 min)");
+                    return SessionOutcome::Fatal;
                 }
                 if now >= deadline {
-                    eprintln!("[fc-agent] cache-ack deadline expired (host silent for 30s)");
-                    return CacheResult::Failed;
+                    eprintln!("[fc-agent] cache handshake deadline expired (host silent for 30s)");
+                    return SessionOutcome::Silent;
                 }
                 continue;
             }
             Ok(_) => {}
         }
 
-        // Drain readable data BEFORE acting on POLLHUP/POLLERR. Linux can report
-        // POLLIN|POLLHUP together when the host writes "cache-ack" and then
-        // immediately closes the connection — which the host status listener does
-        // after a cold-start cache handshake. Treating POLLHUP as EOF before
-        // reading would discard a buffered cache-ack and misclassify the cold
-        // start as a warm restore, sending it through the restore-wait path.
+        // Drain readable data BEFORE acting on POLLHUP/POLLERR. Linux can
+        // report POLLIN|POLLHUP together when the host writes a verdict and
+        // immediately closes the connection. Treating POLLHUP as EOF before
+        // reading would discard a buffered verdict and turn a decided
+        // handshake into a spurious severed session.
         let hung_up = poll_fds[0]
             .revents()
             .is_some_and(|r| r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR));
@@ -1104,27 +1288,22 @@ pub fn notify_cache_ready_and_wait(
             Ok(n) if n > 0 => {
                 total_read += n;
                 let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
+                // Verb scan before keepalive compaction, so a verdict
+                // coalesced into the same read as a trailing keepalive is
+                // never compacted away. The three verbs share no substring.
                 if received.contains("cache-ack") {
-                    // Positive close handshake: close our end FIRST, before any
-                    // logging, so the host's drain sees EOF as early as possible.
-                    // The host holds this connection open until then precisely so
-                    // it never closes with one of our 500ms liveness probes still
-                    // unread — an unread byte at close becomes a vsock RST that
-                    // flushes this receive buffer, and the ack we just read would
-                    // have been lost to a spurious WarmStart (#627). Our close is
-                    // what tells the host the ack landed.
-                    //
-                    // `poll_fds` borrowed `sock`, but its last use was the
-                    // `hung_up` read above, so the borrow has already ended and
-                    // the socket can be dropped — which closes the fd.
-                    drop(sock);
-                    eprintln!("[fc-agent] received cache-ack from host (handshake closed)");
-                    return CacheResult::ColdStart;
+                    return SessionOutcome::Ack;
                 }
-                // Host keepalive: it is alive but still queued on the snapshot
-                // semaphore / writing the snapshot. Extend the deadline (bounded
-                // by the absolute cap) and compact the buffer so repeated
-                // keepalives can't overflow it.
+                if received.contains("cache-restored") {
+                    return SessionOutcome::Restored;
+                }
+                if received.contains("cache-doomed") {
+                    return SessionOutcome::Doomed;
+                }
+                // Host keepalive: it is alive but the verdict is still
+                // pending. Extend the deadline (bounded by the absolute cap)
+                // and compact the buffer so repeated keepalives can't
+                // overflow it.
                 let (new_total, saw_keepalive) = consume_cache_wait_lines(&mut buf, total_read);
                 total_read = new_total;
                 if saw_keepalive {
@@ -1133,51 +1312,48 @@ pub fn notify_cache_ready_and_wait(
                     eprintln!("[fc-agent] cache-wait keepalive from host, extending deadline");
                 }
                 if total_read >= buf.len() {
-                    eprintln!("[fc-agent] cache-ack buffer overflow, giving up");
-                    return CacheResult::Failed;
+                    eprintln!("[fc-agent] cache handshake buffer overflow, giving up");
+                    return SessionOutcome::Fatal;
                 }
-                // Partial data and the peer has hung up: no cache-ack is coming.
+                // Partial data and the peer has hung up: no verdict is coming
+                // on this connection.
                 if hung_up {
-                    eprintln!(
-                        "[fc-agent] cache-ack connection reset after partial read (warm start)"
-                    );
-                    return CacheResult::WarmStart;
+                    eprintln!("[fc-agent] cache handshake connection reset after partial read");
+                    return SessionOutcome::Severed;
                 }
                 // Otherwise keep reading for the rest of the message.
             }
             Ok(_) => {
-                // Orderly EOF with no buffered cache-ack — vsock reset from a
-                // snapshot RESTORE (warm start).
-                eprintln!("[fc-agent] cache-ack connection closed (snapshot taken)");
-                return CacheResult::WarmStart;
+                // Orderly EOF with no buffered verdict — the transport was
+                // severed by a snapshot boundary.
+                eprintln!("[fc-agent] cache handshake connection closed without a verdict");
+                return SessionOutcome::Severed;
             }
             Err(nix::errno::Errno::EAGAIN) => {
-                // No data pending. If the peer hung up, it's a genuine reset.
+                // No data pending. If the peer hung up, the severance is real.
                 if hung_up {
-                    eprintln!("[fc-agent] cache-ack connection reset (snapshot restore detected)");
-                    return CacheResult::WarmStart;
+                    eprintln!("[fc-agent] cache handshake connection reset (no verdict)");
+                    return SessionOutcome::Severed;
                 }
                 // Spurious wakeup, continue polling.
                 continue;
             }
-            // A reset/torn-down connection (no buffered cache-ack recovered above)
-            // means the vsock transport went away — either a genuine snapshot
-            // RESTORE, or a cold-start handshake where the host closed the
-            // connection with our write-probe bytes still unread, turning its
-            // close into a RST that flushes our receive buffer. Either way the
-            // correct fallback is a warm start, matching the write-probe
-            // classification above; returning Failed here would abort container
-            // launch on every reset. Only genuinely unexpected errors are fatal.
+            // A reset/torn-down connection with no buffered verdict — either a
+            // genuine snapshot boundary, or a handshake where the host closed
+            // with our write-probe bytes still unread, turning its close into
+            // a RST that flushed our receive buffer (#627). Both re-ask: the
+            // owner's verdict state answers the retry correctly either way,
+            // which is exactly the recovery #627's one-shot protocol lacked.
             Err(nix::errno::Errno::ECONNRESET)
             | Err(nix::errno::Errno::EPIPE)
             | Err(nix::errno::Errno::ENOTCONN)
             | Err(nix::errno::Errno::ECONNREFUSED) => {
-                eprintln!("[fc-agent] cache-ack connection reset on read (warm start)");
-                return CacheResult::WarmStart;
+                eprintln!("[fc-agent] cache handshake connection reset on read");
+                return SessionOutcome::Severed;
             }
             Err(e) => {
-                eprintln!("[fc-agent] cache-ack read error: {}", e);
-                return CacheResult::Failed;
+                eprintln!("[fc-agent] cache handshake read error: {}", e);
+                return SessionOutcome::Fatal;
             }
         }
     }
@@ -1607,7 +1783,7 @@ pub async fn run_async(
 
 #[cfg(test)]
 mod tests {
-    use super::consume_cache_wait_lines;
+    use super::{consume_cache_wait_lines, run_cache_handshake, CacheResult, StatusConnector};
 
     fn buf_with(data: &[u8]) -> ([u8; 64], usize) {
         let mut buf = [0u8; 64];
@@ -1667,6 +1843,410 @@ mod tests {
             assert!(saw);
             total = rest;
             assert_eq!(total, 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-handshake protocol tests: a scripted fake host over socketpairs.
+    //
+    // The protocol functions are fd-generic (nix poll/read/write), so Unix
+    // stream pairs stand in for vsock exactly. Each `Session` script runs on
+    // its own thread holding the host end; `ScriptedConnector` hands the guest
+    // the matching ends in order. No sleeps anywhere except the single test
+    // that exercises the 500ms write-probe path — every other script answers
+    // or severs immediately, so orderings are forced by the script shape, not
+    // by timing.
+    //
+    // The pre-protocol behaviour (classify a severed session as WarmStart)
+    // cannot host these tests — the connector seam did not exist. Its red is
+    // end-to-end: on the unfixed binary, 4/4 forced snapshot misses hung with
+    // the host's ack sent into the severed session (2026-08-10, x86 KVM,
+    // /tmp/missrace-logs), and the lifecycle-interleave failpoint test pins
+    // the same ordering in-repo.
+    // -----------------------------------------------------------------------
+
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// One scripted host action after reading the guest's ask.
+    #[derive(Clone, Debug)]
+    enum HostScript {
+        /// Write these chunks (possibly split mid-verb), then keep the
+        /// connection open until the guest drops its end.
+        Answer(Vec<&'static [u8]>),
+        /// Like `Answer`, but waits for the guest's hang-up after the first
+        /// chunk. The guest acts on a verb the instant it is unambiguous, so
+        /// a chunk boundary between a verb and its newline leaves the rest of
+        /// the script writing into a closed peer. Reading to EOF is what
+        /// sequences this — no sleeps.
+        AnswerAcrossHangup(Vec<&'static [u8]>),
+        /// Read the ask, then close without answering (a snapshot boundary).
+        Sever,
+        /// Never read at all; close after the guest's first extra byte
+        /// arrives (the 500ms liveness probe) — leaves probe bytes unread so
+        /// the close can surface as a reset (#627's flush mode).
+        CloseOnProbe,
+    }
+
+    /// Runs one script on the host end of a socketpair. Returns the ask line
+    /// it read (empty for CloseOnProbe).
+    fn spawn_host(mut host: UnixStream, script: HostScript) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || match script {
+            HostScript::Answer(chunks) => answer(&mut host, chunks, false),
+            HostScript::AnswerAcrossHangup(chunks) => answer(&mut host, chunks, true),
+            HostScript::Sever => {
+                let ask = read_ask(&mut host);
+                drop(host);
+                ask
+            }
+            HostScript::CloseOnProbe => {
+                let mut byte = [0u8; 1];
+                // First read: the ask's first byte. Swallow the whole ask,
+                // then wait for one probe byte and close with it unread-ish.
+                let _ = read_ask(&mut host);
+                let _ = host.read(&mut byte);
+                drop(host);
+                String::new()
+            }
+        })
+    }
+
+    /// Reads the ask, writes the script's chunks, then holds the connection
+    /// open (mirroring the real listener's positive-close drain) until the
+    /// guest closes.
+    fn answer(
+        host: &mut UnixStream,
+        chunks: Vec<&'static [u8]>,
+        hang_up_after_first: bool,
+    ) -> String {
+        let ask = read_ask(host);
+        for (i, chunk) in chunks.iter().enumerate() {
+            if !write_chunk(host, chunk) {
+                break;
+            }
+            if hang_up_after_first && i == 0 {
+                drain_to_close(host);
+            }
+        }
+        drain_to_close(host);
+        ask
+    }
+
+    /// Writes one chunk, reporting whether the guest is still on the other end.
+    /// A verdict is complete as soon as its verb is unambiguous, so the guest
+    /// may hang up before the host has written the rest of the script. That is
+    /// the guest behaving correctly, not a broken host.
+    fn write_chunk(host: &mut UnixStream, chunk: &[u8]) -> bool {
+        match host.write_all(chunk) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => false,
+            Err(e) => panic!("scripted host write: {e:?}"),
+        }
+    }
+
+    fn drain_to_close(host: &mut UnixStream) {
+        let mut sink = [0u8; 64];
+        while matches!(host.read(&mut sink), Ok(n) if n > 0) {}
+    }
+
+    fn read_ask(host: &mut UnixStream) -> String {
+        let mut ask = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = host.read(&mut byte) {
+            if byte[0] == b'\n' {
+                break;
+            }
+            ask.push(byte[0]);
+        }
+        String::from_utf8_lossy(&ask).into_owned()
+    }
+
+    /// Hands out pre-scripted sessions in order; connects fail once exhausted.
+    struct ScriptedConnector {
+        sessions: std::collections::VecDeque<OwnedFd>,
+        handles: Vec<std::thread::JoinHandle<String>>,
+    }
+
+    impl ScriptedConnector {
+        fn new(scripts: Vec<HostScript>) -> Self {
+            let mut sessions = std::collections::VecDeque::new();
+            let mut handles = Vec::new();
+            for script in scripts {
+                let (guest, host) = UnixStream::pair().expect("socketpair");
+                handles.push(spawn_host(host, script));
+                sessions.push_back(OwnedFd::from(guest));
+            }
+            Self { sessions, handles }
+        }
+
+        fn asks(self) -> Vec<String> {
+            self.handles
+                .into_iter()
+                .map(|h| h.join().expect("host thread"))
+                .collect()
+        }
+    }
+
+    impl StatusConnector for ScriptedConnector {
+        fn connect(&mut self) -> Result<OwnedFd, nix::errno::Errno> {
+            self.sessions
+                .pop_front()
+                .ok_or(nix::errno::Errno::ECONNREFUSED)
+        }
+    }
+
+    fn handshake(scripts: Vec<HostScript>, flag: &AtomicBool) -> (CacheResult, Vec<String>) {
+        let mut connector = ScriptedConnector::new(scripts);
+        let result = run_cache_handshake(&mut connector, "sha256:test", flag);
+        (result, connector.asks())
+    }
+
+    #[test]
+    fn ack_on_the_first_session_is_a_cold_start() {
+        let flag = AtomicBool::new(false);
+        let (result, asks) = handshake(vec![HostScript::Answer(vec![b"cache-ack\n"])], &flag);
+        assert_eq!(result, CacheResult::ColdStart);
+        assert_eq!(asks, vec!["cache-ready:sha256:test"]);
+    }
+
+    /// THE core case of the re-ask protocol: a session severed by a snapshot
+    /// boundary is not a classification. The guest asks again and the owner's
+    /// answer decides. (Pre-protocol code returned WarmStart here and hung
+    /// the resumed source forever.)
+    #[test]
+    fn a_severed_session_re_asks_and_the_late_ack_is_still_cold() {
+        let flag = AtomicBool::new(false);
+        let (result, asks) = handshake(
+            vec![HostScript::Sever, HostScript::Answer(vec![b"cache-ack\n"])],
+            &flag,
+        );
+        assert_eq!(result, CacheResult::ColdStart);
+        assert_eq!(
+            asks,
+            vec!["cache-ready:sha256:test", "cache-ready:sha256:test"],
+            "the re-ask must be the identical idempotent message"
+        );
+    }
+
+    #[test]
+    fn a_severed_session_answered_restored_is_a_warm_start() {
+        let flag = AtomicBool::new(false);
+        let (result, asks) = handshake(
+            vec![
+                HostScript::Sever,
+                HostScript::Answer(vec![b"cache-restored\n"]),
+            ],
+            &flag,
+        );
+        assert_eq!(result, CacheResult::WarmStart);
+        assert_eq!(asks.len(), 2);
+    }
+
+    #[test]
+    fn a_doomed_verdict_is_surfaced_not_misread_as_cold() {
+        let flag = AtomicBool::new(false);
+        let (result, _) = handshake(vec![HostScript::Answer(vec![b"cache-doomed\n"])], &flag);
+        assert_eq!(result, CacheResult::Doomed);
+    }
+
+    #[test]
+    fn two_boundaries_in_a_row_still_converge_on_the_verdict() {
+        let flag = AtomicBool::new(false);
+        let (result, asks) = handshake(
+            vec![
+                HostScript::Sever,
+                HostScript::Sever,
+                HostScript::Answer(vec![b"cache-ack\n"]),
+            ],
+            &flag,
+        );
+        assert_eq!(result, CacheResult::ColdStart);
+        assert_eq!(asks.len(), 3);
+    }
+
+    #[test]
+    fn a_verdict_split_across_writes_still_assembles() {
+        let flag = AtomicBool::new(false);
+        let (result, _) = handshake(vec![HostScript::Answer(vec![b"cache-a", b"ck\n"])], &flag);
+        assert_eq!(result, CacheResult::ColdStart);
+    }
+
+    #[test]
+    fn keepalives_before_the_verdict_are_consumed_not_misread() {
+        let flag = AtomicBool::new(false);
+        let (result, _) = handshake(
+            vec![HostScript::Answer(vec![
+                b"cache-wait\n",
+                b"cache-wait\n",
+                b"cache-wait\n",
+                b"cache-restored\n",
+            ])],
+            &flag,
+        );
+        assert_eq!(result, CacheResult::WarmStart);
+    }
+
+    #[test]
+    fn the_restore_epoch_watcher_is_an_equal_authority() {
+        // The flag is set before the boundary severs the first session, so
+        // the guest must classify WarmStart without ever needing session 2.
+        let flag = Arc::new(AtomicBool::new(false));
+        let (guest, mut host) = UnixStream::pair().expect("socketpair");
+        let flag_host = flag.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = read_ask(&mut host);
+            flag_host.store(true, Ordering::Release);
+            drop(host); // sever AFTER publishing the flag
+        });
+        struct One(Option<OwnedFd>);
+        impl StatusConnector for One {
+            fn connect(&mut self) -> Result<OwnedFd, nix::errno::Errno> {
+                self.0.take().ok_or(nix::errno::Errno::ECONNREFUSED)
+            }
+        }
+        let mut connector = One(Some(OwnedFd::from(guest)));
+        let result = run_cache_handshake(&mut connector, "sha256:test", &flag);
+        handle.join().unwrap();
+        assert_eq!(result, CacheResult::WarmStart);
+    }
+
+    #[test]
+    fn a_first_connect_refusal_fails_cold_like_before() {
+        let flag = AtomicBool::new(false);
+        let (result, asks) = handshake(vec![], &flag);
+        assert_eq!(result, CacheResult::Failed);
+        assert!(asks.is_empty());
+    }
+
+    /// #627's flush mode, now HEALED instead of merely tolerated: the host
+    /// closes with a liveness probe unread, the guest's session dies with no
+    /// verdict, and the re-ask recovers the answer. Exercises the 500ms
+    /// write-probe path, so this is the one deliberately slow test (~1s).
+    #[test]
+    fn a_close_racing_an_unread_probe_recovers_via_re_ask() {
+        let flag = AtomicBool::new(false);
+        let (result, _) = handshake(
+            vec![
+                HostScript::CloseOnProbe,
+                HostScript::Answer(vec![b"cache-ack\n"]),
+            ],
+            &flag,
+        );
+        assert_eq!(result, CacheResult::ColdStart);
+    }
+
+    /// The guest acts on a verb the instant it is unambiguous, which is before
+    /// the newline whenever the host's write splits there. Every verdict must
+    /// still map exactly, and the host must survive discovering the guest
+    /// already hung up on the rest of its script.
+    #[test]
+    fn a_verdict_split_before_its_newline_maps_and_survives_the_hang_up() {
+        for (verb, expected) in [
+            (b"cache-ack".as_slice(), CacheResult::ColdStart),
+            (b"cache-restored".as_slice(), CacheResult::WarmStart),
+            (b"cache-doomed".as_slice(), CacheResult::Doomed),
+        ] {
+            let flag = AtomicBool::new(false);
+            let (result, asks) = handshake(
+                vec![HostScript::AnswerAcrossHangup(vec![verb, b"\n"])],
+                &flag,
+            );
+            assert_eq!(
+                result,
+                expected,
+                "verb {} lost its verdict when the newline landed after the hang-up",
+                String::from_utf8_lossy(verb)
+            );
+            assert_eq!(asks, vec!["cache-ready:sha256:test"]);
+        }
+    }
+
+    /// Seeded protocol fuzz: random host scripts, exact-verdict invariants.
+    ///
+    /// Every script is a chain of severed sessions (with random keepalive and
+    /// garbage prefixes) ending in exactly one verdict, possibly split at a
+    /// random byte. Invariants: the result maps 1:1 to the scripted verdict,
+    /// the guest asked exactly once per session it was given, and every ask
+    /// carried the identical message. No timing dependence: every script
+    /// answers or severs immediately, so a hang would be a real protocol bug
+    /// (and fails the suite's timeout rather than passing vacuously).
+    ///
+    /// Deterministic and replayable: a failure prints its seed; re-run with
+    /// FCVM_FUZZ_SEED=<n> to reproduce, FCVM_FUZZ_SEEDS=<n> to widen (the
+    /// hardware sweep runs thousands; default keeps `cargo test` fast).
+    #[test]
+    fn fuzz_random_host_scripts_map_verdicts_exactly_and_never_hang() {
+        let seeds: u64 = std::env::var("FCVM_FUZZ_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+        let fixed: Option<u64> = std::env::var("FCVM_FUZZ_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
+        for seed in fixed.map(|s| s..s + 1).unwrap_or(0..seeds) {
+            // xorshift64* — tiny, deterministic, no dependency.
+            let mut state = seed.wrapping_mul(2685821657736338717).max(1);
+            let mut next = move || {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                state.wrapping_mul(2685821657736338717)
+            };
+
+            let boundaries = (next() % 4) as usize; // 0..=3 severed sessions
+            let mut scripts = Vec::new();
+            for _ in 0..boundaries {
+                scripts.push(HostScript::Sever);
+            }
+            let verdict_idx = next() % 3;
+            let verdict: &'static [u8] = match verdict_idx {
+                0 => b"cache-ack\n",
+                1 => b"cache-restored\n",
+                _ => b"cache-doomed\n",
+            };
+            let mut chunks: Vec<&'static [u8]> = Vec::new();
+            chunks.extend(std::iter::repeat_n(
+                b"cache-wait\n".as_slice(),
+                (next() % 3) as usize,
+            ));
+            // Random split point inside the verdict verb.
+            let split = (next() as usize) % verdict.len();
+            if split == 0 {
+                chunks.push(verdict);
+            } else {
+                let (a, b) = verdict.split_at(split);
+                chunks.push(a);
+                chunks.push(b);
+            }
+            scripts.push(HostScript::Answer(chunks));
+
+            let flag = AtomicBool::new(false);
+            let expected_asks = scripts.len();
+            let (result, asks) = handshake(scripts, &flag);
+            let expected = match verdict_idx {
+                0 => CacheResult::ColdStart,
+                1 => CacheResult::WarmStart,
+                _ => CacheResult::Doomed,
+            };
+            assert_eq!(
+                result, expected,
+                "seed {seed}: verdict mapping broke (boundaries={boundaries}, split={split})"
+            );
+            assert_eq!(
+                asks.len(),
+                expected_asks,
+                "seed {seed}: ask count diverged from session count"
+            );
+            for ask in &asks {
+                assert_eq!(
+                    ask, "cache-ready:sha256:test",
+                    "seed {seed}: a re-ask mutated the idempotent message"
+                );
+            }
         }
     }
 }

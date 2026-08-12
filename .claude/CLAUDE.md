@@ -45,6 +45,26 @@ another what changed and why. Say that and stop.
 - Read it back as if a colleague sent it to you. If it reads like marketing or an essay,
   rewrite it.
 
+## MAXIMUM REUSE / CACHEABILITY
+
+**The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,
+rootfs images, initrds, container exports, and snapshots are content-addressed precisely
+so nothing is built or booted twice when it doesn't have to be.
+
+- **No snapshot-cache opt-outs unless absolutely required.** An invocation may skip the
+  cache only when a cached artifact would BEHAVE differently for it and the difference
+  cannot be reconciled at restore time. Every entry in `snapshot_cache_opt_out`
+  (`src/commands/podman/mod.rs`) carries that justification next to it; an entry without
+  one is a bug.
+- **Flags that change WHERE something binds are honored at restore time, not by
+  bypassing the cache.** Example: `--vsock-dir` retargets the restore mount redirect so a
+  cache hit places the clone's listener in the caller's directory; it does not force a
+  cold boot.
+- **Never add per-caller data to the content key when restore can reconcile it.**
+  Fragmenting the key silently kills sharing between behaviorally identical artifacts.
+- Before adding an opt-out or a key ingredient, ask: can the restore path absorb this
+  difference? If yes, that is the fix.
+
 ## VERIFY PLAN AND RUN NEW TESTS LOCALLY
 
 **Before committing, ALWAYS:**
@@ -1921,7 +1941,8 @@ ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, 
 ```
 
 **What `fcvm setup` does:**
-1. Downloads Kata kernel from URL in `rootfs-config.toml` (~15MB, cached by URL hash)
+1. Downloads the released default fcvm kernel selected by the explicit
+   architecture profile (content-addressed by version, arch, and manifest SHA)
 2. Downloads packages using `podman run ubuntu:noble` with `apt-get install --download-only`
    - Packages specified in `rootfs-config.toml` (podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony, strace)
    - Uses target Ubuntu version (noble/24.04) to get correct package versions
@@ -1932,7 +1953,10 @@ ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, 
    - Verifies setup completed by checking for `/etc/fcvm-setup-complete` marker file
 4. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
 
-**Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in.
+**Kernel source**: fcvm builds the pinned Linux release from an immutable
+Firecracker base config. Default arm64 and amd64 fragments require FUSE plus
+`CONFIG_INET_DIAG`, `CONFIG_INET_DIAG_DESTROY`, and `CONFIG_PACKET` for safe
+snapshot socket cleanup.
 
 ### Data Layout
 
@@ -1942,7 +1966,7 @@ Paths are configured in `rootfs-config.toml` under `[paths]`:
 
 ```
 assets_dir (default: /mnt/fcvm-btrfs)
-├── kernels/vmlinux-{sha}.bin     # Kernel (SHA of URL)
+├── kernels/vmlinux-{profile}-{version}-{arch}-{sha}.bin  # Released source kernel
 ├── rootfs/layer2-{sha}.raw       # Base image (~10GB, SHA of setup script)
 ├── initrd/fc-agent-{sha}.initrd  # fc-agent injection (SHA of binary)
 ├── image-cache/sha256:{digest}/  # Container image layers

@@ -80,8 +80,12 @@ use std::time::{Duration, Instant};
 /// Poll interval for `block_until_file`.
 const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Hard cap on `block_until_file`: a wedged harness must not wedge the VM forever.
-const BLOCK_CAP: Duration = Duration::from_secs(60);
+/// Hard cap on `block_until_file`: a wedged harness must not wedge the VM
+/// forever. It MUST exceed every harness budget that can elapse while a point
+/// is held (the largest today is a 180s snapshot-create wait) — a cap below
+/// them fires first and silently rewrites the interleaving under test into
+/// exactly the race the hold was supposed to remove.
+const BLOCK_CAP: Duration = Duration::from_secs(300);
 
 /// What an armed failpoint does when hit.
 #[derive(Debug, Clone, PartialEq, Eq)]

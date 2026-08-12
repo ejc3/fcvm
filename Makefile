@@ -224,11 +224,11 @@ CONTAINER_RUN_BASE := podman run --rm --privileged \
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
 .PHONY: all help build clean clean-test-data check-disk \
-	test test-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz \
-	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
+	test test-unit test-agent-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz \
+	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
@@ -248,6 +248,7 @@ help:
 	@echo ""
 	@echo "Test (host):"
 	@echo "  test-unit          Unit tests only (no VMs, no sudo)"
+	@echo "  test-agent-unit    fc-agent unit tests only (no VMs, no sudo)"
 	@echo "  test-fast          + quick VM tests (rootless, no sudo)"
 	@echo "  test-all           + slow VM tests (rootless, no sudo)"
 	@echo "  test-root, test    + privileged tests (bridged, pjdfstest, sudo)"
@@ -448,6 +449,9 @@ clean:
 _test-unit: cargo-target-link
 	$(TEST_CONFIG_WRAPPER) $(NEXTEST) --no-default-features $(FILTER)
 
+_test-agent-unit: cargo-target-link
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) -p fc-agent $(FILTER)
+
 _test-fast: cargo-target-link
 	RUST_LOG="$(TEST_LOG)" \
 	$(TEST_CONFIG_WRAPPER) ./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
@@ -476,6 +480,7 @@ _test-root: cargo-target-link
 
 # Host targets (with setup, check-disk first to fail fast if disk is full)
 test-unit: show-notes check-disk build _test-unit
+test-agent-unit: show-notes check-disk cargo-target-link _test-agent-unit
 test-fast: show-notes check-disk setup-fcvm _test-fast
 test-all: show-notes check-disk setup-fcvm _test-all
 test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages _test-root
@@ -616,12 +621,30 @@ setup-default: build setup-btrfs
 		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
 		exit 1; \
 	fi
-	@echo "==> Running fcvm setup (default kernel)..."
+	@echo "==> Running fcvm setup (default kernel; builds only if release is absent)..."
 	@# Tests run fcvm via sudo, which reads /root/.config/fcvm — sync BOTH the
 	@# user and root configs or a rootfs-config.toml change silently boots the
 	@# previous rootfs under sudo (root keeps the stale SHA).
 	sudo ./target/release/fcvm setup --generate-config --force
-	./target/release/fcvm setup
+	./target/release/fcvm setup --kernel-profile default --build-kernels
+
+# The default kernel as a publishable release artifact.
+#
+# The release workflow uses this instead of calling `fcvm setup` directly, so that
+# storage setup, config synchronisation and any future build routing stay in one
+# place rather than being duplicated in YAML.
+#
+# FORCE=1 makes a forced rebuild actually rebuild, via --force-build-kernels.
+# Deleting the cached file is NOT enough: the release being replaced is still
+# published at build time, so `--build-kernels` (which only builds after a FAILED
+# download) downloads it again and the job republishes the exact artifact the
+# operator asked to replace. A post-run existence check cannot catch that, since
+# a download leaves the same file. KERNEL_FILE names the artifact to assert on.
+release-default-kernel: build setup-btrfs
+	@if [ "$(FORCE)" = "1" ] && [ -z "$(KERNEL_FILE)" ]; then 		echo "ERROR: FORCE=1 needs KERNEL_FILE=<vmlinux-...bin> to assert the rebuild produced it"; 		exit 1; 	fi
+	sudo ./target/release/fcvm setup --generate-config --force
+	@if [ "$(FORCE)" = "1" ]; then 		echo "==> FORCE: rebuilding from source, bypassing the published release"; 		sudo ./target/release/fcvm setup --kernel-profile default --force-build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	else 		sudo ./target/release/fcvm setup --kernel-profile default --build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	fi
+	@if [ -n "$(KERNEL_FILE)" ] && [ ! -f "/mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)" ]; then 		echo "ERROR: setup finished without producing /mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)"; 		ls -la /mnt/fcvm-btrfs/kernels/; 		exit 1; 	fi
 
 setup-fcvm: setup-default
 	@echo "==> Running fcvm setup --kernel-profile nested..."
@@ -649,7 +672,7 @@ _setup-fcvm:
 		exit 1; \
 	fi
 	sudo ./target/release/fcvm setup --generate-config --force
-	sudo ./target/release/fcvm setup
+	sudo ./target/release/fcvm setup --kernel-profile default --build-kernels
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
 	sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
 

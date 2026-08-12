@@ -111,8 +111,9 @@ fn test_generate_config() {
     // Verify config file has expected content
     let content = std::fs::read_to_string(&config_path).expect("failed to read config");
     assert!(
-        content.contains("[kernel]"),
-        "config missing [kernel] section"
+        content.contains("[kernel_profiles.default.arm64]")
+            && content.contains("[kernel_profiles.default.amd64]"),
+        "config missing explicit default kernel profiles"
     );
     assert!(
         content.contains("[packages]"),
@@ -192,8 +193,9 @@ fn test_generate_config_force_overwrite() {
     // Verify config was overwritten with real content
     let content = std::fs::read_to_string(&config_path).expect("failed to read config");
     assert!(
-        content.contains("[kernel]"),
-        "config should contain [kernel] section after --force"
+        content.contains("[kernel_profiles.default.arm64]")
+            && content.contains("[kernel_profiles.default.amd64]"),
+        "config should contain explicit default kernel profiles after --force"
     );
     assert!(
         content != "# existing config",

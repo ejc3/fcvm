@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
@@ -13,7 +13,10 @@ mod snapshot;
 mod types;
 mod vm_config;
 
-pub use types::{CacheRequest, LogLine, PreparedTarget, SnapshotOutcome, VmContext, VmHandle};
+pub use types::{
+    shared_cache_verdict, CacheRequest, CacheVerdict, LogLine, PreparedTarget, SharedCacheVerdict,
+    SnapshotOutcome, VmContext, VmHandle,
+};
 // Re-exported for the snapshot restore path's up-front reboot plan (a rebooted VM
 // relaunches in place via the same shared primitive, on every lifecycle path).
 pub(crate) use types::{RebootSpec, VolumeMapping};
@@ -22,7 +25,10 @@ pub(crate) use types::{RebootSpec, VolumeMapping};
 // ID even when the tag is rebuilt mid-export).
 pub use image::export_image_archive;
 
-pub(crate) use listeners::{run_output_listener, run_status_listener, spawn_bootplan_listener};
+pub(crate) use listeners::{
+    run_output_listener, run_status_listener, spawn_bootplan_listener,
+    spawn_restore_completion_listener,
+};
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
@@ -141,6 +147,20 @@ where
     Ok(config)
 }
 
+/// Resolve a custom vsock directory into the exact socket path that all
+/// launcher components and later snapshot commands will share.
+pub(crate) fn resolve_custom_vsock_socket_path(
+    configured_dir: &Path,
+    current_dir: &Path,
+) -> PathBuf {
+    let absolute_dir = if configured_dir.is_absolute() {
+        configured_dir.to_path_buf()
+    } else {
+        current_dir.join(configured_dir)
+    };
+    absolute_dir.join("vsock.sock")
+}
+
 /// Start a VM with the given args. Returns a handle to the running VM.
 ///
 /// The VM event loop runs in a background task. The handle's `Drop` impl cancels
@@ -160,6 +180,10 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
     let vm_id = ctx.vm_id.clone();
     let name = ctx.vm_name.clone();
     let log_tx = ctx.log_tx.clone();
+    let Some(vsock_socket_path) = ctx.vm_state.config.vsock_socket_path.clone() else {
+        cleanup_vm_context(ctx).await;
+        anyhow::bail!("prepared VM has no recorded vsock socket path");
+    };
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
@@ -189,6 +213,7 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
         vm_id,
         name,
         pid: actual_pid,
+        vsock_socket_path,
         cancel,
         task: Some(task),
         log_tx,
@@ -274,6 +299,40 @@ fn should_arm_startup_snapshot(
     !skip_snapshot_creation
         && has_snapshot_key
         && (lifecycle.is_prepare() || has_explicit_http_health_check)
+}
+
+/// Whether this invocation must stay out of the snapshot cache entirely — no
+/// lookup, no creation. `env_no_snapshot` is `FCVM_NO_SNAPSHOT` set non-empty;
+/// `env_forced_vsock_bootplan` is `FCVM_BOOTPLAN=vsock`.
+///
+/// MAXIMUM REUSE / CACHEABILITY is a core fcvm principle: an entry joins this
+/// list only when a cached artifact would BEHAVE differently for this
+/// invocation and the difference cannot be reconciled at restore time. Flags
+/// that only change WHERE something binds (e.g. `--vsock-dir`) are honored by
+/// the restore path instead of opting out.
+fn snapshot_cache_opt_out(
+    args: &RunArgs,
+    env_no_snapshot: bool,
+    env_forced_vsock_bootplan: bool,
+) -> bool {
+    args.no_snapshot
+        // A disk-only clone cold-boots from the captured disk and must never divert
+        // into the snapshot-cache / UFFD restore path.
+        || args.rootfs_override.is_some()
+        // Cloud Hypervisor supports explicit `snapshot create`/`run` (P2), but the
+        // automatic pre-start snapshot cache for `podman run` is not wired up for CH yet
+        // (a follow-on) — so never enter the snapshot-cache / restore path for it here.
+        || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
+        || env_no_snapshot
+        // A FORCED boot-plan transport override (FCVM_BOOTPLAN=vsock on Firecracker, which
+        // natively uses MMDS) produces a guest whose fc-agent took the vsock path and never
+        // spawned the MMDS restore-epoch watcher. The snapshot cache key is a hash of
+        // FirecrackerConfig, which does NOT encode the boot-plan transport, so a cached
+        // vsock-built snapshot would be restored by a later NORMAL (MMDS) run under the same
+        // key — the host then signals restore over MMDS that nobody polls, wedging the
+        // restored VM (no exec rebind / output reconnect). Forcing the transport is a
+        // test/debug path with no need to populate the shared cache, so skip caching for it.
+        || env_forced_vsock_bootplan
 }
 
 /// Where one `podman prepare` invocation installs its startup snapshot, and what an
@@ -722,7 +781,7 @@ async fn prepare_vm_for_lifecycle(
     validate_vm_name(&args.name).context("invalid VM name")?;
 
     // Validate hugepages memory alignment (2MB pages require even MiB)
-    if args.hugepages && args.mem % 2 != 0 {
+    if args.hugepages && !args.mem.is_multiple_of(2) {
         bail!(
             "--mem {} is not divisible by 2: hugepages requires 2MB-aligned memory size",
             args.mem
@@ -894,28 +953,16 @@ async fn prepare_vm_for_lifecycle(
         (image_ref.cache_key, image_ref.image_id)
     };
 
-    // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
+    // Check for snapshot cache (unless the invocation opts out — see
+    // snapshot_cache_opt_out for the full list and rationale).
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
-    // A disk-only clone cold-boots from the captured disk and must never divert
-    // into the snapshot-cache / UFFD restore path.
-    let no_snapshot = args.no_snapshot
-        || args.rootfs_override.is_some()
-        // Cloud Hypervisor supports explicit `snapshot create`/`run` (P2), but the
-        // automatic pre-start snapshot cache for `podman run` is not wired up for CH yet
-        // (a follow-on) — so never enter the snapshot-cache / restore path for it here.
-        || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
-        || std::env::var("FCVM_NO_SNAPSHOT")
+    let no_snapshot = snapshot_cache_opt_out(
+        &args,
+        std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        // A FORCED boot-plan transport override (FCVM_BOOTPLAN=vsock on Firecracker, which
-        // natively uses MMDS) produces a guest whose fc-agent took the vsock path and never
-        // spawned the MMDS restore-epoch watcher. The snapshot cache key is a hash of
-        // FirecrackerConfig, which does NOT encode the boot-plan transport, so a cached
-        // vsock-built snapshot would be restored by a later NORMAL (MMDS) run under the same
-        // key — the host then signals restore over MMDS that nobody polls, wedging the
-        // restored VM (no exec rebind / output reconnect). Forcing the transport is a
-        // test/debug path with no need to populate the shared cache, so skip caching for it.
-        || std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock");
+            .unwrap_or(false),
+        std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock"),
+    );
     let (fc_config, snapshot_key, prepare_target): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
@@ -977,6 +1024,7 @@ async fn prepare_vm_for_lifecycle(
                 exec: None,
                 no_dirty_tracking: false, // podman needs dirty tracking for future snapshots
                 no_swap: false,
+                vsock_dir: args.vsock_dir.clone(),
                 startup_snapshot_base_key: None, // Already using startup snapshot
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
@@ -1015,6 +1063,7 @@ async fn prepare_vm_for_lifecycle(
                 exec: None,
                 no_dirty_tracking: false, // podman needs dirty tracking for startup snapshot
                 no_swap: false,
+                vsock_dir: args.vsock_dir.clone(),
                 // Create startup snapshot if this config has a health check URL
                 startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
                 cpu: Some(args.cpu),
@@ -1373,24 +1422,43 @@ async fn prepare_vm_for_lifecycle(
     // Firecracker binds to vsock.sock, VolumeServers listen on vsock.sock_{port}
     // Use custom vsock_dir if provided (for predictable socket paths)
     let vsock_socket_path = if let Some(ref vsock_dir) = args.vsock_dir {
-        let vsock_dir = std::path::PathBuf::from(vsock_dir);
-        if let Err(e) = tokio::fs::create_dir_all(&vsock_dir)
-            .await
-            .with_context(|| format!("creating vsock dir: {:?}", vsock_dir))
-        {
-            if let Err(cleanup_err) = network.cleanup().await {
-                warn!(
-                    "failed to cleanup network after setup error: {}",
-                    cleanup_err
-                );
-            }
-            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
-            return Err(e);
+        let resolved: Result<PathBuf> = async {
+            let configured = PathBuf::from(vsock_dir);
+            let current_dir =
+                std::env::current_dir().context("resolving current directory for --vsock-dir")?;
+            let socket_path = resolve_custom_vsock_socket_path(&configured, &current_dir);
+            let absolute_dir = socket_path
+                .parent()
+                .expect("a custom vsock socket path always has a parent");
+            tokio::fs::create_dir_all(absolute_dir)
+                .await
+                .with_context(|| format!("creating vsock dir: {:?}", absolute_dir))?;
+            Ok(socket_path)
         }
-        vsock_dir.join("vsock.sock")
+        .await;
+        match resolved {
+            Ok(path) => path,
+            Err(e) => {
+                if let Err(cleanup_err) = network.cleanup().await {
+                    warn!(
+                        "failed to cleanup network after setup error: {}",
+                        cleanup_err
+                    );
+                }
+                cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+                return Err(e);
+            }
+        }
     } else {
         data_dir.join("vsock.sock")
     };
+    // Snapshot control must connect to the socket the VMM actually bound. In
+    // particular, `--vsock-dir` deliberately places it outside `data_dir`, so
+    // reconstructing the path from vm_id would target the wrong socket.
+    vm_state.config.vsock_socket_path = Some(vsock_socket_path.clone());
+    // A cold-boot VMM embeds the same exact path it binds. Restored clones keep
+    // this source path from snapshot metadata while using a clone-local listener.
+    vm_state.config.source_vsock_socket_path = Some(vsock_socket_path.clone());
 
     // Build VolumeConfigs and spawn VolumeServers BEFORE the VM starts
     // Each VolumeServer listens on vsock.sock_{port} (e.g., vsock.sock_5000)
@@ -1439,6 +1507,16 @@ async fn prepare_vm_for_lifecycle(
         (None, None)
     };
 
+    // What this process knows the guest to be, for answering (re-)asked
+    // "cache-ready" messages. With snapshots disabled no boundary can sever
+    // the handshake and no snapshot decision exists — the verdict is Continue
+    // from the start; otherwise it is Pending until the run loop decides.
+    let cache_verdict = shared_cache_verdict(if skip_snapshot_creation {
+        CacheVerdict::Continue
+    } else {
+        CacheVerdict::Pending
+    });
+
     // Create startup snapshot channel for health-triggered snapshot creation
     // Only create startup snapshots if:
     // - Not skipping snapshots (no --no-snapshot)
@@ -1474,12 +1552,14 @@ async fn prepare_vm_for_lifecycle(
         let vm_id_clone = vm_id.clone();
         let reboot_flag = reboot_requested.clone();
         let exit_flag = container_exit_seen.clone();
+        let verdict = cache_verdict.clone();
         tokio::spawn(async move {
             if let Err(e) = run_status_listener(
                 &socket_path,
                 &runtime_dir,
                 &vm_id_clone,
                 cache_tx,
+                verdict,
                 reboot_flag,
                 exit_flag,
             )
@@ -1635,6 +1715,7 @@ async fn prepare_vm_for_lifecycle(
 
     Ok(VmPreparation::Active(Box::new(VmContext {
         restore_from_cache: None,
+        cache_verdict,
         vm_id,
         vm_name,
         data_dir,
@@ -1827,11 +1908,17 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     info!("guest rebooted — relaunching VM in place");
                     // A reboot is a clean cold boot from the already-provisioned disk
                     // (disk-only-clone semantics) — don't re-create the pre-start /
-                    // startup snapshot. Dropping the receivers makes the relaunched
-                    // fc-agent's cache-ready resolve to a cold start (the status
-                    // listener still acks), so it proceeds straight to the container.
+                    // startup snapshot. The Continue verdict set below makes the
+                    // relaunched fc-agent's cache-ready resolve to a cold start,
+                    // so it proceeds straight to the container.
                     ctx.cache_rx = None;
                     ctx.startup_rx = None;
+                    // The relaunched fc-agent re-sends cache-ready; a rebooted
+                    // guest cold-boots from the provisioned disk regardless of
+                    // how its predecessor was classified (a restored clone that
+                    // reboots is NOT restored again — nothing will publish
+                    // restore readiness to it).
+                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Continue;
                     // The rebooted VM's memory is a fresh boot, not a descendant of
                     // any snapshot — a later diff snapshot against the recorded
                     // parent would mix incompatible memory lineages. Clear it so a
@@ -1937,6 +2024,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     .await
                     {
                         SnapshotOutcome::Interrupted => {
+                            // Shutdown mid-decision: the guest must not launch
+                            // its container into the teardown.
+                            *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
                             return Ok(None);
                         }
                         SnapshotOutcome::Created => {
@@ -1961,6 +2051,11 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                     "Pre-start snapshot created; relaunching by restoring it \
                                      (NV2 miss path converges on the hit path)"
                                 );
+                                // Recorded BEFORE the return drops the oneshot: a
+                                // re-asking guest must hear "cache-doomed", never
+                                // silence read as "maybe ack later" or a bare ack
+                                // from a raced teardown.
+                                *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
                                 ctx.restore_from_cache = Some(key.clone());
                                 return Ok(None);
                             }
@@ -1979,10 +2074,22 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
                         }
                     }
-                    // Send ack back on failure/interruption (fc-agent should continue)
+                    // Continue cold in this VM (snapshot kept alongside a
+                    // resumed source, or creation failed). Recorded BEFORE the
+                    // oneshot resolves so the listener's answer can never race
+                    // ahead of the decision.
+                    //
+                    // failpoint: widen the resume→ack window. The snapshot save
+                    // queued a vsock TRANSPORT_RESET into the guest, so on
+                    // resume the guest's handshake session is severed while
+                    // this ack is still on its way — the interleaving that
+                    // hung the source until the re-ask protocol (#799).
+                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Continue;
+                    failpoint::hit_async("cache.pre_ack").await;
                     let _ = cache_request.ack_tx.send(());
                 } else {
-                    // Should not happen if channel exists, but send ack anyway
+                    // No snapshot key: nothing to decide, continue cold.
+                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Continue;
                     let _ = cache_request.ack_tx.send(());
                 }
                 // Continue waiting for VM exit or cancellation
@@ -2371,6 +2478,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         exec: None,
         no_dirty_tracking: false,
         no_swap: false,
+        vsock_dir: ctx.args.vsock_dir.clone(),
         startup_snapshot_base_key: ctx.args.health_check.as_ref().map(|_| key.clone()),
         cpu: Some(ctx.args.cpu),
         mem: Some(ctx.args.mem),
@@ -2631,6 +2739,48 @@ mod tests {
         assert!(format!("{error:#}").contains("does not support --vsock-dir"));
     }
 
+    /// MAXIMUM REUSE / CACHEABILITY: `--vsock-dir` must NOT opt the run out of
+    /// the snapshot cache. It only changes WHERE the clone's listener binds,
+    /// and the restore mount redirect retargets the cached vmstate's embedded
+    /// vsock directory to the caller-owned one (end-to-end pin:
+    /// test_vsock_dir_honored_on_snapshot_cache_hit).
+    #[test]
+    fn a_custom_vsock_dir_still_participates_in_the_snapshot_cache() {
+        let mut args = test_args();
+        args.no_snapshot = false;
+        args.vsock_dir = Some("/tmp/external-vsock".to_string());
+        assert!(
+            !snapshot_cache_opt_out(&args, false, false),
+            "--vsock-dir must keep using the snapshot cache; the restore redirect honors it"
+        );
+    }
+
+    /// Each opt-out trigger stands alone; none depends on another being set.
+    #[test]
+    fn every_snapshot_cache_opt_out_trigger_stands_alone() {
+        let baseline = || {
+            let mut args = test_args();
+            args.no_snapshot = false;
+            args
+        };
+        assert!(!snapshot_cache_opt_out(&baseline(), false, false));
+
+        let mut args = baseline();
+        args.no_snapshot = true;
+        assert!(snapshot_cache_opt_out(&args, false, false));
+
+        let mut args = baseline();
+        args.rootfs_override = Some(std::path::PathBuf::from("disk-only.raw"));
+        assert!(snapshot_cache_opt_out(&args, false, false));
+
+        let mut args = baseline();
+        args.hypervisor = crate::cli::args::Hypervisor::CloudHypervisor;
+        assert!(snapshot_cache_opt_out(&args, false, false));
+
+        assert!(snapshot_cache_opt_out(&baseline(), true, false));
+        assert!(snapshot_cache_opt_out(&baseline(), false, true));
+    }
+
     #[test]
     fn prepare_publication_requires_successful_cleanup_and_no_cancellation() {
         assert_eq!(finish_prepare(Ok("artifact"), Ok(())).unwrap(), "artifact");
@@ -2758,12 +2908,14 @@ mod tests {
         let snapshot_dir = temp.path().join(snapshot_key);
         tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
 
-        let vm_state = VmState::new(
+        let mut vm_state = VmState::new(
             "vm-prepare-verify".to_string(),
             "alpine:latest".to_string(),
             1,
             512,
         );
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
         let mut config = super::super::common::build_snapshot_config(
             &vm_state,
             snapshot_key,
@@ -2771,7 +2923,8 @@ mod tests {
             &snapshot_dir,
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap();
         config.content_key = Some(snapshot_key.to_string());
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
@@ -2845,12 +2998,14 @@ mod tests {
     ) -> crate::storage::SnapshotConfig {
         let dir = root.join(name);
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let vm_state = VmState::new(
+        let mut vm_state = VmState::new(
             "vm-prepare-target".to_string(),
             "alpine:latest".to_string(),
             1,
             512,
         );
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
         let mut config = super::super::common::build_snapshot_config(
             &vm_state,
             name,
@@ -2858,7 +3013,8 @@ mod tests {
             &dir,
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap();
         config.content_key = content_key.map(str::to_string);
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
@@ -2995,7 +3151,10 @@ mod tests {
     /// default, reclaim only the content-addressed cache.
     #[test]
     fn a_default_prune_keeps_a_tagged_prepare_and_reclaims_an_untagged_one() {
-        let vm_state = VmState::new("vm-prune".to_string(), "alpine:latest".to_string(), 1, 512);
+        let mut vm_state =
+            VmState::new("vm-prune".to_string(), "alpine:latest".to_string(), 1, 512);
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
         let config_for = |target: &PreparedTarget| {
             super::super::common::build_snapshot_config(
                 &vm_state,
@@ -3005,6 +3164,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             )
+            .unwrap()
         };
 
         let tagged_config =
@@ -3042,12 +3202,14 @@ mod tests {
             let snapshot_dir = temp.join(snapshot_key);
             tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
 
-            let vm_state = VmState::new(
+            let mut vm_state = VmState::new(
                 "vm-prepare-parts".to_string(),
                 "alpine:latest".to_string(),
                 1,
                 512,
             );
+            vm_state.config.source_vsock_socket_path =
+                Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
             let mut config = super::super::common::build_snapshot_config(
                 &vm_state,
                 snapshot_key,
@@ -3055,7 +3217,8 @@ mod tests {
                 &snapshot_dir,
                 Vec::new(),
                 Vec::new(),
-            );
+            )
+            .unwrap();
             config.content_key = Some(snapshot_key.to_string());
             config.metadata.extra_disks = extra_disks;
             config.metadata.volumes = volumes;
@@ -3266,6 +3429,19 @@ mod tests {
             ExistingGeneration::Replace,
             false
         ));
+    }
+
+    #[test]
+    fn custom_vsock_path_is_absolute_and_stable_across_launcher_directories() {
+        let launcher_dir = Path::new("/work/launcher");
+        assert_eq!(
+            resolve_custom_vsock_socket_path(Path::new("relative-vsock"), launcher_dir),
+            Path::new("/work/launcher/relative-vsock/vsock.sock")
+        );
+        assert_eq!(
+            resolve_custom_vsock_socket_path(Path::new("/srv/vsock"), launcher_dir),
+            Path::new("/srv/vsock/vsock.sock")
+        );
     }
 
     #[tokio::test]

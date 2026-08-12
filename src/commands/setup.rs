@@ -6,7 +6,7 @@ use crate::setup::rootfs::{generate_config, get_kernel_profile, load_config};
 
 /// Run setup to download kernel and create rootfs.
 ///
-/// This downloads the Kata kernel (~15MB) and creates the Layer 2 rootfs (~10GB).
+/// This downloads the released default kernel and creates the Layer 2 rootfs (~10GB).
 /// The rootfs creation downloads Ubuntu cloud image and installs podman, taking 5-10 minutes.
 pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     // Record --config before anything reads config. The --install-host-kernel
@@ -88,8 +88,10 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
 
-    // Ensure default kernel exists (downloads from [kernel] section if missing)
-    let kernel_path = crate::setup::ensure_kernel("default", true, false)
+    // Ordinary setup downloads the released default artifact. Any source-kernel
+    // release job can bootstrap it locally with --build-kernels when the release
+    // is not published yet; the per-artifact flock serializes concurrent setup.
+    let kernel_path = crate::setup::ensure_kernel("default", true, args.build_kernels)
         .await
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
@@ -104,7 +106,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     }
 
     // Build default Firecracker if configured in [firecracker] section
-    // The [firecracker] config is injected into the "default" profile by synthesize_default_profile()
+    // The [firecracker] config is applied to explicit default profiles at load time.
     if config.firecracker.is_some() {
         let default_profile = crate::setup::rootfs::get_kernel_profile("default")?
             .ok_or_else(|| anyhow::anyhow!("default kernel profile not found in config"))?;
@@ -125,11 +127,18 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             profile_name, profile.description
         );
 
-        // Download or build the profile kernel
-        let profile_kernel_path =
+        // Download or build the profile kernel. --force-build-kernels bypasses
+        // the download so a release refresh cannot republish the artifact it
+        // was asked to replace.
+        let profile_kernel_path = if args.force_build_kernels {
+            crate::setup::rebuild_kernel_from_source(profile_name)
+                .await
+                .context("rebuilding profile kernel from source")?
+        } else {
             crate::setup::ensure_kernel(profile_name, true, args.build_kernels)
                 .await
-                .context("setting up profile kernel")?;
+                .context("setting up profile kernel")?
+        };
         println!(
             "  ✓ Profile kernel ready: {}",
             profile_kernel_path.display()

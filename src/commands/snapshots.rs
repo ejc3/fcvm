@@ -442,6 +442,8 @@ mod tests {
         let mut vm_state =
             crate::state::VmState::new("vm-prune".to_string(), image.to_string(), 1, 512);
         vm_state.config.image = image.to_string();
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
         crate::commands::common::build_snapshot_config(
             &vm_state,
             "snap",
@@ -450,6 +452,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+        .unwrap()
     }
 
     #[test]

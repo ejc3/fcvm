@@ -74,6 +74,48 @@ pub(crate) const EXEC_EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Post-handshake / handshake write timeout.
 const EXEC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The exec socket for a running VM: the recorded path, or the conventional one.
+///
+/// Snapshot bracketing must fail closed when the exact path is unknown, because
+/// pausing the wrong guest is worse than not pausing. Exec has the opposite
+/// requirement: a VM started before `vsock_socket_path` existed deserializes it as
+/// `None`, and refusing those would make every VM already running across a CLI
+/// upgrade permanently uncontrollable. The conventional path is only used when it
+/// is actually there, so this still cannot invent a target.
+fn exec_vsock_socket_path(vm_state: &crate::state::VmState) -> Result<PathBuf> {
+    match super::common::recorded_vsock_socket_path(vm_state) {
+        Ok(path) => Ok(path.to_path_buf()),
+        // Resolved only here: `vm_runtime_dir` reads the loaded config, and a VM that
+        // recorded its own socket has no reason to make the caller depend on that.
+        Err(error) => {
+            conventional_exec_socket(&crate::paths::vm_runtime_dir(&vm_state.vm_id), error)
+        }
+    }
+}
+
+/// The same decision against a caller-supplied runtime directory, for tests.
+#[cfg(test)]
+fn exec_vsock_socket_path_in(
+    vm_state: &crate::state::VmState,
+    runtime_dir: &Path,
+) -> Result<PathBuf> {
+    match super::common::recorded_vsock_socket_path(vm_state) {
+        Ok(path) => Ok(path.to_path_buf()),
+        Err(error) => conventional_exec_socket(runtime_dir, error),
+    }
+}
+
+fn conventional_exec_socket(runtime_dir: &Path, error: anyhow::Error) -> Result<PathBuf> {
+    let conventional = runtime_dir.join("vsock.sock");
+    if conventional.exists() {
+        return Ok(conventional);
+    }
+    Err(error.context(format!(
+        "and the conventional socket {} does not exist",
+        conventional.display()
+    )))
+}
+
 /// Connect to the exec server via vsock with retry logic.
 ///
 /// The guest VM takes several seconds to boot and start fc-agent with the exec server.
@@ -450,6 +492,14 @@ pub fn connect_and_start_exec(
         // Read timeouts are armed by read_ack_line (handshake) and below (post-GO).
         stream.set_write_timeout(Some(EXEC_WRITE_TIMEOUT))?;
 
+        // Failpoint: this attempt's connection exists and NOTHING has been sent
+        // on it. Holding here lets a harness run a whole snapshot create against
+        // the VM, so the connection is provably dead before the request goes out
+        // — the order-only way to force the resend path (no request consumed
+        // anywhere, so the resend is safe by construction, and no actor has to
+        // win a timing race for the interleaving to occur).
+        failpoint::hit("exec.post_connect_pre_send");
+
         // Phase 1: send the request line.
         if let Err(e) = writeln!(stream, "{}", request_json).and_then(|()| stream.flush()) {
             if attempt < MAX_ACK_ATTEMPTS {
@@ -588,9 +638,9 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         bail!("Either --pid or name is required");
     };
 
-    // Get the vsock socket path for this VM
-    let vm_dir = paths::vm_runtime_dir(&vm_state.vm_id);
-    let vsock_socket = vm_dir.join("vsock.sock");
+    // Use the exact persisted path. `--vsock-dir` deliberately places the
+    // socket outside vm_runtime_dir, so reconstructing it breaks exec/health.
+    let vsock_socket = exec_vsock_socket_path(&vm_state)?;
 
     // Suppress logs when in TTY or quiet mode (they mix with command output)
     let quiet = args.quiet || args.tty;
@@ -911,6 +961,57 @@ mod exec_fuzz_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_uses_exact_persisted_custom_vsock_path() {
+        let mut state =
+            crate::state::VmState::new("vm-custom-exec".to_string(), "alpine".to_string(), 1, 128);
+        state.config.vsock_socket_path = Some(PathBuf::from("/srv/fcvm-vsock/vsock.sock"));
+        assert_eq!(
+            exec_vsock_socket_path(&state).unwrap(),
+            PathBuf::from("/srv/fcvm-vsock/vsock.sock")
+        );
+
+        // The absent-path cases live in
+        // `exec_reaches_a_pre_upgrade_vm_through_its_conventional_socket`, which
+        // supplies its own runtime directory rather than reading the host config.
+    }
+
+    /// A VM that was already running when the CLI gained `vsock_socket_path`
+    /// deserializes it as `None`. Refusing those would make every VM running across
+    /// an upgrade permanently uncontrollable, so exec falls back to the conventional
+    /// socket. Snapshot bracketing stays fail-closed: it never takes this path.
+    #[test]
+    fn exec_reaches_a_pre_upgrade_vm_through_its_conventional_socket() {
+        let runtime_dir = tempfile::tempdir().expect("runtime dir");
+        let mut state =
+            crate::state::VmState::new("vm-pre-upgrade".to_string(), "alpine".to_string(), 1, 128);
+        state.config.vsock_socket_path = None;
+
+        // Nothing there yet: a missing socket must not be invented.
+        let error = exec_vsock_socket_path_in(&state, runtime_dir.path()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no recorded vsock socket path")
+                && message.contains("conventional socket"),
+            "the error must name both attempts: {message}"
+        );
+
+        let conventional = runtime_dir.path().join("vsock.sock");
+        std::fs::write(&conventional, b"").expect("create conventional socket");
+        assert_eq!(
+            exec_vsock_socket_path_in(&state, runtime_dir.path()).unwrap(),
+            conventional,
+            "a pre-upgrade VM whose conventional socket exists must stay reachable"
+        );
+
+        // A recorded path always wins, so --vsock-dir is never silently bypassed.
+        state.config.vsock_socket_path = Some(PathBuf::from("/srv/custom/vsock.sock"));
+        assert_eq!(
+            exec_vsock_socket_path_in(&state, runtime_dir.path()).unwrap(),
+            PathBuf::from("/srv/custom/vsock.sock")
+        );
+    }
 
     fn response_line(response: &ExecResponse) -> String {
         format!("{}\n", serde_json::to_string(response).unwrap())

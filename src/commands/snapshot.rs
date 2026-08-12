@@ -25,11 +25,15 @@ use crate::volume::{SpawnedVolumes, VolumeConfig};
 
 use super::common::{
     MemoryBackend, RestoreParams, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT,
-    VSOCK_STATUS_PORT, VSOCK_TTY_PORT,
+    VSOCK_RESTORE_COMPLETE_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT,
 };
-use super::podman::{run_output_listener, run_status_listener};
+use super::podman::{run_output_listener, run_status_listener, spawn_restore_completion_listener};
 
 const SNAPSHOT_LINEAGE_RETRY_LIMIT: usize = 64;
+// Restore work can legitimately take minutes on a CPU-starved guest, but a live
+// VMM that never acknowledges its generation must not hold an unpublished clone
+// forever. Liveness and cancellation are checked independently during this bound.
+const RESTORE_COMPLETION_ACK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 fn record_snapshot_lineage_retry(retries: &mut usize) -> Result<()> {
     *retries += 1;
@@ -61,6 +65,8 @@ struct CloneSetupResources {
     implicit_uffd_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     status_handle: Option<tokio::task::JoinHandle<()>>,
     bootplan_handle: Option<tokio::task::JoinHandle<()>>,
+    restore_completion_handle: Option<tokio::task::JoinHandle<()>>,
+    restore_completion_rx: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
 }
 
 impl CloneSetupResources {
@@ -78,6 +84,8 @@ impl CloneSetupResources {
             implicit_uffd_handle: None,
             status_handle: None,
             bootplan_handle: None,
+            restore_completion_handle: None,
+            restore_completion_rx: None,
         }
     }
 
@@ -104,6 +112,9 @@ impl CloneSetupResources {
         if let Some(handle) = self.bootplan_handle.as_ref() {
             handle.abort();
         }
+        if let Some(handle) = self.restore_completion_handle.as_ref() {
+            handle.abort();
+        }
         if let Some(handle) = self.output_handle.as_ref() {
             handle.abort();
         }
@@ -126,6 +137,10 @@ impl CloneSetupResources {
         if let Some(handle) = self.bootplan_handle.take() {
             let _ = handle.await;
         }
+        if let Some(handle) = self.restore_completion_handle.take() {
+            let _ = handle.await;
+        }
+        self.restore_completion_rx.take();
         if let Some(handle) = self.output_handle.take() {
             let _ = handle.await;
         }
@@ -362,6 +377,82 @@ where
     }
 }
 
+/// Wait for fc-agent to acknowledge this exact restore generation.
+///
+/// This is the single correctness gate shared by ordinary, TTY, and `--exec`
+/// restores. Output/TTY connectivity only proves a workload transport exists;
+/// this one-shot proves guest cleanup, exec/egress rebind, and the shared
+/// Succeeded transition all happened for `expected_epoch`.
+async fn wait_for_restore_completion<F>(
+    vm_id: &str,
+    expected_epoch: &str,
+    completion_rx: &mut tokio::sync::oneshot::Receiver<Result<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
+    timeout: Duration,
+    liveness_interval: &mut tokio::time::Interval,
+    mut try_wait: F,
+) -> Result<bool>
+where
+    F: FnMut() -> Result<Option<std::process::ExitStatus>>,
+{
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            result = &mut *completion_rx => {
+                match result {
+                    Ok(Ok(())) => {
+                        info!(
+                            vm_id = %vm_id,
+                            restore_epoch = %expected_epoch,
+                            "fc-agent acknowledged exact restore generation"
+                        );
+                        return Ok(true);
+                    }
+                    Ok(Err(error)) => {
+                        return Err(error).context(format!(
+                            "restore-completion gate rejected guest ACK (phase=listener-result expected_epoch={expected_epoch})"
+                        ));
+                    }
+                    Err(error) => {
+                        bail!(
+                            "restore-completion gate failed (phase=listener-task expected_epoch={expected_epoch} observed_epoch=<none>): {error}"
+                        );
+                    }
+                }
+            }
+            _ = &mut deadline => {
+                bail!(
+                    "restore-completion gate timed out (phase=await-ack expected_epoch={expected_epoch} observed_epoch=<none> timeout={timeout:?})"
+                );
+            }
+            _ = liveness_interval.tick() => {
+                match try_wait() {
+                    Ok(Some(status)) => {
+                        bail!(
+                            "VM exited before restore-completion ACK (phase=vmm-liveness expected_epoch={expected_epoch} observed_epoch=<none> status={status})"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(error).context(format!(
+                            "checking VM liveness before restore-completion ACK (phase=vmm-liveness expected_epoch={expected_epoch} observed_epoch=<none>)"
+                        ));
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                info!(
+                    vm_id = %vm_id,
+                    restore_epoch = %expected_epoch,
+                    "shutdown requested while waiting for restore-completion ACK"
+                );
+                return Ok(false);
+            }
+        }
+    }
+}
+
 /// Load the VM state targeted by `snapshot create` (selected via --name or --pid).
 ///
 /// The state file is updated concurrently by the VM-owning process (health monitor,
@@ -479,7 +570,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         &snapshot_dir,
         volume_configs,
         extra_disk_configs,
-    );
+    )?;
     if args.disk_only {
         snapshot_config.kind = crate::storage::SnapshotKind::DiskOnly;
     }
@@ -493,7 +584,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .context("creating snapshot directory")?;
     let mut expected_parent_name = vm_state.config.snapshot_name.clone();
     let mut lineage_retries = 0;
-    let (_generation_locks, _vm_lock, parent_dir) = loop {
+    let (_generation_locks, _vm_lock, parent_dir, vsock_socket_path) = loop {
         if let Some(name) = expected_parent_name.as_deref() {
             validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
         }
@@ -534,7 +625,14 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             continue;
         }
 
-        break (generation_locks, vm_lock, expected_parent_dir);
+        let vsock_socket_path =
+            super::common::recorded_vsock_socket_path(&fresh_state)?.to_path_buf();
+        break (
+            generation_locks,
+            vm_lock,
+            expected_parent_dir,
+            vsock_socket_path,
+        );
     };
 
     if args.disk_only {
@@ -550,11 +648,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                 vm_state.config.extra_disks.len()
             );
         }
-        let vsock_socket = paths::vm_runtime_dir(&vm_state.vm_id).join("vsock.sock");
         super::common::create_disk_only_snapshot_core(
             snapshot_config.clone(),
             &vm_disk_path,
-            &vsock_socket,
+            &vsock_socket_path,
         )
         .await?;
     } else {
@@ -568,6 +665,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     &client,
                     snapshot_config.clone(),
                     &vm_disk_path,
+                    &vsock_socket_path,
                     parent_dir.as_deref(),
                     None,
                     super::common::SnapshotSourceDisposition::Resume,
@@ -577,8 +675,13 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             crate::hypervisor::Backend::CloudHypervisor => {
                 let client =
                     crate::hypervisor::cloud_hypervisor::api::ChClient::new(socket_path.clone());
-                super::common::create_snapshot_ch(&client, snapshot_config.clone(), &vm_disk_path)
-                    .await?;
+                super::common::create_snapshot_ch(
+                    &client,
+                    snapshot_config.clone(),
+                    &vm_disk_path,
+                    &vsock_socket_path,
+                )
+                .await?;
             }
         }
     }
@@ -1293,8 +1396,42 @@ async fn cmd_snapshot_run_inner(
     // - VolumeServers listen on the clone's actual socket paths
     // Clone's vsock socket base path
     // With mount namespace isolation, Firecracker will create sockets here
-    // (it thinks it's writing to baseline's path but bind mount redirects to clone's)
-    let clone_vsock_base = data_dir.join("vsock.sock");
+    // (it thinks it's writing to baseline's path but bind mount redirects to
+    // clone's). `--vsock-dir` retargets the redirect to a caller-owned
+    // directory so the clone's listener lands at a predictable path — cache
+    // hits and clones honor the flag rather than silently ignoring it.
+    let clone_vsock_base = match args.vsock_dir.as_deref() {
+        Some(dir) => {
+            let current_dir =
+                std::env::current_dir().context("resolving current directory for --vsock-dir")?;
+            let socket_path = super::podman::resolve_custom_vsock_socket_path(
+                std::path::Path::new(dir),
+                &current_dir,
+            );
+            let parent = socket_path
+                .parent()
+                .expect("a custom vsock socket path always has a parent");
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating vsock dir: {:?}", parent))?;
+            // A caller-owned directory can hold a stale socket from a previous
+            // VM: teardown SIGKILLs the VMM, which never unlinks its socket, so
+            // reusing one --vsock-dir across runs leaves the old file behind.
+            // Firecracker's restore bind — unlike every host-side listener —
+            // does not unlink first, and the failed hit would fall back to a
+            // cold boot, silently throwing the cache away. Same semantics as
+            // the cold-boot set_vsock.
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            socket_path
+        }
+        None => data_dir.join("vsock.sock"),
+    };
+    // Persist the clone's actual host-side socket before restore publishes its
+    // state. A later snapshot of this clone must address this socket, not the
+    // ancestor path embedded in the restored VMM state.
+    vm_state.config.vsock_socket_path = Some(clone_vsock_base.clone());
+    vm_state.config.source_vsock_socket_path =
+        Some(snapshot_config.source_vsock_socket_path.clone());
 
     // Build VolumeConfigs from snapshot metadata and spawn VolumeServers
     let volume_configs: Vec<VolumeConfig> = snapshot_config
@@ -1586,7 +1723,8 @@ async fn cmd_snapshot_run_inner(
 
     // Build restore configuration
     // For snapshots of cache-restored VMs:
-    // - original_vsock_vm_id (vm-AAA) = vsock paths in vmstate.bin (unchanged from cache)
+    // - source_vsock_socket_path = exact vsock path in vmstate.bin (unchanged from cache)
+    // - original_vsock_vm_id (vm-AAA) = ancestor lineage / conventional disk directory
     // - vm_id (vm-BBB) = disk paths in vmstate.bin (patched during cache restore)
     // For snapshots of fresh VMs:
     // - vm_id is used for both (no separate original_vsock_vm_id)
@@ -1755,6 +1893,8 @@ async fn cmd_snapshot_run_inner(
         memory_backend,
         source_disk_path: snapshot_config.disk_path.clone(),
         original_vm_id,
+        source_vsock_socket_path: snapshot_config.source_vsock_socket_path.clone(),
+        vsock_target_dir: clone_vsock_base.parent().map(std::path::Path::to_path_buf),
         snapshot_vm_id,
         hugepages,
         extra_disks: snapshot_config.metadata.extra_disks.clone(),
@@ -1785,18 +1925,30 @@ async fn cmd_snapshot_run_inner(
     let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let status_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_STATUS_PORT);
+    // Restored, and bound BEFORE the VMM resumes: the clone wakes mid-handshake
+    // (the snapshot captured fc-agent waiting for its cache verdict), observes
+    // the transport reset, and re-asks on a fresh connection. The answer must
+    // be "cache-restored" — a bare ack here would launch the container cold,
+    // racing the restore cleanup this process is about to drive. This standing
+    // verdict is what makes the re-ask safe under every ordering of the guest's
+    // re-ask vs the restore-epoch machinery. An in-place guest reboot resets it
+    // to Continue (a rebooted clone cold-boots; nothing will publish restore
+    // readiness to it again).
+    let cache_verdict = super::podman::shared_cache_verdict(super::podman::CacheVerdict::Restored);
     setup.status_handle = Some({
         let socket_path = status_socket_path.clone();
         let runtime_dir = data_dir.clone();
         let vm_id_clone = vm_id.clone();
         let reboot_flag = reboot_requested.clone();
         let exit_flag = container_exit_seen.clone();
+        let verdict = cache_verdict.clone();
         tokio::spawn(async move {
             if let Err(e) = run_status_listener(
                 &socket_path,
                 &runtime_dir,
                 &vm_id_clone,
                 None,
+                verdict,
                 reboot_flag,
                 exit_flag,
             )
@@ -1807,6 +1959,42 @@ async fn cmd_snapshot_run_inner(
         })
     });
 
+    // Every restored guest gets a restore-only vsock control plane, including
+    // Firecracker. Current snapshots deliberately contain eth0 down, so MMDS
+    // cannot be the trigger that performs cookie cleanup and raises the link.
+    // Bind before VMM resume and use the same epoch for Firecracker's later
+    // MMDS mirror so the transport handoff cannot trigger cleanup twice.
+    let restore_epoch = super::common::new_restore_epoch();
+    let mut restore_latest = serde_json::json!({
+        "host-time": chrono::Utc::now().timestamp().to_string(),
+        "restore-epoch": restore_epoch,
+    });
+    if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
+        restore_latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
+    }
+    let bootplan_socket = format!(
+        "{}_{}",
+        clone_vsock_base.display(),
+        super::common::VSOCK_BOOTPLAN_PORT
+    );
+    setup.bootplan_handle = Some(setup_try!(super::podman::spawn_bootplan_listener(
+        &bootplan_socket,
+        &restore_latest
+    )
+    .context("spawning snapshot restore boot-plan listener")));
+
+    let restore_completion_socket = format!(
+        "{}_{}",
+        clone_vsock_base.display(),
+        VSOCK_RESTORE_COMPLETE_PORT
+    );
+    let (restore_completion_handle, restore_completion_rx) = setup_try!(
+        spawn_restore_completion_listener(&restore_completion_socket, &restore_epoch)
+            .context("spawning snapshot restore-completion listener")
+    );
+    setup.restore_completion_handle = Some(restore_completion_handle);
+    setup.restore_completion_rx = Some(restore_completion_rx);
+
     let restore_params = RestoreParams {
         vm_id: &vm_id,
         vm_name: &vm_name,
@@ -1815,15 +2003,20 @@ async fn cmd_snapshot_run_inner(
         runtime_config: &runtime_config,
         restore_config: &restore_config,
         network_config: &network_config,
+        restore_epoch: &restore_epoch,
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
         track_dirty_pages: needs_dirty_tracking,
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
-    // failpoint: hold right before the restore resumes/unblocks the VM (the resume
-    // happens inside restore_from_snapshot{,_ch} below) — clone infra (state file,
-    // status listener, network) is already live, so "client arrives before the
-    // restored guest ever runs" becomes deterministic.
+    // failpoint: hold before the VMM process even starts. The state file and
+    // status listener exist and the network is *configured*, but pasta itself
+    // (and therefore any published-port listener) only starts in the
+    // post_start call inside restore_from_snapshot{,_ch} below, so nothing is
+    // listening on the host port here. Use this point to test shutdown and
+    // pre-publication invariants; for "a client connects to a live host
+    // listener while the guest has not run yet", hold at
+    // `restore.post_network_pre_resume` instead.
     failpoint::hit_async("restore.pre_resume").await;
     if cancel.is_cancelled() {
         info!(vm_id = %vm_id, "shutdown requested before snapshot restore started");
@@ -1838,28 +2031,6 @@ async fn cmd_snapshot_run_inner(
         Box<dyn crate::hypervisor::Hypervisor>,
         Option<tokio::process::Child>,
     )> = if is_ch {
-        // Serve the restore-epoch over the boot-plan vsock port BEFORE the restore
-        // resumes the VM, so the restored guest's watcher can reconnect its vsock
-        // channels immediately. The handle stays in the setup transaction until
-        // ownership transfers to the normal lifecycle below.
-        let restore_epoch = super::common::new_restore_epoch();
-        let mut latest = serde_json::json!({
-            "host-time": chrono::Utc::now().timestamp().to_string(),
-            "restore-epoch": restore_epoch,
-        });
-        if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
-            latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
-        }
-        let bootplan_socket = format!(
-            "{}_{}",
-            clone_vsock_base.display(),
-            super::common::VSOCK_BOOTPLAN_PORT
-        );
-        setup.bootplan_handle = Some(setup_try!(super::podman::spawn_bootplan_listener(
-            &bootplan_socket,
-            &latest
-        )
-        .context("spawning CH restore boot-plan listener")));
         super::common::restore_from_snapshot_ch(
             restore_params,
             setup.network_mut(),
@@ -1909,6 +2080,11 @@ async fn cmd_snapshot_run_inner(
         .take()
         .expect("restored VM owns its status listener");
     let mut bootplan_handle = setup.bootplan_handle.take();
+    let mut restore_completion_handle = setup.restore_completion_handle.take();
+    let mut restore_completion_rx = setup
+        .restore_completion_rx
+        .take()
+        .expect("restored VM owns its restore-completion receiver");
 
     // Disable swap for Firecracker if requested via --no-swap
     if args.no_swap {
@@ -1916,6 +2092,25 @@ async fn cmd_snapshot_run_inner(
             super::common::disable_cgroup_swap(pid);
         }
     }
+
+    // One transport-independent generation gate before any lifecycle branch.
+    // Output may already have reconnected and TTY may already carry bytes, but
+    // neither can publish lifecycle readiness (and --exec cannot run) until the
+    // guest proves that this exact restore epoch reached Succeeded.
+    let mut restore_liveness_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(250),
+        Duration::from_secs(5),
+    );
+    let restore_completion_result = wait_for_restore_completion(
+        &vm_id,
+        &restore_epoch,
+        &mut restore_completion_rx,
+        &cancel,
+        RESTORE_COMPLETION_ACK_TIMEOUT,
+        &mut restore_liveness_interval,
+        || vm_manager.try_wait(),
+    )
+    .await;
 
     // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
     // The state already has the correct guest_ipv6 = vm_ipv6 (set by restore_from_snapshot).
@@ -1925,27 +2120,29 @@ async fn cmd_snapshot_run_inner(
     // exec rebind → wait for confirmation → output.reconnect(). No host-side
     // notify needed — the listener will accept fc-agent's new connection naturally.
 
-    let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
-    if is_uffd {
-        info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
-        println!(
-            "✓ VM '{}' cloned from snapshot '{}' (UFFD mode)",
-            vm_name, snapshot_name
-        );
-        if use_uffd {
-            println!("  Memory pages served on-demand by UFFD serve process");
+    if matches!(&restore_completion_result, Ok(true)) {
+        let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
+        if is_uffd {
+            info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
+            println!(
+                "✓ VM '{}' cloned from snapshot '{}' (UFFD mode)",
+                vm_name, snapshot_name
+            );
+            if use_uffd {
+                println!("  Memory pages served on-demand by UFFD serve process");
+            } else {
+                println!("  Memory pages served on-demand from snapshot file");
+            }
         } else {
-            println!("  Memory pages served on-demand from snapshot file");
+            info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned from snapshot files");
+            println!(
+                "✓ VM '{}' cloned from snapshot '{}' (direct mode)",
+                vm_name, snapshot_name
+            );
+            println!("  Memory loaded from file");
         }
-    } else {
-        info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned from snapshot files");
-        println!(
-            "✓ VM '{}' cloned from snapshot '{}' (direct mode)",
-            vm_name, snapshot_name
-        );
-        println!("  Memory loaded from file");
+        println!("  Disk uses CoW overlay");
     }
-    println!("  Disk uses CoW overlay");
 
     // Handle --exec: run command in container then cleanup and exit
     if let Some(exec_cmd) = &args.exec {
@@ -1955,12 +2152,18 @@ async fn cmd_snapshot_run_inner(
         // ready, exec error) still reaches the cleanup below. Returning early here would
         // leak the network namespace, state file, loopback IP, and data directory that only
         // cleanup_vm removes.
-        let ready_result = match lifecycle_gate.publish(&state_manager, &mut vm_state).await {
-            Ok(super::common::LifecycleReadyOutcome::Published) => Ok(()),
-            Ok(super::common::LifecycleReadyOutcome::Cancelled) => Err(anyhow::anyhow!(
-                "clone --exec interrupted by shutdown signal before lifecycle readiness"
-            )),
+        let ready_result = match restore_completion_result {
             Err(error) => Err(error),
+            Ok(false) => Err(anyhow::anyhow!(
+                "clone --exec interrupted by shutdown signal before restore-completion ACK"
+            )),
+            Ok(true) => match lifecycle_gate.publish(&state_manager, &mut vm_state).await {
+                Ok(super::common::LifecycleReadyOutcome::Published) => Ok(()),
+                Ok(super::common::LifecycleReadyOutcome::Cancelled) => Err(anyhow::anyhow!(
+                    "clone --exec interrupted by shutdown signal before lifecycle readiness"
+                )),
+                Err(error) => Err(error),
+            },
         };
         let exec_result: Result<i32> = match ready_result {
             Err(error) => Err(error),
@@ -2025,6 +2228,10 @@ async fn cmd_snapshot_run_inner(
             let _ = handle.await;
         }
         if let Some(handle) = bootplan_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = restore_completion_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -2104,26 +2311,29 @@ async fn cmd_snapshot_run_inner(
     // falcon all resume simultaneously) and fc-agent's MMDS poll + restore handler
     // can take minutes. Proceeding early causes exec failures; waiting is correct.
     // But poll VM liveness to avoid hanging forever if Firecracker crashes.
-    let output_handshake_result = if !tty_mode {
-        // First liveness check at 250ms, then every 5s: restore_from_snapshot no
-        // longer sleeps post-resume (its old 200ms crash-window moved here, off
-        // the hot path), so a VM that dies right after resume is still diagnosed
-        // quickly — while a healthy clone's output connection wins this select
-        // in a few ms and never waits on any tick.
-        let mut liveness_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + std::time::Duration::from_millis(250),
-            std::time::Duration::from_secs(5),
-        );
-        wait_for_restored_output(
-            &vm_id,
-            &mut output_connected_rx,
-            &cancel,
-            &mut liveness_interval,
-            || vm_manager.try_wait(),
-        )
-        .await
-    } else {
-        Ok(false)
+    let output_handshake_result = match restore_completion_result {
+        Err(error) => Err(error),
+        Ok(false) => Ok(false),
+        Ok(true) if !tty_mode => {
+            // First liveness check at 250ms, then every 5s: restore_from_snapshot no
+            // longer sleeps post-resume (its old 200ms crash-window moved here, off
+            // the hot path), so a VM that dies right after resume is still diagnosed
+            // quickly — while a healthy clone's output connection wins this select
+            // in a few ms and never waits on any tick.
+            let mut liveness_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+                std::time::Duration::from_secs(5),
+            );
+            wait_for_restored_output(
+                &vm_id,
+                &mut output_connected_rx,
+                &cancel,
+                &mut liveness_interval,
+                || vm_manager.try_wait(),
+            )
+            .await
+        }
+        Ok(true) => Ok(false),
     };
     let output_connected = matches!(&output_handshake_result, Ok(true));
 
@@ -2339,6 +2549,13 @@ async fn cmd_snapshot_run_inner(
                         container_exit_seen.store(false, std::sync::atomic::Ordering::Release);
                         let _ = std::fs::remove_file(data_dir.join("container-exit"));
                         let _ = std::fs::remove_file(data_dir.join("container-ready"));
+                        // The relaunched fc-agent cold-boots and re-sends cache-ready.
+                        // Its predecessor's Restored verdict must not answer it —
+                        // nothing will publish restore readiness to a rebooted clone,
+                        // so "cache-restored" here would hang it exactly the way the
+                        // resumed source used to hang (#799).
+                        *cache_verdict.lock().unwrap() =
+                            super::podman::CacheVerdict::Continue;
                         // Build the cold-boot relaunch plan ON DEMAND: only a rebooting
                         // clone needs it, and assembling it (kernel/initrd resolution,
                         // launch config) cost ~19ms up front on EVERY clone — waste for
@@ -2576,6 +2793,10 @@ async fn cmd_snapshot_run_inner(
         let _ = handle.await;
     }
     if let Some(handle) = bootplan_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = restore_completion_handle.take() {
         handle.abort();
         let _ = handle.await;
     }
@@ -3251,6 +3472,7 @@ mod tests {
             non_blocking_output: false,
             no_dirty_tracking: false,
             no_swap: false,
+            vsock_dir: None,
         };
 
         let runtime = snapshot_restore_runtime_config(&args, Some("nested"))
@@ -3278,6 +3500,7 @@ mod tests {
             non_blocking_output: false,
             no_dirty_tracking: false,
             no_swap: false,
+            vsock_dir: None,
         }
     }
 
@@ -3410,5 +3633,102 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(format!("{error:#}").contains("pidfd unavailable"));
+    }
+
+    #[tokio::test]
+    async fn restore_completion_timeout_fails_with_generation_and_phase() {
+        let (_sender, mut receiver) = tokio::sync::oneshot::channel::<Result<()>>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut liveness = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+
+        let error = wait_for_restore_completion(
+            "vm-test",
+            "expected-generation",
+            &mut receiver,
+            &cancel,
+            Duration::ZERO,
+            &mut liveness,
+            || -> Result<Option<std::process::ExitStatus>> {
+                panic!("liveness must not be polled before an immediate ACK timeout")
+            },
+        )
+        .await
+        .expect_err("a missing exact restore ACK must fail closed");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("phase=await-ack"),
+            "timeout must identify its phase: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("expected_epoch=expected-generation"),
+            "timeout must identify the expected generation: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("observed_epoch=<none>"),
+            "timeout must identify that no generation was observed: {diagnostic}"
+        );
+    }
+
+    async fn assert_restore_consumer_waits_for_ack(consumer: &'static str) {
+        let (sender, mut receiver) = tokio::sync::oneshot::channel::<Result<()>>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let published_after_ack = published.clone();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            let mut liveness = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(1),
+            );
+            waiting_tx
+                .send(())
+                .expect("test must observe the consumer enter the ACK gate");
+            let acknowledged = wait_for_restore_completion(
+                "vm-test",
+                "restore-generation",
+                &mut receiver,
+                &cancel,
+                Duration::from_secs(60),
+                &mut liveness,
+                || -> Result<Option<std::process::ExitStatus>> {
+                    panic!("liveness must not run during an in-process ACK test")
+                },
+            )
+            .await
+            .expect("matching restore ACK should release the consumer");
+            assert!(acknowledged);
+            published_after_ack.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        waiting_rx
+            .await
+            .expect("consumer task stopped before entering the ACK gate");
+        tokio::task::yield_now().await;
+        assert!(
+            !published.load(std::sync::atomic::Ordering::Acquire),
+            "{consumer} ran before the exact restore ACK"
+        );
+        sender
+            .send(Ok(()))
+            .expect("consumer must retain the restore ACK receiver");
+        waiter.await.expect("consumer task panicked");
+        assert!(
+            published.load(std::sync::atomic::Ordering::Acquire),
+            "{consumer} did not run after the exact restore ACK"
+        );
+    }
+
+    #[tokio::test]
+    async fn tty_lifecycle_publication_waits_for_exact_restore_ack() {
+        assert_restore_consumer_waits_for_ack("TTY lifecycle publication").await;
+    }
+
+    #[tokio::test]
+    async fn clone_exec_invocation_waits_for_exact_restore_ack() {
+        assert_restore_consumer_waits_for_ack("clone --exec invocation").await;
     }
 }
