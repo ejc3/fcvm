@@ -34,6 +34,11 @@ Fan-out phases add burst latency and marginal memory per concurrent request.
 | `pageserver.py` | in-guest fixture server (`Cache-Control: no-store`, `/ready` gate for `--health-check` golden snapshots) |
 | `render.py` | per-request CDP driver (stdlib-only WebSocket client); prints one machine-parsable `RENDER_OK` line with per-phase timings |
 | `bench.sh` | host-side harness: golden snapshots, egress matrix, fan-out, baselines (see phases below) |
+| `reqbench.sh` | the request-optimized path: direct CDP over fcvm's published-port DNAT, `podman prepare` goldens, hop verification on a restored clone, three-arm A/B, one-SIGKILL teardown (see below) |
+| `cdpdrive.py` | host-side CDP driver for reqbench (stdlib WebSocket); nothing of ours is resident in the guest |
+| `reqbench.py` / `reqanalyze.py` / `reqstages.py` | per-request record schema, analysis, and stage decomposition for reqbench runs |
+| `reqscale.py` / `reqscale_analyze.py` | concurrency scaling arms over the request path |
+| `faultbench.py` / `faultanalyze.py` / `faulttrace.bt` | guest page-fault count/cost per request, per memory backend |
 | `hostserver.py` | host-side "simulated external site": dual-stack bind, optional self-signed TLS, same `pages/` bytes as the image |
 | `report.py` | `sample` (host memory + per-clone PSS one-liner) and `finalize` (requests/samples → `raw.json` + `report.md`) |
 | `gen_images.py` | regenerates the deterministic PNG fixtures in `pages/` (stdlib only) |
@@ -101,6 +106,57 @@ Run the harness with `RUST_LOG=fcvm=debug` in the environment when the run is
 meant to be analyzed for stage attribution (serve/restore logs land in
 `results/<stamp>/logs/`).
 
+## The request-optimized path (`reqbench.sh`)
+
+`bench.sh` measures the egress matrix with an in-guest driver started by `fcvm exec`
+per request — its `exec up` stage (252 ms median, 95% CI 245–259, n=12; the
+"exec up" row of `results/20260808-corrected/tables.md`, raw records in
+`corrected.json`) is mostly Python startup inside the guest: a harness
+artifact, not something a real service would pay. `reqbench.sh`
+is the request path a service would actually run:
+
+- **Direct CDP from the host.** Chromium binds CDP to guest loopback `127.0.0.1:9222`
+  only (it ignores `--remote-debugging-address`; evidence in `entry.sh`), and fcvm
+  DNATs each eligible published TCP port to guest loopback
+  (`fc-agent/src/network.rs::publish_to_loopback`, DESIGN.md "Eligible published TCP
+  ports reach guest loopback") — so `--publish 9222:9222` reaches it with no relay,
+  no exec, and no benchmark-owned process in the byte path. The former per-clone
+  `socat` relay is deleted; the socat-era availability A/B was withdrawn as
+  non-comparable and is not evidence about the relay.
+- **Goldens via `fcvm podman prepare`** snapshotted at the image health gate —
+  which requires BOTH the warm marker file and a live CDP round trip that finds
+  a page target (`entry.sh` + `cdp_health.py`; rootless guests must have
+  healthcheck scheduling active for the gate to fire), and
+  clones inherit `port_mappings` from snapshot metadata — which is why
+  `./reqbench.sh verify` proves every hop **on a restored clone** before `run`
+  measures anything.
+- **Each request's timing includes CDP setup.** `cdpdrive.py` records target
+  resolution (`resolve_ms`), TCP connect (`tcp_ms` — successor of the obsolete
+  `port_wait_ms`, whose old numbers measured a state-discovery boundary, not
+  the network), WebSocket upgrade (`upgrade_ms`), and `Page.enable`
+  (`enable_ms`), rolled up as `connect_total_ms`; the connect stage runs
+  serially within a request (no cross-request connection reuse — every request
+  proves the whole path).
+- **Teardown differs per arm, deliberately**: `cdp-fast` uses the one-SIGKILL
+  teardown (the kernel fans it out to Firecracker and the namespace holder via
+  `PR_SET_PDEATHSIG`); the `cdp`, `noop`, and `exec` control arms keep the
+  normal SIGTERM-and-wait path so the A/B isolates exactly that change.
+- **Sealed provenance.** Each run records content hashes of the harness, `fcvm`, and
+  `fc-agent`, the snapshot generation UUID, and the exact config digest, so every
+  number is bound to the code that produced it.
+
+Prerequisites: `make build && make setup-fcvm` from the repo root first — the
+script stages the `fcvm`/`fc-agent` binaries and `golden` needs the
+content-addressed fc-agent initrd that only `make setup-fcvm` creates (its own
+`build` subcommand builds just the Podman image; a fresh checkout that skips
+setup fails exactly there).
+
+Phases: `./reqbench.sh build` → `golden` → `verify` → `run` (or `all`). Preflight
+`uptime` and `pgrep -c firecracker` yourself; the harness refuses to measure on a
+busy box. `ALLOW_BUSY=1` overrides the refusal and is recorded in the run — an
+overridden run is contaminated and must be excluded from comparisons or rerun
+before publication.
+
 ## Results conventions
 
 Raw run output goes to `results/<timestamp>/` — **git-ignored** (see
@@ -132,6 +188,12 @@ site-isolation-off saves 3.6% on PSS (not 23% - that number was an RSS artifact)
 
 `REVIEW.md` is the ledger of what holds, what was refuted, and what remains unmeasured. Read it
 before quoting anything from this directory.
+
+The corrected run measured the **exec-path** request flow; its `exec up` stage does not exist on
+the `reqbench.sh` direct-CDP path above. Publication gate for that dataset: at least 200
+measured non-warmup CDP requests per backend at zero failures (the harness enforces this and
+exits 5 otherwise), quoted with exact per-arm denominators and two-sided Clopper–Pearson
+intervals for any reliability claim.
 
 ### Running it reproducibly
 
