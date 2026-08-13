@@ -733,13 +733,44 @@ pub fn generate_setup_script(plan: &Plan) -> String {
 // Config File Loading
 // ============================================================================
 
+/// The directory fcvm's config lives in.
+///
+/// `FCVM_CONFIG_DIR` overrides everything, and exists for exactly one caller:
+/// the test harness (`scripts/with-test-config.sh`), which needs a per-run
+/// config directory. It deliberately does NOT ride on `XDG_CONFIG_HOME`: that
+/// variable is shared with podman and skopeo, and pointing it at a bare temp
+/// dir makes container tools re-resolve `containers/storage.conf` — with
+/// version- and uid-dependent fallback rules, so the test's `podman build` and
+/// fcvm's `skopeo`/`podman` calls can land on DIFFERENT image stores. Observed
+/// both ways: rootless skopeo missing the configured graphroot (12 local test
+/// failures), and a runner's root podman honouring the redirected config while
+/// a nested env-reset `sudo podman build` did not ("image not known").
+/// An fcvm-private variable cannot perturb any other tool.
+pub fn fcvm_config_dir() -> Result<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("FCVM_CONFIG_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        // Relative paths are refused rather than resolved: the value crosses
+        // process boundaries (nextest -> sudo -> fcvm -> nested launches) where
+        // the working directory differs, and the directories crate's silent
+        // fallback on bad XDG paths is exactly the trap this replaces.
+        anyhow::ensure!(
+            dir.is_absolute(),
+            "FCVM_CONFIG_DIR must be absolute, got: {}",
+            dir.display()
+        );
+        return Ok(dir.join("fcvm"));
+    }
+    let proj_dirs =
+        ProjectDirs::from("", "", "fcvm").context("Could not determine config directory")?;
+    Ok(proj_dirs.config_dir().to_path_buf())
+}
+
 /// Generate default config file at XDG config directory.
 ///
 /// Writes the embedded default config to ~/.config/fcvm/rootfs-config.toml
 pub fn generate_config(force: bool) -> Result<PathBuf> {
-    let proj_dirs =
-        ProjectDirs::from("", "", "fcvm").context("Could not determine config directory")?;
-    let config_dir = proj_dirs.config_dir();
+    let config_dir = fcvm_config_dir()?;
+    let config_dir = config_dir.as_path();
     let config_path = config_dir.join(CONFIG_FILE);
 
     if config_path.exists() && !force {
@@ -810,8 +841,8 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
     }
 
     // 3. XDG user config
-    if let Some(proj_dirs) = ProjectDirs::from("", "", "fcvm") {
-        let p = proj_dirs.config_dir().join(CONFIG_FILE);
+    if let Ok(config_dir) = fcvm_config_dir() {
+        let p = config_dir.join(CONFIG_FILE);
         if p.exists() {
             return Ok(p);
         }
