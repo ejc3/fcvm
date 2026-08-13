@@ -439,9 +439,6 @@ jobs:
           fi
           echo ""
           sudo chmod 666 /dev/kvm
-          # The AMI can bake a contaminated default rootless store (live builder
-          # snapshot, 8a9c564f); CI never legitimately uses it, so remove it.
-          ./fcvm/scripts/runner-podman-hygiene.sh
           sudo mkdir -p /var/run/netns
           if [ ! -e /dev/userfaultfd ]; then
             sudo mknod /dev/userfaultfd c 10 126
@@ -471,6 +468,13 @@ jobs:
           printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           # Reset podman state if corrupted from previous runs
           podman system migrate || true
+          # The AMI can bake a contaminated default rootless store (live builder
+          # snapshot, 8a9c564f). Runs AFTER the config writes above so podman's
+          # own `system reset` tears db+stores down against the FINAL storage
+          # layout — placed earlier, it left the bolt db referencing paths that
+          # no longer matched ("database static dir ... does not match", podman
+          # exit 125 before any test ran, 2026-08-13).
+          ./fcvm/scripts/runner-podman-hygiene.sh
       - name: Create test log directory
         run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
@@ -492,9 +496,6 @@ jobs:
       - name: Refresh KVM permissions
         run: |
           sudo chmod 666 /dev/kvm
-          # The AMI can bake a contaminated default rootless store (live builder
-          # snapshot, 8a9c564f); CI never legitimately uses it, so remove it.
-          ./fcvm/scripts/runner-podman-hygiene.sh
       # #61: provision the optional Cloud Hypervisor backend so the
       # --hypervisor cloud-hypervisor sanity tests run (instead of skipping).
       # Built from the [cloud_hypervisor] fork (SVE register fix, CH #8268) and
@@ -660,9 +661,6 @@ jobs:
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm
-          # The AMI can bake a contaminated default rootless store (live builder
-          # snapshot, 8a9c564f); CI never legitimately uses it, so remove it.
-          ./fcvm/scripts/runner-podman-hygiene.sh
           sudo mkdir -p /var/run/netns
           if [ ! -e /dev/userfaultfd ]; then
             sudo mknod /dev/userfaultfd c 10 126
@@ -690,6 +688,13 @@ jobs:
           mkdir -p ~/.config/containers
           printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           podman system migrate || true
+          # The AMI can bake a contaminated default rootless store (live builder
+          # snapshot, 8a9c564f). Runs AFTER the config writes above so podman's
+          # own `system reset` tears db+stores down against the FINAL storage
+          # layout — placed earlier, it left the bolt db referencing paths that
+          # no longer matched ("database static dir ... does not match", podman
+          # exit 125 before any test ran, 2026-08-13).
+          ./fcvm/scripts/runner-podman-hygiene.sh
           # Install iperf3 for network benchmarks
           sudo apt-get update && sudo apt-get install -y iperf3 || true
       - name: Create test log directory
@@ -715,9 +720,6 @@ jobs:
       - name: Refresh KVM permissions
         run: |
           sudo chmod 666 /dev/kvm
-          # The AMI can bake a contaminated default rootless store (live builder
-          # snapshot, 8a9c564f); CI never legitimately uses it, so remove it.
-          ./fcvm/scripts/runner-podman-hygiene.sh
       - name: Allocate hugepages
         run: |
           echo 512 | sudo tee /proc/sys/vm/nr_hugepages
@@ -837,9 +839,6 @@ jobs:
       - name: Setup KVM and rootless podman
         run: |
           sudo chmod 666 /dev/kvm
-          # The AMI can bake a contaminated default rootless store (live builder
-          # snapshot, 8a9c564f); CI never legitimately uses it, so remove it.
-          ./fcvm/scripts/runner-podman-hygiene.sh
           # Enable userfaultfd syscall for snapshot cloning
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Disable AppArmor restriction on unprivileged user namespaces (needed for rootless networking on newer Ubuntu)
@@ -863,6 +862,13 @@ jobs:
           printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > ~/.config/containers/containers.conf
           # Reset podman state if corrupted from previous runs
           podman system migrate || true
+          # The AMI can bake a contaminated default rootless store (live builder
+          # snapshot, 8a9c564f). Runs AFTER the config writes above so podman's
+          # own `system reset` tears db+stores down against the FINAL storage
+          # layout — placed earlier, it left the bolt db referencing paths that
+          # no longer matched ("database static dir ... does not match", podman
+          # exit 125 before any test ran, 2026-08-13).
+          ./fcvm/scripts/runner-podman-hygiene.sh
           # Create cargo cache directory for container
           mkdir -p ${{ github.workspace }}/cargo-cache/registry ${{ github.workspace }}/cargo-cache/target
       - name: Login to ghcr.io

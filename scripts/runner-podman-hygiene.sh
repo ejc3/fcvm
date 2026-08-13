@@ -23,15 +23,24 @@ set -euo pipefail
 
 store="${HOME:?HOME must be set}/.local/share/containers"
 
-if [ ! -e "$store" ]; then
-	echo "runner-podman-hygiene: no default store at $store (clean)"
-	exit 0
+# Record what is there before destroying the evidence — this is the data the
+# AMI follow-up (issue #806) needs to confirm where the droppings come from.
+if [ -e "$store" ]; then
+	echo "runner-podman-hygiene: pre-existing default store $store:"
+	sudo find "$store" -maxdepth 3 -printf '%u:%g %m %p\n' 2>/dev/null | head -20 || true
 fi
 
-# Record what was there before destroying the evidence — this is the data the
-# AMI follow-up (issue #806) needs to confirm where the droppings come from.
-echo "runner-podman-hygiene: removing pre-existing default store $store:"
-sudo find "$store" -maxdepth 3 -printf '%u:%g %m %p\n' 2>/dev/null | head -20 || true
+# Tear down podman's state COHERENTLY first: the bolt db cross-references the
+# configured store paths, and removing a directory out from under it leaves
+# every later podman call failing with "database static dir ... does not match"
+# (observed 2026-08-13 when this script was a bare rm -rf: podman login died
+# with exit 125 before any test ran). `system reset` is podman's own primitive
+# for exactly this, and it reads the job's FINAL storage config — which is why
+# the workflow invokes this script after the config writes, not before.
+podman system reset --force 2>&1 | tail -2 || true
 
+# Then sweep the default store path itself: reset runs unprivileged and cannot
+# remove the AMI's foreign-uid droppings, which are the original failure mode
+# (chown .../overlay/l: operation not permitted).
 sudo rm -rf "$store"
-echo "runner-podman-hygiene: removed"
+echo "runner-podman-hygiene: default store cleared"

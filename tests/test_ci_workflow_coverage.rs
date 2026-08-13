@@ -792,12 +792,16 @@ fn summary_artifact_steps_are_gated_on_the_changes_job() {
 }
 
 /// Every self-hosted job that runs podman must clear the DEFAULT rootless store
-/// before tests. The AMI can bake a contaminated one (it is snapshotted from
-/// the RUNNING builder since 8a9c564f), and the first `podman build` that
-/// resolves to it dies with `chown .../overlay/l: operation not permitted` —
-/// every Host job on 2026-08-12 (#792/#805). CI's own storage.conf points the
-/// graphroot at btrfs, so the default store is never legitimately used and
-/// removal is unconditionally safe.
+/// before tests — ONCE, and only after its containers config is fully written.
+/// The AMI can bake a contaminated store (it is snapshotted from the RUNNING
+/// builder since 8a9c564f), and the first `podman build` that resolves to it
+/// dies with `chown .../overlay/l: operation not permitted` (#792/#805,
+/// 2026-08-12). Placement matters as much as presence: invoked BEFORE the
+/// config writes, the script's `podman system reset` tore state down against
+/// the wrong layout and every later podman call failed with "database static
+/// dir ... does not match" (exit 125 before any test ran, 2026-08-13). The
+/// pinned invariant is therefore "immediately after every `podman system
+/// migrate`", which is the last line of each job's podman configuration.
 #[test]
 fn self_hosted_setup_steps_clear_the_default_podman_store() {
     let ci = std::fs::read_to_string(concat!(
@@ -805,16 +809,27 @@ fn self_hosted_setup_steps_clear_the_default_podman_store() {
         "/.github/workflows/ci.yml"
     ))
     .expect("read ci.yml");
-    let kvm_steps = ci.matches("sudo chmod 666 /dev/kvm").count();
+    let migrates = ci.matches("podman system migrate").count();
     let hygiene = ci.matches("runner-podman-hygiene.sh").count();
     assert_eq!(
-        kvm_steps, hygiene,
-        "every runner setup step (the `chmod 666 /dev/kvm` blocks: {kvm_steps}) must invoke \
-         scripts/runner-podman-hygiene.sh (found {hygiene}); a job without it inherits the \
-         AMI's contaminated default store and fails its first rootless podman build"
+        migrates, hygiene,
+        "every `podman system migrate` ({migrates}) must be followed by \
+         scripts/runner-podman-hygiene.sh (found {hygiene} calls); a job without it inherits \
+         the AMI's contaminated default store, and a call anywhere else runs against the \
+         wrong storage config"
     );
     assert!(
         hygiene >= 3,
-        "expected at least 3 wired setup steps, found {hygiene}"
+        "expected at least 3 wired jobs, found {hygiene}"
     );
+    // Adjacency, not just equal counts: each migrate must have the hygiene call
+    // in the lines that follow it before the step ends.
+    for (idx, _) in ci.match_indices("podman system migrate") {
+        let after = &ci[idx..(idx + 600).min(ci.len())];
+        assert!(
+            after.contains("runner-podman-hygiene.sh"),
+            "a `podman system migrate` at byte {idx} is not followed by the hygiene call \
+             within its step"
+        );
+    }
 }
