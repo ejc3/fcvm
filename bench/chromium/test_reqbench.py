@@ -5250,3 +5250,73 @@ class TimedWsUpgradeDiagnostics(unittest.TestCase):
         self.assertEqual(diagnostics["socket_local"][0], "127.0.0.1")
         self.assertEqual(diagnostics["socket_peer"][1], port)
         self.assertIsInstance(diagnostics["socket_so_error"], int)
+
+
+class MakefileBenchGraph(unittest.TestCase):
+    """The Chromium bench make targets must encode their real dependencies.
+
+    Watched red 2026-08-13 against the PHASE?=run single-target Makefile:
+    every assertion failed with "bench-chromium-request-golden not found in
+    make database" (and the PHASE target still present). That day's golden had
+    failed at RUNTIME instead — "Custom firecracker not found ... Run: fcvm
+    setup --kernel-profile default" — because the only make entry point
+    depended on `build` alone and nothing expressed the asset dependency.
+    """
+
+    REPO = os.path.dirname(os.path.dirname(HERE))
+
+    @classmethod
+    def setUpClass(cls):
+        out = subprocess.run(
+            ["make", "-C", cls.REPO, "-pq", "help"],
+            capture_output=True, text=True, timeout=120)
+        cls.rules = {}
+        for line in out.stdout.splitlines():
+            # Rule lines sit at column 0 as "target: prereqs". Skip recipes,
+            # comments, special targets, and target-specific variable lines
+            # ("bench-quick: BENCH_ARGS := ..."), which contain "=".
+            if not line or line[0] in "\t# ." or "=" in line or ":" not in line:
+                continue
+            tgt, _, prereqs = line.partition(":")
+            cls.rules.setdefault(tgt.strip(), set()).update(prereqs.split())
+
+    def prereqs(self, target):
+        self.assertIn(target, self.rules,
+                      f"{target} not found in make database")
+        return self.rules[target]
+
+    def test_golden_depends_on_binary_and_assets(self):
+        p = self.prereqs("bench-chromium-request-golden")
+        self.assertIn("bench-chromium-request-build", p)
+        self.assertIn("setup-default", p)
+
+    def test_image_build_depends_on_fcvm_build(self):
+        self.assertIn("build", self.prereqs("bench-chromium-request-build"))
+
+    def test_measured_phases_never_rebuild(self):
+        # verify/run stage the CURRENT binary into the runtime bundle, and the
+        # run refuses a golden whose provenance records a different bundle
+        # hash. A `build` prerequisite here could swap the binary between
+        # golden and run: the seal would fail closed, but the chain would be
+        # self-breaking. The binary under test comes from the golden-time
+        # build, so these targets must not rebuild anything.
+        for t in ("bench-chromium-request-run", "bench-chromium-request-verify"):
+            self.assertNotIn("build", self.prereqs(t), t)
+            self.assertNotIn("setup-default", self.prereqs(t), t)
+
+    def test_full_chain_and_companion_benches(self):
+        p = self.prereqs("bench-chromium-request-all")
+        self.assertIn("build", p)
+        self.assertIn("setup-default", p)
+        self.assertIn("bench-chromium-request-build",
+                      self.prereqs("bench-chromium-hostcdp"))
+        fp = self.prereqs("bench-chromium-fault")
+        self.assertIn("build", fp)
+        self.assertIn("setup-default", fp)
+
+    def test_phase_indirection_is_gone(self):
+        # NO LEGACY: the PHASE?=run single target could not express
+        # inter-phase dependencies and is exactly how a golden ran on a box
+        # with no firecracker asset. Its survival (including as a stray
+        # .PHONY entry) means the clean break did not happen.
+        self.assertNotIn("bench-chromium-request", self.rules)

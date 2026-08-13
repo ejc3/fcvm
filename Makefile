@@ -229,7 +229,9 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-chromium bench-chromium-request analyze-chromium-request bench-clone-latency test-chromium-request \
+	bench-container-import bench-chromium analyze-chromium-request bench-clone-latency test-chromium-request \
+	bench-chromium-request-build bench-chromium-request-golden bench-chromium-request-verify \
+	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
 	bench-quick bench-throughput bench-operations bench-protocol \
@@ -290,7 +292,13 @@ help:
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
-	@echo "  bench-chromium-request  Run the gated request benchmark (PHASE=, BACKEND=, REPS=, WARMUP=, RESULTS=)"
+	@echo "  bench-chromium-request-build   Build the request-bench container image"
+	@echo "  bench-chromium-request-golden  Create golden snapshot (TAG=, HUGEPAGES=1, NETMODE=)"
+	@echo "  bench-chromium-request-verify  Prove CDP hops on a restored clone (TAG=)"
+	@echo "  bench-chromium-request-run     Measured run (BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, ARMS=, RESULTS=)"
+	@echo "  bench-chromium-request-all     Full chain: image, golden, verify, run"
+	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM)"
+	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
 	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
@@ -697,10 +705,27 @@ bench-chromium: build
 	@echo "==> Running Chromium shared-nothing benchmark..."
 	@bash bench/chromium/bench.sh run
 
-# Request-optimized Chromium benchmark. The driver invokes reqanalyze.py after
-# every run and propagates its publication-gate status, so a Make success means
-# both the producer and analyzer accepted the result.
-PHASE ?= run
+# Request-optimized Chromium benchmark: one make target per reqbench.sh phase,
+# so the dependency chain is explicit instead of discovered at runtime. The
+# golden needs the fcvm binary AND the default-profile assets (kernel, rootfs,
+# initrd, firecracker — that is `setup-default`, whose absence is the
+# "Custom firecracker not found" golden failure of 2026-08-13). The measured
+# phases (verify/run) deliberately do NOT depend on `build`: reqbench.sh
+# stages fcvm+fc-agent+its own sources into a hash-sealed runtime bundle, and
+# the run refuses a golden whose provenance records a different bundle hash —
+# a rebuild between golden and run would swap the binary under test, so the
+# binary must come from the golden-time build and a missing/stale one fails
+# closed with a clear error. Structural pin: MakefileBenchGraph in
+# bench/chromium/test_reqbench.py (make test-chromium-request).
+#
+# Knobs reach reqbench.sh through the environment — make exports command-line
+# variables — so e.g.:
+#   make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1
+#   make bench-chromium-request-run TAG=cb-req-golden-huge UFFD_MODE=minor \
+#        UFFD_PREFETCH=on REPS=202 ARMS=exec,noop,cdp-fast,cdp
+# The run driver invokes reqanalyze.py afterwards and propagates its
+# publication-gate status, so a Make success means both the producer and the
+# analyzer accepted the result.
 BACKEND ?= uffd
 REPS ?= 200
 WARMUP ?= 2
@@ -708,10 +733,40 @@ ifndef RESULTS
 RESULTS := $(CURDIR)/bench/chromium/results/reqbench-$(shell date +%Y%m%d-%H%M%S)-$(BACKEND)
 endif
 
-bench-chromium-request: build
+bench-chromium-request-build: build
+	@echo "==> Building Chromium request-bench container image..."
+	@bash bench/chromium/reqbench.sh build
+
+bench-chromium-request-golden: bench-chromium-request-build setup-default
+	@echo "==> Creating golden snapshot (TAG=$(if $(TAG),$(TAG),cb-req-golden), HUGEPAGES=$(if $(HUGEPAGES),$(HUGEPAGES),0))..."
+	@bash bench/chromium/reqbench.sh golden
+
+bench-chromium-request-verify:
+	@echo "==> Verifying CDP hops on a restored clone..."
+	@bash bench/chromium/reqbench.sh verify
+
+bench-chromium-request-run:
 	@echo "==> Running gated Chromium request benchmark ($(BACKEND), $(REPS) measured attempts per arm)..."
 	@BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
-		bash bench/chromium/reqbench.sh "$(PHASE)"
+		bash bench/chromium/reqbench.sh run
+
+bench-chromium-request-all: build setup-default
+	@echo "==> Full request-bench chain (image, golden, verify, measured run) under one seal..."
+	@BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
+		bash bench/chromium/reqbench.sh all
+
+# Host-container direct-CDP baseline (no VM): same image, same driver, warm
+# pool on the host. Needs only the container image, not VM assets.
+bench-chromium-hostcdp: bench-chromium-request-build
+	@echo "==> Running host-container direct-CDP baseline..."
+	@bash bench/chromium/hostcdp.sh
+
+# Per-request guest page-fault count/cost per memory backend. Requires the
+# bench.sh goldens (cb-golden-*) to exist; cells without one are skipped.
+bench-chromium-fault: build setup-default
+	@test -n "$(FAULT_OUT)" || (echo "ERROR: FAULT_OUT required (results directory)"; exit 1)
+	@echo "==> Running per-request page-fault benchmark..."
+	@python3 bench/chromium/faultbench.py --out "$(FAULT_OUT)" $(FAULT_ARGS)
 
 analyze-chromium-request:
 	@test -f "$(RESULTS)/reqbench.jsonl" || { echo "ERROR: no $(RESULTS)/reqbench.jsonl" >&2; exit 2; }
