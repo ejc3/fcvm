@@ -790,3 +790,31 @@ fn summary_artifact_steps_are_gated_on_the_changes_job() {
          {checked}, so this test is not inspecting what it claims"
     );
 }
+
+/// Every self-hosted job that runs podman must clear the DEFAULT rootless store
+/// before tests. The AMI can bake a contaminated one (it is snapshotted from
+/// the RUNNING builder since 8a9c564f), and the first `podman build` that
+/// resolves to it dies with `chown .../overlay/l: operation not permitted` —
+/// every Host job on 2026-08-12 (#792/#805). CI's own storage.conf points the
+/// graphroot at btrfs, so the default store is never legitimately used and
+/// removal is unconditionally safe.
+#[test]
+fn self_hosted_setup_steps_clear_the_default_podman_store() {
+    let ci = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/ci.yml"
+    ))
+    .expect("read ci.yml");
+    let kvm_steps = ci.matches("sudo chmod 666 /dev/kvm").count();
+    let hygiene = ci.matches("runner-podman-hygiene.sh").count();
+    assert_eq!(
+        kvm_steps, hygiene,
+        "every runner setup step (the `chmod 666 /dev/kvm` blocks: {kvm_steps}) must invoke \
+         scripts/runner-podman-hygiene.sh (found {hygiene}); a job without it inherits the \
+         AMI's contaminated default store and fails its first rootless podman build"
+    );
+    assert!(
+        hygiene >= 3,
+        "expected at least 3 wired setup steps, found {hygiene}"
+    );
+}
