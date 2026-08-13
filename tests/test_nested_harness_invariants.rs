@@ -74,12 +74,19 @@ fn test_recipes_use_an_exact_worktree_local_config() {
     );
     assert!(
         wrapper.contains("target_dir=\"$(cd \"$target_dir\" && pwd -P)\""),
-        "XDG_CONFIG_HOME must be absolute; the directories crate ignores relative XDG paths \
-         and silently falls back to the shared ~/.config/fcvm directory"
+        "FCVM_CONFIG_DIR must be absolute; fcvm refuses relative values because they cross \
+         process boundaries with different working directories"
     );
     assert!(
-        wrapper.contains("export XDG_CONFIG_HOME=\"$config_home\""),
+        wrapper.contains("export FCVM_CONFIG_DIR=\"$config_home\""),
         "the isolated config directory must reach nextest, sudo, and every fcvm child"
+    );
+    assert!(
+        !wrapper.contains("export XDG_CONFIG_HOME"),
+        "the wrapper must NOT touch XDG_CONFIG_HOME: podman and skopeo resolve \
+         containers/storage.conf through it with version- and uid-dependent fallbacks, which \
+         split the test's image store from fcvm's (rootless skopeo hex-ID failures locally; \
+         root podman 'image not known' on a CI runner)"
     );
     assert!(
         wrapper.contains("./target/release/fcvm setup --generate-config --force"),
@@ -110,8 +117,8 @@ fn isolated_config_mounts_the_active_xdg_config_into_nested_guests() {
     let source = nested_test_source();
 
     assert!(
-        source.contains("var_os(\"XDG_CONFIG_HOME\")"),
-        "nested launches must resolve the config mounted into L1 from the active XDG_CONFIG_HOME"
+        source.contains("var_os(\"FCVM_CONFIG_DIR\")"),
+        "nested launches must resolve the config mounted into L1 from the active FCVM_CONFIG_DIR"
     );
     assert!(
         source.contains("join(\"fcvm\")"),

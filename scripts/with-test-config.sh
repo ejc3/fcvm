@@ -29,7 +29,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export XDG_CONFIG_HOME="$config_home"
+# FCVM_CONFIG_DIR is fcvm-private, so this isolation cannot perturb any other
+# tool. The previous mechanism exported XDG_CONFIG_HOME, which podman and
+# skopeo also read to find containers/storage.conf — with version- and
+# uid-dependent fallback rules. That split the test's image store from fcvm's
+# twice over: rootless skopeo missed the configured graphroot ("cannot specify
+# 64-byte hexadecimal strings" on every localhost-image test), and a CI
+# runner's root podman honoured the redirected config while the test's
+# env-reset `sudo podman build` did not ("image not known"). A variable only
+# fcvm reads has no second reader to disagree with.
+export FCVM_CONFIG_DIR="$config_home"
 ./target/release/fcvm setup --generate-config --force >/dev/null
 
 "$@"

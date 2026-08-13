@@ -64,7 +64,9 @@ impl ImageCacheMount {
 /// L1 runs its nested fcvm process as root, so callers mount this directory at
 /// `/root/.config/fcvm` instead of letting L2 reopen a shared host config.
 fn active_fcvm_config_dir() -> std::path::PathBuf {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(config_dir) = std::env::var_os("FCVM_CONFIG_DIR") {
+        std::path::PathBuf::from(config_dir).join("fcvm")
+    } else if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
         std::path::PathBuf::from(config_home).join("fcvm")
     } else if let Some(home) = std::env::var_os("HOME") {
         std::path::PathBuf::from(home).join(".config/fcvm")
