@@ -1046,3 +1046,94 @@ mod tests {
         );
     }
 }
+
+/// Build identity of a cached image-delivery artifact: inode, size, and mtime.
+///
+/// The content-addressed cache path names the IMAGE the artifact was built
+/// from, not the build itself — and `podman load` randomizes overlay layer
+/// link IDs on every build, so two builds of the same digest are NOT
+/// interchangeable once a snapshot has provisioned a container against one of
+/// them. Atomic-rename installation means a rebuild always produces a new
+/// inode, so this triple distinguishes builds cheaply (one stat) without
+/// hashing multi-hundred-MB files.
+pub fn file_identity(path: &std::path::Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path)?;
+    Ok(format!(
+        "{}:{}:{}.{:09}",
+        md.ino(),
+        md.size(),
+        md.mtime(),
+        md.mtime_nsec()
+    ))
+}
+
+/// Whether an image-delivery disk is an overlay STORAGE image (as opposed to a
+/// Docker archive). Only overlay stores carry host-generated layer link IDs
+/// that a provisioned container keeps referencing after restore — btrfs and
+/// archive modes import the archive INTO the guest before the pre-start
+/// snapshot, so the restored VM never re-reads the archive and its rebuilds
+/// must not invalidate snapshots (or key on identity at all).
+pub fn is_overlay_storage_image(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".storage-v"))
+}
+
+/// Fail unless `path` currently has exactly the recorded build identity.
+///
+/// Closes the stat-to-open race on image-delivery disks: the snapshot key (and
+/// snapshot metadata) name one BUILD of the disk, while the VMM opens it by
+/// PATH — a delete-and-rebuild between the two would pair old provisioning
+/// with new layer link IDs. Callers run this AFTER the VMM has the file (drive
+/// attach / snapshot load), so a mismatch proves the pairing is wrong. The
+/// error text is matched by `is_snapshot_load_failure` so a restore-time
+/// mismatch invalidates the snapshot and falls back to a fresh boot.
+pub fn verify_image_disk_identity(path: &std::path::Path, expected: &str) -> anyhow::Result<()> {
+    let current =
+        file_identity(path).with_context(|| format!("re-stat image disk {}", path.display()))?;
+    anyhow::ensure!(
+        current == expected,
+        "image disk build changed during launch: {} is now {current}, snapshot/key was          computed against {expected}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod image_disk_identity_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_storage_images_are_identified_by_suffix() {
+        assert!(is_overlay_storage_image(std::path::Path::new(
+            "/mnt/fcvm-btrfs/image-cache/abc123.storage-v2.img"
+        )));
+        // Docker archives are imported into the guest before the pre-start
+        // snapshot; their rebuilds must not key or verify anything.
+        assert!(!is_overlay_storage_image(std::path::Path::new(
+            "/mnt/fcvm-btrfs/image-cache/abc123.docker.tar"
+        )));
+        assert!(!is_overlay_storage_image(std::path::Path::new("/tmp/img")));
+    }
+
+    #[test]
+    fn verify_image_disk_identity_detects_a_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.storage-v2.img");
+        std::fs::write(&path, b"build one").unwrap();
+        let recorded = file_identity(&path).unwrap();
+        // Same build: passes.
+        verify_image_disk_identity(&path, &recorded).expect("unchanged file must verify");
+        // Rebuild at the same path (unique temp + atomic rename => new inode).
+        let tmp = dir.path().join("x.tmp");
+        std::fs::write(&tmp, b"build two").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let err = verify_image_disk_identity(&path, &recorded)
+            .expect_err("a rebuilt file must fail verification");
+        assert!(
+            format!("{err:#}").contains("image disk build changed"),
+            "error must carry the snapshot-load-failure marker: {err:#}"
+        );
+    }
+}

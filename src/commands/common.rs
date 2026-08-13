@@ -2620,6 +2620,7 @@ pub fn build_snapshot_config(
             kernel_profile: vm_state.config.kernel_profile.clone(),
             image_mode: vm_state.config.image_mode.clone(),
             image_disk_path: vm_state.config.image_disk_path.clone(),
+            image_disk_identity: vm_state.config.image_disk_identity.clone(),
             hypervisor: vm_state.config.hypervisor,
         },
     })

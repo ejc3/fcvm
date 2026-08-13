@@ -124,6 +124,17 @@ pub struct FirecrackerConfig {
     /// entries. None (the default) is skip-serialized so existing keys are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_failpoint: Option<String>,
+    /// Build identity (inode:size:mtime) of the attached image-delivery disk
+    /// (overlay storage image or Docker archive). The disk's PATH is
+    /// content-addressed by image digest and so survives rebuilds — but
+    /// `podman load` randomizes overlay layer link IDs per build, so a
+    /// pre-start snapshot that provisioned its container against one build
+    /// fails against another ("readlink .../overlay/l/<id>: no such file or
+    /// directory", 2026-08-13). Keying on the build identity turns a rebuilt
+    /// disk into a snapshot cache miss. None (registry-pulled images, no
+    /// attached disk) is skip-serialized so those keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_disk_identity: Option<String>,
 }
 
 impl Default for FirecrackerConfig {
@@ -155,6 +166,7 @@ impl Default for FirecrackerConfig {
             portable_volumes: false,
             firecracker_bin: None,
             guest_failpoint: None,
+            image_disk_identity: None,
         }
     }
 }
@@ -566,6 +578,23 @@ mod tests {
         let mut config2 = test_config();
         config2.guest_failpoint = Some("exec.post_accept_pre_read:sleep:100".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_image_disk_identity() {
+        // The image disk's PATH is content-addressed by image digest and does
+        // not change on rebuild — but `podman load` randomizes overlay link
+        // IDs per build, so a snapshot provisioned against one build must
+        // never restore against another. Two builds at the same path differ
+        // only in this identity; the key must differ with it, and a rebuild
+        // must also miss a snapshot created before the field existed (None).
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.image_disk_identity = Some("1841:73678848:1765574672.000000000".to_string());
+        let mut config3 = test_config();
+        config3.image_disk_identity = Some("2007:73678848:1765581300.000000000".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+        assert_ne!(config2.snapshot_key(), config3.snapshot_key());
     }
 
     #[test]
