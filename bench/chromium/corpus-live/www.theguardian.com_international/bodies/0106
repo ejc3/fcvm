@@ -1,0 +1,61 @@
+"use strict";(function(){try{var record=function(name,detail){aps.get(accountId).queue.push(new CustomEvent(name,{detail}))};const accountId="3722";window._aps=window._aps||new Map;const aps=window._aps;aps.has(accountId)||aps.set(accountId,{queue:[],store:new Map}),record("_config/requestViewerCountry/define",{"code":"US"});record("analytics/sampling/set",{"rates":{"error":0.001,"status":0.0001}});record("a3pes/video/activate",{"restrictions":{"block":{"accounts":["5220","e32f1423-28bc-43ed-8ab0-5ae6b4449cf8"]}}});record("a3pes/video/activate",{"bypassCountryCheck":true,"restrictions":{"allow":{"accountTypes":["ssw"]},"block":{"accounts":["e32f1423-28bc-43ed-8ab0-5ae6b4449cf8"]}}});record("a3pes/video/activate",{"bypassCountryCheck":true,"restrictions":{"allow":{"accountTypes":["mw"],"rate":0.5},"block":{"accounts":["5220"]}}});record("a3pes/banner/activate",{"bypassCountryCheck":true});record("idVendors/enabled/set",{"bidParameterKeys":["liveintent","merkle","intimateMerger","pair","amx","33across","fTrack","captify","publink","anonymised","quantcast","idPlus","unifiedid","ddb_key_638","fabrick","uid","criteo","yahoo","liveRamp","id5","pubcommon","audigent","lightPublisherAudiences","lotame"]});record("idVendors/integration/execute",{"accountId":"3722","sourceId":"3722","countryCode":"US","vendorId":"id5","allowedRegions":undefined,"blockedRegions":["BR"],"vendorLoadedSampleRate":5,"domainPrecedence":[],"defaultScript":function anonymous(
+) {
+undefined?undefined.includes("US")&&(function anonymous(
+) {
+var id5PropertyId = '182';
+if (!window.ID5 && id5PropertyId && id5PropertyId.charAt(0) !== '%') {
+  var id5Script = document.createElement('script');
+  id5Script.src = '//cdn.id5-sync.com/api/1.0/id5-api.js';
+  id5Script['onload'] = function (e) {
+    ID5.init({ partnerId: Number(id5PropertyId), provider: 'aps' })
+  };
+  document.head.appendChild(id5Script);
+}
+})():(!["BR"]||["BR"]&&!["BR"].includes("US"))&&(function anonymous(
+) {
+var id5PropertyId = '182';
+if (!window.ID5 && id5PropertyId && id5PropertyId.charAt(0) !== '%') {
+  var id5Script = document.createElement('script');
+  id5Script.src = '//cdn.id5-sync.com/api/1.0/id5-api.js';
+  id5Script['onload'] = function (e) {
+    ID5.init({ partnerId: Number(id5PropertyId), provider: 'aps' })
+  };
+  document.head.appendChild(id5Script);
+}
+})()
+},"defaultPropertyId":"182"});record("idVendors/integration/execute",{"accountId":"3722","sourceId":"3722","countryCode":"US","vendorId":"liveRamp","allowedRegions":undefined,"blockedRegions":undefined,"vendorLoadedSampleRate":5,"domainPrecedence":[],"defaultScript":function anonymous(
+) {
+undefined?undefined.includes("US")&&(function anonymous(
+) {
+(function(){if (window.apstag) {window.apstag.__liveRamp__ = false;}})();
+})():(!undefined||undefined&&!undefined.includes("US"))&&(function anonymous(
+) {
+(function(){if (window.apstag) {window.apstag.__liveRamp__ = false;}})();
+})()
+},"defaultPropertyId":"14522"});record("idVendors/integration/execute",{"accountId":"3722","sourceId":"3722","countryCode":"US","vendorId":"pubcommon","allowedRegions":undefined,"blockedRegions":["BR"],"vendorLoadedSampleRate":5,"domainPrecedence":[],"defaultScript":function anonymous(
+) {
+undefined?undefined.includes("US")&&(function anonymous(
+) {
+if (!window.PublisherCommonId) {
+    var pubcommonScript = document.createElement('script');
+    pubcommonScript.src = '//secure.cdn.fastclick.net/js/pubcid/latest/pubcid.min.js';
+    document.head.appendChild(pubcommonScript);
+}
+})():(!["BR"]||["BR"]&&!["BR"].includes("US"))&&(function anonymous(
+) {
+if (!window.PublisherCommonId) {
+    var pubcommonScript = document.createElement('script');
+    pubcommonScript.src = '//secure.cdn.fastclick.net/js/pubcid/latest/pubcid.min.js';
+    document.head.appendChild(pubcommonScript);
+}
+})()
+},"defaultPropertyId":undefined});record("idVendors/integration/execute",{"accountId":"3722","sourceId":"3722","countryCode":"US","vendorId":"confiant","allowedRegions":undefined,"blockedRegions":undefined,"vendorLoadedSampleRate":5,"domainPrecedence":[],"defaultScript":function anonymous(
+) {
+undefined?undefined.includes("US")&&(function anonymous(
+) {
+window.creativeVendorLibraryLoaded = true;
+})():(!undefined||undefined&&!undefined.includes("US"))&&(function anonymous(
+) {
+window.creativeVendorLibraryLoaded = true;
+})()
+},"defaultPropertyId":"7oDgiTsq88US4rrBG0_Nxpafkrg"});record("_config/config/didLoad",undefined)}catch(e){console.error(e)}})();

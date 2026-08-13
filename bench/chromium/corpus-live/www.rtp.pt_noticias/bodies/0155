@@ -1,0 +1,13 @@
+
+    {
+        "country":"XX",
+        "rights":1,
+        "video":{
+            "streamer":"ec24.rtp.pt",
+            "file":""
+          },
+          "timeout":60,
+          "live":1,
+          "cachefile":"STATIC"
+    }
+  

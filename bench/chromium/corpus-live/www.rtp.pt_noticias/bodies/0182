@@ -1,0 +1,5 @@
+
+if (typeof gemius_hcconn!='undefined' && gemius_hcconn.sonar_add) {
+	gemius_hcconn.sonar_add("px0wQn_3LwvnSI68k48WIsPc7zEyghtsAdS20LBvELT.W7",1786637166,3000,"gA=noticias/inicio-destaques");
+}
+

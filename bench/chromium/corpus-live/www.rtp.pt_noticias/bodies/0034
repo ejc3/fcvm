@@ -1,0 +1,27 @@
+(function() {
+    function fix(el) {
+      try {
+        var visible = (el.textContent || '').trim();
+        var aria = el.getAttribute('aria-label') || '';
+        if (visible && aria.indexOf(visible) === -1) {
+          el.setAttribute('aria-label', visible + (aria ? ' — ' + aria : ''));
+        }
+      } catch (e) {}
+    }
+    function scan(root) {
+      var nodes = root.querySelectorAll('button[aria-keyshortcuts], [role="button"][aria-keyshortcuts]');
+      nodes.forEach(fix);
+    }
+    function init() {
+      scan(document.body);
+      var observer = new MutationObserver(function(mutations) {
+        scan(document.body);
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  })();

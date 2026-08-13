@@ -1,0 +1,1 @@
+{"e":["(function(w,d){;w.zarazData.executed.push(\"AllTracks\");})(window,document)","(function(w,d){{(function(w,d){zaraz._c=pR=>{const{event:pS,...pT}=pR;zaraz.track(pS,{...pT,__zarazClientEvent:!0})};zaraz._syncedAttributes=[\"altKey\",\"clientX\",\"clientY\",\"pageX\",\"pageY\",\"button\"];zaraz.__zcl.track=!0;})(window,document);}})(window,document)"]}

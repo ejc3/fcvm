@@ -1,0 +1,8 @@
+{
+		"country":"ES",
+		"rights":0,
+		"image": "http://img0.rtp.pt/play/images/direitos_play_vod.jpg",
+		"timeout":10620,
+		"live":1,
+    "cachefile":"STATIC"
+	    }

@@ -1,0 +1,1 @@
+import{t as e}from"./tippy.esm.DTH3uxDt.js";function t(t,n,r){if(r?.hideAfter){let e=r.hideAfter;r.onShow=t=>{setTimeout(()=>{t.hide()},e)}}e(t,{content:n,allowHTML:!0,interactive:!0,appendTo:document.body,...r})}export{t};

@@ -1,0 +1,60 @@
+{
+ "url": "https://todomvc.com/examples/javascript-es6/dist/",
+ "captured_utc": "2026-08-13T16:06:29Z",
+ "resources": {
+  "https://todomvc.com/examples/javascript-es6/dist/": {
+   "file": "bodies/0000",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 1273
+  },
+  "https://todomvc.com/examples/javascript-es6/dist/app.css": {
+   "file": "bodies/0001",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 7377
+  },
+  "https://todomvc.com/examples/javascript-es6/dist/app.bundle.js": {
+   "file": "bodies/0002",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 8360
+  },
+  "https://todomvc.com/examples/javascript-es6/dist/base.js": {
+   "file": "bodies/0003",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 3758
+  },
+  "https://www.google-analytics.com/analytics.js": {
+   "file": "bodies/0004",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 52310
+  },
+  "https://todomvc.com/favicon.ico": {
+   "file": "bodies/0005",
+   "status": 404,
+   "mime": "text/html",
+   "bytes": 9379
+  },
+  "https://www.google-analytics.com/j/collect?v=1&_v=j102&a=1320189895&t=pageview&_s=1&dl=https%3A%2F%2Ftodomvc.com%2Fexamples%2Fjavascript-es6%2Fdist%2F&ul=en-us&dt=TodoMVC%3A%20JavaScript%20Es6%20Webpack&sr=800x600&vp=1280x657&_u=IEBAAEABAAAAACAAI~&jid=1971196579&gjid=1124567568&cid=63194413.1786637183&tid=UA-31081062-1&_gid=1568215100.1786637183&_r=1&_slc=1&z=710264330": {
+   "file": "bodies/0006",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 15
+  },
+  "https://todomvc.com/learn.json": {
+   "file": "bodies/0007",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 44907
+  },
+  "https://www.googletagmanager.com/gtag/js?id=G-T3XWXPZX5B&cx=c&_slc=1": {
+   "file": "bodies/0008",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 446574
+  }
+ }
+}

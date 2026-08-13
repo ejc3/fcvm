@@ -1,0 +1,254 @@
+Skip to content
+Products
+Solutions
+Resources
+Pricing
+All Categories
+Login
+Contact Sales
+Cloudflare Blog
+
+Technical deep dives, product updates, and insights from the teams that are helping to build a better Internet.
+
+AUGUST 13, 2026
+Certificate Transparency Monitoring is now generally available
+
+Cloudflare's Certificate Transparency Monitoring is now generally available. The biggest change: we no longer email you about certificates Cloudflare issued for your domain, so when an alert lands in your inbox, it's worth a look.
+
+Pravallika Nakarikanti
+ and 
+Jenny Yang
+
+AUGUST 11, 2026
+Cloudflare DDoS Threat Report H1 2026: 1 Tbps attacks soar as DNS floods and geopolitical tensions drive a new wave
+
+In the first half of 2026, Cloudflare detected a 519% surge in hyper-volumetric DDos attacks across its network. These attacks were driven heavily by DNS and CLDAP reflection vectors. This report breaks down how major geopolitical conflicts reshaped the global cyber threat landscape.
+
+Cloudforce One
+
+AUGUST 10, 2026
+Everything we launched during Agents Week
+
+Our latest Agents Week has come to a close. Here’s a recap of all the announcements we made from Wallets to Radar.
+
+Shelley Jones,
+ 
+Ann Ming Samborski,
+ and 
+Kathy Liao
+
+AUGUST 10, 2026
+Serving the most critical missions: Cloudflare for Government achieves FedRAMP Class D (High) Certified status
+
+Cloudflare for Government achieves FedRAMP Class D (High) Certified status. We also announce our commitment to pursue DoD IL4 authorization. Cloudflare brings world-class security, performance, and developer products to the public sector.
+
+Wesley Evans,
+ 
+Tom Lianza,
+ and 
+Jake Schaeufele
+
+AUGUST 7, 2026
+Unveiling good and bad behaviors on the Agentic Internet
+
+Cloudflare is shifting bot mitigation from point-in-time Risk assessment to continuous Trust evaluation. Learn how new good and bad behaviors from bots and agents are assessed by our systems, including BotBase and Precursor — and try out our Precursor Trace simulation to see how your own cursor movements would be assessed as human or bot.
+
+Jin-Hee Lee
+ and 
+Marina Elmore
+
+AUGUST 7, 2026
+Introducing Radar Researcher: An AI tool for exploring Internet data in plain language
+
+Cloudflare Radar Researcher is a new AI-powered tool that lets you explore global Internet trends and traffic data using plain language. Built entirely on Cloudflare's Developer Platform, it turns natural language queries into real, interactive charts.
+
+Lai Yi Ohlsen
+ and 
+André Jesus
+
+AUGUST 7, 2026
+Announcing Cloudflare Ambassadors, Community Engineers, and another $1M in open-source funding
+
+We are launching updated community programs, including Cloudflare Ambassadors and Community Engineers, backed by $1M in open-source funding. Learn how we are supporting maintainers and scaling our developer community.
+
+Kristian Freeman,
+ 
+Phil Hawksworth,
+ and 
+Marissa Phul
+
+AUGUST 7, 2026
+Unifying Workers AI and AI Gateway into a single AI control plane
+
+Cloudflare is unifying AI Gateway and Workers AI into a single control plane, giving developers observability, billing, and dynamic routing across both managed GPUs and external providers. Learn how unified bindings and model-first routing simplify building resilient AI applications.
+
+Michelle Chen
+ and 
+Ming Lu
+
+AUGUST 6, 2026
+Cloudflare AI Search: give your agents a search engine for your data
+
+AI Search makes search easier than ever, with no Cloudflare primitives to stitch together. Point it at your data to create a search for your own files and websites. We're also sharing a preview of our new pricing model.
+
+Nelson Duarte,
+ 
+Tiago Teles,
+ and 
+Anni Wang
+
+AUGUST 6, 2026
+The next generation of MCP
+
+The next version of MCP has a rewritten, stateless core that just works on Workers. We cover upgrades to the protocol, the new feature lifecycle and SDK migration path, and hear from early adopters already running it in production.
+
+Matt Carey
+
+AUGUST 6, 2026
+From ranking to recommended: get your site ready to thrive in the age of AI agents
+
+More than half of requests now come from machines, not people. Agent Readiness shows how well agents can discover and read your site, while Answer Engine Optimization tracks how often AI assistants recommend you.
+
+Matthew Conroy
+ and 
+Jack Galilee
+
+AUGUST 6, 2026
+Building an open Agentic Internet: readable, discoverable, callable, and payable
+
+Agents are a new kind of visitor. They don't render CSS or click ads, but they have a paying human on the other end. Block them and you block your customer. We're building the open tools and protocols so publishers and agents can cooperate and not collide.
+
+Jack Galilee,
+ 
+Will Papper,
+ and 
+Andrew Galloni
+
+AUGUST 6, 2026
+Introducing Kitesurf: The agent-first browser that runs in V8 isolates on Cloudflare Workers
+
+We should be giving all agents tools that excel at what’s important for an AI model. Kitesurf is Cloudflare’s new stateless, highly scalable, and cost-effective web browser that runs entirely on top of Workers and was designed specifically for the Agentic Cloud.
+
+Celso Martinho,
+ 
+Ruskin Constant,
+ 
+Rui Figueira,
+ and 
+Luís Duarte
+
+AUGUST 6, 2026
+Give any website a WebMCP interface
+
+Today we're launching a developer preview of WebMCP on Cloudflare. With one switch, any site becomes usable by browser AI agents — no new APIs, no origin changes — while the human stays in control and creators keep their traffic.
+
+Will Rowe
+
+AUGUST 5, 2026
+Cloudflare is the only vendor named a Visionary in 2026 SASE and SSE reports
+
+We're honored to announce that Cloudflare is the only vendor that has been recognized as a Visionary in both the 2026 Gartner® Magic Quadrant™ for SASE Platforms and the 2026 Gartner® Magic Quadrant™ for Security Service Edge reports.
+
+Michael Keane
+
+AUGUST 5, 2026
+The Agent Access Model
+
+The Agent Access Model proposes a new architecture to secure task-scoped agents using strict identity brokering, continuous mediation, and stateful trust.
+
+Matt Silverlock
+
+AUGUST 5, 2026
+How we’re rethinking work at Cloudflare with Cloudflare OS
+
+We built Cloudflare OS to equip our teams to safely rethink how they get work done with AI. The platform brings together the best of our technologies, from our Compute primitives to our Zero Trust suite. This post walks through our journey to give our users the best AI tools available.
+
+Sam Rhea
+
+AUGUST 5, 2026
+Cloudflare OS: an open platform for agents, apps, and work
+
+Cloudflare OS is an open-source platform that lets everyone in your company build apps, automate work, and safely access internal systems, shaped around what your organization knows and how it operates
+
+Phillip Jones
+ and 
+Dan Carter
+
+AUGUST 5, 2026
+WriteGuard: fine-grained controls for MCP Servers
+
+At Cloudflare, we knew we could not depend on every employee to configure every agent perfectly or watch every tool call. Before expanding write access across our own internal MCP servers, we built WriteGuard. We are now bringing those controls to Cloudflare MCP server portals through a private beta.
+
+Scott Roe-Meschke
+ and 
+Kenny Johnson
+
+Load more
+
+Subscribe to receive notifications of new posts
+Email address
+
+We’ll never share your email address.
+
+Subscribe
+Getting Started
+Plans
+Contact sales
+Partners
+Find a partner
+Startups
+Under attack?
+Domain name search
+Public interest
+Project Galileo
+Athenian Project
+Cloudflare for Campaigns
+Project Fairshot
+Impact/ESG
+Resources
+App innovation report
+Cloudflare Radar
+Case studies
+Status
+Support
+Events
+Blog
+Solutions
+SSE and SASE platform
+Cloudflare AI Cloud
+AI Security
+Frontend Development Platform
+Multi-Tenant Platform Development
+Web Security Platform
+Company
+About
+Careers
+Investors
+Press
+Press kit
+Global network
+Compliance
+Compliance resources
+Trust
+GDPR
+Responsible AI
+Transparency report
+Report abuse
+Developers
+Documentation
+Learning center
+Community
+
+© 2026 Cloudflare, Inc.
+
+|
+Your privacy choices
+Report security issues
+|
+Privacy Policy
+|
+Terms of use
+|
+GDPR
+|
+Trademark

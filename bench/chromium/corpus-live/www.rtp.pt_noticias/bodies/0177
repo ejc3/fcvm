@@ -1,0 +1,4 @@
+if (typeof gemius_hcconn != 'undefined' && typeof gemius_hcconn.fpdata != 'undefined' && (gemius_hcconn.fpdata=='' || gemius_hcconn.fpdata[0]=='-')) {
+	gemius_hcconn.fpdata = "Gj2wUDOgCC10P.eC.1oiSrEzd7MNpvKvxNpyE.4bC73.k7|1786637165|2|||8:3:0";
+	gemius_hcconn.fpcdomain = 'rtp.pt';
+}

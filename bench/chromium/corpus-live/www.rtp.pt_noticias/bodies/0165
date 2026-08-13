@@ -1,0 +1,10 @@
+{
+	    "country":"ES",
+	    "rights":1,
+	    "video": {
+		"streamer": "h2e.rtp.pt",
+		"file": "wavrss/info/antena1noticiarios/DLT3770801_380581.mp3"},
+		"timeout":10800,
+		"live":1,
+		"cachefile":"STATIC"
+		}

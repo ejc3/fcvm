@@ -1,0 +1,419 @@
+/**
+ * [OneSignalModule description]
+ * 
+ * requires jquery.min.js
+ * requires OneSignal.js
+ * requires OneSignalSDKWorker.js
+ * requires OneSignalSDKUpdaterWorker.js
+ * requires OnesignalSetup.js
+ * 
+ * requires bell on page
+ * 	<div id="onesignal-subscribe-mbutton" class="onesignal-subscribe-mbutton-class">
+ *		<i id="onesignal-subscribe-mbell" class="fa fa-bell" aria-hidden="true" style="transform:scale(1); display:none"></i>
+ *	</div>
+ *
+ * requires data-subscription-status div to show status
+ *	<div id='data-subscription-status'></div>
+ *
+ * @return  {[type]}  [return description]
+ */
+OneSignalModule = function() {
+
+	var subscriptionStatus = {
+	//	appId: "db5c803f-6d88-4ce8-85d9-ad548339ac01", // OneSignal App ID (from OneSignal dashboard) - APP RTP PT Dev Web
+	//	safariWebId: 'web.onesignal.auto.5cadd501-3597-404f-b8f7-8075876e5307',	// Safari web ID (from OneSignal dashboard) - APP RTP PT Dev Web
+		appId: "dce19501-7ae2-4e50-b7e7-72cea0f7e56c", // OneSignal App ID (from OneSignal dashboard) - APP RTP PT Web
+		safariWebId: 'web.onesignal.auto.05255d72-c150-4ea5-804e-422907370478',	// Safari web ID (from OneSignal dashboard) - APP RTP PT Web
+		isSubscribed: null, // null = uninitialized, true = subscribed, false = unsubscribed
+		userId: null, // null = uninitialized, string = id of the user
+		registrationId: null, // null = uninitialized, string = id of the registration
+		notificationPermission: null, // null = uninitialized, string = permission
+		optedOut: null, // null = uninitialized, true = opted out, false = opted in
+		serviceWorkerActive: false, // true = active, false = inactive
+		hasTagNoticias: null, // null = uninitialized, true = has tag, false = does not have tag
+		hasTagPlay: null, // null = uninitialized, true = has tag, false = does not have tag
+		locationHref: null, // null = uninitialized, string = href of the page
+	}
+	
+	var mainTag = "rtp-noticias"; // main segment tag
+	var secondaryTag = "rtp-play"; // secondary segment tag
+	var dialogToSubscribe = ""; // main segment tag
+	var dialogToUnsubscribe = ""; // main segment tag
+	var dialogSubscribed ="";
+	var dialogUnsubscribed ="";
+
+	// show segment subscription status
+	/*
+	function showSegmentSubscriptionStatus(){
+		if (mainTag=="rtp-noticias"){
+			if(subscriptionStatus.hasTagNoticias=='true'){
+				dataStatus='<span class="subscription-status-subscribed">'+dialogSubscribed+'</span>';
+			}else if(subscriptionStatus.hasTagNoticias=='false'){
+				dataStatus='<span class="subscription-status-unsubscribed">'+dialogUnsubscribed+'</span>';
+			}
+		}else if (mainTag=="rtp-play"){
+			if(subscriptionStatus.hasTagPlay=='true'){
+				dataStatus='<span class="subscription-status-subscribed">'+dialogSubscribed+'</span>';
+			}else if(subscriptionStatus.hasTagPlay=='false'){
+				dataStatus='<span class="subscription-status-unsubscribed">'+dialogUnsubscribed+'</span>';
+			}
+		}
+		$('#data-subscription-status').html(dataStatus);
+		$('#dataArea').html("");
+	}
+	*/
+
+	//-- showBellToSubscribe
+	function showBellToSubscribe(){
+		$('#onesignal-bell-container').css({
+			"transform": "scale(0.8)",
+			"display": "block",
+			"position": "fixed",
+			"bottom": "20px",
+			"right": "20px"
+		});
+	}
+
+	//-- showBellToUnsubscribe
+	function showBellToUnsubscribe(){
+		$('#onesignal-bell-container').css({
+			"transform": "scale(0.4)",
+			"display": "block",
+			"position": "fixed",
+			"bottom": "20px",
+			"right": "20px"
+		});
+	}
+
+	// subscribe to segment
+	function subscribeToSegment(){
+		if (mainTag=="rtp-noticias"){
+			var tagsToSend = {'rtp-noticias': true};
+		}else if (mainTag=="rtp-play"){
+			var tagsToSend = {'rtp-play': true};
+		}
+
+		OneSignal.push(["sendTags",tagsToSend,function() {	
+			updateSubscriptionInfo();
+			showBellToUnsubscribe();
+
+			if (mainTag=="rtp-noticias"){
+				subscriptionStatus.hasTagNoticias='true';
+			}else if (mainTag=="rtp-play"){
+				subscriptionStatus.hasTagPlay='true';
+			}
+			//showSegmentSubscriptionStatus();
+		}]);
+		return;
+	}
+
+	// unsubscribe from segment
+	function unsubscribeFromSegment(){
+
+		function checkSegmentsAndUnsubscribe() {
+			OneSignal.push(["getTags", function(tags){
+
+				if (secondaryTag=="rtp-noticias"){
+					subscriptionStatus.hasTagNoticias=tags[secondaryTag];
+				}else if (secondaryTag=="rtp-play"){
+					subscriptionStatus.hasTagPlay=tags[secondaryTag];
+				}
+
+				if(subscriptionStatus.hasTagNoticias == 'false' && 
+				subscriptionStatus.hasTagPlay == 'false') {
+					unsubscribePushNotifications();
+				}
+			}]);
+		}
+
+		if (mainTag=="rtp-noticias"){
+			var tagsToSend = {'rtp-noticias': false};
+		}else if (mainTag=="rtp-play"){
+			var tagsToSend = {'rtp-play': false};
+		}
+
+		OneSignal.sendTags(tagsToSend,function(){
+			updateSubscriptionInfo();
+			showBellToSubscribe();
+
+			if (mainTag=="rtp-noticias"){
+				subscriptionStatus.hasTagNoticias='false';
+			}else if (mainTag=="rtp-play"){
+				subscriptionStatus.hasTagPlay='false';
+			}
+
+			//showSegmentSubscriptionStatus();
+			//checkSegmentsAndUnsubscribe(); 
+		});
+		return;
+	}
+
+	// subscribe push notifications
+	function subscribePushNotifications(){
+		OneSignal.push(function (){
+			OneSignal.setSubscription(true).then(function() {	
+				var tagsToSend = {'rtp-noticias': true};
+				OneSignal.sendTags(tagsToSend,function(){
+					showBellToUnsubscribe();
+					updateSubscriptionInfo();
+				});		
+			});	
+		});	
+		
+	}
+
+	// unsubscribe push notifications
+	function unsubscribePushNotifications(){
+		OneSignal.push(function (){
+			OneSignal.setSubscription(false);
+			showBellToSubscribe();
+		});
+	}
+
+	// unsubscribe all notifications
+	function unsubscribeAllNotifications(){
+		var tagsToSend = {'rtp-noticias': false, 'rtp-play': false};
+		OneSignal.sendTags(tagsToSend,function(){
+			OneSignal.push(function (){
+				OneSignal.setSubscription(false).then(function() {		
+					showBellToSubscribe();
+					updateSubscriptionInfo();
+				});
+			});
+		});
+	}
+
+	//-- updateInitInfo
+	function updateSubscriptionInfo(){
+		
+		Promise.all([
+			OneSignal.isPushNotificationsEnabled(),
+			OneSignal.getUserId(),
+			OneSignal.getRegistrationId(),
+			OneSignal.getNotificationPermission(),
+			OneSignal.isOptedOut(),
+			OneSignal.context.serviceWorkerManager.getActiveState(),
+		])
+		.then(([isSubscribed, userId, registrationId, notificationPermission, optedOut, serviceWorkerActive]) => {
+			subscriptionStatus.isSubscribed = isSubscribed;
+			subscriptionStatus.userId = userId;
+			subscriptionStatus.registrationId = registrationId;
+			subscriptionStatus.notificationPermission = notificationPermission;
+			subscriptionStatus.optedOut = optedOut;
+			subscriptionStatus.serviceWorkerActive = serviceWorkerActive;
+			subscriptionStatus.locationHref = location.href;
+		})
+		.catch(e => {
+			console.error("Info - Issue determining whether push is enabled:", e);
+		});
+
+		// get tags
+		Promise.all([
+			OneSignal.getTags()
+		])
+		.then(([tags]) => {
+			if(tags){	
+				if ("rtp-noticias" in tags){
+					subscriptionStatus.hasTagNoticias=(tags["rtp-noticias"]=='true')?'true':'false';
+				}else{
+					subscriptionStatus.hasTagNoticias='false';
+				}
+				if ("rtp-play" in tags){
+					subscriptionStatus.hasTagPlay=(tags["rtp-play"]=='true')?'true':'false';
+				}else{
+					subscriptionStatus.hasTagPlay='false';
+				}
+			}else{
+				subscriptionStatus.hasTagNoticias='false';
+				subscriptionStatus.hasTagPlay='false';
+			}
+		})
+		.catch(e => {
+			subscriptionStatus.hasTagPlay=false;
+			subscriptionStatus.hasTagNoticias=false;
+			console.error("Tags - Issue determining whether push is enabled:", e);
+		});	
+	}
+
+	/*
+	// getTagsUpdateLocalInfo();
+	function getTagsUpdateLocalInfo(){
+		console.log("getTagsUpdateLocalInfo");
+		OneSignal.push(["getTags", function(tags){		
+			console.log("getTagsUpdateLocalInfo - tags: ", tags);
+			subscriptionStatus.hasTagNoticias=(tags["rtp-noticias"]=='true')?'true':'false';
+			subscriptionStatus.hasTagPlay=(tags["rtp-play"]=='true')?'true':'false';
+			//showSegmentSubscriptionStatus();				
+		}]);
+	}
+	*/
+
+	//-- button  layout
+	function updateSubscriptionStatus(mode){
+						
+		Promise.all([
+			OneSignal.isPushNotificationsEnabled(),
+			OneSignal.getUserId()
+		])
+		.then(([isEnabled,userId]) => {
+			subscriptionStatus.isSubscribed = isEnabled;
+			subscriptionStatus.subscriptionId = userId;
+			if (isEnabled) { 
+				OneSignal.push(["getTags", function(tags){
+
+					if(tags[mainTag]=='true'){
+						if (mode=='read'){
+							showBellToUnsubscribe();	
+						}if (mode=='write'){
+							if (confirm(dialogToUnsubscribe)) {
+								unsubscribeFromSegment();
+							}
+						}
+					} else {
+						if (mode=='read'){
+							showBellToSubscribe();	
+						}if (mode=='write'){
+							if (confirm(dialogToSubscribe)) {
+								subscribeToSegment();
+							}
+						}
+					}
+				}]);	
+			} else { 
+				if(mode=='read'){
+					showBellToSubscribe();					
+				}if (mode=='write'){
+					if (confirm(dialogToSubscribe)) {
+						subscribePushNotifications();
+					}
+				}
+			}	
+		})
+		.catch(e => {
+			console.error("Issue determining whether push is enabled:", e);
+		});
+	}
+
+	// init
+	function init(setupTags,setupMessages) {	
+		setSegmentTags(setupTags);
+		setSubscriptionMessages(setupMessages);
+		updateSubscriptionInfo();
+		updateSubscriptionStatus('read'); 
+		//getTagsUpdateLocalInfo();
+	}
+
+	// update bell
+	/*
+	function updateBell () {
+		getTagsPeriodicUpdate();
+	}
+	*/
+
+	// subscription change send tags
+	function subscriptionChangeSetTag() {
+
+		if (mainTag=="rtp-noticias"){
+			var tagsToSend = {'rtp-noticias': true};
+		}else if (mainTag=="rtp-play"){
+			var tagsToSend = {'rtp-play': true};
+		}
+
+		OneSignal.push(["sendTags",tagsToSend,function() {		
+			updateSubscriptionInfo();
+			showBellToUnsubscribe();
+
+			if (mainTag=="rtp-noticias"){
+				subscriptionStatus.hasTagNoticias='true';
+			}else if (mainTag=="rtp-play"){
+				subscriptionStatus.hasTagPlay='true';
+			}
+			//showSegmentSubscriptionStatus();
+		}]);
+	}
+
+	// subscription change remove tags
+	function subscriptionChangeResetTag() {
+		if (mainTag=="rtp-noticias"){
+			var tagsToSend = {'rtp-noticias': false};
+		}else if (mainTag=="rtp-play"){
+			var tagsToSend = {'rtp-play': false};
+		}
+		OneSignal.push(["sendTags",tagsToSend,function() {
+			updateSubscriptionInfo();
+			showBellToSubscribe();
+
+			if (mainTag=="rtp-noticias"){
+				subscriptionStatus.hasTagNoticias='false';
+			}else if (mainTag=="rtp-play"){
+				subscriptionStatus.hasTagPlay='false';
+			}
+			//showSegmentSubscriptionStatus();
+		}]);
+	}
+	//-- subscriber click
+	function subscriberClick(){
+		updateSubscriptionStatus('write'); 
+		updateSubscriptionInfo();
+		//getTagsUpdateLocalInfo();
+	}
+	
+	// getSubscriptionStatus
+	function getSubscriptionStatus(){
+		return subscriptionStatus;
+	}
+
+	//-- subscriptionChange
+	
+	function subscriptionChange(isSubscribed){
+		if (isSubscribed) {
+			OneSignal.push(["sendTags",{"rtp-noticias": true},function() {		
+				//OneSignalModule.subscriptionChangeSetTag();
+				console.log("OneSignal.on('subscriptionChange') - isSubscribed is true");
+				updateSubscriptionInfo();
+				showBellToUnsubscribe();
+			}]);
+		}else if (!isSubscribed) {
+			OneSignal.push(["sendTags",{"rtp-noticias": false},function() {
+				//OneSignalModule.subscriptionChangeResetTag();
+				console.log("OneSignal.on('subscriptionChange') - isSubscribed is false");
+				updateSubscriptionInfo();
+				showBellToSubscribe();
+			}]);
+		}else{
+			console.log("OneSignal.on('subscriptionChange') - isSubscribed is undefined");
+		}
+	}
+	
+
+	// setSegmentTags
+	function setSegmentTags(segmentTags) {
+		if (segmentTags===null || segmentTags===undefined) { segmentTags={}; return; }
+		mainTag = segmentTags.mainTag;
+		secondaryTag = segmentTags.secondaryTag;
+		return;
+	}
+
+	// setSubscriptionMessages
+	function setSubscriptionMessages(messages) {
+		if (messages===null || messages===undefined) { messages={}; return; }
+		dialogToSubscribe = messages.dialogToSubscribe;
+		dialogToUnsubscribe = messages.dialogToUnsubscribe;
+		dialogSubscribed = messages.dialogSubscribed;
+		dialogUnsubscribed = messages.dialogUnsubscribed;
+		return;
+	}
+
+	return{
+		init:init,
+		//updateBell:updateBell,
+		subscriptionChangeSetTag:subscriptionChangeSetTag,
+		subscriptionChangeResetTag:subscriptionChangeResetTag,
+		subscriberClick:subscriberClick,
+		subscribeSiteNotifications:subscribePushNotifications,
+		unsubscribeAllNotifications:unsubscribeAllNotifications,
+		getSubscriptionStatus:getSubscriptionStatus,
+		updateSubscriptionInfo:updateSubscriptionInfo,
+		subscriptionChange:subscriptionChange
+	}
+}();

@@ -1,0 +1,396 @@
+.rs_addtools,
+.rsbtn,
+div.rsbtn,
+div.rs_skip.rsbtn{
+    height: 39px !important;
+    box-sizing: border-box !important;
+    display: flex !important;
+    align-items: center !important;
+    margin-top: 20px !important;
+    margin-bottom: 20px !important;
+}
+
+.rs_addtools .rsbtn_tooltoggle,
+.rsbtn .rsbtn_tooltoggle,
+.rs_addtools .rsbtn_play,
+.rsbtn .rsbtn_play,
+.rsbtn .rsbtn_exp .rsbtn_exp_inner,
+.rs_addtools .rsbtn_toolpanel.vertical .rsbtn_tools,
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools,
+.rs-dialog-esque .rs-slider-label,
+.rs-dialog-slider-dropdown .rs-slider-label,
+.rsbtn .rs-slider-label,
+.slider-container .rs-slider-label,
+.rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_dropdown{
+    background: #fff !important;
+}
+
+.rs_addtools .rsbtn_play,
+.rsbtn .rsbtn_play{
+    border-radius: 50px !important;
+    height: 39px !important;
+}
+
+.rs_addtools .rsbtn_toolpanel.vertical .rsbtn_tools,
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools{
+    /* border: 0 !important; */
+}
+
+.rs_addtools .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool.active .rs_minitoggler::after,
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool.active .rs_minitoggler::after{
+    background-color: #a9bbc4 !important;
+}
+
+.rs_addtools .rsbtn_play,
+.rsbtn .rsbtn_play,
+.rsbtn .rsbtn_exp .rsbtn_exp_inner,
+.rs_addtools .rsbtn_tooltoggle,
+.rsbtn .rsbtn_tooltoggle{
+    border: 1px solid #a9bbc4 !important;
+}
+
+.rs_addtools a,
+.rs_addtools span,
+.rsbtn a,
+.rsbtn span{
+    color: #3E515C !important;
+}
+
+.rs_addtools .rsbtn_play .rsbtn_left .rsbtn_text::before,
+.rsbtn .rsbtn_play .rsbtn_left .rsbtn_text::before{
+    color: #3E515C !important;
+    line-height: 39px !important;
+    vertical-align: middle !important;
+}
+
+.rs_addtools .rsbtn_play .rsbtn_left .rsbtn_text span,
+.rsbtn .rsbtn_play .rsbtn_left .rsbtn_text span{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 14px !important;
+    line-height: 20px !important;
+    letter-spacing: -0.01em !important;
+    text-transform: uppercase !important;
+    color: #3E515C !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    vertical-align: middle !important;
+}
+
+.rs_addtools .rsbtn_play .rsbtn_left,
+.rsbtn .rsbtn_play .rsbtn_left{
+    display: inline-flex !important;
+    align-items: center !important;
+    height: 39px !important;
+    line-height: 39px !important;
+}
+
+.rs_addtools .rsbtn_play .rsbtn_right,
+.rsbtn .rsbtn_play .rsbtn_right{
+    display: inline-flex !important;
+    align-items: center !important;
+    height: 100% !important;
+}
+
+.rs_addtools .rsbtn_play,
+.rsbtn .rsbtn_play{
+    display: inline-flex !important;
+    align-items: center !important;
+}
+
+.rspopup .rspopup_btn::before,
+.rspopup .rspopup_btn::after{
+    color: #a9bbc4 !important;
+}
+
+.rspopup .rspopup_btn:hover::before,
+.rspopup .rspopup_btn:hover::after,
+.rspopup .rspopup_play:hover::after{
+    color: #fff !important;
+}
+
+.rsbtn .rsbtn_exp .rsbtn_exp_inner{
+    border-left: 0 !important;
+}
+
+.rsbtn .rsbtn_play:focus,
+.rsbtn .rsbtn_play:hover{
+    background: #637a85 !important;
+}
+
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool .rs_minitoggler{
+    background-color: #44565f !important;
+}
+
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool .rs_minitoggler::after{
+    background-color: #ffffff !important;
+}
+
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool span.rsbtn_btnlabel,
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool span.rsicn{
+    color: #637a85 !important;
+}
+
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool:hover{
+    background-color: #637a85 !important;
+}
+
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool:hover span.rsbtn_btnlabel,
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool:hover span.rsicn{
+    color: #fff !important;
+}
+
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li{
+    min-height: 3.5em !important;
+}
+
+.rsbtn .rsbtn_play:hover .rsbtn_left .rsbtn_text::before,
+.rsbtn .rsbtn_play:hover .rsbtn_left .rsbtn_text span,
+.rsbtn .rsbtn_play:hover .rsbtn_right::before{
+    color: #fff !important;
+}
+
+.rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_player_item:focus,
+.rs_addtools .rsbtn_play:focus,
+.rsbtn .rsbtn_play:focus{
+    background-color: #cfd7df !important;
+}
+
+#rsmpl_container .rs-player-loadindicator .rsbtn-loading,
+.rsbtn .rs-player-loadindicator .rsbtn-loading,
+#rsmpl_container .rs-player-loadindicator .rsbtn-progress,
+.rsbtn .rs-player-loadindicator .rsbtn-progress{
+    background: #1024ea !important;
+}
+
+.rs_addtools .rsbtn_play .rsbtn_left .rsbtn_text::after,
+.rsbtn .rsbtn_play .rsbtn_left .rsbtn_text::after{
+    color: #3E515C !important;
+    line-height: 39px !important;
+    height: 39px !important;
+    vertical-align: middle !important;
+}
+
+.rs_addtools .rsbtn_play .rsbtn_left .rsbtn_text,
+.rsbtn .rsbtn_play .rsbtn_left .rsbtn_text{
+    display: inline-flex !important;
+    align-items: center !important;
+    height: 39px !important;
+    line-height: 39px !important;
+}
+
+.rs_addtools .rsbtn_play .rsbtn_right,
+.rsbtn .rsbtn_play .rsbtn_right,
+.rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_player_item{
+    border-left: 1px solid #a9bbc4 !important;
+}
+
+.rsbtn_tooltoggle{
+    border-right: 1px solid #a9bbc4 !important;
+    border-bottom: 1px solid #a9bbc4 !important;
+}
+
+.rspopup{
+    border: 1px solid #a9bbc4 !important;
+    background: #fff !important;
+    color: #a9bbc4 !important;
+}
+
+.rspopup .rspopup_btn{
+    border-top: 1px solid #a9bbc4 !important;
+}
+
+.rspopup .rspopup_btn:hover{
+    background: #a9bbc4 !important;
+    color: #fff !important;
+}
+
+.rs_addtools .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool span.rsicn,
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool span.rsicn{
+    font-size: 15px !important;
+}
+
+.rs_addtools .rsbtn_play:hover .rsbtn_right::before{
+    color: #637a85 !important;
+}
+
+.rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_player_item:hover,
+.rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_player_item:focus,
+.rs_addtools .rsbtn_play:focus,
+.rsbtn .rsbtn_play:focus{
+    background: #637a85 !important;
+}
+
+.rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_player_item:hover .rsicn::before,
+.rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_player_item:focus span.rsicn{
+    color: #fff !important;
+}
+
+.rs_addtools .rsbtn_tooltoggle:focus,
+.rsbtn .rsbtn_tooltoggle:focus,
+.rs_addtools .rsbtn_tooltoggle:active,
+.rsbtn .rsbtn_tooltoggle:active,
+.rsbtn .rsbtn_tooltoggle:hover {
+    background: #637a85 !important;
+}
+
+.rs_addtools .rsbtn_tooltoggle:focus .rsicn::before,
+.rsbtn .rsbtn_tooltoggle:focus .rsicn::before,
+.rs_addtools .rsbtn_tooltoggle:active .rsicn::before,
+.rsbtn .rsbtn_tooltoggle:active .rsicn::before,
+.rsbtn .rsbtn_tooltoggle:hover .rsicn::before{
+    color: #fff !important;
+}
+
+#rsmpl_container .rs-player-loadindicator,
+.rsbtn .rs-player-loadindicator{
+    background: #e3e8eb !important;
+}
+
+#rs-controlpanel{
+    background: #fff !important;
+}
+
+#rs-controlpanel,
+#rs-controlpanel button{
+    border: 1px solid #a9bbc4 !important;
+    color: #a9bbc4 !important;
+}
+
+#rs-controlpanel .rsicn-logo::before,
+#rs-controlpanel .rsicn-logo::after{
+    color: #1024ea !important;
+}
+
+#rs-controlpanel button.rs-controlpanel-scroll-toggler.enabled span.rs-controlpanel-scroll-state,
+#rs-controlpanel button.rs-controlpanel-scroll-toggler:focus span.rs-controlpanel-scroll-state,
+#rs-controlpanel button.rs-controlpanel-scroll-toggler span.rs-controlpanel-scroll-state{
+    color: #637a85 !important;
+}
+
+#rs-controlpanel button:hover,
+#rs-controlpanel button:focus,
+#rs-controlpanel button:active{
+    background: #637a85 !important;
+}
+
+#rs-controlpanel button:hover.rs-controlpanel-scroll-toggler.enabled span.rs-controlpanel-scroll-state,
+#rs-controlpanel button:hover.rs-controlpanel-scroll-toggler:focus span.rs-controlpanel-scroll-state,
+#rs-controlpanel button:hover.rs-controlpanel-scroll-toggler span.rs-controlpanel-scroll-state{
+    color: #fff !important;
+}
+
+#rs-controlpanel button:hover .rsicn::before,
+#rs-controlpanel button:focus .rsicn::before,
+#rs-controlpanel button:active .rsicn::before,
+#rs-controlpanel button:hover .rs-controlpanel-scroll-label{
+    color: #fff !important;
+}
+
+.rs-dialog-grabbable button{
+    color: #AABBC7 !important;
+}
+
+#rs-dialog #rs-dialog-main>footer nav [role=button]:focus:not(.rs-dialog-resize),
+#rs-dialog #rs-dialog-main>footer nav button:focus:not(.rs-dialog-resize),
+#rs-dialog #rs-dialog-main>header nav [role=button]:focus:not(.rs-dialog-resize),
+#rs-dialog #rs-dialog-main>header nav button:focus:not(.rs-dialog-resize),
+#rs-dialog-fullscreen #rs-dialog-main>footer nav [role=button]:focus:not(.rs-dialog-resize),
+#rs-dialog-fullscreen #rs-dialog-main>footer nav button:focus:not(.rs-dialog-resize),
+#rs-dialog-fullscreen #rs-dialog-main>header nav [role=button]:focus:not(.rs-dialog-resize),
+#rs-dialog-fullscreen #rs-dialog-main>header nav button:focus:not(.rs-dialog-resize){
+    background-color: #637a85 !important;
+    border-color: #637a85 !important;
+}
+
+#rs-dialog #rs-dialog-main>footer nav [role=button]:hover,
+#rs-dialog #rs-dialog-main>footer nav button:hover,
+#rs-dialog #rs-dialog-main>footer nav [role=button]:active,
+#rs-dialog #rs-dialog-main>footer nav button:active,
+#rs-dialog #rs-dialog-main>header nav [role=button]:active,
+#rs-dialog #rs-dialog-main>header nav button:active,
+#rs-dialog-fullscreen #rs-dialog-main>footer nav [role=button]:active,
+#rs-dialog-fullscreen #rs-dialog-main>footer nav button:active,
+#rs-dialog-fullscreen #rs-dialog-main>header nav [role=button]:active,
+#rs-dialog-fullscreen #rs-dialog-main>header nav button:active {
+    background-color: #637a85 !important;
+}
+
+#rs-dialog #rs-dialog-main>footer nav [role=button]:hover::before,
+#rs-dialog #rs-dialog-main>footer nav button:hover::before,
+#rs-dialog #rs-dialog-main>footer nav [role=button]:active::before,
+#rs-dialog #rs-dialog-main>footer nav button:active::before,
+#rs-dialog #rs-dialog-main>header nav [role=button]:active::before,
+#rs-dialog #rs-dialog-main>header nav button:active::before,
+#rs-dialog-fullscreen #rs-dialog-main>footer nav [role=button]:active::before,
+#rs-dialog-fullscreen #rs-dialog-main>footer nav button:active::before,
+#rs-dialog-fullscreen #rs-dialog-main>header nav [role=button]:active::before,
+#rs-dialog-fullscreen #rs-dialog-main>header nav button:active::before,
+#rs-dialog #rs-dialog-main>footer nav [role=button]:focus:not(.rs-dialog-resize)::before,
+#rs-dialog #rs-dialog-main>footer nav button:focus:not(.rs-dialog-resize)::before,
+#rs-dialog #rs-dialog-main>header nav [role=button]:focus:not(.rs-dialog-resize)::before,
+#rs-dialog #rs-dialog-main>header nav button:focus:not(.rs-dialog-resize)::before,
+#rs-dialog-fullscreen #rs-dialog-main>footer nav [role=button]:focus:not(.rs-dialog-resize)::before,
+#rs-dialog-fullscreen #rs-dialog-main>footer nav button:focus:not(.rs-dialog-resize)::before,
+#rs-dialog-fullscreen #rs-dialog-main>header nav [role=button]:focus:not(.rs-dialog-resize)::before,
+#rs-dialog-fullscreen #rs-dialog-main>header nav button:focus:not(.rs-dialog-resize)::before,
+#rs-dialog #rs-dialog-main>footer nav button:hover{
+    color: #fff !important;
+}
+
+#rs-dialog #rs-dialog-main>header h1 .rsicn, #rs-dialog #rs-dialog-main>header h1 label,
+#rs-dialog-fullscreen #rs-dialog-main>header h1 .rsicn,
+#rs-dialog-fullscreen #rs-dialog-main>header h1 label,
+#rs-dialog #rs-dialog-main>header,
+#rs-dialog-fullscreen #rs-dialog-main>header{
+    text-shadow: none !important;
+    color: #637a85 !important;
+}
+
+.bg-black .rs_addtools .rsbtn_tooltoggle,
+.bg-black .rsbtn .rsbtn_tooltoggle,
+.bg-black .rs_addtools .rsbtn_play,
+.bg-black .rsbtn .rsbtn_play,
+.bg-black .rsbtn .rsbtn_exp .rsbtn_exp_inner,
+.bg-black .rs_addtools .rsbtn_toolpanel.vertical .rsbtn_tools,
+.bg-black .rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools,
+.bg-black .rs-dialog-esque .rs-slider-label,
+.bg-black .rs-dialog-slider-dropdown .rs-slider-label,
+.bg-black .rsbtn .rs-slider-label,
+.bg-black .slider-container .rs-slider-label,
+.bg-black .rsbtn .rsbtn_exp .rsbtn_exp_inner .rsbtn_dropdown{
+    background: #171D20 !important;
+}
+
+.bg-black .rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool span.rsbtn_btnlabel,
+.rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool span.rsicn{
+    color: #a9bbc4 !important;
+}
+
+.bg-black .rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool:hover span.rsbtn_btnlabel,
+.bg-black .rsbtn .rsbtn_toolpanel.vertical .rsbtn_tools .rsbtn_tools_inner .rsbtn_toolcontainer ul.rsbtn_toollist li button.rsbtn_tool span.rsicn{
+    color: #fff !important;
+}
+
+.bg-black #rs-controlpanel{
+    background: #171D20 !important;
+    box-shadow: 0 0 5px #1f1d1d !important;
+}
+
+/* Mobile: larger padding matching Figma, hide tooltoggle (List icon) */
+@media screen and (max-width: 768px) {
+    .rs_addtools .rsbtn_tooltoggle,
+    .rsbtn .rsbtn_tooltoggle{
+        display: none !important;
+    }
+
+    .rs_addtools .rsbtn_play .rsbtn_left,
+    .rsbtn .rsbtn_play .rsbtn_left{
+        padding: 12px 12px 12px 16px !important;
+    }
+
+    .rs_addtools .rsbtn_play .rsbtn_right,
+    .rsbtn .rsbtn_play .rsbtn_right{
+        padding: 12px 16px 12px 12px !important;
+    }
+}

@@ -1,0 +1,17 @@
+Angular
+Angular
+Source
+
+Angular is a TypeScript-first web framework for building fast, reliable applications. The modern toolchain (standalone components, signals, the @angular/build builder, zoneless change detection by default in v21+) keeps the framework current while preserving the structured, opinionated developer experience Angular is known for.
+
+Angular
+Official Resources
+Docs
+If you have other helpful links to share, or find any of the links above no longer work, please let us know.
+Todos
+
+Double-click to edit a todo
+
+Created by the TodoMVC Team
+
+Part of TodoMVC

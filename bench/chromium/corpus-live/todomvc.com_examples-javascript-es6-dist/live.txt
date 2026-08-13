@@ -1,0 +1,15 @@
+JavaScript ES6
+Example
+Source
+
+The ECMAScript 6 (ES2015) standard was ratified in 2015 following years of work standardizing improvements to ECMAScript 3. The committee introduced a wide variety of improvements such as arrow functions, const declarations, and native Promises.
+
+JavaScript ES6
+If you have other helpful links to share, or find any of the links above no longer work, please let us know.
+todos
+
+Double-click to edit a todo
+
+Created by the TodoMVC Team
+
+Part of TodoMVC

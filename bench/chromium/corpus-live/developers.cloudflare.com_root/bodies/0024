@@ -1,0 +1,1 @@
+var e=(e,t)=>{if(!window.zaraz){console.log(`zaraz.track:`,e,t);return}window.zaraz.track(e,t)};export{e as t};

@@ -1,0 +1,18 @@
+{
+  "code" : 0,
+  "ts" : 1786637155,
+  "templateContext" : {
+    "user_info" : {
+      "user_lang" : null,
+      "is_new_customer" : true,
+      "user" : "{\"uid\":\"anon\",\"email\":null,\"displayName\":null,\"valid\":false,\"firstName\":null,\"lastName\":null,\"emailConfirmed\":null,\"emailState\":\"UNCONFIRMED\",\"phoneNumberConfirmed\":null,\"confirmed\":false}",
+      "country_code" : "US",
+      "postal_code" : "95141",
+      "tax_support" : null
+    },
+    "experience_id" : "EX5RQ8UZIT2G",
+    "experience_action_id" : "showTemplate09JTPUZP673OYQ6",
+    "experience_execution_id" : "18077e00ec-000037vrrttktp5ig3oln58sbg",
+    "template_language" : "en_US"
+  }
+}

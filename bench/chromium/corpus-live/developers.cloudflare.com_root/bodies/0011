@@ -1,0 +1,1 @@
+import{a as e,i as t}from"./client.wBZpIm3M.js";function n(e){let n=e.querySelector(`[data-nb-collapsible-trigger]`),r=e.querySelector(`[data-nb-collapsible-content]`);if(!n||!r)return()=>{};let i=e.dataset.nbDefaultOpen===`true`,a=t({trigger:n,content:r,defaultOpen:i});return e.__nbDisclosure=a,()=>{delete e.__nbDisclosure,a.destroy()}}e(`[data-nb-collapsible]`,n);
