@@ -764,6 +764,159 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     }
 }
 
+/// Format version for overlay image cache. Bump when the build process
+/// changes in a way that invalidates previously-cached images.
+/// v2: host-side cleanup of podman state files before ext4 packaging
+const OVERLAY_CACHE_VERSION: u32 = 2;
+
+/// The content-addressed cache path the image-delivery disk for `digest` lands
+/// at once built. Purely computed — existence is the caller's question to ask.
+fn expected_image_disk_path(digest: &str, mode: crate::firecracker::ImageMode) -> PathBuf {
+    let cache_dir = paths::image_cache_dir().join(digest);
+    match mode {
+        crate::firecracker::ImageMode::Overlay => PathBuf::from(format!(
+            "{}.storage-v{}.img",
+            cache_dir.display(),
+            OVERLAY_CACHE_VERSION
+        )),
+        crate::firecracker::ImageMode::Btrfs | crate::firecracker::ImageMode::Archive => {
+            cache_dir.with_extension("docker.tar")
+        }
+    }
+}
+
+/// Export a localhost/ image and build its delivery disk (overlay storage
+/// image, or the Docker archive itself for btrfs/archive modes), reusing the
+/// content-addressed cache when it already holds a valid artifact.
+///
+/// Runs BEFORE snapshot-key computation: the returned file's build identity is
+/// part of the snapshot key (see `FirecrackerConfig::image_disk_identity`).
+async fn export_localhost_image_disk(
+    args: &RunArgs,
+    image_identifier: &str,
+    localhost_image_id: Option<&str>,
+) -> Result<PathBuf> {
+    // Reuse the digest resolved by get_image_cache_ref (already stripped of the
+    // "sha256:" prefix). Using the same inspect result for the snapshot key and
+    // the export cache prevents a tag rebuilt in between from being exported
+    // under a digest that no longer matches the snapshot key.
+    let digest = image_identifier.to_string();
+
+    // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
+    let image_cache_dir = paths::image_cache_dir();
+    tokio::fs::create_dir_all(&image_cache_dir)
+        .await
+        .context("creating image-cache directory")?;
+
+    let cache_dir = image_cache_dir.join(&digest);
+
+    // Lock per-digest to prevent concurrent exports of the same image
+    let lock_path = image_cache_dir.join(format!("{}.lock", &digest));
+    let lock_file = std::fs::File::create(&lock_path).context("creating image cache lock file")?;
+    lock_file
+        .lock_exclusive()
+        .context("acquiring image cache lock")?;
+
+    // Check if already cached (inside lock to prevent race)
+    // Use Docker archive format (preserves HEALTHCHECK, single tar file) for FUSE transfer
+    let archive_path = cache_dir.with_extension("docker.tar");
+    let needs_export = if !archive_path.exists() {
+        true
+    } else {
+        // A cached archive that fails validation — whether it parses cleanly but is
+        // missing manifest.json (Ok(false)) or is structurally corrupt and can't be
+        // parsed at all (Err) — is removed and re-exported. Only the freshly exported
+        // archive below treats a validation error as fatal.
+        match validate_docker_archive(&archive_path) {
+            Ok(true) => {
+                info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+                false
+            }
+            Ok(false) => {
+                warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
+                let _ = tokio::fs::remove_file(&archive_path).await;
+                true
+            }
+            Err(e) => {
+                warn!(path = %archive_path.display(), error = %e, "Cached archive is unreadable, re-exporting");
+                let _ = tokio::fs::remove_file(&archive_path).await;
+                true
+            }
+        }
+    };
+
+    if needs_export {
+        info!(image = %args.image, digest = %digest, "Exporting localhost image as Docker archive");
+
+        // Export into a UUID-keyed temp, then atomically rename. This avoids corrupt
+        // archives from interrupted exports AND is safe under cross-VM concurrency: the
+        // image-cache dir is shared across VMs and the per-digest flock above does not
+        // coordinate cross-VM (see image::unique_cache_tmp). A shared "<digest>.tmp"
+        // would let one VM's rename ENOENT the other's in-flight export.
+        let tmp_path = image::unique_cache_tmp(&archive_path);
+
+        // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
+        // tag (#598). A parallel build can repoint the tag between the cache-key
+        // inspect and this export; `podman save <tag>` would then archive the newer
+        // build under the older digest's cache entry. export_image_archive pins the
+        // exact content the cache key names and writes the original repo tag into the
+        // archive's RepoTags, so the guest still loads and runs it by name.
+        let image_id = localhost_image_id.ok_or_else(|| {
+            anyhow::anyhow!("internal: localhost image id was not captured at inspect time")
+        })?;
+        if let Err(e) = image::export_image_archive(image_id, &args.image, &tmp_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            drop(lock_file);
+            return Err(e);
+        }
+
+        // Atomic rename within the same filesystem
+        if let Err(e) = tokio::fs::rename(&tmp_path, &archive_path).await {
+            // Clean up the UUID-keyed temp — unlike the old fixed-name temp, a UUID
+            // orphan is never overwritten by the next run.
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e).context("renaming exported archive to final path");
+        }
+
+        info!(path = %archive_path.display(), "Image exported as Docker archive");
+    }
+
+    let resolved_image_mode = resolve_image_mode(args);
+    info!(image = %args.image, digest = %digest, mode = %resolved_image_mode, "Image delivery mode");
+
+    let disk_path = match resolved_image_mode {
+        crate::firecracker::ImageMode::Overlay => {
+            // Pre-built overlay storage: ext4 image with podman storage.
+            // Guest mounts this as additionalImageStore — no podman load needed.
+            let storage_img_path =
+                expected_image_disk_path(&digest, crate::firecracker::ImageMode::Overlay);
+            if !storage_img_path.exists() {
+                info!(image = %args.image, digest = %digest, "Building overlay storage image");
+                build_storage_image(&archive_path, &storage_img_path).await?;
+            } else {
+                info!(image = %args.image, digest = %digest, "Using cached overlay storage image");
+            }
+            storage_img_path
+        }
+        crate::firecracker::ImageMode::Btrfs => {
+            // VM-side btrfs loading: attach Docker archive as read-only block device.
+            // fc-agent creates btrfs loopback on rootfs and runs `podman load` from
+            // the archive device into the btrfs storage.
+            archive_path.clone()
+        }
+        crate::firecracker::ImageMode::Archive => {
+            // Docker archive: attach as raw block device.
+            // fc-agent reads docker-archive:/dev/vdX via podman load at boot.
+            archive_path
+        }
+    };
+
+    // Lock released when lock_file is dropped
+    drop(lock_file);
+
+    Ok(disk_path)
+}
+
 async fn prepare_vm_for_lifecycle(
     mut args: RunArgs,
     lifecycle: PodmanLifecycle,
@@ -953,6 +1106,55 @@ async fn prepare_vm_for_lifecycle(
         (image_ref.cache_key, image_ref.image_id)
     };
 
+    // Resolve the image-delivery disk BEFORE computing the snapshot key. The
+    // pre-start snapshot provisions the container against the layer link IDs
+    // inside one specific build of the storage image, and `podman load`
+    // randomizes those IDs on every build — so a rebuilt storage image
+    // invalidates every snapshot provisioned against its predecessor. The
+    // disk's file identity is therefore part of the snapshot key (2026-08-13:
+    // a cached pre-start snapshot paired with a rebuilt storage image failed
+    // every localhost run with "readlink .../overlay/l/<id>: no such file or
+    // directory").
+    //
+    // A disk-only clone never attaches an image device — the image already
+    // lives in the captured container storage on the reflinked rootfs — so
+    // skip export (and don't require the original host image tag to still
+    // exist). None for registry-pulled images.
+    let image_disk_path: Option<PathBuf> = if args.image.starts_with("localhost/")
+        && args.rootfs_override.is_none()
+    {
+        let resolved_mode = resolve_image_mode(&args);
+        let expected = expected_image_disk_path(&image_identifier, resolved_mode);
+        if resolved_mode == crate::firecracker::ImageMode::Overlay && expected.exists() {
+            // Warm-cache fast path: stat-only, preserves clone hot-path
+            // latency. Non-overlay modes attach the archive itself and keep
+            // the full path for its validation/re-export logic.
+            info!(image = %args.image, digest = %image_identifier, "Using cached overlay storage image");
+            Some(expected)
+        } else {
+            Some(
+                export_localhost_image_disk(
+                    &args,
+                    &image_identifier,
+                    localhost_image_id.as_deref(),
+                )
+                .await?,
+            )
+        }
+    } else {
+        args.image_disk_override.clone()
+    };
+
+    // Build identity (inode/size/mtime) of the exact file that will be
+    // attached; a rebuild at the same path is a different identity.
+    let image_disk_identity = image_disk_path
+        .as_deref()
+        .map(|p| {
+            image::file_identity(p)
+                .with_context(|| format!("stat image disk {} for snapshot key", p.display()))
+        })
+        .transpose()?;
+
     // Check for snapshot cache (unless the invocation opts out — see
     // snapshot_cache_opt_out for the full list and rationale).
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
@@ -978,6 +1180,7 @@ async fn prepare_vm_for_lifecycle(
             cmd_args.clone(),
             resolved_mode,
             runtime_config.firecracker_bin.as_deref(),
+            image_disk_identity.clone(),
         );
         let key = config.snapshot_key();
 
@@ -1121,147 +1324,6 @@ async fn prepare_vm_for_lifecycle(
         .map(|s| VolumeMapping::parse(s))
         .collect::<Result<Vec<_>>>()
         .context("parsing volume mappings")?;
-
-    // For localhost/ images, export as OCI archive for direct podman run
-    // Uses content-addressable cache to avoid re-exporting the same image.
-    // A disk-only clone never attaches an image device — the image already lives
-    // in the captured container storage on the reflinked rootfs — so skip export
-    // (and don't require the original host image tag to still exist).
-    let image_disk_path = if args.image.starts_with("localhost/") && args.rootfs_override.is_none()
-    {
-        // Reuse the digest resolved by get_image_identifier above (already stripped of
-        // the "sha256:" prefix). Using the same inspect result for the snapshot key and
-        // the export cache prevents a tag rebuilt in between from being exported under
-        // a digest that no longer matches the snapshot key.
-        let digest = image_identifier.clone();
-
-        // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
-        let image_cache_dir = paths::image_cache_dir();
-        tokio::fs::create_dir_all(&image_cache_dir)
-            .await
-            .context("creating image-cache directory")?;
-
-        let cache_dir = image_cache_dir.join(&digest);
-
-        // Lock per-digest to prevent concurrent exports of the same image
-        let lock_path = image_cache_dir.join(format!("{}.lock", &digest));
-        let lock_file =
-            std::fs::File::create(&lock_path).context("creating image cache lock file")?;
-        lock_file
-            .lock_exclusive()
-            .context("acquiring image cache lock")?;
-
-        // Check if already cached (inside lock to prevent race)
-        // Use Docker archive format (preserves HEALTHCHECK, single tar file) for FUSE transfer
-        let archive_path = cache_dir.with_extension("docker.tar");
-        let needs_export = if !archive_path.exists() {
-            true
-        } else {
-            // A cached archive that fails validation — whether it parses cleanly but is
-            // missing manifest.json (Ok(false)) or is structurally corrupt and can't be
-            // parsed at all (Err) — is removed and re-exported. Only the freshly exported
-            // archive below treats a validation error as fatal.
-            match validate_docker_archive(&archive_path) {
-                Ok(true) => {
-                    info!(image = %args.image, digest = %digest, "Using cached Docker archive");
-                    false
-                }
-                Ok(false) => {
-                    warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
-                    let _ = tokio::fs::remove_file(&archive_path).await;
-                    true
-                }
-                Err(e) => {
-                    warn!(path = %archive_path.display(), error = %e, "Cached archive is unreadable, re-exporting");
-                    let _ = tokio::fs::remove_file(&archive_path).await;
-                    true
-                }
-            }
-        };
-
-        if needs_export {
-            info!(image = %args.image, digest = %digest, "Exporting localhost image as Docker archive");
-
-            // Export into a UUID-keyed temp, then atomically rename. This avoids corrupt
-            // archives from interrupted exports AND is safe under cross-VM concurrency: the
-            // image-cache dir is shared across VMs and the per-digest flock above does not
-            // coordinate cross-VM (see image::unique_cache_tmp). A shared "<digest>.tmp"
-            // would let one VM's rename ENOENT the other's in-flight export.
-            let tmp_path = image::unique_cache_tmp(&archive_path);
-
-            // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
-            // tag (#598). A parallel build can repoint the tag between the cache-key
-            // inspect and this export; `podman save <tag>` would then archive the newer
-            // build under the older digest's cache entry. export_image_archive pins the
-            // exact content the cache key names and writes the original repo tag into the
-            // archive's RepoTags, so the guest still loads and runs it by name.
-            let image_id = localhost_image_id.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("internal: localhost image id was not captured at inspect time")
-            })?;
-            if let Err(e) = image::export_image_archive(image_id, &args.image, &tmp_path).await {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                drop(lock_file);
-                return Err(e);
-            }
-
-            // Atomic rename within the same filesystem
-            if let Err(e) = tokio::fs::rename(&tmp_path, &archive_path).await {
-                // Clean up the UUID-keyed temp — unlike the old fixed-name temp, a UUID
-                // orphan is never overwritten by the next run.
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(e).context("renaming exported archive to final path");
-            }
-
-            info!(path = %archive_path.display(), "Image exported as Docker archive");
-        }
-
-        let resolved_image_mode = resolve_image_mode(&args);
-        info!(image = %args.image, digest = %digest, mode = %resolved_image_mode, "Image delivery mode");
-
-        let disk_path = match resolved_image_mode {
-            crate::firecracker::ImageMode::Overlay => {
-                // Pre-built overlay storage: ext4 image with podman storage.
-                // Guest mounts this as additionalImageStore — no podman load needed.
-                // Format version for overlay image cache. Bump when the build process
-                // changes in a way that invalidates previously-cached images.
-                // v2: host-side cleanup of podman state files before ext4 packaging
-                const OVERLAY_CACHE_VERSION: u32 = 2;
-                let storage_img_path = PathBuf::from(format!(
-                    "{}.storage-v{}.img",
-                    cache_dir.display(),
-                    OVERLAY_CACHE_VERSION
-                ));
-                if !storage_img_path.exists() {
-                    info!(image = %args.image, digest = %digest, "Building overlay storage image");
-                    build_storage_image(&archive_path, &storage_img_path).await?;
-                } else {
-                    info!(image = %args.image, digest = %digest, "Using cached overlay storage image");
-                }
-                storage_img_path
-            }
-            crate::firecracker::ImageMode::Btrfs => {
-                // VM-side btrfs loading: attach Docker archive as read-only block device.
-                // fc-agent creates btrfs loopback on rootfs and runs `podman load` from
-                // the archive device into the btrfs storage.
-                archive_path.clone()
-            }
-            crate::firecracker::ImageMode::Archive => {
-                // Docker archive: attach as raw block device.
-                // fc-agent reads docker-archive:/dev/vdX via podman load at boot.
-                archive_path
-            }
-        };
-
-        // Lock released when lock_file is dropped
-        drop(lock_file);
-
-        Some(disk_path)
-    } else {
-        // Disk-only clone of an overlay/archive-mode VM: re-attach the recorded
-        // image device (content-addressed cache file) so the captured container's
-        // image layers stay reachable. None for registry-pulled images.
-        args.image_disk_override.clone()
-    };
 
     if !volume_mappings.is_empty() {
         info!(

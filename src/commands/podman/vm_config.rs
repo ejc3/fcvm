@@ -1030,6 +1030,9 @@ pub(crate) fn build_launch_config(
         // Cache-key isolation for guest failpoints (see field docs): the spec is
         // forwarded to the guest by build_runtime_boot_args from the same env var.
         guest_failpoint: std::env::var("FCVM_GUEST_FAILPOINT").ok(),
+        // Launch-only config: never hashed into a snapshot key, so the image
+        // disk's build identity is not resolved here.
+        image_disk_identity: None,
     }
 }
 

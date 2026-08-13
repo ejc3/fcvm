@@ -24,6 +24,27 @@ pub(super) fn unique_cache_tmp(final_path: &Path) -> PathBuf {
     ))
 }
 
+/// Build identity of a cached image-delivery artifact: inode, size, and mtime.
+///
+/// The content-addressed cache path names the IMAGE the artifact was built
+/// from, not the build itself — and `podman load` randomizes overlay layer
+/// link IDs on every build, so two builds of the same digest are NOT
+/// interchangeable once a snapshot has provisioned a container against one of
+/// them. Atomic-rename installation (see `unique_cache_tmp`) means a rebuild
+/// always produces a new inode, so this triple distinguishes builds cheaply
+/// (one stat) without hashing multi-hundred-MB files.
+pub(super) fn file_identity(path: &Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path)?;
+    Ok(format!(
+        "{}:{}:{}.{:09}",
+        md.ino(),
+        md.size(),
+        md.mtime(),
+        md.mtime_nsec()
+    ))
+}
+
 /// Remove podman state files from a storage root, keeping only image/layer data.
 ///
 /// `podman load` creates state files (db.sql, storage.lock, libpod/, etc.) that
