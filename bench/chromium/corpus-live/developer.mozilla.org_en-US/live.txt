@@ -1,0 +1,132 @@
+Skip to main content
+Skip to search
+HTML
+CSS
+JavaScript
+Web APIs
+All
+Learn
+Tools
+About
+Blog
+MDN
+Resources for Developers,
+by Developers 
+
+Documenting CSS, HTML, and JavaScript, since 2005.
+
+   / / / / / / / / / / / /    / / / / / / / / / / / /    / / / / / / / / / / / /    / / / / / / / / / / / /    / / / / / / / / / / / /    / / / / / / / / / / / /    / / / / / / / / / / / /
+  + + + + + +   + + + + + +   + + + + + +   + + + + + +   + + + + + +   + + + + + +   + + + + + +
+{ { { {  } } } }   { { { {  } } } }   { { { {  } } } }   { { { {  } } } }   { { { {  } } } }   { { { {  } } } }  
+   ../../    ../../    ../../    ../../    ../../    ../../    ../../
+<> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </> <> </>
+Featured articles
+Blog
+Celebrating 20 years of MDN
+
+MDN turns 20! Let's look at how we started, how MDN became the most trusted resource for web developers, the impact it's had on the open web, and yes, there's cake, too.
+
+Web APIs
+Navigation API
+
+The Navigation API provides the ability to initiate, intercept, and manage browser navigation actions. It can also examine an application's history entries. This is a successor to previous web platform features such as the History API and window.location, which solves their shortcomings and is specifically aimed at the needs of single-page applications (SPAs).
+
+Web APIs
+Trusted Types API
+
+The Trusted Types API gives web developers a way to ensure that input has been passed through a user-specified transformation function before being passed to an API that might execute that input. This can help to protect against client-side cross-site scripting (XSS) attacks. Most commonly the transformation function sanitizes the input.
+
+CSS
+Using CSS anchor positioning
+
+The CSS anchor positioning module defines features that allow you to tether elements together. Elements can be defined as anchor elements and anchor-positioned elements. Anchor-positioned elements can be bound to anchor elements. The anchor-positioned elements can then have their size and position set relative to the size and location of the anchor elements to which they are bound.
+
+Latest news
+developer.mozilla.org
+Introducing the MDN MCP server
+2 months ago
+
+MDN's MCP server brings MDN's documentation and browser compatibility data directly into your editor or IDE, giving your LLM or coding agent access to accurate, up-to-date web platform information.
+
+developer.mozilla.org
+Under the hood of MDN's new frontend
+4 months ago
+
+You may have spotted that MDN has a new frontend. There's plenty happening under the surface, so let's unpack the technologies we chose, the architectural decisions we made, and why we did a rebuild at all.
+
+developer.mozilla.org
+Image formats: Codecs and compression tools
+9 months ago
+
+Image compression involves countless trade-offs between quality, size, and speed. In this final part of the series, we experiment with codecs, metrics, and tools to find practical ways to balance efficiency and visual fidelity.
+
+developer.mozilla.org
+A beginner-friendly guide to view transitions in CSS
+10 months ago
+
+Learn how to bring smooth, animated navigation to multi-page apps with view transitions. With just one line of CSS, you can enable seamless transitions between pages.
+
+Recent contributions
+mdn/content
+10 hours ago
+Add Soft Navigation docs
+mdn/content
+8 hours ago
+fix(css): clarify wbr line breaking behavior
+mdn/content
+6 hours ago
+Clarify texture mapping in Texel glossary
+mdn/content
+5 hours ago
+Avoid using the same id as tag name without visible HTML
+mdn/translated-content
+3 hours ago
+chore(fr): translation of `Web/Security/Attacks/IDOR`
+mdn/translated-content
+3 hours ago
+chore(fr): translation of `Web/Security/Attacks/MITM`
+mdn/translated-content
+3 hours ago
+[es] Update What_is_a_domain_name translation
+mdn/translated-content
+3 hours ago
+chore(fr): translation of `Web/Security/Attacks/Phishing`
+mdn/translated-content
+3 hours ago
+[es] Sincronizar Learn_web_development/Core/Text_styling/Fundamentals
+mdn/content
+2 hours ago
+add accessibility section for CSS Custom Highlight API
+Contributor Spotlight
+SHRINIVASS ARUNACHALAM BALASUBRAMANIAN
+MDN closely follows W3C standards which helps me keep up with important topics. It's a complete package as it caters to everything; complex APIs, new browser functionalities, and best practices. MDN serves as a truly valuable resource and continues to assist me in my everyday development.
+Get involved
+
+Your blueprint for a better internet.
+
+MDN
+About
+Blog
+Mozilla careers
+Advertise with us
+MDN Plus
+Product help
+Contribute
+MDN Community
+Community resources
+Writing guidelines
+MDN Discord
+MDN on GitHub
+Developers
+Web technologies
+Learn web development
+Guides
+Tutorials
+Glossary
+Hacks blog
+Website Privacy Notice
+Telemetry Settings
+Legal
+Community Participation Guidelines
+
+Portions of this content are ©1998–2026 by individual mozilla.org contributors. Content available under a Creative Commons license.

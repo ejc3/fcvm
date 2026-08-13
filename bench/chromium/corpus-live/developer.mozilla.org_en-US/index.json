@@ -1,0 +1,456 @@
+{
+ "url": "https://developer.mozilla.org/en-US/",
+ "captured_utc": "2026-08-13T16:05:52Z",
+ "resources": {
+  "https://developer.mozilla.org/static/client/styles-homepage-header.da8a69fafe1cfb00.css": {
+   "file": "bodies/0000",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 522
+  },
+  "https://developer.mozilla.org/en-US/": {
+   "file": "bodies/0001",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 121326
+  },
+  "https://developer.mozilla.org/static/client/styles-global.c2608c3dabc11098.css": {
+   "file": "bodies/0002",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 25048
+  },
+  "https://developer.mozilla.org/static/client/styles-homepage.0980eec27925cc11.css": {
+   "file": "bodies/0003",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 381
+  },
+  "https://developer.mozilla.org/static/client/styles-homepage-hero.61cf31e2c2f1b72c.css": {
+   "file": "bodies/0004",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 751
+  },
+  "https://developer.mozilla.org/static/client/styles-mandala.8fbfeb0567dbde40.css": {
+   "file": "bodies/0005",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 495
+  },
+  "https://developer.mozilla.org/static/client/styles-homepage-body.22274e9a4a78b7ae.css": {
+   "file": "bodies/0006",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 136
+  },
+  "https://developer.mozilla.org/static/client/styles-featured-articles.770034368883a9ae.css": {
+   "file": "bodies/0007",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 1406
+  },
+  "https://developer.mozilla.org/static/client/styles-latest-news.4e8f60fdbf19d588.css": {
+   "file": "bodies/0008",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 1564
+  },
+  "https://developer.mozilla.org/static/client/styles-recent-contributions.ddcab7ad78446b98.css": {
+   "file": "bodies/0009",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 999
+  },
+  "https://developer.mozilla.org/static/client/styles-homepage-footer.5d6588cf8c9b4dc6.css": {
+   "file": "bodies/0010",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 140
+  },
+  "https://developer.mozilla.org/static/client/styles-page-layout.5a4354f33e894319.css": {
+   "file": "bodies/0011",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 718
+  },
+  "https://developer.mozilla.org/static/client/styles-breadcrumbs.87eb742f4e711dc3.css": {
+   "file": "bodies/0012",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 859
+  },
+  "https://developer.mozilla.org/static/client/runtime.eff609ca98e58bcb.js": {
+   "file": "bodies/0013",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 19633
+  },
+  "https://developer.mozilla.org/static/client/5909.489e266d049aa182.js": {
+   "file": "bodies/0014",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 23977
+  },
+  "https://developer.mozilla.org/static/client/4585.c86502bf8c0611c2.js": {
+   "file": "bodies/0015",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 78959
+  },
+  "https://developer.mozilla.org/static/client/index.f1e3bac4165e0bf9.js": {
+   "file": "bodies/0016",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 45320
+  },
+  "https://developer.mozilla.org/static/client/3391.743690721cc78406.css": {
+   "file": "bodies/0017",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 8168
+  },
+  "https://developer.mozilla.org/static/client/styles-homepage-contributor-spotlight.9d9b306c201f94e2.css": {
+   "file": "bodies/0018",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 1565
+  },
+  "https://developer.mozilla.org/static/client/styles-a11y-menu.5796ee87cb69f93f.css": {
+   "file": "bodies/0019",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 548
+  },
+  "https://developer.mozilla.org/static/client/styles-navigation.c3ebf384e65df345.css": {
+   "file": "bodies/0020",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 1987
+  },
+  "https://developer.mozilla.org/static/client/styles-logo.aea5ff6edf1b9cfb.css": {
+   "file": "bodies/0021",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 478
+  },
+  "https://developer.mozilla.org/static/client/styles-menu.e2c5c8a53a8854c2.css": {
+   "file": "bodies/0022",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 5013
+  },
+  "https://developer.mozilla.org/static/client/styles-breadcrumbs-bar.9a51a3c76a6231d0.css": {
+   "file": "bodies/0023",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 1337
+  },
+  "https://developer.mozilla.org/static/client/jetbrains-mono-latin.119994ed445212c7.woff2": {
+   "file": "bodies/0024",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 28416
+  },
+  "https://developer.mozilla.org/static/client/styles-footer.66072dd619a4ef50.css": {
+   "file": "bodies/0025",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 3116
+  },
+  "https://developer.mozilla.org/static/client/inter-latin.9a3b1bc220d426ef.woff2": {
+   "file": "bodies/0026",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 105484
+  },
+  "https://developer.mozilla.org/static/client/chevron-down.7c923b7054da305b.svg": {
+   "file": "bodies/0027",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 211
+  },
+  "https://developer.mozilla.org/static/client/github.4d94e1bf436aa7ed.svg": {
+   "file": "bodies/0028",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 581
+  },
+  "https://developer.mozilla.org/static/ssr/languages.dcba936080e5be86.svg": {
+   "file": "bodies/0029",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 255
+  },
+  "https://developer.mozilla.org/static/ssr/search.5dd31cbeea7d1af9.svg": {
+   "file": "bodies/0030",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 246
+  },
+  "https://developer.mozilla.org/static/client/external-link.4f3a2dc8e402cae5.svg": {
+   "file": "bodies/0031",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 275
+  },
+  "https://developer.mozilla.org/static/client/bluesky.a9421882d093c829.svg": {
+   "file": "bodies/0032",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 478
+  },
+  "https://developer.mozilla.org/static/client/wrench.a3caa7312a364b47.svg": {
+   "file": "bodies/0033",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 351
+  },
+  "https://developer.mozilla.org/static/client/quote.894340f7e3ad2575.svg": {
+   "file": "bodies/0034",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 367
+  },
+  "https://developer.mozilla.org/static/ssr/contrast.d86e85c43de8dee8.svg": {
+   "file": "bodies/0035",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 253
+  },
+  "https://developer.mozilla.org/static/client/graduation-cap.c7aa0f3430c53718.svg": {
+   "file": "bodies/0036",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 367
+  },
+  "https://developer.mozilla.org/static/client/x.4c7e68bf52af030a.svg": {
+   "file": "bodies/0037",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 247
+  },
+  "https://developer.mozilla.org/static/client/rss.37214526d7308d0c.svg": {
+   "file": "bodies/0038",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 270
+  },
+  "https://developer.mozilla.org/static/client/mastodon.1a5c0fde8353f680.svg": {
+   "file": "bodies/0039",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 888
+  },
+  "https://developer.mozilla.org/static/client/inter-italic-latin.fd2627ec16333c05.woff2": {
+   "file": "bodies/0040",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 115932
+  },
+  "https://developer.mozilla.org/manifest.json": {
+   "file": "bodies/0041",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 381
+  },
+  "https://developer.mozilla.org/static/client/7489.cd806d2f427a883d.js": {
+   "file": "bodies/0042",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 2054
+  },
+  "https://developer.mozilla.org/static/client/3708.4a0422a33ccb46ea.js": {
+   "file": "bodies/0043",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 1103
+  },
+  "https://developer.mozilla.org/static/client/8280.d23400460d00c14a.js": {
+   "file": "bodies/0044",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 2897
+  },
+  "https://developer.mozilla.org/static/client/1477.2e21275901ede190.js": {
+   "file": "bodies/0045",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 1119
+  },
+  "https://developer.mozilla.org/static/client/9204.06e7b2d605d4fb56.js": {
+   "file": "bodies/0046",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 10936
+  },
+  "https://developer.mozilla.org/static/client/3690.aff41e46ab46802b.js": {
+   "file": "bodies/0047",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 2042
+  },
+  "https://developer.mozilla.org/static/client/4759.79d81ac789157be7.js": {
+   "file": "bodies/0048",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 3841
+  },
+  "https://developer.mozilla.org/static/client/4249.f72e3bc533441dbe.js": {
+   "file": "bodies/0049",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 1724
+  },
+  "https://developer.mozilla.org/static/client/9099.d5fd55aa8af08e99.js": {
+   "file": "bodies/0050",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 1963
+  },
+  "https://developer.mozilla.org/static/client/9647.28b4240dbab81568.js": {
+   "file": "bodies/0051",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 667
+  },
+  "https://developer.mozilla.org/static/client/3711.4e1b6f9388a8f55f.js": {
+   "file": "bodies/0052",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 6349
+  },
+  "https://developer.mozilla.org/static/client/5542.1e868b3ebf533fa2.js": {
+   "file": "bodies/0053",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 5038
+  },
+  "https://developer.mozilla.org/static/client/8926.d515e53005c98927.js": {
+   "file": "bodies/0054",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 722
+  },
+  "https://developer.mozilla.org/static/client/7678.aef92a055a338198.js": {
+   "file": "bodies/0055",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 1856
+  },
+  "https://developer.mozilla.org/static/client/4060.e43b50f9730edd74.js": {
+   "file": "bodies/0056",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 3846
+  },
+  "https://developer.mozilla.org/static/client/2868.72600e71ae8128fe.js": {
+   "file": "bodies/0057",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 2225
+  },
+  "https://developer.mozilla.org/static/client/8121.43c3f18174bc4a4a.js": {
+   "file": "bodies/0058",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 668
+  },
+  "https://developer.mozilla.org/static/client/1996.e833c07cb4ee4327.js": {
+   "file": "bodies/0059",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 5973
+  },
+  "https://incoming.telemetry.mozilla.org/submit/mdn-fred/events/1/4908d956-540e-4123-8f5b-749337ae5354": {
+   "file": "bodies/0060",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://developer.mozilla.org/favicon.svg": {
+   "file": "bodies/0061",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 536
+  },
+  "https://developer.mozilla.org/favicon-192x192.png": {
+   "file": "bodies/0062",
+   "status": 200,
+   "mime": "image/png",
+   "bytes": 2171
+  },
+  "https://developer.mozilla.org/api/v1/whoami": {
+   "file": "bodies/0063",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 187
+  },
+  "https://incoming.telemetry.mozilla.org/submit/mdn-fred/events/1/1fd0e92e-9e35-4bfc-b2a5-0e3c79478147": {
+   "file": "bodies/0064",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://developer.mozilla.org/pong/get": {
+   "file": "bodies/0065",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 2848
+  },
+  "https://developer.mozilla.org/pimg/aHR0cHM6Ly9zdGF0aWM0LmJ1eXNlbGxhZHMubmV0L3V1LzIvMTc2NDc2LzE3ODUzNjI1MzctMTczNjI4MDkxOS1Nb25nb0RCX1NsYXRlQmx1ZV9yZXNpemVkLnBuZw%3D%3D.vVouDRnZ23BeXYRNeEbmPUv3rSGiYGrW89X1hN1WGMc%3D": {
+   "file": "bodies/0066",
+   "status": 200,
+   "mime": "image/png",
+   "bytes": 3347
+  },
+  "https://developer.mozilla.org/pimg/aHR0cHM6Ly9zdGF0aWM0LmJ1eXNlbGxhZHMubmV0L3V1LzIvMTc2NDc2LzE3ODUzNjIxNDYtTUROXy1fQUlSZXZvbHV0aW9uLUxpZ2h0LTE5NDB4NTAwLnBuZw%3D%3D.6gKcSsQopcZykC9ZyRrYP1G802I%2FIgfnqGww9IqLeK0%3D": {
+   "file": "bodies/0067",
+   "status": 200,
+   "mime": "image/png",
+   "bytes": 35359
+  },
+  "https://developer.mozilla.org/pimg/aHR0cHM6Ly9zdGF0aWM0LmJ1eXNlbGxhZHMubmV0L3V1LzIvMTc2NDc2LzE3ODUzNjIyNjgtTUROXy1fQUlSZXZvbHV0aW9uLUxpZ2h0LTE0NTZ4MTgwLnBuZw%3D%3D.WxiM9CVvShX3RHmbqMVTFIDMYqWL%2BaxQ7TPU1VRlM0I%3D": {
+   "file": "bodies/0068",
+   "status": 200,
+   "mime": "image/png",
+   "bytes": 16559
+  },
+  "https://incoming.telemetry.mozilla.org/submit/mdn-fred/events/1/e25aee40-5bd2-4748-a098-2abdfeaa6729": {
+   "file": "bodies/0069",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://incoming.telemetry.mozilla.org/submit/mdn-fred/events/1/2ca3f796-411a-4ba6-8c23-742262773c0c": {
+   "file": "bodies/0070",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://incoming.telemetry.mozilla.org/submit/mdn-fred/events/1/64591519-74dc-42ef-b838-22ccb9965e00": {
+   "file": "bodies/0071",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://incoming.telemetry.mozilla.org/submit/mdn-fred/events/1/3d65c347-1ad5-4ed4-bafe-797c85cb0d9d": {
+   "file": "bodies/0072",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://developer.mozilla.org/pong/viewed?code=aHR0cHM6Ly9zcnYuYnV5c2VsbGFkcy5jb20vYWRzL3ZpZXdhYmxlL3gvR1RORDQyN1lDWUJJRTUzTkM2QUxZS1FVRlRTRFRLUVlDS1lJNlozSkNBQURLS1FJQ0U3RExLUUtDNkJJNEs3SUNUQklMMjNJQ1lBRDZLSkpDSzdJVjIzS0M2U0lFMkpOQ0tTREVLM0VISlNDTDdaVUtISkNZN1Y%3D.DievgpTXO1tNnmHdfyrdDNHUnu5pjVhP945IwiyO%2FJs%3D&version=2": {
+   "file": "bodies/0073",
+   "status": 201,
+   "mime": "text/plain",
+   "bytes": 7
+  },
+  "https://developer.mozilla.org/pong/viewed?code=aHR0cHM6Ly9zcnYuYnV5c2VsbGFkcy5jb20vYWRzL3ZpZXdhYmxlL3gvR1RORDQyN1lDWUJJRTJKSUM2QUxZS1FVRlRTRFRLUVlDS1lJVlozSkNBQURLS1FJQ0U3REwyM0tDNllEVjUzSUY2QklMNVFFQ1RZSVQ1UUVDV1NJUDJKWUhFWUk1NTNOQ1k3SUs1M0VDVE5GS0JaSDVSRU42U0RI.I9L4akk6gfkgt2NYMMQmrb711Tliy6oDCLTKJonir6M%3D&version=2": {
+   "file": "bodies/0074",
+   "status": 201,
+   "mime": "text/plain",
+   "bytes": 7
+  }
+ }
+}

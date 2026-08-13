@@ -1,0 +1,93 @@
+/**
+ * WCAG accessibility fixes for third-party injected content
+ */
+(function() {
+    'use strict';
+
+    /**
+     * Fix 1: aria-required-attr for RMP seek bars (missing aria-valuenow)
+     */
+    function fixSeekBarAria() {
+        var seekBars = document.querySelectorAll('.rmp-seek-bar[role="slider"]');
+        seekBars.forEach(function(seekBar) {
+            if (!seekBar.hasAttribute('aria-valuenow')) {
+                seekBar.setAttribute('aria-valuenow', '0');
+            }
+        });
+    }
+
+    /**
+     * Fix 2: Wrap .sso-wraper content in a landmark
+     * Note: .sso-wraper is an <a> element, so we wrap it in a nav instead
+     */
+    function fixSsoWraperLandmark() {
+        var ssoWraper = document.querySelector('.sso-wraper');
+        if (ssoWraper && !ssoWraper.parentElement.matches('[role="navigation"], nav')) {
+            var nav = document.createElement('nav');
+            nav.setAttribute('aria-label', 'Conta de utilizador');
+            ssoWraper.parentElement.insertBefore(nav, ssoWraper);
+            nav.appendChild(ssoWraper);
+        }
+    }
+
+    /**
+     * Fix 3: Add role=navigation to .uninav-breaking-wrapper
+     */
+    function fixBreakingNewsLandmark() {
+        var breakingWrapper = document.querySelector('.uninav-breaking-wrapper');
+        if (breakingWrapper && !breakingWrapper.closest('[role="region"], [role="navigation"], nav, main, aside')) {
+            breakingWrapper.setAttribute('role', 'region');
+            breakingWrapper.setAttribute('aria-label', 'Notícias de última hora');
+        }
+    }
+
+    function runFixes() {
+        fixSeekBarAria();
+        fixSsoWraperLandmark();
+        fixBreakingNewsLandmark();
+    }
+
+    // Run on DOM ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', runFixes);
+    } else {
+        runFixes();
+    }
+
+    // Observe for dynamically added elements (players, SSO, breaking news)
+    var observer = new MutationObserver(function(mutations) {
+        mutations.forEach(function(mutation) {
+            mutation.addedNodes.forEach(function(node) {
+                if (node.nodeType === 1) {
+                    // RMP seek bars
+                    if (node.classList && node.classList.contains('rmp-seek-bar') && node.getAttribute('role') === 'slider') {
+                        if (!node.hasAttribute('aria-valuenow')) {
+                            node.setAttribute('aria-valuenow', '0');
+                        }
+                    }
+                    var seekBars = node.querySelectorAll && node.querySelectorAll('.rmp-seek-bar[role="slider"]');
+                    if (seekBars) {
+                        seekBars.forEach(function(seekBar) {
+                            if (!seekBar.hasAttribute('aria-valuenow')) {
+                                seekBar.setAttribute('aria-valuenow', '0');
+                            }
+                        });
+                    }
+                    // SSO wrapper
+                    if (node.classList && node.classList.contains('sso-wraper')) {
+                        setTimeout(fixSsoWraperLandmark, 0);
+                    }
+                    // Breaking news
+                    if (node.classList && node.classList.contains('uninav-breaking-wrapper')) {
+                        fixBreakingNewsLandmark();
+                    }
+                }
+            });
+        });
+    });
+
+    observer.observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true
+    });
+})();

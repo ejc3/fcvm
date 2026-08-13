@@ -1,0 +1,1733 @@
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* LOADING  */
+a.pub_solverde {
+    background-color: #05253f;
+    display: block !important;
+    text-align: center;
+}
+
+a.pub_solverde img {
+    width: 290px;
+    height: 40px;
+}
+
+.Opta p.Opta-Load {
+    font-size: 13px;
+    font-weight: 500;
+    text-transform: uppercase;
+    background: url("https://cdn-images.rtp.pt/noticias/images/loadingOPTA.gif") center 50px no-repeat transparent !important;
+}
+
+.Opta td a,
+.Opta th a {
+    color: #44565f !important;
+    font-size: 14px !important;
+}
+
+.Opta td a:hover,
+.Opta th a:hover {
+    color: #9babb4 !important;
+    text-decoration: none !important;
+}
+
+.sidebar_titulo_sports {
+    font-size: 24px;
+    font-weight: 500;
+    color: #171d20;
+    margin-bottom: 10px;
+}
+
+.modulo_sports {
+    margin-bottom: 30px;
+    border-bottom: 1px solid #c8d3d9;
+}
+
+abbr[data-original-title],
+abbr[title] {
+    text-decoration: none;
+    -webkit-text-decoration: none;
+    cursor: default;
+}
+
+/* LOADING  */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* STANDINGS - Classificação */
+
+.Opta {
+    font-family: 'Roboto' !important;
+}
+
+.Opta .Opta-H3,
+.Opta .Opta-H4,
+.Opta h3,
+.Opta h4 {
+    height: 40px;
+    line-height: 40px;
+}
+
+#standigsW {
+    height: 250px;
+    overflow: hidden;
+}
+
+.standigsW-show-more {
+    height: 100% !important;
+}
+
+#standigsW .Opta td,
+#standigsW .Opta th {
+    height: 40px !important;
+    font-size: 16px;
+    font-weight: 500;
+    color: #171d20;
+}
+
+#standigsW .Opta tfoot th,
+#standigsW .Opta thead th {
+    background-color: transparent;
+}
+
+#standigsW .Opta abbr {
+    font-size: 13px;
+    color: #44565f;
+    font-weight: 500;
+}
+
+#standigsW .Opta > .Opta_W,
+#standigsW .Opta > .Opta_W > div {
+    background: transparent;
+}
+
+#standigsW .Opta .Opta-Striped li:nth-child(even),
+#standigsW .Opta .Opta-Striped tbody tr:nth-child(even) td,
+#standigsW .Opta .Opta-Striped tbody tr:nth-child(even) th,
+#standigsW .Opta div.Opta-Even,
+#standigsW .Opta li.Opta-Even {
+    background-color: #ecf4f8;
+}
+
+#standigsW .Opta .Opta-Striped li:nth-child(odd),
+#standigsW .Opta .Opta-Striped tbody tr:nth-child(odd) td,
+#standigsW .Opta .Opta-Striped tbody tr:nth-child(odd) th,
+#standigsW .Opta div.Opta-Odd,
+#standigsW .Opta li.Opta-Odd {
+    background-color: #fff;
+}
+
+.full-table {
+    text-transform: uppercase;
+    color: #fff;
+    background-color: #a1b91c;
+    display: inline-block;
+    padding: 10px 30px;
+    font-size: 14px;
+    font-weight: 500;
+    margin-top: 30px;
+    margin-bottom: 30px;
+    border-radius: 6px;
+}
+
+.full-table:hover {
+    background-color: #97BA0E;
+    color: #fff;
+}
+
+.full-table.gray {
+    background-color: #9babb4;
+}
+
+.full-table.gray:hover {
+    background-color: #445660;
+}
+
+/* STANDINGS */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* FIXTURES - Jornadas */
+
+#jornadasW .Opta .Opta-Tabs .Opta-Nav > ul.Opta-Overflowed,
+#jornadasW .Opta > .Opta_W,
+#jornadasW .Opta > .Opta_W > div,
+#jornadasW .Opta .Opta-Tabs .Opta-Nav > ul {
+    background-color: transparent;
+}
+
+#jornadasW .Opta .Opta-Nav {
+    background: transparent;
+}
+
+#jornadasW .Opta .Opta_F_F.Opta_F_F_N .Opta-fixture .Opta-Odd {
+    background-color: transparent;
+}
+
+#jornadasW .Opta .Opta_F_F.Opta_F_F_N .Opta-fixture .Opta-Even {
+    background-color: #ecf4f8 !important;
+}
+
+#jornadasW .Opta .Opta-Nav li {
+    border: 0;
+}
+
+#jornadasW .Opta .Opta-Nav a {
+    font-size: 13px;
+    font-weight: 500;
+    color: #9babb4;
+    background-color: transparent;
+    text-transform: uppercase;
+}
+
+#jornadasW .Opta .Opta-Nav .Opta-On {
+    color: #445660;
+    background-color: #c8d3d9;
+    border: 0;
+}
+
+#jornadasW .Opta .Opta-Nav .Opta-On a {
+    color: #445660;
+}
+
+#jornadasW .Opta .Opta-H4,
+#jornadasW .Opta h4 {
+    background-color: #c8d3d9;
+    font-size: 13px;
+    color: #445660;
+    font-weight: 500;
+    height: 40px;
+}
+
+#jornadasW .Opta td,
+#jornadasW .Opta th {
+    height: 40px;
+}
+
+#jornadasW .Opta h4 span,
+#jornadasW .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Outer,
+#jornadasW .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Outer abbr {
+    font-size: 13px;
+    color: #445660;
+    font-weight: 500;
+    line-height: 40px;
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
+#jornadasW .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Team,
+#jornadasW .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Team-Score,
+#jornadasW .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Versus abbr {
+    font-size: 13px;
+    color: #445660;
+    font-weight: normal;
+}
+
+#jornadasW .Opta-Cf.Opta-Overflowed.Opta-Overflow {
+    background: #A9BBC4;
+}
+
+#jornadasW .Opta .Opta-Nav > ul.Opta-Overflow li.Opta-Overflow {
+    background: #80949F;
+    text-align: center;
+    color: #fff;
+    padding-top: 10px;
+    padding-bottom: 10px;
+}
+
+#jornadasW .Opta .Opta-Nav > ul.Opta-Overflow li.Opta-Overflow a {
+    color: #fff !important;
+}
+
+/* FIXTURES - Jornadas */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* HEATMAP */
+
+#heatmapW .Opta .Opta-Teamsheet-Holder .Opta-Teamsheet-Button {
+    background: #44565f;
+    height: 35px;
+    font-size: 18px;
+    line-height: 36px;
+    font-weight: 500;
+    padding: 0;
+    padding-left: 5px;
+    margin-bottom: 0;
+}
+
+#heatmapW .Opta .Opta-Teamsheet-Holder.Opta-Away .Opta-Teamsheet-Button {
+    background-color: #dfe8ec;
+    color: #1e2326;
+}
+
+#heatmapW .Opta .Opta-Tabs .Opta-Nav > ul,
+#heatmapW .Opta .Opta-Nav {
+    background-color: transparent;
+    margin-bottom: 0;
+}
+
+#heatmapW .Opta .Opta-Nav li {
+    border: 0;
+}
+
+#heatmapW .Opta .Opta-Nav a {
+    background-color: transparent;
+    border: 0;
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+    color: #9babb4;
+    height: 35px;
+    padding: 2px 10px;
+}
+
+#heatmapW .Opta .Opta-Nav li.Opta-On a {
+    background-color: #9babb4;
+    color: #fff;
+    border: 1px solid #9babb4;
+}
+
+#heatmapW .Opta .Opta-Teamsheet .Opta-Team .Opta-Name,
+#heatmapW .Opta .Opta-Teamsheet .Opta-Subs .Opta-Name {
+    font-size: 14px;
+    font-weight: 500;
+}
+
+#heatmapW .Opta-Player .Opta-Name {
+    font-size: 14px;
+    font-weight: normal;
+}
+
+#heatmapW .Opta .Opta-Teamsheet .Opta-Position,
+#heatmapW .Opta .Opta-Teamsheet .Opta-Shirt {
+    color: #9babb4;
+}
+
+#heatmapW .Opta .Opta-Teamsheet .Opta-Action {
+    width: 15px;
+}
+
+#heatmapW .Opta .Opta-Teamsheet li abbr {
+    font-size: 14px;
+}
+
+#heatmapW .Opta .Opta-Teamsheet .Opta-Shirt {
+    width: 1.5em;
+    font-size: 14px;
+}
+
+#heatmapW .Opta .Opta-Even td,
+#heatmapW .Opta .Opta-Even th,
+#heatmapW .Opta .Opta-Striped li:nth-child(even),
+#heatmapW .Opta .Opta-Striped tbody tr:nth-child(even) td,
+#heatmapW .Opta .Opta-Striped tbody tr:nth-child(even) th,
+#heatmapW .Opta div.Opta-Even,
+#heatmapW .Opta li.Opta-Even,
+#heatmapW .Opta .Opta-Teamsheet dt {
+    background-color: #f5f9fb !important;
+}
+
+#heatmapW .Opta .Opta-TimeControls {
+    background-color: transparent;
+}
+
+#heatmapW .Opta .Opta-TimeControls .Opta-Dragger path,
+#heatmapW .Opta .Opta-TimeControls .Opta-TimeSpan {
+    fill: #ff3333;
+}
+
+#heatmapW .Opta .Opta-TimeControls .Opta-TimeBox rect {
+    fill: transparent;
+}
+
+#heatmapW .Opta .Opta-TimeControls .Opta-TimeBox text {
+    font-size: 12px;
+    font-weight: normal;
+    fill: #44565f;
+}
+
+#heatmapW .Opta .Opta-TimeControls .Opta-PeriodButtons button.Opta-On,
+#heatmapW .Opta .Opta-TimeControls .Opta-PeriodButtons button.Opta-On:hover {
+    background-color: #ff3333;
+    border: 1px solid #ff3333;
+    color: #fff;
+}
+
+#heatmapW .Opta .Opta-TimeControls .Opta-PeriodButtons button {
+    background-color: transparent;
+    color: #9babb4;
+    border: 1px solid #9babb4;
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+}
+
+#heatmapW .Opta .Opta-Flex {
+    display: block;
+}
+
+#heatmapW .Opta .Opta-TimeControls .Opta-PeriodButtons.Opta-Periods-2 button {
+    width: auto;
+    margin: 0;
+    margin-bottom: 10px;
+    line-height: 16px;
+}
+
+#heatmapW .Opta .Opta-Teamsheet .Opta-Action {
+    background: url("https://cdn-images.rtp.pt/noticias/images/checkbox.png") 0 -35px no-repeat;
+}
+
+#heatmapW .Opta .Opta-Teamsheet .Opta-On .Opta-Action {
+    background-position: 0 0;
+}
+
+#heatmapW .Opta .Opta-Teamsheet .Opta-Half .Opta-Action {
+    background-position: 0 -70px;
+}
+
+@media only screen and (max-width: 632px) {
+    #heatmapW tbody tr > td {
+        padding-left: 0;
+    }
+
+    #heatmapW tbody tr > td:last-child {
+        padding-right: 0;
+    }
+
+    #heatmapW .Opta .Opta-Teamsheet-Holder .Opta-Teamsheet-Button .Opta-Teamsheet-Icon:after {
+        top: 8px;
+        left: -5px;
+    }
+}
+
+/* HEATMAP */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* MATCHSTATS */
+
+#stat-equipas .Opta .Opta-Nav,
+#stat-equipas .Opta .Opta-Tabs .Opta-Nav > ul {
+    background-color: transparent;
+}
+
+#stat-equipas .Opta .Opta-Nav li {
+    border: 0;
+}
+
+#stat-equipas .Opta .Opta-Nav a {
+    background-color: transparent;
+    color: #c8d3d9;
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+}
+
+#stat-equipas .Opta .Opta-Nav li.Opta-On a {
+    color: #9babb4;
+}
+
+#stat-equipas .Opta-Stats-Bars-Text {
+    font-size: 14px;
+    font-weight: 500;
+    color: #171d20;
+}
+
+#stat-equipas .Opta .Opta-Stats-Bars td.Opta-Outer {
+    font-size: 14px;
+    font-weight: bold;
+    color: #9babb4;
+}
+
+#stat-equipas .Opta .Opta-Stats-Bars .Opta-Bars-Full {
+    height: 4px;
+}
+
+#stat-equipas .Opta .Opta-Stats-Bars .Opta-Bars-Full .Opta-Percent {
+    background: #44565f;
+    height: 4px;
+}
+
+#stat-equipas .Opta .Opta-Stats-Bars .Opta-Bars-Full .Opta-Percent.Opta-Away {
+    background: #dfe8ec;
+}
+
+#stat-equipas .Opta .Opta-Stats-Bars td.Opta-Outer {
+    width: 12%;
+}
+
+#stat-equipas .Opta-Outer:first-child {
+    text-align: left;
+}
+
+#stat-equipas .Opta-Outer:last-child {
+    text-align: right;
+}
+
+#stat-equipas .Opta .Opta-TimeControls {
+    background-color: transparent;
+}
+
+#stat-equipas .Opta .Opta-TimeControls .Opta-Dragger path,
+#stat-equipas .Opta .Opta-TimeControls .Opta-TimeSpan {
+    fill: #ff3333;
+}
+
+#stat-equipas .Opta .Opta-TimeControls .Opta-TimeBox rect {
+    fill: transparent;
+}
+
+#stat-equipas .Opta .Opta-TimeControls .Opta-TimeBox text {
+    font-size: 12px;
+    font-weight: normal;
+    fill: #44565f;
+}
+
+#stat-equipas .Opta .Opta-TimeControls .Opta-PeriodButtons button.Opta-On,
+#stat-equipas .Opta .Opta-TimeControls .Opta-PeriodButtons button.Opta-On:hover {
+    background-color: #ff3333;
+    border: 1px solid #ff3333;
+    color: #fff;
+}
+
+#stat-equipas .Opta .Opta-TimeControls .Opta-PeriodButtons button {
+    background-color: transparent;
+    color: #9babb4;
+    border: 1px solid #9babb4;
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+}
+
+#stat-equipas .Opta .Opta-Flex {
+    display: block;
+}
+
+#stat-equipas .Opta .Opta-TimeControls .Opta-PeriodButtons.Opta-Periods-2 button {
+    width: auto;
+    margin: 0;
+    margin-bottom: 10px;
+}
+
+/* MATCHSTATS */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* GOAL REPLAY - Resumo */
+
+#tabs .Opta > .Opta_W {
+    margin: 0;
+}
+
+#resumo .Opta .Opta-EventsBar {
+    background-color: transparent;
+}
+
+#resumo .Opta-event-strip-container {
+    background-color: #f5f9fb;
+}
+
+#resumo .Opta .Opta-EventTicker-Strip .Opta-Fadeout {
+    display: none;
+}
+
+#resumo .Opta .Opta-Flex {
+    display: block;
+}
+
+#resumo .Opta .Opta-EventsBar .Opta-EventButtons button {
+    background-color: transparent;
+    border: 1px solid #9babb4;
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+    width: auto;
+    color: #9babb4;
+    margin: 0;
+    margin-bottom: 10px;
+    display: inline-block;
+    line-height: 15px;
+}
+
+#resumo .Opta .Opta-EventsBar .Opta-EventButtons button.Opta-On,
+#resumo .Opta .Opta-EventsBar .Opta-EventButtons button.Opta-On:hover {
+    background-color: #ff3333;
+    border: 1px solid #ff3333;
+    color: #fff;
+}
+
+#resumo .Opta .Opta-FootballPitch .Opta-Node circle.Opta-Home {
+    fill: #44565f;
+    stroke: #171d20;
+}
+
+#resumo .Opta .Opta-FootballPitch .Opta-Node circle.Opta-Away {
+    fill: #dfe8ec;
+    stroke: #171d20;
+}
+
+#resumo .Opta .Opta-EventsBar .Opta-TimeSpan,
+#resumo .Opta .Opta-EventsBar .Opta-Timestrip .Opta-CurrentTime {
+    fill: #ff3333;
+    stroke: #ff3333;
+}
+
+#resumo .Opta .Opta-EventsBar .Opta-Timestrip .Opta-EventMarker {
+    stroke: #ff3333;
+}
+
+#resumo .Opta .Opta-EventTicker li.Opta-Selected:not(.Opta-EventTicker-TimeMarker).Opta-Home {
+    background-color: #44565f;
+    color: #fff;
+}
+
+#resumo .Opta .Opta-EventTicker li.Opta-Selected:not(.Opta-EventTicker-TimeMarker).Opta-Away {
+    background-color: #dfe8ec;
+}
+
+#resumo .Opta .Opta-EventTicker .Opta-EventTicker-TimeMarker {
+    background-color: transparent;
+}
+
+#resumo .Opta .Opta-EventTicker .Opta-Event-Time {
+    font-size: 14px;
+    font-weight: bold;
+    color: #9babb4;
+}
+
+#resumo .Opta .Opta-EventsBar .Opta-EventsPanel .Opta-Player.Opta-Home .Opta-Shape {
+    fill: #44565f;
+    stroke: #171d20;
+}
+
+#resumo .Opta .Opta-EventsBar .Opta-EventsPanel .Opta-Player.Opta-Away .Opta-Shape {
+    fill: #dfe8ec;
+    stroke: #171d20;
+}
+
+#resumo .Opta-Node.Opta-stdevent g {
+    stroke: #171d20;
+}
+
+#resumo .Opta .Opta-EventTicker li.Opta-Home .Opta-JerseyNumber {
+    background-color: #44565f;
+    border: 2px solid #171d20;
+}
+
+#resumo .Opta .Opta-EventTicker li.Opta-Away .Opta-JerseyNumber {
+    background-color: #dfe8ec;
+    border: 2px solid #171d20;
+    color: #171d20;
+}
+
+#resumo .Opta_F_GR_N .Opta-Overlay.Opta-Home h3 {
+    background-color: #44565f;
+    text-transform: uppercase;
+    font-weight: bold;
+}
+
+#resumo .Opta_F_GR_N .Opta-Overlay.Opta-Away h3 {
+    background-color: #dfe8ec;
+    text-transform: uppercase;
+    font-weight: bold;
+    color: #171d20;
+}
+
+#resumo .Opta_F_GR_N .Opta-Overlay.Opta-Away .Opta-Shirt {
+    background-color: #dfe8ec;
+    border: 2px solid #171d20;
+    color: #171d20;
+}
+
+#resumo .Opta_F_GR_N .Opta-Overlay.Opta-Home .Opta-Shirt {
+    background-color: #44565f;
+    border: 2px solid #171d20;
+    color: #fff;
+}
+
+#resumo .Opta_F_GR_N .Opta-Overlay.Opta-Home .Opta-Name {
+    font-size: 14px;
+    font-weight: 500;
+}
+
+#resumo .Opta .Opta-EventTicker li.Opta-Selected:not(.Opta-EventTicker-TimeMarker) {
+    color: #171d20;
+}
+
+#resumo .Opta .Opta-EventTicker-Strip .Opta-eventtext {
+    font-weight: bold;
+}
+
+#resumo .Opta .Opta-EventTicker-Strip li.Opta-Home {
+    border-bottom: 2px solid #44565f;
+}
+
+#resumo .Opta .Opta-EventTicker-Strip li.Opta-Away {
+    border-bottom: 2px solid #dfe8ec;
+}
+
+/* GOAL REPLAY - Resumo */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* TIMELINE - Jogo em Direto */
+
+#timelineW .Opta .Opta-MatchHeader .Opta-Score.Opta-Away .Opta-Team-Score,
+#timelineW .Opta .Opta-MatchHeader .Opta-Score .Opta-Team-Score {
+    background-color: #ff3333 !important;
+    font-size: 22px;
+    font-weight: bold;
+    padding: 6px 12px;
+}
+
+#timelineW .Opta .Opta_F_TL .Opta-Timeline > div {
+    background-color: #ff3333 !important;
+}
+
+#timelineW .Opta .Opta_F_TL .Opta-Timeline {
+    border-color: #ff3333 !important;
+}
+
+#timelineW .Opta .Opta-MatchHeader div.Opta-MatchHeader-Details > div,
+#timelineW .Opta .Opta-MatchHeader tr.Opta-MatchHeader-Details td > div {
+    background: transparent !important;
+}
+
+#timelineW .Opta .Opta_F_TL .Opta-MatchHeader .Opta-Competition {
+    font-size: 14px;
+    font-weight: 500;
+    margin-left: 24px;
+    margin-right: 10px;
+}
+
+#timelineW .Opta .Opta_F_TL .Opta-MatchHeader .Opta-Competition:after {
+    content: '|';
+    margin-left: 10px;
+}
+
+#timelineW .Opta .Opta_F_TL .Opta-MatchHeader .Opta-Date {
+    font-size: 14px;
+    margin-left: 0;
+}
+
+#timelineW .Opta .Opta-MatchHeader.Opta-MatchHeader-Crested td.Opta-Team a {
+    font-size: 18px !important;
+    font-weight: 500;
+    color: #171d20;
+}
+
+#timelineW .Opta .Opta-Matchdata dl,
+#timelineW .Opta .Opta-Matchdata dd,
+#timelineW .Opta .Opta-Matchdata dt {
+    font-size: 14px;
+    color: #9aa9b1;
+}
+
+#timelineW .Opta .Opta-Matchdata {
+    background-color: #f5f9fb;
+}
+
+#timelineW .Opta .Opta-Matchdata dt {
+    font-weight: 500;
+}
+
+#timelineW .Opta .Opta-Matchdata dt:after {
+    content: '|';
+    margin-left: 5px;
+}
+
+/* TIMELINE */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* COMMENTARY */
+
+#commentaryW {
+    height: 680px;
+    overflow: auto;
+}
+
+.Opta_F_TL.Opta_F_TL_N .Opta-Time abbr,
+.Opta_F_TL.Opta_F_TL_N .Opta-Time span {
+    color: #44565f !important;
+}
+
+#commentaryW .Opta_F_C .Opta-comment,
+#commentaryW .Opta .Opta-Emphasis,
+#commentaryW .Opta .Opta-Emphasis a,
+#commentaryW .Opta_F_C .Opta-Time {
+    font-size: 14px;
+    line-height: 1.29;
+}
+
+.Opta .Opta-Even td,
+.Opta .Opta-Even th,
+.Opta .Opta-Striped li:nth-child(even),
+.Opta .Opta-Striped tbody tr:nth-child(even) td,
+.Opta .Opta-Striped tbody tr:nth-child(even) th,
+.Opta div.Opta-Even,
+.Opta li.Opta-Even {
+    background-color: #f5f9fb !important;
+}
+
+#commentaryW .Opta_F_C .Opta-comment {
+    margin: 0 10px 0 92px;
+}
+
+#commentaryW .Opta_F_C .Opta-Events span.Opta-Event {
+    margin: 0 24px;
+}
+
+.Opta .Opta_W .Opta-Tooltip h3 {
+    background-color: #c8d3d9 !important;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    color: #44565f !important;
+}
+
+.Opta .Opta_W .Opta-Tooltip h3 > span {
+    font-size: 14px;
+    font-weight: 500 !important;
+}
+
+.Opta .Opta_W .Opta-Tooltip {
+    border-radius: 5px;
+}
+
+.Opta .Opta_W .Opta-Tooltip p {
+    font-size: 14px;
+}
+
+/* COMMENTARY */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* MATCH DAY */
+
+#equipas .Opta .Opta-FootballPitch .Opta-Node text {
+    fill: #000;
+    filter: none;
+    font-weight: 500;
+    font-size: 16px;
+}
+
+#equipas .Opta .Opta-FootballPitch .Opta-Node circle.Opta-Home {
+    fill: #44565f;
+    stroke: #171d20;
+}
+
+#equipas .Opta .Opta-FootballPitch .Opta-Node circle.Opta-Away {
+    fill: #dfe8ec;
+    stroke: #171d20;
+}
+
+#equipas .Opta-JerseyNumber {
+    fill: #fff !important;
+}
+
+#equipas .Opta-Away .Opta-JerseyNumber {
+    fill: #171d20 !important;
+}
+
+#equipas .Opta tfoot th,
+#equipas .Opta thead th {
+    background-color: transparent !important;
+    font-size: 18px;
+    font-weight: 500;
+    color: #9babb4;
+}
+
+#equipas .Opta .Opta-FootballPitch-Subplayers .Opta-Sub .Opta-Circle {
+    background-color: #44565f;
+    box-shadow: 0 0 0 2px #171d20;
+}
+
+#equipas .Opta .Opta-FootballPitch-Subplayers .Opta-Sub.Opta-Away .Opta-Circle {
+    background-color: #dfe8ec;
+    color: #171d20;
+}
+
+#equipas .Opta .Opta-Stat .Opta-Value {
+    fill: #44565f;
+    color: #44565f;
+    font-weight: bold;
+    font-size: 20px;
+}
+
+#equipas .Opta .Opta-Overlay {
+    border: 0;
+}
+
+#equipas .Opta-Overlay .Opta-Cf {
+    background-color: #c8d3d9;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}
+
+#equipas .Opta .Opta_W.Opta_F_ML_N .Opta-Overlay li.Opta-Circle.Opta-Home {
+    background-color: #44565f;
+    box-shadow: 0 0 0 2px #171d20;
+}
+
+#equipas .Opta .Opta_W.Opta_F_ML_N .Opta-Overlay li.Opta-Circle.Opta-Away {
+    background-color: #dfe8ec;
+    box-shadow: 0 0 0 2px #171d20;
+    color: #171d20;
+}
+
+#equipas .Opta .Opta_W.Opta_F_ML_N .Opta-Overlay li.Opta-soft {
+    color: #44565f;
+    font-weight: 400;
+}
+
+#equipas .Opta .Opta_W.Opta_F_ML_N .Opta-Overlay {
+    border-radius: 6px;
+}
+
+#equipas .Opta .Opta_W.Opta_F_ML_N .Opta-Overlay li {
+    font-weight: 500;
+}
+
+#equipas .Opta-Event-Text span {
+    font-size: 14px;
+    color: #44565f;
+}
+
+#equipas .Opta .Opta-Flex {
+    padding-top: 15px;
+    padding-bottom: 15px;
+}
+
+/* MATCH DAY */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* LIVE MATCH TABS */
+
+#live-match-tab .nav-link {
+    border-radius: 0;
+    padding: 5px 10px;
+    text-transform: uppercase;
+    color: #9babb4;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+#live-match-tab .nav-link.active,
+#live-match-tab .show > .nav-link {
+    background-color: #9babb4;
+    border-radius: 0;
+    border-color: #9babb4;
+    color: #fff;
+}
+
+#tabs .ui-widget-header {
+    border-bottom: 1px solid #9babb4;
+}
+
+/* LIVE MATCH TABS */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* CALENDÀRIO */
+
+.jornada-atual #sports_fixtures_fixtures .Opta .Opta-Nav {
+    display: none;
+}
+
+#sports_fixtures_fixtures .Opta .Opta-Dropdown > .Opta-Nav h3 {
+    background-color: #c8d3d9;
+    color: #1e2326;
+    height: 40px;
+}
+
+#sports_fixtures_fixtures .Opta h3 > span {
+    height: 40px;
+    line-height: 40px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+#sports_fixtures_fixtures .Opta .Opta-H4,
+#sports_fixtures_fixtures .Opta h4 {
+    background: #e1e8ec;
+    color: #445660;
+    font-weight: 500;
+}
+
+#sports_fixtures_fixtures .Opta .Opta-H4 > span,
+#sports_fixtures_fixtures .Opta h4 > span {
+    font-size: 14px;
+    font-weight: 500;
+}
+
+#sports_fixtures_fixtures .Opta td,
+#sports_fixtures_fixtures .Opta th {
+    height: 40px;
+}
+
+#sports_fixtures_fixtures .Opta .Opta-H3,
+#sports_fixtures_fixtures .Opta .Opta-H4,
+#sports_fixtures_fixtures .Opta h3,
+#sports_fixtures_fixtures .Opta h4 {
+    height: 40px;
+    line-height: 40px;
+    border: 0;
+    background: #e1e8ec;
+}
+
+#sports_fixtures_fixtures .Opta .Opta-H2 > span,
+#sports_fixtures_fixtures .Opta .Opta-H3 > span,
+#sports_fixtures_fixtures .Opta .Opta-H4 > span,
+#sports_fixtures_fixtures .Opta h2 > span,
+#sports_fixtures_fixtures .Opta h3 > abbr,
+#sports_fixtures_fixtures .Opta h3 > span,
+#sports_fixtures_fixtures .Opta h4 > span {
+    line-height: 40px;
+}
+
+#sports_fixtures_fixtures .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Outer,
+#sports_fixtures_fixtures .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Outer abbr {
+    font-size: 14px;
+    font-weight: 500;
+    color: #44565f;
+}
+
+#sports_fixtures_fixtures .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Team,
+#sports_fixtures_fixtures .Opta .Opta_F_F.Opta_F_F_N .Opta-Scoreline .Opta-Score .Opta-Team-Score {
+    font-size: 14px;
+    font-weight: 500;
+    color: #44565f;
+}
+
+#sports_fixtures_fixtures .Opta .Opta-Dropdown > .Opta-Nav li:nth-child(even) a {
+    background-color: rgb(245, 249, 251);
+}
+
+#sports_fixtures_fixtures .Opta .Opta-Dropdown > .Opta-Nav ul {
+    border-color: rgb(245, 249, 251);
+}
+
+#sports_fixtures_fixtures .gameLinkContainer td {
+    padding-top: 3px !important;
+    height: auto !important;
+}
+
+/* CALENDÀRIO */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* MELHORES MARCADORES */
+
+#sports_player_ranking .Opta .Opta-Ranking .Opta-FeatureHeader td,
+#sports_player_ranking .Opta .Opta-Ranking .Opta-FeatureHeader th {
+    background: #fff;
+    color: #44565f;
+    font-size: 18px;
+    font-weight: 500;
+}
+
+#sports_player_ranking .Opta .Opta-Ranking .Opta-FeatureHeader td .Opta-PlayerName a {
+    font-weight: 500;
+    color: #44565f;
+}
+
+#sports_player_ranking .Opta .Opta-Ranking .Opta-FeatureHeader td .Opta-PlayerName,
+#sports_player_ranking .Opta .Opta-Ranking .Opta-FeatureHeader th .Opta-PlayerName,
+#sports_player_ranking .Opta .Opta-Ranking .Opta-FeatureHeader th .Opta-PlayerName a {
+    color: #44565f;
+}
+
+#sports_player_ranking .Opta td,
+#sports_player_ranking .Opta th {
+    height: 40px;
+}
+
+#sports_player_ranking .Opta div,
+#sports_player_ranking .Opta .Opta-Ranking .Opta-Games,
+#sports_player_ranking .Opta .Opta-Ranking .Opta-Team,
+#sports_player_ranking .Opta .Opta-Ranking .Opta-Score {
+    font-size: 14px;
+    line-height: 1.14;
+    color: #44565f;
+    font-weight: normal;
+}
+
+#sports_player_ranking .Opta .Opta-Ranking .Opta-Games > div,
+#sports_player_ranking .Opta .Opta-Ranking .Opta-Score > div {
+    margin-bottom: 10px;
+}
+
+/* MELHORES MARCADORES */
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* EQUIPA SECTION */
+
+#widget-tabs {
+    border-bottom: 1px solid #9babb4;
+}
+
+#widget-tabs .nav {
+    border-bottom: 1px solid #9babb4;
+    margin-bottom: 0;
+}
+
+#widget-tabs .Opta > .Opta_W {
+    margin: 0;
+}
+
+#widget-tabs .nav-pills .nav-link {
+    font-size: 14px;
+    font-weight: 500;
+    color: #9babb4;
+    text-transform: uppercase;
+}
+
+#widget-tabs .nav-pills .nav-link.active,
+#widget-tabs .nav-pills .show > .nav-link {
+    color: #fff;
+    background-color: #9babb4;
+    border-radius: 0;
+}
+
+#widget-tabs .Opta .Opta_F_SPS_N .Opta-Stats {
+    margin: 40px 10px;
+}
+
+#widget-tabs .Opta .Opta-Stats-Radial .Opta-Info {
+    position: absolute;
+    bottom: -30px;
+    right: 92px;
+}
+
+.dropdown-btn-container {
+    border-bottom: 1px solid #9babb4;
+}
+
+.dropdown-btn {
+    color: #fff;
+    background-color: #9babb4;
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+    padding: .5rem 1rem;
+    display: inline-block;
+}
+
+#widget-tabs .Opta .Opta-Stats-Bars.Opta-Stats-Bars-Simple .Opta-Graph-Title {
+    text-align: left;
+}
+
+@media only screen and (max-width: 575px) {
+    #team-section {
+        display: none;
+    }
+}
+
+/**** team_profile ****/
+
+#profile .Opta .Opta_W .Opta-Profile .Opta-One-Profile tr:first-child td,
+#profile .Opta .Opta_W .Opta-Profile .Opta-One-Profile tr:first-child th,
+#profile .Opta .Opta_W .Opta-Profile,
+#profile .Opta > .Opta_W {
+    background: transparent;
+    border-color: #fff;
+}
+
+#profile .Opta td,
+#profile .Opta td span,
+#profile .Opta td abbr {
+    font-size: 14px;
+    font-weight: 500;
+    color: #44565f;
+}
+
+#profile .Opta th {
+    font-size: 14px;
+    font-weight: 500;
+    color: #9babb4;
+}
+
+#profile .Opta .Opta_W .Opta-Profile td.Opta-Image {
+    padding: 0 35px 10px 10px;
+}
+
+/**** team_profile ****/
+
+/**** squad team_profile ****/
+
+#team .Opta .Opta-H4,
+#team .Opta h4 {
+    background: #c8d3d9;
+    font-weight: 500;
+}
+
+#team .Opta .Opta-H4 > span,
+#team .Opta h4 > span {
+    font-size: 14px;
+    font-weight: 500;
+    color: #445660;
+    line-height: 40px;
+    height: 40px;
+}
+
+#team .Opta .Opta-H3,
+#team .Opta .Opta-H4,
+#team .Opta h3,
+#team .Opta h4 {
+    height: 40px;
+    line-height: 40px;
+}
+
+#team .Opta td,
+#team .Opta th {
+    height: 40px;
+    line-height: 40px;
+    font-size: 14px;
+    color: #44565f;
+}
+
+#team .Opta td:first-child {
+    padding-left: 20px;
+}
+
+#team .Opta .Opta-Squad tr.Opta-Position td {
+    padding: 0;
+}
+
+#team .Opta-Country {
+    text-align: right;
+    padding-right: 20px;
+}
+
+/**** squad team_profile ****/
+
+/**** fixtures team_profile ****/
+
+#calendario .Opta td,
+#calendario .Opta th {}
+
+#calendario .Opta .Opta-H3,
+#calendario .Opta h3 {
+    background: #c8d3d9;
+    color: #1e2326;
+    height: 40px;
+    line-height: 40px;
+}
+
+#calendario .Opta .Opta-H2 > span,
+#calendario .Opta .Opta-H3 > span,
+#calendario .Opta .Opta-H4 > span,
+#calendario .Opta h2 > span,
+#calendario .Opta h3 > abbr,
+#calendario .Opta h3 > span,
+#calendario .Opta h4 > span {
+    height: 40px;
+    line-height: 40px;
+}
+
+#calendario .Opta-fixture td {
+    height: 40px;
+    line-height: 40px;
+    font-size: 14px;
+    font-weight: normal;
+    color: #44565f;
+}
+
+#calendario .Opta-fixture td:first-child {
+    padding-left: 20px;
+}
+
+#calendario .Opta-Team-Score {
+    font-size: 14px;
+    font-weight: normal;
+    color: #44565f;
+}
+
+/**** fixtures team_profile ****/
+
+/**** season_player_stats team_profile ****/
+
+#estatisticas .Opta .Opta-Selection-Slide .Opta-Exp {
+    background: #9babb4;
+    color: #fff;
+    height: 40px;
+}
+
+#estatisticas .Opta .Opta-Selection-Slide .Opta-Exp span {
+    line-height: 40px;
+    height: 40px;
+    font-weight: 500;
+    font-size: 16px;
+}
+
+#estatisticas .Opta-Selected-Title {
+    font-size: 16px;
+    font-weight: 500;
+}
+
+#estatisticas .Opta .Opta-Tabs.Opta-TabsMore .Opta-Nav > ul {
+    height: 45px;
+    background: transparent;
+}
+
+#estatisticas .Opta .Opta-Nav li {
+    border: 0;
+}
+
+#estatisticas .Opta .Opta-Nav li a {
+    border: 0;
+    background-color: transparent;
+    font-size: 14px;
+    color: #c8d3d9;
+    font-weight: 500;
+    text-transform: uppercase;
+    padding: 10px 10px;
+}
+
+#estatisticas .Opta .Opta-Selection-Slide .Opta-Options li:not(.Opta-Selected):hover {
+    background: #9babb4;
+}
+
+#estatisticas .Opta .Opta-Nav .Opta-On a {
+    color: #9babb4;
+}
+
+#estatisticas .Opta .Opta-Stat .Opta-Value {
+    fill: #171d20;
+    color: #171d20;
+    font-size: 20px;
+    font-weight: bold;
+}
+
+#estatisticas .Opta .Opta-Stats-Radial .Opta-Stat path.Opta-Arc,
+#estatisticas .Opta .Opta-Stats-Cross .Opta-Stat circle {
+    fill: #a1b91c;
+}
+
+#estatisticas .Opta .Opta-Stats-Bars.Opta-Stats-Bars-Simple .Opta-Bar-Track {
+    background: #dfe8ec;
+    height: 4px;
+}
+
+#estatisticas .Opta .Opta-Stats-Bars.Opta-Stats-Bars-Simple .Opta-Bar-Track .Opta-Bar-Fill {
+    height: 4px;
+    background: #a1b91c;
+}
+
+#estatisticas .Opta .Opta-Stat .Opta-Label {
+    font-size: 13px;
+    color: #44565f;
+    font-weight: normal;
+}
+
+#estatisticas .Opta .Opta-Tabs .Opta-Nav > ul.Opta-Overflowed {
+    background-color: #dfe8ec;
+}
+
+#estatisticas .Opta .Opta-Selection-Slide .Opta-Options {
+    background-color: #c8d3d9;
+}
+
+#estatisticas .Opta .Opta-Info.active,
+#estatisticas .Opta .Opta-Info:hover {
+    background-color: #44565f;
+}
+
+#estatisticas .Opta .Opta-Stats-Goal-Methods .Opta-Goal-Method-Left .Opta-Goal-Figure {
+    background-image: url("https://cdn-images.rtp.pt/noticias/images/goal-left-foot.svg");
+}
+
+#estatisticas .Opta .Opta-Stats-Goal-Methods .Opta-Goal-Method-Right .Opta-Goal-Figure {
+    background-image: url("https://cdn-images.rtp.pt/noticias/images/goal-right-foot.svg");
+}
+
+#estatisticas .Opta .Opta-Stats-Goal-Methods .Opta-Goal-Method-Headed .Opta-Goal-Figure {
+    background-image: url("https://cdn-images.rtp.pt/noticias/images/goal-headed.svg");
+}
+
+#estatisticas .Opta .Opta-Stats-Goal-Methods .Opta-Goal-Method-Other .Opta-Goal-Figure {
+    background-image: url("https://cdn-images.rtp.pt/noticias/images/goal-other.svg");
+}
+
+/**** season_player_stats team_profile ****/
+
+/**** player_compare team_profile ****/
+
+#comparacao .Opta .Opta_F_MPC_N .Opta-Selects .Opta-Dropdown,
+#comparacao .Opta .Opta_F_PC_N .Opta-Selects .Opta-Dropdown,
+#comparacao .Opta .Opta_F_MPC_N .Opta-Selects > div,
+#comparacao .Opta .Opta_F_PC_N .Opta-Selects > div {
+    margin: 0;
+}
+
+#comparacao .Opta div.Opta-Dropdown.Opta-Dropdown-Half {
+    width: calc(50%);
+}
+
+#comparacao .Opta .Opta-Selects > div {
+    width: calc(100%);
+}
+
+#comparacao .Opta div.Opta-Dropdown.Opta-Active label.Opta-Dropdown-Label,
+#comparacao .Opta div.Opta-Dropdown label.Opta-Dropdown-Label,
+#comparacao .Opta div.Opta-Dropdown.Opta-Active label.Opta-Dropdown-Label span.Opta-Dropdown-Label-Button,
+#comparacao .Opta div.Opta-Dropdown.Opta-Active label.Opta-Dropdown-Label span.Opta-Dropdown-Label-Text,
+#comparacao .Opta div.Opta-Dropdown label.Opta-Dropdown-Label span.Opta-Dropdown-Label-Button {
+    background-color: #9babb4;
+}
+
+#comparacao .Opta div.Opta-Dropdown label.Opta-Dropdown-Label span.Opta-Dropdown-Label-Text {
+    color: #fff;
+    font-size: 16px;
+    font-weight: 500;
+}
+
+#comparacao .Opta div.Opta-Dropdown label.Opta-Dropdown-Label:hover span.Opta-Dropdown-Label-Text {
+    background-color: #c8d3d9;
+}
+
+#comparacao .Opta .Opta-Tabs.Opta-TabsMore .Opta-Nav > ul {
+    height: 45px;
+    background: transparent;
+}
+
+#comparacao .Opta .Opta-Nav li {
+    border: 0;
+}
+
+#comparacao .Opta .Opta-Nav li a {
+    border: 0;
+    background-color: transparent;
+    font-size: 14px;
+    color: #c8d3d9;
+    font-weight: 500;
+    text-transform: uppercase;
+    padding: 10px 10px;
+}
+
+#comparacao .Opta .Opta-Nav .Opta-On a {
+    color: #9babb4;
+}
+
+#comparacao .Opta .Opta-Nav > ul.Opta-Overflow li.Opta-Overflow {
+    background: #f5f5f5;
+    height: 45px;
+}
+
+#comparacao .Opta .Opta-Player-Card {
+    background: transparent;
+}
+
+#comparacao .Opta-Player-Name > div {
+    color: #1e2326;
+    font-weight: 500;
+}
+
+#comparacao .Opta-Player-Name .Opta-Team-Name {
+    font-weight: normal;
+    margin-top: 5px;
+}
+
+#comparacao .Opta td,
+#comparacao .Opta th {
+    height: 50px;
+    font-size: 14px;
+    font-weight: normal;
+    color: #445660;
+}
+
+#comparacao .Opta-Selects .Opta-Dropdown:first-child {
+    border-right: 1px solid #fff;
+}
+
+#comparacao .Opta div.Opta-Dropdown label.Opta-Dropdown-Label {
+    height: 35px;
+}
+
+#comparacao .Opta div.Opta-Dropdown label.Opta-Dropdown-Label span.Opta-Dropdown-Label-Text,
+#comparacao .Opta div.Opta-Dropdown label.Opta-Dropdown-Label span.Opta-Dropdown-Label-Button {
+    height: 35px;
+    line-height: 35px;
+}
+
+/* Página do Jogo  */
+.gameLinkContainer td {
+    height: 25px !important;
+    padding-top: 0 !important;
+}
+
+.gameLinkContainer td .gameLink {
+    border-bottom: 1px solid #80949f;
+    font-size: 10px !important;
+    font-weight: 500;
+    color: #80949f !important;
+    text-transform: uppercase;
+}
+
+/* #sports_fixtures_fixtures .gameLinkContainer td .gameLink {
+  position: relative;
+  top: 12px;
+  float: left;
+} */
+
+.gameLinkContainer .match-channels {
+    text-align: right !important;
+}
+
+.gameLinkContainer td .gameLink:hover {
+    color: #37474f !important;
+    border-bottom: 1px solid #37474f;
+}
+
+/* Página do Jogo */
+
+/**** standigs team_profile ****/
+
+#classificacao .Opta tfoot th,
+#classificacao .Opta thead th {
+    background-color: #e1e8ec;
+}
+
+#classificacao .Opta td,
+#classificacao .Opta th {
+    height: 45px;
+    font-size: 14px;
+    font-weight: normal;
+    color: #44565f;
+}
+
+#classificacao .Opta td abbr,
+#classificacao .Opta th abbr,
+#classificacao .Opta th span {
+    font-size: 13px;
+    color: #445660;
+    font-weight: 500;
+}
+
+#classificacao .Opta-JS-Tip {
+    color: #fff;
+}
+
+#classificacao .Opta tr[class*="Opta-Team-"] {
+    height: 55px;
+}
+
+#classificacao .Opta .Opta-Record > span {
+    height: 22px;
+    font-size: 14px;
+    line-height: 19px;
+    background-color: #7ecf4a;
+}
+
+#classificacao .Opta .Opta-Record > span.Opta-Lose {
+    background-color: #ed415a;
+}
+
+#classificacao .Opta .Opta-Record > span.Opta-Draw {
+    background-color: #c8d3d9;
+}
+
+#classificacao .Opta .Opta-H3,
+#classificacao .Opta h3 {
+    background: #c8d3d9;
+    font-weight: 500;
+    color: #445660;
+    border: 0;
+    height: 40px;
+}
+
+#classificacao .Opta .Opta-H3 span,
+#classificacao .Opta h3 span {
+    height: 40px;
+    line-height: 40px;
+    font-weight: 700;
+}
+
+/* WIDGET NEXT AND LIVE GAMES */
+
+#next-and-live-games .gameLinkContainer {
+    border-top: 1px solid #D6DFE2;
+    display: inline-block;
+    width: 100%;
+}
+
+#next-and-live-games .gameLinkContainer td {
+    padding-top: 3px !important;
+    width: 50%;
+    display: inline-block;
+    height: auto !important;
+}
+
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture .Opta-crested .Opta-Team {
+    height: auto !important;
+}
+
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture {
+    position: relative;
+    width: 100%;
+    background: #fff;
+    box-shadow: 0 24px 30px 0 rgba(0, 0, 0, 0.04);
+}
+
+#next-and-live-games .Opta > .Opta_W,
+#next-and-live-games .Opta > .Opta_W > div {
+    background: transparent;
+    margin: 0;
+}
+
+#next-and-live-games .Opta .Opta-H2 > span,
+#next-and-live-games .Opta .Opta-H3 > span,
+#next-and-live-games .Opta .Opta-H4 > span,
+#next-and-live-games .Opta h2 > span,
+#next-and-live-games .Opta h3 > abbr,
+#next-and-live-games .Opta h4 > span {
+    height: 40px;
+    line-height: 40px;
+    color: #445660;
+    text-transform: uppercase;
+}
+
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture h3 abbr,
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture h3 span {
+    font-size: 14px;
+    font-weight: 500;
+}
+
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture .Opta-Venue,
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture h4 {
+    font-size: 14px;
+    font-weight: 500;
+}
+
+#next-and-live-games .Opta .Opta-H3,
+#next-and-live-games .Opta h3 {
+    background: #dfe8ec;
+}
+
+#next-and-live-games .Opta .Opta-H4,
+#next-and-live-games .Opta h4 {
+    background: transparent;
+    color: #9babb4;
+    border-bottom: 0;
+}
+
+#next-and-live-games .Opta .Opta-Home.Opta-Team .Opta-TeamName a {
+    margin-right: 40px;
+    font-size: 14px;
+    font-weight: 500;
+    color: #5D6C79;
+}
+
+#next-and-live-games .Opta .Opta-Away.Opta-Team .Opta-TeamName a {
+    margin-left: 40px;
+    font-size: 14px;
+    font-weight: 500;
+    color: #5D6C79;
+}
+
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture .Opta-Team span {
+    padding-top: 0;
+    padding-bottom: 12px;
+}
+
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture .Opta-badges {
+    margin: 0;
+}
+
+#next-and-live-games .Opta-badges .Opta-Home .Opta-Image-Holder img {
+    margin-right: 40px;
+}
+
+#next-and-live-games .Opta-badges .Opta-Away .Opta-Image-Holder img {
+    margin-left: 40px;
+}
+
+#next-and-live-games .Opta-Scoreline {
+    position: absolute;
+    top: 40px;
+}
+
+#next-and-live-games .Opta-Home .Opta-Team-Score {
+    float: right;
+    margin-right: 20px;
+}
+
+#next-and-live-games .Opta-Away .Opta-Team-Score {
+    float: left;
+    margin-left: 20px;
+}
+
+#next-and-live-games .Opta-Team-Score,
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture .Opta-Scoreline .Opta-Divider,
+#next-and-live-games .Opta .Opta_F_F.Opta_F_F_G .Opta-fixture .Opta-Scoreline .Opta-Divider abbr {
+    color: #445660;
+    font-weight: 500;
+    font-size: 28px;
+}
+
+#next-and-live-games .Opta-fixture.Opta-live h3 {
+    background: #ff0000 !important;
+}
+
+#next-and-live-games .Opta-fixture.Opta-live h3 > span {
+    color: #fff;
+}
+
+#next-and-live-games .live-game-gif {
+    position: relative;
+    top: 2px;
+}
+
+#next-and-live-games .gameLinkContainerRTPDesporto {
+    float: left;
+    width: 100%;
+    border-top: 1px solid #e4e4e4;
+    padding: 15px;
+}
+
+#next-and-live-games .gameLinkContainerRTPDesporto a {
+    font-size: 14px;
+    font-weight: 500;
+    color: #445660;
+    text-transform: uppercase;
+}
+
+#next-and-live-games .gameLinkContainerRTPDesporto a .fa-arrow-right {
+    display: inline-block;
+    float: right;
+}
+
+/* WIDGET NEXT AND LIVE GAMES */
+
+/* WIDGET TOURNAMENT TREE */
+
+#sports_tournament_tree .Opta .Opta_F_TT .Opta-TournamentTree-Scroller-Cell,
+#sports_tournament_tree .Opta .Opta-TournamentTree-Container .Opta-TournamentTree-Scorebox-Winner {
+    background: #c8d3d9;
+    height: 40px;
+    line-height: 40px;
+    font-weight: 700;
+    color: #445660;
+    font-size: 13px;
+}
+
+#sports_tournament_tree .Opta .Opta-TournamentTree-Container .Opta-TournamentTree-Scorebox-Date {
+    background-color: #e1e8ec;
+}
+
+#sports_tournament_tree .Opta .Opta-TournamentTree-Container .Opta-TournamentTree-Scorebox-Date .Opta-Date {
+    font-size: 13px;
+    color: #445660;
+    font-weight: 500;
+}
+
+#sports_tournament_tree .Opta .Opta-TournamentTree-Container .Opta-Score a,
+#sports_tournament_tree .Opta .Opta-TournamentTree-Container .Opta-Team a {
+    color: #44565f !important;
+    font-size: 14px !important;
+}
+
+#sports_tournament_tree .Opta .Opta_F_TT .Opta-TournamentTree-Scorebox-Team,
+#sports_tournament_tree .Opta .Opta-TournamentTree-Container .Opta-TournamentTree-Scorebox-WinnerImage {
+    background: #f5f9fb !important;
+}
+
+#sports_tournament_tree .Opta .Opta-TournamentTree-Container .Opta-TournamentTree-ConnectLine {
+    color: #445660;
+}
+
+/* SELECÇOES PAGE */
+
+#sports_teams .single a img {
+    border: 1px solid #E5E8EA;
+    border-radius: 5px;
+}
+
+/* WIDGET TOURNAMENT TREE */
+
+/**** standigs team_profile ****/
+.Opta .Opta-Nav > ul.Opta-Overflowed:after {
+    background: url("https://cdn-images.rtp.pt/noticias/images/ellipsis-h-regular.svg") -1px -6px / 23px 27px no-repeat;
+}
+
+/**** player_compare team_profile ****/
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* EQUIPA SECTION */

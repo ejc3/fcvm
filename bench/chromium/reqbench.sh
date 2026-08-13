@@ -755,6 +755,14 @@ PY
 # honest but could only ever carry one value, and REVIEW.md's re-run gate
 # (">=200 CDP requests PER BACKEND at 0 failures") was not runnable.
 BACKEND="${BACKEND:-uffd}"
+# copy is fcvm's serve default; minor shares clean pages across clones via
+# UFFDIO_CONTINUE and is the production-lean configuration. Recorded per run.
+UFFD_MODE="${UFFD_MODE:-copy}"
+# Replay of recorded fault working sets. PINNED explicitly on the serve line so
+# the sealed record proves the effective state — the 08-13 runs left it to the
+# binary default and an env override could not be excluded, making replay's
+# contribution unattributable.
+UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 
 cmd_run() {
     local guard_rc=0
@@ -772,9 +780,10 @@ cmd_run() {
         || { log "run: invalid benchmark image ID $image_id"; return 1; }
     case "$BACKEND" in
         uffd)
-            log "run: BACKEND=uffd — starting serve for $TAG"
+            log "run: BACKEND=uffd — starting serve for $TAG (mode=$UFFD_MODE prefetch=$UFFD_PREFETCH)"
             local sf="$RESULTS/logs/serve.log"
-            $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
+            $SUDO "$FCVM" snapshot serve "$TAG" --uffd-mode "$UFFD_MODE" \
+                --uffd-prefetch "$UFFD_PREFETCH" >"$sf" 2>&1 &
             serve_bg=$!
             track "$serve_bg"
             local t0=$SECONDS

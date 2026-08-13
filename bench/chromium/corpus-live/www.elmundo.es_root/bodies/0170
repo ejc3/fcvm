@@ -1,0 +1,11 @@
+{
+  "code" : 0,
+  "ts" : 1786633819,
+  "client_configurations_dto" : {
+    "ga_account" : "",
+    "is_performance_metrics_enabled" : "false",
+    "performance_metrics_ga_account" : "",
+    "performance_metrics_track_only_aids" : "[]",
+    "msqa_client_id" : ""
+  }
+}

@@ -1,0 +1,59 @@
+var shareThisLib = shareThisLib || (function(){
+
+    var _args = {}; // private
+    var _src="";
+    var _cdnsrc='//platform-api.sharethis.com/js/sharethis.js#property=5bec469bda105300172a3224&product=custom-share-buttons';
+
+    function initialize(Args){
+      _args = Args;
+    }
+
+    /**
+     * [run description]
+     * @return {[type]} [description]
+     */
+    function run(enabled){
+
+      if(enabled){
+
+        RTPRequireScript([{
+          src: _cdnsrc,
+          bucket: RTPRequireScriptBucketLevel.sharethis,
+          callback: function(){}
+        }]).loadScript();
+
+      }else{
+        disabled();
+      }
+
+    }
+
+    /**
+     * [runMobile description]
+     * @return {[type]} [description]
+     */
+    function runMobile(enabled){
+
+      if(enabled){
+        jQuery.getScript(_cdnsrc);
+      }else{
+        disabled();
+      }
+
+    }
+
+    /**
+     * [source disabled]
+     * @return {[type]}     [description]
+     */
+    function disabled(){
+      //console.log("shareThis Disabled");
+    }
+
+    return {
+        init       : initialize,
+        run        : run,
+        runMobile  : runMobile,
+    };
+
+}());

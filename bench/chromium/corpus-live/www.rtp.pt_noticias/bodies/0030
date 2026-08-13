@@ -1,0 +1,62 @@
+var oneSignalLib = oneSignalLib || (function(){
+
+    var _args = {}; // private
+    var _src="";
+   
+    /**
+     * [initialize description]
+     *
+     * @param   {[type]}  Args  [Args description]
+     *
+     * @return  {[type]}        [return description]
+     */
+    function initialize(Args){
+      _args = Args;
+    }
+
+    /**
+     * [source description]
+     * @param  {[type]} src [description]
+     * @return {[type]}     [description]
+     */
+    function source(src){
+        _src = src;
+    }
+
+    /**
+     * [run description]
+     * @return {[type]} [description]
+     */
+    function run(enabled){
+
+      if (enabled){
+
+        RTPRequireScript([{
+          src: _src,
+          bucket: RTPRequireScriptBucketLevel.onesignal,
+          callback: function() {
+            oneSignalSetup("production");
+          }
+        }]).loadScript();
+
+      }else{
+        disabled();
+      }
+
+    }
+
+    /**
+     * [source disabled]
+     * @return {[type]}     [description]
+     */
+    function disabled(){
+      //console.log("Onesignal Disabled");
+    }
+
+    return {
+        init : initialize,
+        src  : source,
+        run  : run,
+    };
+
+}());

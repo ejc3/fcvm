@@ -1,0 +1,14 @@
+$.fn.humanDate = function() {
+  jQuery.timeago.settings.cutoff = 1000*60*60;
+
+  // Portuguese
+  jQuery.timeago.settings.strings['minute']  = "%d min."
+  jQuery.timeago.settings.strings['minutes'] = "%d min."
+
+  this.timeago();
+  if ($(this).text().endsWith('min.')) {
+    $('<i class="mr-1 fal fa-clock date-clock" aria-hidden="true">&nbsp;</i>').insertBefore($(this));
+  }
+
+  return this;
+}

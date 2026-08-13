@@ -1,0 +1,1182 @@
+{
+ "url": "https://www.rtp.pt/noticias/",
+ "captured_utc": "2026-08-13T16:06:13Z",
+ "resources": {
+  "https://www.rtp.pt/noticias/css/icomoon.css?v=20232303-1300": {
+   "file": "bodies/0000",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 1179
+  },
+  "https://www.rtp.pt/noticias/css/floatingPlayer.css?v=20202603-1300": {
+   "file": "bodies/0001",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 6397
+  },
+  "https://www.rtp.pt/noticias/js/vendor/OwlCarousel2/dist/assets/owl.carousel.min.css": {
+   "file": "bodies/0002",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 3351
+  },
+  "https://www.rtp.pt/noticias/js/vendor/OwlCarousel2/dist/assets/owl.theme.default.min.css": {
+   "file": "bodies/0003",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 1013
+  },
+  "https://www.rtp.pt/noticias/": {
+   "file": "bodies/0004",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 408722
+  },
+  "https://www.rtp.pt/noticias/css/style.css?v=20261906-1700": {
+   "file": "bodies/0005",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 40081
+  },
+  "https://www.rtp.pt/noticias/css/readspeaker.css?v=20261906-1700": {
+   "file": "bodies/0006",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 14186
+  },
+  "https://www.rtp.pt/noticias/js/vendor/jquery-ui/jquery-ui.min.js": {
+   "file": "bodies/0007",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 38179
+  },
+  "https://www.rtp.pt/noticias/js/rtp/homepagesVideoPreview.js": {
+   "file": "bodies/0008",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 2012
+  },
+  "https://cdn-images.rtp.pt/noticias/images/AppleStore.png": {
+   "file": "bodies/0009",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1908
+  },
+  "https://cdn-images.rtp.pt/noticias/images/rtpnoticias_logo.svg": {
+   "file": "bodies/0010",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 7575
+  },
+  "https://cdn-images.rtp.pt/noticias/images/GooglePlay.png": {
+   "file": "bodies/0011",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 3408
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/07/07d9a69309592fc3ede3c97032a6078f?w=1200&q=90&rect=0,3,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0012",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 85294
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/ee/ee1e5ed2ce4081aea52d77c1e2c71eea?w=1200&q=90&rect=1,0,3338,1830&auto=webp&format=pjgp": {
+   "file": "bodies/0013",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 88708
+  },
+  "https://www.rtp.pt/noticias/js/vendor/bootstrap-4-1-3/bootstrap.min.js": {
+   "file": "bodies/0014",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 51040
+  },
+  "https://www.rtp.pt/noticias/js/rtp/floatingPlayer.js?v=20200320-1305": {
+   "file": "bodies/0015",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 6872
+  },
+  "https://www.rtp.pt/noticias/js/vendor/OwlCarousel2/dist/owl.carousel.min.js": {
+   "file": "bodies/0016",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 44342
+  },
+  "https://www.rtp.pt/noticias/js/rtp/pubsLazyLoad.js?v=20240331-1630": {
+   "file": "bodies/0017",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1919
+  },
+  "https://www.rtp.pt/noticias/js/vendor/timeago/jquery.timeago.js": {
+   "file": "bodies/0018",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 7399
+  },
+  "https://www.rtp.pt/noticias/js/vendor/timeago/jquery.timeago.pt.js": {
+   "file": "bodies/0019",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 716
+  },
+  "https://www.rtp.pt/noticias/js/rtp/humanDate.js?v=20200320-1300": {
+   "file": "bodies/0020",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 392
+  },
+  "https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&display=swap": {
+   "file": "bodies/0021",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 22239
+  },
+  "https://www.rtp.pt/common/js/keycloak.js": {
+   "file": "bodies/0022",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 43009
+  },
+  "https://www.rtp.pt/common/js/jquery.min.js": {
+   "file": "bodies/0023",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 95786
+  },
+  "https://www.rtp.pt/common/js/rtp-require.js?ver=25102024": {
+   "file": "bodies/0024",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 11256
+  },
+  "https://www.rtp.pt/common/css/common-bar.css": {
+   "file": "bodies/0025",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 46035
+  },
+  "https://www.rtp.pt/common/js/sso-v2.js?ver=2024-11-05-19": {
+   "file": "bodies/0026",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 19194
+  },
+  "https://www.rtp.pt/common/player/build/rtp-player-9.16.7.min.js?v=20250514-1800": {
+   "file": "bodies/0027",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1142448
+  },
+  "https://www.rtp.pt/noticias/css/estilos.css?v=20262307-1500": {
+   "file": "bodies/0028",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 277893
+  },
+  "https://www.rtp.pt/common/js/analytics.js?v=20210817-1700": {
+   "file": "bodies/0029",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 18581
+  },
+  "https://www.rtp.pt/noticias/js/rtp/onesignal/v2/OneSignalLoader.js?v=20221213-1600": {
+   "file": "bodies/0030",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1158
+  },
+  "https://www.rtp.pt/noticias/js/rtp/onesignal/v2/OneSignalModule.js?v=20221213-1600": {
+   "file": "bodies/0031",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 12452
+  },
+  "https://www.rtp.pt/noticias/js/vendor/shareThis/shareThis.js?v=20200527-1800": {
+   "file": "bodies/0032",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1126
+  },
+  "https://www.rtp.pt/noticias/js/vendor/printThis/printThis.js": {
+   "file": "bodies/0033",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 13945
+  },
+  "https://www.rtp.pt/noticias/js/rtp/wcagLabelInName.js": {
+   "file": "bodies/0034",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 872
+  },
+  "https://www.rtp.pt/noticias/js/rtp/wcagAriaFixes.js": {
+   "file": "bodies/0035",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 3524
+  },
+  "https://www.rtp.pt/noticias/js/rtp/behaviorRtpNavBar.js": {
+   "file": "bodies/0036",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 9061
+  },
+  "https://www.rtp.pt/noticias/js/vendor/jquery-waypoints/lib/jquery.waypoints.min.js": {
+   "file": "bodies/0037",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 9028
+  },
+  "https://www.rtp.pt/noticias/js/rtp/homeLastArticles.js": {
+   "file": "bodies/0038",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 4479
+  },
+  "https://www.rtp.pt/common/js/dfp.js?v=20251021-1800": {
+   "file": "bodies/0039",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 15066
+  },
+  "https://www.rtp.pt/noticias/css/app.css": {
+   "file": "bodies/0040",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 146663
+  },
+  "https://www.googletagmanager.com/gtag/js?id=G-CBZDN7F1HX": {
+   "file": "bodies/0041",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 501526
+  },
+  "https://fonts.googleapis.com/css?family=Raleway:300,400,600": {
+   "file": "bodies/0042",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 5181
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/b6/b6a31d4de1c0c3a3c5c4fe69d6aea19a?w=1200&q=90&rect=0,152,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0043",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 133780
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/5e/5e38a77d261c94ce1ff2b73aa3611f1a?w=1200&q=90&rect=0,0,5184,2842&auto=webp&format=pjgp": {
+   "file": "bodies/0044",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 53540
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/ca/ca760d5fd6b8e3c6fb984f02d1c5390b?w=1200&q=90&rect=0,11,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0045",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 165588
+  },
+  "https://fonts.gstatic.com/s/inter/v20/UcC73FwrK3iLTeHuS_nVMrMxCp50SjIa1ZL7.woff2": {
+   "file": "bodies/0046",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 48256
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/ec/ec77da37363355c6ca18eb1b58910268?w=1200&q=90&rect=0,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0047",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 60046
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/f9/f955bd041f8b1b43688cf89be5cac548?w=1200&q=90&rect=0,0,1560,855&auto=webp&format=pjgp": {
+   "file": "bodies/0048",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 113478
+  },
+  "https://cdn.onesignal.com/sdks/OneSignalSDK.js": {
+   "file": "bodies/0049",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 10007
+  },
+  "https://fonts.googleapis.com/css?family=Roboto:400,100,300,500,700,900,100italic,500italic,400italic,300italic": {
+   "file": "bodies/0050",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 53974
+  },
+  "https://sdk.privacy-center.org/2840048d-b3c4-47b9-ba5d-c37ed10b41ca/loader.js?target=www.rtp.pt": {
+   "file": "bodies/0051",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 122184
+  },
+  "https://cdn-images.rtp.pt/common/img/channels/logos/gray-negative/vertical/antena1_2026.png": {
+   "file": "bodies/0052",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 9236
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/96/9602c2cba7276369935af3b2e21c52fd?w=140&q=90&rect=0,0,1499,822&auto=format": {
+   "file": "bodies/0053",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 3176
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/f1/f111fe37c6780b9916e572185b48d23c?w=140&q=90&rect=0,7,1024,561&auto=format": {
+   "file": "bodies/0054",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 3840
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/76/76f0fa782e1ce3367933974a7dd1d230?w=140&q=90&rect=1,0,4564,2502&auto=format": {
+   "file": "bodies/0055",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 4420
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/e7/e7657aca409ac883015d26cf8eca6246?w=140&q=90&rect=0,0,1499,822&auto=format": {
+   "file": "bodies/0056",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 4200
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/dc/dc2b17c3a658998915adca9b41661b57?w=140&q=90&rect=0,0,1499,822&auto=format": {
+   "file": "bodies/0057",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 3976
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/54/540d80b3f0adb54d84fa7fc345b1454b?w=140&q=90&rect=0,0,1499,822&auto=format": {
+   "file": "bodies/0058",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 4366
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/41/4199a3805f8c757cd7358c1a95da4220?w=350&q=90&rect=58,0,688,1000&auto=format": {
+   "file": "bodies/0059",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 15774
+  },
+  "https://cdn-images.rtp.pt/noticias/images/rtpnoticias_logo.svg?w=124&q=100&fm=png32": {
+   "file": "bodies/0060",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 7575
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/0f/0ff81292ec9f291c9b6c999e9d35f340?w=1200&q=90&rect=0,38,450,247&auto=webp&format=pjgp": {
+   "file": "bodies/0061",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 20884
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/6b/6bd6a3ccf99ffbe0b6c10e5822207798?w=350&q=90&rect=0,0,860,1251&auto=format": {
+   "file": "bodies/0062",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 24952
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/73/731d4cf698a9f3778475d4edd60c34b5?w=860&q=90&rect=0,6,900,493&auto=format": {
+   "file": "bodies/0063",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 27522
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/37/371e43c1e5e593a68d11551f57f63e39?w=860&q=90&rect=0,6,900,493&auto=format": {
+   "file": "bodies/0064",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 29702
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/9b/9b0e9569e30969aa980f21cb2a22bdef?w=860&q=90&rect=0,0,1200,883&auto=format": {
+   "file": "bodies/0065",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 39116
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/cd/cdfe6fdd7180256aef9773b2dd5b98c9?w=1200&q=90&rect=0,209,2587,1418&auto=webp&format=pjgp": {
+   "file": "bodies/0066",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 46636
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/c5/c539111cf6a81b27d6c1215f2a40c830?w=350&q=90&rect=0,0,860,1251&auto=format": {
+   "file": "bodies/0067",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 45836
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/d3/d3eb64e0d7c382d0a2469f9e8380600a?w=1200&q=90&rect=0,70,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0068",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 61240
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/ee/ee8d585976d1a8d7afd50b00df68699c?w=1200&q=90&rect=0,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0069",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 46274
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/03/0369292f52df7f0c4caac0b126f6affe?w=1200&q=90&rect=0,118,1080,592&auto=webp&format=pjgp": {
+   "file": "bodies/0070",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 68296
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/7c/7c628cdd928c75788d43fe6cfc459663?w=1200&q=90&rect=0,14,2000,1096&auto=webp&format=pjgp": {
+   "file": "bodies/0071",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 47034
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/8d/8d089755b160b2461493ab08060a0f1c?w=1200&q=90&rect=0,50,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0072",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 80292
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/d4/d4e36af9fa71da394e4f5ee8be7e48b4?w=1200&q=90&rect=0,89,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0073",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 69868
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/fb/fb3db3611db6ec1011b495e8de4ae93b?w=860&q=90&rect=0,0,1200,883&auto=format": {
+   "file": "bodies/0074",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 54948
+  },
+  "https://cdn-images.rtp.pt/noticias/images/search.svg": {
+   "file": "bodies/0075",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 1927
+  },
+  "https://cdn-images.rtp.pt/noticias/images/bars.svg": {
+   "file": "bodies/0076",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 494
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/2b/2bf81ba671a22c8df6fea10bd880f8a4?w=1200&q=90&rect=0,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0077",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 46120
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/2f/2fc8c2bec1c4390107d133ed6f5708fd?w=1200&q=90&rect=0,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0078",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 60140
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/dc/dc2b17c3a658998915adca9b41661b57?w=1200&q=90&rect=0,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0079",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 73702
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/e7/e7657aca409ac883015d26cf8eca6246?w=1200&q=90&rect=0,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0080",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 98828
+  },
+  "https://cdn-images.rtp.pt/noticias/images/whatsapp-white.svg": {
+   "file": "bodies/0081",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 13971
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/7e/7e6d26218c38cd5cab58969ee802bc37?w=1200&q=90&rect=0,14,2000,1096&auto=webp&format=pjgp": {
+   "file": "bodies/0082",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 99680
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/14/14761a22b32d114ce64c9b3c196de141?w=350&q=90&rect=670,0,908,1321&auto=format": {
+   "file": "bodies/0083",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 77412
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/83/831bd8cd2d74ab46742d15af8899a57a?w=1200&q=90&rect=0,0,1149,630&auto=webp&format=pjgp": {
+   "file": "bodies/0084",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 125962
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/af/af3220bbd53c61ac40609bf39605135e?w=1200&q=90&rect=0,0,1560,855&auto=webp&format=pjgp": {
+   "file": "bodies/0085",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 72128
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/f2/f2fb743c8047ec129e7ce411d5dc3ea9?w=1200&q=90&rect=0,48,810,444&auto=webp&format=pjgp": {
+   "file": "bodies/0086",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 71686
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/61/611070f1a89b55474ca77be1d5d813b7?w=1200&q=90&rect=0,0,1560,855&auto=webp&format=pjgp": {
+   "file": "bodies/0087",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 138436
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/aa/aa15f8ca21a6e690ef70db42f0693eac?w=1200&q=90&rect=0,42,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0088",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 150630
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/56/5659bc22d7d458ae8f55b526dfb5d7e9?w=1200&q=90&rect=0,18,1280,702&auto=webp&format=pjgp": {
+   "file": "bodies/0089",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 135762
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/53/530773484f0935cc83cbae0edba97461?w=1200&q=90&rect=0,242,2048,1123&auto=webp&format=pjgp": {
+   "file": "bodies/0090",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 120548
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/41/41277359900f48da01478dc01407ef86?w=1200&q=90&rect=0,0,1560,855&auto=webp&format=pjgp": {
+   "file": "bodies/0091",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 145882
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/79/79c4288788b43d5ef1adf4be0acaf9a7?w=860&q=90&rect=0,0,1200,538&auto=format": {
+   "file": "bodies/0092",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 153968
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/e4/e42afe64e3c356e4e645dcd1405e9aa5?w=1200&q=90&rect=0,0,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0093",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 163638
+  },
+  "https://cdn-images.rtp.pt/noticias/images/facebook-side.svg": {
+   "file": "bodies/0094",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 63629
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/96/9602c2cba7276369935af3b2e21c52fd?w=1200&q=90&rect=0,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0095",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 189084
+  },
+  "https://cdn-images.rtp.pt/noticias/images/threads.svg": {
+   "file": "bodies/0096",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 49172
+  },
+  "https://cdn-images.rtp.pt/noticias/images/twitter-side.svg": {
+   "file": "bodies/0097",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 137909
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/14/14f84fe37994639b62b97ed3818fe73c?w=1200&q=90&rect=1,0,3998,2192&auto=webp&format=pjgp": {
+   "file": "bodies/0098",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 299884
+  },
+  "https://www.rtp.pt/noticias/css/fonts/icomoon.ttf?seevr": {
+   "file": "bodies/0099",
+   "status": 200,
+   "mime": "application/octet-stream",
+   "bytes": 2392
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/62/625633b032a8bf9d15093f3393c0495c?w=1200&q=90&rect=145,0,1499,822&auto=webp&format=pjgp": {
+   "file": "bodies/0100",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 311776
+  },
+  "https://cdn-images.rtp.pt/noticias/images/instagram-invertido.svg": {
+   "file": "bodies/0101",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 763054
+  },
+  "https://sdk.privacy-center.org/sdk/0d3605ade78dc410aaa46a5c215a6d7cda4831f7/modern/sdk.0d3605ade78dc410aaa46a5c215a6d7cda4831f7.js": {
+   "file": "bodies/0102",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 433949
+  },
+  "https://cdn-images.rtp.pt/noticias/images/angle-down.svg": {
+   "file": "bodies/0103",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 635
+  },
+  "https://cdn-images.rtp.pt/noticias/images/monitorplay.svg": {
+   "file": "bodies/0104",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 890
+  },
+  "https://cdn-images.rtp.pt/noticias/images/play.svg": {
+   "file": "bodies/0105",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 223
+  },
+  "https://www.rtp.pt/noticias/img/default/news/podcasts-microfone.svg": {
+   "file": "bodies/0106",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 2257
+  },
+  "https://www.googletagmanager.com/gtag/js?id=G-HSZZCYCBG3&cx=c&gtm=4e68b1": {
+   "file": "bodies/0107",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 493534
+  },
+  "https://cdn-images.rtp.pt/noticias/images/facebook-f.svg": {
+   "file": "bodies/0108",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 163781
+  },
+  "https://cdn-images.rtp.pt/noticias/images/instagram.svg": {
+   "file": "bodies/0109",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 2354
+  },
+  "https://cdn-images.rtp.pt/noticias/images/twitter-rounded.svg": {
+   "file": "bodies/0110",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 755
+  },
+  "https://cdn-images.rtp.pt/noticias/images/youtube.svg": {
+   "file": "bodies/0111",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 1127
+  },
+  "https://cdn-images.rtp.pt/noticias/images/flickr.svg": {
+   "file": "bodies/0112",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 1206
+  },
+  "https://cdn-images.rtp.pt/noticias/images/mail.svg": {
+   "file": "bodies/0113",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 687
+  },
+  "https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?": {
+   "file": "bodies/0114",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 44434
+  },
+  "https://cdn-images.rtp.pt/icm/images/cf/cfa6ab81ae3d6e76f724a9d06e58be14_N.jpg?": {
+   "file": "bodies/0115",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 64855
+  },
+  "https://cdn-images.rtp.pt/icm/images/f9/f9a1a4b546ae7b1c88fc46e283781372_N.jpg?": {
+   "file": "bodies/0116",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 69468
+  },
+  "https://static.chartbeat.com/js/chartbeat.js": {
+   "file": "bodies/0117",
+   "status": 200,
+   "mime": "application/x-javascript",
+   "bytes": 41744
+  },
+  "https://www.rtp.pt/rtp-sensor/?action=web_entrada_nao_logado&type=sso&url=https%253A%252F%252Fwww.rtp.pt%252Fnoticias%252F": {
+   "file": "bodies/0118",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://www.google-analytics.com/analytics.js": {
+   "file": "bodies/0119",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 52310
+  },
+  "https://www.rtp.pt/noticias/js/rtp/callPlayer.js?_=1786637164212": {
+   "file": "bodies/0120",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 573
+  },
+  "https://www.rtp.pt/noticias/js/rtp/callPlayer.js?_=1786637164213": {
+   "file": "bodies/0121",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 573
+  },
+  "https://cdn.insurads.com/bootstrap/QWQOVZ6C.js": {
+   "file": "bodies/0122",
+   "status": 200,
+   "mime": "application/x-javascript",
+   "bytes": 7663
+  },
+  "https://cdn-images.rtp.pt/icm/images/2c/2c573277318584e79f48f988404234f8_N.jpg?": {
+   "file": "bodies/0123",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 52167
+  },
+  "https://cdn-images.rtp.pt/icm/images/57/57814ad43efb035694dc3a8f16e51046_N.jpg?": {
+   "file": "bodies/0124",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 62792
+  },
+  "https://www.rtp.pt/noticias/js/rtp/callPlayer.js?_=1786637164214": {
+   "file": "bodies/0125",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 573
+  },
+  "https://www.googletagservices.com/tag/js/gpt.js": {
+   "file": "bodies/0126",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 125827
+  },
+  "https://cdn-images.rtp.pt/icm/images/ab/abf6a542a10e68281ee643066f00dfa6_N.jpg?": {
+   "file": "bodies/0127",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 62279
+  },
+  "https://cdn-images.rtp.pt/icm/images/59/5941a326d476204a49a333d641cd6c14_N.jpg?": {
+   "file": "bodies/0128",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 49783
+  },
+  "https://cdn-images.rtp.pt/icm/images/4c/4c1632b9486c8c725be0f91c20657f9d_N.jpg?": {
+   "file": "bodies/0129",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 18716
+  },
+  "https://cdn-images.rtp.pt/icm/images/6a/6a9813a67298488f0e4c1b7736e2fe64_N.jpg?": {
+   "file": "bodies/0130",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 22260
+  },
+  "https://cdn-images.rtp.pt/icm/images/23/230d15943cb7c6a4556a6e53fee87882_N.jpg?": {
+   "file": "bodies/0131",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 42590
+  },
+  "https://cdn-images.rtp.pt/icm/images/38/388bf49fd341c7660de8b1f94729cf3d_N.jpg?": {
+   "file": "bodies/0132",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 49741
+  },
+  "https://cdn-images.rtp.pt/icm/images/c5/c570fef20d2c52a7d3b76aef7dd6c877_N.jpg?": {
+   "file": "bodies/0133",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 47590
+  },
+  "https://cdn-images.rtp.pt/icm/images/10/102b9f1da543d0d289fc428d5401bed4_N.jpg?": {
+   "file": "bodies/0134",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 69107
+  },
+  "https://cdn-images.rtp.pt/icm/images/8b/8b015a428c3dd362a594899cf00c0223_N.jpg?": {
+   "file": "bodies/0135",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 51497
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/ca/ca728dfbf34068fb86c56f2aad7c4149?w=1200&q=90&rect=0,178,1500,822&auto=webp&format=pjgp": {
+   "file": "bodies/0136",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 111826
+  },
+  "https://cdn-images.rtp.pt/icm/images/71/71d6e037d8804a14d02bfb6d1a3bdf1b_N.jpg?": {
+   "file": "bodies/0137",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 54702
+  },
+  "https://cdn-images.rtp.pt/icm/images/84/843c0fa74a3245e0132bbddd58ce55b5_N.jpg?": {
+   "file": "bodies/0138",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 60476
+  },
+  "https://cdn-images.rtp.pt/icm/images/3a/3a98c1e7a0c1a2b8f775bd6bc7e6d7b2_N.jpg?": {
+   "file": "bodies/0139",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 72304
+  },
+  "https://cdn-images.rtp.pt/icm/images/83/8308b2ea986a2ce9dad1f8b22a1e49da_N.jpg?": {
+   "file": "bodies/0140",
+   "status": 200,
+   "mime": "image/jpeg",
+   "bytes": 41460
+  },
+  "https://cdn-images.rtp.pt/icm/images/7f/7fd4b81a67edca9be472c89265bf42a8_N.jpg?": {
+   "file": "bodies/0141",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 30590
+  },
+  "https://sdk.privacy-center.org/sdk/0d3605ade78dc410aaa46a5c215a6d7cda4831f7/modern/src_sdk_core_modules_integrations_sdk-integrations_providers_gcm_gcm_js.0d3605ade78dc410aaa46a5c215a6d7cda4831f7.js": {
+   "file": "bodies/0142",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 3224
+  },
+  "https://sdk.privacy-center.org/sdk/0d3605ade78dc410aaa46a5c215a6d7cda4831f7/modern/src_sdk_core_modules_integrations_sdk-integrations_providers_google_google_js.0d3605ade78dc410aaa46a5c215a6d7cda4831f7.js": {
+   "file": "bodies/0143",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 2520
+  },
+  "https://cdn-eu.readspeaker.com/script/17/webReader/webReader.js?pids=wr&disable=dictionary&notools=1": {
+   "file": "bodies/0144",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 92212
+  },
+  "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-CBZDN7F1HX&cid=2108691117.1786637165&gtm=45je68b1v897581779za200zd897581779&rcb=18&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938466~115938468~118897920~118897930~119367802~119367810~119404703~119527020~119896802~120385422": {
+   "file": "bodies/0145",
+   "status": 204,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://cdn.onesignal.com/sdks/OneSignalPageSDKES6.js?v=151607": {
+   "file": "bodies/0146",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 291481
+  },
+  "https://stats.g.doubleclick.net/j/collect?t=dc&aip=1&_r=3&v=1&_v=j102&tid=UA-312913-1&cid=2108691117.1786637165&jid=749492600&gjid=877314402&_gid=1268466901.1786637165&_u=ICDAgAABAAAAAGAAI~&z=1135533174": {
+   "file": "bodies/0147",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 1
+  },
+  "https://www.google-analytics.com/j/collect?v=1&_v=j102&a=612584439&t=pageview&_s=1&dl=https%3A%2F%2Fwww.rtp.pt%2Fnoticias%2F&ul=en-us&dt=RTP%20Not%C3%ADcias&sr=800x600&vp=1280x657&_u=ICDAgAABAAAAACAAI~&jid=749492600&gjid=877314402&cid=2108691117.1786637165&tid=UA-312913-1&_gid=1268466901.1786637165&_slc=1&z=1649120714": {
+   "file": "bodies/0148",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 3
+  },
+  "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202608100101/pubads_impl.js?cb=122880391": {
+   "file": "bodies/0149",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 657960
+  },
+  "https://securepubads.g.doubleclick.net/pagead/managed/dict/m202608130101/gpt": {
+   "file": "bodies/0150",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 65505
+  },
+  "https://www.rtp.pt/noticias/rc/view/player/rtp3/default": {
+   "file": "bodies/0151",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 3178
+  },
+  "https://www.rtp.pt/noticias/rc/view/player/1759276/default?autostart=false": {
+   "file": "bodies/0152",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 3183
+  },
+  "https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png?auto=format&w=860": {
+   "file": "bodies/0153",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 10110
+  },
+  "https://www.rtp.pt/noticias/rc/view/remote-load/pub/mrec_noticias_1": {
+   "file": "bodies/0154",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 356
+  },
+  "https://www.rtp.pt/services/rtpplay/?v=5&ch_k=rtpn": {
+   "file": "bodies/0155",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 225
+  },
+  "https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=860&q=90&auto=format": {
+   "file": "bodies/0156",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 50380
+  },
+  "https://ping.chartbeat.net/ping?h=noticias.rtp.pt&p=%2Fnoticias&u=wgBxcDLXsbLBvWy0M&d=rtp.pt&g=60571&g0=RTP&g1=RTP&n=1&f=00001&c=0&x=0&m=0&y=12054&o=1280&w=657&j=45&R=1&W=0&I=0&E=0&e=0&r=&PA=https%3A%2F%2Fwww.rtp.pt%2Fnoticias%2F&b=1577&t=D8IHCrCtRWvYCVzEIFBTLbonBtDz4u&V=152&i=RTP%20Not%C3%ADcias&tz=0&sn=1&sv=XTbp2DCjqrSDba_XNFCnyeBM2DG8&sr=external&sd=1&im=061b2cf3&_": {
+   "file": "bodies/0157",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://www.rtp.pt/services/rtpplay/?v=5&file=/nas2.share/informacao/2026/wMedalha15h_1308ww_geoblockrule_472542.mp4": {
+   "file": "bodies/0158",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 163
+  },
+  "https://cdn-images.rtp.pt/play/images/direitos_play_live2.0.jpg?v=2": {
+   "file": "bodies/0159",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 4750
+  },
+  "https://cdn.radiantmediatechs.com/rmp/rr/vgrp-o.json": {
+   "file": "bodies/0160",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 35033
+  },
+  "https://www.rtp.pt/noticias/rc/view/player/1759284/audioonly": {
+   "file": "bodies/0161",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 2700
+  },
+  "https://cdn-eu.readspeaker.com/script/17/webReader/r/r2918/ReadSpeaker.Styles-Button.css?v=3.8.10.2918": {
+   "file": "bodies/0162",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 79666
+  },
+  "https://fonts.gstatic.com/s/roboto/v51/KFO7CnqEu92Fr1ME7kSn66aGLdTylUAMa3yUBA.woff2": {
+   "file": "bodies/0163",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 43136
+  },
+  "https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=860&q=90&auto=format": {
+   "file": "bodies/0164",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 11736
+  },
+  "https://www.rtp.pt/services/rtpplay/?v=5&file=/wavrss/info/antena1noticiarios/DLT3770801_380581.mp3": {
+   "file": "bodies/0165",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 208
+  },
+  "https://www.rtp.pt/noticias/rc/view/home-last-articles/homepage/0/1": {
+   "file": "bodies/0166",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 19150
+  },
+  "https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=1200&q=90&auto=webp&format=pjgp": {
+   "file": "bodies/0167",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 15222
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/dc/dc7d3fb96fc134068a0e28ffb0347ce3?w=1200&q=90&rect=0,196,2001,1097&auto=webp&format=pjgp": {
+   "file": "bodies/0168",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 134272
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/29/298bfac8efe54e733ee6fb3957bbdd17?w=1200&q=90&rect=0,0,1440,789&auto=webp&format=pjgp": {
+   "file": "bodies/0169",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 100696
+  },
+  "https://cdn-images.rtp.pt/icm/noticias/images/9c/9ceb65c44fa93edbb9440a45cf3fb52a?w=1200&q=90&rect=0,290,4645,2547&auto=webp&format=pjgp": {
+   "file": "bodies/0170",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 222252
+  },
+  "https://imasdk.googleapis.com/js/sdkloader/ima3.js": {
+   "file": "bodies/0171",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 519907
+  },
+  "https://www.googletagmanager.com/a?id=G-CBZDN7F1HX&v=3&t=t&pid=903480333&gtm=45je68b1v897581779za200zd897581779&cv=2&rv=68b1&tc=17&tag_exp=115938466~115938468~118897920~118897930~119367802~119367810~119404703~119527020~119896802~120385422&es=1&e=*&eid=26&u=AgAAAIAAAAAAACCAAAAAEAAY&ut=BAAI&h=Ag&epr=1G&z=0": {
+   "file": "bodies/0172",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 0
+  },
+  "https://pagead2.googlesyndication.com/omsdk/releases/live/omweb-v1.js": {
+   "file": "bodies/0173",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 49086
+  },
+  "https://s0.2mdn.net/instream/video/client.js": {
+   "file": "bodies/0174",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 44701
+  },
+  "https://gapt.hit.gemius.pl/xgemius.js": {
+   "file": "bodies/0175",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 61999
+  },
+  "https://www.rtp.pt/common/player/lib/rmp-9.16.7/hls/hls.min.js": {
+   "file": "bodies/0176",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 413952
+  },
+  "https://gapt.hit.gemius.pl/fpdata.js?href=www.rtp.pt": {
+   "file": "bodies/0177",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 285
+  },
+  "https://www.googletagmanager.com/a?id=G-CBZDN7F1HX&v=3&t=t&pid=903480333&gtm=45je68b1v897581779za200zd897581779&cv=2&rv=68b1&tc=17&tag_exp=115938466~115938468~118897920~118897930~119367802~119367810~119404703~119527020~119896802~120385422&es=1&e=*&eid=27&u=AgAAAIAAAAAAACCAAAAAEAAY&ut=BAAI&h=Ag&epr=1G&z=0": {
+   "file": "bodies/0178",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 0
+  },
+  "https://streaming-live.rtp.pt/liverepeater/smil:rtpnHD.smil/rtp_playlist.m3u8?token=1786680000_8da58650df326b6f49fb284baccea4eb01587633": {
+   "file": "bodies/0179",
+   "status": 200,
+   "mime": "application/vnd.apple.mpegurl",
+   "bytes": 221
+  },
+  "https://fonts.gstatic.com/s/roboto/v51/KFO7CnqEu92Fr1ME7kSn66aGLdTylUAMaxKUBGEe.woff2": {
+   "file": "bodies/0180",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 20556
+  },
+  "https://streaming-live.rtp.pt/liverepeater/smil:rtpnHD.smil/chunklist_b2540000_slpor.m3u8": {
+   "file": "bodies/0181",
+   "status": 200,
+   "mime": "application/vnd.apple.mpegurl",
+   "bytes": 990
+  },
+  "https://gapt.hit.gemius.pl/__/_1786637166243/rexdot.js?l=100&sendf=24&id=px0wQn_3LwvnSI68k48WIsPc7zEyghtsAdS20LBvELT.W7&et=view&hsrc=1&initsonar=1&extra=gA%3Dnoticias%2Finicio-destaques&eventid=0&tz=0&fv=-&href=https%3A%2F%2Fwww.rtp.pt%2Fnoticias%2F&mtp=0&screen=800x600r1000&col=24&window=1280x657&vis=1&lsdata=iNp7GDJHsXrz6HrZEwSyk.ipERBxMm2h3PKEpChKvib.a7GQ4TfjpTvBbHSAEWsTCcArKvW2LyglfdkjXYX98l9g8aQU/w3QfPb3VjW75Z/&fpdata=Gj2wUDOgCC10P.eC.1oiSrEzd7MNpvKvxNpyE.4bC73.k7%7C1786637165%7C2%7C%7C%7C8%3A3%3A0&ltime=730&fr=1&ref=&inner=_ver%3D403%7C_min%3D1%7C_fpsrc%3Dload%7C_ch_arch%3Darm%7C_ch_pm%3DLinux%7C_ch_bits%3D64%7C_ch_mobile%3D0%7C_ch_wow64%3D0%7C_ch_brands%3D%7B%22Chromium%22%2C%22151.0.7922.108%22%7D%2C%7B%22Not%3DA%3FBrand%22%2C%2299.0.0.0%22%7D&exid=6a7deb6d1e768255&brts=1786637166&fpcap=": {
+   "file": "bodies/0182",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 195
+  },
+  "https://cdn-images.rtp.pt/common/img/favicon_noticias_2026.ico": {
+   "file": "bodies/0183",
+   "status": 200,
+   "mime": "image/vnd.microsoft.icon",
+   "bytes": 10806
+  },
+  "https://streaming-live.rtp.pt/liverepeater/smil:rtpnHD.smil/media_b2540000_slpor_440325.ts": {
+   "file": "bodies/0184",
+   "status": 200,
+   "mime": "video/mp2t",
+   "bytes": 2035100
+  },
+  "https://services.insurads.com/init?appId=QWQOVZ6C&h=https%3A%2F%2Fwww.rtp.pt%2Fnoticias%2F&tcfc=1&t=1786637166903": {
+   "file": "bodies/0185",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 42
+  },
+  "https://www.googletagmanager.com/a?id=G-CBZDN7F1HX&v=3&t=t&pid=903480333&gtm=45je68b1v897581779za200zd897581779&cv=2&rv=68b1&tc=17&tag_exp=115938466~115938468~118897920~118897930~119367802~119367810~119404703~119527020~119896802~120385422&es=1&e=gtm.load&eid=28&u=AgAAAIAAAAAAACCAAAAAEAAY&ut=BAAI&h=Ag&z=0": {
+   "file": "bodies/0186",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 0
+  },
+  "https://static.chartbeat.com/js/chartbeat_video.js": {
+   "file": "bodies/0187",
+   "status": 200,
+   "mime": "application/x-javascript",
+   "bytes": 75758
+  },
+  "https://www.googletagmanager.com/a?id=G-CBZDN7F1HX&v=3&t=t&pid=903480333&gtm=45je68b1v897581779za200zd897581779&cv=2&rv=68b1&tc=17&tag_exp=115938466~115938468~118897920~118897930~119367802~119367810~119404703~119527020~119896802~120385422&es=1&e=*&eid=29&u=AgAAAIAAAAAAACCAAAAAEAAY&ut=BAAI&h=Ag&epr=1G&z=0": {
+   "file": "bodies/0188",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 0
+  },
+  "https://www.googletagmanager.com/a?id=G-CBZDN7F1HX&v=3&t=t&pid=903480333&gtm=45je68b1v897581779za200zd897581779&cv=2&rv=68b1&tc=17&tag_exp=115938466~115938468~118897920~118897930~119367802~119367810~119404703~119527020~119896802~120385422&es=1&e=*&eid=30&u=AgAAAIAAAAAAACCAAAAAEAAY&ut=BAAI&h=Ag&epr=1G&z=0": {
+   "file": "bodies/0189",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 0
+  },
+  "https://ping.chartbeat.net/ping?h=video%40noticias.rtp.pt&g=60571&p=liverepeatersmilrtpnHDsmilrtpplaylistm3u8token17866800008da58650df326b6f49fb284baccea4eb01587633&i=Direto%20RTP3%20-%20RTP%20Not%C3%ADcias&g0=RTP&g1=RTP&u=BA8tQABoCTkcCy8Z5J&t=DSEkzTCo5vliBK8qNBCdtCCaBJeRYO&x=0&y=0&V=152&n=1&b=3513&r=&_vd=3600000&_vi=RTP%20Not%C3%ADcias&_vp=rtp.pt%2Fnoticias&_vh=rtp.pt&_pu=wgBxcDLXsbLBvWy0M&_pt=D8IHCrCtRWvYCVzEIFBTLbonBtDz4u&_pr=&_vdd=noticias.rtp.pt&_vt=ct&_vap=a1&_vs=s2&_vcs=0&_vbr=1024000&_vvs=0.004&_vpt=100&_vtn=https%3A%2F%2Fcdn-images.rtp.pt%2Fcommon%2Fimg%2Fchannels%2Flogos%2Fcolor%2Fhorizontal%2F64-042825131610.png&_vaup=auto&_vplt=radiantMP&_vce=0&c=0&W=0&R=1&I=0&E=0&j=20&tz=0&_": {
+   "file": "bodies/0190",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://www.googletagmanager.com/a?id=G-CBZDN7F1HX&v=3&t=t&pid=903480333&gtm=45je68b1v897581779za200zd897581779&cv=2&rv=68b1&tc=17&tag_exp=115938466~115938468~118897920~118897930~119367802~119367810~119404703~119527020~119896802~120385422&es=1&e=*&eid=31&u=AgAAAIAAAAAAACCAAAAAEAAY&ut=BAAI&h=Ag&epr=1G&z=0": {
+   "file": "bodies/0191",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 0
+  },
+  "https://streaming-live.rtp.pt/liverepeater/smil:rtpnHD.smil/media_b2540000_slpor_440326.ts": {
+   "file": "bodies/0192",
+   "status": 200,
+   "mime": "video/mp2t",
+   "bytes": 2146396
+  },
+  "https://ping.chartbeat.net/ping?h=noticias.rtp.pt&p=%2Fnoticias&u=wgBxcDLXsbLBvWy0M&d=rtp.pt&g=60571&g0=RTP&g1=RTP&n=1&f=00001&c=0.06&x=0&m=0&y=13412&o=1280&w=657&j=30&R=1&W=0&I=0&E=0&e=0&r=&PA=https%3A%2F%2Fwww.rtp.pt%2Fnoticias%2F&b=1577&t=D8IHCrCtRWvYCVzEIFBTLbonBtDz4u&V=152&tz=0&_vi=Direto%20RTP3%20-%20RTP%20Not%C3%ADcias&_vp=liverepeatersmilrtpnHDsmilrtpplaylistm3u8token17866800008da58650df326b6f49fb284baccea4eb01587633&_vdd=video%40noticias.rtp.pt&_vs=s2&_vt=ct&_vap=a1&_vtn=https%3A%2F%2Fcdn-images.rtp.pt%2Fcommon%2Fimg%2Fchannels%2Flogos%2Fcolor%2Fhorizontal%2F64-042825131610.png&_vd=3600000&sn=2&sv=XTbp2DCjqrSDba_XNFCnyeBM2DG8&sr=external&sd=1&im=061b2cf3&_": {
+   "file": "bodies/0193",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://streaming-live.rtp.pt/liverepeater/smil:rtpnHD.smil/media_b2540000_slpor_440327.ts": {
+   "file": "bodies/0194",
+   "status": 200,
+   "mime": "video/mp2t",
+   "bytes": 2071572
+  },
+  "https://ping.chartbeat.net/ping?h=video%40noticias.rtp.pt&g=60571&p=liverepeatersmilrtpnHDsmilrtpplaylistm3u8token17866800008da58650df326b6f49fb284baccea4eb01587633&i=Direto%20RTP3%20-%20RTP%20Not%C3%ADcias&g0=RTP&g1=RTP&u=BA8tQABoCTkcCy8Z5J&t=DSEkzTCo5vliBK8qNBCdtCCaBJeRYO&x=0&y=0&V=152&n=1&b=3513&_vd=3600000&_vi=RTP%20Not%C3%ADcias&_vp=rtp.pt%2Fnoticias&_vh=rtp.pt&_pu=wgBxcDLXsbLBvWy0M&_pt=D8IHCrCtRWvYCVzEIFBTLbonBtDz4u&_pr=&_vdd=noticias.rtp.pt&_vt=ct&_vap=a1&_vs=s2&_vcs=1&_vbr=1024000&_vvs=5.011&_vpt=5099.999999999998&_vtn=https%3A%2F%2Fcdn-images.rtp.pt%2Fcommon%2Fimg%2Fchannels%2Flogos%2Fcolor%2Fhorizontal%2F64-042825131610.png&_vaup=auto&_vplt=radiantMP&_vce=5&c=0.08&W=0&R=1&I=0&E=5&j=20&tz=0&_": {
+   "file": "bodies/0195",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  }
+ }
+}

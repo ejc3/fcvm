@@ -1,0 +1,28 @@
+(function ($) {
+
+  $.fn.callPlayer = function (options) {
+
+    var defaults = {
+      route:'/rc/view/player/rtp3',
+      appendOnLoad : null,
+    };
+    var settings = $.extend( {}, defaults, options);
+
+    return $(this).each(function() {
+      call(this,settings);
+    });
+
+  };
+
+  function call(trgt,settings){
+    $.ajax({
+      url: settings.route,
+    }).done(function( data ) {
+      var playerData = $(trgt).empty().append(data).fadeIn();
+      if (settings.appendOnLoad!==null){
+        playerData.append(settings.appendOnLoad);
+      }
+    });
+  };
+
+}(jQuery));

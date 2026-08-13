@@ -1,0 +1,229 @@
+$(function () {
+
+if ($(window).width() > 992) {
+  var floatingPlayerEvents = new Array("ended", "pause", "playing");
+  var inViewPortBol = true;
+
+  var closeButton = $('<button type="submit" aria-label="fechar janela de popup da emissão" class="closeButton floating-player-close-button"><i class="fal fa-times"></i></button>');
+  $(document.body).append(closeButton);
+
+  // Get existing videos
+  scanFloaterVideos();
+
+  var MutationObserver = window.MutationObserver || window.WebKitMutationObserver;
+
+  if( MutationObserver ){
+      // define a new observer
+      var obs = new MutationObserver(function(mutations, observer){
+        scanFloaterVideos();
+      })
+      // have the observer observe foo for changes in children
+      obs.observe( document.body, { childList:true, subtree:true });
+  }
+  else if( window.addEventListener ){
+      obj.addEventListener('DOMNodeInserted', scanFloaterVideos(), false);
+  }
+
+  function scanFloaterVideos() {
+      /*Getting Video Tag List and Creating instances*/
+      videoListRaw = $('.rmp-container');
+      for (i = 0; i < videoListRaw.length; i++) {
+          monitorVideo($(videoListRaw[i]));
+      }
+  }
+
+  function videoList() {
+    var l = $.map($('.floating-player-video'), function( val, i ) {
+      return $(val);
+    });
+    //console.log(l);
+    //console.log($('.floating-player-video'));
+    return l;
+  }
+
+  function monitorVideo(video) {
+    if ( video.hasClass("floating-player-video") ) {
+      return;
+    }
+
+    if ( video.find('video').size() == 0 ) {
+      return;
+    }
+
+    if ( video.data('floating-player-id') ) {
+      return;
+    }
+
+    video.addClass("floating-player-video");
+
+    k = $(videoList()).size() - 1;
+
+    video.data('floating-player-id', k);
+
+    for (var j in floatingPlayerEvents) {
+      video.find('video')[0].addEventListener(floatingPlayerEvents[j], videoTagPlayerhandler, false);
+    }
+
+  }
+
+  function currentPlayer() {
+    cp = $('.floating-video-current-player');
+    if ( cp.length == 0 ) {
+      return null;
+    }
+    return cp.first();
+  }
+
+  function setNewCurrentPlayer(player) {
+    if (player != currentPlayer()) {
+      videoList().map(function(val, i) {
+        val.removeClass('floating-video-current-player');
+      });
+      player.addClass('floating-video-current-player');
+
+      for (i = 0; i < videoList().length; i++) {
+        if (videoList()[i].hasClass('floating-video-current-player')) {
+            continue;
+        }
+        videoList()[i].find('video')[0].pause();
+      }
+
+    }
+  }
+
+  function videoTagPlayerhandler(e) {
+      /* Pause and End Rules*/
+      for (i = 0; i < videoList().length; i++) {
+          if (e.target == videoList()[i].find('video')[0]) {
+              //console.log(e.type);
+              if (e.type == "playing") {
+                  videoList()[i].removeClass("is-paused");
+                  videoList()[i].addClass("is-playing");
+                  setNewCurrentPlayer(videoList()[i]);
+              }
+              if (e.type == "pause") {
+                  videoList()[i].addClass("is-paused");
+                  videoList()[i].removeClass("is-playing");
+                  videoList()[i].find('video')[0].pause();
+              }
+              if (e.type == "ended") {
+                  videoList()[i].removeClass("is-playing");
+                  videoList()[i].removeClass("is-paused");
+              }
+          }
+      }
+
+      videohandler();
+  };
+
+  function videohandler() {
+      if (!currentPlayer()) {
+        return;
+      }
+
+      if (!closeButton.length) {
+         return;
+      }
+
+      closeButton.on("click", function (e) {
+          if (currentPlayer().hasClass("floating-player-is-sticky")) {
+              $('#fp_ph_' + currentPlayer().data('floating-player-id')).remove();
+              currentPlayer().removeClass("floating-player-is-sticky");
+              closeFloatVideo();
+              currentPlayer().addClass("floating-player-is-dismissed")
+
+              $(currentPlayer()[0]).find('video')[0].pause();
+
+              for (i = 0; i < videoList().length; i++) {
+                  if (currentPlayer() == videoList()[i]) {
+                      $(videoList()[i]).find('video')[0].pause();
+                  }
+              }
+
+          } else {
+              for (i = 0; i < videoList().length; i++) {
+                  if (currentPlayer() != videoList()[i]) {
+                      $('#fp_ph_' + currentPlayer().data('floating-player-id')).remove();
+                      videoList()[i].removeClass("floating-player-is-sticky");
+                      closeFloatVideo();
+                  }
+              }
+          }
+          return false;
+      });
+  }
+
+
+
+  window.addEventListener('scroll', function () {
+      if (!currentPlayer()) {
+        return;
+      }
+
+      if (currentPlayer().hasClass('floating-player-is-dismissed')) {
+        return;
+      }
+
+      inViewPortBol = inViewPort();
+      //console.log(inViewPortBol);
+      //console.log(currentPlayer.hasClass("is-playing"));
+      if (!inViewPortBol && currentPlayer().hasClass("is-playing")) {
+          for (i = 0; i < videoList().length; i++) {
+              if (currentPlayer().attr('id') != videoList()[i].attr('id')) {
+                 $('#fp_ph_' + videoList()[i].data('floating-player-id')).remove();
+                 videoList()[i].removeClass("floating-player-is-sticky");
+              }
+          }
+
+          if (!currentPlayer().hasClass("floating-player-is-sticky")) {
+              w = currentPlayer().outerWidth();
+              h = currentPlayer().outerHeight();
+              ph = $('<div id="fp_ph_' + currentPlayer().data('floating-player-id') + '"></div>');
+              ph.css('width', w);
+              ph.css('height', h);
+
+              ph.insertAfter( currentPlayer() );
+              currentPlayer().addClass("floating-player-is-sticky");
+              openFloatVideo();
+          }
+
+      } else {
+          if (currentPlayer().hasClass("floating-player-is-sticky")) {
+              $('#fp_ph_' + currentPlayer().data('floating-player-id')).remove();
+              currentPlayer().removeClass("floating-player-is-sticky");
+              closeFloatVideo();
+          }
+      }
+  });
+
+  function inViewPort() {
+    var elem = null;
+    if (currentPlayer()) {
+        if ( $('#fp_ph_' + currentPlayer().data('floating-player-id')).size() > 0 ) {
+          elem = $('#fp_ph_' + currentPlayer().data('floating-player-id'))[0];
+        } else {
+          elem = currentPlayer()[0];
+        }
+    }
+    else {
+      return true;
+    }
+
+    var videoParentLocal = elem.getBoundingClientRect();
+
+    return videoParentLocal.bottom > 0 &&
+        (videoParentLocal.top+10) < (window.innerHeight || document.documentElement.clientHeight);
+
+  }
+
+  function openFloatVideo() {
+      closeButton.css('display',"block");
+  }
+
+
+
+  function closeFloatVideo() {
+      closeButton.css('display',"none");
+  }
+}
+});

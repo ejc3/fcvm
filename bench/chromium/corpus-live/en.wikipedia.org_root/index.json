@@ -1,0 +1,232 @@
+{
+ "url": "https://en.wikipedia.org/",
+ "captured_utc": "2026-08-13T16:10:53Z",
+ "redirects": {
+  "https://en.wikipedia.org/": {
+   "status": 301,
+   "location": "https://en.wikipedia.org/wiki/Main_Page"
+  },
+  "https://en.wikipedia.org/wiki/Special:CentralAutoLogin/start?useformat=desktop&type=script&usesul3=1": {
+   "status": 302,
+   "location": "https://auth.wikimedia.org/metawiki/wiki/Special:CentralAutoLogin/checkLoggedIn?useformat=desktop&wikiid=enwiki&usesul3=1&type=script"
+  }
+ },
+ "resources": {
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=site.styles&only=styles&skin=vector-2022": {
+   "file": "bodies/0000",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 6658
+  },
+  "https://en.wikipedia.org/static/images/mobile/copyright/wikipedia-wordmark-en-25.svg": {
+   "file": "bodies/0001",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 9865
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=ext.uls.interlanguage%7Cext.visualEditor.desktopArticleTarget.noscript%7Cext.wikimediamessages.styles%7Cmediawiki.skinning.content.parsoid%7Cmediawiki.skins.legacy%7Cskins.vector.icons%2Cstyles%7Cskins.vector.search.codex.styles%7Cwikibase.client.init&only=styles&skin=vector-2022": {
+   "file": "bodies/0002",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 209284
+  },
+  "https://en.wikipedia.org/wiki/Main_Page": {
+   "file": "bodies/0003",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 251042
+  },
+  "https://en.wikipedia.org/static/images/icons/enwiki-25.svg": {
+   "file": "bodies/0004",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 115918
+  },
+  "https://en.wikipedia.org/static/images/mobile/copyright/wikipedia-tagline-en-25.svg": {
+   "file": "bodies/0005",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 15219
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/2/20/ECWackett1958.jpg/250px-ECWackett1958.jpg?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0006",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 26058
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0c/The_Building_Worker_statue.jpg/250px-The_Building_Worker_statue.jpg?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0007",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 47664
+  },
+  "https://upload.wikimedia.org/wikipedia/en/thumb/4/4a/Commons-logo.svg/40px-Commons-logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0008",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1114
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1c/Pereira_after_the_earthquake_-_WCK_%28cropped%29.jpg/250px-Pereira_after_the_earthquake_-_WCK_%28cropped%29.jpg?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0009",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 26938
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/1876Rhinemaidens_%28cropped%29.jpg/250px-1876Rhinemaidens_%28cropped%29.jpg?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0010",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 18804
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/8/8d/A_big_male_Addax_showing_as_the_power_of_his_horns.jpg/500px-A_big_male_Addax_showing_as_the_power_of_his_horns.jpg?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0011",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 39658
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/7/75/Wikimedia_Community_Logo.svg/40px-Wikimedia_Community_Logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0012",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1644
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fa/Wikibooks-logo.svg/40px-Wikibooks-logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0013",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1754
+  },
+  "https://en.wikipedia.org/w/load.php?modules=skins.vector.icons&image=menu&format=original&lang=en&skin=vector-2022&version=1ko18": {
+   "file": "bodies/0014",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 220
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a6/MediaWiki-2020-icon.svg/40px-MediaWiki-2020-icon.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0015",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 2252
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0c/Wikifunctions-logo.svg/40px-Wikifunctions-logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0016",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1216
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fa/Wikiquote-logo.svg/40px-Wikiquote-logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0017",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1650
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/d/df/Wikispecies-logo.svg/40px-Wikispecies-logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0018",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 2766
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0b/Wikiversity_logo_2017.svg/60px-Wikiversity_logo_2017.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0019",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 656
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/f/ff/Wikidata-logo.svg/60px-Wikidata-logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0020",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 244
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Wikivoyage-Logo-v3-icon.svg/40px-Wikivoyage-Logo-v3-icon.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0021",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 564
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4c/Wikisource-logo.svg/40px-Wikisource-logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0022",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1752
+  },
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/9/99/Wiktionary-logo-en-v2.svg/40px-Wiktionary-logo-en-v2.svg.png?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail": {
+   "file": "bodies/0023",
+   "status": 200,
+   "mime": "image/webp",
+   "bytes": 1240
+  },
+  "https://en.wikipedia.org/w/load.php?modules=skins.vector.icons&image=verticalEllipsis&format=original&lang=en&skin=vector-2022&version=1ko18": {
+   "file": "bodies/0024",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 230
+  },
+  "https://en.wikipedia.org/w/load.php?modules=skins.vector.icons&image=language&variant=progressive&format=original&lang=en&skin=vector-2022&version=1ko18": {
+   "file": "bodies/0025",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 641
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=startup&only=scripts&raw=1&skin=vector-2022": {
+   "file": "bodies/0026",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 69026
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=ext.gadget.ReferenceTooltips%2Cswitcher&skin=vector-2022&version=a22z1": {
+   "file": "bodies/0027",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 23241
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=ext.visualEditor.core.utils.parsing%7Cext.visualEditor.desktopArticleTarget.init%7Cext.visualEditor.progressBarWidget%2CsupportCheck%2CtargetLoader%2CtempWikitextEditorWidget%2Ctrack%2Cve&skin=vector-2022&version=lg84c": {
+   "file": "bodies/0028",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 63114
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=ext.centralNotice.bannerHistoryLogger%2CchoiceData%2Cdisplay%2CgeoIP%2CimpressionDiet%2CkvStore%2ClargeBannerLimit%2ClegacySupport%2CstartUp%7Cext.centralauth.centralautologin%7Cext.checkUser.clientHints%7Cext.cx.eventlogging.campaigns%7Cext.echo.centralauth%7Cext.eventLogging%2CnavigationTiming%2Cpopups%2CtestKitchen%2CwikimediaEvents%7Cext.eventLogging.metricsPlatform%7Cext.uls.interface%2Cpreferences%2Cwebfonts%7Cext.urlShortener.toolbar%7Cext.wikimediaEvents.testKitchen%7Cjquery%2Coojs%2Csite%7Cjquery.client%2CtextSelection%7Cmediawiki.String%2CTitle%2Capi%2Cbase%2Ccldr%2Ccookie%2Cexperiments%2CjqueryMsg%2Clanguage%2Crouter%2Cstorage%2Cuser%2Cutil%2CvisibleTimeout%7Cmediawiki.editfont.styles%7Cmediawiki.libs.pluralruleparser%7Cmediawiki.page.ready%7Cmediawiki.page.watch.ajax%7Cmmv.bootstrap%2Ccodex%7Cskins.vector.clientPreferences%2Cjs%7Cskins.vector.icons.js%7Cwikibase.client.vector-2022%7Cwikibase.databox.fromWikidata&skin=vector-2022&version=1us8a": {
+   "file": "bodies/0029",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 827578
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=mw.config.values.wbCurrentSiteDetails%2CwbRepo%7Coojs-ui.styles.icons-editing-core&skin=vector-2022&version=1f6qt": {
+   "file": "bodies/0030",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 14956
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=ext.centralauth.ForeignApi%7Cext.cite.referencePreviews%7Cext.math.popup%7Cext.popups.main%7Cmediawiki.ForeignApi%7Cmediawiki.ForeignApi.core&skin=vector-2022&version=10vni": {
+   "file": "bodies/0031",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 134388
+  },
+  "https://en.wikipedia.org/static/favicon/wikipedia.ico": {
+   "file": "bodies/0032",
+   "status": 200,
+   "mime": "image/vnd.microsoft.icon",
+   "bytes": 2734
+  },
+  "https://auth.wikimedia.org/metawiki/wiki/Special:CentralAutoLogin/checkLoggedIn?useformat=desktop&wikiid=enwiki&usesul3=1&type=script": {
+   "file": "bodies/0033",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 254
+  },
+  "https://en.wikipedia.org/w/load.php?lang=en&modules=ext.uls.rewrite.entrypoints&skin=vector-2022&version=hxbks": {
+   "file": "bodies/0034",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 1857
+  },
+  "https://en.wikipedia.org/ins-502b/v2/events?hasty=true": {
+   "file": "bodies/0035",
+   "status": 202,
+   "mime": "text/plain",
+   "bytes": 0
+  }
+ }
+}

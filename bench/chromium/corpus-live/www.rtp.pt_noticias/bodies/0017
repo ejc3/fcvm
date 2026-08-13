@@ -1,0 +1,46 @@
+(function ($) {
+    document.addEventListener("DOMContentLoaded", function () {
+        const lazyLoadHolders = document.querySelectorAll(
+            '[pub-data-lazy-load="true"]'
+        );
+
+        lazyLoadHolders.forEach((lazyLoadComponent) => {
+            const componentUrl = lazyLoadComponent.getAttribute(
+                "pub-data-component-url"
+            );
+
+            function fetchComponent() {
+                fetch(componentUrl)
+                    .then((response) => response.text())
+                    .then((html) => {
+                        lazyLoadComponent.innerHTML = html;
+                        try {
+                            var baseAdUnit = lazyLoadComponent.getAttribute("pub-data-ad-unit");
+                            var adUnitClass = baseAdUnit + '-container-ads';
+                            var adUnitId = $(html).find('.' + adUnitClass)[0].id;
+                            
+                            if (adUnitId && baseAdUnit && ad_slots_disponiveis[baseAdUnit]) {
+                                
+                                if (typeof googletag === 'object' && typeof RTPPub.adCreateSlot === 'function') {  
+                                    RTPPub.adCreateSlot(adUnitId, baseAdUnit);       
+                                }
+
+                            } 
+                        } catch (adError) {
+                            //console.error("==>> Error creating ad slot:", adError);
+                        }
+                    });
+            }
+
+            const observer = new IntersectionObserver((entries, observer) => {
+                entries.forEach((entry) => {
+                    if (entry.isIntersecting) {
+                        fetchComponent();
+                        observer.unobserve(entry.target);
+                    }
+                });
+            });
+            observer.observe(lazyLoadComponent);
+        });
+    });
+})(jQuery);

@@ -177,6 +177,10 @@ fi
 #                          dirtied rootfs extents (and destroy cost) down
 # remaining flags        : startup-variance reduction (no first-run, no background
 #                          fetches, no crash uploader, fixed window)
+# CHROMIUM_EXTRA_FLAGS   : env passthrough (word-split on purpose) for run-scoped
+#                          flags, e.g. --host-resolver-rules="MAP * 127.0.0.1" for
+#                          the corpus replay arm. Empty by default; NEVER baked
+#                          into a golden.
 HOME=/tmp chromium \
     --headless=new \
     --no-sandbox \
@@ -196,6 +200,7 @@ HOME=/tmp chromium \
     --disable-component-update \
     --user-data-dir=/tmp/chrome-profile \
     $SITE_ISO_FLAGS \
+    ${CHROMIUM_EXTRA_FLAGS:-} \
     about:blank &
 CHROME_PID=$!
 wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp

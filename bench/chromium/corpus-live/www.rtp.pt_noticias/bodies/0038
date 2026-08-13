@@ -1,0 +1,144 @@
+(function($) {
+
+    var HomeLastArticles = function($el, options) {
+
+        this._defaults = {
+            container     : null,  // Dom element that is the container of the playlist (sidebar)
+            dataUrl       : null,
+            area          : 'homepage',
+            currentPage   : 0,
+            isLoading     : false,
+            pageCode      : 0,
+            noMoreContent : false,
+            loader        : null,
+        };
+
+        this._options = $.extend(true, {}, this._defaults, options);
+
+        this.options = function(options) {
+            return (options) ?
+                $.extend(true, this._options, options) :
+                this._options;
+        };
+
+        this.container = function() {
+            return this._options['container'];
+        }
+
+        this.setUpWaypoint = function() {
+            pl = this;    
+            $(this.container()).waypoint({
+              handler: function (direction) {
+                pl.loadNextPage();
+              },
+              offset: 'bottom-in-view'
+            });
+        }
+
+        this.loadNextPage = function () {
+
+            if (this._options['isLoading'] == true) {
+              return;
+            }
+            if (this._options['noMoreContent'] == true) {
+              return;
+            }
+
+            page_to_load = this._options['currentPage'] + 1;
+
+            this._options['isLoading'] = true;
+            if ( this._options['loader'] != null ) {
+              this._options['loader'].show();
+            }
+
+            pl = this;
+            $.ajax({
+              url: this._options['dataUrl'] +
+                   this._options['area'] + '/' + 
+                   this._options['pageCode'] + '/' + 
+                   page_to_load
+            })
+            .done(function( data ) {
+              if (data == '') {
+                pl._options['noMoreContent'] == true
+              } else {
+                e = $(data);
+                $(e).find("time.timeago").humanDate();
+                pl.container().append(e);
+                pl._options['pageCode']=pl.container().find('[data-scroll-list-item-id]').last().data('scrollListItemId')|| 0;
+              }
+              pl._options['currentPage'] = page_to_load;
+              pl._options['isLoading'] = false;
+              if ( pl._options['loader'] != null ) {
+                pl._options['loader'].show();
+              }
+              Waypoint.refreshAll();
+            });
+        }
+
+        this.init = function() {
+          this._options['container'] = $el;
+          this.loadNextPage();
+          this.setUpWaypoint();
+        }
+
+        this.init();
+
+    };
+
+    $.fn.homeLastArticles = function(methodOrOptions) {
+
+        var method = (typeof methodOrOptions === 'string') ? methodOrOptions : undefined;
+
+        if (method) {
+            var homeLastArticles_ = [];
+
+            function getHomeLastArticles() {
+                var $el          = $(this);
+                var homeLastArticles = $el.data('homeLastArticles');
+
+                homeLastArticles_.push(homeLastArticles);
+            }
+
+            this.each(getHomeLastArticles);
+
+            var args    = (arguments.length > 1) ? Array.prototype.slice.call(arguments, 1) : undefined;
+            var results = [];
+
+            function applyMethod(index) {
+                var homeLastArticles = homeLastArticles_[index];
+
+                if (!homeLastArticles) {
+                    console.warn('$.homeLastArticles not instantiated yet');
+                    console.info(this);
+                    results.push(undefined);
+                    return;
+                }
+
+                if (typeof homeLastArticles[method] === 'function') {
+                    var result = homeLastArticles[method].apply(articlePlaylist, args);
+                    results.push(result);
+                } else {
+                    console.warn('Method \'' + method + '\' not defined in $.articlePlaylist');
+                }
+            }
+
+            this.each(applyMethod);
+
+            return (results.length > 1) ? results : results[0];
+        } else {
+            var options = (typeof methodOrOptions === 'object') ? methodOrOptions : undefined;
+
+            function init() {
+                var $el          = $(this);
+                var homeLastArticles = new HomeLastArticles($el, options);
+
+                $el.data('homeLastArticles', homeLastArticles);
+            }
+
+            return this.each(init);
+        }
+
+    };
+
+})(jQuery);

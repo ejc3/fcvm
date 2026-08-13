@@ -1,0 +1,1 @@
+{"tag":"cf-speed-brain","prefetch":[{"eagerness":"conservative","source":"document","where":{"and":[{"href_matches":"/*","relative_to":"document"}]}}]}

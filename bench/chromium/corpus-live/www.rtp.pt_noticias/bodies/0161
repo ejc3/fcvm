@@ -1,0 +1,59 @@
+<div id="player_1759284" class="embed-responsive-item color-red">
+          <img itemprop="image"
+           class="img-fluid"
+           srcset="https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=140&amp;q=90&amp;auto=format 140w, https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=350&amp;q=90&amp;auto=format 350w, https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=470&amp;q=90&amp;auto=format 470w, https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=615&amp;q=90&amp;auto=format 615w, https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=860&amp;q=90&amp;auto=format 860w, https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=1200&amp;q=90&amp;auto=format 1200w"
+           sizes="(min-width:1200px) 860px, (min-width:992px) 615px, (min-width:768px) 470px, (min-width:568px) 350px, (min-width:300px) 140px"
+           src="https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=860&amp;q=90" >
+      </div>
+
+      <script>
+    var player16575329 = new RTPPlayer({
+              id: "player_1759284",
+                    fileKey: "/wavrss/info/antena1noticiarios/DLT3770801_380581.mp3",
+                  modules: [
+        { name: 'RTPChartbeat', bucket: RTPRequireScriptBucketLevel.chartbeat, params: { domain: "noticias.rtp.pt"  } },
+      ],
+      metadata: {
+        program: {
+          title: "16h Migrações: Bruxelas alerta para desinformação em Ceuta"
+        }
+      },
+                      file: "https://cdn-ondemand.rtp.pt/nas2.share//wavrss/info/antena1noticiarios/DLT3770801_380581.mp3",
+                                      streamType:"ondemand",
+                  controls:false,
+                  mediaType: "audio",
+                  poster: "https://cdn-images.rtp.pt/noticias/images/antena1_default.png?w=860&q=90",
+                              ads: true,
+                    autostart: false,
+                    muted: false,
+                                    audioOnly: true,
+                  hideFullscreen: true,
+                  sharing: false,
+                  subadUnit: "Noticias",
+                  pip: false,
+            extraSettings: { 
+                  airplay: false
+              }
+    });
+
+      
+      player16575329.newPlayer();
+
+      
+      const rmpContainerplayer_1759284 = document.getElementById("player_1759284");
+
+      rmpContainerplayer_1759284.addEventListener("rtpinstanceavailable", function() { 
+
+         
+
+                      player16575329.instance.on("play", function() {
+        player16575329.instance.setMute(false);
+        player16575329.instance.setVolume(1);
+    });
+          
+                
+      });
+      
+    </script>
+  
+  

@@ -1,0 +1,42 @@
+{
+ "url": "https://news.ycombinator.com/",
+ "captured_utc": "2026-08-13T16:05:24Z",
+ "resources": {
+  "https://news.ycombinator.com/": {
+   "file": "bodies/0000",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 34793
+  },
+  "https://news.ycombinator.com/news.css?2HYqxKC9JAyJ9r5n98uc": {
+   "file": "bodies/0001",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 7350
+  },
+  "https://news.ycombinator.com/hn.js?2HYqxKC9JAyJ9r5n98uc": {
+   "file": "bodies/0002",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 5217
+  },
+  "https://news.ycombinator.com/y18.svg": {
+   "file": "bodies/0003",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 315
+  },
+  "https://news.ycombinator.com/s.gif": {
+   "file": "bodies/0004",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://news.ycombinator.com/triangle.svg": {
+   "file": "bodies/0005",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 131
+  }
+ }
+}

@@ -1,0 +1,1188 @@
+{
+ "url": "https://www.theguardian.com/international",
+ "captured_utc": "2026-08-13T16:06:22Z",
+ "resources": {
+  "https://assets.guim.co.uk/static/frontend/fonts/guardian-headline/noalts-not-hinted/GHGuardianHeadline-Bold.woff2": {
+   "file": "bodies/0000",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 16492
+  },
+  "https://assets.guim.co.uk/static/frontend/fonts/guardian-textegyptian/noalts-not-hinted/GuardianTextEgyptian-Regular.woff2": {
+   "file": "bodies/0001",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 16792
+  },
+  "https://i.guim.co.uk/img/media/2c4f83b2d7e4e8128144231946cccc301483bda7/503_0_1350_1080/master/1350.jpg?width=98&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0002",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 3588
+  },
+  "https://i.guim.co.uk/img/media/370114526e54695f94dbd444556647b7d823103c/0_0_5000_4000/master/5000.jpg?width=98&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0003",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 2579
+  },
+  "https://www.theguardian.com/international": {
+   "file": "bodies/0004",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 1382929
+  },
+  "https://assets.guim.co.uk/static/frontend/css/print.css": {
+   "file": "bodies/0005",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 75
+  },
+  "https://assets.guim.co.uk/assets/index.client.web.c06bb65b0e89b331fe95.js": {
+   "file": "bodies/0006",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 173486
+  },
+  "https://i.guim.co.uk/img/media/7cdf83c55d79a96a161395d5c73576671830d88a/31_0_5000_4000/master/5000.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0007",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 9244
+  },
+  "https://i.guim.co.uk/img/uploads/2020/03/22/Robert-Reich,-L.png?width=150&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0008",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 4511
+  },
+  "https://i.guim.co.uk/img/uploads/2025/04/02/Polly_Hudson,_R.png?width=90&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0009",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 2650
+  },
+  "https://i.guim.co.uk/img/uploads/2025/09/08/Jules_Darmanin,_L.png?width=90&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0010",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 2493
+  },
+  "https://i.guim.co.uk/img/media/501f7dc88b2aca174fb4d359c71fa885db8af59e/601_0_3001_2401/master/3001.jpg?width=98&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0011",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 2131
+  },
+  "https://i.guim.co.uk/img/media/79a9c56b77899db42e377d9776163393b7954279/301_14_6641_5315/master/6641.jpg?width=98&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0012",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 2296
+  },
+  "https://i.guim.co.uk/img/uploads/2020/03/22/Robert-Reich,-L.png?width=98&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0013",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 2880
+  },
+  "https://i.guim.co.uk/img/media/0ef7df969b94b8bee721d07af588d6b2a3454c8d/0_0_5000_4000/master/5000.jpg?width=98&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0014",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 2458
+  },
+  "https://i.guim.co.uk/img/media/6460023264d60122192ce6de3b86eb5f2bdd2623/730_0_5000_4000/master/5000.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0015",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 7824
+  },
+  "https://i.guim.co.uk/img/media/e9039afefd31782618d1d335fe5a5b9a4b674d36/115_0_2729_2184/master/2729.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0016",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 5846
+  },
+  "https://i.guim.co.uk/img/media/89d7e519394a8ff8df46f7fa74e2adcd7bf257f5/250_0_2501_2000/master/2501.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0017",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 6801
+  },
+  "https://i.guim.co.uk/img/media/10fef22e4aad248b556ea600aa2bc445896b973f/243_0_3100_2480/master/3100.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0018",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 6128
+  },
+  "https://i.guim.co.uk/img/media/926de377daf3d455ab452397d131d8d39c41f462/1949_201_2022_1617/master/2022.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0019",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 6355
+  },
+  "https://i.guim.co.uk/img/media/e0797cbf5b7b8e9e46c09080e8ea5674cc6ae6d2/286_0_3402_2722/master/3402.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0020",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 10541
+  },
+  "https://i.guim.co.uk/img/uploads/2022/03/19/Moira_Donegan,_L.png?width=150&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0021",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 4950
+  },
+  "https://i.guim.co.uk/img/uploads/2025/05/21/George_Monbiot.png?width=90&dpr=1&s=none&crop=1%3A1": {
+   "file": "bodies/0022",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 3099
+  },
+  "https://i.guim.co.uk/img/media/c8ac626264763f988ad635ecde75279c8b213b8d/889_0_2886_2309/master/2886.jpg?width=620&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0023",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 39570
+  },
+  "https://i.guim.co.uk/img/media/04128edbdc76a1cc544f0735b4328144d0c9382d/555_0_5715_4573/master/5715.jpg?width=620&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0024",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 54475
+  },
+  "https://i.guim.co.uk/img/media/28002c94b965f2d20d8d0e3d27566bd16c249300/576_0_6400_5120/master/6400.jpg?width=620&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0025",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 47975
+  },
+  "https://assets.guim.co.uk/assets/frameworks.client.web.0f4ca0ca54a9adc16639.js": {
+   "file": "bodies/0026",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 53662
+  },
+  "https://assets.guim.co.uk/static/frontend/fonts/guardian-textsans/noalts-not-hinted/GuardianTextSans-Regular.woff2": {
+   "file": "bodies/0027",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 15416
+  },
+  "https://assets.guim.co.uk/commercial/d90b873bb264d3d29936/graun.standalone.commercial.js": {
+   "file": "bodies/0028",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 60490
+  },
+  "https://assets.guim.co.uk/static/frontend/fonts/guardian-textsans/noalts-not-hinted/GuardianTextSans-Bold.woff2": {
+   "file": "bodies/0029",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 17376
+  },
+  "https://assets.guim.co.uk/static/frontend/fonts/guardian-headline/noalts-not-hinted/GHGuardianHeadline-Medium.woff2": {
+   "file": "bodies/0030",
+   "status": 200,
+   "mime": "font/woff2",
+   "bytes": 16612
+  },
+  "https://assets.guim.co.uk/static/frontend/manifest.json": {
+   "file": "bodies/0031",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 1100
+  },
+  "https://assets.guim.co.uk/polyfill.io/v3/polyfill.min.js?rum=0&features=es6%2Ces7%2Ces2017%2Ces2018%2Ces2019%2Cdefault-3.6%2CHTMLPictureElement%2CIntersectionObserver%2CIntersectionObserverEntry%2CURLSearchParams%2Cfetch%2CNodeList.prototype.forEach%2Cnavigator.sendBeacon%2Cperformance.now%2CPromise.allSettled&flags=gated&callback=guardianPolyfilled&unknown=polyfill&cacheClear=1": {
+   "file": "bodies/0032",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 168
+  },
+  "https://assets.guim.co.uk/assets/3859.client.web.e00a2286371b48211f54.js": {
+   "file": "bodies/0033",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 810
+  },
+  "https://assets.guim.co.uk/assets/1141.client.web.56e271b8e712fe2348b2.js": {
+   "file": "bodies/0034",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 815
+  },
+  "https://assets.guim.co.uk/assets/7688.client.web.8a3cf91ead3a90607990.js": {
+   "file": "bodies/0035",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1026
+  },
+  "https://assets.guim.co.uk/assets/1510.client.web.93a97776e6f93c745a02.js": {
+   "file": "bodies/0036",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 622
+  },
+  "https://assets.guim.co.uk/assets/Metrics-island.client.web.2e075aa1f5e052a59b7f.js": {
+   "file": "bodies/0037",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 10164
+  },
+  "https://assets.guim.co.uk/assets/SetABTests-island.client.web.2c1d69d3ebe2b13331bf.js": {
+   "file": "bodies/0038",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 6292
+  },
+  "https://assets.guim.co.uk/assets/SetAdTargeting-island.client.web.72a935b53bcaea279069.js": {
+   "file": "bodies/0039",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 706
+  },
+  "https://assets.guim.co.uk/assets/562.client.web.e76f231abdc7eda73b58.js": {
+   "file": "bodies/0040",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 20604
+  },
+  "https://assets.guim.co.uk/assets/5212.client.web.90e34cbc424c6087616c.js": {
+   "file": "bodies/0041",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 21509
+  },
+  "https://assets.guim.co.uk/assets/77.client.web.d98792fed7d2984c6870.js": {
+   "file": "bodies/0042",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 9750
+  },
+  "https://assets.guim.co.uk/assets/3079.client.web.8c1fa311bed02e441c46.js": {
+   "file": "bodies/0043",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 6781
+  },
+  "https://assets.guim.co.uk/assets/5292.client.web.2539eea5cde085f21b00.js": {
+   "file": "bodies/0044",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 11817
+  },
+  "https://assets.guim.co.uk/assets/TopBar-island.client.web.2d37c0b4da262a68720d.js": {
+   "file": "bodies/0045",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 10896
+  },
+  "https://assets.guim.co.uk/assets/187.client.web.5db44cc02486eeb6e0e4.js": {
+   "file": "bodies/0046",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 25027
+  },
+  "https://assets.guim.co.uk/assets/Titlepiece-island.client.web.0c9e0841cd35486b5cbc.js": {
+   "file": "bodies/0047",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 37830
+  },
+  "https://sourcepoint.theguardian.com/unified/wrapperMessagingWithoutDetection.js": {
+   "file": "bodies/0048",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 141342
+  },
+  "https://assets.guim.co.uk/assets/9831.client.web.42a753cdd91f7486215f.js": {
+   "file": "bodies/0049",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 10038
+  },
+  "https://assets.guim.co.uk/assets/250.client.web.f58729f2c379eddc8acd.js": {
+   "file": "bodies/0050",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 16301
+  },
+  "https://assets.guim.co.uk/assets/5647.client.web.0ea424086f47cfde48fa.js": {
+   "file": "bodies/0051",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 11146
+  },
+  "https://assets.guim.co.uk/assets/4132.client.web.7db1ae8608261b25d0b5.js": {
+   "file": "bodies/0052",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 8349
+  },
+  "https://assets.guim.co.uk/assets/1467.client.web.6f2b1aa1d584ea5dc8b8.js": {
+   "file": "bodies/0053",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 10518
+  },
+  "https://assets.guim.co.uk/assets/8009.client.web.6e52b62ea44e74e4b221.js": {
+   "file": "bodies/0054",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 11772
+  },
+  "https://assets.guim.co.uk/assets/6711.client.web.993e9e8a352ee312b887.js": {
+   "file": "bodies/0055",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 126263
+  },
+  "https://assets.guim.co.uk/assets/9566.client.web.b1957af082fa0112610b.js": {
+   "file": "bodies/0056",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 19012
+  },
+  "https://assets.guim.co.uk/assets/ScrollableHighlights-island.client.web.b33b6daf766e7fb35235.js": {
+   "file": "bodies/0057",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 27612
+  },
+  "https://sourcepoint.theguardian.com/wrapper/v2/meta-data?hasCsp=true&accountId=1257&env=prod&metadata=%7B%22usnat%22%3A%7B%7D%7D&propertyId=7417&scriptVersion=4.40.2&scriptType=unified": {
+   "file": "bodies/0058",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 244
+  },
+  "https://sourcepoint.theguardian.com/unified/4.40.2/usnat.f12613136193900e32e2.bundle.js": {
+   "file": "bodies/0059",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 414024
+  },
+  "https://sourcepoint.theguardian.com/wrapper/v2/messages?hasCsp=true&env=prod&body=%7B%22accountId%22%3A1257%2C%22campaignEnv%22%3A%22prod%22%2C%22campaigns%22%3A%7B%22usnat%22%3A%7B%22consentStatus%22%3A%7B%7D%2C%22hasLocalData%22%3Afalse%2C%22targetingParams%22%3A%7B%22framework%22%3A%22usnat%22%7D%7D%7D%2C%22clientMMSOrigin%22%3A%22https%3A%2F%2Fsourcepoint.theguardian.com%22%2C%22hasCSP%22%3Atrue%2C%22includeData%22%3A%7B%22localState%22%3A%7B%22type%22%3A%22string%22%7D%2C%22actions%22%3A%7B%22type%22%3A%22RecordString%22%7D%2C%22cookies%22%3A%7B%22type%22%3A%22RecordString%22%7D%7D%2C%22propertyHref%22%3A%22https%3A%2F%2Fwww.theguardian.com%2Finternational%22%2C%22propertyId%22%3A7417%7D&localState=null&metadata=%7B%22usnat%22%3A%7B%22applies%22%3Atrue%7D%7D&nonKeyedLocalState=null&ch=481980003915d&scriptVersion=4.40.2&scriptType=unified": {
+   "file": "bodies/0060",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 21055
+  },
+  "https://assets.guim.co.uk/commercial/d05d8b57a793b2739a9f/graun.677.commercial.js": {
+   "file": "bodies/0061",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 8632
+  },
+  "https://assets.guim.co.uk/commercial/6d2903f34362daaf9f55/graun.306.commercial.js": {
+   "file": "bodies/0062",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 29282
+  },
+  "https://assets.guim.co.uk/commercial/2b7c93c33ef8bd50d9bf/graun.742.commercial.js": {
+   "file": "bodies/0063",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 36889
+  },
+  "https://assets.guim.co.uk/commercial/80fbba20c1ee86a2572d/graun.783.commercial.js": {
+   "file": "bodies/0064",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 9222
+  },
+  "https://assets.guim.co.uk/commercial/4df2f65da3b3b5b00b47/graun.326.commercial.js": {
+   "file": "bodies/0065",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 59103
+  },
+  "https://assets.guim.co.uk/commercial/6cacc0f6f5797e23a403/graun.consented-advertising.commercial.js": {
+   "file": "bodies/0066",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 117662
+  },
+  "https://assets.guim.co.uk/assets/4501.client.web.238e68692cfcc9a1d9c0.js": {
+   "file": "bodies/0067",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 12450
+  },
+  "https://sourcepoint.theguardian.com/us_pm/index.html?hasCsp=true&usNatOrigin=https%3A%2F%2Fsourcepoint.theguardian.com%2Fusnat&uuid=null&message_id=1498198&site_id=7417&mms_origin=https%3A%2F%2Fsourcepoint.theguardian.com%2Fmms%2Fv2&is_usnat_notice=true&version=v1": {
+   "file": "bodies/0068",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 5433
+  },
+  "https://cdn.privacy-mgmt.com/wrapper/v2/meta-data?accountId=1257&env=prod&metadata={%22gdpr%22:{},%22usnat%22:{},%22globalcmp%22:{}}&propertyId=9398": {
+   "file": "bodies/0069",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 687
+  },
+  "https://sourcepoint.theguardian.com/wrapper/v2/meta-data?accountId=1257&env=prod&metadata={%22gdpr%22:{},%22usnat%22:{},%22globalcmp%22:{}}&propertyId=9398": {
+   "file": "bodies/0070",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 687
+  },
+  "https://sourcepoint.theguardian.com/PrivacyManagerUS.b9d1f.css": {
+   "file": "bodies/0071",
+   "status": 200,
+   "mime": "text/css",
+   "bytes": 35610
+  },
+  "https://i.guim.co.uk/img/media/56e122503dac04f5e60a5fc9de36923be558c49b/522_415_2109_1687/master/2109.jpg?width=220&dpr=1&s=none&crop=5%3A4": {
+   "file": "bodies/0072",
+   "status": 200,
+   "mime": "image/avif",
+   "bytes": 8597
+  },
+  "https://sourcepoint.theguardian.com/polyfills.01516.js": {
+   "file": "bodies/0073",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 5109
+  },
+  "https://sourcepoint.theguardian.com/PrivacyManagerUS.6a027.js": {
+   "file": "bodies/0074",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 382341
+  },
+  "https://sourcepoint.theguardian.com/mms/v2/message?message_id=1498198": {
+   "file": "bodies/0075",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 19763
+  },
+  "https://sourcepoint.theguardian.com/wrapper/v2/pv-data?hasCsp=true&env=prod&ch=481980003915d&scriptVersion=4.40.2&scriptType=unified": {
+   "file": "bodies/0076",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 193
+  },
+  "https://assets.guim.co.uk/commercial/e4b1d46db6bd9131f720/graun.Prebid.js.commercial.js": {
+   "file": "bodies/0077",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 7672
+  },
+  "https://cdn.privacy-mgmt.com/usnat/vendor-list/categories?siteId=7417&consentLanguage=EN": {
+   "file": "bodies/0078",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 1028
+  },
+  "https://assets.guim.co.uk/commercial/d10717f4465a03c0db36/graun.760.commercial.js": {
+   "file": "bodies/0079",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 521021
+  },
+  "https://cdn.adsafeprotected.com/iasPET.1.js": {
+   "file": "bodies/0080",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 23448
+  },
+  "https://sb.scorecardresearch.com/internal-cs/default/beacon.js": {
+   "file": "bodies/0081",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 21373
+  },
+  "https://assets.guim.co.uk/assets/AlreadyVisited-island.client.web.07bc1cea30078ad5635c.js": {
+   "file": "bodies/0082",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 589
+  },
+  "https://cdn.brandmetrics.com/tag/c3330059-9ad5-4d32-8e7a-e9f6c7d74957/the_guardian_us.js": {
+   "file": "bodies/0083",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 10609
+  },
+  "https://assets.guim.co.uk/assets/AdmiralScript-island.client.web.7421693207658caa91d4.js": {
+   "file": "bodies/0084",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 4740
+  },
+  "https://assets.guim.co.uk/assets/FocusStyles-island.client.web.928ae9d130df9911767d.js": {
+   "file": "bodies/0085",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1269
+  },
+  "https://assets.guim.co.uk/assets/ShowHideContainers-island.client.web.4e4a8f2145cd9ebd7e7f.js": {
+   "file": "bodies/0086",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1732
+  },
+  "https://c.amazon-adsystem.com/aax2/apstag.js": {
+   "file": "bodies/0087",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 371999
+  },
+  "https://assets.guim.co.uk/assets/BrazeMessaging-island.client.web.c42c59165559249a62fd.js": {
+   "file": "bodies/0088",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 511
+  },
+  "https://www.googleadservices.com/pagead/conversion_async.js": {
+   "file": "bodies/0089",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 64690
+  },
+  "https://securepubads.g.doubleclick.net/tag/js/gpt.js": {
+   "file": "bodies/0090",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 126436
+  },
+  "https://cdn.confiant-integrations.net/7oDgiTsq88US4rrBG0_Nxpafkrg/gpt_and_prebid/config.js": {
+   "file": "bodies/0091",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 483348
+  },
+  "https://cdn.id5-sync.com/api/1.0/id5PrebidModule.js": {
+   "file": "bodies/0092",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 102362
+  },
+  "https://cdn.privacy-mgmt.com/usnat/consent/7417/default-consent": {
+   "file": "bodies/0093",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 528
+  },
+  "https://assets.guim.co.uk/assets/ReaderRevenueDev-island.client.web.9ac11c7d6c025875ecef.js": {
+   "file": "bodies/0094",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 754
+  },
+  "https://assets.guim.co.uk/assets/GoogleOneTap-island.client.web.81420dbdb17ba91c829f.js": {
+   "file": "bodies/0095",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 4536
+  },
+  "https://assets.guim.co.uk/assets/EditionSwitcherBanner-island.client.web.6978a016d3628feefed4.js": {
+   "file": "bodies/0096",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 11302
+  },
+  "https://assets.guim.co.uk/assets/7455.client.web.582a67d4ff941b4e7c44.js": {
+   "file": "bodies/0097",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 97901
+  },
+  "https://assets.guim.co.uk/assets/130.client.web.ff3e303452f413e19462.js": {
+   "file": "bodies/0098",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 39154
+  },
+  "https://assets.guim.co.uk/assets/StickyBottomBanner-island.client.web.eeeeafe2af9a1fe1788b.js": {
+   "file": "bodies/0099",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 19268
+  },
+  "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202608050101/pubads_impl.js?cb=122880268": {
+   "file": "bodies/0100",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 650252
+  },
+  "https://sb.scorecardresearch.com/b2?c1=2&c2=6035250&cs_fpcu=9df9c1d6627845e79adfe7b75f8e79ad&cs_it=b1&cv=4.13.1%2B2508250908&ns__t=1786637175124&ns_c=UTF-8&cs_cfg=1101110&cs_ucfr=1&cs_ucc=1&cs_cmp_id=6&gpp_ssv=1&gpp_gpc=0&gpp_oos=22X&gpp_oon=XX11XX0&gpp_sdp=000000000&gpp_pdc=0&gpp_cdc=00&gpp_mct=2&gpp_mom=0&gpp_msm=0&cs_cmp_ie=10&cs_cmp_rt=0&cs_cmp_av=1.1&gpp_sid=8&gpp_smv=1.1&c7=https%3A%2F%2Fwww.theguardian.com%2Finternational&c8=Latest%20news%2C%20sport%20and%20opinion%20from%20the%20Guardian&c9=": {
+   "file": "bodies/0101",
+   "status": 204,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://cdn.permutive.com/d6691a17-6fdb-4d26-85d6-b3dd27f55f08-web.js": {
+   "file": "bodies/0102",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 1366029
+  },
+  "https://api.intentiq.com/profiles_engine/ProfilesEngineServlet?at=39&mi=10&dpi=377078111&pt=17&dpn=1&iiqidtype=2&iiqpcid=2236f414-5eed-4c71-bb13-5394897b452a&iiqpciddate=1786637175067&gpp=DBABBg~BUoAAACA.QA&gdpr=0&japs=false&jaesc=0&jafc=0&jaensc=0&jsver=0.33&testGroup=A&source=pbjs&ABTestingConfigurationSource=IIQServer&abtg=A&vrref=https%3A%2F%2Fwww.theguardian.com%2Finternational&uh=%7B%220%22%3A%22%5C%22Chromium%5C%22%3Bv%3D%5C%22151%5C%22%2C%20%5C%22Not%3DA%3FBrand%5C%22%3Bv%3D%5C%2299%5C%22%22%2C%221%22%3A%22%3F0%22%2C%222%22%3A%22%5C%22Linux%5C%22%22%2C%223%22%3A%22%5C%22arm%5C%22%22%2C%224%22%3A%22%5C%2264%5C%22%22%2C%227%22%3A%22%3F0%22%2C%228%22%3A%22%5C%22Chromium%5C%22%3Bv%3D%5C%22151.0.7922.108%5C%22%2C%20%5C%22Not%3DA%3FBrand%5C%22%3Bv%3D%5C%2299.0.0.0%5C%22%22%7D": {
+   "file": "bodies/0103",
+   "status": 200,
+   "mime": "text/html",
+   "bytes": 333
+  },
+  "https://cdn.brandmetrics.com/scripts/bundle/65568.js?sid=0f840a9d-c6e8-486a-87b2-147c74fe4309&toploc=www.theguardian.com": {
+   "file": "bodies/0104",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 60178
+  },
+  "https://c.amazon-adsystem.com/bao-csm/aps-comm/aps_csm.js": {
+   "file": "bodies/0105",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 6482
+  },
+  "https://config.aps.amazon-adsystem.com/configs/3722": {
+   "file": "bodies/0106",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 4469
+  },
+  "https://cdn.confiant-integrations.net/gptprebidnative/202607281755/wrap.js": {
+   "file": "bodies/0107",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 413213
+  },
+  "https://googleads.g.doubleclick.net/pagead/viewthroughconversion/971225648/?random=1786637175230&cv=9&fst=1786637175230&num=1&guid=ON&resp=GooglemKTybQhCsO&eid=466465925&u_h=600&u_w=800&ig=1&frm=0&url=https%3A%2F%2Fwww.theguardian.com%2Finternational&tiba=Latest%20news%2C%20sport%20and%20opinion%20from%20the%20Guardian&hn=www.googleadservices.com&uaa=arm&uab=64&uam=&uap=Linux&uapv=&uaw=0&uafvl=Chromium%3B151.0.7922.108%7CNot%253DA%253FBrand%3B99.0.0.0&async=1&rfmt=3&fmt=4": {
+   "file": "bodies/0108",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 4947
+  },
+  "https://cdn.id5-sync.com/api/1.0/esp.js": {
+   "file": "bodies/0109",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 121105
+  },
+  "https://tags.crwdcntrl.net/lt/c/16589/sync.min.js": {
+   "file": "bodies/0110",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 46160
+  },
+  "https://ads.pubmatic.com/AdServer/js/google-esp.js": {
+   "file": "bodies/0111",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 9612
+  },
+  "https://dmp.im-apps.net/secure-signal/provider.js": {
+   "file": "bodies/0112",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 4890
+  },
+  "https://connectid.analytics.yahoo.com/connectId-gpt.js": {
+   "file": "bodies/0113",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 8729
+  },
+  "https://cdn.mgaru.dev/static/myGaruStandalone.js": {
+   "file": "bodies/0114",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 2733
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--top-above-nav,ss:%5B1.1,2.2,728.90,940.230,900.250,970.250,88.71,300.197,300.250%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0115",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 488
+  },
+  "https://oa.openxcdn.net/esp.js": {
+   "file": "bodies/0116",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 32437
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-2,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0117",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--mostpop,ss:%5B1.1,2.2,300.250,300.274,300.600,300.197%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0118",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 482
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-7,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0119",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-6,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0120",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--merchandising,ss:%5B1.1,2.2,88.88,970.250,300.250%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0121",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 488
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-1,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0122",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--merchandising-high,ss:%5B1.1,2.2,88.87,970.250,300.250%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0123",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 493
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-4,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0124",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-8,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0125",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-3,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0126",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://pixel.adsafeprotected.com/services/pub?anId=10249&slot=%7Bid:dfp-ad--fronts-banner-5,ss:%5B1.1,2.2,970.250,88.87,728.90%5D,p:/59666047/theguardian.com/international/front/ng,t:display%7D&wr=1280.657&sr=800.600&sessionId=c7d36620-a622-a754-5c04-bb89f3cc3c56&url=https%253A%252F%252Fwww.theguardian.com%252Finternational": {
+   "file": "bodies/0127",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 490
+  },
+  "https://id5-sync.com/api/config/prebid": {
+   "file": "bodies/0128",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 194
+  },
+  "https://static.criteo.net/js/ld/publishertag.ids.js": {
+   "file": "bodies/0129",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 35816
+  },
+  "https://ib.adnxs.com/getuidj?gdpr=0": {
+   "file": "bodies/0130",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 11
+  },
+  "https://cdn.id5-sync.com/api/1.0/id5-api.js": {
+   "file": "bodies/0131",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 120304
+  },
+  "https://invstatic101.creativecdn.com/encrypted-signals/encrypted-tag-g.js": {
+   "file": "bodies/0132",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 2729
+  },
+  "https://secure.cdn.fastclick.net/js/pubcid/latest/pubcid.min.js": {
+   "file": "bodies/0133",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 68276
+  },
+  "https://collector.brandmetrics.com/c.js?siteid=0f840a9d-c6e8-486a-87b2-147c74fe4309&toploc=www.theguardian.com&rnd=9145443": {
+   "file": "bodies/0134",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 0
+  },
+  "https://web-banner.ads.aps.amazon-adsystem.com/e/dtb/bid": {
+   "file": "bodies/0135",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 251
+  },
+  "https://d6691a17-6fdb-4d26-85d6-b3dd27f55f08.prmutv.co/v2.0/pxid?k=359ba275-5edd-4756-84f8-21a24369ce0b": {
+   "file": "bodies/0136",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 46
+  },
+  "https://api.permutive.com/ctx/v1/state?url=https%3A%2F%2Fwww.theguardian.com%2Finternational&k=359ba275-5edd-4756-84f8-21a24369ce0b": {
+   "file": "bodies/0137",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 104
+  },
+  "https://bcp.crwdcntrl.net/6/map?xcid=16589": {
+   "file": "bodies/0138",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 235
+  },
+  "https://www.google.com/pagead/1p-user-list/971225648/?random=1786637175230&cv=9&fst=1786636800000&num=1&guid=ON&resp=GooglemKTybQhCsO&eid=466465925&u_h=600&u_w=800&ig=1&frm=0&url=https%3A%2F%2Fwww.theguardian.com%2Finternational&tiba=Latest%20news%2C%20sport%20and%20opinion%20from%20the%20Guardian&hn=www.googleadservices.com&uaa=arm&uab=64&uam=&uap=Linux&uapv=&uaw=0&uafvl=Chromium%3B151.0.7922.108%7CNot%253DA%253FBrand%3B99.0.0.0&async=1&rfmt=3&fmt=3&is_vtc=1&cid=CAQS6wEAEQoqgRtOxtohe6vJoxvdGZG5l90WszjBAncUbl1RR3MS56jVrO5_tXqmy7eFk34kD7K5CDc6dFTVYHaktDz4Wv-PdOcaQkm0CWpN6tUqO5k8BOAGqJT_ibgjcPZDwnJ4jgrSeVVOGUHBe4HasuXIKw_-ll-cwQeYSHPhS1k2hpkE6gXTqAIZsKulEHpqwoOtWly9cFTt7ktmjtcz5BZQzHiMZG_C1KstzdAwztD97fFMXClrgIXYWi0jWaNG-hZs1HMY_cRYYAvdESRZl6j6FbKAvf-KkM60WARNGgkE4lOGD1ERG8p6eVIs&random=3918126850&resp=GooglemKTybQhCsO&rmt_tld=0&ipr=y": {
+   "file": "bodies/0139",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 42
+  },
+  "https://ups.analytics.yahoo.com/ups/58813/fed?gpp=DBABBg~BUoAAACA.QA&gpp_sid=8&v=1&url=https%3A%2F%2Fwww.theguardian.com%2Finternational": {
+   "file": "bodies/0140",
+   "status": 400,
+   "mime": "application/json",
+   "bytes": 0
+  },
+  "https://securepubads.g.doubleclick.net/pagead/managed/dict/m202608130101/gpt": {
+   "file": "bodies/0141",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 65505
+  },
+  "https://rtb.openx.net/esp?url=https%3A%2F%2Fwww.theguardian.com%2Finternational&rid=esp&cc=1": {
+   "file": "bodies/0142",
+   "status": 200,
+   "mime": "",
+   "bytes": 0
+  },
+  "https://contributions.guardianapis.com/header": {
+   "file": "bodies/0143",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 673
+  },
+  "https://sync6.im-apps.net/9001/pid?ref=null&page=https://www.theguardian.com/international": {
+   "file": "bodies/0144",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 70
+  },
+  "https://assets.guim.co.uk/assets/8378.client.web.eb65c4a5e8c5b2310e86.js": {
+   "file": "bodies/0145",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 9489
+  },
+  "https://assets.guim.co.uk/assets/7854.client.web.a8073d6806ae47b81b62.js": {
+   "file": "bodies/0146",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 7120
+  },
+  "https://assets.guim.co.uk/assets/5357.client.web.47b2df1c934cd9522a25.js": {
+   "file": "bodies/0147",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 2128
+  },
+  "https://pubads.g.doubleclick.net/activity;dc_iu=/59666047/DFPAudiencePixel;ord=1;dc_seg=895181798;permutive=23527?": {
+   "file": "bodies/0148",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 42
+  },
+  "https://api.permutive.com/v2.0/identify?k=359ba275-5edd-4756-84f8-21a24369ce0b": {
+   "file": "bodies/0149",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 50
+  },
+  "https://api.permutive.com/v2.0/px/sync?k=359ba275-5edd-4756-84f8-21a24369ce0b&u=af045a27-f1b8-4aa9-a895-f85c598b0d51&alias=ecc046a8-05cd-40af-8631-7f82493986a9&type=viant": {
+   "file": "bodies/0150",
+   "status": 201,
+   "mime": "image/gif",
+   "bytes": 35
+  },
+  "https://krk2.kargo.com/api/v1/prebid": {
+   "file": "bodies/0151",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 2
+  },
+  "https://fastlane.rubiconproject.com/a/api/fastlane.json?account_id=26644&site_id=554244&zone_id=3471428&size_id=2&alt_size_ids=57&gpp=DBABBg~BUoAAACA.QA&gpp_sid=8&eid_pubcid.org=18e3403e-3e0d-4aea-999c-407089d9d760%5E1%5E%5E%5E%5E%5E&rf=https%3A%2F%2Fwww.theguardian.com%2Finternational&kw=Network%20Front%2Cp_standard%3D10000010%2Cp_standard%3D10000015%2Cp_standard%3D10000021%2Cp_standard%3D10000064%2Cp_standard_aud%3Dbhis%2Cp_standard_aud%3Dbhkl%2Cp_standard_aud%3Dbhlp%2Cp_standard_aud%3Dbhir%2Cp_standard_aud%3Dbhlk%2Cp_standard_aud%3Dbhnc%2Cp_standard_aud%3Dbhnx%2Cp_standard_aud%3Dbhnz%2Cp_standard_aud%3Dbhls%2Cp_standard_aud%3Dbhjo%2Cp_standard_aud%3Dbhhl%2Cp_standard_aud%3Dbhmo%2Cp_standard_aud%3Dcur%2Cp_standard_aud%3Dehnd%2Cp_standard_aud%3Dbzyw%2Cp_standard_aud%3Dbzyg%2Cp_standard_aud%3Dbzyf%2Cp_standard_aud%3Dbzyx%2Cp_standard_aud%3Dbzyy%2Cp_standard_aud%3Dbzyz%2Cp_standard_aud%3Dehkn%2Cp_standard_aud%3Dehko%2Cp_standard_aud%3Ddsgz%2Cp_standard_aud%3Depcu&tg_v.p_standard=10000010%2C10000015%2C10000021%2C10000064&tg_i.domain=theguardian.com&tg_i.page=https%3A%2F%2Fwww.theguardian.com%2Finternational&tg_i.keywords=Network%20Front&tg_i.documentLang=en&tg_i.pbadslot=%2F59666047%2Fgu%2Finternational%2FNetwork%20Front%2Ftop-above-nav&tk_flint=pbjs_lite_v10.23.0&l_pb_bid_id=a2cff490-f9dd-4772-ada0-7ec2ce2419cb&p_screen_res=800x600&rp_secure=1&rp_hard_floor=0.1&p_gpid=%2F59666047%2Fgu%2Finternational%2FNetwork%20Front%2Ftop-above-nav&m_ch_ua=%22Chromium%22%7Cv%3D%22151%22%2C%22Not%3DA%3FBrand%22%7Cv%3D%2299%22&m_ch_mobile=%3F0&m_ch_platform=Linux&slots=1&rand=0.4927038597204345": {
+   "file": "bodies/0152",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 510
+  },
+  "https://static.guim.co.uk/images/favicon-32x32.ico": {
+   "file": "bodies/0153",
+   "status": 200,
+   "mime": "image/x-icon",
+   "bytes": 4286
+  },
+  "https://assets.guim.co.uk/static/frontend/icons/homescreen/roundel.svg": {
+   "file": "bodies/0154",
+   "status": 200,
+   "mime": "image/svg+xml",
+   "bytes": 437
+  },
+  "https://htlb.casalemedia.com/openrtb/pbjs?s=208246": {
+   "file": "bodies/0155",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 58
+  },
+  "https://hbopenbid.pubmatic.com/translator?source=prebid-client&gzip=1": {
+   "file": "bodies/0156",
+   "status": 204,
+   "mime": "",
+   "bytes": 0
+  },
+  "https://tlx.3lift.com/header/auction?lib=prebid&v=10.23.0&referrer=https%3A%2F%2Fwww.theguardian.com%2Finternational&tmax=1500": {
+   "file": "bodies/0157",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 19
+  },
+  "https://api.id5-sync.com/analytics/182/id5-api-js": {
+   "file": "bodies/0158",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 1504
+  },
+  "https://elb.the-ozone-project.com/openrtb2/auction": {
+   "file": "bodies/0159",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 112
+  },
+  "https://direct.adsrvr.org/bid/bidder/theguardian": {
+   "file": "bodies/0160",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 0
+  },
+  "https://a.teads.tv/hb/bid-request": {
+   "file": "bodies/0161",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 16
+  },
+  "https://contributions.guardianapis.com/banner": {
+   "file": "bodies/0162",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 4738
+  },
+  "https://grid-bidder.criteo.com/openrtb_2_5/pbjs/auction/request?profileId=207&av=37&wv=10.23.0&cb=50545373601&lsavail=1&networkId=337&gzip=1": {
+   "file": "bodies/0163",
+   "status": 204,
+   "mime": "",
+   "bytes": 0
+  },
+  "https://id5-sync.com/api/esp/increment?counter=no-config": {
+   "file": "bodies/0164",
+   "status": 204,
+   "mime": "text/plain",
+   "bytes": 0
+  },
+  "https://ep1.adtrafficquality.google/getconfig/sodar?sv=200&tid=gpt&tv=m202608050101&st=env&sjk=5298106869430558": {
+   "file": "bodies/0165",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 17678
+  },
+  "https://ep2.adtrafficquality.google/sodar/sodar2.js": {
+   "file": "bodies/0166",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 21546
+  },
+  "https://ident.mygaru.com/v2/id": {
+   "file": "bodies/0167",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 191
+  },
+  "https://id5-sync.com/bounce": {
+   "file": "bodies/0168",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 29
+  },
+  "https://securepubads.g.doubleclick.net/gampad/ads?pvsid=5298106869430558&correlator=280284444344198&eid=31099592%2C95395802%2C95399243%2C122880268&output=ldjh&gdfp_req=1&vrg=202608050101&ptt=17&impl=fif&gpp=DBABBg~BUoAAACA.QA&gpp_sid=8&iu_parts=59666047%2Ctheguardian.com%2Cinternational%2Cfront%2Cng&enc_prev_ius=%2F0%2F1%2F2%2F3%2F4&prev_iu_szs=320x50%7C1x1%7C2x2%7C728x90%7C940x230%7C900x250%7C970x250%7C88x71&fluid=height&ifi=1&didk=1168867225&dids=dfp-ad--top-above-nav&adfs=2664771441&sfv=1-0-45&fsbs=1&sc=1&cookie_enabled=1&abxe=1&dt=1786637176248&lmt=1786637176&adxs=639&adys=0&biw=1280&bih=657&scr_x=0&scr_y=0&btvi=0&ucis=1&oid=2&u_his=12&u_h=600&u_w=800&u_ah=600&u_aw=800&u_cd=24&u_sd=1&dmc=32&bc=31&nvt=1&uach=WyJMaW51eCIsIiIsImFybSIsIiIsIjE1MS4wLjc5MjIuMTA4IixudWxsLDAsbnVsbCwiNjQiLFtbIkNocm9taXVtIiwiMTUxLjAuNzkyMi4xMDgiXSxbIk5vdD1BP0JyYW5kIiwiOTkuMC4wLjAiXV0sMF0.&url=https%3A%2F%2Fwww.theguardian.com%2Finternational&vis=1&psz=1280x294&msz=2x0&fws=516&ohw=1280&a3p=EjQKCnB1YmNpZC5vcmcSJDE4ZTM0MDNlLTNlMGQtNGFlYS05OTljLTQwNzA4OWQ5ZDc2MFgBEloKDWNyd2RjbnRybC5uZXQSQDliNTQ0Zjc0YzY5ZmE0NWRiOWY3ZDZkM2Y2ZmMxODVjYTAyYzg1NzhmZGE0YzdhNTA0YjAyMWY0NThjYzRmZDIYiJj_3v8zSAASHQoOZXNwLmNyaXRlby5jb20Y95T_3v8zSABSAghkEjEKEmludGltYXRlbWVyZ2VyLmNvbRISaC4xODcxMDM1Y2M0MWE1NmY4GIaZ_97_M0gAEhgKCXlhaG9vLmNvbRjyl__e_zNIAFICCG8SFwoIbXlnYXJ1SUQY95T_3v8zSABSAghkEh8KEGVzcC5wdWJtYXRpYy5jb20Y95T_3v8zSABSAghkEhsKDGlkNS1zeW5jLmNvbRj3lP_e_zNIAFICCGQS0QEKF3Blcm11dGl2ZS1zZWN1cmUtc2lnbmFsEqwBTFk4NjM4NG1HODJQcW0za2JRaEEvcXFPWG94eWViRDBWcHhYOEpLbzBleUFVYnptNHFGaFozbXdsdmttQm53N2dZOHMyWFE4NDJNMHVnMTRrblh3VzVzdlo1N3phazBJbW9wcGRnSGE1bVRzcVg0M3pGaVZ3TUpYS1poc29Ea0ZlQ3hQc1R6aEFqN0NOVGNuRDU5Z3FsNHJBb2tnYkdVTjVzNTJZWG04UVljPRjYl__e_zNIAA..&cbidsp=CqICCAESEAoDdHRkEGcgAjgBUgN0dGQSFAoFa2FyZ28QMCACOAFSBWthcmdvEhQKBW96b25lEF4gAjgBUgVvem9uZRIeCgp0cmlwbGVsaWZ0EEogAjgBUgp0cmlwbGVsaWZ0EhcKBmNyaXRlbxDCASACOAFSBmNyaXRlbxIUCgV0ZWFkcxBeIAI4AVIFdGVhZHMSGAoHcnViaWNvbhAiIAI4AVIHcnViaWNvbhIOCgJpeBA3IAI4AVICaXgSDgoCaXgQNyACOAFSAml4EhoKCHB1Ym1hdGljEDggAjgBUghwdWJtYXRpYxgCIiQ0NzIwNTYyNS1mMzJkLTQzODctOTYxNi0zZjAxMDUwYTdiYzUqBAgDIAAyCHYxMC4yMy4wQNwLSgA.&dlt=1786637174264&idt=1015&prev_scp=slot-fabric%3Dfabric1%26slot%3Dtop-above-nav%26testgroup%3D41%26gpid%3D%252F59666047%252Fgu%252Finternational%252FNetwork%2520Front%252Ftop-above-nav%26amznbid%3D2%26amznp%3D2%26id%3De95b6083-9730-11f1-884e-cecab2a22f5f%26teadsEligible%3Dfalse&cust_params=amtgrp%3D5%26fr%3D1%26consent_tcfv2%3Dna%26rdp%3Df%26pa%3Dt%26ct%3Dnetwork-front%26url%3D%252Finternational%26edition%3Dus%26p%3Dng%26k%3Dinternational%26dcre%3Dt%26rc%3D7%26rp%3Ddotcom-rendering%26s%3Dinternational%26sens%3Df%26urlkw%3Dinternational%26allkw%3Dinternational%26ab%3Dmartech-admiral-adblock-control%252Ccommercial-prebid-transaction-ids-contro%252Cgrowth-auxia-banner-control%26cc%3DUS%26lh%3D16%26pv%3Dmsrpn6kx0r4m6mpuuhzk%26si%3Df%26idp%3DsharedId%252Cid5Id%252CintentIqId%26bp%3Ddesktop%26skinsize%3Ds%26inskin%3Df%26intent_iq_group%3DA%263pc%3Df%26adt%3DveryLow%26alc%3DveryLow%26dlm%3DveryLow%26drg%3DveryLow%26hat%3DveryLow%26off%3DveryLow%26vio%3Dlow%26fra%3Dfalse%26ias-kw%3DIAS_1512460_PG%252CIAS_3005065_PG%252CIAS_1539290_PG%252CIAS_1511999_PG%252CIAS_1539691_PG%252CIAS_1539688_PG%252CIAS_1526082_PG%252CIAS_1512447_PG%252CIAS_3006646_PG%252CIAS_SET%252CIAS_3006644_PG%252CIAS_1525969_PG%252CIAS_1538770_PG%252CIAS_3005046_PG%252CIAS_3005062_PG%26permutive%3D151037%252C155919%252C208432%252C219898%252C23527%252C243284%252C252036%252Crts%26prmtvsdk%3Dweb%26puid%3Daf045a27-f1b8-4aa9-a895-f85c598b0d51%26prmtvvid%3Da154a379-5aba-43d0-afaf-8ee310d8e5a6%26prmtvsid%3D37cab9fc-69d7-4358-8da8-88dab6b08c7f%26prmtvwid%3Dd6691a17-6fdb-4d26-85d6-b3dd27f55f08%26prmtvctx%3Drts&adks=4089234545&frm=20&eoidce=1&gblpids=%2F59666047%2Fgu%2Finternational%2FNetwork%20Front%2Ftop-above-nav&pb_szs=970x250%7C728x90": {
+   "file": "bodies/0169",
+   "status": 200,
+   "mime": "text/plain",
+   "bytes": 146237
+  },
+  "https://tpc.googlesyndication.com/pagead/js/r20260812/r20110914/abg_lite.js": {
+   "file": "bodies/0170",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 28744
+  },
+  "https://tpc.googlesyndication.com/simgad/18016375388765127727": {
+   "file": "bodies/0171",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 85200
+  },
+  "https://tpc.googlesyndication.com/pagead/js/r20260812/r20110914/client/window_focus.js": {
+   "file": "bodies/0172",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 3047
+  },
+  "https://pagead2.googlesyndication.com/pagead/managed/js/activeview/current/ufs_web_display.js": {
+   "file": "bodies/0173",
+   "status": 200,
+   "mime": "text/javascript",
+   "bytes": 243965
+  },
+  "https://lb.eu-1-id5-sync.com/lb/v1": {
+   "file": "bodies/0174",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 45
+  },
+  "https://lbs.eu-1-id5-sync.com/lbs/v1": {
+   "file": "bodies/0175",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 54
+  },
+  "https://pixel.adsafeprotected.com/jload?anId=10249&campId=970x250&pubId=5180427314&chanId=87606687&placementId=7394937029&pubCreative=138571225813&pubOrder=4156154361&custom=network-front&custom2=top-above-nav&custom3=us&custom4=desktop&custom5=international&adsafe_par&impId=e95b6083-9730-11f1-884e-cecab2a22f5f": {
+   "file": "bodies/0176",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 352198
+  },
+  "https://jsconfig.adsafeprotected.com/jsconfig/jload/10249?cbName=__IntegralAS_911fc20e85e1635051db2088a634bad1_6669&anId=10249&campId=970x250&pubId=5180427314&chanId=87606687&placementId=7394937029&pubCreative=138571225813&pubOrder=4156154361&custom=network-front&custom2=top-above-nav&custom3=us&custom4=desktop&custom5=international&adsafe_par=&impId=e95b6083-9730-11f1-884e-cecab2a22f5f": {
+   "file": "bodies/0177",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 5177
+  },
+  "https://static.adsafeprotected.com/sca.17.6.4.js": {
+   "file": "bodies/0178",
+   "status": 200,
+   "mime": "application/javascript",
+   "bytes": 93624
+  },
+  "https://api.permutive.com/v2.0/batch/events?enrich=false&sdkp=true&k=359ba275-5edd-4756-84f8-21a24369ce0b": {
+   "file": "bodies/0179",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 101
+  },
+  "https://jsconfig.adsafeprotected.com/mon?cbName=__IntegralAS_911fc20e85e1635051db2088a634bad1_6669&anId=10249&campId=970x250&pubId=5180427314&chanId=87606687&placementId=7394937029&pubCreative=138571225813&pubOrder=4156154361&custom=network-front&custom2=top-above-nav&custom3=us&custom4=desktop&custom5=international&adsafe_par=&impId=e95b6083-9730-11f1-884e-cecab2a22f5f&adsafe_url=https%3A%2F%2Fwww.theguardian.com%2Finternational&adsafe_type=abcedfq&adsafe_jsinfo=,id:911fc20e-85e1-6350-51db-2088a634bad1,c:lbGZTQ,sl:inView,em:true,fr:true,thd:1,mn:postbid-edge-primary-7f59dfc46b-d4nc5,rg:va,pt:1-5-15,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,mu:10000,br:c,bru:c,an:n,oam:0,scm:publ1.grpm1,mtim:10,mot:0,app:0,maw:0,tdt:s,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,pl:CV8L.CV8L.CV8L.CV8L.CV8L,rmeas:1,rend:1,renddet:IMG.qs,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,tt:jload,et:62,oid:ea319c4f-9730-11f1-b65e-e23fbe02e1ab,v:19.8.704,sp:0,st:1,fwm:0,wr:1280.657,sr:800.600,ov:0": {
+   "file": "bodies/0180",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://id5-sync.com/gm/v3": {
+   "file": "bodies/0181",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 3208
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbGZTT,pingTime:-8,time:64,type:l,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:64,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B24~50%5D,as:%5B24~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:0,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,rmeas:1,rend:1,renddet:IMG.qs,siq:63%7D&br=c": {
+   "file": "bodies/0182",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbGZUf,pingTime:-2,time:86,type:a,im:%7BpBlk:72,sf:0,pom:1,prf:%7BbeA:105,beZ:107,mfA:115,mfZ:117,cmA:142,inA:143,inZ:149,prA:149,prZ:156,si:167,poA:170,bl:178,poZ:178,cmZ:178,loA:185,loZ:188,ltA:190,ltZ:190,rt:1,bc:n%7D%7D,sca:%7Bdfp:%7Bdf:4,sz:970.250,dom:body%7D,hbs:%7BcdcP:0,cdcA:0,cdcS:0,cyp:0,wd:0,uaHC:1,chHC:0%7D%7D,env:%7Bgca:false,cca:false,gca2:false%7D,clog:%5B%7Bpiv:65,vs:i,r:,w:970,h:250,t:61%7D%5D,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:86,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B46~50%5D,as:%5B46~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:0,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,pd:CV8L.internal-pdf-viewer,rmeas:1,rend:1,renddet:IMG.qs,siq:63,slid:%5Bgoogle_ads_iframe_/59666047/theguardian.com/international/front/ng_0,google_ads_iframe_/59666047/theguardian.com/international/front/ng_0__container__,dfp-ad--top-above-nav,bannerandheader%5D,msd:0,ph:20562,igt:0,sinceFw:20,readyFired:true%7D&br=c": {
+   "file": "bodies/0183",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbGZUB,time:108,type:e,im:%7BpWait:0%7D,env:%7Bar:self.0%7D,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:108,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B68~50%5D,as:%5B68~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:0,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,rmeas:1,rend:1,renddet:IMG.qs,siq:63,msd:0,ph:20562,igt:0%7D&br=c": {
+   "file": "bodies/0184",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://id5-sync.com/i/182/8.gif?o=api&id5id=ID5*93pxvqrVrtozN9gUHM_MRVnbnQBNitgUHM_MRVnbnQD__2p963haAQEBCmp963gA0m0b62xhNzJCLe22Dh5r3g&gdpr_consent=undefined&gdpr=false&gpp=DBABBg%7EBUoAAACA.QA&gpp_sid=8": {
+   "file": "bodies/0185",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbGZYN,pingTime:-10,time:368,type:s,mvn:ZnNjPTEzLHNkPTMsbm89OCxhc3A9MQ--,sd:MTcuNi40djYwMHx8ODAwfHwxfHwxfHwyNHx8NjAwfHwwfHwwfHwxfHxsYW5kc2NhcGUtcHJpbWFyeXx8MjR8fDQvM3x8NC8zfHwwfHw4MDA-,no:MTcuNi40dk1vemlsbGF8fE5ldHNjYXBlfHxufHxufHwwfHxufHxMaW51eCB4ODZfNjR8fEdlY2tvfHwyMDAzMDEwN3x8MHx8TW96aWxsYS81LjAgKFgxMTsgTGludXggeDg2XzY0KSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBIZWFkbGVzc0Nocm9tZS8xNTEuMC4wLjAgU2FmYXJpLzUzNy4zNnx8MXx8MXx8R29vZ2xlIEluYy58fG4-,ch:n,fsc:17.6.4v222222220002222202222222220222222222202222222220222202000022000220222222220000222202002222202222222220222222220000020022222200022222220200000222200022220002022022022222202002220222022222022220000220200000022220222220222222222222202222222222222222222222222222222222222200000022022020020000002022202022022022222222000000000020222202022022222000000020000000000000000000020220202220000022200222202220022200200222022202220022220222200202222020002200002222022222202222000002002002222222202220022202200222002220222202,asp:1786637177197%7C%7C68f21140493709979b92c7950a0abccc%7C%7C06c7269cc465b286d1c82a0c108f23db%7C%7Ce59ad9be58ae559f0fb70766a6e1ed0e%7C%7C5c1bac8129bfcec53ce7c902dbab3b34%7C%7Cab19ce03e2eae5e2459cae4e907419fc%7C%7C1af6e901598b06356086e04a7ff6aa17%7C%7Cdb708e06eda5fabca17bfa252976ec19%7C%7C1715618633,sca:%7Beng:b,tss:%7Blts:2026-08-1316.06.17,tzo:0,tzn:UTC%7D,mob:%7Bori:0,ges:0,tch:0%7D%7D%7D": {
+   "file": "bodies/0186",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbH00W,time:501,type:e,sca:%7Bprp:%7Bnot:1,csi:1,msl:0,hdl:1,aps:0,hae:1,ito:1,sec:1%7D,exr:%7Bexs:objectExternal%7D,ifr:%7Bact:1,eff:0%7D,dvw:%7Bwit:0,wot:0%7D,uai:%7Buad:brands~brand~Chromium~version~151/brand~NotABrand~version~99%7Cmobile~false%7Cplatform~Linux%7D,nit:%7Bpqr:prompt,ntr:default%7D,cdc:%5B2,2,2,2,0,0,0,0,0,2,0,2,0,0,2,2,2,2%5D%7D,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:501,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B461~50%5D,as:%5B461~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:65,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,rmeas:1,rend:1,renddet:IMG.qs,siq:63,msd:0,ph:20562,igt:0,sis:113%7D&br=c": {
+   "file": "bodies/0187",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://ep1.adtrafficquality.google/pagead/sodar?id=sodar2&v=255&t=2&li=gpt_m202608050101&jk=5298106869430558&bg=!8fKl8pDNAAYpRUYQCUU7AEcBe5WfOCPMylU3tvqZv9NjkAoygDK22IztMcUtOrW2FvK4iVpekI5FQ1OdaFxmmShm1ZBpG9hYbCCsrF4J_3aEoYrNCPef7wIAAABaUgAAAA1oAQd-ADajwf2L26JOEny2wLvXckM-RbGdwWWKHe4DQl3I2ketN_9NydoBEmA3p604iRmelMW12vykasCZAqDfgPTrueoPtxdtB7WSaF4-F5EUw6Vv-rc_EySOgLHQHNtHRDkEl-EO8eDacW76SgSWqhInXEh82YI8Esz06doOoQUcbAVpSrp8UhC79sI5jqz2u29ODJDdh61aTeKn0T7eCdVBjNjFva1rcfntAxq_79IL2AnIdE-z2_KjXKBM3TNS-o8y4ykiyMFBnXwT9S1BJaxadLR9cLQG-1xhSa88j4C9oiLxdJnTELaBsU7P8KCBS8bCiBHmUZUGhJ1HYE9_8Myf-GyS75Y4CHX9ENVPaE_y-6jki_eKLmYvzeKbo8AX2FZji-K-FIMAY591Q8EIHX-SR9NzgMO-RBowjEHkBH-SP8pX2o-dimPVp3h9wa0_6s238CZ7wdIaA4ppKeElyDYlzcywthOZxZYNMLTi3ciZB-_Je8embhndEEjZlUknZvsUmL7AWtv7ESNztM6CNaZCXc7O1v1XzhyjjuKBpdYB5viQNkuNw9iAMc-iTCvcKK_UeYHO1x6RqW5dQQuEk8T9TUMw6UI-SSfpCgkHXgI7cwPQDLHmdHwyGpZHmdFLliOImBYiLtg00qlZ_ZgZGdp7WH3_HDU6i3hf2xh6Qjuyy8awb5Hyx50XhOyjJ28HhVFmYHPrj3dAvj0xUEpwALhDc4gIdO5AJi7gvOksZWs4ecf3hLyWpV2byEY-uyVyzVNBEspDx8aG80tCDFCqhzD7stGXJJo3apMFXNkg31raN2UYpM5ilu29XSV0fY0EM3rwxWx4hz45bE6_W6zCW3IqOINVQ-eNhvVMyJx4rVLQJsdl88LzaiNRk3VZBDwdniYm4DRYN7qbyAF9EcVfGZAbYJdTfKofGFgWOQ-71EgTfoFbRFTFX92AQhXnJMvQ7dMfiEfmGz8nvvD4N3Y": {
+   "file": "bodies/0188",
+   "status": 204,
+   "mime": "image/",
+   "bytes": 0
+  },
+  "https://www.theguardian.com/commercial/non-refreshable-line-items.json": {
+   "file": "bodies/0189",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 12525
+  },
+  "https://pagead2.googlesyndication.com/pcs/activeview?xai=AKAOjsvlVuUBSM1Asqd1oKGFERvjlWl7tqMAs6M1JNTwdUHBleAvOyn-lBfbDEcQo4T7CN3rOo5vjYN_rVdmW0ZNKztyi9L6JIFAXWMf35zbHub-TMMPeh5Rs-gE6BhSh6XVImI-i8RyzFpYRW8KPBSKcvc6H6Q1e627jNSb6lkP8HNSASS6zpYylD_ntay_7EY&sig=Cg0ArKJSzLXkH4n-_M3rEAE&id=lidar2&mcvt=1000&p=24,155,274,1125&tm=1016.6999999880791&tu=17&mtos=1000,1000,1000,1000,1000&tos=1000,0,0,0,0&v=20260722&bin=7&avms=nio&bs=1280,657&mc=1&vu=1&app=0&itpl=0&adk=4089234545&rs=4&la=1&cr=0&uach=WyJMaW51eCIsIiIsImFybSIsIiIsIjE1MS4wLjc5MjIuMTA4IixudWxsLDAsbnVsbCwiNjQiLFtbIkNocm9taXVtIiwiMTUxLjAuNzkyMi4xMDgiXSxbIk5vdD1BP0JyYW5kIiwiOTkuMC4wLjAiXV0sMF0%3D&vs=4&r=v&co=8256997600&rst=1786637176592&rpt=124&isd=0&lsd=0&met=mue&wmsd=0&pbe=0&fle=0&vae=0&spb=0&sfl=0&ffslot=0&reach=8&io2=0": {
+   "file": "bodies/0190",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 42
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbH0ae,pingTime:1,time:1077,type:c,clog:%5B%7Bpiv:65,vs:i,r:,w:970,h:250,t:61%7D%5D,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:1077,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B1037~50%5D,as:%5B1037~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:64,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,rmeas:1,rend:1,renddet:IMG.qs,siq:63,msd:0,ph:20562,igt:0,sis:113,metricId:grpm1,cmr:t%7D&br=c": {
+   "file": "bodies/0191",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbH0ad,pingTime:1,time:1076,type:p,clog:%5B%7Bpiv:65,vs:i,r:,w:970,h:250,t:61%7D%5D,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:1076,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B1036~50%5D,as:%5B1036~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:64,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,rmeas:1,rend:1,renddet:IMG.qs,siq:63,msd:0,ph:20562,igt:0,sis:113%7D&br=c": {
+   "file": "bodies/0192",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbH0ad,pingTime:1,time:1076,type:c,clog:%5B%7Bpiv:65,vs:i,r:,w:970,h:250,t:61%7D%5D,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:1076,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B1036~50%5D,as:%5B1036~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:64,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,rmeas:1,rend:1,renddet:IMG.qs,siq:63,msd:0,ph:20562,igt:0,sis:113,metricId:publ1,cmr:t%7D&br=c": {
+   "file": "bodies/0193",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  },
+  "https://check.analytics.rlcdn.com/check/14522": {
+   "file": "bodies/0194",
+   "status": 200,
+   "mime": "application/json",
+   "bytes": 25
+  },
+  "https://secure-gl.imrworldwide.com/cgi-bin/m?ci=tradedesk&cg=7ca18d4c-612c-4f2c-b261-c1deb14adf8f": {
+   "file": "bodies/0195",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 44
+  },
+  "https://dt.adsafeprotected.com/dt?anId=10249&asId=911fc20e-85e1-6350-51db-2088a634bad1&tv=%7Bc:lbH1cI,pingTime:5,time:5075,type:p,clog:%5B%7Bpiv:65,vs:i,r:,w:970,h:250,t:61%7D%5D,es:0,sc:1,ha:1,fgad:1,fif:1,gmnp:0,for:1,b11:0,cnod:1,gm:1,slTimes:%7Bi:5076,o:0,n:0,pp:0,pm:0%7D,slEvents:%5B%7Bsl:i,t:61,wc:10.10.1280.657,ac:165.34.970.250,am:i,cc:165.34.970.250,piv:65,obst:0,th:0,reas:,bkn:%7Bpiv:%5B5036~50%5D,as:%5B5036~970.250%5D%7D%7D%5D,slEventCount:1,em:true,fr:true,e:,tt:jload,dtt:69,fm:vsc3w6x+11%7C12%7C13%7C14%7C15%7C16%7C17%7C18%7C19%7C1a%7C1b%7C1c%7C1d%7C1e*.10249%7C1e1%7C1f,idMap:1e*,rmeas:1,rend:1,renddet:IMG.qs,siq:63,msd:0,ph:20562,igt:0,sis:113%7D&br=c": {
+   "file": "bodies/0196",
+   "status": 200,
+   "mime": "image/gif",
+   "bytes": 43
+  }
+ }
+}

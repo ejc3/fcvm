@@ -1,0 +1,237 @@
+.floating-player-is-sticky .rmp-overlay-button.rmp-color-bg {
+    display: none;
+}
+
+.floating-player-close-button {
+    display: none;
+    position: fixed !important;
+    box-sizing: border-box !important;
+    right: 57px !important;
+    bottom: 220px !important;
+    top: auto   !important;
+    left: auto !important;
+    z-index: 9999;
+    color: #ffffff;
+    animation-delay: 2s;
+    background-color: transparent;
+    border: 0;
+    font-size: 27px;
+    cursor: pointer;
+    background-image: inherit;
+}
+
+button.rmp-button.rmp-quality.rmp-module.rmp-color-bg {
+    top: 0 !important;
+    right: 10% !important;
+}
+
+#playerLiveHP div.rmp-control-bar.rmp-color-bg, #mediaCarousel div.rmp-control-bar.rmp-color-bg {
+    background: -moz-linear-gradient(bottom, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0) 100%);
+    background: -webkit-linear-gradient(bottom, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0) 100%);
+    background: linear-gradient(to top, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0) 100%) !important;
+    filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#a6000000', endColorstr='#00000000',GradientType=0 );
+    animation-delay: 2s;
+}
+
+.rmp-quick-rewind-ui.rmp-seek-bar {
+    bottom: 5px !important;
+}
+
+.floating-player-is-sticky {
+    position: fixed !important;
+    right: 50px !important;
+    bottom: 50px !important;
+    top: auto !important;
+    left: auto !important;
+    max-width: 370px !important;
+    max-height: 208px !important;
+    width: 370px !important;
+    height: 208px !important;
+    -webkit-animation-name: fadeInUp;
+    animation-name: fadeInUp;
+    -webkit-animation-duration: 1s;
+    animation-duration: 1s;
+    -webkit-animation-fill-mode: both;
+    animation-fill-mode: both;
+    z-index: 2000;
+}
+
+section.modulo_player_hp div.rmp-control-bar.rmp-color-bg {
+    background-color: #EC0020 !important;
+}
+
+/*#playerLiveHP div.rmp-color-bg { background: transparent!important;}*/
+.rmp-color-bg:not(.rmp-overlay-level-active), .rmp-module-overlay-icons, .rmp-related-duration, .rmp-related-up-next, .rmp-related-title {
+    background: transparent !important;
+}
+
+.rmp-module-volume-icons-area .rmp-volume-off-mute, .rmp-volume.rmp-volume-off-mute {
+    color: #ffffff !important;
+}
+
+.color-red .rmp-mobile-show-play.rmp-color-bg, .color-red .rmp-overlay-button.rmp-color-bg {
+    border-radius: 50%;
+}
+
+.rmp-extrasmall .rmp-time {
+    right: inherit !important;
+}
+
+.rmp-handle {
+    position: absolute;
+    top: 40% !important;
+    left: 0;
+    margin-top: -11px !important;
+    margin-left: 0px !important;
+    margin-right: 0px !important;
+    width: 6px !important;
+    height: 25px !important;
+    border: 0px solid rgba(0, 0, 0, 0.2) !important;
+    border-radius: 10px !important;
+    box-shadow: 0 0 4px 0 rgba(0, 0, 0, 0.19);
+    -webkit-border-radius: 10px !important;
+    -moz-border-radius: 10px !important;
+    -webkit-background-clip: padding-box;
+    background-clip: padding-box;
+}
+
+.rmp-current {
+    position: absolute;
+    top: 0px !important;
+    left: 0;
+    width: 0;
+    height: 20px !important;
+    -webkit-border-radius: 0 !important;
+    -moz-border-radius: 0 !important;
+    border-radius: 0 !important;
+    -webkit-background-clip: padding-box;
+    background-clip: padding-box;
+}
+
+.rmp-loaded {
+    position: absolute;
+    top: 0px !important;
+    left: 0;
+    width: 0;
+    height: 20px !important;
+    background: rgba(255, 255, 255, 0.2);
+    -webkit-border-radius: 0px !important;
+    -moz-border-radius: 0px !important;
+    border-radius: 0px !important;
+    -webkit-background-clip: padding-box;
+    background-clip: padding-box;
+    -webkit-box-shadow: inset 0 0 0px 0 rgba(0, 0, 0, 0.6) !important;
+    -moz-box-shadow: inset 0 0 0px 0 rgba(0, 0, 0, 0.6) !important;
+    box-shadow: inset 0 0 0px 0 rgba(0, 0, 0, 0.6) !important;
+}
+
+.rmp-time-total {
+    position: relative;
+    top: 10px !important;
+    left: 0% !important;
+    width: 98%;
+    height: 20px !important;
+    cursor: pointer;
+    -webkit-border-radius: 0px !important;
+    -moz-border-radius: 0px !important;
+    border-radius: 0px !important;
+    -webkit-background-clip: padding-box;
+    background-clip: padding-box;
+    background: rgba(0, 0, 0, 0.2) !important;
+    -webkit-box-shadow: inset 0 0 0px 0 rgba(0, 0, 0, 0.6) !important;
+    -moz-box-shadow: inset 0 0 0px 0 rgba(0, 0, 0, 0.6) !important;
+    box-shadow: inset 0 0 0px 0 rgba(0, 0, 0, 0.6) !important;
+}
+
+.rmp-module {
+    top: 8px !important;
+    right: 23px !important;
+}
+
+.rmp-airplay.rmp-module.rmp-color-bg {
+    right: 68px !important;
+}
+
+.floating-player-is-sticky div.rmp-sharing.rmp-module {
+    right: 44px !important;
+    top: 5px !important;
+}
+
+.floating-player-is-sticky div.rmp-airplay.rmp-module {
+    right: 85px !important;
+    top: 5px !important;
+}
+
+.floating-player-is-sticky div.rmp-volume.rmp-module {
+    right: 85px !important;
+}
+
+.rmp-container * {
+    -webkit-box-sizing: border-box;
+    -moz-box-sizing: border-box;
+    box-sizing: border-box;
+}
+
+@-webkit-keyframes fadeInUp {
+    0% {
+        opacity: 0;
+        -webkit-transform: translate3d(0, 100%, 0);
+        transform: translate3d(0, 100%, 0);
+    }
+
+    100% {
+        opacity: 1;
+        -webkit-transform: none;
+        transform: none;
+    }
+}
+
+@keyframes fadeInUp {
+    0% {
+        opacity: 0;
+        -webkit-transform: translate3d(0, 100%, 0);
+        transform: translate3d(0, 100%, 0);
+    }
+
+    100% {
+        opacity: 1;
+        -webkit-transform: none;
+        transform: none;
+    }
+}
+
+@media screen and (max-width: 1024px) {
+    .floating-player-close-button {
+        display: none;
+        position: fixed !important;
+        box-sizing: border-box !important;
+        right: 9px !important;
+        bottom: 208px !important;
+        top: auto   !important;
+        left: auto !important;
+        z-index: 9999;
+        color: #ffffff;
+        animation-delay: 2s;
+        background-color: transparent;
+        border: 0;
+        font-size: 25px;
+        cursor: pointer;
+        background-image: inherit;
+    }
+
+    .floating-player-close-button {
+        right: 4px !important;
+    }
+
+    .floating-player-is-sticky div.rmp-sharing.rmp-module {
+        right: 45px !important;
+    }
+
+    .floating-player-is-sticky div.rmp-volume.rmp-module {
+        right: 85px !important;
+    }
+
+    .floating-player-is-sticky div.rmp-airplay.rmp-module {
+        right: 86px !important;
+    }
+}

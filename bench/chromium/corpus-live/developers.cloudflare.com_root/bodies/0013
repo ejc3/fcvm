@@ -1,0 +1,1722 @@
+var e=Object.defineProperty,t=(t,n,r)=>n in t?e(t,n,{enumerable:!0,configurable:!0,writable:!0,value:r}):t[n]=r,n=(e,n,r)=>t(e,typeof n==`symbol`?n:n+``,r),r=`Powered by <a href="https://workers.cloudflare.com/product/ai-search" target="_blank" rel="noopener noreferrer">Cloudflare AI Search <svg width="32" height="10" viewBox="0 0 412 186" xmlns="http://www.w3.org/2000/svg" aria-label="Cloudflare" role="img">
+  <path fill="#f38020" d="m280.8395,183.31456c11,-26 -4,-38 -19,-38l-148,-2c-4,0 -4,-6 1,-7l150,-2c17,-1 37,-15 43,-33c0,0 10,-21 9,-24a97,97 0 0 0 -187,-11c-38,-25 -78,9 -69,46c-48,3 -65,46 -60,72c0,1 1,2 3,2l274,0c1,0 3,-1 3,-3z"/>
+  <path fill="#faae40" d="m330.8395,81.31456c-4,0 -6,-1 -7,1l-5,21c-5,16 3,30 20,31l32,2c4,0 4,6 -1,7l-33,1c-36,4 -46,39 -46,39c0,2 0,3 2,3l113,0l3,-2a81,81 0 0 0 -78,-103"/>
+</svg></a>`,i={loadingAriaLabel:`Loading`,errorPrefix:`Error:`,missingApiUrlError:`The api-url attribute is required. Please provide a valid API URL.`,poweredBy:`Powered by`,poweredByLinkLabel:`Cloudflare AI Search`,placeholder:`Search...`,searchButtonLabel:`Search`,searchInputAriaLabel:`Search input`,searchResultsAriaLabel:`Search results`,emptyStateTitle:`Start Searching`,emptyStateDescription:`Enter a query to search for results`,modalEmptyStateDescription:`Start typing to search`,noResultsTitle:`No Results Found`,noResultsDescription:`No results found for "{query}"`,modalNoResultsTitle:`No results found`,modalNoResultsDescription:`No results for "{query}"`,resultsCount:`Found {n} result`,resultsCountPlural:`Found {n} results`,resultsCountOverflow:`Showing {n} of {total} results`,modalResultsCount:`{n} result`,modalResultsCountPlural:`{n} results`,modalResultsCountZero:`0 results`,modalResultsCountError:`Error`,seeMoreResults:`See more results`,groupOther:`Other`,favoriteResults:`Favorites`,recentResults:`Recent`,addFavorite:`Add to favorites`,removeFavorite:`Remove from favorites`,navigateHint:`Navigate`,selectHint:`Select`,closeHint:`Close`,chatTitle:`Chat`,chatPlaceholder:`Type a message...`,chatInputAriaLabel:`Chat message input`,sendButtonLabel:`Send`,sendButtonAriaLabel:`Send message`,chatEmptyTitle:`Start a Conversation`,chatEmptyDescription:`Send a message to begin chatting`,userAvatar:`U`,assistantAvatar:`AI`,unknownError:`Unknown error`,openChatAriaLabel:`Open chat`,clearHistoryAriaLabel:`Clear history`,minimizeAriaLabel:`Minimize`,closeAriaLabel:`Close`,historyTitle:`History`,newChatButton:`New Chat`,clearChatButton:`Clear Chat`,toggleSidebarTitle:`Toggle sidebar`,deleteChatTitle:`Delete chat`,noChatsYet:`No chats yet`,yesterday:`Yesterday`,justNow:`Just now`,minuteAgo:`{n} minute ago`,minutesAgo:`{n} minutes ago`,hourAgo:`{n} hour ago`,hoursAgo:`{n} hours ago`,loadingMessages:[`Searching...`,`Digging through results...`,`Scanning the knowledge base...`,`Finding the best matches...`,`Sifting through the data...`,`Almost there...`,`Looking far and wide...`,`Connecting the dots...`,`Rummaging through pages...`,`Hunting down answers...`]};function a(e){if(!e||typeof e!=`object`)return i;let t={...i};for(let n of Object.keys(e)){let r=e[n];if(r!=null){if(n===`loadingMessages`){Array.isArray(r)&&r.length>0&&(t.loadingMessages=r.filter(e=>typeof e==`string`),t.loadingMessages.length===0&&(t.loadingMessages=i.loadingMessages));continue}typeof r==`string`&&(t[n]=r)}}return t}function o(e,t={}){return e.replace(/\{(\w+)\}/g,(e,n)=>Object.hasOwn(t,n)?String(t[n]):e)}function s(e,t){if(!e)return null;try{let t=JSON.parse(e);if(typeof t!=`object`||!t||Array.isArray(t))throw Error(`translations must be a JSON object`);return t}catch(e){return console.error(`${t}: invalid translations attribute`,e),null}}var c=`
+:host {
+  /* Colors - Light Mode */
+  --search-snippet-primary-color: #2563eb;
+  --search-snippet-primary-hover: #0f51dfff;
+  --search-snippet-background: #ffffff;
+  --search-snippet-surface: #f8f9fa;
+  --search-snippet-text-color: #212529;
+  --search-snippet-text-secondary: #6c757d;
+  --search-snippet-text-description: #495057;
+  --search-snippet-border-color: #dee2e6;
+  --search-snippet-hover-background: #f1f3f5;
+  --search-snippet-focus-ring: #0066cc40;
+  --search-snippet-error-color: #dc3545;
+  --search-snippet-error-background: #f8d7da;
+  --search-snippet-success-color: #28a745;
+  --search-snippet-success-background: #d4edda;
+  --search-snippet-warning-color: #ffc107;
+  --search-snippet-warning-background: #fff3cd;
+  
+  /* Message Colors */
+  --search-snippet-user-message-bg: #0066cc;
+  --search-snippet-user-message-text: #ffffff;
+  --search-snippet-assistant-message-bg: #f1f3f5;
+  --search-snippet-assistant-message-text: #212529;
+  --search-snippet-system-message-bg: #fff3cd;
+  --search-snippet-system-message-text: #856404;
+  
+  /* Typography */
+  --search-snippet-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 
+                                'Helvetica Neue', Arial, sans-serif, 'Apple Color Emoji', 
+                                'Segoe UI Emoji', 'Segoe UI Symbol';
+  --search-snippet-font-family-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+  --search-snippet-font-size-base: 14px;
+  --search-snippet-font-size-sm: 12px;
+  --search-snippet-font-size-lg: 16px;
+  --search-snippet-font-size-xl: 18px;
+  --search-snippet-line-height: 1.5;
+  --search-snippet-font-weight-normal: 400;
+  --search-snippet-font-weight-medium: 500;
+  --search-snippet-font-weight-bold: 600;
+  
+  /* Spacing */
+  --search-snippet-spacing-xs: 4px;
+  --search-snippet-spacing-sm: 8px;
+  --search-snippet-spacing-md: 12px;
+  --search-snippet-spacing-lg: 16px;
+  --search-snippet-spacing-xl: 24px;
+  --search-snippet-spacing-xxl: 32px;
+  
+  /* Sizing */
+  --search-snippet-width: 100%;
+  --search-snippet-max-width: 100%;
+  --search-snippet-min-width: 320px;
+  --search-snippet-max-height: 600px;
+  --search-snippet-input-height: 44px;
+  --search-snippet-button-height: 36px;
+  --search-snippet-icon-size: 20px;
+  
+  /* Border */
+  --search-snippet-border-width: 1px;
+  --search-snippet-border-radius: 18px;
+  
+  /* Shadows */
+  --search-snippet-shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --search-snippet-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  --search-snippet-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.15);
+  --search-snippet-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.2);
+  --search-snippet-shadow-inner: inset 0 2px 4px 0 rgba(0, 0, 0, 0.06);
+  
+  /* Animation */
+  --search-snippet-transition-fast: 150ms ease;
+  --search-snippet-transition: 200ms ease;
+  --search-snippet-transition-slow: 300ms ease;
+  --search-snippet-animation-duration: 0.2s;
+  
+  /* Z-index */
+  --search-snippet-z-dropdown: 1000;
+  --search-snippet-z-modal: 1050;
+  --search-snippet-z-popover: 1060;
+  --search-snippet-z-tooltip: 1070;
+  
+  /* Layout */
+  display: block;
+  width: var(--search-snippet-width);
+  max-width: var(--search-snippet-max-width);
+  min-width: var(--search-snippet-min-width);
+  font-family: var(--search-snippet-font-family);
+  font-size: var(--search-snippet-font-size-base);
+  line-height: var(--search-snippet-line-height);
+  color: var(--search-snippet-text-color);
+
+
+  /* Search */
+  --search-snippet-icon-size: 20px;
+  --search-snippet-icon-margin-left: 6px;
+  --search-snippet-result-icon-size: 20px;
+  --search-snippet-result-icon-color: var(--search-snippet-text-secondary);
+  --search-snippet-result-icon-active-color: var(--search-snippet-primary-color);
+  --search-snippet-result-item-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+
+  /* Chat Bubble */
+  --chat-bubble-button-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  --chat-bubble-window-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  --chat-bubble-button-size: 60px;
+  --chat-bubble-button-radius: 50%;
+  --chat-bubble-button-icon-size: 28px;
+  --chat-bubble-button-icon-color: white;
+  --chat-bubble-button-bottom: 20px;
+  --chat-bubble-button-right: 20px;
+  --chat-bubble-button-z-index: 9999;
+  --chat-bubble-position: fixed;
+
+
+}
+
+:host(:not([theme="dark"])) {
+  /* Colors - Light Mode */
+  --search-snippet-primary-color: #2563eb;
+  --search-snippet-primary-hover: #0f51dfff;
+  --search-snippet-background: #ffffff;
+  --search-snippet-surface: #f8f9fa;
+  --search-snippet-text-color: #212529;
+  --search-snippet-text-secondary: #6c757d;
+  --search-snippet-text-description: #495057;
+  --search-snippet-border-color: #dee2e6;
+  --search-snippet-hover-background: #f1f3f5;
+  --search-snippet-focus-ring: #0066cc40;
+  --search-snippet-error-color: #dc3545;
+  --search-snippet-error-background: #f8d7da;
+  --search-snippet-success-color: #28a745;
+  --search-snippet-success-background: #d4edda;
+  --search-snippet-warning-color: #ffc107;
+  --search-snippet-warning-background: #fff3cd;
+  
+  /* Message Colors */
+  --search-snippet-user-message-bg: #0066cc;
+  --search-snippet-user-message-text: #ffffff;
+  --search-snippet-assistant-message-bg: #f1f3f5;
+  --search-snippet-assistant-message-text: #212529;
+  --search-snippet-system-message-bg: #fff3cd;
+  --search-snippet-system-message-text: #856404;
+}
+
+/* Dark Mode */
+@media (prefers-color-scheme: dark) {
+  :host(:not([theme="light"])) {
+    --search-snippet-primary-color: #2563eb;
+    --search-snippet-primary-hover: #0f51dfff;
+    --search-snippet-background: #1a1b1e;
+    --search-snippet-surface: #25262b;
+    --search-snippet-text-color: #c1c2c5;
+    --search-snippet-text-secondary: #909296;
+    --search-snippet-text-description: #adb5bd;
+    --search-snippet-border-color: #373a40;
+    --search-snippet-hover-background: #2c2e33;
+    --search-snippet-focus-ring: #4dabf740;
+    --search-snippet-error-color: #ff6b6b;
+    --search-snippet-error-background: #3d1f1f;
+    --search-snippet-success-color: #51cf66;
+    --search-snippet-success-background: #1f3d24;
+    --search-snippet-warning-color: #ffd43b;
+    --search-snippet-warning-background: #3d3419;
+    
+    --search-snippet-user-message-bg: #4dabf7;
+    --search-snippet-user-message-text: #1a1b1e;
+    --search-snippet-assistant-message-bg: #2c2e33;
+    --search-snippet-assistant-message-text: #c1c2c5;
+    --search-snippet-system-message-bg: #3d3419;
+    --search-snippet-system-message-text: #ffd43b;
+    color-scheme: dark;
+  }
+}
+
+/* Auto theme support */
+:host([theme="light"]) {
+  color-scheme: light;
+}
+
+
+/* Base reset */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* Metadata-driven result icons are hidden until an external ::part() rule displays them. */
+.result-icon {
+  display: none;
+  flex: 0 0 var(--search-snippet-result-icon-size);
+  width: var(--search-snippet-result-icon-size);
+  height: var(--search-snippet-result-icon-size);
+  color: var(--search-snippet-result-icon-color);
+}
+
+a:hover > .result-icon,
+a:focus-visible > .result-icon,
+a.active > .result-icon {
+  color: var(--search-snippet-result-icon-active-color);
+}
+
+/* Container */
+.container {
+  background: var(--search-snippet-background);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  border-radius: var(--search-snippet-border-radius);
+  box-shadow: var(--search-snippet-shadow);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Header */
+.header {
+  padding: var(--search-snippet-spacing-md);
+  border-bottom: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  background: var(--search-snippet-surface);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--search-snippet-spacing-md);
+}
+
+.header-title {
+  font-size: var(--search-snippet-font-size-lg);
+  font-weight: var(--search-snippet-font-weight-bold);
+  color: var(--search-snippet-text-color);
+}
+
+/* Input */
+.input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-sm);
+}
+
+.input {
+  width: 100%;
+  height: var(--search-snippet-input-height);
+  padding: var(--search-snippet-spacing-sm) var(--search-snippet-spacing-md);
+  font-family: var(--search-snippet-font-family);
+  font-size: var(--search-snippet-font-size-base);
+  line-height: var(--search-snippet-line-height);
+  color: var(--search-snippet-text-color);
+  background: var(--search-snippet-background);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  border-radius: var(--search-snippet-border-radius);
+  outline: none;
+  transition: var(--search-snippet-transition);
+}
+
+.input:focus {
+  border-color: var(--search-snippet-primary-color);
+  box-shadow: 0 0 0 3px var(--search-snippet-focus-ring);
+}
+
+.input::placeholder {
+  color: var(--search-snippet-text-secondary);
+}
+
+.input:disabled {
+  background: var(--search-snippet-surface);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Button */
+.button {
+  height: var(--search-snippet-button-height);
+  padding: 0 var(--search-snippet-spacing-lg);
+  font-family: var(--search-snippet-font-family);
+  font-size: var(--search-snippet-font-size-base);
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: #ffffff;
+  background: var(--search-snippet-primary-color);
+  border: none;
+  border-radius: var(--search-snippet-border-radius);
+  cursor: pointer;
+  outline: none;
+  transition: var(--search-snippet-transition);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--search-snippet-spacing-sm);
+  white-space: nowrap;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--search-snippet-primary-hover);
+}
+
+.button:focus-visible {
+  box-shadow: 0 0 0 3px var(--search-snippet-focus-ring);
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.button-secondary {
+  background: var(--search-snippet-surface);
+  color: var(--search-snippet-text-color);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+}
+
+.button-secondary:hover:not(:disabled) {
+  background: var(--search-snippet-hover-background);
+}
+
+/* Content area */
+.content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--search-snippet-spacing-md);
+}
+
+/* Scrollbar styling */
+.content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.content::-webkit-scrollbar-track {
+  background: var(--search-snippet-surface);
+}
+
+.content::-webkit-scrollbar-thumb {
+  background: var(--search-snippet-border-color);
+  border-radius: var(--search-snippet-border-radius);
+}
+
+.content::-webkit-scrollbar-thumb:hover {
+  background: var(--search-snippet-text-secondary);
+}
+
+/* Loading spinner */
+.loading {
+  display: inline-block;
+  width: var(--search-snippet-icon-size);
+  height: var(--search-snippet-icon-size);
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Loading message animation */
+@keyframes loading-message-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.loading-text {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-secondary);
+}
+
+.loading-text-animate {
+  animation: loading-message-in 0.3s ease-out;
+}
+
+/* Error message */
+.error {
+  padding: var(--search-snippet-spacing-md);
+  color: var(--search-snippet-error-color);
+  background: var(--search-snippet-error-background);
+  border-radius: var(--search-snippet-border-radius);
+  font-size: var(--search-snippet-font-size-sm);
+}
+
+/* Empty state */
+.empty {
+  padding: var(--search-snippet-spacing-xl);
+  text-align: center;
+  color: var(--search-snippet-text-secondary);
+}
+
+/* Accessibility */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* Focus visible polyfill */
+.focus-visible:focus {
+  outline: 2px solid var(--search-snippet-primary-color);
+  outline-offset: 2px;
+}
+
+/* Powered by branding - block style (for sidebars) */
+.powered-by {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--search-snippet-spacing-xs);
+  padding: var(--search-snippet-spacing-sm) var(--search-snippet-spacing-md);
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-secondary);
+  background: var(--search-snippet-surface);
+  border-top: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  margin-top: auto;
+  flex-shrink: 0;
+}
+
+.powered-by svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.powered-by a,
+.powered-by-inline a {
+  color: var(--search-snippet-text-secondary);
+  text-decoration: none;
+  transition: color var(--search-snippet-transition-fast);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.powered-by a:hover,
+.powered-by-inline a:hover {
+  color: var(--search-snippet-primary-color);
+}
+
+/* Powered by branding - inline style (for headers/subtle placement) */
+.powered-by-inline {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-secondary);
+  padding: var(--search-snippet-spacing-xs) 0;
+  text-align: center;
+}
+`,l=`@cf/meta/llama-3.3-70b-instruct-fp8-fast`,u=`You rewrite a multi-turn chat into a single standalone search query for a retrieval system.
+
+Inputs: the full conversation in \`messages\`. The final user message is the one to answer; earlier messages are context only.
+
+Rules:
+- Output ONLY the rewritten query as plain text. No preamble, no quotes, no markdown, no explanation.
+- Resolve pronouns and references (it, that, they, the second one, the previous one, etc.) using prior turns.
+- Inline any entities, names, versions, products, or constraints from earlier turns that the final message depends on.
+- Preserve the user's original language and terminology. Do not translate.
+- Do not invent facts, sources, dates, or details not present in the conversation.
+- If the final user message is already fully self-contained, return it unchanged (modulo trivial cleanup).
+- Drop greetings, thanks, and meta questions about the assistant itself; keep only the information need.
+- Keep it concise — a search query, not a sentence. Aim for under 200 characters when possible.
+
+Return only the rewritten query.`;function d(e){let t=`message`,n=[];for(let r of e.split(`
+`)){let e=r.endsWith(`\r`)?r.slice(0,-1):r;if(e===``||e.startsWith(`:`))continue;let i=e.indexOf(`:`),a=i===-1?e:e.slice(0,i),o=i===-1?``:e.slice(i+1);o.startsWith(` `)&&(o=o.slice(1)),a===`event`?t=o:a===`data`&&n.push(o)}return n.length===0?null:{event:t,data:n.join(`
+`)}}function f(e){return typeof e==`object`&&!!e&&!Array.isArray(e)}function p(...e){let t={};for(let n of e)if(n)for(let[e,r]of Object.entries(n)){let n=t[e];t[e]=f(n)&&f(r)?p(n,r):r}return t}function m(e,t){if(!f(t))return e;let n=new URLSearchParams;for(let[e,r]of Object.entries(t))r!=null&&n.append(e,String(r));let r=n.toString();if(!r)return e;let i=e.indexOf(`#`),a=i===-1?e:e.slice(0,i),o=i===-1?``:e.slice(i);return`${a}${a.includes(`?`)?`&`:`?`}${r}${o}`}function h(e){if(!f(e))return{};let t={};for(let[n,r]of Object.entries(e))r!=null&&(t[n]=String(r));return t}function g(e){return f(e)?e:void 0}var _=class{constructor(e){n(this,`activeRequests`,new Map),n(this,`baseUrl`),this.baseUrl=e.replace(/\/$/,``)}request(e,t,n,r){let i=t===`search`?`snippet-search`:`snippet-chat-completions`,a=m(`${this.baseUrl}/${t}`,r?.queryParams);return fetch(a,{method:`POST`,body:JSON.stringify(p(g(r?.body),e)),headers:{...h(r?.headers),"Content-Type":`application/json`,Accept:e.stream?`text/event-stream`:`application/json`,"cf-ai-search-source":i},signal:n})}async search(e,t={}){let n=this.generateRequestId(),r=new AbortController,i=t.signal||r.signal;this.registerRequest(n,r);try{let n=await this.request({messages:[{role:`user`,content:e}],stream:!1,ai_search_options:{retrieval:{metadata_only:!0,max_num_results:t.maxResults??30}}},`search`,i,t.request);if(!n.ok)throw Error(`HTTP error! status: ${n.status}`);if(!n.body)throw Error(`Response body is empty`);let r=await n.json();if(r.success&&r.result)return r.result.chunks.map(e=>({type:`result`,id:e.id,title:S(e.item.metadata?.title),description:e.item.metadata?.description?S(e.item.metadata?.description):``,timestamp:e.item.timestamp??void 0,url:e.item.key,image:e.item.metadata?.image||void 0,metadata:{...e.item.metadata,instance_id:e.instance_id}}));throw r.success===!1?Error(r.error):Error(`Unknown error`)}finally{this.unregisterRequest(n)}}async*searchStream(e,t={}){let n=this.generateRequestId(),r=new AbortController,i=t.signal||r.signal;this.registerRequest(n,r);let a=await this.request({messages:[{role:`user`,content:e}],stream:!0,...t.maxResults!==void 0&&{max_num_results:t.maxResults}},`ai-search`,i,t.request);if(!a.ok)throw Error(`HTTP error! status: ${a.status}`);if(!a.body)throw Error(`Response body is empty`);let o=``,s=a.body.getReader(),c=new TextDecoder;for(;;){let{done:e,value:t}=await s.read();if(e)break;let n=c.decode(t,{stream:!0});o+=n}yield{type:`result`,id:``,title:``,description:o.replaceAll(`data: `,``).trim().split(`
+
+`).map(e=>JSON.parse(e)).map(e=>e.response).join(``),url:``,metadata:{}}}async*chat(e,t){let n=new AbortController,r=t?.signal||n.signal,i=t?.stream??!0,a={messages:[...t?.history??[],{role:`user`,content:e}],stream:i};if(t?.queryRewrite){let e=typeof t.queryRewrite==`object`?t.queryRewrite:{};a.ai_search_options={query_rewrite:{enabled:!0,model:e.model??l,rewrite_prompt:e.rewritePrompt??u}}}let o=await this.request(a,`chat/completions`,r);if(!o.ok)throw Error(`HTTP error! status: ${o.status}`);if(!o.body)throw Error(`Response body is empty`);if(!i){yield{type:`text`,message:(await o.json()).choices.map(e=>e.message.content).join(``)};return}yield*this.parseChatStream(o.body)}async*parseChatStream(e){let t=e.getReader(),n=new TextDecoder,r=``,i=e=>{let t=d(e);if(!t||t.event===`chunks`)return null;if(t.data===`[DONE]`)return`done`;try{let e=JSON.parse(t.data).choices?.[0]?.delta?.content;if(typeof e==`string`&&e.length>0)return{type:`text`,message:e}}catch(e){console.error(`AISearchClient: failed to parse SSE chat chunk`,e)}return null};try{for(;;){let{done:e,value:a}=await t.read();if(e)break;r+=n.decode(a,{stream:!0});let o=r.indexOf(`
+
+`);for(;o!==-1;){let e=r.slice(0,o);r=r.slice(o+2);let t=i(e);if(t===`done`)return;t&&(yield t),o=r.indexOf(`
+
+`)}}if(r+=n.decode(),r.trim().length>0){let e=i(r);e&&e!==`done`&&(yield e)}}catch(e){if(e.name===`AbortError`)return;throw e}finally{t.releaseLock()}}cancelRequest(e){let t=this.activeRequests.get(e);t&&(t.controller.abort(),this.unregisterRequest(e))}cancelAllRequests(){for(let[e]of this.activeRequests)this.cancelRequest(e)}registerRequest(e,t){this.activeRequests.set(e,{id:e,controller:t,timestamp:Date.now()})}unregisterRequest(e){this.activeRequests.delete(e)}generateRequestId(){return`req-${Date.now()}-${Math.random().toString(36).substr(2,9)}`}},v=2500;function y(e,t){let n;function r(...r){clearTimeout(n),n=setTimeout(()=>{e(...r)},t)}return r.cancel=()=>clearTimeout(n),r}function b(e){let t=document.createElement(`div`);return t.textContent=e,t.innerHTML}function x(e){try{return decodeURI(e)}catch{return e}}function S(e){return new DOMParser().parseFromString(e,`text/html`).documentElement.textContent||``}function C(e){return new Date(e).toLocaleDateString(void 0,{month:`short`,day:`numeric`})}function w(e,t){return e===null?t:e}function T(e,t){return e===null?t:e===`true`||e===``}function E(e,t){if(e===null)return t;let n=Number.parseInt(e,10);return Number.isNaN(n)?t:n}function D(e){return typeof e!=`string`||!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(e)?``:`<span class="result-icon" part="result-icon result-icon-${e}" aria-hidden="true"></span>`}function O(e,t){return new CustomEvent(e,{detail:t,bubbles:!0,composed:!0,cancelable:!0})}function k(e,t,n=`Other`){let r=new Map;for(let i of e){let e=i.metadata?.[t],a=e==null||String(e).trim()===``?n:String(e),o=r.get(a);o?o.push(i):r.set(a,[i])}return[...r].map(([e,t])=>({key:e,results:t}))}function A(e,t){let n=0;return e.map((e,r)=>`
+        <div class="result-group" role="group" aria-labelledby="result-group-label-${r}">
+          <div class="result-group-header" id="result-group-label-${r}" role="presentation">${b(e.key)}</div>
+          ${e.results.map(e=>t(e,n++)).join(``)}
+        </div>
+      `).join(``)}function j(e){if(!e)throw Error(`API URL is required`);return new _(e)}var ee=/^[a-z][a-z0-9+.-]*:/i,te=new Set([`http:`,`https:`,`mailto:`,`tel:`]);function M(e){if(typeof e!=`string`)return``;let t=e.replace(/^[\s\u0000-\u001f\u007f]+|[\s\u0000-\u001f\u007f]+$/g,``);if(t===``)return``;if(!ee.test(t))return t;let n;try{n=new URL(t)}catch{return``}return te.has(n.protocol)?t:``}var N=Object.defineProperty,P=(e,t,n)=>t in e?N(e,t,{enumerable:!0,configurable:!0,writable:!0,value:n}):e[t]=n,F=(e,t,n)=>P(e,typeof t==`symbol`?t:t+``,n),I=2e4,ne=20,re=`/stats`;function L(){return typeof document<`u`&&typeof window<`u`}var R=class{constructor(e,t={}){F(this,`baseUrl`),F(this,`endpoint`),F(this,`snippetVersion`),F(this,`flushIntervalMs`),F(this,`maxBufferSize`),F(this,`buffer`,[]),F(this,`flushTimer`,null),F(this,`destroyed`,!1),F(this,`boundUnloadHandler`),F(this,`boundVisibilityHandler`),this.baseUrl=e.replace(/\/$/,``),this.endpoint=t.endpoint??re,this.snippetVersion=t.snippetVersion??`0.0.43`,this.flushIntervalMs=t.flushIntervalMs??I,this.maxBufferSize=Math.max(1,t.maxBufferSize??ne),this.boundUnloadHandler=()=>this.flushBeacon(),this.boundVisibilityHandler=()=>{typeof document<`u`&&document.visibilityState===`hidden`&&this.flushBeacon()},L()&&(window.addEventListener(`pagehide`,this.boundUnloadHandler),document.addEventListener(`visibilitychange`,this.boundVisibilityHandler))}trackSearch(e,t){this.track({inputQuery:e,snippetVersion:this.snippetVersion,totalResult:t})}trackClick(e,t,n,r){this.track({inputQuery:e,snippetVersion:this.snippetVersion,totalResult:t,clickedResultId:n,clickPosition:r,clickViewMore:!1})}trackViewMore(e,t){this.track({inputQuery:e,snippetVersion:this.snippetVersion,totalResult:t,clickViewMore:!0})}track(e){if(!this.destroyed){if(this.buffer.push(e),this.buffer.length>=this.maxBufferSize){this.flush();return}this.scheduleFlush()}}flush(){let e=this.drainBuffer();if(e.length===0)return;let t=JSON.stringify({events:e});fetch(this.buildUrl(),{method:`POST`,headers:{"Content-Type":`application/json`},body:t,keepalive:!0}).catch(e=>{console.log(e)})}flushBeacon(){let e=this.drainBuffer();if(e.length===0)return;let t=JSON.stringify({events:e}),n=this.buildUrl();if(typeof navigator<`u`&&typeof navigator.sendBeacon==`function`)try{let e=new Blob([t],{type:`application/json`});if(navigator.sendBeacon(n,e))return}catch{}typeof fetch<`u`&&fetch(n,{method:`POST`,headers:{"Content-Type":`application/json`},body:t,keepalive:!0}).catch(()=>{})}destroy(){this.destroyed||(this.destroyed=!0,this.flushTimer!==null&&(clearTimeout(this.flushTimer),this.flushTimer=null),L()&&(window.removeEventListener(`pagehide`,this.boundUnloadHandler),document.removeEventListener(`visibilitychange`,this.boundVisibilityHandler)),this.flushBeacon())}scheduleFlush(){this.flushTimer!==null||this.destroyed||(this.flushTimer=setTimeout(()=>{this.flushTimer=null,this.flush()},this.flushIntervalMs))}drainBuffer(){if(this.flushTimer!==null&&(clearTimeout(this.flushTimer),this.flushTimer=null),this.buffer.length===0)return[];let e=this.buffer;return this.buffer=[],e}buildUrl(){let e=this.endpoint.startsWith(`/`)?this.endpoint:`/${this.endpoint}`;return`${this.baseUrl}${e}`}},ie=`
+/* Search view states */
+.search-view {
+  transition: var(--search-snippet-transition-slow);
+  background: var(--search-snippet-background);
+  border-radius: var(--search-snippet-border-radius);
+  padding: 0px;
+}
+
+.search-view-collapsed {
+  max-height: 60px;
+}
+
+.search-view-expanded {
+  max-height: var(--search-snippet-max-height);
+}
+
+
+.search-icon {
+  width: var(--search-snippet-icon-size);
+  height: var(--search-snippet-icon-size);
+  margin-left: var(--search-snippet-icon-margin-left);
+  color: var(--search-snippet-text-color);
+}
+
+/* Search input wrapper */
+.search-input-wrapper {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: var(--search-snippet-spacing-sm);
+  overflow: hidden;
+  transition: max-width var(--search-snippet-transition-slow), 
+              opacity var(--search-snippet-transition);
+  padding: var(--search-snippet-spacing-sm);
+  border-radius: var(--search-snippet-border-radius);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+}
+
+
+
+.search-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--search-snippet-text-color);
+  font-size: var(--search-snippet-font-size-base);
+  font-weight: var(--search-snippet-font-weight-medium);
+  box-shadow: none;
+  padding: 0;
+}
+
+.search-input::placeholder {
+  color: var(--search-snippet-text-secondary);
+}
+
+.search-view:has(.search-input:not(:placeholder-shown)) .search-input-wrapper, .search-view:has(.search-input:not(:placeholder-shown)) {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.search-view:focus-within {
+  border-color: var(--search-snippet-primary-color);
+  box-shadow: inset 0 0 0 3px var(--search-snippet-focus-ring);
+}
+
+.search-view:has(.search-input:not(:placeholder-shown)) .search-content {
+  max-height: 600px;
+  opacity: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.search-submit-button {
+  flex-shrink: 0;
+  position: relative;
+  border-radius: max(var(--search-snippet-button-min-border-radius, 4px), calc(var(--search-snippet-border-radius) - var(--search-snippet-spacing-sm)))
+}
+
+.search-loading-indicator {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  visibility: hidden;
+}
+
+.search-loading-indicator .loading {
+  width: 16px;
+  height: 16px;
+}
+
+.search-submit-button.is-loading .search-submit-label {
+  visibility: hidden;
+}
+
+.search-submit-button.is-loading .search-loading-indicator {
+  visibility: visible;
+}
+
+/* Search content */
+.search-content {
+  max-height: 0;
+  opacity: 0;
+  transition: max-height var(--search-snippet-transition-slow),
+              opacity var(--search-snippet-transition);
+  position: absolute;
+  width: 100%;
+  background: var(--search-snippet-background);
+  border-bottom-left-radius: var(--search-snippet-border-radius);
+  border-bottom-right-radius: var(--search-snippet-border-radius);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  border-top: none;
+}
+
+.search-content::-webkit-scrollbar {
+  width: 8px;
+  height: 100px;
+}
+
+.search-content::-webkit-scrollbar-track {
+  background: var(--search-snippet-surface);
+  
+}
+
+.search-content::-webkit-scrollbar-thumb {
+  background: var(--search-snippet-border-color);
+  border-radius: var(--search-snippet-border-radius);
+}
+
+.search-content::-webkit-scrollbar-thumb:hover {
+  background: var(--search-snippet-text-secondary);
+}
+
+.container {
+  overflow: unset;
+  position: relative;
+  border: none;
+}
+
+.container:has(.search-input:not(:placeholder-shown)) {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+
+/* Override header for search mode */
+
+/* Search results */
+.search-results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--search-snippet-spacing-sm);
+}
+
+.result-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--search-snippet-spacing-sm);
+}
+
+.result-group + .result-group {
+  margin-top: var(--search-snippet-spacing-md);
+}
+
+.result-group-header {
+  padding: var(--search-snippet-spacing-xs) 0;
+  color: var(--search-snippet-text-secondary);
+  font-size: var(--search-snippet-font-size-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+a.search-result-item {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--search-snippet-spacing-md);
+  padding: var(--search-snippet-spacing-md);
+  background: var(--search-snippet-surface);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  border-radius: var(--search-snippet-border-radius);
+  cursor: pointer;
+  transition: var(--search-snippet-transition);
+  text-decoration: none;
+  color: inherit;
+}
+
+/* Image thumbnail container */
+.search-result-image-container {
+  flex-shrink: 0;
+  width: 64px;
+  height: 64px;
+  border-radius: calc(var(--search-snippet-border-radius) - 4px);
+  overflow: hidden;
+  position: relative;
+}
+
+.search-result-image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity var(--search-snippet-transition);
+}
+
+.search-result-image.loaded {
+  opacity: 1;
+}
+
+/* Loading shimmer */
+.search-result-image-loading {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    var(--search-snippet-surface) 25%,
+    var(--search-snippet-border-color) 50%,
+    var(--search-snippet-surface) 75%
+  );
+  background-size: 200% 100%;
+  animation: search-image-shimmer 1.5s infinite;
+}
+
+@keyframes search-image-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Placeholder icon */
+.search-result-image-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--search-snippet-text-secondary);
+  opacity: 0.5;
+}
+
+.search-result-image-placeholder svg {
+  width: 24px;
+  height: 24px;
+}
+
+/* Content wrapper */
+.search-result-content {
+  flex: 1;
+  min-width: 0;
+}
+
+a.search-result-item:hover {
+  background: var(--search-snippet-hover-background);
+  border-color: var(--search-snippet-primary-color);
+  transform: translateY(-1px);
+  box-shadow: var(--search-snippet-result-item-shadow);
+}
+
+a.search-result-item:focus-visible {
+  outline: 2px solid var(--search-snippet-primary-color);
+  outline-offset: 2px;
+}
+
+.search-result-title {
+  font-size: var(--search-snippet-font-size-base);
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: var(--search-snippet-text-color);
+  margin-bottom: var(--search-snippet-spacing-xs);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.search-result-snippet {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-description);
+  line-height: 1.6;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.search-result-metadata {
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-sm);
+  margin-top: var(--search-snippet-spacing-xs);
+  min-width: 0;
+}
+
+.search-result-url {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-primary-color);
+  text-decoration: none;
+  display: block;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-result-url-empty {
+  visibility: hidden;
+}
+
+.search-result-date {
+  font-size: 12px;
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: var(--search-snippet-text-secondary);
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.search-result-url:hover {
+  text-decoration: underline;
+}
+
+/* Search header */
+.search-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--search-snippet-spacing-md);
+  padding-bottom: var(--search-snippet-spacing-sm);
+  border-bottom: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+}
+
+.search-count {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-secondary);
+}
+
+/* Search footer */
+.search-footer {
+  padding: var(--search-snippet-spacing-md);
+  padding-bottom: var(--search-snippet-spacing-xs);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--search-snippet-spacing-sm);
+}
+
+/* See more link */
+.search-see-more {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-xs);
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-primary-color);
+  text-decoration: none;
+  font-weight: var(--search-snippet-font-weight-medium);
+  transition: color var(--search-snippet-transition-fast);
+}
+
+.search-see-more:hover {
+  text-decoration: underline;
+}
+
+/* Loading state for search */
+.search-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--search-snippet-spacing-xxl);
+  gap: var(--search-snippet-spacing-md);
+  color: var(--search-snippet-text-secondary);
+}
+
+/* Empty search state */
+.search-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--search-snippet-spacing-xxl);
+  gap: var(--search-snippet-spacing-md);
+  color: var(--search-snippet-text-secondary);
+  text-align: center;
+}
+
+.search-empty-icon {
+  width: 64px;
+  height: 64px;
+  opacity: 0.5;
+}
+
+.search-empty-title {
+  font-size: var(--search-snippet-font-size-lg);
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: var(--search-snippet-text-color);
+}
+
+.search-empty-description {
+  font-size: var(--search-snippet-font-size-sm);
+}
+
+/* Highlight matching text */
+.search-highlight {
+  background: var(--search-snippet-warning-background);
+  color: var(--search-snippet-warning-color);
+  padding: 1px 2px;
+  border-radius: 2px;
+  font-weight: var(--search-snippet-font-weight-medium);
+}
+`,z=`search-bar-snippet`,B=10,V=50,H=class extends HTMLElement{constructor(){super(),F(this,`shadow`),F(this,`client`,null),F(this,`stats`,null),F(this,`container`,null),F(this,`inputElement`,null),F(this,`resultsContainer`,null),F(this,`searchButton`,null),F(this,`debouncedSearch`,null),F(this,`currentSearchController`,null),F(this,`loadingMessageInterval`,null),F(this,`loadingMessageIndex`,0),F(this,`translationsOverride`,null),F(this,`resolvedTranslations`,a(null)),F(this,`lastSearchQuery`,``),F(this,`lastSearchTotal`,0),F(this,`handleInputChange`,null),F(this,`handleInputKeydownEnter`,null),F(this,`handleInputKeydownEscape`,null),F(this,`handleSearchButtonClick`,null),F(this,`handleResultClick`,null),F(this,`handleSeeMoreClick`,null),this.shadow=this.attachShadow({mode:`open`})}static get observedAttributes(){return[`api-url`,`placeholder`,`max-results`,`max-render-results`,`debounce-ms`,`theme`,`hide-branding`,`show-url`,`show-date`,`hide-thumbnails`,`see-more`,`disable-analytics`,`request-options`,`translations`]}connectedCallback(){this.syncTranslationsFromAttribute(),this.initializeClient(),this.render(),this.dispatchEvent(O(`ready`,void 0))}disconnectedCallback(){this.cleanup()}attributeChangedCallback(e,t,n){t!==n&&(e===`api-url`||e===`disable-analytics`?this.initializeClient():e===`theme`?this.updateTheme(n):e===`translations`&&(this.syncTranslationsFromAttribute(),this.isConnected&&this.rerender()))}get translations(){return this.translationsOverride}set translations(e){this.translationsOverride=e??null,this.resolvedTranslations=a(this.translationsOverride),this.isConnected&&this.rerender()}rerender(){let e=this.inputElement?.value??``;this.render(),e&&this.inputElement&&(this.inputElement.value=e,e.trim().length>0&&this.performSearch(e.trim()))}syncTranslationsFromAttribute(){if(this.translationsOverride){this.resolvedTranslations=a(this.translationsOverride);return}let e=s(this.getAttribute(`translations`),`SearchBarSnippet`);this.resolvedTranslations=a(e)}getProps(){let e=this.resolvedTranslations;return{apiUrl:w(this.getAttribute(`api-url`),``),placeholder:w(this.getAttribute(`placeholder`),e.placeholder),maxResults:E(this.getAttribute(`max-results`),V),maxRenderResults:E(this.getAttribute(`max-render-results`),B),debounceMs:E(this.getAttribute(`debounce-ms`),300),theme:w(this.getAttribute(`theme`),`auto`),hideBranding:T(this.getAttribute(`hide-branding`),!1),showUrl:T(this.getAttribute(`show-url`),!1),showDate:T(this.getAttribute(`show-date`),!1),hideThumbnails:T(this.getAttribute(`hide-thumbnails`),!1),seeMore:w(this.getAttribute(`see-more`),``),groupBy:w(this.getAttribute(`group-by`),``),disableAnalytics:T(this.getAttribute(`disable-analytics`),!1),translations:this.translationsOverride??void 0}}getRequestOptions(){let e=this.getAttribute(`request-options`);if(e)try{let t=JSON.parse(e);if(typeof t!=`object`||!t||Array.isArray(t))throw Error(`request-options must be a JSON object`);return t}catch(e){console.error(`SearchBarSnippet: invalid request-options attribute`,e);return}}initializeClient(){let e=this.getProps();if(!e.apiUrl){console.error(`SearchBarSnippet: api-url attribute is required`),this.client=null,this.destroyStatsClient(),this.showMissingApiUrlError();return}try{this.client=j(e.apiUrl),this.destroyStatsClient(),e.disableAnalytics||(this.stats=new R(e.apiUrl))}catch(e){console.error(`SearchBarSnippet:`,e)}}destroyStatsClient(){this.stats&&=(this.stats.destroy(),null)}render(){let e=this.getProps(),t=this.resolvedTranslations,n=e=>this.performSearch(e);this.debouncedSearch=y(n,e.debounceMs||400);let r=document.createElement(`style`);r.textContent=`${c}
+${ie}`,this.container=document.createElement(`div`),this.container.className=`container`,this.container.innerHTML=`
+            <div class="search-view"> 
+                <div class="search-input-wrapper">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="search-icon" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor"><path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                    <input
+                        type="text"
+                        name="search-input"
+                        class="search-input"
+                        placeholder="${b(e.placeholder||t.placeholder)}"
+                        aria-label="${b(t.searchInputAriaLabel)}"
+                        autocomplete="off"
+                    />
+                    <button class="button search-submit-button" aria-label="${b(t.searchButtonLabel)}">
+                        <span class="search-submit-label">${b(t.searchButtonLabel)}</span>
+                        <span class="search-loading-indicator" aria-hidden="true">
+                            <span class="loading"></span>
+                        </span>
+                    </button>
+                </div>
+                <div class="search-content">
+                    <div class="search-results-wrapper">
+                        <!-- Results will be inserted here -->
+                    </div>
+                </div>
+            </div>
+        `,this.shadow.innerHTML=``,this.shadow.appendChild(r),this.shadow.appendChild(this.container),this.inputElement=this.container.querySelector(`.search-input`),this.resultsContainer=this.container.querySelector(`.search-results-wrapper`),this.searchButton=this.container.querySelector(`.search-submit-button`),this.attachEventListeners(),this.client||this.showMissingApiUrlError()}attachEventListeners(){this.inputElement&&(this.handleInputChange=e=>{let t=e.target.value.trim();t.length>0&&this.debouncedSearch?this.debouncedSearch(t):(this.debouncedSearch?.cancel(),this.currentSearchController?.abort(),this.showEmptyState())},this.inputElement.addEventListener(`input`,this.handleInputChange),this.handleInputKeydownEnter=e=>{if(e.key===`Enter`){let t=e.target.value.trim();t.length>0&&this.performSearch(t)}},this.inputElement.addEventListener(`keydown`,this.handleInputKeydownEnter),this.handleInputKeydownEscape=e=>{e.key===`Escape`&&this.inputElement&&(this.inputElement.value=``)},window.addEventListener(`keydown`,this.handleInputKeydownEscape),this.searchButton&&(this.handleSearchButtonClick=()=>{let e=this.inputElement?.value.trim()||``;e.length>0&&this.performSearch(e)},this.searchButton.addEventListener(`click`,this.handleSearchButtonClick)))}async performSearch(e){if(!this.client){this.showMissingApiUrlError();return}this.currentSearchController&&=(this.currentSearchController.abort(),null);let t=new AbortController;this.currentSearchController=t,this.showLoadingState();try{let n=this.getProps(),r=await this.client.search(e,{signal:t.signal,maxResults:n.maxResults||V,request:this.getRequestOptions()});if(t.signal.aborted||this.currentSearchController!==t)return;let i=r.slice(0,n.maxRenderResults||B);this.lastSearchQuery=e,this.lastSearchTotal=r.length,this.stats?.trackSearch(e,r.length),this.displayResults(i,e,r.length)}catch(e){if(e.name===`AbortError`||t.signal.aborted||this.currentSearchController!==t)return;this.showErrorState(e.message)}finally{this.currentSearchController===t&&(this.currentSearchController=null)}}displayResults(e,t,n=e.length){if(this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;if(e.length===0){this.showNoResultsState(t);return}let i=this.getProps(),a=this.resolvedTranslations,s=i.hideBranding?``:`<div class="powered-by-inline">${r}</div>`,c=n>e.length,l=c?o(a.resultsCountOverflow,{n:e.length,total:n}):o(n===1?a.resultsCount:a.resultsCountPlural,{n}),u=i.seeMore&&c?`<div class="search-footer">
+            <a href="${b(i.seeMore+encodeURIComponent(t))}" class="search-see-more">
+              <span>${b(a.seeMoreResults)}</span>
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            </a>
+          </div>`:``,d=`
+            <div class="search-header">
+                <div class="search-count">
+                    ${b(l)}
+                </div>
+                ${s}
+            </div>
+            <div class="search-results">
+                ${i.groupBy?A(k(e,i.groupBy,a.groupOther),(e,t)=>this.renderResult(e,t)):e.map((e,t)=>this.renderResult(e,t)).join(``)}
+            </div>
+            ${u}
+        `;this.resultsContainer.innerHTML=d,this.attachResultHandlers()}renderResult(e,t){let n=this.getProps(),r=D(e.metadata?.icon),i=n.hideThumbnails?``:this.renderResultImage(e.image,e.title),a=M(e.url),o=a?b(a):`#`,s=a?b(x(a)):``,c=n.showDate&&e.timestamp!==void 0?`<div class="search-result-date">${b(C(e.timestamp))}</div>`:``,l=n.showUrl&&a||c?`<div class="search-result-metadata">
+            ${n.showUrl&&a?`<span class="search-result-url">${s}</span>`:`<span class="search-result-url search-result-url-empty"></span>`}
+            ${c}
+          </div>`:``;return`
+            <a href="${o}" class="search-result-item" data-index="${t}" data-result-id="${b(e.id||``)}">
+                ${r}
+                ${i}
+                <div class="search-result-content">
+                    <div class="search-result-title">${b(e.title||``)}</div>
+                    <div class="search-result-snippet">${b(e.description||``)}</div>
+                    ${l}
+                </div>
+            </a>
+        `}renderResultImage(e,t){let n=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>`;return e?`
+      <div class="search-result-image-container">
+        <div class="search-result-image-loading"></div>
+        <div class="search-result-image-placeholder" style="display: none;">${n}</div>
+        <img 
+          class="search-result-image" 
+          src="${b(e)}" 
+          alt="${b(t)}"
+          loading="lazy"
+        />
+      </div>
+    `:`
+        <div class="search-result-image-container">
+          <div class="search-result-image-placeholder">${n}</div>
+        </div>
+      `}attachResultHandlers(){this.detachResultTrackingHandlers();let e=this.resultsContainer;if(!e)return;this.handleResultClick=e=>{let t=e.target?.closest(`.search-result-item`);if(!t)return;t.getAttribute(`href`)===`#`&&e.preventDefault();let n=t.getAttribute(`data-index`),r=t.getAttribute(`data-result-id`)??``,i=n===null?NaN:Number.parseInt(n,10);!Number.isNaN(i)&&r&&this.stats?.trackClick(this.lastSearchQuery,this.lastSearchTotal,r,i)},e.addEventListener(`click`,this.handleResultClick);let t=e.querySelector(`.search-see-more`);t&&(this.handleSeeMoreClick=()=>{this.stats?.trackViewMore(this.lastSearchQuery,this.lastSearchTotal)},t.addEventListener(`click`,this.handleSeeMoreClick)),this.container?.querySelectorAll(`.search-result-image`)?.forEach(e=>{e.addEventListener(`load`,()=>{e.classList.add(`loaded`),e.closest(`.search-result-image-container`)?.querySelector(`.search-result-image-loading`)?.remove()}),e.addEventListener(`error`,()=>{let t=e.closest(`.search-result-image-container`);t?.querySelector(`.search-result-image-loading`)?.remove();let n=t?.querySelector(`.search-result-image-placeholder`);n&&(n.style.display=`flex`),e.style.display=`none`})})}detachResultTrackingHandlers(){let e=this.resultsContainer;e&&this.handleResultClick&&e.removeEventListener(`click`,this.handleResultClick),this.handleResultClick=null,this.handleSeeMoreClick=null}showLoadingState(){if(!this.resultsContainer||(this.clearLoadingInterval(),this.setLoadingIndicator(!0),this.resultsContainer.querySelector(`.search-result-item`)))return;let e=this.resolvedTranslations.loadingMessages;this.loadingMessageIndex=Math.floor(Math.random()*e.length),this.resultsContainer.innerHTML=`
+            <div class="search-loading">
+                <div class="loading-text loading-text-animate">${b(e[this.loadingMessageIndex])}</div>
+            </div>
+        `,this.startLoadingInterval()}setLoadingIndicator(e){this.searchButton?.classList.toggle(`is-loading`,e),this.searchButton?.setAttribute(`aria-busy`,String(e)),this.resultsContainer?.setAttribute(`aria-busy`,String(e))}startLoadingInterval(){this.loadingMessageInterval=setInterval(()=>{let e=this.resolvedTranslations.loadingMessages;this.loadingMessageIndex=(this.loadingMessageIndex+1)%e.length;let t=this.resultsContainer?.querySelector(`.loading-text`);t&&(t.classList.remove(`loading-text-animate`),t.offsetWidth,t.textContent=e[this.loadingMessageIndex],t.classList.add(`loading-text-animate`))},v)}clearLoadingInterval(){this.loadingMessageInterval&&=(clearInterval(this.loadingMessageInterval),null)}showEmptyState(){if(this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;let e=this.resolvedTranslations;this.resultsContainer.innerHTML=`
+            <div class="search-empty">
+                <svg class="search-empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <path d="m21 21-4.35-4.35"></path>
+                </svg>
+                <div class="search-empty-title">${b(e.emptyStateTitle)}</div>
+                <div class="search-empty-description">
+                    ${b(e.emptyStateDescription)}
+                </div>
+            </div>
+        `}showNoResultsState(e){if(this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;let t=this.resolvedTranslations;this.resultsContainer.innerHTML=`
+            <div class="search-empty">
+                <svg class="search-empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                <div class="search-empty-title">${b(t.noResultsTitle)}</div>
+                <div class="search-empty-description">
+                    ${b(o(t.noResultsDescription,{query:e}))}
+                </div>
+            </div>
+        `}showErrorState(e){if(this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;let t=this.resolvedTranslations;this.resultsContainer.innerHTML=`
+            <div class="error">
+                <strong>${b(t.errorPrefix)}</strong> ${b(e)}
+            </div>
+        `}showMissingApiUrlError(){this.resultsContainer&&this.showErrorState(this.resolvedTranslations.missingApiUrlError)}updateTheme(e){let t=e===`light`||e===`dark`||e===`auto`?e:`auto`;t===`auto`?this.removeAttribute(`theme`):this.setAttribute(`theme`,t)}cleanup(){this.clearLoadingInterval(),this.currentSearchController&&=(this.currentSearchController.abort(),null),this.client&&this.client.cancelAllRequests(),this.destroyStatsClient(),this.inputElement&&(this.handleInputChange&&this.inputElement.removeEventListener(`input`,this.handleInputChange),this.handleInputKeydownEnter&&this.inputElement.removeEventListener(`keydown`,this.handleInputKeydownEnter),this.handleInputKeydownEscape&&window.removeEventListener(`keydown`,this.handleInputKeydownEscape)),this.searchButton&&this.handleSearchButtonClick&&this.searchButton.removeEventListener(`click`,this.handleSearchButtonClick),this.detachResultTrackingHandlers(),this.handleInputChange=null,this.handleInputKeydownEnter=null,this.handleInputKeydownEscape=null,this.handleSearchButtonClick=null}async search(e){await this.performSearch(e)}};customElements.get(z)||customElements.define(z,H);var U=`
+/* Modal backdrop */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  z-index: var(--search-snippet-z-modal);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--search-snippet-transition), visibility var(--search-snippet-transition);
+}
+
+.modal-backdrop.open {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Modal container */
+.modal-container {
+  position: fixed;
+  top: 15%;
+  left: 50%;
+  transform: translateX(-50%) scale(0.95);
+  width: 90%;
+  max-width: 600px;
+  max-height: 70vh;
+  background: var(--search-snippet-background);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  border-radius: var(--search-snippet-border-radius);
+  box-shadow: var(--search-snippet-shadow-lg);
+  z-index: calc(var(--search-snippet-z-modal) + 1);
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--search-snippet-transition), 
+              visibility var(--search-snippet-transition),
+              transform var(--search-snippet-transition);
+}
+
+.modal-container.open {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) scale(1);
+}
+
+/* Modal header with search input */
+.modal-header {
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-sm);
+  padding: var(--search-snippet-spacing-md);
+  border-bottom: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+}
+
+.modal-search-icon {
+  width: var(--search-snippet-icon-size);
+  height: var(--search-snippet-icon-size);
+  color: var(--search-snippet-text-secondary);
+  flex-shrink: 0;
+}
+
+.modal-search-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--search-snippet-text-color);
+  font-size: var(--search-snippet-font-size-lg);
+  font-family: var(--search-snippet-font-family);
+  font-weight: var(--search-snippet-font-weight-normal);
+  padding: var(--search-snippet-spacing-xs) 0;
+}
+
+.modal-search-input::placeholder {
+  color: var(--search-snippet-text-secondary);
+}
+
+.modal-loading-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--search-snippet-icon-size);
+  height: var(--search-snippet-icon-size);
+  flex-shrink: 0;
+  visibility: hidden;
+}
+
+.modal-loading-indicator .loading {
+  width: 16px;
+  height: 16px;
+}
+
+.modal-container.is-loading .modal-loading-indicator {
+  visibility: visible;
+}
+
+.modal-shortcut-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-xs);
+  color: var(--search-snippet-text-secondary);
+  font-size: var(--search-snippet-font-size-sm);
+  flex-shrink: 0;
+}
+
+.modal-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 var(--search-snippet-spacing-xs);
+  background: var(--search-snippet-surface);
+  border: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  border-radius: 4px;
+  font-size: var(--search-snippet-font-size-sm);
+  font-family: var(--search-snippet-font-family);
+  color: var(--search-snippet-text-secondary);
+}
+
+/* Modal content (results area) */
+.modal-content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--search-snippet-spacing-sm);
+}
+
+.modal-content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.modal-content::-webkit-scrollbar-track {
+  background: var(--search-snippet-surface);
+}
+
+.modal-content::-webkit-scrollbar-thumb {
+  background: var(--search-snippet-border-color);
+  border-radius: var(--search-snippet-border-radius);
+}
+
+.modal-content::-webkit-scrollbar-thumb:hover {
+  background: var(--search-snippet-text-secondary);
+}
+
+/* Results list */
+.modal-results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--search-snippet-spacing-xs);
+}
+
+.result-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--search-snippet-spacing-xs);
+}
+
+.result-group + .result-group {
+  margin-top: var(--search-snippet-spacing-sm);
+}
+
+.result-group-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: var(--search-snippet-spacing-xs) var(--search-snippet-spacing-md);
+  background: var(--search-snippet-surface);
+  color: var(--search-snippet-text-secondary);
+  font-size: var(--search-snippet-font-size-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/*
+ * Mask the scroll container's top padding while the header is pinned so
+ * result items don't peek through as a sliver between the search input and
+ * the (sticky) category header. The pseudo-element rides above the header,
+ * painted with the modal background, covering the padding gap and giving a
+ * clean cutoff for items scrolling underneath.
+ */
+.result-group-header::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: var(--search-snippet-spacing-sm);
+  background: var(--search-snippet-background);
+}
+
+.modal-result-row {
+  position: relative;
+  display: flex;
+}
+
+
+a.modal-result-item {
+  flex: 1;
+  min-width: 0;
+  padding: var(--search-snippet-spacing-md);
+  padding-right: calc(
+    36px + var(--search-snippet-spacing-md) + var(--search-snippet-spacing-md)
+  );
+  background: transparent;
+  border: var(--search-snippet-border-width) solid transparent;
+  border-radius: calc(var(--search-snippet-border-radius) - 4px);
+  cursor: pointer;
+  transition: var(--search-snippet-transition-fast);
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--search-snippet-spacing-md);
+  text-decoration: none;
+  color: inherit;
+}
+
+/* Image thumbnail container */
+.modal-result-image-container {
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+}
+
+.modal-result-image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity var(--search-snippet-transition);
+}
+
+.modal-result-image.loaded {
+  opacity: 1;
+}
+
+/* Loading shimmer */
+.modal-result-image-loading {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    var(--search-snippet-surface) 25%,
+    var(--search-snippet-border-color) 50%,
+    var(--search-snippet-surface) 75%
+  );
+  background-size: 200% 100%;
+  animation: modal-image-shimmer 1.5s infinite;
+}
+
+@keyframes modal-image-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Placeholder icon */
+.modal-result-image-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--search-snippet-text-secondary);
+  opacity: 0.5;
+}
+
+.modal-result-image-placeholder svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* Content wrapper */
+.modal-result-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--search-snippet-spacing-xs);
+}
+
+a.modal-result-item:hover,
+a.modal-result-item.active {
+  background: var(--search-snippet-hover-background);
+  border-color: var(--search-snippet-border-color);
+}
+
+a.modal-result-item.active {
+  border-color: var(--search-snippet-primary-color);
+  background: var(--search-snippet-focus-ring);
+}
+
+a.modal-result-item:focus-visible {
+  outline: 2px solid var(--search-snippet-primary-color);
+  outline-offset: -2px;
+}
+
+.modal-favorite-button {
+  position: absolute;
+  top: 50%;
+  right: var(--search-snippet-spacing-md);
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 8px;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--search-snippet-text-secondary);
+  cursor: pointer;
+  transition: var(--search-snippet-transition-fast);
+}
+
+.modal-favorite-button:hover,
+.modal-favorite-button:focus-visible {
+  background: var(--search-snippet-hover-background);
+  color: var(--search-snippet-primary-color);
+}
+
+.modal-favorite-button:focus-visible {
+  outline: 2px solid var(--search-snippet-primary-color);
+  outline-offset: -2px;
+}
+
+.modal-favorite-button svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linejoin: round;
+  stroke-width: 1.75;
+}
+
+.modal-favorite-button.favorite {
+  color: var(--search-snippet-primary-color);
+}
+
+.modal-favorite-button.favorite svg {
+  fill: currentColor;
+}
+
+.modal-result-title {
+  font-size: var(--search-snippet-font-size-base);
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: var(--search-snippet-text-color);
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.modal-result-description {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-description);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.modal-result-metadata {
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-sm);
+  min-width: 0;
+}
+
+.modal-result-url {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-primary-color);
+  text-decoration: none;
+  display: block;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-result-url-empty {
+  visibility: hidden;
+}
+
+.modal-result-date {
+  font-size: 12px;
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: var(--search-snippet-text-secondary);
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.modal-result-url:hover {
+  text-decoration: underline;
+}
+
+/* Initial modal sections */
+.modal-initial-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--search-snippet-spacing-xs);
+}
+
+.modal-initial-section + .modal-initial-section {
+  margin-top: var(--search-snippet-spacing-md);
+}
+
+.modal-initial-section-title {
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-xs);
+  margin: 0;
+  padding: var(--search-snippet-spacing-xs) var(--search-snippet-spacing-md);
+  color: var(--search-snippet-text-secondary);
+  font-size: var(--search-snippet-font-size-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.modal-initial-section-title svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.75;
+}
+
+/* Result group header */
+.modal-group-header {
+  padding: var(--search-snippet-spacing-sm) var(--search-snippet-spacing-md);
+  font-size: var(--search-snippet-font-size-sm);
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: var(--search-snippet-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Loading state */
+.modal-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--search-snippet-spacing-xxl);
+  gap: var(--search-snippet-spacing-md);
+  color: var(--search-snippet-text-secondary);
+}
+
+/* Empty state */
+.modal-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--search-snippet-spacing-xxl);
+  gap: var(--search-snippet-spacing-md);
+  color: var(--search-snippet-text-secondary);
+  text-align: center;
+}
+
+.modal-empty-icon {
+  width: 48px;
+  height: 48px;
+  opacity: 0.5;
+}
+
+.modal-empty-title {
+  font-size: var(--search-snippet-font-size-base);
+  font-weight: var(--search-snippet-font-weight-medium);
+  color: var(--search-snippet-text-color);
+}
+
+.modal-empty-description {
+  font-size: var(--search-snippet-font-size-sm);
+}
+
+/* Footer */
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--search-snippet-spacing-sm) var(--search-snippet-spacing-md);
+  border-top: var(--search-snippet-border-width) solid var(--search-snippet-border-color);
+  background: var(--search-snippet-surface);
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-secondary);
+  border-radius: 0 0 var(--search-snippet-border-radius) var(--search-snippet-border-radius);
+}
+
+.modal-footer-hints {
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-md);
+}
+
+.modal-footer-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--search-snippet-spacing-xs);
+}
+
+.modal-footer-hint .modal-kbd {
+  min-width: 20px;
+  height: 20px;
+  font-size: 11px;
+}
+
+/* Results count */
+.modal-results-count {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-secondary);
+}
+
+/* Powered by in modal footer */
+.modal-footer .powered-by-inline {
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-text-secondary);
+}
+
+.modal-footer .powered-by-inline a {
+  color: var(--search-snippet-text-secondary);
+  text-decoration: none;
+  transition: color var(--search-snippet-transition-fast);
+}
+
+.modal-footer .powered-by-inline a:hover {
+  color: var(--search-snippet-primary-color);
+}
+
+/* See more link */
+.modal-see-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--search-snippet-spacing-xs);
+  padding: var(--search-snippet-spacing-md);
+  font-size: var(--search-snippet-font-size-sm);
+  color: var(--search-snippet-primary-color);
+  text-decoration: none;
+  font-weight: var(--search-snippet-font-weight-medium);
+  transition: background var(--search-snippet-transition-fast);
+  padding-bottom: var(--search-snippet-spacing-xs);
+}
+
+.modal-see-more:hover {
+  background: var(--search-snippet-hover);
+  text-decoration: underline;
+}
+
+/* Responsive adjustments */
+@media (max-width: 640px) {
+  .modal-container {
+    top: 10%;
+    width: 95%;
+    max-height: 80vh;
+  }
+
+  .modal-footer-hints {
+    display: none;
+  }
+}
+
+/* Animation for modal open */
+@keyframes modal-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) scale(0.95) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) scale(1) translateY(0);
+  }
+}
+
+.modal-container.open {
+  animation: modal-slide-in var(--search-snippet-transition) ease-out;
+}
+`,W=`search-snippet:recent-results`,G=`search-snippet:favorite-results`,K=5;function q(e){if(!e||typeof e!=`object`)return!1;let t=e;return t.type===`result`&&typeof t.id==`string`&&typeof t.title==`string`&&typeof t.description==`string`&&(t.url===void 0||typeof t.url==`string`)&&(t.image===void 0||typeof t.image==`string`)&&(t.timestamp===void 0||typeof t.timestamp==`number`)&&(t.metadata===void 0||typeof t.metadata==`object`&&t.metadata!==null)}function J(e){return e.url||e.id}function Y(e,t){let n=J(t);return e.some(e=>J(e)===n)}function X(e){try{let t=localStorage.getItem(e);if(!t)return[];let n=JSON.parse(t);return Array.isArray(n)?n.filter(q):[]}catch{return[]}}function ae(e,t=W,n=K){let r=J(e),i=[e,...X(t).filter(e=>J(e)!==r)].slice(0,Math.max(0,n));try{localStorage.setItem(t,JSON.stringify(i))}catch{}return i}function oe(e,t=G){let n=X(t),r=Y(n,e)?n.filter(t=>J(t)!==J(e)):[e,...n];try{localStorage.setItem(t,JSON.stringify(r))}catch{}return r}var Z=`search-modal-snippet`,Q=10,$=50,se=class extends HTMLElement{constructor(){super(),F(this,`shadow`),F(this,`client`,null),F(this,`stats`,null),F(this,`backdrop`,null),F(this,`modal`,null),F(this,`inputElement`,null),F(this,`resultsContainer`,null),F(this,`footerCount`,null),F(this,`isOpen`,!1),F(this,`results`,[]),F(this,`favoriteResults`,[]),F(this,`activeIndex`,-1),F(this,`debouncedSearch`,null),F(this,`currentSearchController`,null),F(this,`loadingMessageInterval`,null),F(this,`loadingMessageIndex`,0),F(this,`translationsOverride`,null),F(this,`resolvedTranslations`,a(null)),F(this,`lastSearchQuery`,``),F(this,`lastSearchTotal`,0),F(this,`handleGlobalKeydown`,null),F(this,`handleInputChange`,null),F(this,`handleInputKeydown`,null),F(this,`handleBackdropClick`,null),F(this,`handleResultsContainerClick`,null),F(this,`savedBodyStyles`,null),F(this,`savedHtmlOverflow`,null),this.shadow=this.attachShadow({mode:`open`})}static get observedAttributes(){return[`api-url`,`placeholder`,`max-results`,`max-render-results`,`theme`,`shortcut`,`use-meta-key`,`debounce-ms`,`hide-branding`,`show-url`,`show-date`,`hide-thumbnails`,`see-more`,`disable-analytics`,`request-options`,`translations`]}connectedCallback(){this.syncTranslationsFromAttribute(),this.initializeClient(),this.render(),this.attachGlobalKeyboardShortcut(),this.dispatchEvent(O(`ready`,void 0))}disconnectedCallback(){this.cleanup()}attributeChangedCallback(e,t,n){t!==n&&(e===`api-url`||e===`disable-analytics`?this.initializeClient():e===`theme`?this.updateTheme(n):e===`translations`&&(this.syncTranslationsFromAttribute(),this.isConnected&&this.rerender()))}get translations(){return this.translationsOverride}set translations(e){this.translationsOverride=e??null,this.resolvedTranslations=a(this.translationsOverride),this.isConnected&&this.rerender()}rerender(){let e=this.isOpen,t=this.inputElement?.value??``;this.isOpen=!1,this.render(),e&&(this.isOpen=!0,this.backdrop?.classList.add(`open`),this.modal?.classList.add(`open`),requestAnimationFrame(()=>{requestAnimationFrame(()=>{this.inputElement?.focus()})})),t&&this.inputElement&&(this.inputElement.value=t,t.trim().length>0&&this.performSearch(t.trim()))}syncTranslationsFromAttribute(){if(this.translationsOverride){this.resolvedTranslations=a(this.translationsOverride);return}let e=s(this.getAttribute(`translations`),`SearchModalSnippet`);this.resolvedTranslations=a(e)}getProps(){let e=this.resolvedTranslations;return{apiUrl:w(this.getAttribute(`api-url`),``),placeholder:w(this.getAttribute(`placeholder`),e.placeholder),maxResults:E(this.getAttribute(`max-results`),$),maxRenderResults:E(this.getAttribute(`max-render-results`),Q),debounceMs:E(this.getAttribute(`debounce-ms`),300),theme:w(this.getAttribute(`theme`),`auto`),shortcut:w(this.getAttribute(`shortcut`),`k`),useMetaKey:this.getAttribute(`use-meta-key`)!==`false`,hideBranding:T(this.getAttribute(`hide-branding`),!1),showUrl:T(this.getAttribute(`show-url`),!1),showDate:T(this.getAttribute(`show-date`),!1),hideThumbnails:T(this.getAttribute(`hide-thumbnails`),!1),seeMore:w(this.getAttribute(`see-more`),``),groupBy:w(this.getAttribute(`group-by`),``),disableAnalytics:T(this.getAttribute(`disable-analytics`),!1),translations:this.translationsOverride??void 0}}getRequestOptions(){let e=this.getAttribute(`request-options`);if(e)try{let t=JSON.parse(e);if(typeof t!=`object`||!t||Array.isArray(t))throw Error(`request-options must be a JSON object`);return t}catch(e){console.error(`SearchModalSnippet: invalid request-options attribute`,e);return}}initializeClient(){let e=this.getProps();if(!e.apiUrl){console.error(`SearchModalSnippet: api-url attribute is required`),this.client=null,this.destroyStatsClient(),this.showMissingApiUrlError();return}try{this.client=j(e.apiUrl),this.destroyStatsClient(),e.disableAnalytics||(this.stats=new R(e.apiUrl))}catch(e){console.error(`SearchModalSnippet:`,e)}}destroyStatsClient(){this.stats&&=(this.stats.destroy(),null)}render(){let e=this.getProps(),t=this.resolvedTranslations,n=e=>this.performSearch(e);this.debouncedSearch=y(n,e.debounceMs||300);let i=document.createElement(`style`);i.textContent=`${c}
+${U}`;let a=e.hideBranding?``:`<div class="powered-by-inline">${r}</div>`,o=document.createElement(`div`);o.innerHTML=`
+      <div class="modal-backdrop" role="presentation"></div>
+      <div class="modal-container" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal-header">
+          <svg class="modal-search-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor">
+            <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
+          </svg>
+          <input
+            type="text"
+            class="modal-search-input"
+            placeholder="${b(e.placeholder||t.placeholder)}"
+            aria-label="${b(t.searchButtonLabel)}"
+            aria-autocomplete="list"
+            aria-controls="modal-results-list"
+            aria-expanded="false"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="modal-loading-indicator" role="status" aria-label="${b(t.loadingAriaLabel)}">
+            <span class="loading" aria-hidden="true"></span>
+          </span>
+        </div>
+        <div class="modal-content">
+          <div class="modal-results" id="modal-results-list" role="listbox" aria-label="${b(t.searchResultsAriaLabel)}"></div>
+        </div>
+        <div class="modal-footer">
+          <div class="modal-footer-hints">
+            <div class="modal-footer-hint">
+              <kbd class="modal-kbd">↑</kbd>
+              <kbd class="modal-kbd">↓</kbd>
+              <span>${b(t.navigateHint)}</span>
+            </div>
+            <div class="modal-footer-hint">
+              <kbd class="modal-kbd">↵</kbd>
+              <span>${b(t.selectHint)}</span>
+            </div>
+            <div class="modal-footer-hint">
+              <kbd class="modal-kbd">Esc</kbd>
+              <span>${b(t.closeHint)}</span>
+            </div>
+          </div>
+          ${a}
+        </div>
+      </div>
+    `,this.shadow.innerHTML=``,this.shadow.appendChild(i),this.shadow.appendChild(o),this.backdrop=this.shadow.querySelector(`.modal-backdrop`),this.modal=this.shadow.querySelector(`.modal-container`),this.inputElement=this.shadow.querySelector(`.modal-search-input`),this.resultsContainer=this.shadow.querySelector(`.modal-results`),this.footerCount=this.shadow.querySelector(`.modal-results-count`),this.attachEventListeners(),this.client?this.showEmptyState():this.showMissingApiUrlError()}attachGlobalKeyboardShortcut(){let e=this.getProps(),t=e.shortcut?.toLowerCase()||`k`;this.handleGlobalKeydown=n=>{(e.useMetaKey&&n.metaKey||n.ctrlKey)&&n.key.toLowerCase()===t&&!this.isOpen&&(n.preventDefault(),this.open())},document.addEventListener(`keydown`,this.handleGlobalKeydown)}attachEventListeners(){!this.inputElement||!this.backdrop||(this.handleInputChange=e=>{let t=e.target.value.trim();t.length>0&&this.debouncedSearch?this.debouncedSearch(t):(this.debouncedSearch?.cancel(),this.currentSearchController?.abort(),this.results=[],this.activeIndex=-1,this.showEmptyState())},this.inputElement.addEventListener(`input`,this.handleInputChange),this.handleInputKeydown=e=>{switch(e.key){case`ArrowDown`:e.preventDefault(),this.navigateResults(1);break;case`ArrowUp`:e.preventDefault(),this.navigateResults(-1);break;case`Enter`:e.preventDefault(),this.selectActiveResult();break;case`Escape`:e.preventDefault(),this.close()}},this.inputElement.addEventListener(`keydown`,this.handleInputKeydown),this.handleBackdropClick=e=>{e.target===this.backdrop&&this.close()},this.backdrop.addEventListener(`click`,this.handleBackdropClick))}navigateResults(e){if(this.results.length===0)return;let t=this.activeIndex+e;this.activeIndex=t<0?this.results.length-1:t>=this.results.length?0:t,this.updateActiveResult()}updateActiveResult(){let e=this.resultsContainer?.querySelectorAll(`.modal-result-item`);e&&(e.forEach((e,t)=>{t===this.activeIndex?(e.classList.add(`active`),e.setAttribute(`aria-selected`,`true`),e.scrollIntoView({block:`nearest`})):(e.classList.remove(`active`),e.setAttribute(`aria-selected`,`false`))}),this.inputElement&&this.activeIndex>=0?this.inputElement.setAttribute(`aria-activedescendant`,`result-${this.activeIndex}`):this.inputElement&&this.inputElement.removeAttribute(`aria-activedescendant`))}selectActiveResult(){if(this.currentSearchController)return;if(this.activeIndex<0||this.activeIndex>=this.results.length){let e=this.inputElement?.value.trim();e&&e.length>0&&this.performSearch(e);return}let e=this.results[this.activeIndex];this.dispatchEvent(O(`result-select`,{result:e,index:this.activeIndex}));let t=this.resultsContainer?.querySelector(`.modal-result-item[data-index="${this.activeIndex}"]`);t&&M(e.url)&&t.click(),this.close()}async performSearch(e){if(!this.client){this.showMissingApiUrlError();return}this.currentSearchController&&=(this.currentSearchController.abort(),null);let t=new AbortController;this.currentSearchController=t,this.showLoadingState();try{let n=this.getProps(),r=await this.client.search(e,{signal:t.signal,maxResults:n.maxResults||$,request:this.getRequestOptions()});if(t.signal.aborted||this.currentSearchController!==t)return;let i=r.slice(0,n.maxRenderResults||Q);this.lastSearchQuery=e,this.lastSearchTotal=r.length,this.stats?.trackSearch(e,r.length),this.displayResults(i,e,r.length)}catch(e){if(e.name===`AbortError`||t.signal.aborted||this.currentSearchController!==t)return;this.showErrorState(e.message)}finally{this.currentSearchController===t&&(this.currentSearchController=null)}}displayResults(e,t,n=e.length){let r=this.getProps(),i=this.resolvedTranslations,a=r.groupBy?k(e,r.groupBy,i.groupOther):null;if(this.results=a?a.flatMap(e=>e.results):e,this.favoriteResults=X(G),this.activeIndex=this.results.length>0?0:-1,this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;if(this.results.length===0){this.showNoResultsState(t);return}let s=a?A(a,(e,t)=>this.renderResult(e,t)):this.results.map((e,t)=>this.renderResult(e,t)).join(``),c=n>e.length,l=c?o(i.resultsCountOverflow,{n:e.length,total:n}):o(n===1?i.modalResultsCount:i.modalResultsCountPlural,{n}),u=r.seeMore&&c?`<a href="${b(r.seeMore+encodeURIComponent(t))}" class="modal-see-more">
+            <span>${b(i.seeMoreResults)}</span>
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+          </a>`:``;this.resultsContainer.innerHTML=s+u,this.footerCount&&(this.footerCount.textContent=l),this.inputElement&&this.inputElement.setAttribute(`aria-expanded`,`true`),this.attachResultHandlers(),this.updateActiveResult()}renderResult(e,t){let n=this.getProps(),r=D(e.metadata?.icon),i=n.hideThumbnails?``:this.renderResultImage(e.image,e.title),a=M(e.url),o=a?b(a):`#`,s=a?b(x(a)):``,c=n.showDate&&e.timestamp!==void 0?`<div class="modal-result-date">${b(C(e.timestamp))}</div>`:``,l=n.showUrl&&a||c?`<div class="modal-result-metadata">
+            ${n.showUrl&&a?`<span class="modal-result-url">${s}</span>`:`<span class="modal-result-url modal-result-url-empty"></span>`}
+            ${c}
+          </div>`:``,u=Y(this.favoriteResults,e),d=u?this.resolvedTranslations.removeFavorite:this.resolvedTranslations.addFavorite;return`
+      <div class="modal-result-row">
+        <a
+          href="${o}"
+          class="modal-result-item${t===this.activeIndex?` active`:``}"
+          role="option"
+          id="result-${t}"
+          aria-selected="${t===this.activeIndex}"
+          tabindex="-1"
+          data-index="${t}"
+          data-result-id="${b(e.id||``)}"
+          data-url="${b(a)}"
+        >
+          ${r}
+          ${i}
+          <div class="modal-result-content">
+            <div class="modal-result-title">${b(e.title||``)}</div>
+            ${e.description?`<div class="modal-result-description">${b(e.description)}</div>`:``}
+            ${l}
+          </div>
+        </a>
+        <button
+          type="button"
+          class="modal-favorite-button${u?` favorite`:``}"
+          data-favorite-index="${t}"
+          aria-label="${b(d)}"
+          title="${b(d)}"
+          aria-pressed="${u}"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m12 2.7 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.3l6.2-.9L12 2.7Z"></path>
+          </svg>
+        </button>
+      </div>
+    `}renderResultImage(e,t){let n=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>`;return e?`
+      <div class="modal-result-image-container">
+        <div class="modal-result-image-loading"></div>
+        <div class="modal-result-image-placeholder" style="display: none;">${n}</div>
+        <img 
+          class="modal-result-image" 
+          src="${b(e)}" 
+          alt="${b(t)}"
+          loading="lazy"
+        />
+      </div>
+    `:`
+        <div class="modal-result-image-container">
+          <div class="modal-result-image-placeholder">${n}</div>
+        </div>
+      `}attachResultHandlers(){this.detachResultsContainerClick();let e=this.resultsContainer;e&&(this.handleResultsContainerClick=e=>{let t=e.target;if(!t)return;let n=t.closest(`.modal-favorite-button`);if(n){let e=Number.parseInt(n.dataset.favoriteIndex??``,10),t=this.results[e];if(!Number.isNaN(e)&&t){if(this.favoriteResults=oe(t),this.inputElement?.value.trim()){let e=Y(this.favoriteResults,t),r=e?this.resolvedTranslations.removeFavorite:this.resolvedTranslations.addFavorite;n.classList.toggle(`favorite`,e),n.setAttribute(`aria-pressed`,String(e)),n.setAttribute(`aria-label`,r),n.title=r}else this.showEmptyState()}return}let r=t.closest(`.modal-result-item`);if(r){r.getAttribute(`href`)===`#`&&e.preventDefault();let t=r.getAttribute(`data-index`),n=r.getAttribute(`data-result-id`)??``,i=t===null?NaN:Number.parseInt(t,10);if(!Number.isNaN(i)){let e=this.results[i];e&&ae(e),n&&this.stats?.trackClick(this.lastSearchQuery,this.lastSearchTotal,n,i)}return}t.closest(`.modal-see-more`)&&this.stats?.trackViewMore(this.lastSearchQuery,this.lastSearchTotal)},e.addEventListener(`click`,this.handleResultsContainerClick),e.querySelectorAll(`.modal-result-item`).forEach((e,t)=>{e.addEventListener(`mouseenter`,()=>{this.activeIndex=t,this.updateActiveResult()})}),e.querySelectorAll(`.modal-result-image`).forEach(e=>{e.addEventListener(`load`,()=>{e.classList.add(`loaded`),e.closest(`.modal-result-image-container`)?.querySelector(`.modal-result-image-loading`)?.remove()}),e.addEventListener(`error`,()=>{let t=e.closest(`.modal-result-image-container`);t?.querySelector(`.modal-result-image-loading`)?.remove();let n=t?.querySelector(`.modal-result-image-placeholder`);n&&(n.style.display=`flex`),e.style.display=`none`})}))}detachResultsContainerClick(){this.resultsContainer&&this.handleResultsContainerClick&&this.resultsContainer.removeEventListener(`click`,this.handleResultsContainerClick),this.handleResultsContainerClick=null}renderEmptyState(){let e=this.resolvedTranslations;return`
+      <div class="modal-empty">
+        <svg class="modal-empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <path d="m21 21-4.35-4.35"></path>
+        </svg>
+        <div class="modal-empty-description">${b(e.modalEmptyStateDescription)}</div>
+      </div>
+    `}renderInitialSection(e,t,n,r,i){return e.length===0?``:`
+      <section class="modal-initial-section" aria-labelledby="${n}">
+        <h2 class="modal-initial-section-title" id="${n}">
+          ${i===`favorite`?`<svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m12 2.7 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.3l6.2-.9L12 2.7Z"></path>
+          </svg>`:`<svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path>
+            <path d="M3 3v5h5"></path>
+            <path d="M12 7v5l4 2"></path>
+          </svg>`}
+          <span>${b(t)}</span>
+        </h2>
+        ${e.map((e,t)=>this.renderResult(e,r+t)).join(``)}
+      </section>
+    `}showEmptyState(){if(this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;this.favoriteResults=X(G);let e=X(W).filter(e=>!Y(this.favoriteResults,e));this.results=[...this.favoriteResults,...e],this.activeIndex=this.results.length>0?0:-1,this.resultsContainer.innerHTML=this.results.length>0?`${this.renderInitialSection(this.favoriteResults,this.resolvedTranslations.favoriteResults,`modal-favorite-results-title`,0,`favorite`)}${this.renderInitialSection(e,this.resolvedTranslations.recentResults,`modal-recent-results-title`,this.favoriteResults.length,`recent`)}`:this.renderEmptyState(),this.attachResultHandlers(),this.updateActiveResult(),this.footerCount&&(this.footerCount.textContent=``),this.inputElement&&this.inputElement.setAttribute(`aria-expanded`,String(this.results.length>0))}showLoadingState(){if(!this.resultsContainer)return;this.clearLoadingInterval(),this.setLoadingIndicator(!0);let e=this.resolvedTranslations.loadingMessages;this.loadingMessageIndex=Math.floor(Math.random()*e.length),this.resultsContainer.querySelector(`.modal-result-item`)||(this.resultsContainer.innerHTML=`
+        <div class="modal-loading">
+          <div class="loading-text loading-text-animate">${b(e[this.loadingMessageIndex])}</div>
+        </div>
+      `),this.footerCount&&(this.footerCount.textContent=e[this.loadingMessageIndex]),this.startLoadingInterval()}setLoadingIndicator(e){this.modal?.classList.toggle(`is-loading`,e),this.inputElement?.setAttribute(`aria-busy`,String(e)),this.resultsContainer?.setAttribute(`aria-busy`,String(e))}startLoadingInterval(){this.loadingMessageInterval=setInterval(()=>{let e=this.resolvedTranslations.loadingMessages;this.loadingMessageIndex=(this.loadingMessageIndex+1)%e.length;let t=this.resultsContainer?.querySelector(`.loading-text`);t&&(t.classList.remove(`loading-text-animate`),t.offsetWidth,t.textContent=e[this.loadingMessageIndex],t.classList.add(`loading-text-animate`)),this.footerCount&&(this.footerCount.textContent=e[this.loadingMessageIndex])},v)}clearLoadingInterval(){this.loadingMessageInterval&&=(clearInterval(this.loadingMessageInterval),null)}showNoResultsState(e){if(this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;let t=this.resolvedTranslations;this.resultsContainer.innerHTML=`
+      <div class="modal-empty">
+        <svg class="modal-empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <div class="modal-empty-title">${b(t.modalNoResultsTitle)}</div>
+        <div class="modal-empty-description">${b(o(t.modalNoResultsDescription,{query:e}))}</div>
+      </div>
+    `,this.footerCount&&(this.footerCount.textContent=t.modalResultsCountZero),this.inputElement&&this.inputElement.setAttribute(`aria-expanded`,`false`)}showErrorState(e){if(this.clearLoadingInterval(),this.setLoadingIndicator(!1),!this.resultsContainer)return;let t=this.resolvedTranslations;this.resultsContainer.innerHTML=`
+      <div class="error">
+        <strong>${b(t.errorPrefix)}</strong> ${b(e)}
+      </div>
+    `,this.footerCount&&(this.footerCount.textContent=t.modalResultsCountError)}showMissingApiUrlError(){this.resultsContainer&&this.showErrorState(this.resolvedTranslations.missingApiUrlError)}updateTheme(e){let t=e===`light`||e===`dark`||e===`auto`?e:`auto`;t===`auto`?this.removeAttribute(`theme`):this.setAttribute(`theme`,t)}lockBodyScroll(){let e=window.scrollY;this.savedBodyStyles={overflow:document.body.style.overflow,position:document.body.style.position,top:document.body.style.top,width:document.body.style.width,scrollbarGutter:document.body.style.scrollbarGutter},this.savedHtmlOverflow=document.documentElement.style.overflow,document.body.style.scrollbarGutter=`stable`,document.documentElement.style.overflow=`hidden`,document.body.style.overflow=`hidden`,document.body.style.position=`fixed`,document.body.style.top=`-${e}px`,document.body.style.width=`100%`}unlockBodyScroll(){if(!this.savedBodyStyles)return;let e=Math.abs(Number.parseInt(document.body.style.top||`0`,10));document.documentElement.style.overflow=this.savedHtmlOverflow||``,document.body.style.overflow=this.savedBodyStyles.overflow,document.body.style.position=this.savedBodyStyles.position,document.body.style.top=this.savedBodyStyles.top,document.body.style.width=this.savedBodyStyles.width,document.body.style.scrollbarGutter=this.savedBodyStyles.scrollbarGutter||``,window.scrollTo(0,e),this.savedBodyStyles=null,this.savedHtmlOverflow=null}cleanup(){this.clearLoadingInterval(),this.currentSearchController&&=(this.currentSearchController.abort(),null),this.handleGlobalKeydown&&=(document.removeEventListener(`keydown`,this.handleGlobalKeydown),null),this.inputElement&&(this.handleInputChange&&this.inputElement.removeEventListener(`input`,this.handleInputChange),this.handleInputKeydown&&this.inputElement.removeEventListener(`keydown`,this.handleInputKeydown)),this.backdrop&&this.handleBackdropClick&&this.backdrop.removeEventListener(`click`,this.handleBackdropClick),this.detachResultsContainerClick(),this.handleInputChange=null,this.handleInputKeydown=null,this.handleBackdropClick=null,this.destroyStatsClient(),this.client&&this.client.cancelAllRequests()}open(){this.isOpen||(this.isOpen=!0,this.backdrop?.classList.add(`open`),this.modal?.classList.add(`open`),requestAnimationFrame(()=>{requestAnimationFrame(()=>{this.inputElement?.focus()})}),this.lockBodyScroll(),this.dispatchEvent(O(`open`,void 0)))}close(){this.isOpen&&(this.debouncedSearch?.cancel(),this.currentSearchController?.abort(),this.currentSearchController=null,this.isOpen=!1,this.backdrop?.classList.remove(`open`),this.modal?.classList.remove(`open`),this.inputElement&&(this.inputElement.value=``),this.results=[],this.activeIndex=-1,this.showEmptyState(),this.unlockBodyScroll(),this.dispatchEvent(O(`close`,void 0)))}toggle(){this.isOpen?this.close():this.open()}async search(e){this.isOpen||this.open(),this.inputElement&&(this.inputElement.value=e),await this.performSearch(e)}getResults(){return[...this.results]}isModalOpen(){return this.isOpen}};customElements.get(Z)||customElements.define(Z,se);var ce=class extends HTMLElement{trigger=null;modal=null;previouslyFocused=null;open=async()=>{await customElements.whenDefined(`search-modal-snippet`),this.modal?.open()};prepareModal=()=>{let e=this.modal?.shadowRoot?.querySelector(`[role="dialog"]`);e?.removeAttribute(`aria-labelledby`),e?.setAttribute(`aria-label`,`Search`)};handleModalOpen=()=>{this.previouslyFocused=document.activeElement instanceof HTMLElement?document.activeElement:null,document.dispatchEvent(new Event(`docs-search-open`))};handleModalClose=()=>{this.previouslyFocused?.isConnected&&this.previouslyFocused.focus(),this.previouslyFocused=null};handleModalKeydown=e=>{if(!this.modal?.isModalOpen())return;if(e.key===`Escape`){e.preventDefault(),this.modal.close();return}if(e.key!==`Tab`)return;let t=Array.from(this.modal.shadowRoot?.querySelectorAll(`a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])`)??[]).filter(e=>getComputedStyle(e).visibility!==`hidden`);if(t.length===0)return;let n=this.modal.shadowRoot?.activeElement,r=t[0],i=t.at(-1);e.shiftKey&&n===r?(e.preventDefault(),i?.focus()):!e.shiftKey&&n===i&&(e.preventDefault(),r?.focus())};connectedCallback(){this.trigger=this.querySelector(`[data-search-trigger]`),this.modal=this.querySelector(`search-modal-snippet`),this.trigger?.addEventListener(`click`,this.open),this.modal?.addEventListener(`ready`,this.prepareModal),this.modal?.addEventListener(`open`,this.handleModalOpen),this.modal?.addEventListener(`close`,this.handleModalClose),document.addEventListener(`keydown`,this.handleModalKeydown,{capture:!0}),this.prepareModal();let e=this.querySelector(`[data-search-shortcut-modifier]`);e&&/Mac|iPhone|iPad|iPod/.test(navigator.userAgent)&&(e.textContent=`⌘`)}disconnectedCallback(){this.trigger?.removeEventListener(`click`,this.open),this.modal?.removeEventListener(`ready`,this.prepareModal),this.modal?.removeEventListener(`open`,this.handleModalOpen),this.modal?.removeEventListener(`close`,this.handleModalClose),document.removeEventListener(`keydown`,this.handleModalKeydown,{capture:!0})}};customElements.get(`cfdocs-search`)||customElements.define(`cfdocs-search`,ce);

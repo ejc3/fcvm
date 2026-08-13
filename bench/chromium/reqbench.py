@@ -108,6 +108,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import traceback
 import sys
 import time
 import uuid
@@ -1540,6 +1541,15 @@ def teardown_fast(
     machine_cpu_ms = measured["machine_ms"]
     machine_window_ms = measured["machine_window_ms"]
     pre = measured["pre"]
+    # Absolute CPU each pinned child had burned at the kill instant. The VM
+    # lives exactly one request, so firecracker's figure IS the per-request
+    # VMM+vCPU cost; subtracting the noop arm's (restore + idle) yields
+    # CPU-per-render. Recorded per child, in ms (utime+stime, CLK_TCK-scaled).
+    out["lifetime_cpu_ms_by_child"] = {
+        name: (fields[1] + fields[2]) * 1000.0 / CLK_TCK
+        for name, fields in pre.items()
+        if fields is not None
+    }
     reclaim_cpu = measured["reclaim_cpu"]
     sample_period_s = measured["sample_period_s"]
     self_ms = measured["self_ms"]
@@ -3711,7 +3721,17 @@ def main_with_resources(resources: ExitStack) -> int:
                 )
                 fatal = e
             except Exception as e:  # noqa: BLE001 - record, then re-raise
-                rec = {"arm": arm, "rep": rep, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                # The abort below throws away the rest of the schedule on this
+                # exception, so the record must carry enough to debug it: an
+                # "OSError: [Errno 9] Bad file descriptor" alone cost a run on
+                # 2026-08-13 and left nothing to diagnose.
+                rec = {
+                    "arm": arm,
+                    "rep": rep,
+                    "ok": False,
+                    "error": f"{type(e).__name__}: {e}",
+                    "traceback": traceback.format_exc(),
+                }
                 fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
             rec["run_id"] = run_id

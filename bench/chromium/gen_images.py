@@ -60,6 +60,10 @@ def write_png(path: str, width: int, height: int, seed: int) -> None:
 
 def main() -> None:
     write_png(os.path.join(PAGES, "img1.png"), 256, 256, seed=0xDEADBEEF)
+    # Warmup-ONLY image: the warm point must share ZERO byte-resources with
+    # measured fixtures (a shared image leaves decoded-image cache warmth in
+    # the golden that "no-store should evict" cannot guarantee away).
+    write_png(os.path.join(PAGES, "imgw.png"), 224, 224, seed=0x5EED4A11)
     write_png(os.path.join(PAGES, "img2.png"), 256, 256, seed=0xC0FFEE42)
     write_png(os.path.join(PAGES, "img3.png"), 256, 256, seed=0x8BADF00D)
     write_png(os.path.join(PAGES, "img4.png"), 384, 256, seed=0x1BADB002)

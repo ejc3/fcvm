@@ -1,0 +1,62 @@
+<div id="player_1759276" class="embed-responsive-item color-blue">
+          <img itemprop="image"
+           class="img-fluid"
+           srcset="https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=140&amp;q=90&amp;auto=format 140w, https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=350&amp;q=90&amp;auto=format 350w, https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=470&amp;q=90&amp;auto=format 470w, https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=615&amp;q=90&amp;auto=format 615w, https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=860&amp;q=90&amp;auto=format 860w, https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=1200&amp;q=90&amp;auto=format 1200w"
+           sizes="(min-width:1200px) 860px, (min-width:992px) 615px, (min-width:768px) 470px, (min-width:568px) 350px, (min-width:300px) 140px"
+           src="https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=860&amp;q=90" >
+      </div>
+
+      <script>
+    var player15058691 = new RTPPlayer({
+              id: "player_1759276",
+                    fileKey: "/nas2.share/informacao/2026/wMedalha15h_1308ww_geoblockrule_472542.mp4",
+                  modules: [
+        { name: 'RTPChartbeat', bucket: RTPRequireScriptBucketLevel.chartbeat, params: { domain: "noticias.rtp.pt"  } },
+      ],
+      metadata: {
+        program: {
+          title: "Fatumata Diallo conquista bronze nos 400 metros barreiras nos Europeus de Atletismo"
+        }
+      },
+                file: { fps:"https://streaming-vod.rtp.pt/drm-fps/nas2.share/informacao/2026/wMedalha15h_1308ww_geoblockrule_472542.mp4/master.m3u8" ,  dash:"https://streaming-vod.rtp.pt/drm-dash/nas2.share/informacao/2026/wMedalha15h_1308ww_geoblockrule_472542.mp4/manifest.mpd"  } ,
+          drm: true,
+          k: "",
+                  seekBarThumbnailsLoc: "//cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_preview.vtt",
+                        streamType:"ondemand",
+                  controls:false,
+                  mediaType: "video",
+                  poster: "https://cdn-images.rtp.pt/icm/images/ef/efb05e5300cc409e4d761d4522abbad2_N.jpg?w=860&q=90",
+                              ads: true,
+                    autostart: false,
+                    muted: false,
+                                    audioOnly: false,
+                  hideFullscreen: true,
+                  sharing: false,
+                  subadUnit: "Noticias",
+                  pip: false,
+            extraSettings: { 
+                  airplay: false
+              }
+    });
+
+      
+      player15058691.newPlayer();
+
+      
+      const rmpContainerplayer_1759276 = document.getElementById("player_1759276");
+
+      rmpContainerplayer_1759276.addEventListener("rtpinstanceavailable", function() { 
+
+         
+
+                      player15058691.instance.on("play", function() {
+        player15058691.instance.setMute(false);
+        player15058691.instance.setVolume(1);
+    });
+          
+                
+      });
+      
+    </script>
+  
+  

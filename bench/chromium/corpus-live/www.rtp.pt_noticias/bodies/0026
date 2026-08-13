@@ -1,0 +1,497 @@
+var eventLogged = new Event('sso-logged');
+
+var docReady = 0;
+window.onload = function() {
+    docReady = 1;  
+};
+
+
+function isTokenExpired(tokenExp) {
+  const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
+  // Convert to milliseconds and then to a Date object
+  //const expDate = new Date(currentTime * 1000);
+  //const tokenExpDate = new Date(tokenExp * 1000);
+
+// Display in ISO format
+//console.log("Today  Date (ISO):", expDate.toISOString());
+//console.log("TOKEN EXP  Date (ISO):",  tokenExpDate.toISOString());
+
+  return tokenExp < currentTime;
+}
+
+function decodeJWT(token) {
+  const [header, payload, signature] = token.split('.');
+
+  // Base64 decode helper (adds padding if needed)
+  const decode = str => {
+    str = str.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = str + '='.repeat((4 - str.length % 4) % 4);
+    const decoded = atob(padded); // Decode base64
+    return JSON.parse(decoded);
+  };
+
+  return {
+    header: decode(header),
+    payload: decode(payload),
+    signature: signature
+  };
+}
+
+var RTPSSOHELPER = {
+    local_storage_name: 'sso',
+    url: 'https://conta.rtp.pt',
+    realm: 'rtp',
+    client_id: 'rtp',
+    debug: true,
+    local_storage_name: 'sso',
+    placeholder: document.getElementById('icon'),
+    sso_obj: null,
+    ut: 0,
+    loggin_in: false,
+    init: false,
+    getSSOCookieToken: function (cookieName = 'sso_token') {
+        var name
+        var value
+        var cookie = document.cookie.split(';');
+        for (var i = 0; i < cookie.length; i++) {
+          name = cookie[i].split('=')[0].trim();
+          value = cookie[i].split('=')[1];
+          if (name == cookieName) {
+            return value;
+          }
+        }
+        return null;
+    },
+    setSSOCookieToken: function () {
+        // set cookie expiration from exp of jwt token
+        var date = new Date(0);
+        date.setUTCSeconds(RTPSSOHELPER.sso_obj.tokenParsed.exp);
+        document.cookie = "sso_token=" + RTPSSOHELPER.sso_obj.token + "; expires=" + date.toUTCString() + "; path=/; domain=.rtp.pt";
+        document.cookie = "account_id=" + RTPSSOHELPER.sso_obj.tokenParsed.sub + "; expires=" + date.toUTCString() + "; path=/; domain=.rtp.pt";
+    },
+    removeSSOCookieToken: function () {
+        document.cookie = "sso_token=a; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; domain=.rtp.pt";
+        document.cookie = "account_id=a; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; domain=.rtp.pt";
+    },
+    consolelog: function (msg) {
+        if (RTPSSOHELPER.debug) { console.log(msg) };
+      },
+    getLocalStorageObject: function () {
+        try {      
+            var serialize_sso = JSON.parse(localStorage.getItem(RTPSSOHELPER.local_storage_name));
+        } catch (e) {
+            localStorage.removeItem(RTPSSOHELPER.local_storage_name);
+            RTPSSOHELPER.consolelog('invalid json in localstorage');
+            var serialize_sso = null;
+        }
+        return serialize_sso;
+    },
+    createKCObject: function () {
+        RTPSSOHELPER.consolelog('createKCObject');
+        if (RTPSSOHELPER.sso_obj == null) {
+            var sso = new Keycloak({ url: RTPSSOHELPER.url, realm: RTPSSOHELPER.realm, clientId: RTPSSOHELPER.client_id });
+            RTPSSOHELPER.sso_obj = sso;
+        }
+    },
+    iniKCObj: function () {
+        if (RTPSSOHELPER.sso_obj != null) {
+            RTPSSOHELPER.sso_obj.init({responseMode: 'fragment' });
+        }
+    },
+    silentLogin: function () {
+        if (RTPSSOHELPER.sso_obj != null) {
+            RTPSSOHELPER.sso_obj.init({ onLoad: 'check-sso', silentCheckSsoRedirectUri: window.location.origin +'/common/sso/silent-check-sso.html' });
+        }
+    },
+    requestAccountManagement: function () {
+        RTPSSOHELPER.consolelog('requestAccountManagement');    
+        if  (RTPSSOHELPER.init) {
+            RTPSSOHELPER.createKCObject();
+            RTPSSOHELPER.iniKCObj();
+        }
+        RTPSSOHELPER.sso_obj.accountManagement();
+    },
+    requestLogin: function (stayLogin=0) {
+        RTPSSOHELPER.consolelog('requestLogin STAY LOGIN',stayLogin);    
+        RTPSSOHELPER.consolelog('sso_obj', RTPSSOHELPER.sso_obj);    
+        if (RTPSSOHELPER.sso_obj == null) {
+            RTPSSOHELPER.createKCObject();
+            RTPSSOHELPER.iniKCObj();
+            if (!stayLogin){
+                RTPSSOHELPER.sso_obj.login({action:"register"});
+            }else{
+                RTPSSOHELPER.sso_obj.login();
+            }            
+        }
+    },
+    sensorRequest: function (params) {
+ 
+        if (typeof _sensorAnalytics === 'function'){
+            
+            if (typeof params.action !== 'string') {
+                params.action = 'default';
+            }
+            if (typeof params.type !== 'string') {
+                params.type = 'sso';
+            }
+            if (document.referrer !== '') {
+                params["referrer"] = encodeURIComponent(document.referrer);
+            }
+            if (document.url  !== '') {
+                params["url"] = encodeURIComponent(document.URL);
+            }
+
+            const {callback, params_callback,  ...paramsSensor } = params;
+
+            let x = _sensorAnalytics();
+
+            if (typeof callback !== undefined && typeof callback === 'function') {
+                if (paramsSensor.action==="web_btn_iniciar"){
+                    if (typeof window.apptracker === 'function') {
+                        window.apptracker('trackCustomEvent', {
+                            name: "rtp_custom_event",
+                            data: { 
+                                "type": "click", 
+                                "page": "navbar", 
+                                "action": "web_btn_iniciar", 
+                                "message": "Entrar" 
+                            }
+                        });
+                    }
+                }
+                x._sensorClick( paramsSensor, callback(params_callback) );
+            }else{
+                x._sensorClick( paramsSensor );
+            }
+              //if typeof params.referrer !== 'string') {
+            //params.referrer = encodeURIComponent(document.referrer);
+            //console.log ("REFERRER "+document.referrer);
+            
+              //}
+             
+       
+
+            
+
+
+        };
+    },
+
+    requestLogout: function () {
+        if (RTPSSOHELPER.sso_obj != null) {
+ 
+
+
+            //RTPSSOHELPER.sensorRequest({sensor:{action:"web_logout", type:"xpto"}, callback:""});
+            //RTPSSOHELPER.sensorRequest({action:"web_logout"});
+
+            localStorage.removeItem(RTPSSOHELPER.local_storage_name);
+            RTPSSOHELPER.removeSSOCookieToken();
+            if  (RTPSSOHELPER.init) {
+                RTPSSOHELPER.createKCObject();
+                RTPSSOHELPER.iniKCObj();
+            }
+            RTPSSOHELPER.sso_obj.logout();   
+        }
+    },
+    checkLoggingIn: function () {
+        if (window.location.hash.includes('state')) {
+            RTPSSOHELPER.loggin_in = true;
+            return true;
+        } else {
+            return false;
+        }
+    },
+    removeIcon: function () {
+        const ssoWraper = document.createElement('div');
+        ssoWraper.href = "javascript:;";
+        ssoWraper.className = "sso-wraper";
+        RTPSSOHELPER.placeholder.innerHTML = '';
+    },
+    addLoggedOutIcon: function () {
+        RTPSSOHELPER.consolelog('addLoggedOutIcon');
+
+        if (typeof showModal === 'function'){
+            if (docReady==0){
+                window.onload = function() {
+                
+                showModal();
+            };
+            }else{
+
+                showModal(); 
+            }
+        }
+        RTPSSOHELPER.sensorRequest({action:"web_entrada_nao_logado"});
+
+        //create a anchor with class sso-wraper
+        ssoWraper = document.createElement('a');
+        ssoWraper.href = "javascript:;";
+        ssoWraper.className = "sso-wraper";
+        ssoWraper.innerHTML = '<span>Entrar</span>';
+        ssoWraper.innerHTML += '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="9.99902" r="9" stroke="currentColor" stroke-width="1.25516" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.9724 15.2325C14.9724 14.479 14.6731 13.7565 14.1404 13.2237C13.6076 12.6909 12.885 12.3916 12.1315 12.3916H7.87019C7.11674 12.3916 6.39415 12.6909 5.86138 13.2237C5.3286 13.7565 5.0293 14.479 5.0293 15.2325" stroke="currentColor" stroke-width="1.25516" stroke-linecap="round" stroke-linejoin="round"/><path d="M9.9991 9.93179C11.5681 9.93179 12.84 8.65988 12.84 7.0909C12.84 5.52191 11.5681 4.25 9.9991 4.25C8.43012 4.25 7.1582 5.52191 7.1582 7.0909C7.1582 8.65988 8.43012 9.93179 9.9991 9.93179Z" stroke="currentColor" stroke-width="1.25516" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        
+        ssoWraper.onclick = () => {
+
+            RTPSSOHELPER.sensorRequest({action:"web_btn_iniciar", callback: RTPSSOHELPER.requestLogin });
+        //setTimeout(function(){
+        //    RTPSSOHELPER.requestLogin();},1000);
+        };
+
+        RTPSSOHELPER.placeholder.innerHTML = '';
+
+        if (RTPSSOHELPER.placeholder) {
+            RTPSSOHELPER.placeholder.appendChild(ssoWraper);
+        }
+    },
+    addLoggedInIcon: function () {
+        RTPSSOHELPER.consolelog('addLoggedInIcon');
+        if (RTPSSOHELPER.sso_obj != null && RTPSSOHELPER.sso_obj.authenticated == true) {
+            RTPSSOHELPER.sensorRequest({action: 'web_entrada_logado'});
+
+            const data = RTPSSOHELPER.sso_obj.tokenParsed;
+            // need the fisrt name of the given_name and the last name of the family_name, family_name has multiple names
+            
+   
+
+            data.given_name = data.given_name.trim();
+            data.family_name = data.family_name.trim();
+
+
+
+            const name = data.given_name[0].toUpperCase() +  data.family_name.split(' ')[data.family_name.split(' ').length - 1][0].toUpperCase();
+
+            //create a anchor with class sso-wraper
+            ssoWraper = document.createElement('a');
+            ssoWraper.href = "javascript:;";
+            ssoWraper.className = "sso-wraper";
+            const icon = document.createElement('div');
+            // menu with class sso-user
+            icon.className = "sso-user";
+            icon.innerHTML = name;
+            ssoWraper.appendChild(icon);
+
+            const menu = document.createElement('div');
+            menu.style.position = 'absolute';
+            menu.style.width = '150px';
+            menu.style.top = '60px';
+            menu.style.right = '103px';
+            menu.style.color = '#fff';
+            menu.style.backgroundColor = '#2B323B';
+            menu.style.padding = '10px';
+            menu.style.zIndex = '1000';
+            menu.style.boxShadow = '0px 4px 13.7px rgba(0, 0, 0, 0.11)';
+            menu.style.borderRadius = '8px';
+            menu.style.display = 'none';
+            menu.id = 'sso-menu';
+            menu.onmouseleave = () => {
+                //menu.style.display = 'none';
+            };
+            const sso_name = document.createElement('p');
+
+            sso_name.innerHTML = 'Ol&aacute;, ' + data.given_name.split(' ')[0];
+            const logoutbutton = document.createElement('button');
+            logoutbutton.className = 'sso-menu-logout';
+            logoutbutton.innerHTML = 'Sair';
+            logoutbutton.onclick = () => {
+                RTPSSOHELPER.requestLogout();
+            };
+            const manage = document.createElement('button');
+            manage.className = 'sso-menu-manage';
+            manage.innerHTML = 'Gerir Conta';
+            manage.onclick = () => {
+                RTPSSOHELPER.requestAccountManagement();
+            };
+            menu.appendChild(sso_name);
+            menu.appendChild(manage);
+            if (RTPSSOHELPER.menu !== "") {
+                menu.appendChild(RTPSSOHELPER.menu);
+            }
+            menu.appendChild(logoutbutton);
+            ssoWraper.appendChild(menu);
+
+            ssoWraper.onclick = () => {
+                RTPSSOHELPER.consolelog('ssoWraper click');
+                //document.getElementById('sso-menu').style.display = 'block';
+                $('#sso-menu').toggle();
+            }
+            RTPSSOHELPER.placeholder.innerHTML = '';
+
+            if (RTPSSOHELPER.placeholder) {
+                RTPSSOHELPER.placeholder.appendChild(ssoWraper);
+            }
+        }
+    },
+    isLogginIn: function () {
+        // url contains hash named state        
+        RTPSSOHELPER.removeIcon();
+        RTPSSOHELPER.createKCObject();
+        RTPSSOHELPER.iniKCObj();
+        RTPSSOHELPER.addListeners();
+        
+    },
+    hasCookieButNotLocalStorage: function () {
+        if (RTPSSOHELPER.getSSOCookieToken() != null && RTPSSOHELPER.loggin_in == false && RTPSSOHELPER.getLocalStorageObject() == null) {
+            //RTPSSOHELPER.createKCObject();
+            //RTPSSOHELPER.sso_obj.init({ onLoad: 'check-sso', silentCheckSsoRedirectUri: window.location.origin +'/common/sso/silent-check-sso.html' });
+            return true;
+        }
+        return false;       
+    },
+    donthaveCookie: function () {
+        //logged out
+        if (RTPSSOHELPER.getSSOCookieToken() == null) {
+            return true;
+        } else {
+            return false;
+        }
+    },
+    hasCookieAndLocalStorage: function () {
+        //logged out
+        if (RTPSSOHELPER.getSSOCookieToken() != null && RTPSSOHELPER.getLocalStorageObject() != null) {
+            return true;
+        } else {
+            return false;
+        }
+    },
+    setSSOLocalStorage: function () {
+        localStorage.setItem(RTPSSOHELPER.local_storage_name, JSON.stringify(RTPSSOHELPER.sso_obj));
+    },
+    loginSuccess: function () {
+        RTPSSOHELPER.consolelog('Authenticated Success');
+        
+        if (typeof window.apptracker === 'function') {
+            window.apptracker('trackCustomEvent', {
+                name: "rtp_custom_event",
+                data: { 
+                    "type": "redirect", 
+                    "page": "navbar", 
+                    "action": "web_login_confirm", 
+                    "message": "Login confirmado com sucesso" 
+                }
+            });
+        }
+
+        // PEDIDO LOGIN SUCESS RTP SENSOR
+        //RTPSSOHELPER.sensorRequest( {action: 'web_login'} );
+
+        RTPSSOHELPER.setSSOLocalStorage();
+        RTPSSOHELPER.SSOIcon();
+    },
+    SSOIcon: function () {
+
+
+        RTPSSOHELPER.consolelog("VAI TENTAR LOGIN");
+        if (RTPSSOHELPER.sso_obj != null) {
+            if (RTPSSOHELPER.sso_obj.authenticated == true) {
+                RTPSSOHELPER.addLoggedInIcon();
+            } else {
+                RTPSSOHELPER.addLoggedOutIcon();
+            }
+        } else {
+            RTPSSOHELPER.addLoggedOutIcon();
+        }
+    },
+    addListeners: function () {
+        if (RTPSSOHELPER.sso_obj != null) {
+            RTPSSOHELPER.sso_obj.onAuthSuccess = function () {
+                RTPSSOHELPER.loggin_in = false;
+                document.dispatchEvent(eventLogged);
+                RTPSSOHELPER.loginSuccess();
+                RTPSSOHELPER.setSSOCookieToken();
+            }
+            RTPSSOHELPER.sso_obj.onAuthError = function () { RTPSSOHELPER.loggin_in = false; 
+                RTPSSOHELPER.consolelog('Error Auth'); 
+                // PEDIDO LOGIN ERROR RTP SENSOR
+
+                RTPSSOHELPER.SSOIcon(); 
+            }
+            RTPSSOHELPER.sso_obj.onAuthRefreshSuccess = function () {   RTPSSOHELPER.setSSOLocalStorage(); RTPSSOHELPER.consolelog('Token refreshed', RTPSSOHELPER.sso_obj.tokenParsed); }
+            RTPSSOHELPER.sso_obj.onAuthRefreshError = function () { RTPSSOHELPER.consolelog('Error refreshing token',  RTPSSOHELPER.sso_obj.tokenParsed); localStorage.removeItem('sso'); RTPSSOHELPER.removeSSOCookieToken(); RTPSSOHELPER.SSOIcon(); }
+        }
+    },
+    updateToken: function (refresh_interval) {
+        if (RTPSSOHELPER.sso_obj != null) {
+            setInterval(() => {
+            if (RTPSSOHELPER.sso_obj.authenticated == true && refresh_interval > 30000) {
+
+                RTPSSOHELPER.consolelog('refreshToken interval');
+                RTPSSOHELPER.sso_obj.updateToken(-1);
+            }
+            }, refresh_interval);
+        }
+      },
+    createSSOObject: function (options) {
+       
+        RTPSSOHELPER.debug = options.debug || false;
+        RTPSSOHELPER.local_storage_name = options.local_storage_name || "sso";
+        RTPSSOHELPER.placeholder = options.placeholder || {};
+        RTPSSOHELPER.ut = options.ut || 0;
+        RTPSSOHELPER.menu = options.menu || "";
+        RTPSSOHELPER.consolelog("sso begin");
+
+        //is logging in
+        if (RTPSSOHELPER.checkLoggingIn() == true) { 
+            RTPSSOHELPER.isLogginIn();
+            RTPSSOHELPER.consolelog("isLogginIn");
+            return 1;
+        }
+        
+        // subdomain loader
+        if (RTPSSOHELPER.hasCookieButNotLocalStorage() == true) {    
+            RTPSSOHELPER.createKCObject(); 
+            RTPSSOHELPER.silentLogin();        
+            RTPSSOHELPER.consolelog("hasCookieButNotLocalStorage");
+            RTPSSOHELPER.addListeners();
+
+            //RTPSSOHELPER.updateToken(options.ut);
+            return 2;
+        }
+
+        // logged in
+        if (RTPSSOHELPER.hasCookieAndLocalStorage() == true) {
+            RTPSSOHELPER.init = true;
+            RTPSSOHELPER.consolelog("hasCookieAndLocalStorage");
+            const serialize_sso = RTPSSOHELPER.getLocalStorageObject();
+            RTPSSOHELPER.consolelog(serialize_sso.token);
+            const decoded = decodeJWT(serialize_sso.token);
+
+            RTPSSOHELPER.consolelog(decoded.payload.exp);
+
+
+
+            if (isTokenExpired(decoded.payload.exp)) {
+                //RTPSSOHELPER.consolelog("❌ Token is expired");
+               RTPSSOHELPER.requestLogout();
+               RTPSSOHELPER.SSOIcon();
+               // RTPSSOHELPER.sso_obj = {};
+
+            } else {
+                //RTPSSOHELPER.consolelog("✅ Token is still valid");
+                RTPSSOHELPER.createKCObject();
+
+                RTPSSOHELPER.sso_obj.token = serialize_sso.token;
+                RTPSSOHELPER.sso_obj.tokenParsed = serialize_sso.tokenParsed;
+                RTPSSOHELPER.sso_obj.authenticated = serialize_sso.authenticated;
+                RTPSSOHELPER.sso_obj.refreshToken = serialize_sso.refreshToken;
+                RTPSSOHELPER.sso_obj.refreshTokenParsed = serialize_sso.refreshTokenParsed;
+                RTPSSOHELPER.sso_obj.idToken = serialize_sso.idToken;
+                var date = new Date(0);
+                date.setUTCSeconds(RTPSSOHELPER.sso_obj.tokenParsed.exp);
+                document.cookie = "account_id=" + RTPSSOHELPER.sso_obj.tokenParsed.sub + "; expires=" + date.toUTCString() + "; path=/; domain=.rtp.pt";
+                RTPSSOHELPER.SSOIcon();
+    }
+                //RTPSSOHELPER.updateToken(options.ut);
+                return 3;
+        }
+
+        // logged out
+        if (RTPSSOHELPER.donthaveCookie() == true) {
+            RTPSSOHELPER.SSOIcon();
+            RTPSSOHELPER.consolelog("donthaveCookie");
+            return 4;
+        }
+        
+        
+    }       
+}

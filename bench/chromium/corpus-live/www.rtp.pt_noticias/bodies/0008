@@ -1,0 +1,49 @@
+function handlerInOut(e) {
+    if (e.type === 'mouseenter') {
+    if ($(this).find('div video').length > 0){
+      $(this).find('div video')[0].play();
+      self=this;
+      $(this).find('div video')[0].onplaying = function() {
+        $(self).find('.video-epg-image').stop().fadeOut(750);
+      };
+    }else {
+      $(this).find('.video-epg-image').stop().fadeOut(750);
+    }
+  }
+  if (e.type === 'mouseleave') {
+    if ($(this).find('div video').length > 0){
+      $(this).find('div video')[0].pause();
+    }
+    $(this).find('.video-epg-image').stop().fadeIn(750);
+
+  }
+}
+
+$(document).ready(function(){
+  $(".video-holder").off("mouseleave mouseenter").on( "mouseleave mouseenter", handlerInOut);
+});
+
+
+    function uxDevice(img, video, container, title, preload, imagesizes, srcset){
+
+      preload = preload || 'auto';
+
+      if (typeof(container !== 'undefined')) {
+        var filterdevices = (/android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(navigator.userAgent.toLowerCase()));
+
+        // verifica se e IE11
+        if (!filterdevices){
+          filterdevices = (navigator.userAgent.toLowerCase().indexOf('trident/7.0') > -1)
+        }
+        var data = '';
+        if (!filterdevices && video != '' && typeof(video !== 'undefined') && video.indexOf(".mp4") > 0  ) {
+            var uniqueId = 'video-description-' + Math.random().toString(36).substr(2, 9);
+            data = '<figure ' + (title ? 'aria-labelledby="' + uniqueId + '"' : '') + ' itemprop="video" itemscope="" itemtype="http://schema.org/ImageObject"><video aria-label="Este vídeo não possui som." width="100%" poster="'+img+'" preload="'+preload+'" loop muted><source src="'+video+'" type="video/mp4"></video></figure>';
+        } else {
+          data = '<img itemprop="thumbnail" srcset="'+srcset+'" sizes="'+imagesizes+'" src="'+img+'" alt="'+title+'" class="img-fluid w-100" />';
+        }
+
+        //$("#"+container).html(data);
+        document.getElementById(container).innerHTML = data;
+      }
+    }

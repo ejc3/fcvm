@@ -1,0 +1,68 @@
+<div id="player_live_rtp3" class="embed-responsive-item color-blue">
+          <img itemprop="image"
+           class="img-fluid"
+           srcset="https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png?auto=format&amp;w=140 140w, https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png?auto=format&amp;w=350 350w, https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png?auto=format&amp;w=470 470w, https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png?auto=format&amp;w=615 615w, https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png?auto=format&amp;w=860 860w, https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png?auto=format&amp;w=1200 1200w"
+           sizes="(min-width:1200px) 860px, (min-width:992px) 615px, (min-width:768px) 470px, (min-width:568px) 350px, (min-width:300px) 140px"
+           src="https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png" >
+      </div>
+
+      <script>
+    var player13667370 = new RTPPlayer({
+              id: "player_live_rtp3",
+                          channelKey: "rtpn",
+            modules: [
+        { name: 'RTPChartbeat', bucket: RTPRequireScriptBucketLevel.chartbeat, params: { domain: "noticias.rtp.pt"  } },
+      ],
+      metadata: {
+        program: {
+          title: "Direto RTP3 - RTP Notícias"
+        }
+      },
+                      file: "https://streaming-live.rtp.pt/liverepeater/smil:rtpnHD.smil/rtp_playlist.m3u8?token=1786680000_8da58650df326b6f49fb284baccea4eb01587633",
+                                      streamType:"live",
+                  controls:false,
+                  mediaType: "video",
+                  poster: "https://cdn-images.rtp.pt/common/img/channels/logos/color/horizontal/64-042825131610.png",
+                              ads: false,
+                    autostart: true,
+                    muted: true,
+                                    audioOnly: false,
+                  hideFullscreen: false,
+                  sharing: false,
+                  subadUnit: "Noticias",
+                  pip: false,
+            extraSettings: { 
+                  airplay: false
+              }
+    });
+
+      
+      player13667370.newPlayer();
+
+      
+      const rmpContainerplayer_live_rtp3 = document.getElementById("player_live_rtp3");
+
+      rmpContainerplayer_live_rtp3.addEventListener("rtpinstanceavailable", function() { 
+
+         
+
+                      player13667370.instance.on('ready', function() {
+
+    player13667370.instance.setMute(true);
+        if (player13667370.instance.muted){
+            $('#playerLiveHP').append("<div class='overlay-muted'><div class='muteLive'><i class='fal fa-microphone-slash'></i></div></div>");
+            $( ".overlay-muted" ).on( "click", function(e) {
+                $(e.target).hide();
+                player13667370.instance.setMute(false);
+                player13667370.instance.setVolume(1);
+            });
+        }
+    });
+
+          
+                
+      });
+      
+    </script>
+  
+  

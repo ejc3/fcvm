@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"><title>
+		ellipses vertical
+	</title><g fill="#000"><path d="M8 0h4v4H8zm0 8h4v4H8zm0 8h4v4H8z"/></g></svg>
