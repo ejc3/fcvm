@@ -108,6 +108,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import traceback
 import sys
 import time
 import uuid
@@ -3711,7 +3712,17 @@ def main_with_resources(resources: ExitStack) -> int:
                 )
                 fatal = e
             except Exception as e:  # noqa: BLE001 - record, then re-raise
-                rec = {"arm": arm, "rep": rep, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                # The abort below throws away the rest of the schedule on this
+                # exception, so the record must carry enough to debug it: an
+                # "OSError: [Errno 9] Bad file descriptor" alone cost a run on
+                # 2026-08-13 and left nothing to diagnose.
+                rec = {
+                    "arm": arm,
+                    "rep": rep,
+                    "ok": False,
+                    "error": f"{type(e).__name__}: {e}",
+                    "traceback": traceback.format_exc(),
+                }
                 fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
             rec["run_id"] = run_id

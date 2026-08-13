@@ -4,7 +4,18 @@
 <meta charset="utf-8">
 <title>warmup fixture</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="styles.css">
+<!-- SELF-CONTAINED BY DESIGN: the warm point must share zero byte-resources
+     with measured fixtures. Inline styles exercise the CSS parse path on
+     private bytes; imgw.png is warmup-only (gen_images.py). The one warmth
+     deliberately shared and disclosed: glyph/shaping caches for the system
+     font stack — browser warmth every warm pool has, not page warmth. -->
+<style>
+  body { margin: 2rem; font: 15px/1.5 sans-serif; color: #223; background: #fdfdfa; }
+  header h1 { font-size: 1.4rem; letter-spacing: 0.02em; }
+  .wcard { border: 1px solid #ccd; border-radius: 6px; padding: 0.75rem; }
+  .wcard figcaption { font-size: 0.8rem; color: #667; }
+  #marker { font-family: monospace; }
+</style>
 </head>
 <body>
 <header><h1>warmup fixture</h1></header>
@@ -12,8 +23,8 @@
   <p>Touches every path the bench fixtures use so the golden snapshot carries a
   warm renderer: network fetch (this page + stylesheet + one image), CSS parse,
   PNG decode, text shaping, canvas raster, and a little JS.</p>
-  <figure class="card" style="max-width: 280px">
-    <img src="img1.png" alt="warmup image" width="256" height="256">
+  <figure class="wcard" style="max-width: 280px">
+    <img src="imgw.png" alt="warmup image" width="224" height="224">
     <figcaption>warmup image</figcaption>
   </figure>
   <canvas id="cv" width="320" height="200"></canvas>
