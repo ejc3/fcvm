@@ -1541,6 +1541,15 @@ def teardown_fast(
     machine_cpu_ms = measured["machine_ms"]
     machine_window_ms = measured["machine_window_ms"]
     pre = measured["pre"]
+    # Absolute CPU each pinned child had burned at the kill instant. The VM
+    # lives exactly one request, so firecracker's figure IS the per-request
+    # VMM+vCPU cost; subtracting the noop arm's (restore + idle) yields
+    # CPU-per-render. Recorded per child, in ms (utime+stime, CLK_TCK-scaled).
+    out["lifetime_cpu_ms_by_child"] = {
+        name: (fields[1] + fields[2]) * 1000.0 / CLK_TCK
+        for name, fields in pre.items()
+        if fields is not None
+    }
     reclaim_cpu = measured["reclaim_cpu"]
     sample_period_s = measured["sample_period_s"]
     self_ms = measured["self_ms"]
