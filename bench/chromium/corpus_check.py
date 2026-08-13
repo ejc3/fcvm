@@ -112,11 +112,14 @@ def har_summary(har):
 
 
 def dom_similarity(a: str, b: str) -> float:
-    na = re.sub(r"\s+", " ", a).strip()[:100000]
-    nb = re.sub(r"\s+", " ", b).strip()[:100000]
+    # ratio(), not quick_ratio(): quick_ratio is an upper bound from character
+    # COUNTS and scores fully reordered text 1.0. Capped at 30k chars so the
+    # O(n^2) alignment stays affordable for 14 sites.
+    na = re.sub(r"\s+", " ", a).strip()[:30000]
+    nb = re.sub(r"\s+", " ", b).strip()[:30000]
     if not na and not nb:
         return 1.0
-    return difflib.SequenceMatcher(None, na, nb).quick_ratio()
+    return difflib.SequenceMatcher(None, na, nb).ratio()
 
 
 def pixel_diff(a: bytes, b: bytes):

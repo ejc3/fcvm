@@ -84,7 +84,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         path, status, mime = entry
         data = path.read_bytes()
-        self.send_response(status if 200 <= (status or 200) < 400 else 200)
+        # Replay the RECORDED status: coercing errors to 200 changed browser
+        # behavior for captured 404/400 responses. Body-bearing 3xx entries
+        # (no Location header captured) degrade to 200 so the browser does
+        # not follow a redirect to nowhere; real redirect hops are replayed
+        # from the captured redirect map above.
+        status = status or 200
+        if 300 <= status < 400:
+            status = 200
+        self.send_response(status)
         if mime:
             # CDP's mimeType drops the charset parameter, and captured TEXT
             # bodies are re-encoded utf-8 (getResponseBody returns decoded

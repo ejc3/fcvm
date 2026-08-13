@@ -138,19 +138,36 @@ def main():
     args = ap.parse_args()
     picks = {s.strip() for s in args.sites.split(",") if s.strip()}
     out = Path(args.out)
+    failed = []
     for key, url in URLS.items():
         if picks and key not in picks:
             continue
-        dest = out / key
-        dest.mkdir(parents=True, exist_ok=True)
+        # Capture into a temp dir and swap on success: a failed capture must
+        # not leave a half-written mixture that a later replay check reads as
+        # a same-session reference. On failure the previous capture (with its
+        # own accurate captured_utc) stays in place and the run exits nonzero
+        # naming the site.
+        import shutil, uuid
+        tmp = out / f".{key}.tmp-{uuid.uuid4().hex[:8]}"
+        tmp.mkdir(parents=True, exist_ok=True)
         print(f"── {key}", flush=True)
         try:
-            r = capture(args.cdp, url, dest)
+            r = capture(args.cdp, url, tmp)
+            dest = out / key
+            if dest.exists():
+                shutil.rmtree(dest)
+            tmp.rename(dest)
             print(f"   captured {r['resources']} resources, {r['bytes']} bytes", flush=True)
         except Exception as e:  # noqa: BLE001
+            shutil.rmtree(tmp, ignore_errors=True)
+            failed.append(key)
             print(f"   CAPTURE-FAIL: {e}", flush=True)
         time.sleep(0.5)
+    if failed:
+        print(f"FAILED captures: {','.join(failed)}", flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

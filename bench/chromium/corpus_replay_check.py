@@ -14,6 +14,10 @@ import sys
 import time
 from pathlib import Path
 
+# The visual check is part of the verdict; without Pillow it would silently
+# pass (fail-open), so its absence is a startup error, not a degraded mode.
+import PIL  # noqa: F401  (hard requirement)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from corpus_check import dom_similarity, har_summary, pixel_diff, render  # noqa: E402
 from corpus_capture import URLS  # noqa: E402
@@ -52,15 +56,49 @@ def main():
         h = har_summary(rep["har"])
         sim = dom_similarity(ref_dom, rep["dom"])
         px = pixel_diff(ref_png, rep["png"])
-        n_captured = len(json.loads((ref / "index.json").read_text())["resources"])
+        captured = json.loads((ref / "index.json").read_text())["resources"]
+        n_captured = len(captured)
+        # Faithfulness, not blanket success: a replayed 404 whose CAPTURE was a
+        # 404 is fidelity (the live favicon 404'd too), while a 200 where the
+        # capture had 404 — or any network-level failure — is divergence.
+        import urllib.parse
+        cap_status = {}
+        for cu, meta in captured.items():
+            pu = urllib.parse.urlparse(cu)
+            cap_status[(pu.netloc, pu.path, pu.query)] = meta.get("status", 200)
+            cap_status.setdefault((pu.netloc, pu.path), meta.get("status", 200))
+        faithful = unfaithful = 0
+        for e in rep["har"]:
+            pu = urllib.parse.urlparse(e.get("url", ""))
+            want = cap_status.get((pu.netloc, pu.path, pu.query),
+                                  cap_status.get((pu.netloc, pu.path)))
+            if e.get("failed"):
+                unfaithful += 1
+            elif want is not None and e.get("status") == want:
+                faithful += 1
+            elif want is None and (e.get("status") or 0) < 400:
+                faithful += 1  # request live never made but replay satisfied
+            else:
+                unfaithful += 1
+        h["faithful"] = faithful
+        h["unfaithful"] = unfaithful
         row = {"key": key, "url": url,
                "replay_requests": h, "captured_resources": n_captured,
                "dom_similarity": round(sim, 3), "pixels": px}
-        visual_ok = (not px.get("available")) or px.get("changed_frac", 1) < 0.10
-        row["verdict"] = "EQUIVALENT" if (sim >= 0.90 and visual_ok) else "DIVERGENT"
+        # Fail closed on every axis: an unavailable pixel diff blocks; failed
+        # or missing replay requests block even when text/pixels look right —
+        # a replay that exercises a different request set is a different
+        # working set, and measurements from it would be about the wrong
+        # thing. Analytics-tier failures are tolerated to a bounded fraction.
+        visual_ok = px.get("available") and px.get("changed_frac", 1) < 0.10
+        coverage_ok = h["faithful"] >= 0.85 * max(1, n_captured)
+        failures_ok = h["unfaithful"] <= max(3, 0.08 * max(1, n_captured))
+        row["verdict"] = "EQUIVALENT" if (
+            sim >= 0.90 and visual_ok and coverage_ok and failures_ok
+        ) else "DIVERGENT"
         rows.append(row)
         print(f"   {row['verdict']}  dom={sim:.2f} px={px.get('changed_frac','n/a')} "
-              f"replay_ok={h['ok']} bad={h['bad']} captured={n_captured}", flush=True)
+              f"faithful={h['faithful']} unfaithful={h['unfaithful']} captured={n_captured}", flush=True)
         time.sleep(0.5)
 
     (out / "report.json").write_text(json.dumps(rows, indent=1))
