@@ -442,7 +442,7 @@ cmd_build() {
 }
 
 cmd_golden() {
-    log "golden: podman prepare --tag $TAG (cold build, snapshot at the image health gate)"
+    log "golden: podman prepare --tag $TAG (cold build, snapshot at the image health gate, hugepages=$HUGEPAGES)"
     local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
     local image_record image_digest image_id image_cache_key
     # One inspect binds the mutable tag's manifest digest and immutable image ID
@@ -485,7 +485,26 @@ cmd_golden() {
     # captured separately from the log so the provenance below can be bound to
     # THAT generation rather than to whatever currently sits under the tag.
     local prepared_json="$RESULTS/logs/golden-prepared.json"
-    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force \
+    local huge_flag=""
+    if [ "$HUGEPAGES" = 1 ]; then
+        huge_flag="--hugepages"
+        # One 1024MiB guest = 512 2MB pages; golden build + serve + clones in
+        # flight need headroom. Grow the pool if short and fail closed if the
+        # kernel could not deliver (fragmentation) — a golden quietly built
+        # on 4K pages would poison every later A/B against this tag.
+        local huge_need=2048 huge_cur
+        huge_cur=$(cat /proc/sys/vm/nr_hugepages)
+        if [ "$huge_cur" -lt "$huge_need" ]; then
+            log "golden: growing hugepage pool $huge_cur -> $huge_need"
+            sudo sh -c "echo $huge_need > /proc/sys/vm/nr_hugepages"
+            huge_cur=$(cat /proc/sys/vm/nr_hugepages)
+            if [ "$huge_cur" -lt "$huge_need" ]; then
+                log "golden: hugepage pool only $huge_cur/$huge_need pages"
+                return 1
+            fi
+        fi
+    fi
+    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag \
         --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
         --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" 2>"$lf" >"$prepared_json" \
         || { log "golden: PREPARE FAILED"; tail -20 "$lf" >&2; return 1; }
@@ -763,6 +782,12 @@ UFFD_MODE="${UFFD_MODE:-copy}"
 # binary default and an env override could not be excluded, making replay's
 # contribution unattributable.
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
+# Hugepage-backed guest memory (2MB pages). Part of the snapshot identity, so
+# the golden must be CREATED with it; serve/restore inherit it from snapshot
+# metadata. Use a distinct TAG (e.g. cb-req-golden-huge) so plain and huge
+# goldens coexist. faultbench measured huge+minor at zero userspace faults
+# per render — this knob puts that configuration on the request path.
+HUGEPAGES="${HUGEPAGES:-0}"
 
 cmd_run() {
     local guard_rc=0
