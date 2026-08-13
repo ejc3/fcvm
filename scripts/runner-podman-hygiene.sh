@@ -35,15 +35,24 @@
 # one every later podman call will use.
 set -euo pipefail
 
+# Unprivileged removal first, sudo only for what it could not delete (the
+# AMI's foreign-uid droppings). Keeps the script runnable where sudo is
+# unavailable — the unprivileged test suite shims sudo with a hard failure,
+# which is how the first version of this fallback was caught (2026-08-13:
+# green under bare cargo-nextest, red under `make test-fast`'s sudo guard).
+remove_tree() {
+	rm -rf "$1" 2>/dev/null || sudo rm -rf "$1"
+}
+
 store="${HOME:?HOME must be set}/.local/share/containers"
 
 # Record what is there before destroying the evidence — this is the data the
 # AMI follow-up (issue #806) needs to confirm where the droppings come from.
 if [ -e "$store" ]; then
 	echo "runner-podman-hygiene: pre-existing default store $store:"
-	sudo find "$store" -maxdepth 3 -printf '%u:%g %m %p\n' 2>/dev/null | head -20 || true
+	find "$store" -maxdepth 3 -printf '%u:%g %m %p\n' 2>/dev/null | head -20 || true
 fi
-sudo rm -rf "$store"
+remove_tree "$store"
 echo "runner-podman-hygiene: default store cleared"
 
 conf="${HOME}/.config/containers/storage.conf"
@@ -53,7 +62,8 @@ if [ -r "$conf" ]; then
 fi
 if [ -n "$graphroot" ] && [ -d "$graphroot" ]; then
 	echo "runner-podman-hygiene: clearing state db under $graphroot (image layers preserved)"
-	sudo rm -rf "$graphroot/libpod" "$graphroot/db.sql"
+	remove_tree "$graphroot/libpod"
+	remove_tree "$graphroot/db.sql"
 else
 	echo "runner-podman-hygiene: no configured graphroot to heal (conf=$conf)"
 fi
