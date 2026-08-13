@@ -27,7 +27,8 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 # every ratio computed against it.
 la=$(cut -d' ' -f1 /proc/loadavg)
 fc=$(pgrep -c firecracker || true)
-if [ "${ALLOW_BUSY:-0}" != 1 ] && { [ "${fc:-0}" -gt 0 ] || [ "$(printf '%.0f' "$la")" -gt 0 ]; }; then
+# Same 1.0 gate as faultbench; the earlier printf-rounding form refused at 0.70.
+if [ "${ALLOW_BUSY:-0}" != 1 ] && { [ "${fc:-0}" -gt 0 ] || awk -v l="$la" 'BEGIN{exit !(l >= 1.0)}'; }; then
     log "REFUSING: load=$la firecracker=$fc. ALLOW_BUSY=1 overrides and taints the run."
     exit 3
 fi
