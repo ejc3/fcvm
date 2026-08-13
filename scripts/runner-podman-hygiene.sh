@@ -35,6 +35,23 @@
 # one every later podman call will use.
 set -euo pipefail
 
+# The default-store sweep can escalate to sudo, so refuse to run against a
+# HOME that is not this user's real home: a preceding step exporting a stray
+# HOME would otherwise aim `sudo rm -rf` at an arbitrary directory. Tests
+# exercise the script against a fixture home via FCVM_HYGIENE_HOME_OVERRIDE=1
+# (fixture trees are user-owned, so those runs never reach sudo).
+if [ "${FCVM_HYGIENE_HOME_OVERRIDE:-0}" != 1 ]; then
+	runner_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+	if [ -z "$runner_home" ] || [ "${HOME:-}" != "$runner_home" ]; then
+		echo "runner-podman-hygiene: HOME (${HOME:-unset}) does not match this user's passwd home ($runner_home); refusing" >&2
+		exit 1
+	fi
+fi
+case "${HOME:-}" in
+	/*) ;;
+	*) echo "runner-podman-hygiene: HOME must be an absolute path" >&2; exit 1 ;;
+esac
+
 # Unprivileged removal first, sudo only for what it could not delete (the
 # AMI's foreign-uid droppings). Keeps the script runnable where sudo is
 # unavailable — the unprivileged test suite shims sudo with a hard failure,

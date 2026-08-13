@@ -90,13 +90,21 @@ fn test_generate_config() {
     let config_dir = temp_dir.path().join("fcvm");
     let config_path = config_dir.join("rootfs-config.toml");
 
-    // Generate config with a custom FCVM_CONFIG_DIR
+    // XDG set to a DIFFERENT directory: the override must win when both are
+    // present (a run where FCVM_CONFIG_DIR silently lost to XDG would pass a
+    // remove-XDG-only test while regressing the harness isolation).
+    let xdg_dir = tempfile::tempdir().expect("failed to create XDG temp dir");
     let output = Command::new(&fcvm)
         .args(["setup", "--generate-config", "--force"])
         .env("FCVM_CONFIG_DIR", temp_dir.path())
-        .env_remove("XDG_CONFIG_HOME")
+        .env("XDG_CONFIG_HOME", xdg_dir.path())
         .output()
         .expect("failed to run fcvm setup --generate-config");
+
+    assert!(
+        !xdg_dir.path().join("fcvm/rootfs-config.toml").exists(),
+        "config must not land under XDG_CONFIG_HOME when FCVM_CONFIG_DIR is set"
+    );
 
     assert!(
         output.status.success(),

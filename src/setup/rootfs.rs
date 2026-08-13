@@ -765,9 +765,11 @@ pub fn fcvm_config_dir() -> Result<std::path::PathBuf> {
     Ok(proj_dirs.config_dir().to_path_buf())
 }
 
-/// Generate default config file at XDG config directory.
+/// Generate the default config file into the resolved config directory.
 ///
-/// Writes the embedded default config to ~/.config/fcvm/rootfs-config.toml
+/// Writes the embedded default config to `$FCVM_CONFIG_DIR/fcvm/rootfs-config.toml`
+/// when the override is set (per-run test isolation), otherwise to the platform
+/// default (`~/.config/fcvm/rootfs-config.toml` on Linux).
 pub fn generate_config(force: bool) -> Result<PathBuf> {
     let config_dir = fcvm_config_dir()?;
     let config_dir = config_dir.as_path();
@@ -821,26 +823,46 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         return Ok(p.clone());
     }
 
-    // 2. SUDO_USER's config (when running with sudo)
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        // Get the invoking user's home directory
-        match nix::unistd::User::from_name(&sudo_user) {
-            Ok(Some(user)) => {
-                let p = user.dir.join(".config/fcvm").join(CONFIG_FILE);
-                if p.exists() {
-                    return Ok(p);
+    // 2. FCVM_CONFIG_DIR — an explicit per-run override (test isolation). It
+    // outranks SUDO_USER because it is set deliberately for THIS process while
+    // SUDO_USER is ambient: a sudoed test run must read its per-run config,
+    // not the invoking user's ~/.config/fcvm. A set-but-invalid override
+    // (relative path) is an error, not a fallback — silently reading a
+    // different file is the failure this chain exists to remove.
+    if std::env::var_os("FCVM_CONFIG_DIR").is_some() {
+        let config_dir = fcvm_config_dir()?;
+        let p = config_dir.join(CONFIG_FILE);
+        if p.exists() {
+            return Ok(p);
+        }
+        // Not generated yet: continue past SUDO_USER (ambient, would be the
+        // wrong file by definition when an override is set) to the shared
+        // system/development fallbacks below.
+    }
+
+    // 3. SUDO_USER's config (when running with sudo). Skipped entirely when an
+    // FCVM_CONFIG_DIR override is set — see above.
+    if std::env::var_os("FCVM_CONFIG_DIR").is_none() {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            // Get the invoking user's home directory
+            match nix::unistd::User::from_name(&sudo_user) {
+                Ok(Some(user)) => {
+                    let p = user.dir.join(".config/fcvm").join(CONFIG_FILE);
+                    if p.exists() {
+                        return Ok(p);
+                    }
                 }
-            }
-            Ok(None) => {
-                tracing::debug!("SUDO_USER '{}' not found in passwd database", sudo_user);
-            }
-            Err(e) => {
-                tracing::debug!("Failed to lookup SUDO_USER '{}': {}", sudo_user, e);
+                Ok(None) => {
+                    tracing::debug!("SUDO_USER '{}' not found in passwd database", sudo_user);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to lookup SUDO_USER '{}': {}", sudo_user, e);
+                }
             }
         }
     }
 
-    // 3. XDG user config
+    // 4. Default user config dir (XDG); FCVM_CONFIG_DIR-set case handled above.
     if let Ok(config_dir) = fcvm_config_dir() {
         let p = config_dir.join(CONFIG_FILE);
         if p.exists() {
@@ -2577,6 +2599,21 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
 
     /// A --config path that does not exist must fail, not quietly fall back to
     /// the discovered config, which is the bug this whole path removes.
+    #[test]
+    fn find_config_file_propagates_a_relative_fcvm_config_dir() {
+        // A set-but-invalid override must ERROR, not silently fall through to
+        // some other config location (nextest runs each test in its own
+        // process, so the env mutation cannot leak).
+        std::env::set_var("FCVM_CONFIG_DIR", "relative/not-absolute");
+        let err = find_config_file(None)
+            .expect_err("a relative FCVM_CONFIG_DIR must be an error, not a fallthrough");
+        std::env::remove_var("FCVM_CONFIG_DIR");
+        assert!(
+            format!("{err:#}").contains("absolute"),
+            "error should name the absolute-path requirement: {err:#}"
+        );
+    }
+
     #[test]
     fn find_config_file_rejects_a_missing_explicit_path() {
         let err = find_config_file(Some("/nonexistent/rootfs-config.toml"))

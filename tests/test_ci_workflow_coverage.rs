@@ -822,14 +822,16 @@ fn self_hosted_setup_steps_clear_the_default_podman_store() {
         hygiene >= 3,
         "expected at least 3 wired jobs, found {hygiene}"
     );
-    // Adjacency, not just equal counts: each migrate must have the hygiene call
-    // in the lines that follow it before the step ends.
+    // Adjacency within the STEP, not just equal counts: global substring
+    // counting can pass when one setup block loses its call and a comment
+    // elsewhere adds an occurrence. Bound each check at the next step header.
     for (idx, _) in ci.match_indices("podman system migrate") {
-        let after = &ci[idx..(idx + 600).min(ci.len())];
+        let rest = &ci[idx..];
+        let step_end = rest.find("\n      - name:").unwrap_or(rest.len());
         assert!(
-            after.contains("runner-podman-hygiene.sh"),
-            "a `podman system migrate` at byte {idx} is not followed by the hygiene call \
-             within its step"
+            rest[..step_end].contains("./fcvm/scripts/runner-podman-hygiene.sh"),
+            "a `podman system migrate` at byte {idx} is not followed by the exact hygiene \
+             invocation within its own step"
         );
     }
 }
@@ -874,6 +876,9 @@ fn hygiene_script_heals_state_db_and_preserves_layers() {
     );
     let out = std::process::Command::new(script)
         .env("HOME", home)
+        // Fixture home: the script's passwd-match guard would (correctly)
+        // refuse it; the override is the documented test entry.
+        .env("FCVM_HYGIENE_HOME_OVERRIDE", "1")
         .output()
         .expect("run hygiene script");
     assert!(
@@ -898,5 +903,40 @@ fn hygiene_script_heals_state_db_and_preserves_layers() {
     assert!(
         !default_store.exists(),
         "the default rootless store is a dropping and must be removed"
+    );
+}
+
+/// The privileged sweep must refuse a HOME that is not this user's passwd
+/// home — a stray HOME export would otherwise aim `sudo rm -rf` at an
+/// arbitrary directory. Red-verified against the pre-guard script version:
+/// it deleted the fixture store instead of refusing.
+#[test]
+fn hygiene_script_refuses_a_home_that_is_not_the_users() {
+    let tmp = tempfile::tempdir().expect("create fixture home");
+    let home = tmp.path();
+    let default_store = home.join(".local/share/containers");
+    std::fs::create_dir_all(&default_store).unwrap();
+
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/runner-podman-hygiene.sh"
+    );
+    let out = std::process::Command::new(script)
+        .env("HOME", home)
+        .env_remove("FCVM_HYGIENE_HOME_OVERRIDE")
+        .output()
+        .expect("run hygiene script");
+    assert!(
+        !out.status.success(),
+        "a HOME that does not match the passwd entry must be refused"
+    );
+    assert!(
+        default_store.exists(),
+        "nothing may be deleted when the guard refuses"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not match"),
+        "stderr must say why: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
