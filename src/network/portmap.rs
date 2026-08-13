@@ -464,7 +464,16 @@ pub async fn detect_default_interface() -> Result<String> {
         anyhow::bail!("failed to get default route");
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_default_interface(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pick the interface out of `ip route show default` output.
+///
+/// Empty output gets its own diagnosis rather than being reported as an
+/// unparseable route: a host that routes only over IPv6 has no IPv4 default
+/// route at all, and "could not detect default interface from: " with nothing
+/// after the colon reads like a parser bug instead of an unsupported host.
+fn parse_default_interface(stdout: &str) -> Result<String> {
     // Output format: "default via 192.168.1.1 dev eth0 ..."
     if let Some(prev) = stdout.split_whitespace().position(|p| p == "dev") {
         if let Some(iface) = stdout.split_whitespace().nth(prev + 1) {
@@ -472,20 +481,48 @@ pub async fn detect_default_interface() -> Result<String> {
         }
     }
 
-    // Fallback: try to parse manually
-    if let Some(dev_pos) = stdout.find(" dev ") {
-        let after_dev = &stdout[dev_pos + 5..];
-        if let Some(iface) = after_dev.split_whitespace().next() {
-            return Ok(iface.to_string());
-        }
+    if stdout.trim().is_empty() {
+        anyhow::bail!(
+            "this host has no IPv4 default route, so bridged networking cannot \
+             pick an interface to NAT through. Hosts that route only over IPv6 \
+             hit this; use --network rootless there, or add an IPv4 default \
+             route. (`ip route show default` printed nothing.)"
+        );
     }
-
     anyhow::bail!("could not detect default interface from: {}", stdout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ipv6_only_host_is_diagnosed_not_reported_as_a_parse_failure() {
+        // Measured on a devserver whose only default route is IPv6: `ip route
+        // show default` prints nothing, and the old message ended in a colon
+        // with nothing after it.
+        let error = parse_default_interface("").expect_err("no default route");
+        let text = format!("{error:#}");
+        assert!(text.contains("no IPv4 default route"), "{text}");
+        assert!(
+            text.contains("rootless"),
+            "must name the way forward: {text}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_default_route_yields_its_interface() {
+        assert_eq!(
+            parse_default_interface("default via 10.0.0.1 dev eth0 proto dhcp\n").unwrap(),
+            "eth0"
+        );
+    }
+
+    #[test]
+    fn output_without_a_device_still_reports_what_it_saw() {
+        let error = parse_default_interface("default via 10.0.0.1\n").expect_err("no dev");
+        assert!(format!("{error:#}").contains("10.0.0.1"));
+    }
 
     #[test]
     fn test_delete_rule_conversion() {
