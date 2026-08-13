@@ -833,3 +833,70 @@ fn self_hosted_setup_steps_clear_the_default_podman_store() {
         );
     }
 }
+
+/// The hygiene script must heal a poisoned graphroot state db WITHOUT touching
+/// the image layers — the persistent volume's expensive content.
+///
+/// RED-verified against the previous script version (podman system reset +
+/// default-store rm): reset either refused on the very mismatch it was meant
+/// to clear ("database static dir \"\" does not match", 2026-08-13, every
+/// arm64 job) or, where the db was healthy, deleted the layer cache this test
+/// pins as preserved.
+#[test]
+fn hygiene_script_heals_state_db_and_preserves_layers() {
+    let tmp = tempfile::tempdir().expect("create fixture home");
+    let home = tmp.path();
+
+    // Fixture: a configured graphroot carrying a state db and an image layer.
+    let graphroot = home.join("graphroot");
+    std::fs::create_dir_all(graphroot.join("libpod")).unwrap();
+    std::fs::write(graphroot.join("libpod/bolt_state.db"), b"poisoned").unwrap();
+    std::fs::write(graphroot.join("db.sql"), b"poisoned").unwrap();
+    std::fs::create_dir_all(graphroot.join("overlay/abc123")).unwrap();
+    std::fs::write(graphroot.join("overlay/abc123/layer"), b"cached layer").unwrap();
+    let conf_dir = home.join(".config/containers");
+    std::fs::create_dir_all(&conf_dir).unwrap();
+    std::fs::write(
+        conf_dir.join("storage.conf"),
+        format!(
+            "[storage]\ndriver = \"overlay\"\ngraphroot = \"{}\"\n",
+            graphroot.display()
+        ),
+    )
+    .unwrap();
+    // And an AMI-style default store dropping.
+    let default_store = home.join(".local/share/containers");
+    std::fs::create_dir_all(default_store.join("storage/overlay/l")).unwrap();
+
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/runner-podman-hygiene.sh"
+    );
+    let out = std::process::Command::new(script)
+        .env("HOME", home)
+        .output()
+        .expect("run hygiene script");
+    assert!(
+        out.status.success(),
+        "hygiene script failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !graphroot.join("libpod").exists(),
+        "poisoned libpod db dir must be removed"
+    );
+    assert!(
+        !graphroot.join("db.sql").exists(),
+        "poisoned sqlite db must be removed"
+    );
+    assert!(
+        graphroot.join("overlay/abc123/layer").exists(),
+        "image layers are the persistent cache and must survive hygiene"
+    );
+    assert!(
+        !default_store.exists(),
+        "the default rootless store is a dropping and must be removed"
+    );
+}

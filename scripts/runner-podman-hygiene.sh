@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
-# Remove the DEFAULT rootless podman store before tests run.
+# Per-job podman hygiene for self-hosted runners. Two independent repairs, both
+# safe to run unconditionally because CI's podman state is disposable while its
+# IMAGE LAYERS are the expensive persistent cache:
 #
-# CI never legitimately uses it: every job writes ~/.config/containers/storage.conf
-# pointing the graphroot at /mnt/fcvm-btrfs, so any content under
-# ~/.local/share/containers is a dropping by definition — which is what makes
-# unconditional removal correct and heuristics unnecessary.
+# 1. Remove the DEFAULT rootless store (~/.local/share/containers). CI never
+#    legitimately uses it: every job writes ~/.config/containers/storage.conf
+#    pointing the graphroot at /mnt/fcvm-btrfs, so any content there is a
+#    dropping by definition. It arrives PRE-CONTAMINATED from the AMI: 8a9c564f
+#    switched AMI creation to snapshotting the RUNNING builder, so whatever
+#    rootless-store state the builder accumulated (partial layers, foreign-uid
+#    files from a different subuid map) is baked into every runner. The first
+#    `podman build` that resolves to it dies with
+#      chown .../storage/overlay/l: operation not permitted
+#    — how every Host job failed on 2026-08-12 (#792/#805). Removal needs sudo
+#    because foreign-uid files are the failure mode.
 #
-# Why it must be removed: the store arrives PRE-CONTAMINATED from the AMI.
-# 8a9c564f switched AMI creation to snapshotting the RUNNING builder, so
-# whatever rootless-store state the builder accumulated (partial layers,
-# foreign-uid files from a different subuid map) is baked into every runner.
-# The first `podman build` that resolves to the default store then dies with
-#   chown .../storage/overlay/l: operation not permitted
-# — which is how every Host job failed on 2026-08-12 (#792/#805). Tests were
-# only steered into the default store by an XDG_CONFIG_HOME redirect that is
-# also fixed (FCVM_CONFIG_DIR), so this is defence in depth: the droppings stay
-# gone even if some future path resolves the default store again.
+# 2. Remove podman's state databases from the CONFIGURED graphroot, KEEPING the
+#    image layers. The graphroot lives on /mnt/fcvm-btrfs, which persists
+#    across runner instances, so a database poisoned by one job poisons every
+#    later job on that volume: observed 2026-08-13, a db recording static dir
+#    "" made every podman call fail with
+#      database static dir "" does not match our static dir ".../libpod"
+#    (exit 125 before any test ran) — and `podman system reset` REFUSES on
+#    exactly that mismatch, so no podman-native repair can run. Deleting only
+#    libpod/ and db.sql lets the next podman call recreate a coherent db while
+#    the overlay layer cache (the one-time-cost content this volume exists to
+#    keep) survives. An earlier version of this script used
+#    `podman system reset --force` instead: on poisoned runners it failed the
+#    same way as everything else, and on healthy ones it threw away the entire
+#    persistent image cache every job.
 #
-# Removal uses sudo because the droppings are, by nature, not ours to delete
-# unprivileged — foreign-uid files are the failure mode.
+# Invoked by ci.yml immediately after each job's `podman system migrate` — the
+# last line of its podman configuration — so the graphroot parsed here is the
+# one every later podman call will use.
 set -euo pipefail
 
 store="${HOME:?HOME must be set}/.local/share/containers"
@@ -29,18 +43,17 @@ if [ -e "$store" ]; then
 	echo "runner-podman-hygiene: pre-existing default store $store:"
 	sudo find "$store" -maxdepth 3 -printf '%u:%g %m %p\n' 2>/dev/null | head -20 || true
 fi
-
-# Tear down podman's state COHERENTLY first: the bolt db cross-references the
-# configured store paths, and removing a directory out from under it leaves
-# every later podman call failing with "database static dir ... does not match"
-# (observed 2026-08-13 when this script was a bare rm -rf: podman login died
-# with exit 125 before any test ran). `system reset` is podman's own primitive
-# for exactly this, and it reads the job's FINAL storage config — which is why
-# the workflow invokes this script after the config writes, not before.
-podman system reset --force 2>&1 | tail -2 || true
-
-# Then sweep the default store path itself: reset runs unprivileged and cannot
-# remove the AMI's foreign-uid droppings, which are the original failure mode
-# (chown .../overlay/l: operation not permitted).
 sudo rm -rf "$store"
 echo "runner-podman-hygiene: default store cleared"
+
+conf="${HOME}/.config/containers/storage.conf"
+graphroot=""
+if [ -r "$conf" ]; then
+	graphroot=$(sed -n 's/^graphroot[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$conf" | head -1)
+fi
+if [ -n "$graphroot" ] && [ -d "$graphroot" ]; then
+	echo "runner-podman-hygiene: clearing state db under $graphroot (image layers preserved)"
+	sudo rm -rf "$graphroot/libpod" "$graphroot/db.sql"
+else
+	echo "runner-podman-hygiene: no configured graphroot to heal (conf=$conf)"
+fi
