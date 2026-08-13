@@ -344,6 +344,7 @@ pub(super) async fn attach_extra_disks(
     hv: &mut dyn crate::hypervisor::Hypervisor,
     data_dir: &std::path::Path,
     image_disk_path: Option<&std::path::Path>,
+    image_disk_identity: Option<&str>,
     image_disk_read_only: bool,
     rebuild_disk_dir_images: bool,
 ) -> Result<(Vec<crate::state::types::ExtraDisk>, Option<String>)> {
@@ -511,6 +512,13 @@ pub(super) async fn attach_extra_disks(
             is_read_only: image_disk_read_only,
         })
         .await?;
+        // The snapshot key was computed from a stat of this path; the VMM just
+        // opened it. Verify the same build is still there so a concurrent
+        // delete-and-rebuild between the two cannot pair a key (and the
+        // snapshot it will create) with a different disk's layer link IDs.
+        if let Some(expected) = image_disk_identity {
+            crate::utils::verify_image_disk_identity(disk_path, expected)?;
+        }
         Some(device)
     } else {
         None
@@ -1082,6 +1090,9 @@ pub(crate) async fn configure_and_boot_vm(
         hv,
         data_dir,
         plan.image_disk_path.as_deref(),
+        // Expected build identity from the snapshot-key config; None when
+        // snapshots are disabled (no key was computed, nothing to pin).
+        plan.image_disk_identity.as_deref(),
         image_disk_read_only,
         network.is_some(),
     )
@@ -1430,6 +1441,9 @@ async fn run_vm_setup_inner(
     // The launch plan: everything needed to (re)boot this VM. Built UP FRONT so the
     // exact same descriptor boots the VM now and relaunches it on a guest reboot, and
     // is shared with the disk-only clone path (which boots via prepare_vm -> here).
+    // launch_config preserves the key config's identity (with_rootfs_path
+    // clones); build_launch_config sets None when snapshots are disabled.
+    let image_disk_identity = launch_config.image_disk_identity.clone();
     let plan = super::types::RebootSpec {
         firecracker_bin: vmm_bin,
         fc_args: vmm_extra_args,
@@ -1437,6 +1451,7 @@ async fn run_vm_setup_inner(
         boot_args: runtime_boot_args,
         track_dirty_pages,
         image_disk_path: image_disk_path.map(|p| p.to_path_buf()),
+        image_disk_identity,
         vsock_socket_path: vsock_socket_path.to_path_buf(),
         bootplan_over_vsock,
     };

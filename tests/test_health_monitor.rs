@@ -91,6 +91,7 @@ async fn test_health_monitor_behaviors() {
             kernel_profile: None,
             image_mode: None,
             image_disk_path: None,
+            image_disk_identity: None,
             tty: false,
             interactive: false,
             labels: std::collections::HashMap::new(),

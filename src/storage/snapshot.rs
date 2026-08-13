@@ -238,6 +238,15 @@ pub struct SnapshotMetadata {
     /// stay reachable.
     #[serde(default)]
     pub image_disk_path: Option<PathBuf>,
+    /// Build identity (inode:size:mtime) of that disk when the source VM
+    /// booted. `podman load` randomizes overlay layer link IDs per build, so a
+    /// restore against a REBUILT disk at the same path pairs the captured
+    /// container with links that no longer exist ("readlink .../overlay/l/…").
+    /// Restore verifies the current file against this and treats a mismatch as
+    /// an unusable snapshot. None for pre-field snapshots and non-overlay
+    /// modes (fail-open for legacy artifacts, by design).
+    #[serde(default)]
+    pub image_disk_identity: Option<String>,
     /// Which VMM backend created this snapshot. Restore must use the same backend
     /// (the memory image format is VMM-specific). Defaults to Firecracker for snapshots
     /// written before this field existed (#632 P2).
@@ -671,6 +680,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                image_disk_identity: None,
                 hypervisor: Default::default(),
             },
         };
@@ -866,6 +876,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                image_disk_identity: None,
                 hypervisor: Default::default(),
             },
         };
@@ -946,6 +957,7 @@ mod tests {
                     kernel_profile: None,
                     image_mode: None,
                     image_disk_path: None,
+                    image_disk_identity: None,
                     hypervisor: Default::default(),
                 },
             };
@@ -1013,6 +1025,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                image_disk_identity: None,
                 hypervisor: Default::default(),
             },
         };
@@ -1204,6 +1217,7 @@ mod tests {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                image_disk_identity: None,
                 hypervisor: Default::default(),
             },
         };
@@ -1271,6 +1285,27 @@ mod tests {
     }
 
     #[test]
+    fn image_disk_identity_survives_roundtrip_and_defaults_to_none() {
+        // Pre-field snapshot JSON must parse with None (legacy artifacts stay
+        // restorable, fail-open by design)...
+        let legacy = r#"{
+            "image": "x", "vcpu": 1, "memory_mib": 128,
+            "network_config": { "tap_device": "t", "guest_mac": "AA:BB:CC:DD:EE:FF" }
+        }"#;
+        let parsed: SnapshotMetadata = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.image_disk_identity, None);
+        // ...and a recorded identity survives the round trip.
+        let mut meta = parsed;
+        meta.image_disk_identity = Some("1841:73678848:1765574672.000000000".into());
+        let reparsed: SnapshotMetadata =
+            serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert_eq!(
+            reparsed.image_disk_identity.as_deref(),
+            Some("1841:73678848:1765574672.000000000")
+        );
+    }
+
+    #[test]
     fn test_snapshot_metadata_ipv6_prefix_roundtrip() {
         let metadata = SnapshotMetadata {
             image: "nginx:alpine".to_string(),
@@ -1294,6 +1329,7 @@ mod tests {
             kernel_profile: None,
             image_mode: None,
             image_disk_path: None,
+            image_disk_identity: None,
             hypervisor: Default::default(),
         };
 

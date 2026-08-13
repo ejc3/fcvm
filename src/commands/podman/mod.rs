@@ -690,7 +690,12 @@ fn nv2_profile(kernel_profile: &Option<String>) -> bool {
 /// Firecracker prefixes every snapshot-load fault with "Load snapshot error",
 /// which fcvm's API client embeds verbatim in the error message.
 fn is_snapshot_load_failure(err: &anyhow::Error) -> bool {
-    format!("{err:#}").contains("Load snapshot error")
+    let rendered = format!("{err:#}");
+    // "image disk build changed" is verify_image_disk_identity's marker: the
+    // snapshot references a disk build that no longer exists at that path, so
+    // it is permanently unusable — invalidate it and fall back to a fresh
+    // boot, which re-stats the disk and provisions coherently.
+    rendered.contains("Load snapshot error") || rendered.contains("image disk build changed")
 }
 
 /// Delete a cached snapshot that failed to load so the run can fall back to a
@@ -1146,11 +1151,16 @@ async fn prepare_vm_for_lifecycle(
     };
 
     // Build identity (inode/size/mtime) of the exact file that will be
-    // attached; a rebuild at the same path is a different identity.
+    // attached; a rebuild at the same path is a different identity. Overlay
+    // storage images ONLY: btrfs/archive modes import the archive into the
+    // guest before the pre-start snapshot, so a restored VM never re-reads the
+    // archive — keying those on identity would force a needless cold boot on
+    // every re-export without changing restored behavior.
     let image_disk_identity = image_disk_path
         .as_deref()
+        .filter(|p| crate::utils::is_overlay_storage_image(p))
         .map(|p| {
-            image::file_identity(p)
+            crate::utils::file_identity(p)
                 .with_context(|| format!("stat image disk {} for snapshot key", p.display()))
         })
         .transpose()?;
@@ -1377,6 +1387,7 @@ async fn prepare_vm_for_lifecycle(
     // image device (overlay/archive image layers live on a separate read-only disk).
     vm_state.config.kernel_profile = args.kernel_profile.clone();
     vm_state.config.image_disk_path = image_disk_path.clone();
+    vm_state.config.image_disk_identity = image_disk_identity.clone();
     vm_state.config.image_mode = image_disk_path
         .as_ref()
         .map(|_| resolve_image_mode(&args).to_string());
@@ -3541,5 +3552,20 @@ mod tests {
         // Error paths can run before any state was persisted — calling the helper
         // again with nothing left to remove must not panic.
         cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
+    }
+}
+
+#[cfg(test)]
+mod image_disk_identity_classifier_tests {
+    #[test]
+    fn identity_mismatch_is_a_snapshot_load_failure() {
+        // The restore-time identity check must trigger invalidate-and-fresh-boot,
+        // not a hard run failure: its marker string is classified as a load failure.
+        let err = anyhow::anyhow!(
+            "image disk build changed during launch: /x is now a, snapshot/key was computed against b"
+        );
+        assert!(super::is_snapshot_load_failure(&err));
+        let unrelated = anyhow::anyhow!("some other failure");
+        assert!(!super::is_snapshot_load_failure(&unrelated));
     }
 }
