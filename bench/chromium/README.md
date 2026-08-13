@@ -109,8 +109,10 @@ meant to be analyzed for stage attribution (serve/restore logs land in
 ## The request-optimized path (`reqbench.sh`)
 
 `bench.sh` measures the egress matrix with an in-guest driver started by `fcvm exec`
-per request — its `exec up` stage (~252 ms median, mostly Python startup inside the
-guest) is a harness artifact, not something a real service would pay. `reqbench.sh`
+per request — its `exec up` stage (252 ms median, 95% CI 245–259, n=12; the
+"exec up" row of `results/20260808-corrected/tables.md`, raw records in
+`corrected.json`) is mostly Python startup inside the guest: a harness
+artifact, not something a real service would pay. `reqbench.sh`
 is the request path a service would actually run:
 
 - **Direct CDP from the host.** Chromium binds CDP to guest loopback `127.0.0.1:9222`
@@ -121,19 +123,39 @@ is the request path a service would actually run:
   no exec, and no benchmark-owned process in the byte path. The former per-clone
   `socat` relay is deleted; the socat-era availability A/B was withdrawn as
   non-comparable and is not evidence about the relay.
-- **Goldens via `fcvm podman prepare`** snapshotted at the image health gate, and
+- **Goldens via `fcvm podman prepare`** snapshotted at the image health gate —
+  which requires BOTH the warm marker file and a live CDP round trip that finds
+  a page target (`entry.sh` + `cdp_health.py`; rootless guests must have
+  healthcheck scheduling active for the gate to fire), and
   clones inherit `port_mappings` from snapshot metadata — which is why
   `./reqbench.sh verify` proves every hop **on a restored clone** before `run`
   measures anything.
-- **Teardown is one SIGKILL** to fcvm; the kernel fans it out to Firecracker and the
-  namespace holder via `PR_SET_PDEATHSIG`.
+- **Each request's timing includes CDP setup.** `cdpdrive.py` records target
+  resolution (`resolve_ms`), TCP connect (`tcp_ms` — successor of the obsolete
+  `port_wait_ms`, whose old numbers measured a state-discovery boundary, not
+  the network), WebSocket upgrade (`upgrade_ms`), and `Page.enable`
+  (`enable_ms`), rolled up as `connect_total_ms`; the connect stage runs
+  serially within a request (no cross-request connection reuse — every request
+  proves the whole path).
+- **Teardown differs per arm, deliberately**: `cdp-fast` uses the one-SIGKILL
+  teardown (the kernel fans it out to Firecracker and the namespace holder via
+  `PR_SET_PDEATHSIG`); the `cdp`, `noop`, and `exec` control arms keep the
+  normal SIGTERM-and-wait path so the A/B isolates exactly that change.
 - **Sealed provenance.** Each run records content hashes of the harness, `fcvm`, and
   `fc-agent`, the snapshot generation UUID, and the exact config digest, so every
   number is bound to the code that produced it.
 
-Phases: `./reqbench.sh build` → `golden` → `verify` → `run` (or `all`). The box must
-be quiet — the harness refuses to measure under load (`ALLOW_BUSY=1` overrides, and
-says so in the record).
+Prerequisites: `make build && make setup-fcvm` from the repo root first — the
+script stages the `fcvm`/`fc-agent` binaries and `golden` needs the
+content-addressed fc-agent initrd that only `make setup-fcvm` creates (its own
+`build` subcommand builds just the Podman image; a fresh checkout that skips
+setup fails exactly there).
+
+Phases: `./reqbench.sh build` → `golden` → `verify` → `run` (or `all`). Preflight
+`uptime` and `pgrep -c firecracker` yourself; the harness refuses to measure on a
+busy box. `ALLOW_BUSY=1` overrides the refusal and is recorded in the run — an
+overridden run is contaminated and must be excluded from comparisons or rerun
+before publication.
 
 ## Results conventions
 
@@ -168,7 +190,10 @@ site-isolation-off saves 3.6% on PSS (not 23% - that number was an RSS artifact)
 before quoting anything from this directory.
 
 The corrected run measured the **exec-path** request flow; its `exec up` stage does not exist on
-the `reqbench.sh` direct-CDP path above, whose timing dataset is the open re-baseline.
+the `reqbench.sh` direct-CDP path above. Publication gate for that dataset: at least 200
+measured non-warmup CDP requests per backend at zero failures (the harness enforces this and
+exits 5 otherwise), quoted with exact per-arm denominators and two-sided Clopper–Pearson
+intervals for any reliability claim.
 
 ### Running it reproducibly
 
