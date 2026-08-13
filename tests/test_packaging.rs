@@ -83,15 +83,18 @@ fn test_completions_all_shells() {
 fn test_generate_config() {
     let fcvm = fcvm_binary();
 
-    // Use a temp directory for XDG_CONFIG_HOME to avoid polluting real config
+    // Use a temp directory for FCVM_CONFIG_DIR (highest-precedence override;
+    // the harness wrapper exports it, so the test must control it) to avoid
+    // polluting real config
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let config_dir = temp_dir.path().join("fcvm");
     let config_path = config_dir.join("rootfs-config.toml");
 
-    // Generate config with custom XDG_CONFIG_HOME
+    // Generate config with a custom FCVM_CONFIG_DIR
     let output = Command::new(&fcvm)
         .args(["setup", "--generate-config", "--force"])
-        .env("XDG_CONFIG_HOME", temp_dir.path())
+        .env("FCVM_CONFIG_DIR", temp_dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .output()
         .expect("failed to run fcvm setup --generate-config");
 
@@ -141,7 +144,8 @@ fn test_generate_config_no_overwrite() {
     // Try to generate without --force
     let output = Command::new(&fcvm)
         .args(["setup", "--generate-config"])
-        .env("XDG_CONFIG_HOME", temp_dir.path())
+        .env("FCVM_CONFIG_DIR", temp_dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .output()
         .expect("failed to run fcvm setup --generate-config");
 
@@ -180,7 +184,8 @@ fn test_generate_config_force_overwrite() {
     // Generate with --force
     let output = Command::new(&fcvm)
         .args(["setup", "--generate-config", "--force"])
-        .env("XDG_CONFIG_HOME", temp_dir.path())
+        .env("FCVM_CONFIG_DIR", temp_dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .output()
         .expect("failed to run fcvm setup --generate-config --force");
 
@@ -257,4 +262,32 @@ fn test_help_shows_all_commands() {
             cmd
         );
     }
+}
+
+/// The XDG fallback must keep working when FCVM_CONFIG_DIR is absent: real
+/// users have no FCVM_CONFIG_DIR, and the directories crate resolves
+/// XDG_CONFIG_HOME. The harness wrapper exports FCVM_CONFIG_DIR, so this test
+/// must remove it explicitly or it asserts the wrong precedence.
+#[test]
+fn test_generate_config_falls_back_to_xdg() {
+    let fcvm = fcvm_binary();
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let config_path = temp_dir.path().join("fcvm/rootfs-config.toml");
+
+    let output = Command::new(&fcvm)
+        .args(["setup", "--generate-config", "--force"])
+        .env_remove("FCVM_CONFIG_DIR")
+        .env("XDG_CONFIG_HOME", temp_dir.path())
+        .output()
+        .expect("failed to run fcvm setup --generate-config");
+    assert!(
+        output.status.success(),
+        "generate-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        config_path.exists(),
+        "XDG fallback did not create {config_path:?} — FCVM_CONFIG_DIR must be an override, \
+         not a replacement, of the XDG resolution real users rely on"
+    );
 }
