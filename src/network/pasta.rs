@@ -1534,9 +1534,17 @@ mod tests {
     }
 
     fn live_child() -> Child {
-        let mut command = Command::new("cat");
+        // Must stay alive with NO stdin dependency: tokio's Child::wait()
+        // drops the child's stdin handle on its first poll (deadlock
+        // avoidance), so a `cat` with piped stdin exits 0 the moment the
+        // select polls the wait arm — and whether that real OS exit beats the
+        // paused clock's auto-advance to the safety tick is a scheduler race
+        // (observed as a TRY 1 FAIL of the safety-tick test under a loaded
+        // full-suite run, 2026-08-13).
+        let mut command = Command::new("sleep");
         command
-            .stdin(std::process::Stdio::piped())
+            .arg("3600")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         command.spawn().expect("spawn live child")
