@@ -828,10 +828,20 @@ fn self_hosted_setup_steps_clear_the_default_podman_store() {
     for (idx, _) in ci.match_indices("podman system migrate") {
         let rest = &ci[idx..];
         let step_end = rest.find("\n      - name:").unwrap_or(rest.len());
-        assert!(
-            rest[..step_end].contains("./fcvm/scripts/runner-podman-hygiene.sh"),
-            "a `podman system migrate` at byte {idx} is not followed by the exact hygiene \
-             invocation within its own step"
+        // The hygiene call must be the NEXT executable line (comments allowed):
+        // an intervening command could recreate podman state after the heal.
+        let next_command = rest[..step_end]
+            .split_once('\n')
+            .map(|(_, following)| following)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'));
+        assert_eq!(
+            next_command,
+            Some("./fcvm/scripts/runner-podman-hygiene.sh"),
+            "a `podman system migrate` at byte {idx} is not immediately followed by \
+             the hygiene invocation"
         );
     }
 }
