@@ -370,9 +370,13 @@ vs passing for contention), boot sequence (fc-agent startup stalls), dmesg artif
 ## Answering review findings
 
 `scripts/check-review-threads.sh <pr>` is the gate. It blocks on UNRESOLVED threads,
-UNDISPOSED resolved threads, and UNACKED PR-level review bodies. A defect claim is closed
+UNDISPOSED resolved threads, and UNANSWERED PR-level review bodies. A defect claim is closed
 by `RED-VERIFIED: <test>` naming a test you watched **fail without the fix** — not by an
 assertion that it is fixed. `NOT-A-DEFECT:` and `DISAGREE:` are equally valid dispositions;
 silence is not one.
+
+Write the disposition as the FIRST thing in a reply of its own (`RED-VERIFIED: ...`), post it
+AFTER the finding it answers, and use the same three words for findings that arrive in a
+review body rather than inline. All three are enforced, and all three were once holes.
 
 Verify the gate itself with `scripts/test-check-review-threads.sh` before trusting a CLEAR.

@@ -100,16 +100,28 @@ branch logged 0 times across 137 runs, a `grep '^ *FAIL'` blind to nextest's `TR
 Every one of them was green for its whole life.
 
 Enforcement: `scripts/check-review-threads.sh <pr>` fails while any review thread is
-unresolved, while any RESOLVED thread carries no disposition reply, and while any PR-level
-review body carries no `REVIEW-ACK:`. Every resolved thread needs one of:
+unresolved, and while any finding — inline OR in a PR-level review body — carries no
+disposition. One vocabulary for both:
 
 | `RED-VERIFIED: <test>` | a defect claim, closed by a test watched failing without the fix |
 | `NOT-A-DEFECT: <reason>` | naming, docs, style |
 | `DISAGREE: <reason>` | a defect claim you are rejecting, with reasoning |
 
-Earlier versions guessed which findings were defects from a `panic|crash|leak|...` regex. That
-failed BOTH ways: "this drops the final game from the schedule" matched nothing and closed on an
-assertion, while a *wrong* defect claim could never be closed at all. Do not guess; answer.
+Three rules the gate enforces, each of them a hole it once had:
+
+- **A disposition must OPEN a reply of its own.** Matched anywhere in the text, "Please add
+  `RED-VERIFIED: <test>` before resolving" counted the reviewer DEMANDING evidence as the
+  person supplying it.
+- **An answer must be NEWER than the claim it answers.** Counting dispositions in aggregate
+  meant one reply closed every finding posted after it, forever.
+- **Review bodies answer to the same vocabulary as inline findings.** A bare acknowledgement
+  used to clear a PR-level defect claim that, posted inline, would have demanded a real
+  disposition — the same finding adjudicated or waved through depending on where the
+  reviewer happened to click.
+
+Earlier versions also guessed which findings were defects from a `panic|crash|leak|...` regex.
+That failed BOTH ways: "this drops the final game from the schedule" matched nothing and closed
+on an assertion, while a *wrong* defect claim could never be closed at all. Do not guess; answer.
 
 The gate has its own tests, each written against the unfixed script and observed failing first:
 `scripts/test-check-review-threads.sh`, plus `scripts/probe-review-gate-pagination.sh` for the

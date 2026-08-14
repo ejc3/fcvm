@@ -66,15 +66,57 @@ run_case "non-defect disposition clears" \
   0 "CLEAR"
 
 echo "== finding 4: PR-level review bodies must be adjudicated =="
-run_case "unacknowledged review body blocks" \
-  "$(wrap '[]' '[{"author":{"login":"chatgpt-codex-connector"},"state":"COMMENTED","body":"P1: this silently drops events"}]')" \
+run_case "undisposed review body blocks" \
+  "$(wrap '[]' '[{"author":{"login":"chatgpt-codex-connector"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops events"}]')" \
   1 "BLOCKED"
-run_case "acknowledged review body clears" \
-  "$(wrap '[]' '[{"author":{"login":"chatgpt-codex-connector"},"state":"COMMENTED","body":"P1: this silently drops events"},{"author":{"login":"me"},"state":"COMMENTED","body":"REVIEW-ACK: addressed in the thread above"}]')" \
+run_case "disposed review body clears" \
+  "$(wrap '[]' '[{"author":{"login":"chatgpt-codex-connector"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops events"},{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"DISAGREE: the guard above already rejects that input"}]')" \
   0 "CLEAR"
-run_case "empty review body needs no ack" \
+run_case "empty review body needs no disposition" \
   "$(wrap '[]' '[{"author":{"login":"someone"},"state":"APPROVED","body":""}]')" \
   0 "CLEAR"
+
+echo "== finding 8: a reply ASKING for proof is not a disposition =="
+# "Please add RED-VERIFIED: <test>" contains the marker followed by non-whitespace, so an
+# unanchored substring test counted the person DEMANDING evidence as the one supplying it.
+run_case "reply requesting proof blocks" \
+  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this corrupts the output"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"Please add RED-VERIFIED: test-name before resolving this."}]}}]')" \
+  1 "BLOCKED"
+run_case "disposition buried after prose blocks" \
+  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this corrupts the output"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"we talked about this and\nNOT-A-DEFECT: it is fine"}]}}]')" \
+  1 "BLOCKED"
+run_case "disposition opening the reply clears" \
+  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this corrupts the output"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"NOT-A-DEFECT: renamed only, no behaviour change"}]}}]')" \
+  0 "CLEAR"
+
+echo "== finding 9: an answer must be NEWER than the claim it answers =="
+# One disposition used to zero the whole count, so a review body posted AFTER it was
+# silently treated as answered.
+run_case "claim posted after the disposition blocks" \
+  "$(wrap '[]' '[{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"DISAGREE: answered the first round"},{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-05T00:00:00Z","body":"P1: new finding nobody has answered"}]')" \
+  1 "BLOCKED"
+run_case "two claims, one late disposition clears both" \
+  "$(wrap '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: first finding"},{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"P2: second finding"},{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"RED-VERIFIED: covers both, tests/foo.rs"}]')" \
+  0 "CLEAR"
+
+echo "== finding 10: review data must be validated like thread data =="
+run_case "reviews.nodes as an object exits 2" \
+  "$(wrap '[]' '{"malformed":true}')" 2 "BLOCKED"
+run_case "reviews.nodes as a string exits 2" \
+  "$(wrap '[]' '"nonsense"')" 2 "BLOCKED"
+run_case "review body of the wrong type exits 2" \
+  "$(wrap '[]' '[{"author":{"login":"x"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":42}]')" \
+  2 "BLOCKED"
+run_case "non-empty review body with no timestamp exits 2" \
+  "$(wrap '[]' '[{"author":{"login":"x"},"state":"COMMENTED","body":"P1: this drops events"}]')" \
+  2 "BLOCKED"
+
+echo "== finding 11: PR-level claims answer to the same vocabulary as inline ones =="
+# A bare "REVIEW-ACK: read" used to clear a PR-level defect claim that, posted inline,
+# would have demanded a real disposition. Same finding, two standards.
+run_case "PR-level claim + bare ack blocks" \
+  "$(wrap '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last record"},{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"REVIEW-ACK: read"}]')" \
+  1 "BLOCKED"
 
 echo "== finding 6: a disposition past the first comment page must be seen =="
 long=$(python3 -c '

@@ -1,14 +1,16 @@
 #!/bin/bash
 # Fail while a PR has UNRESOLVED inline review threads.
 #
-# This is the enforcement half of the review rules in CLAUDE.md.
+# This is the enforcement half of the review-comment rules in .claude/CLAUDE.md.
 # A doc that says "read the inline findings before merging" cannot fire. This can.
 #
-# It exists because CI state says nothing about whether a review was ANSWERED.
-# Ported from ejc3/fcvm, where a PR sat at 15 green checks / 0 failures /
+# It exists because on 2026-08-08 a PR here sat at 15 green checks / 0 failures /
 # MERGEABLE with 19 unresolved inline findings, and another merged carrying four
-# unread Major findings behind a green `CodeRabbit pass`. Codex reviews this repo,
-# so the same shape is available here the moment a review has findings.
+# unread Major findings behind a green `CodeRabbit pass`. CI state says nothing
+# about whether a human or bot review was answered.
+#
+# A port of this script runs in dolphin-labs-hq/dolphin-labs; fixes have flowed
+# both ways. Keep them in sync — they have drifted once already.
 #
 # Why GraphQL and not `created_at` heuristics: an earlier version of the docs
 # said "comment older than your fix commit => already addressed". That is wrong
@@ -56,12 +58,16 @@ fetch_payload() {
     resp=$(gh api graphql -f query="
       { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
           pullRequest(number: $pr) {
-            reviews(first: 100) { nodes { author { login } state body } }
+            reviews(first: 100) { nodes { author { login } state body submittedAt } }
             reviewThreads(first: 100$after) {
               pageInfo { hasNextPage endCursor }
               nodes {
                 id isResolved isOutdated
-                comments(first: $COMMENTS_PAGE_SIZE) { totalCount nodes { author { login } path line originalLine body } }
+                comments(first: $COMMENTS_PAGE_SIZE) {
+                  totalCount
+                  pageInfo { hasNextPage endCursor }
+                  nodes { author { login } path line originalLine body }
+                }
               } } } } }" 2>/dev/null) || return 1
 
     # A wrong PR number, a renamed repo, or a permissions problem all return a NULL
@@ -82,25 +88,41 @@ fetch_payload() {
     cursor=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$resp")
   done
 
-  # A disposition is a REPLY, so it lands at the END of a long thread. comments(first:100)
-  # silently truncated exactly there: a thread with 100+ comments reported UNPROVEN even
-  # though its RED-VERIFIED reply existed, with no way for a later reply to become
-  # visible. Re-fetch the tail of any oversized thread and merge it in.
-  local oversized
+  # A thread's comments are a paged connection like any other, and a disposition is a
+  # REPLY, so it lands at the far end of a long one. Two earlier versions got this wrong:
+  #   - comments(first: N) alone truncated the tail, so a disposed thread reported
+  #     UNDISPOSED with no way for a later reply to ever become visible;
+  #   - then first:N + last:N covered both ends but never the MIDDLE, so on a thread
+  #     longer than 2N a disposition in between was still invisible.
+  # Page it properly instead of approximating. Pages are appended in order, so comment
+  # order is preserved — which matters, because the disposition scan treats nodes[0] as
+  # the original finding. (An interim version deduped with unique_by(.body), which SORTS,
+  # and a reply sorting before the finding silently became nodes[0].)
+  local oversized tid
   oversized=$(jq -r --argjson page "$COMMENTS_PAGE_SIZE" \
   '[.[] | select((.comments.totalCount // 0) > $page) | .id] | .[]' <<<"$threads")
-  local tid
   for tid in $oversized; do
-    local tail
-    tail=$(gh api graphql -f query="
-      { node(id: \"$tid\") { ... on PullRequestReviewThread {
-          comments(last: $COMMENTS_PAGE_SIZE) { nodes { author { login } path line originalLine body } } } } }" 2>/dev/null) || continue
-    threads=$(jq --arg id "$tid" --argjson tail "$(jq '.data.node.comments.nodes // []' <<<"$tail")" \
-      'def dedupe_stable: reduce .[] as $c ([]; if any(.[]; . == $c) then . else . + [$c] end);
-       map(if .id == $id
-           then .comments.nodes = ((.comments.nodes + $tail) | dedupe_stable)
-           else . end)' \
-      <<<"$threads")
+    local ccursor cresp all_comments
+    ccursor=$(jq -r --arg id "$tid" \
+      '.[] | select(.id == $id) | .comments.pageInfo.endCursor // "null"' <<<"$threads")
+    all_comments=$(jq -c --arg id "$tid" \
+      '.[] | select(.id == $id) | .comments.nodes' <<<"$threads")
+    while [ "$ccursor" != "null" ] && [ -n "$ccursor" ]; do
+      cresp=$(gh api graphql -f query="
+        { node(id: \"$tid\") { ... on PullRequestReviewThread {
+            comments(first: $COMMENTS_PAGE_SIZE, after: \"$ccursor\") {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login } path line originalLine body } } } } }" 2>/dev/null) || break
+      all_comments=$(jq -c -s '.[0] + (.[1].data.node.comments.nodes // [])' \
+        <(echo "$all_comments") <(echo "$cresp"))
+      if [ "$(jq -r '.data.node.comments.pageInfo.hasNextPage' <<<"$cresp")" = "true" ]; then
+        ccursor=$(jq -r '.data.node.comments.pageInfo.endCursor' <<<"$cresp")
+      else
+        ccursor=null
+      fi
+    done
+    threads=$(jq --arg id "$tid" --argjson c "$all_comments" \
+      'map(if .id == $id then .comments.nodes = $c else . end)' <<<"$threads")
   done
 
   jq -n --argjson t "$threads" --argjson r "$reviews" \
@@ -135,6 +157,27 @@ if ! jq -e 'all((.isResolved | type) == "boolean" and (.comments.nodes | type ==
   echo "an answer, and a thread that matches neither selector must not slip through." >&2
   exit 2
 fi
+# Review data gets the SAME scrutiny as thread data. It did not, originally: `reviews` was
+# added in the commit that hardened `threads` and simply missed the validation, so a
+# malformed reviews array made the later jq fail, hit its `|| echo 0` fallback, and
+# reported CLEAR. Half-applied hardening is how a gate ends up trusted and wrong.
+if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$reviews"; then
+  echo "verdict: BLOCKED — review data is not an array; refusing to judge input this" >&2
+  echo "gate could not parse. Re-run, or re-capture the fixture." >&2
+  exit 2
+fi
+# A body must be text, and any non-empty body must carry a timestamp — answers are matched
+# to claims by time below, and an unordered claim cannot be shown to have been answered.
+if ! jq -e 'all(((.body // "") | type) == "string")' >/dev/null 2>&1 <<<"$reviews"; then
+  echo "verdict: BLOCKED — a review body is not text; refusing to judge it." >&2
+  exit 2
+fi
+if ! jq -e 'all(((.body // "") | test("[^[:space:]]") | not) or ((.submittedAt | type) == "string"))' \
+     >/dev/null 2>&1 <<<"$reviews"; then
+  echo "verdict: BLOCKED — a non-empty review body has no submittedAt timestamp, so this" >&2
+  echo "gate cannot tell whether the answer came before or after the claim." >&2
+  exit 2
+fi
 
 total=$(jq 'length' <<<"$threads")
 unresolved=$(jq '[.[] | select(.isResolved == false)] | length' <<<"$threads")
@@ -166,19 +209,27 @@ fi
 #   NOT-A-DEFECT: <reason>  not a defect (naming, docs, style) — say what you did
 #   DISAGREE: <reason>      a defect claim you are rejecting, with the reasoning
 #
-# `[^[:space:]]` after the colon is required: a bare "RED-VERIFIED:" — or a comment
-# merely ASKING someone for proof — previously satisfied a plain substring test.
-disposition_re='(RED-VERIFIED|NOT-A-DEFECT|DISAGREE):[[:space:]]*[^[:space:]]'
+# A disposition must OPEN a reply of its own. Two weaker versions shipped first:
+#   - a plain substring test, which a bare "RED-VERIFIED:" satisfied;
+#   - then a non-empty-suffix test applied to every reply JOINED into one string, which
+#     "Please add RED-VERIFIED: <test> before resolving" satisfied — counting the person
+#     DEMANDING evidence as the person supplying it.
+# `\A` (start of string, not start of line) anchors it to a deliberate answer. Prose with
+# a marker buried in the middle does not count, in either direction.
+disposition_re='\A[[:space:]]*(RED-VERIFIED|NOT-A-DEFECT|DISAGREE):[[:space:]]*[^[:space:]]'
 
+# No `|| echo 0` here or below. That fallback is how a jq failure became "nothing to
+# answer" — the gate reporting CLEAR precisely because it could not evaluate.
 undisposed=$(jq -r --arg re "$disposition_re" '
   [ .[] | select(.isResolved == true)
-        | select(([.comments.nodes[1:][].body] | join(" ") | test($re)) | not) ]
-  | length' <<<"$threads" 2>/dev/null || echo 0)
+        | select(any(.comments.nodes[1:][]; (.body // "") | test($re)) | not) ]
+  | length' <<<"$threads") || {
+  echo "verdict: BLOCKED — could not evaluate thread dispositions." >&2; exit 2; }
 
 if [ "${undisposed:-0}" -gt 0 ]; then
   echo
   jq -r --arg re "$disposition_re" '.[] | select(.isResolved == true)
-    | select(([.comments.nodes[1:][].body] | join(" ") | test($re)) | not)
+    | select(any(.comments.nodes[1:][]; (.body // "") | test($re)) | not)
     | .comments.nodes[0]
     | "  UNDISPOSED \(.author.login)  \(.path):\(.line // .originalLine // "?")\n    \(.body | split("\n")[0][0:150])"' \
     <<<"$threads"
@@ -195,29 +246,44 @@ fi
 # A defect claim can also arrive in a PR-LEVEL REVIEW BODY, which is not a thread and has
 # no isResolved. Those never appeared in reviewThreads at all, so a review whose entire
 # content was "P1: this silently drops events" left the gate reporting 0 threads / CLEAR.
-# Require an explicit acknowledgement comment for each non-empty review body.
-# Count only bodies that are NOT themselves acknowledgements. An ACK reply carries a
-# body too, and counting it as one more thing needing acknowledgement made a correctly
-# acked PR block forever — the fail-closed-permanently twin of the bug this replaced.
-unacked=$(jq -r '
-  ([ .[] | select((.body // "") | test("[^[:space:]]"))
-          | select((.body // "") | test("REVIEW-ACK:") | not) ] | length) as $needing
-  | ([ .[] | select((.body // "") | test("REVIEW-ACK:[[:space:]]*[^[:space:]]")) ] | length) as $acks
-  | if $acks > 0 then 0 else $needing end' <<<"$reviews" 2>/dev/null || echo 0)
+#
+# Review bodies answer to the SAME vocabulary as inline findings. They used to accept a
+# bare "REVIEW-ACK: read", which meant an identical claim was adjudicated or waved through
+# depending only on where the reviewer happened to click. A weaker rule reachable by
+# accident is not a rule.
+#
+# And an answer only answers what came BEFORE it. Counting dispositions in aggregate ("any
+# disposition exists => nothing outstanding") meant a finding posted after an earlier round
+# was closed was silently treated as answered. Each claim needs a disposition NEWER than
+# itself; ISO-8601 timestamps compare lexicographically, and the validation above
+# guarantees every non-empty body has one.
+unanswered=$(jq -r --arg re "$disposition_re" '
+  [ .[] | select((.body // "") | test($re)) | .submittedAt ] as $answers
+  | [ .[] | select((.body // "") | test("[^[:space:]]"))
+          | select(((.body // "") | test($re)) | not)
+          | . as $claim
+          | select([ $answers[] | select(. > $claim.submittedAt) ] | length == 0) ]
+  | length' <<<"$reviews") || {
+  echo "verdict: BLOCKED — could not evaluate review bodies." >&2; exit 2; }
 
-if [ "${unacked:-0}" -gt 0 ]; then
+if [ "${unanswered:-0}" -gt 0 ]; then
   echo
-  jq -r '.[] | select((.body // "") | test("[^[:space:]]"))
-    | select((.body // "") | test("REVIEW-ACK:") | not)
-    | "  UNACKED    \(.author.login) (\(.state))\n    \(.body | split("\n")[0][0:150])"' <<<"$reviews"
+  jq -r --arg re "$disposition_re" '
+    [ .[] | select((.body // "") | test($re)) | .submittedAt ] as $answers
+    | .[] | select((.body // "") | test("[^[:space:]]"))
+    | select(((.body // "") | test($re)) | not)
+    | . as $claim
+    | select([ $answers[] | select(. > $claim.submittedAt) ] | length == 0)
+    | "  UNANSWERED \(.author.login) (\(.state))\n    \(.body | split("\n")[0][0:150])"' <<<"$reviews"
   echo
-  echo "verdict: BLOCKED — $unacked PR-level review body/bodies not acknowledged."
-  echo "A finding in a review body is not a thread and cannot be 'resolved'. Reply on the"
-  echo "PR with 'REVIEW-ACK: <what you did>' once you have read and answered it."
+  echo "verdict: BLOCKED — $unanswered PR-level review body/bodies carry no disposition."
+  echo "A finding in a review body is not a thread and cannot be 'resolved'. Post a review"
+  echo "on the PR OPENING with one of RED-VERIFIED: / NOT-A-DEFECT: / DISAGREE: — the same"
+  echo "answers an inline finding requires, and dated after the finding it answers."
   rc=1
 fi
 
 if [ "$rc" -eq 0 ]; then
-  echo "verdict: CLEAR — every thread resolved and disposed, every review body acknowledged."
+  echo "verdict: CLEAR — every thread resolved and disposed, every review body answered."
 fi
 exit $rc
