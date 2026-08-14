@@ -51,7 +51,7 @@ COMMENTS_PAGE_SIZE=${COMMENTS_PAGE_SIZE:-100}
 REVIEWS_PAGE_SIZE=${REVIEWS_PAGE_SIZE:-100}
 
 fetch_payload() {
-  local pr=$1 cursor=null threads='[]' reviews='[]'
+  local pr=$1 cursor=null threads='[]' reviews='[]' prcomments='[]'
 
   # Reviews are their OWN connection and must be paged on their OWN cursor. They used to
   # ride along inside the reviewThreads loop, which was wrong twice over: past 100 reviews
@@ -77,6 +77,26 @@ fetch_payload() {
           <(echo "$reviews") <(echo "$rresp"))
     [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
     rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
+  done
+
+  # THIRD place a finding can live: a top-level PR comment. Not a thread, not a review —
+  # its own `comments` connection. This gate told people to answer with `gh pr comment`
+  # while never reading what that command produces, so a defect claim posted the way the
+  # docs suggest could sit on a PR that reported CLEAR.
+  local ccursor2=null cafter="" cresp2
+  while :; do
+    [ "$ccursor2" != "null" ] && cafter=", after: \"$ccursor2\""
+    cresp2=$(gh api graphql -f query="
+      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $pr) {
+            comments(first: $REVIEWS_PAGE_SIZE$cafter) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login } body createdAt }
+            } } } }" 2>/dev/null) || return 1
+    prcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
+          <(echo "$prcomments") <(echo "$cresp2"))
+    [ "$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage' <<<"$cresp2")" = "true" ] || break
+    ccursor2=$(jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor' <<<"$cresp2")
   done
 
   while :; do
@@ -139,7 +159,13 @@ fetch_payload() {
         { node(id: \"$tid\") { ... on PullRequestReviewThread {
             comments(first: $COMMENTS_PAGE_SIZE, after: \"$ccursor\") {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login } path line originalLine body } } } } }" 2>/dev/null) || break
+              nodes { author { login } path line originalLine body } } } } }" 2>/dev/null) || {
+        # NOT `break`. A transient API/auth/rate-limit failure mid-thread used to return
+        # the pages fetched so far as though they were the whole conversation — so an
+        # early disposition could certify a thread nobody finished reading.
+        echo "verdict: BLOCKED — could not page comments for thread $tid." >&2
+        return 1
+      }
       all_comments=$(jq -c -s '.[0] + (.[1].data.node.comments.nodes // [])' \
         <(echo "$all_comments") <(echo "$cresp"))
       if [ "$(jq -r '.data.node.comments.pageInfo.hasNextPage' <<<"$cresp")" = "true" ]; then
@@ -152,8 +178,9 @@ fetch_payload() {
       'map(if .id == $id then .comments.nodes = $c else . end)' <<<"$threads")
   done
 
-  jq -n --argjson t "$threads" --argjson r "$reviews" \
-     '{data:{repository:{pullRequest:{reviewThreads:{nodes:$t}, reviews:{nodes:$r}}}}}'
+  jq -n --argjson t "$threads" --argjson r "$reviews" --argjson c "$prcomments" \
+     '{data:{repository:{pullRequest:{reviewThreads:{nodes:$t}, reviews:{nodes:$r},
+                                      comments:{nodes:$c}}}}}'
 }
 
 if [ "${1:-}" = "--from-file" ]; then
@@ -164,6 +191,7 @@ else
 fi
 threads=$(jq '.data.repository.pullRequest.reviewThreads.nodes' <<<"$payload" 2>/dev/null)
 reviews=$(jq '.data.repository.pullRequest.reviews.nodes // []' <<<"$payload" 2>/dev/null)
+prcomments=$(jq '.data.repository.pullRequest.comments.nodes // []' <<<"$payload" 2>/dev/null)
 
 # Prove the payload is what we think before counting it. `jq` emits `null` for a missing
 # path and an empty string on a parse error, and `[ "" -gt 0 ]` is a shell error, not a
@@ -205,6 +233,24 @@ if ! jq -e 'all(((.body // "") | test("[^[:space:]]") | not) or ((.submittedAt |
   echo "gate cannot tell whether the answer came before or after the claim." >&2
   exit 2
 fi
+if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$prcomments"; then
+  echo "verdict: BLOCKED — top-level PR comment data is not an array." >&2
+  exit 2
+fi
+if ! jq -e 'all(((.body // "") | type) == "string"
+                and (((.body // "") | test("[^[:space:]]") | not) or ((.createdAt | type) == "string")))' \
+     >/dev/null 2>&1 <<<"$prcomments"; then
+  echo "verdict: BLOCKED — a top-level PR comment has a non-text body or no createdAt." >&2
+  exit 2
+fi
+
+# Reviews and top-level comments are two containers for the same thing: a PR-level
+# statement. Judge them as one list, so an answer posted either way settles a claim posted
+# either way. `at` normalises submittedAt/createdAt.
+bodies=$(jq -s '(.[0] | map({author, state, body, at: .submittedAt}))
+              + (.[1] | map({author, state: "COMMENT", body, at: .createdAt}))' \
+         <(echo "$reviews") <(echo "$prcomments")) || {
+  echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 
 total=$(jq 'length' <<<"$threads")
 unresolved=$(jq '[.[] | select(.isResolved == false)] | length' <<<"$threads")
@@ -247,16 +293,25 @@ disposition_re='\A[[:space:]]*(RED-VERIFIED|NOT-A-DEFECT|DISAGREE):[[:space:]]*[
 
 # No `|| echo 0` here or below. That fallback is how a jq failure became "nothing to
 # answer" — the gate reporting CLEAR precisely because it could not evaluate.
-undisposed=$(jq -r --arg re "$disposition_re" '
-  [ .[] | select(.isResolved == true)
-        | select(any(.comments.nodes[1:][]; (.body // "") | test($re)) | not) ]
-  | length' <<<"$threads") || {
+# The disposition must also come AFTER the last outstanding comment. Merely requiring one
+# to EXIST let an early answer certify a thread where someone later raised a new defect and
+# nobody responded — the inline twin of the review-body ordering bug. Comment order is
+# positional (pages append in order), so no timestamps are needed: the index of the newest
+# disposition must exceed the index of the newest non-disposition comment.
+undisposed=$(jq -r --arg re "$disposition_re" '[ .[] | select(.isResolved == true)
+  | (.comments.nodes | to_entries) as $e
+  | (([ $e[] | select(.key > 0) | select((.value.body // "") | test($re)) | .key ] | max) // -1) as $answer
+  | (([ $e[] | select((.value.body // "") | test($re) | not) | .key ] | max) // -1) as $claim
+  | select($answer <= $claim) ] | length' <<<"$threads") || {
   echo "verdict: BLOCKED — could not evaluate thread dispositions." >&2; exit 2; }
 
 if [ "${undisposed:-0}" -gt 0 ]; then
   echo
   jq -r --arg re "$disposition_re" '.[] | select(.isResolved == true)
-    | select(any(.comments.nodes[1:][]; (.body // "") | test($re)) | not)
+  | (.comments.nodes | to_entries) as $e
+  | (([ $e[] | select(.key > 0) | select((.value.body // "") | test($re)) | .key ] | max) // -1) as $answer
+  | (([ $e[] | select((.value.body // "") | test($re) | not) | .key ] | max) // -1) as $claim
+  | select($answer <= $claim)
     | .comments.nodes[0]
     | "  UNDISPOSED \(.author.login)  \(.path):\(.line // .originalLine // "?")\n    \(.body | split("\n")[0][0:150])"' \
     <<<"$threads"
@@ -285,23 +340,23 @@ fi
 # itself; ISO-8601 timestamps compare lexicographically, and the validation above
 # guarantees every non-empty body has one.
 unanswered=$(jq -r --arg re "$disposition_re" '
-  [ .[] | select((.body // "") | test($re)) | .submittedAt ] as $answers
+  [ .[] | select((.body // "") | test($re)) | .at ] as $answers
   | [ .[] | select((.body // "") | test("[^[:space:]]"))
           | select(((.body // "") | test($re)) | not)
           | . as $claim
-          | select([ $answers[] | select(. > $claim.submittedAt) ] | length == 0) ]
-  | length' <<<"$reviews") || {
-  echo "verdict: BLOCKED — could not evaluate review bodies." >&2; exit 2; }
+          | select([ $answers[] | select(. > $claim.at) ] | length == 0) ]
+  | length' <<<"$bodies") || {
+  echo "verdict: BLOCKED — could not evaluate PR-level bodies." >&2; exit 2; }
 
 if [ "${unanswered:-0}" -gt 0 ]; then
   echo
   jq -r --arg re "$disposition_re" '
-    [ .[] | select((.body // "") | test($re)) | .submittedAt ] as $answers
+    [ .[] | select((.body // "") | test($re)) | .at ] as $answers
     | .[] | select((.body // "") | test("[^[:space:]]"))
     | select(((.body // "") | test($re)) | not)
     | . as $claim
-    | select([ $answers[] | select(. > $claim.submittedAt) ] | length == 0)
-    | "  UNANSWERED \(.author.login) (\(.state))\n    \(.body | split("\n")[0][0:150])"' <<<"$reviews"
+    | select([ $answers[] | select(. > $claim.at) ] | length == 0)
+    | "  UNANSWERED \(.author.login) (\(.state))\n    \(.body | split("\n")[0][0:150])"' <<<"$bodies"
   echo
   echo "verdict: BLOCKED — $unanswered PR-level review body/bodies carry no disposition."
   echo "A finding in a review body is not a thread and cannot be 'resolved'. Post a review"

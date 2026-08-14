@@ -127,6 +127,29 @@ n+=[{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: leak.te
 print(json.dumps([{"isResolved":True,"comments":{"nodes":n,"totalCount":len(n)}}]))')
 run_case "RED-VERIFIED after 100+ comments is found" "$(wrap "$long")" 0 "CLEAR"
 
+echo "== finding 12: a disposition must answer the LAST outstanding comment =="
+# An early disposition used to certify a thread where someone later raised a new defect.
+run_case "new claim after the disposition blocks" \
+  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this drops a record"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: a.test.ts"},{"author":{"login":"x"},"path":"a.ts","line":1,"body":"and it also double-counts on retry"}]}}]')" \
+  1 "BLOCKED"
+run_case "re-disposing the later claim clears" \
+  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this drops a record"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: a.test.ts"},{"author":{"login":"x"},"path":"a.ts","line":1,"body":"and it also double-counts on retry"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: b.test.ts"}]}}]')" \
+  0 "CLEAR"
+
+echo "== finding 13: findings in top-level PR comments count too =="
+wrap3() { printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "${2:-[]}" "${3:-[]}"; }
+run_case "undisposed top-level PR comment blocks" \
+  "$(wrap3 '[]' '[]' '[{"author":{"login":"codex"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last row"}]')" \
+  1 "BLOCKED"
+run_case "disposed top-level PR comment clears" \
+  "$(wrap3 '[]' '[]' '[{"author":{"login":"codex"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last row"},{"author":{"login":"me"},"createdAt":"2026-01-02T00:00:00Z","body":"DISAGREE: the guard above rejects that input"}]')" \
+  0 "CLEAR"
+run_case "a PR comment can answer a review body" \
+  "$(wrap3 '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: drops a row"}]' '[{"author":{"login":"me"},"createdAt":"2026-01-02T00:00:00Z","body":"RED-VERIFIED: row.test.ts"}]')" \
+  0 "CLEAR"
+run_case "malformed PR comment data exits 2" \
+  "$(wrap3 '[]' '[]' '"nonsense"')" 2 "BLOCKED"
+
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
   "$(wrap '[{"isResolved":false,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"something"}]}}]')" \
