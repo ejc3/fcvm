@@ -965,12 +965,6 @@ pub(super) async fn run_vm_setup(
     Ok((vm_manager, holder_slot, reboot_spec, bootplan_handle_slot))
 }
 
-/// Build the FirecrackerConfig used to cold-boot a VM from a disk.
-///
-/// Single source of truth for launch-config construction, shared by:
-///   * initial `fcvm podman run` (run_vm_setup_inner, cache miss)
-///   * the snapshot-restore path's up-front reboot plan (a rebooted restored clone
-///     cold-boots from its current provisioned disk — disk-only-clone semantics)
 /// The extra kernel boot args a launch will actually append.
 ///
 /// Resolves the kernel profile's `boot_args`, falling back to FCVM_BOOT_ARGS.
@@ -986,6 +980,12 @@ pub(crate) fn effective_extra_boot_args(
         .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok())
 }
 
+/// Build the FirecrackerConfig used to cold-boot a VM from a disk.
+///
+/// Single source of truth for launch-config construction, shared by:
+///   * initial `fcvm podman run` (run_vm_setup_inner, cache miss)
+///   * the snapshot-restore path's up-front reboot plan (a rebooted restored clone
+///     cold-boots from its current provisioned disk — disk-only-clone semantics)
 pub(crate) fn build_launch_config(
     args: &RunArgs,
     rootfs_path: &std::path::Path,
