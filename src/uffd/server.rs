@@ -1074,8 +1074,25 @@ fn continue_page(
                     target: "uffd",
                     vm_id = %vm_id,
                     fault_addr = format!("0x{:x}", page + done),
-                    "UFFDIO_CONTINUE skipped - page already mapped (EEXIST)"
+                    "UFFDIO_CONTINUE skipped - page already mapped (EEXIST), waking waiters"
                 );
+                // EEXIST proves the PTE is present — NOT that the faulter was woken. The
+                // kernel's check-then-sleep window lets a faulter enqueue AFTER the racing
+                // winner's wake scan, and userfaultfd(2) requires an explicit UFFDIO_WAKE
+                // here for exactly that case. Without it the faulter sleeps forever: the
+                // 4K-minor clone wedge (VMM device thread parked in handle_userfault,
+                // victim uffd fdinfo `pending:0 total:1`, whole virtio plane dead).
+                // A failed wake is the hang this arm exists to prevent — propagate it
+                // into the fail-closed kill path rather than logging and limping on.
+                uffd.wake(addr, remaining).map_err(|wake_error| {
+                    anyhow!(
+                        "UFFDIO_WAKE after EEXIST failed at 0x{:x}+{}: {:?} — a stranded \
+                         faulter would hang its thread permanently",
+                        page + done,
+                        remaining,
+                        wake_error
+                    )
+                })?;
                 // EEXIST refers to the granule at the current position; with per-granule
                 // requests that is the whole remaining range.
                 done += remaining;
@@ -3573,5 +3590,185 @@ mod tests {
             "the name must be reconstructible: clones derive it from the serve state file"
         );
         assert_eq!(a, Path::new("/data/uffd-snap-42-1000.sock"));
+    }
+
+    /// EEXIST from UFFDIO_CONTINUE proves the PTE is present — NOT that the faulter was
+    /// woken. The kernel's check-then-sleep window lets a faulter enqueue AFTER a racing
+    /// winner's wake scan, which is why userfaultfd(2) requires an explicit UFFDIO_WAKE
+    /// after EEXIST. This is the userspace half of the 4K-minor clone wedge: the VMM's
+    /// device thread parked forever in `handle_userfault`, the victim uffd's fdinfo
+    /// reading `pending:0 total:1` (one read-but-never-woken fault), the serve idle.
+    ///
+    /// Deterministic — no race roulette: the "winner" installs the PTE with wake=false
+    /// (a legal stand-in for a wake scan the sleeper missed), so the sleeping reader can
+    /// be released ONLY by `continue_page`'s EEXIST arm issuing the mandated wake.
+    #[test]
+    fn eexist_resolution_wakes_the_stranded_faulter() {
+        use std::os::unix::io::FromRawFd;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const PAGE: usize = 4096;
+        // Pinned from uapi/linux/userfaultfd.h: _IOWR(0xAA, 0x3F, uffdio_api) and
+        // _IOWR(0xAA, 0x00, uffdio_register); identical on x86_64 and aarch64.
+        const UFFDIO_API: libc::c_ulong = 0xc018_aa3f;
+        const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
+        const UFFD_FEATURE_MINOR_SHMEM: u64 = 1 << 10;
+        const UFFDIO_REGISTER_MODE_MINOR: u64 = 1 << 2;
+
+        #[repr(C)]
+        struct UffdioApi {
+            api: u64,
+            features: u64,
+            ioctls: u64,
+        }
+        #[repr(C)]
+        struct UffdioRange {
+            start: u64,
+            len: u64,
+        }
+        #[repr(C)]
+        struct UffdioRegister {
+            range: UffdioRange,
+            mode: u64,
+            ioctls: u64,
+        }
+
+        // The crate's builder cannot negotiate MINOR_SHMEM (no such FeatureFlag in 0.9),
+        // so the api/register handshake is raw; the fd then becomes an ordinary `Uffd`
+        // and `continue_page` runs exactly as production runs it. /dev/userfaultfd is a
+        // CONTROL device: the real uffd comes from its USERFAULTFD_IOC_NEW ioctl
+        // (_IO(0xAA, 0x00)), with the O_* flags as the ioctl argument.
+        const USERFAULTFD_IOC_NEW: libc::c_ulong = 0xAA00;
+        let dev = unsafe { libc::open(c"/dev/userfaultfd".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        assert!(
+            dev >= 0,
+            "open /dev/userfaultfd: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: valid control fd; IOC_NEW returns a fresh uffd fd.
+        let raw = unsafe {
+            libc::ioctl(
+                dev,
+                USERFAULTFD_IOC_NEW,
+                libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        assert!(
+            raw >= 0,
+            "USERFAULTFD_IOC_NEW: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: closing the control fd; the created uffd is independent of it.
+        unsafe { libc::close(dev) };
+        let mut api = UffdioApi {
+            api: 0xAA,
+            features: UFFD_FEATURE_MINOR_SHMEM,
+            ioctls: 0,
+        };
+        // SAFETY: valid fd, matching pinned request/struct pair.
+        let rc = unsafe { libc::ioctl(raw, UFFDIO_API, &mut api) };
+        assert_eq!(
+            rc,
+            0,
+            "UFFDIO_API(MINOR_SHMEM): {}",
+            std::io::Error::last_os_error()
+        );
+
+        // One-page memfd whose page is RESIDENT: minor faults require page-in-cache.
+        let memfd = unsafe { libc::memfd_create(c"eexist-wake".as_ptr(), 0) };
+        assert!(memfd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(memfd, PAGE as libc::off_t) }, 0);
+        // SAFETY: fresh shared mapping of the memfd, written then unmapped.
+        unsafe {
+            let shared = libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                memfd,
+                0,
+            );
+            assert_ne!(shared, libc::MAP_FAILED);
+            std::ptr::write_volatile(shared as *mut u8, 0x5A);
+            libc::munmap(shared, PAGE);
+        }
+
+        // SAFETY: fresh private mapping of the same memfd.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                memfd,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let mut reg = UffdioRegister {
+            range: UffdioRange {
+                start: base as u64,
+                len: PAGE as u64,
+            },
+            mode: UFFDIO_REGISTER_MODE_MINOR,
+            ioctls: 0,
+        };
+        // SAFETY: valid fd, matching pinned request/struct pair.
+        let rc = unsafe { libc::ioctl(raw, UFFDIO_REGISTER, &mut reg) };
+        assert_eq!(
+            rc,
+            0,
+            "UFFDIO_REGISTER(MINOR): {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a live uffd whose API handshake just succeeded.
+        let uffd = unsafe { Uffd::from_raw_fd(raw) };
+
+        let addr = base as usize;
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            // Minor-faults (page resident, PTE absent) and sleeps until woken.
+            // SAFETY: addr is a live registered mapping for the test's lifetime.
+            let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
+            tx.send(got).ok();
+        });
+
+        let mut pfd = libc::pollfd {
+            fd: uffd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised pollfd, owned fd.
+        assert!(
+            unsafe { libc::poll(&mut pfd, 1, 5000) } > 0,
+            "no fault event within 5s"
+        );
+        match uffd.read_event() {
+            Ok(Some(userfaultfd::Event::Pagefault { .. })) => {}
+            other => panic!("expected the reader's pagefault event, got {other:?}"),
+        }
+
+        // The racing winner: installs the PTE with NO wake. The fault event is already
+        // consumed above, so nothing else will ever wake the reader.
+        uffd.r#continue(base, PAGE, false)
+            .expect("winner's CONTINUE must succeed");
+
+        // The handler under test answers the consumed fault: it must see EEXIST and wake.
+        let outcome =
+            continue_page(&uffd, "eexist-wake-test", addr, PAGE).expect("continue_page");
+        assert!(matches!(outcome, ContinueOutcome::Resolved));
+
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "faulter still asleep after EEXIST resolution — continue_page must UFFDIO_WAKE \
+             the granule (userfaultfd(2) EEXIST contract); this is the 4K clone wedge",
+        );
+        assert_eq!(got, 0x5A, "reader must observe the resident page's bytes");
+        reader.join().expect("reader thread");
+        // SAFETY: unmapping our own mapping; memfd close releases the file.
+        unsafe {
+            libc::munmap(base, PAGE);
+            libc::close(memfd);
+        }
     }
 }
