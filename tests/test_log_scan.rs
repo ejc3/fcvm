@@ -204,10 +204,16 @@ fn unresolved_review_threads_block_the_merge() {
 }
 
 /// The counterpart: the gate must be able to pass, or it is just a wall.
+/// "Fully resolved" now means resolved AND dispositioned — the fixture's
+/// thread carries a NOT-A-DEFECT reply, since resolution alone stopped
+/// being sufficient when every resolved thread began requiring an answer.
 #[test]
 fn a_fully_resolved_pr_passes_the_gate() {
     let (out, code) = run_threads("review-threads-clear.json");
-    assert_eq!(code, 0, "an all-resolved PR must pass:\n{out}");
+    assert_eq!(
+        code, 0,
+        "an all-resolved, dispositioned PR must pass:\n{out}"
+    );
     assert!(out.contains("CLEAR"), "{out}");
 }
 
@@ -221,7 +227,11 @@ fn a_resolved_defect_claim_without_a_red_test_blocks_the_merge() {
         "a resolved thread describing a panic, with no RED-VERIFIED reply, must \
          block — otherwise a defect is closed by assertion.\n{out}"
     );
-    assert!(out.contains("UNPROVEN"), "{out}");
+    // The gate names the missing thing rather than guessing whether the
+    // finding was defect-shaped: the regex that used to decide that failed
+    // both ways (AGENTS.md), so an undispositioned resolved thread blocks
+    // whatever it says.
+    assert!(out.contains("carry no disposition reply"), "{out}");
 }
 
 /// ...and citing the test clears it, so the rule is satisfiable.
@@ -356,7 +366,7 @@ fn a_defect_report_cannot_serve_as_its_own_red_verification() {
         "a lone defect comment containing the marker must NOT count as proof — the \
          evidence has to come from a reply.\n{out}"
     );
-    assert!(out.contains("UNPROVEN"), "{out}");
+    assert!(out.contains("carry no disposition reply"), "{out}");
 }
 
 /// The run's OWN summary is authoritative — counting per-test lines is not enough.
