@@ -665,8 +665,16 @@ cmd_verify() {
     local fail=0
     # A rebooted or pool-shrunk box re-runs verify against a persisted huge
     # golden with an empty pool; grow it here, not only at golden time.
-    if [ "$(hugepage_snapshot_state)" = huge ]; then
-        ensure_hugepage_pool || return 1
+    # unknown refuses: jq missing or an unreadable config would otherwise
+    # skip provisioning fail-OPEN and die mid-serve instead.
+    local huge_state
+    huge_state=$(hugepage_snapshot_state)
+    if [ "$huge_state" = unknown ]; then
+        log "verify: cannot determine hugepage state for '$TAG' (config.json unreadable or jq missing)"
+        return 1
+    fi
+    if [ "$huge_state" = huge ]; then
+        ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
     fi
     log "verify: starting serve for $TAG"
     local sf="$RESULTS/logs/verify-serve.log"
@@ -803,18 +811,36 @@ hugepage_snapshot_state() {
 # quietly starting on a starved pool would die mid-measurement, or worse,
 # measure a mixed-page configuration.
 ensure_hugepage_pool() {
-    local per_vm=$((MEM / 2)) need cur
-    need=$((per_vm * 4))
+    # $1: guest MiB to size for (defaults to $MEM). Measured phases pass the
+    # SNAPSHOT's recorded memory_mib — sizing from the caller's ambient MEM
+    # under-provisions when a big golden is verified with default knobs.
+    local mem="${1:-$MEM}" need cur
+    if [ $((mem % 2)) -ne 0 ]; then
+        # fcvm rejects odd MEM too, but only AFTER we would have reserved
+        # gigabytes of pool for an invocation that can never boot.
+        log "hugepages: MEM=${mem} is not divisible by 2 (2MB pages)"
+        return 1
+    fi
+    need=$(( (mem / 2) * 4 ))
     cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
     if [ "$cur" -lt "$need" ]; then
-        log "hugepages: growing pool $cur -> $need (MEM=${MEM}MiB x4)"
-        sudo sh -c "echo $need > '$HUGEPAGE_POOL_FILE'"
+        log "hugepages: growing pool $cur -> $need (${mem}MiB guest x4)"
+        sudo sh -c 'echo "$1" > "$2"' _ "$need" "$HUGEPAGE_POOL_FILE"
         cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
         if [ "$cur" -lt "$need" ]; then
             log "hugepages: pool only $cur/$need pages (fragmentation?)"
             return 1
         fi
     fi
+}
+
+# The installed snapshot's guest size; falls back to ambient MEM when the
+# config predates the field.
+snapshot_memory_mib() {
+    local v
+    v=$($SUDO jq -er '.metadata.memory_mib' \
+        "$DATA_ROOT/snapshots/$TAG/config.json" 2>/dev/null) || v="$MEM"
+    echo "$v"
 }
 
 cmd_run() {
@@ -830,7 +856,7 @@ cmd_run() {
         return 2
     fi
     if [ "$huge_state" = huge ]; then
-        ensure_hugepage_pool || return 1
+        ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
     fi
     local guard_rc=0
     guard_quiet || guard_rc=$?

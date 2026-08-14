@@ -425,7 +425,7 @@ then on "Custom firecracker not found", because a hand-rolled runner called
   (the golden grows the pool to 2048x2MB pages and fails closed if the
   kernel cannot deliver them).
 - Quiet-box gates: `run` refuses when 1-min load exceeds 2.0 or stray
-  fcvm/firecracker processes exist (hostcdp and faultbench refuse above 1.0).
+  fcvm/firecracker processes exist (hostcdp refuses at >= 1.0, faultbench above 1.0).
   Do not start builds — or ANY box-local work, including analysis scripts and
   background agents — while a measured run is in flight; the noop drift gate
   catches the contamination and voids the run (burned twice, 2026-08-13).

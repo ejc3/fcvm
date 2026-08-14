@@ -5367,9 +5367,19 @@ class MakefileBenchGraph(unittest.TestCase):
         # fails immediately after the workflow that creates its own
         # prerequisite (codex P1, 2026-08-14).
         recipe = "\n".join(self.recipes.get("bench-chromium-fault", []))
-        self.assertIn("nr_hugepages", recipe,
-                      "bench-chromium-fault recipe does not provision the "
-                      "hugepage pool its default cell matrix needs")
+        # Three reads of the knob: current-value cat, the grow write, and
+        # the POST-WRITE reread. Linux accepts the write even when
+        # fragmentation delivers fewer pages, so a recipe that never
+        # rereads reports a pool it does not have (codex round 2).
+        self.assertGreaterEqual(recipe.count("nr_hugepages"), 3,
+                                "fault recipe must reread the pool "
+                                "after growing it")
+        self.assertIn("ERROR", recipe,
+                      "short delivery must fail the target")
+        # Growth is gated on the huge golden existing: a file-4k-only
+        # run must not reserve gigabytes it will never touch.
+        self.assertIn("cb-golden-huge", recipe,
+                      "pool growth must be gated on the huge golden")
 
     def test_run_help_documents_tag(self):
         # Following the documented huge flow without TAG= on the run line
@@ -5420,7 +5430,8 @@ class HugepageGuards(unittest.TestCase):
         snapdir = os.path.join(d, "data", "snapshots", "tag-under-test")
         os.makedirs(snapdir)
         with open(os.path.join(snapdir, "config.json"), "w") as f:
-            f.write('{"metadata": {"hugepages": %s}}' % hugepages)
+            f.write('{"metadata": {"hugepages": %s, "memory_mib": 4096}}'
+                    % hugepages)
         pool = os.path.join(d, "nr_hugepages")
         with open(pool, "w") as f:
             f.write("100\n")
@@ -5460,10 +5471,10 @@ class HugepageGuards(unittest.TestCase):
         # sudo "succeeds" but the write never lands (the kernel could not
         # deliver contiguous pages): the phase must stop, not measure a
         # hugepage cell on a starved pool.
-        r, _ = self._bash(
-            'cp "$HUGEPAGE_POOL_FILE" /tmp/keep-$$; '
-            'sudo() { :; }; ensure_hugepage_pool')
+        r, _ = self._bash('sudo() { :; }; ensure_hugepage_pool')
         self.assertNotEqual(r.returncode, 0)
+        self.assertIn("pool only", r.stdout + r.stderr,
+                      "must fail via the reread check, not incidentally")
 
     def test_snapshot_state_reads_metadata(self):
         for js, want in (("true", "huge"), ("false", "normal")):
@@ -5476,3 +5487,44 @@ class HugepageGuards(unittest.TestCase):
         r, _ = self._bash("BACKEND=file cmd_run")
         self.assertEqual(r.returncode, 2, f"stdout={r.stdout} stderr={r.stderr}")
         self.assertIn("BACKEND=uffd", r.stdout + r.stderr)
+
+
+class HugepageGuardsRound2(unittest.TestCase):
+    """Second codex round on the hugepage guards.
+
+    Watched red 2026-08-14 before the fix: `snapshot_memory_mib` did not
+    exist; `ensure_hugepage_pool` accepted odd MEM (2051 -> grew the pool,
+    exit 0) and sized from ambient MEM rather than the snapshot's recorded
+    memory_mib; `cmd_verify` treated unknown hugepage state as non-huge and
+    sailed on toward serve (fail-open when jq or the config is missing).
+    """
+
+    SH = HugepageGuards.SH
+    _bash = HugepageGuards._bash
+
+    def test_pool_sizes_from_snapshot_memory(self):
+        # The fixture snapshot records memory_mib=4096: verify/run must size
+        # from THAT, not from the caller's ambient MEM (default 1024) — an
+        # 8 GiB golden verified after a reboot would otherwise provision a
+        # quarter of what the first clone needs.
+        r, pool = self._bash(
+            'ensure_hugepage_pool "$(snapshot_memory_mib)"')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(open(pool).read().strip(), "8192")
+
+    def test_pool_rejects_odd_mem(self):
+        r, pool = self._bash( "ensure_hugepage_pool",
+                                   {"MEM": "2051"})
+        self.assertNotEqual(r.returncode, 0,
+                            "odd MEM must fail before touching the pool "
+                            "(fcvm rejects it AFTER we would have reserved "
+                            "gigabytes)")
+        self.assertEqual(open(pool).read().strip(), "100",
+                         "pool must be untouched on rejection")
+
+    def test_verify_fails_closed_on_unknown_state(self):
+        # jq missing / config unreadable => unknown. Proceeding as if
+        # non-huge is exactly the fail-open shape this repo bans.
+        r, _ = self._bash( "TAG=missing-tag cmd_verify")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("hugepage state", r.stdout + r.stderr)
