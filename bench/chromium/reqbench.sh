@@ -831,9 +831,14 @@ ensure_hugepage_pool() {
     # than hanging behind a stuck owner.
     local wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
     local pool_lock="$DATA_ROOT/hugepage-pool.lock"
+    mkdir -p "$DATA_ROOT" 2>/dev/null || true
     touch "$pool_lock" 2>/dev/null || true
     if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
-        exec {REQBENCH_POOL_LOCK_FD}<>"$pool_lock"
+        exec {REQBENCH_POOL_LOCK_FD}<>"$pool_lock" || true
+    fi
+    if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
+        log "hugepages: pool lock unavailable at $pool_lock"
+        return 1
     fi
     if ! flock -s -w "$wait_s" "$REQBENCH_POOL_LOCK_FD"; then
         log "hugepages: pool lock busy for ${wait_s}s; refusing to race the owner"
@@ -870,9 +875,14 @@ ensure_hugepage_pool() {
 # PR #815): fcvm snapshot create/delete take this lock exclusive.
 acquire_generation_lock() {
     local gen_lock="$DATA_ROOT/snapshots/$TAG.lock"
+    mkdir -p "$(dirname "$gen_lock")" 2>/dev/null || true
     touch "$gen_lock" 2>/dev/null || true
     if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
-        exec {REQBENCH_GEN_LOCK_FD}<>"$gen_lock"
+        exec {REQBENCH_GEN_LOCK_FD}<>"$gen_lock" || true
+    fi
+    if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
+        log "generation lock unavailable at $gen_lock"
+        return 1
     fi
     if ! flock -s -w "${HUGEPAGE_POOL_LOCK_WAIT:-60}" "$REQBENCH_GEN_LOCK_FD"; then
         log "generation lock busy for '$TAG'; refusing to classify a moving target"
