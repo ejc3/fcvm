@@ -5593,9 +5593,9 @@ class SnapshotLockHeldAcrossRun(unittest.TestCase):
 class ExecArmIsOptional(unittest.TestCase):
     """The retired exec arm must not be REQUIRED for publication.
 
-    Watched red 2026-08-14: both assertions failed with "publication runs
-    require exec, noop, and at least one CDP arm" (driver) and "publication
-    schedule requires exec, noop, and a CDP arm" (analyzer). The measured
+    Red/green evidence is recorded per test (the first driver version was
+    vacuous — it exited at backend selection before the arm check; codex
+    caught it on #816 and the rewrite below drives the real main). The measured
     justification for making exec optional, from run
     reqbench-20260814-022254-uffd: 95% of noop reps that FOLLOW an exec rep
     land in a +17 ms slow mode (59/62), vs 15% after cdp-fast — the in-guest
@@ -5608,21 +5608,139 @@ class ExecArmIsOptional(unittest.TestCase):
     """
 
     def test_driver_accepts_publication_arms_without_exec(self):
-        import io as _io
-        from contextlib import redirect_stderr
-        argv = sys.argv
-        sys.argv = ["reqbench.py", "--url", "http://x/", "--out-dir", "/tmp",
-                    "--arms", "noop,cdp"]
-        err = _io.StringIO()
-        try:
-            with self.assertRaises(SystemExit):
-                with redirect_stderr(err), redirect_stdout(io.StringIO()):
-                    reqbench.main()
-        finally:
-            sys.argv = argv
-        # It still exits (no backend selected), but must get PAST the arm
-        # check: the arm-requirement error must not be the reason.
-        self.assertNotIn("require exec", err.getvalue())
+        """Drive the real main() to completion with --arms noop,cdp-fast.
+
+        The earlier version of this test exited at the backend-selection
+        check (no --serve-pid/--snapshot-tag) and never reached the arm
+        validation it claimed to cover, so restoring the old exec
+        requirement left it green (found by codex review on #816). This
+        version reaches the full schedule. Watched red 2026-08-14 with the
+        exec-requirement hunk reverse-applied: SystemExit(2) from p.error
+        "publication runs require exec, noop, and at least one CDP arm" —
+        the exact check under test — then green again with it restored.
+        """
+        with tempfile.TemporaryDirectory() as data_root:
+            SnapshotGenerationIdentity._write_generation(
+                data_root, "22222222-2222-4222-8222-222222222222",
+            )
+            snapshot = SnapshotGenerationIdentity.SNAPSHOT
+            runtime_bundle = os.path.join(data_root, "runtime")
+            os.makedirs(runtime_bundle)
+            manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+            with open(manifest_path, "w") as target:
+                target.write("sealed runtime fixture\n")
+            fcvm = os.path.join(runtime_bundle, "fcvm")
+            with open(fcvm, "w") as target:
+                target.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fcvm, 0o755)
+
+            def record(arm, rep):
+                return {
+                    "arm": arm,
+                    "rep": rep,
+                    "ok": True,
+                    "blocking_ms": 1.0,
+                    "wall_ms": 1.0,
+                    "teardown": {},
+                }
+
+            def run_exec(_args, rep):
+                raise AssertionError(
+                    "exec arm ran despite --arms noop,cdp-fast",
+                )
+
+            def run_noop(_args, rep):
+                return record("noop", rep)
+
+            def run_cdp(_args, rep, fast, probe=None):
+                return record("cdp-fast" if fast else "cdp", rep)
+
+            saved = {
+                "HERE": reqbench.HERE,
+                "run_exec_request": reqbench.run_exec_request,
+                "run_noop_request": reqbench.run_noop_request,
+                "run_cdp_request": reqbench.run_cdp_request,
+                "sha256_file": reqbench.sha256_file,
+                "harness_sha256": reqbench.harness_sha256,
+                "command_text": reqbench.command_text,
+                "pending_signal": reqbench._pending_harness_signal,
+                "argv": sys.argv,
+                "sigint": signal.getsignal(signal.SIGINT),
+                "sigterm": signal.getsignal(signal.SIGTERM),
+            }
+            env_updates = {
+                "REQBENCH_RUNTIME_BUNDLE": runtime_bundle,
+                "REQBENCH_SOURCE_REVISION": "e" * 40,
+                "REQBENCH_GUARD_LOADAVG1": "0.1",
+                "REQBENCH_GUARD_VM_PROCESSES": "0",
+                "REQBENCH_QUIET_LOADAVG1_LIMIT": "2.0",
+                "REQBENCH_QUIET_GUARD": "1",
+                "ALLOW_BUSY": "0",
+            }
+            saved_env = {key: os.environ.get(key) for key in env_updates}
+            out_dir = os.path.join(data_root, "results")
+            exact_hashes = {
+                os.path.realpath(fcvm): "c" * 64,
+                os.path.realpath(manifest_path): "d" * 64,
+            }
+            rc = None
+            try:
+                os.environ.update(env_updates)
+                reqbench.HERE = runtime_bundle
+                reqbench.run_exec_request = run_exec
+                reqbench.run_noop_request = run_noop
+                reqbench.run_cdp_request = run_cdp
+                reqbench.sha256_file = (
+                    lambda path: exact_hashes[os.path.realpath(path)]
+                )
+                reqbench.harness_sha256 = lambda: "f" * 64
+                reqbench.command_text = lambda _argv: "fcvm fixture"
+                reqbench._pending_harness_signal = 0
+                sys.argv = [
+                    "reqbench.py",
+                    "--snapshot-tag", snapshot,
+                    "--snapshot-name", snapshot,
+                    "--url", "http://fixture/medium.html",
+                    "--arms", "noop,cdp-fast",
+                    "--reps", "1",
+                    "--warmup", "0",
+                    "--image", "localhost/chromium-bench-req",
+                    "--image-id", "sha256:" + "b" * 64,
+                    "--network-mode", "rootless",
+                    "--cpu", "2",
+                    "--memory-mib", "1024",
+                    "--fcvm", fcvm,
+                    "--data-root", data_root,
+                    "--out-dir", out_dir,
+                    "--run-id", "2" * 32,
+                ]
+                rc = reqbench.main()
+            finally:
+                reqbench.HERE = saved["HERE"]
+                reqbench.run_exec_request = saved["run_exec_request"]
+                reqbench.run_noop_request = saved["run_noop_request"]
+                reqbench.run_cdp_request = saved["run_cdp_request"]
+                reqbench.sha256_file = saved["sha256_file"]
+                reqbench.harness_sha256 = saved["harness_sha256"]
+                reqbench.command_text = saved["command_text"]
+                reqbench._pending_harness_signal = saved["pending_signal"]
+                sys.argv = saved["argv"]
+                signal.signal(signal.SIGINT, saved["sigint"])
+                signal.signal(signal.SIGTERM, saved["sigterm"])
+                for key, value in saved_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out_dir, "reqbench.jsonl")) as source:
+                records = [json.loads(line) for line in source]
+            self.assertEqual(records[0]["kind"], "meta")
+            self.assertEqual(
+                {row["arm"] for row in records[1:]},
+                {"cdp-fast", "noop"},
+            )
 
     def test_analyzer_accepts_schedule_without_exec(self):
         dataset = {
