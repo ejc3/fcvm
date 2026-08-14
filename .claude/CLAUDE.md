@@ -122,6 +122,19 @@ Three rules the gate enforces, each of them a hole it once had:
   or a plain top-level PR comment (`gh pr comment`). The last of those was invisible to the
   gate for a while, which meant a claim posted exactly the way the docs suggested could sit
   on a PR reporting CLEAR.
+- **But not everything is a claim.** The PR author's own words, and a bot's top-level
+  notification, are not findings. Treating every non-empty body as one blocked PRs that had
+  no findings at all — including on `@codex review`, the command the docs tell you to post.
+- **The head commit must have been reviewed.** Answering every finding proves nothing if
+  nobody reviewed the code you are merging. This gate shipped with five open findings that
+  way: the branch was pushed, the prior round was answered, the gate went CLEAR, and it
+  merged 36 seconds later while the reviewer was still working. Nothing was bypassed — the
+  gate simply had no notion of review *coverage*.
+
+A rule was also **withdrawn**: requiring the disposition to be the last word in a thread.
+It could not distinguish a new defect claim from "Thanks, confirmed", so it blocked
+adjudicated threads. It traded a rare fail-open for a routine fail-closed, and a gate that
+cries wolf on ordinary conversation gets switched off — after which it catches nothing.
 
 Earlier versions also guessed which findings were defects from a `panic|crash|leak|...` regex.
 That failed BOTH ways: "this drops the final game from the schedule" matched nothing and closed

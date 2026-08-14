@@ -127,13 +127,11 @@ n+=[{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: leak.te
 print(json.dumps([{"isResolved":True,"comments":{"nodes":n,"totalCount":len(n)}}]))')
 run_case "RED-VERIFIED after 100+ comments is found" "$(wrap "$long")" 0 "CLEAR"
 
-echo "== finding 12: a disposition must answer the LAST outstanding comment =="
-# An early disposition used to certify a thread where someone later raised a new defect.
-run_case "new claim after the disposition blocks" \
-  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this drops a record"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: a.test.ts"},{"author":{"login":"x"},"path":"a.ts","line":1,"body":"and it also double-counts on retry"}]}}]')" \
-  1 "BLOCKED"
-run_case "re-disposing the later claim clears" \
-  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this drops a record"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: a.test.ts"},{"author":{"login":"x"},"path":"a.ts","line":1,"body":"and it also double-counts on retry"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: b.test.ts"}]}}]')" \
+echo "== finding 14: ordinary chatter after a disposition must NOT re-block =="
+# A positional "the disposition must be last" rule was tried and withdrawn: it could not
+# tell a new defect claim from "Thanks, confirmed", so it blocked adjudicated threads.
+run_case "reviewer confirmation after a disposition clears" \
+  "$(wrap '[{"isResolved":true,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"this drops a record"},{"author":{"login":"y"},"path":"a.ts","line":1,"body":"RED-VERIFIED: a.test.ts"},{"author":{"login":"x"},"path":"a.ts","line":1,"body":"Thanks, confirmed."}]}}]')" \
   0 "CLEAR"
 
 echo "== finding 13: findings in top-level PR comments count too =="
@@ -149,6 +147,33 @@ run_case "a PR comment can answer a review body" \
   0 "CLEAR"
 run_case "malformed PR comment data exits 2" \
   "$(wrap3 '[]' '[]' '"nonsense"')" 2 "BLOCKED"
+
+echo "== finding 15: only real claimants raise PR-level claims =="
+wrap4() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"%s"},"reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "$2" "${3:-[]}" "${4:-[]}"; }
+# The command this skill documents — posted by the PR author — is not a finding.
+run_case "author's own @codex review comment does not block" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"me","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"@codex review"}]')" \
+  0 "CLEAR"
+run_case "deploy bot notification does not block" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"vercel","__typename":"Bot"},"createdAt":"2026-01-01T00:00:00Z","body":"Deployment ready at https://preview.example"}]')" \
+  0 "CLEAR"
+run_case "a human finding in a top-level comment still blocks" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"reviewer","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  1 "BLOCKED"
+run_case "a bot REVIEW body still blocks" \
+  "$(wrap4 me '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]' '[]')" \
+  1 "BLOCKED"
+
+echo "== finding 16: the head commit must actually have been reviewed =="
+wrap5() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"%s","reviewThreads":{"nodes":[]},"reviews":{"nodes":%s},"comments":{"nodes":[]}}}}}' "$1" "$2"; }
+run_case "reviews exist but none cover the head blocks" \
+  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]')" \
+  1 "UNREVIEWED HEAD"
+run_case "a review covering the head clears" \
+  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]')" \
+  0 "CLEAR"
+run_case "no reviews at all is not this check's business" \
+  "$(wrap5 deadbeef '[]')" 0 "CLEAR"
 
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \

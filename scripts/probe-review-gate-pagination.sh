@@ -56,7 +56,7 @@ cleanup() {
   if [ -n "$START_BRANCH" ]; then git checkout -q "$START_BRANCH" 2>/dev/null
   else git checkout -q --detach "$START_COMMIT" 2>/dev/null; fi
   git branch -qD "$BRANCH" 2>/dev/null
-  rm -f "${GATE_SNAPSHOT:-}" /tmp/gate.A.firstonly.sh /tmp/gate.D.reviewsfirst.sh
+  [ -n "${WORK:-}" ] && rm -rf "$WORK"
 }
 die() { echo "PROBE ABORTED: $*" >&2; exit 1; }
 trap cleanup EXIT
@@ -64,18 +64,23 @@ trap cleanup EXIT
 # Copy the shipping gate somewhere stable BEFORE any checkout. Run from the PR that
 # introduces or edits this skill, `git checkout origin/main` removes $GATE from the working
 # tree, and the verification this script advertises cannot run at all.
-GATE_SNAPSHOT=$(mktemp)
+# Everything generated lives in one per-invocation directory. Fixed /tmp/gate.*.sh paths
+# meant two concurrent probes overwrote and then deleted each other's comparison scripts
+# between generation and execution — the unique branch name fixed the git collision but not
+# this one.
+WORK=$(mktemp -d)
+GATE_SNAPSHOT="$WORK/gate.shipping.sh"
 cp "$GATE" "$GATE_SNAPSHOT" || die "could not snapshot the gate"
 GATE="$GATE_SNAPSHOT"
 
-python3 - "$GATE" <<'PY' || die "could not build comparison gates"
+python3 - "$GATE" "$WORK" <<'PY' || die "could not build comparison gates"
 import sys
 s = open(sys.argv[1]).read()
 
 # A: never page past the first page.
 a = s.replace("for tid in $oversized; do", "for tid in ; do", 1)
 assert a != s, "paging loop not found"
-open("/tmp/gate.A.firstonly.sh", "w").write(a)
+open(sys.argv[2] + "/gate.A.firstonly.sh", "w").write(a)
 
 PY
 
@@ -124,7 +129,10 @@ echo
 rc_all=0
 check() { # name, gate, expected exit
   local out rc
-  out=$(COMMENTS_PAGE_SIZE=1 REVIEWS_PAGE_SIZE=1 bash "$2" "$PRNUM" 2>&1); rc=$?
+  # Pass the repo through. Without it the gate falls back to its compiled-in default, so a
+  # probe run from a fork evaluated the same PR NUMBER in an unrelated repository.
+  out=$(COMMENTS_PAGE_SIZE=1 REVIEWS_PAGE_SIZE=1 REPO_OWNER="$OWNER" REPO_NAME="$NAME" \
+        REQUIRE_REVIEWED_HEAD=0 bash "$2" "$PRNUM" 2>&1); rc=$?
   printf '  %-26s exit=%s ' "$1" "$rc"
   if [ "$rc" = "$3" ]; then echo "PASS"; else echo "FAIL (want $3)"; rc_all=1; fi
 }
@@ -134,7 +142,7 @@ check() { # name, gate, expected exit
 # a check comparing them could never fail. That is the trap this whole suite exists to
 # avoid, so it is documented rather than kept as a green-forever test.
 echo "comment paging — finding, filler, then the disposition last:"
-check "A first page only"    /tmp/gate.A.firstonly.sh 1
+check "A first page only"    "$WORK/gate.A.firstonly.sh" 1
 check "C full cursor paging" "$GATE"                  0
 
 # The reviews connection is separate and pages separately. Post a defect claim as a REVIEW
@@ -145,15 +153,25 @@ echo "reviews paging — unanswered claim in a review body on page 2:"
 gh pr review "$PRNUM" --repo "$REPO" --comment \
   -b "P1 probe finding posted in a REVIEW BODY, deliberately left unanswered." >/dev/null \
   || die "review body"
-python3 - "$GATE" <<'PY' || die "could not build reviews variant"
+python3 - "$GATE" "$WORK" <<'PY' || die "could not build reviews variant"
 import sys
 s = open(sys.argv[1]).read()
 old = """    [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break"""
 assert old in s, "reviews paging break not found"
-open("/tmp/gate.D.reviewsfirst.sh", "w").write(s.replace(old, "    break", 1))
+open(sys.argv[2] + "/gate.D.reviewsfirst.sh", "w").write(s.replace(old, "    break", 1))
 PY
-check "D reviews unpaged"    /tmp/gate.D.reviewsfirst.sh 0
-check "E reviews paged"      "$GATE"                     1
+# Compare what each gate FETCHED, not what it concluded. With REVIEWS_PAGE_SIZE=1 an
+# unpaged gate stops after one review; a paged one collects them all.
+rcount() {
+  COMMENTS_PAGE_SIZE=1 REVIEWS_PAGE_SIZE=1 REPO_OWNER="$OWNER" REPO_NAME="$NAME" \
+  REQUIRE_REVIEWED_HEAD=0 GATE_DEBUG_COUNTS=1 bash "$1" "$PRNUM" 2>/dev/null \
+    | grep -oE 'reviews=[0-9]+' | cut -d= -f2
+}
+D=$(rcount "$WORK/gate.D.reviewsfirst.sh"); E=$(rcount "$GATE")
+printf '  %-26s reviews fetched=%s ' "D reviews unpaged" "${D:-?}"
+[ "${D:-0}" = "1" ] && echo "PASS" || { echo "FAIL (want 1)"; rc_all=1; }
+printf '  %-26s reviews fetched=%s ' "E reviews paged" "${E:-?}"
+[ "${E:-0}" -gt 1 ] 2>/dev/null && echo "PASS" || { echo "FAIL (want >1)"; rc_all=1; }
 
 echo
 [ "$rc_all" = 0 ] \

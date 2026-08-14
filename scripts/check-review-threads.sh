@@ -51,7 +51,7 @@ COMMENTS_PAGE_SIZE=${COMMENTS_PAGE_SIZE:-100}
 REVIEWS_PAGE_SIZE=${REVIEWS_PAGE_SIZE:-100}
 
 fetch_payload() {
-  local pr=$1 cursor=null threads='[]' reviews='[]' prcomments='[]'
+  local pr=$1 cursor=null threads='[]' reviews='[]' prcomments='[]' prauthor='' headoid=''
 
   # Reviews are their OWN connection and must be paged on their OWN cursor. They used to
   # ride along inside the reviewThreads loop, which was wrong twice over: past 100 reviews
@@ -64,9 +64,11 @@ fetch_payload() {
     rresp=$(gh api graphql -f query="
       { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
           pullRequest(number: $pr) {
+            author { login }
+            headRefOid
             reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login } state body submittedAt }
+              nodes { author { login } state body submittedAt commit { oid } }
             } } } }" 2>/dev/null) || return 1
     if [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$rresp")" = "null" ]; then
       echo "verdict: BLOCKED — no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is" >&2
@@ -75,6 +77,8 @@ fetch_payload() {
     fi
     reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
           <(echo "$reviews") <(echo "$rresp"))
+    prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$rresp")
+    headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$rresp")
     [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
     rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
   done
@@ -91,7 +95,7 @@ fetch_payload() {
           pullRequest(number: $pr) {
             comments(first: $REVIEWS_PAGE_SIZE$cafter) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login } body createdAt }
+              nodes { author { login __typename } body createdAt }
             } } } }" 2>/dev/null) || return 1
     prcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
           <(echo "$prcomments") <(echo "$cresp2"))
@@ -179,7 +183,9 @@ fetch_payload() {
   done
 
   jq -n --argjson t "$threads" --argjson r "$reviews" --argjson c "$prcomments" \
-     '{data:{repository:{pullRequest:{reviewThreads:{nodes:$t}, reviews:{nodes:$r},
+        --arg a "$prauthor" --arg h "$headoid" \
+     '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
+                                      reviewThreads:{nodes:$t}, reviews:{nodes:$r},
                                       comments:{nodes:$c}}}}}'
 }
 
@@ -247,10 +253,32 @@ fi
 # Reviews and top-level comments are two containers for the same thing: a PR-level
 # statement. Judge them as one list, so an answer posted either way settles a claim posted
 # either way. `at` normalises submittedAt/createdAt.
-bodies=$(jq -s '(.[0] | map({author, state, body, at: .submittedAt}))
-              + (.[1] | map({author, state: "COMMENT", body, at: .createdAt}))' \
+#
+# `claimable` is the part that took two tries. Treating EVERY non-empty body as an
+# outstanding claim blocked PRs that had no findings at all: `gh pr comment --body "@codex
+# review"` — the command this skill's own docs tell you to run — became an unanswered
+# claim, as did deploy notifications and approval chatter. A gate that blocks on ordinary
+# conversation is a gate people switch off. Two exclusions, neither of them a guess about
+# what a finding looks like:
+#   - the PR AUTHOR's own words are never a claim against themselves;
+#   - a Bot's TOP-LEVEL comment is a notification, not a review finding.
+# Bot REVIEWS still count in full: Codex reviews as an App, and its review bodies are
+# exactly what this check exists to catch.
+prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
+bodies=$(jq -s --arg me "$prauthor" \
+   '(.[0] | map({author, state, body, at: .submittedAt, claimable: (.author.login != $me)}))
+  + (.[1] | map({author, state: "COMMENT", body, at: .createdAt,
+                 claimable: (.author.login != $me and (.author.__typename // "User") != "Bot")}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
+
+# Observability seam for the probe. Paging is about what was FETCHED, and the verdict is a
+# poor proxy for that — the probe authors everything it posts, and the author-exclusion rule
+# above means it cannot manufacture a PR-level claim to swing the verdict with. Counting the
+# fetch directly tests the thing, without a flag that disables any rule.
+if [ "${GATE_DEBUG_COUNTS:-0}" = "1" ]; then
+  echo "fetched: threads=$(jq 'length' <<<"$threads") reviews=$(jq 'length' <<<"$reviews") prcomments=$(jq 'length' <<<"$prcomments")"
+fi
 
 total=$(jq 'length' <<<"$threads")
 unresolved=$(jq '[.[] | select(.isResolved == false)] | length' <<<"$threads")
@@ -293,25 +321,27 @@ disposition_re='\A[[:space:]]*(RED-VERIFIED|NOT-A-DEFECT|DISAGREE):[[:space:]]*[
 
 # No `|| echo 0` here or below. That fallback is how a jq failure became "nothing to
 # answer" — the gate reporting CLEAR precisely because it could not evaluate.
-# The disposition must also come AFTER the last outstanding comment. Merely requiring one
-# to EXIST let an early answer certify a thread where someone later raised a new defect and
-# nobody responded — the inline twin of the review-body ordering bug. Comment order is
-# positional (pages append in order), so no timestamps are needed: the index of the newest
-# disposition must exceed the index of the newest non-disposition comment.
+# A previous version also demanded the disposition be POSITIONALLY LAST — newer than every
+# non-disposition comment in the thread. That is withdrawn, deliberately. It was aimed at a
+# real case (someone raises a second defect after the first is answered, and the thread gets
+# resolved anyway), but the only way to implement it without guessing what a defect looks
+# like was to treat every later reply as a new claim — so an ordinary "Thanks, confirmed"
+# after a RED-VERIFIED reply blocked a fully adjudicated thread. It traded a rare fail-open
+# for a routine fail-closed, which is the worse of the two: a gate that cries wolf on normal
+# conversation gets switched off, and then it catches nothing at all.
+#
+# What remains is that a disposition must EXIST as a reply. Resolving is a deliberate act;
+# resolving a thread whose latest message you have not answered is a human failure this
+# script does not try to model.
 undisposed=$(jq -r --arg re "$disposition_re" '[ .[] | select(.isResolved == true)
-  | (.comments.nodes | to_entries) as $e
-  | (([ $e[] | select(.key > 0) | select((.value.body // "") | test($re)) | .key ] | max) // -1) as $answer
-  | (([ $e[] | select((.value.body // "") | test($re) | not) | .key ] | max) // -1) as $claim
-  | select($answer <= $claim) ] | length' <<<"$threads") || {
+  | select(any(.comments.nodes[1:][]; (.body // "") | test($re)) | not) ] | length' \
+  <<<"$threads") || {
   echo "verdict: BLOCKED — could not evaluate thread dispositions." >&2; exit 2; }
 
 if [ "${undisposed:-0}" -gt 0 ]; then
   echo
   jq -r --arg re "$disposition_re" '.[] | select(.isResolved == true)
-  | (.comments.nodes | to_entries) as $e
-  | (([ $e[] | select(.key > 0) | select((.value.body // "") | test($re)) | .key ] | max) // -1) as $answer
-  | (([ $e[] | select((.value.body // "") | test($re) | not) | .key ] | max) // -1) as $claim
-  | select($answer <= $claim)
+    | select(any(.comments.nodes[1:][]; (.body // "") | test($re)) | not)
     | .comments.nodes[0]
     | "  UNDISPOSED \(.author.login)  \(.path):\(.line // .originalLine // "?")\n    \(.body | split("\n")[0][0:150])"' \
     <<<"$threads"
@@ -341,7 +371,8 @@ fi
 # guarantees every non-empty body has one.
 unanswered=$(jq -r --arg re "$disposition_re" '
   [ .[] | select((.body // "") | test($re)) | .at ] as $answers
-  | [ .[] | select((.body // "") | test("[^[:space:]]"))
+  | [ .[] | select(.claimable)
+          | select((.body // "") | test("[^[:space:]]"))
           | select(((.body // "") | test($re)) | not)
           | . as $claim
           | select([ $answers[] | select(. > $claim.at) ] | length == 0) ]
@@ -352,7 +383,8 @@ if [ "${unanswered:-0}" -gt 0 ]; then
   echo
   jq -r --arg re "$disposition_re" '
     [ .[] | select((.body // "") | test($re)) | .at ] as $answers
-    | .[] | select((.body // "") | test("[^[:space:]]"))
+    | .[] | select(.claimable)
+    | select((.body // "") | test("[^[:space:]]"))
     | select(((.body // "") | test($re)) | not)
     | . as $claim
     | select([ $answers[] | select(. > $claim.at) ] | length == 0)
@@ -363,6 +395,31 @@ if [ "${unanswered:-0}" -gt 0 ]; then
   echo "on the PR OPENING with one of RED-VERIFIED: / NOT-A-DEFECT: / DISAGREE: — the same"
   echo "answers an inline finding requires, and dated after the finding it answers."
   rc=1
+fi
+
+# Answering every finding proves nothing if nobody has reviewed the CODE YOU ARE MERGING.
+# This gate shipped with five open findings for exactly that reason: the branch was pushed,
+# the previous round's threads were answered, the gate went CLEAR, and it merged 36 seconds
+# later — while the reviewer was still working. Its findings arrived five minutes after the
+# squash. Nothing was bypassed; the gate simply had no notion of review COVERAGE.
+#
+# Skipped when REQUIRE_REVIEWED_HEAD=0, and when no review has ever been submitted (a PR
+# nobody has reviewed at all is a different conversation, and the required-checks ruleset
+# is the right place for that policy).
+headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$payload" 2>/dev/null)
+if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
+  reviewed=$(jq -r --arg h "$headoid" '[ .[] | select((.commit.oid // "") == $h) ] | length' \
+             <<<"$reviews" 2>/dev/null || echo 0)
+  anyreview=$(jq -r 'length' <<<"$reviews" 2>/dev/null || echo 0)
+  if [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ]; then
+    echo
+    echo "  UNREVIEWED HEAD  ${headoid:0:9} — reviews exist, none of them cover this commit"
+    echo
+    echo "verdict: BLOCKED — the head commit has not been reviewed."
+    echo "Every finding raised so far is answered, but the code being merged is not the code"
+    echo "anyone reviewed. Wait for a review of ${headoid:0:9}, or re-request one."
+    rc=1
+  fi
 fi
 
 if [ "$rc" -eq 0 ]; then
