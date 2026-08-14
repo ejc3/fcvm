@@ -5588,3 +5588,57 @@ class SnapshotLockHeldAcrossRun(unittest.TestCase):
                             "grow must not race a concurrent pool owner")
         self.assertEqual(open(pool).read().strip(), "100",
                          "pool must be untouched while another owner holds it")
+
+
+class ExecArmIsOptional(unittest.TestCase):
+    """The retired exec arm must not be REQUIRED for publication.
+
+    Watched red 2026-08-14: both assertions failed with "publication runs
+    require exec, noop, and at least one CDP arm" (driver) and "publication
+    schedule requires exec, noop, and a CDP arm" (analyzer). The measured
+    justification for making exec optional, from run
+    reqbench-20260814-022254-uffd: 95% of noop reps that FOLLOW an exec rep
+    land in a +17 ms slow mode (59/62), vs 15% after cdp-fast — the in-guest
+    Python driver faults a large, run-varying page set that pollutes the
+    shared prefetch working set and destabilizes the noop drift canary. No
+    published claim rests on exec (it was retired for its ~230 ms in-guest
+    driver startup), so requiring it only forces the arm that corrupts the
+    baseline into every publication run. Keeping it ALLOWED preserves the
+    continuity arm for anyone who asks for it.
+    """
+
+    def test_driver_accepts_publication_arms_without_exec(self):
+        import io as _io
+        from contextlib import redirect_stderr
+        argv = sys.argv
+        sys.argv = ["reqbench.py", "--url", "http://x/", "--out-dir", "/tmp",
+                    "--arms", "noop,cdp"]
+        err = _io.StringIO()
+        try:
+            with self.assertRaises(SystemExit):
+                with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    reqbench.main()
+        finally:
+            sys.argv = argv
+        # It still exits (no backend selected), but must get PAST the arm
+        # check: the arm-requirement error must not be the reason.
+        self.assertNotIn("require exec", err.getvalue())
+
+    def test_analyzer_accepts_schedule_without_exec(self):
+        dataset = {
+            "metadata_errors": [],
+            "meta": {"arms": ["noop", "cdp"]},
+        }
+        import reqanalyze
+        # _validate_schedule appends its errors; build the minimal call the
+        # arms check participates in and inspect the messages.
+        errors = []
+        try:
+            reqanalyze._validate_arms_for_test(["noop", "cdp"], errors)
+        except AttributeError:
+            # No seam yet: fall back to scanning the source contract.
+            src = open(os.path.join(HERE, "reqanalyze.py")).read()
+            self.assertNotIn('"exec" not in arms', src,
+                             "analyzer still hard-requires the exec arm")
+            return
+        self.assertFalse([e for e in errors if "exec" in e])

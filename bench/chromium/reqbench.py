@@ -3614,8 +3614,15 @@ def main_with_resources(resources: ExitStack) -> int:
             "--arms must be a non-empty, duplicate-free subset of "
             "exec,cdp,cdp-fast,noop"
         )
-    if "noop" not in arms or "exec" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
-        p.error("publication runs require exec, noop, and at least one CDP arm")
+    # exec is ALLOWED but no longer REQUIRED: it is retired from measurement
+    # (no published claim rests on it), and run reqbench-20260814-022254-uffd
+    # measured that 95% of noop reps following an exec rep land in a +17 ms
+    # slow mode (59/62, vs 15% after cdp-fast) — the in-guest Python driver
+    # faults a large run-varying page set that pollutes the shared prefetch
+    # working set and destabilizes the noop drift canary. Requiring it forced
+    # the arm that corrupts the baseline into every publication run.
+    if "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
+        p.error("publication runs require noop and at least one CDP arm")
 
     args.run_id = args.run_id or uuid.uuid4().hex
     if (

@@ -437,9 +437,12 @@ def _validate_schedule(dataset):
         errors.append(f"{label} metadata has no valid duplicate-free arms list")
     elif any(arm not in {"exec", "cdp", "cdp-fast", "noop"} for arm in arms):
         errors.append(f"{label} metadata declares an unsupported arm")
-    elif "exec" not in arms or "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
+    elif "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
+        # exec is optional: retired from measurement, and measured to
+        # destabilize the noop canary via working-set pollution (see
+        # reqbench.py arm validation for the run citation).
         errors.append(
-            f"{label} publication schedule requires exec, noop, and a CDP arm"
+            f"{label} publication schedule requires noop and a CDP arm"
         )
     if not isinstance(reps, int) or isinstance(reps, bool) or reps <= 0:
         errors.append(f"{label} metadata has no positive reps count")
