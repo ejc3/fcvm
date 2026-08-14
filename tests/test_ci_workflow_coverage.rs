@@ -790,3 +790,163 @@ fn summary_artifact_steps_are_gated_on_the_changes_job() {
          {checked}, so this test is not inspecting what it claims"
     );
 }
+
+/// Every self-hosted job that runs podman must clear the DEFAULT rootless store
+/// before tests — ONCE, and only after its containers config is fully written.
+/// The AMI can bake a contaminated store (it is snapshotted from the RUNNING
+/// builder since 8a9c564f), and the first `podman build` that resolves to it
+/// dies with `chown .../overlay/l: operation not permitted` (#792/#805,
+/// 2026-08-12). Placement matters as much as presence: invoked BEFORE the
+/// config writes, the script's `podman system reset` tore state down against
+/// the wrong layout and every later podman call failed with "database static
+/// dir ... does not match" (exit 125 before any test ran, 2026-08-13). The
+/// pinned invariant is therefore "immediately after every `podman system
+/// migrate`", which is the last line of each job's podman configuration.
+#[test]
+fn self_hosted_setup_steps_clear_the_default_podman_store() {
+    let ci = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/ci.yml"
+    ))
+    .expect("read ci.yml");
+    let migrates = ci.matches("podman system migrate").count();
+    let hygiene = ci.matches("runner-podman-hygiene.sh").count();
+    assert_eq!(
+        migrates, hygiene,
+        "every `podman system migrate` ({migrates}) must be followed by \
+         scripts/runner-podman-hygiene.sh (found {hygiene} calls); a job without it inherits \
+         the AMI's contaminated default store, and a call anywhere else runs against the \
+         wrong storage config"
+    );
+    assert!(
+        hygiene >= 3,
+        "expected at least 3 wired jobs, found {hygiene}"
+    );
+    // Adjacency within the STEP, not just equal counts: global substring
+    // counting can pass when one setup block loses its call and a comment
+    // elsewhere adds an occurrence. Bound each check at the next step header.
+    for (idx, _) in ci.match_indices("podman system migrate") {
+        let rest = &ci[idx..];
+        let step_end = rest.find("\n      - name:").unwrap_or(rest.len());
+        // The hygiene call must be the NEXT executable line (comments allowed):
+        // an intervening command could recreate podman state after the heal.
+        let next_command = rest[..step_end]
+            .split_once('\n')
+            .map(|(_, following)| following)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'));
+        assert_eq!(
+            next_command,
+            Some("./fcvm/scripts/runner-podman-hygiene.sh"),
+            "a `podman system migrate` at byte {idx} is not immediately followed by \
+             the hygiene invocation"
+        );
+    }
+}
+
+/// The hygiene script must heal a poisoned graphroot state db WITHOUT touching
+/// the image layers — the persistent volume's expensive content.
+///
+/// RED-verified against the previous script version (podman system reset +
+/// default-store rm): reset either refused on the very mismatch it was meant
+/// to clear ("database static dir \"\" does not match", 2026-08-13, every
+/// arm64 job) or, where the db was healthy, deleted the layer cache this test
+/// pins as preserved.
+#[test]
+fn hygiene_script_heals_state_db_and_preserves_layers() {
+    let tmp = tempfile::tempdir().expect("create fixture home");
+    let home = tmp.path();
+
+    // Fixture: a configured graphroot carrying a state db and an image layer.
+    let graphroot = home.join("graphroot");
+    std::fs::create_dir_all(graphroot.join("libpod")).unwrap();
+    std::fs::write(graphroot.join("libpod/bolt_state.db"), b"poisoned").unwrap();
+    std::fs::write(graphroot.join("db.sql"), b"poisoned").unwrap();
+    std::fs::create_dir_all(graphroot.join("overlay/abc123")).unwrap();
+    std::fs::write(graphroot.join("overlay/abc123/layer"), b"cached layer").unwrap();
+    let conf_dir = home.join(".config/containers");
+    std::fs::create_dir_all(&conf_dir).unwrap();
+    std::fs::write(
+        conf_dir.join("storage.conf"),
+        format!(
+            "[storage]\ndriver = \"overlay\"\ngraphroot = \"{}\"\n",
+            graphroot.display()
+        ),
+    )
+    .unwrap();
+    // And an AMI-style default store dropping.
+    let default_store = home.join(".local/share/containers");
+    std::fs::create_dir_all(default_store.join("storage/overlay/l")).unwrap();
+
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/runner-podman-hygiene.sh"
+    );
+    let out = std::process::Command::new(script)
+        .env("HOME", home)
+        // Fixture home: the script's passwd-match guard would (correctly)
+        // refuse it; the override is the documented test entry.
+        .env("FCVM_HYGIENE_HOME_OVERRIDE", "1")
+        .output()
+        .expect("run hygiene script");
+    assert!(
+        out.status.success(),
+        "hygiene script failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !graphroot.join("libpod").exists(),
+        "poisoned libpod db dir must be removed"
+    );
+    assert!(
+        !graphroot.join("db.sql").exists(),
+        "poisoned sqlite db must be removed"
+    );
+    assert!(
+        graphroot.join("overlay/abc123/layer").exists(),
+        "image layers are the persistent cache and must survive hygiene"
+    );
+    assert!(
+        !default_store.exists(),
+        "the default rootless store is a dropping and must be removed"
+    );
+}
+
+/// The privileged sweep must refuse a HOME that is not this user's passwd
+/// home — a stray HOME export would otherwise aim `sudo rm -rf` at an
+/// arbitrary directory. Red-verified against the pre-guard script version:
+/// it deleted the fixture store instead of refusing.
+#[test]
+fn hygiene_script_refuses_a_home_that_is_not_the_users() {
+    let tmp = tempfile::tempdir().expect("create fixture home");
+    let home = tmp.path();
+    let default_store = home.join(".local/share/containers");
+    std::fs::create_dir_all(&default_store).unwrap();
+
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/runner-podman-hygiene.sh"
+    );
+    let out = std::process::Command::new(script)
+        .env("HOME", home)
+        .env_remove("FCVM_HYGIENE_HOME_OVERRIDE")
+        .output()
+        .expect("run hygiene script");
+    assert!(
+        !out.status.success(),
+        "a HOME that does not match the passwd entry must be refused"
+    );
+    assert!(
+        default_store.exists(),
+        "nothing may be deleted when the guard refuses"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not match"),
+        "stderr must say why: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -83,6 +83,11 @@ URL="${URL:-http://127.0.0.1:8000/medium.html}"
 
 STATE_DIR="${STATE_DIR:-/mnt/fcvm-btrfs/state}"
 DATA_ROOT="${DATA_ROOT:-$(dirname "$STATE_DIR")}"
+# fcvm resolves snapshots/ (and the generation lock this harness shares with
+# it) from FCVM_DATA_DIR. reqbench derives DATA_ROOT independently; export
+# the alignment so both processes always lock the SAME files even when the
+# caller overrides the paths.
+export FCVM_DATA_DIR="$DATA_ROOT"
 LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 QUIET_LOADAVG1_LIMIT="2.0"
 QUIET_GUARD_LOADAVG1=""

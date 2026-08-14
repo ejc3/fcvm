@@ -191,6 +191,11 @@ pub struct VmConfig {
     /// additionalImageStore or docker archive). Content-addressed cache file.
     #[serde(default)]
     pub image_disk_path: Option<std::path::PathBuf>,
+    /// Build identity (inode:size:mtime) of that disk at BOOT time — the build
+    /// the container was provisioned against. Copied into snapshot metadata so
+    /// restore can refuse a snapshot whose disk was rebuilt underneath it.
+    #[serde(default)]
+    pub image_disk_identity: Option<String>,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -280,6 +285,7 @@ impl VmState {
                 kernel_profile: None,
                 image_mode: None,
                 image_disk_path: None,
+                image_disk_identity: None,
                 hypervisor: crate::hypervisor::Backend::default(),
             },
         }

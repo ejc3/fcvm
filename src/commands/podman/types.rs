@@ -28,6 +28,12 @@ pub struct RebootSpec {
     pub boot_args: String,
     pub track_dirty_pages: bool,
     pub image_disk_path: Option<PathBuf>,
+    /// Build identity of that disk at boot time (see
+    /// `FirecrackerConfig::image_disk_identity`); verified again on every
+    /// re-attach so a reboot cannot pair the captured store with a rebuilt
+    /// disk. None when snapshots are disabled or the disk is not an overlay
+    /// storage image.
+    pub image_disk_identity: Option<String>,
     pub vsock_socket_path: PathBuf,
     /// Whether the boot plan is delivered over vsock (VMMs without a metadata service)
     /// rather than MMDS. Baked into `boot_args` too (`fcvm_bootplan=vsock`), so an

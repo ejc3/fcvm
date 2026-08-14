@@ -307,6 +307,7 @@ pub(super) fn build_firecracker_config(
     cmd_args: Option<Vec<String>>,
     image_mode: crate::firecracker::ImageMode,
     firecracker_bin: Option<&Path>,
+    image_disk_identity: Option<String>,
 ) -> crate::firecracker::FirecrackerConfig {
     // image_identifier is the digest for localhost images (content-addressed cache key).
     // args.image is the original name (what the guest uses to find the image).
@@ -371,6 +372,7 @@ pub(super) fn build_firecracker_config(
         // Cache-key isolation for guest failpoints (see field docs): the spec is
         // forwarded to the guest by build_runtime_boot_args from the same env var.
         guest_failpoint: std::env::var("FCVM_GUEST_FAILPOINT").ok(),
+        image_disk_identity,
     }
 }
 

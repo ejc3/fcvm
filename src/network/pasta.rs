@@ -33,6 +33,10 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Timeout for waiting for pasta's TAP device to appear in the namespace
 const PASTA_DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Budget for the post-restore readiness check: the guest must answer, and its
+/// published ports must accept, within this window.
+const GUEST_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Number of recent pasta stderr lines kept for error reporting
 const PASTA_STDERR_TAIL_LINES: usize = 20;
 
@@ -44,10 +48,11 @@ const PASTA_STDERR_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// Whether `ip neigh show` proves that the bridge resolved the guest's MAC.
 ///
-/// ICMP echo is not the readiness contract: a guest may deliberately ignore
-/// echo requests while serving published TCP ports.  The ping in the restore
-/// probe is only an ARP trigger.  A neighbour entry with a link-layer address
-/// is the evidence that the L2 path is ready.
+/// This is an L2 fact and nothing more. A resolved entry is necessary for
+/// readiness but NOT sufficient: the neighbour table keeps a REACHABLE entry
+/// for a guest that has stopped answering, so this predicate cannot fail when
+/// the guest goes silent. [`wait_for_guest_to_answer`] pairs it with a TCP
+/// answer from the guest, which is the part that observes the guest itself.
 fn neighbor_is_resolved(output: &str) -> bool {
     let fields: Vec<&str> = output.split_whitespace().collect();
     fields
@@ -59,6 +64,253 @@ fn neighbor_is_resolved(output: &str) -> bool {
                 "PERMANENT" | "NOARP" | "REACHABLE" | "STALE" | "DELAY" | "PROBE"
             )
         })
+}
+
+/// The two namespace observations the restore readiness loop makes of a guest.
+///
+/// Both are `nsenter` invocations in production, which makes the readiness
+/// decision untestable without a namespace and a live VM. Keeping the loop
+/// generic over this boundary lets a scripted guest — one that answers, one
+/// that stays silent behind a resolved neighbour entry — drive the decision
+/// deterministically in unit tests, the same way [`crate::utils::DirEventSource`]
+/// drives the PID-file wait.
+trait GuestProbe {
+    /// Ask the guest's IP stack to answer a TCP SYN on `port` and report whether
+    /// anything came back.
+    ///
+    /// ANY response proves the guest: a SYN-ACK means the service is up, and an
+    /// RST (connection refused) means the guest's kernel processed the segment
+    /// and answered — which is all readiness needs. `Ok(false)` means silence:
+    /// the guest may simply not be up yet, which is the case the loop retries.
+    /// `Err` means the probe itself could not run.
+    ///
+    /// TCP rather than ICMP echo, deliberately: `net.ipv4.icmp_echo_ignore_all=1`
+    /// is a legitimate guest policy, and main's
+    /// `test_clone_port_forward_rootless` snapshots a guest with exactly that
+    /// policy (a42eda55) to pin the contract that readiness "must prove ARP/L2
+    /// resolution and the forwarded TCP path itself, rather than requiring an
+    /// unrelated ping reply". A published port is the one part of the guest the
+    /// operator has declared traffic will arrive on, so probing it never tests a
+    /// policy the guest is entitled to refuse.
+    async fn answers_tcp(&mut self, port: u16, budget: std::time::Duration) -> Result<TcpAnswer>;
+
+    /// Read the guest's neighbour entry from the bridge, as `ip neigh` prints it.
+    async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String>;
+}
+
+/// One TCP probe: whether the guest answered, and what the prober said if not.
+struct TcpAnswer {
+    answered: bool,
+    /// Diagnostic detail for the failure message; empty when the guest answered.
+    detail: String,
+}
+
+/// Production [`GuestProbe`]: runs the probes inside the VM's network namespace
+/// via the holder PID.
+struct NsenterGuestProbe {
+    nsenter_prefix: Vec<String>,
+}
+
+impl NsenterGuestProbe {
+    fn new(nsenter_prefix: Vec<String>) -> Self {
+        Self { nsenter_prefix }
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.nsenter_prefix[0]);
+        command
+            .args(&self.nsenter_prefix[1..])
+            .args(args)
+            .kill_on_drop(true);
+        command
+    }
+}
+
+impl GuestProbe for NsenterGuestProbe {
+    async fn answers_tcp(&mut self, port: u16, budget: std::time::Duration) -> Result<TcpAnswer> {
+        // `bash -c 'exec 3<>/dev/tcp/…'` is a plain connect(2) with bash's
+        // error reporting, run single-threaded through nsenter — which matters:
+        // joining the holder's USER namespace (required to enter its net
+        // namespace without root) is impossible from this multithreaded
+        // process, so the probe must be a subprocess. `timeout` bounds the
+        // no-answer case; refused comes back in one RTT.
+        let probe_timeout = budget.as_secs_f64().clamp(0.05, 0.5);
+        let script = format!("exec 3<>/dev/tcp/{GUEST_IP}/{port}");
+        let mut command = self.command(&[
+            "env",
+            "LC_ALL=C",
+            "timeout",
+            &format!("{probe_timeout:.2}"),
+            "bash",
+            "-c",
+            &script,
+        ]);
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let output = tokio::time::timeout(budget, command.output())
+            .await
+            .context("TCP probe exceeded pasta's readiness deadline")?
+            .context("running the TCP probe via nsenter in namespace")?;
+
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Exit 0: connected (SYN-ACK). "Connection refused": the guest's kernel
+        // sent an RST — it is alive, nothing is bound on the port yet, and that
+        // is still an answer. Exit 124 is `timeout` reporting silence; anything
+        // else (no route, probe misconfiguration) is treated as silence and
+        // retried, with the detail carried into the deadline error.
+        let answered = output.status.success() || detail.contains("Connection refused");
+        Ok(TcpAnswer {
+            answered,
+            detail: if answered { String::new() } else { detail },
+        })
+    }
+
+    async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String> {
+        let mut command =
+            self.command(&["ip", "neigh", "show", "to", GUEST_IP, "dev", BRIDGE_DEVICE]);
+        command.stderr(Stdio::piped());
+        let output = tokio::time::timeout(budget, command.output())
+            .await
+            .context("neighbor query exceeded pasta's readiness deadline")?
+            .context("reading guest neighbour entry via nsenter in namespace")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to inspect ARP entry for guest {} on {}: {}",
+                GUEST_IP,
+                BRIDGE_DEVICE,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// How long the readiness loop waits between probe rounds.
+const GUEST_ANSWER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Wait until the guest itself answers, or the deadline expires.
+///
+/// Readiness requires BOTH a TCP answer from the guest and a resolved neighbour
+/// entry, and the TCP answer is the load-bearing half. A neighbour entry
+/// survives the guest going quiet, so gating on it alone cannot fail when the
+/// guest is silent — a 808-clone benchmark declared 5 silent clones ready and 3
+/// of those 5 then hung at the client's own ~100s deadline. Requiring an answer
+/// turns that into a named failure here, inside the existing budget.
+///
+/// The probe is a TCP SYN to a published guest port, not an ICMP echo: an echo
+/// requirement fails a guest that legitimately sets
+/// `net.ipv4.icmp_echo_ignore_all=1`, which main's
+/// `test_clone_port_forward_rootless` bakes into its snapshot (a42eda55)
+/// precisely to pin that contract. An RST counts as an answer — the guest's
+/// kernel spoke, which is what readiness observes; whether a service is bound
+/// yet is the health check's question, not this one's.
+///
+/// Retries until the deadline. Time is `tokio::time` throughout so tests drive
+/// the loop under a paused clock instead of racing real windows.
+async fn wait_for_guest_to_answer<P: GuestProbe>(
+    probe: &mut P,
+    probe_port: u16,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    // Carried out of the loop so the deadline message can distinguish "the guest
+    // never appeared at L2" from "the guest is at L2 but never answered".
+    let mut last_neighbor = String::new();
+    let mut last_detail = String::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+        }
+        // A probe that outlives the whole deadline is reported as the guest
+        // never answering — with the neighbour context — not as a bare probe
+        // timeout: the informative error must not depend on where inside the
+        // loop the budget happened to run out.
+        let answer = match probe.answers_tcp(probe_port, remaining).await {
+            Ok(answer) => answer,
+            Err(error) if error.to_string().contains("readiness deadline") => {
+                return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+            }
+            Err(error) => return Err(error),
+        };
+        last_detail = answer.detail;
+        if !answer.answered {
+            debug!(
+                guest_ip = GUEST_IP,
+                probe_port,
+                detail = %last_detail,
+                "guest did not answer the readiness TCP probe"
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+        }
+        last_neighbor = match probe.neighbor(remaining).await {
+            Ok(neighbor) => neighbor,
+            Err(error) if error.to_string().contains("readiness deadline") => {
+                return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+            }
+            Err(error) => return Err(error),
+        };
+        let resolved = neighbor_is_resolved(&last_neighbor);
+
+        if answer.answered && resolved {
+            info!(
+                guest_ip = GUEST_IP,
+                probe_port,
+                neighbor = %last_neighbor.trim(),
+                "guest answered and its MAC is resolved"
+            );
+            return Ok(());
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+        }
+        debug!(
+            guest_ip = GUEST_IP,
+            probe_port,
+            answered = answer.answered,
+            neighbor_resolved = resolved,
+            "guest not ready yet, retrying"
+        );
+        tokio::time::sleep(remaining.min(GUEST_ANSWER_RETRY_DELAY)).await;
+    }
+}
+
+/// Deadline error for [`wait_for_guest_to_answer`], naming which half was missing.
+fn guest_unanswered_error(neighbor: &str, detail: &str) -> anyhow::Error {
+    let neighbor = neighbor.trim();
+    let detail = if detail.is_empty() {
+        "(silence)"
+    } else {
+        detail
+    };
+    if neighbor_is_resolved(neighbor) {
+        // The failure this whole path exists to catch: pasta can reach the
+        // guest's MAC, so every host-side check passes, but nothing is answering
+        // behind it. Report it here rather than letting a client discover it.
+        anyhow::anyhow!(
+            "guest {} resolved to a MAC but never answered a TCP probe within {:?}: \
+             the guest is not reachable even though its neighbour entry is present; \
+             neighbour: {}; probe: {}",
+            GUEST_IP,
+            GUEST_ANSWER_DEADLINE,
+            neighbor,
+            detail
+        )
+    } else {
+        anyhow::anyhow!(
+            "guest {} never appeared at L2 within {:?}: no resolved neighbour entry \
+             and no TCP answer; neighbour: {:?}; probe: {}",
+            GUEST_IP,
+            GUEST_ANSWER_DEADLINE,
+            neighbor,
+            detail
+        )
+    }
 }
 
 /// Heredoc delimiter separating the batched `ip` commands from the shell script.
@@ -915,16 +1167,30 @@ impl PastaNetwork {
         GUEST_GATEWAY
     }
 
-    /// Wait for pasta port forwarding to be ready by probing each mapped port.
+    /// Wait for pasta to bind each mapped host port.
     ///
     /// Pasta binds ports asynchronously after startup. The PID file just means
     /// the process is running, not that ports are listening. Without this check,
     /// the health monitor may declare the VM "healthy" (via nsenter/bridge) before
-    /// port forwarding actually works.
-    async fn wait_for_port_forwarding_until(&self, deadline: std::time::Instant) -> Result<()> {
+    /// pasta is even listening.
+    ///
+    /// This is a host-side check only, and it CANNOT tell you the guest is
+    /// reachable. pasta is a userspace stack: its listener completes the TCP
+    /// handshake itself, before and independently of any L2 forwarding to the
+    /// guest, so this connect succeeds against a guest that is silent or absent.
+    /// In the run that motivated [`wait_for_guest_to_answer`] it reported "port
+    /// forward ready" 95 MICROseconds after the readiness log line, on clones
+    /// whose guest was not answering.
+    ///
+    /// It is kept as-is rather than made end-to-end because fcvm does not know
+    /// what protocol a published port speaks — 9222 happens to be CDP, but a
+    /// mapping is just a number — so there are no bytes it could send that would
+    /// constitute a valid request. Guest liveness is established before this
+    /// runs, by the guest's TCP answer in [`wait_for_guest_to_answer`].
+    async fn wait_for_port_forwarding_until(&self, deadline: tokio::time::Instant) -> Result<()> {
         use tokio::net::TcpStream;
 
-        let readiness_budget = deadline.saturating_duration_since(std::time::Instant::now());
+        let readiness_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
         let loopback = self.loopback_ip.as_deref().unwrap_or("127.0.0.1");
 
         for mapping in &self.port_mappings {
@@ -939,7 +1205,7 @@ impl PastaNetwork {
             let addr = format!("{}:{}", bind_addr, mapping.host_port);
 
             loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     return Err(port_forward_deadline_error(&addr, readiness_budget));
                 }
@@ -950,7 +1216,7 @@ impl PastaNetwork {
                     }
                     Ok(Err(_)) => {
                         let remaining =
-                            deadline.saturating_duration_since(std::time::Instant::now());
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
                         if remaining.is_zero() {
                             return Err(port_forward_deadline_error(&addr, readiness_budget));
                         }
@@ -966,10 +1232,8 @@ impl PastaNetwork {
     }
 
     async fn wait_for_port_forwarding(&self) -> Result<()> {
-        self.wait_for_port_forwarding_until(
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await
+        self.wait_for_port_forwarding_until(tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE)
+            .await
     }
 }
 
@@ -1167,19 +1431,18 @@ impl NetworkManager for PastaNetwork {
         &self.tap_device
     }
 
-    /// Verify pasta's L2 forwarding path is ready after snapshot restore.
+    /// Verify the guest is reachable after snapshot restore, then that its
+    /// published ports accept.
     ///
-    /// After snapshot restore, pasta needs the guest's MAC address to forward
-    /// L2 frames. We send a ping from the namespace only to trigger a normal ARP
-    /// exchange, then inspect the bridge's neighbour table. The echo reply is
-    /// deliberately not the gate: a guest can ignore ICMP while its published
-    /// TCP service is fully functional. With arp_accept=0 (Linux default), the
-    /// guest's gratuitous arping does NOT create neighbour entries — only updates
-    /// existing ones. The outbound packet forces the namespace kernel to send an
-    /// ARP request that the guest replies to, creating a resolved entry.
+    /// After snapshot restore, pasta needs the guest's MAC address to forward L2
+    /// frames. The TCP probe serves two purposes: it triggers the ARP exchange
+    /// that populates the neighbour table (with arp_accept=0, the Linux default,
+    /// the guest's gratuitous arping only updates existing entries, so the
+    /// outbound packet is what creates a resolved one), and its answer — SYN-ACK
+    /// or RST — is the only signal here that the guest itself is alive.
     ///
-    /// Once ARP is resolved, we probe each forwarded port to confirm pasta's
-    /// loopback port forwarding is end-to-end functional.
+    /// Both halves are required. See [`wait_for_guest_to_answer`] for why the
+    /// neighbour entry alone declared silent guests ready.
     async fn verify_port_forwarding(&self) -> Result<()> {
         if self.port_mappings.is_empty() {
             return Ok(());
@@ -1192,95 +1455,31 @@ impl NetworkManager for PastaNetwork {
             }
         };
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
+        // Probe the first published TCP port: it is the one address the operator
+        // has declared traffic will arrive on, so the guest cannot legitimately
+        // be silent there — an RST counts (see GuestProbe::answers_tcp).
+        let probe_port = match self
+            .port_mappings
+            .iter()
+            .find(|m| m.proto == crate::network::Protocol::Tcp)
+        {
+            Some(mapping) => mapping.guest_port,
+            // UDP-only mappings: nothing the guest is obliged to answer on, so
+            // fall back to the host-side pasta checks alone, as before.
+            None => {
+                return self
+                    .wait_for_port_forwarding_until(
+                        tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE,
+                    )
+                    .await
+            }
+        };
 
-        // Ping the guest from inside the namespace to trigger ARP resolution.
-        // The echo status is not evidence: ICMP may be disabled while published
-        // TCP is healthy. Inspect the neighbour entry after every trigger and
-        // require a resolved MAC before probing the actual published ports.
-        // Use a 200ms timeout for ~16 attempts within the 5s deadline.
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!("ARP for guest {} not resolved within 5s", GUEST_IP);
-            }
-            let mut ping_command = Command::new(&nsenter_prefix[0]);
-            ping_command
-                .args(&nsenter_prefix[1..])
-                .args(["ping", "-c", "1", "-W", "0.2", GUEST_IP])
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let ping = tokio::time::timeout(remaining, ping_command.output())
-                .await
-                .context("ping exceeded pasta's 5s readiness deadline")?
-                .context("running ping via nsenter in namespace")?;
-            if !ping.status.success() {
-                debug!(
-                    guest_ip = GUEST_IP,
-                    status = ?ping.status.code(),
-                    stderr = %String::from_utf8_lossy(&ping.stderr).trim(),
-                    "ARP-triggering ping did not receive a reply"
-                );
-            }
+        let deadline = tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE;
+        let mut probe = NsenterGuestProbe::new(self.build_nsenter_prefix(holder_pid));
 
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!("ARP for guest {} not resolved within 5s", GUEST_IP);
-            }
-            let mut neighbor_command = Command::new(&nsenter_prefix[0]);
-            neighbor_command
-                .args(&nsenter_prefix[1..])
-                .args(["ip", "neigh", "show", "to", GUEST_IP, "dev", BRIDGE_DEVICE])
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let neighbor = tokio::time::timeout(remaining, neighbor_command.output())
-                .await
-                .context("neighbor query exceeded pasta's 5s readiness deadline")?
-                .context("reading guest neighbour entry via nsenter in namespace")?;
-            if !neighbor.status.success() {
-                anyhow::bail!(
-                    "failed to inspect ARP entry for guest {} on {}: {}",
-                    GUEST_IP,
-                    BRIDGE_DEVICE,
-                    String::from_utf8_lossy(&neighbor.stderr).trim()
-                );
-            }
-            let neighbor_stdout = String::from_utf8_lossy(&neighbor.stdout);
-            if neighbor_is_resolved(&neighbor_stdout) {
-                info!(
-                    guest_ip = GUEST_IP,
-                    neighbor = %neighbor_stdout.trim(),
-                    ping_replied = ping.status.success(),
-                    "guest MAC resolved; verifying published ports"
-                );
-                self.wait_for_port_forwarding_until(deadline).await?;
-                return Ok(());
-            }
-
-            if std::time::Instant::now() > deadline {
-                let stderr = String::from_utf8_lossy(&ping.stderr);
-                let stderr = stderr.trim();
-                anyhow::bail!(
-                    "ARP for guest {} not resolved within 5s on {}: neighbour: {}; ping stderr: {}",
-                    GUEST_IP,
-                    BRIDGE_DEVICE,
-                    if neighbor_stdout.trim().is_empty() {
-                        "(no entry)"
-                    } else {
-                        neighbor_stdout.trim()
-                    },
-                    if stderr.is_empty() { "(empty)" } else { stderr }
-                );
-            }
-
-            debug!(guest_ip = GUEST_IP, "ARP unresolved, retrying");
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if !remaining.is_zero() {
-                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
-            }
-        }
+        wait_for_guest_to_answer(&mut probe, probe_port, deadline).await?;
+        self.wait_for_port_forwarding_until(deadline).await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1335,9 +1534,17 @@ mod tests {
     }
 
     fn live_child() -> Child {
-        let mut command = Command::new("cat");
+        // Must stay alive with NO stdin dependency: tokio's Child::wait()
+        // drops the child's stdin handle on its first poll (deadlock
+        // avoidance), so a `cat` with piped stdin exits 0 the moment the
+        // select polls the wait arm — and whether that real OS exit beats the
+        // paused clock's auto-advance to the safety tick is a scheduler race
+        // (observed as a TRY 1 FAIL of the safety-tick test under a loaded
+        // full-suite run, 2026-08-13).
+        let mut command = Command::new("sleep");
         command
-            .stdin(std::process::Stdio::piped())
+            .arg("3600")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         command.spawn().expect("spawn live child")
@@ -1542,11 +1749,158 @@ mod tests {
         assert_eq!(net.gateway_ip(), "10.0.2.2");
     }
 
+    /// A guest whose TCP answers are scripted.
+    ///
+    /// Each entry is one attempt; the last entry repeats for every attempt after
+    /// it, so a guest can be made to answer late or never.
+    struct ScriptedGuest {
+        answers: VecDeque<bool>,
+        last_answer: bool,
+        neighbor: String,
+        probes: usize,
+    }
+
+    impl ScriptedGuest {
+        /// The shape of the 5 failing clones: `ip neigh` has the guest's MAC and
+        /// reports REACHABLE, and the guest answers nothing. The neighbour line
+        /// is verbatim from the captured failure log, `dev` field included by
+        /// omission — `ip neigh show ... dev br0` does not repeat the device.
+        fn silent_behind_resolved_neighbor() -> Self {
+            Self {
+                answers: VecDeque::new(),
+                last_answer: false,
+                neighbor: "10.0.2.100 lladdr 02:c4:f0:3b:67:bd REACHABLE".to_string(),
+                probes: 0,
+            }
+        }
+
+        /// A healthy clone: answers the first probe. 803 of 808 did.
+        fn answering() -> Self {
+            let mut guest = Self::silent_behind_resolved_neighbor();
+            guest.last_answer = true;
+            guest
+        }
+
+        /// A clone still coming up: silent for `attempts` probes, then answers.
+        fn answering_after(attempts: usize) -> Self {
+            let mut guest = Self::silent_behind_resolved_neighbor();
+            guest.answers = std::iter::repeat_n(false, attempts).collect();
+            guest.answers.push_back(true);
+            guest
+        }
+
+        /// A guest that has not appeared at L2 at all.
+        fn absent() -> Self {
+            let mut guest = Self::silent_behind_resolved_neighbor();
+            guest.neighbor = String::new();
+            guest
+        }
+    }
+
+    impl GuestProbe for ScriptedGuest {
+        async fn answers_tcp(
+            &mut self,
+            _port: u16,
+            _budget: std::time::Duration,
+        ) -> Result<TcpAnswer> {
+            self.probes += 1;
+            if let Some(answered) = self.answers.pop_front() {
+                self.last_answer = answered;
+            }
+            Ok(TcpAnswer {
+                // The captured failure logged nothing on stderr: the probe simply
+                // timed out waiting for an answer, it did not fail to run.
+                answered: self.last_answer,
+                detail: String::new(),
+            })
+        }
+
+        async fn neighbor(&mut self, _budget: std::time::Duration) -> Result<String> {
+            Ok(self.neighbor.clone())
+        }
+    }
+
+    /// Any port; the scripted guest ignores it.
+    const PROBE_PORT: u16 = 80;
+
+    /// A deadline under tokio's PAUSED clock: `start_paused` tests advance time
+    /// only when every task is idle, so the loop's retry sleeps pass instantly
+    /// and deterministically — no real window to race under parallel nextest
+    /// load, and the deadline genuinely expires for the silent-guest cases.
+    fn paused_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_millis(100)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_guest_behind_a_resolved_neighbor_is_not_ready() {
+        // The bug: readiness gated on the neighbour entry, which stays REACHABLE
+        // after the guest goes quiet and so cannot fail. Of 808 restored clones,
+        // the 5 whose readiness probe went unanswered were all declared ready and
+        // 3 of them then failed at the client's own ~100s deadline.
+        let mut guest = ScriptedGuest::silent_behind_resolved_neighbor();
+
+        let error = wait_for_guest_to_answer(&mut guest, PROBE_PORT, paused_deadline())
+            .await
+            .expect_err("a guest that never answers must not be declared ready");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("never answered") && message.contains("neighbour entry is present"),
+            "the deadline error must name the caught failure — MAC resolved, guest silent — \
+             so the operator is not sent hunting through host-side checks that all passed: \
+             {message}"
+        );
+        assert!(
+            guest.probes > 1,
+            "the loop must RETRY a silent guest until the deadline, not fail on attempt 1: \
+             a clone that is merely slow to come up would otherwise be killed \
+             (probes: {})",
+            guest.probes
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answering_guest_is_ready_on_the_first_attempt() {
+        let mut guest = ScriptedGuest::answering();
+        wait_for_guest_to_answer(&mut guest, PROBE_PORT, paused_deadline())
+            .await
+            .expect("an answering guest with a resolved neighbour is ready");
+        assert_eq!(guest.probes, 1, "no retries for a healthy guest");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guest_that_answers_late_is_ready_without_waiting_out_the_deadline() {
+        let mut guest = ScriptedGuest::answering_after(2);
+        wait_for_guest_to_answer(&mut guest, PROBE_PORT, paused_deadline())
+            .await
+            .expect("a guest that answers on attempt 3 is ready");
+        assert_eq!(
+            guest.probes, 3,
+            "the loop must keep probing until the guest answers, then stop"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guest_absent_from_the_neighbour_table_still_reports_arp_failure() {
+        // Both halves are required: an answering guest whose neighbour entry is
+        // missing is not ready, and the error must say which half failed.
+        let mut guest = ScriptedGuest::absent();
+        guest.last_answer = true;
+
+        let error = wait_for_guest_to_answer(&mut guest, PROBE_PORT, paused_deadline())
+            .await
+            .expect_err("no resolved neighbour entry must not be ready");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("never appeared at L2"),
+            "the error must name the missing half (L2), got: {message}"
+        );
+    }
+
     #[test]
-    fn resolved_neighbor_is_ready_even_when_icmp_echo_is_disabled() {
-        // This is the production predicate used after the ARP-triggering ping.
-        // The ping's exit status is intentionally absent: a guest with
-        // icmp_echo_ignore_all=1 still has a valid forwarding path.
+    fn neighbour_predicate_reads_l2_resolution_only() {
+        // The predicate is L2-only and says nothing about the guest answering;
+        // `wait_for_guest_to_answer` supplies that half. Every assertion here is
+        // unchanged from when this predicate alone gated readiness.
         assert!(neighbor_is_resolved(
             "10.0.2.100 dev br0 lladdr 02:aa:bb:cc:dd:ee REACHABLE"
         ));
@@ -1589,7 +1943,7 @@ mod tests {
         let net = PastaNetwork::new("vm-test123".to_string(), "tap0".to_string(), vec![mapping]);
         let error = net
             .wait_for_port_forwarding_until(
-                std::time::Instant::now() - std::time::Duration::from_millis(1),
+                tokio::time::Instant::now() - std::time::Duration::from_millis(1),
             )
             .await
             .expect_err("an expired caller deadline must fail immediately");

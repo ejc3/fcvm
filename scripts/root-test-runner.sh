@@ -26,12 +26,16 @@
 # so it holds in the case that leaked here — a SIGKILL where no userspace cleanup,
 # Drop impl or signal handler gets to run.
 
-# Host test recipes provide a unique absolute XDG_CONFIG_HOME containing the
-# current worktree's embedded config. sudo also sets SUDO_USER, and fcvm normally
-# gives that user's ~/.config precedence over XDG; remove only that lookup hint
-# for hermetic test runs so another worktree cannot replace the config between
-# setup and VM launch. Normal invocations without XDG_CONFIG_HOME are unchanged.
-if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+# Host test recipes provide a unique absolute FCVM_CONFIG_DIR containing the
+# current worktree's embedded config (previously signalled via XDG_CONFIG_HOME;
+# both are honoured so an older wrapper still gets hermetic behaviour). sudo
+# also sets SUDO_USER, and fcvm gives that user's config precedence when it is
+# set; remove only that lookup hint for hermetic test runs so another worktree
+# cannot replace the config between setup and VM launch — and so the store
+# ownership hand-back stays a no-op under the test harness, exactly as it is
+# for a genuine root login. Normal invocations without an isolated config dir
+# are unchanged.
+if [ -n "${FCVM_CONFIG_DIR:-}" ] || [ -n "${XDG_CONFIG_HOME:-}" ]; then
 	unset SUDO_USER
 fi
 

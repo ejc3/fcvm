@@ -1342,6 +1342,18 @@ async fn cmd_snapshot_run_inner(
     vm_state.config.kernel_profile = snapshot_config.metadata.kernel_profile.clone();
     vm_state.config.image_mode = snapshot_config.metadata.image_mode.clone();
     vm_state.config.image_disk_path = snapshot_config.metadata.image_disk_path.clone();
+    vm_state.config.image_disk_identity = snapshot_config.metadata.image_disk_identity.clone();
+    // Refuse to restore against a REBUILT image disk before any side effects:
+    // the snapshot's provisioned container references layer link IDs from one
+    // specific build (see SnapshotMetadata::image_disk_identity). The error is
+    // classified as a snapshot-load failure, so the podman hit path
+    // invalidates this snapshot and falls back to a fresh boot.
+    if let (Some(disk), Some(expected)) = (
+        snapshot_config.metadata.image_disk_path.as_deref(),
+        snapshot_config.metadata.image_disk_identity.as_deref(),
+    ) {
+        crate::utils::verify_image_disk_identity(disk, expected)?;
+    }
     // The clone runs the same VMM that created the snapshot (the memory image format is
     // VMM-specific). Recorded so `fcvm ls` and any later snapshot of the clone are correct.
     vm_state.config.hypervisor = snapshot_config.metadata.hypervisor;
@@ -2403,11 +2415,15 @@ async fn cmd_snapshot_run_inner(
         });
     }
 
-    // Verify pasta's L2 forwarding path is ready before starting health monitor.
+    // Verify the restored guest is reachable before starting the health monitor.
     // After snapshot restore, pasta may not have learned the guest's MAC yet.
-    // Readiness requires ARP neighbor resolution, then probes each forwarded TCP
-    // port to confirm end-to-end forwarding works. ICMP echo is unrelated to a
-    // published TCP service and may legitimately be disabled by the guest.
+    // Readiness requires a TCP answer from the guest on a published port (SYN-ACK
+    // or RST — either proves the guest's kernel spoke) AND a resolved ARP entry,
+    // then probes each forwarded port via pasta. The guest-side TCP answer is what
+    // observes the guest: pasta answers a host-side connect on its own, the
+    // neighbour entry outlives the guest going quiet, and an ICMP echo requirement
+    // would fail a guest that legitimately sets icmp_echo_ignore_all=1 — the
+    // policy test_clone_port_forward_rootless deliberately snapshots.
     //
     // On failure (the VM crashed during the wait above, or pasta's port probe timed out)
     // skip the monitor/wait section and fall through to the shared cleanup below before
@@ -2986,6 +3002,9 @@ async fn build_clone_reboot_plan(
         // Re-attach the recorded image device (content-addressed cache file) so an
         // overlay/archive-mode container's image layers survive the reboot.
         image_disk_path: meta.image_disk_path.clone(),
+        // The captured store references THIS build's layer link IDs; attach
+        // verifies it is still the same file.
+        image_disk_identity: meta.image_disk_identity.clone(),
         vsock_socket_path: vsock_socket_path.to_path_buf(),
         // Clones restore from Firecracker snapshots and use MMDS; CH clone/restore is P2.
         bootplan_over_vsock: false,
@@ -3320,6 +3339,7 @@ mod tests {
             kernel_profile: Some("btrfs".to_string()),
             image_mode: Some("overlay".to_string()),
             image_disk_path: Some(std::path::PathBuf::from("/cache/img.storage-v2.img")),
+            image_disk_identity: None,
             hypervisor: Default::default(),
         };
         let args =
@@ -3392,6 +3412,7 @@ mod tests {
             kernel_profile: None,
             image_mode: None,
             image_disk_path: None,
+            image_disk_identity: None,
             hypervisor: crate::hypervisor::Backend::CloudHypervisor,
         };
         let args = run_args_from_snapshot_metadata(&base, "c".to_string(), 1, 512, false, None);

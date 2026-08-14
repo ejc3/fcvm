@@ -224,9 +224,14 @@ fn ensure_config_exists() {
             .expect("failed to acquire config generation lock");
 
         // Check if config already exists and is valid
-        let config_path = std::env::var_os("XDG_CONFIG_HOME")
+        let config_path = std::env::var_os("FCVM_CONFIG_DIR")
             .map(PathBuf::from)
             .map(|dir| dir.join("fcvm/rootfs-config.toml"))
+            .or_else(|| {
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .map(|dir| dir.join("fcvm/rootfs-config.toml"))
+            })
             .or_else(|| {
                 std::env::var_os("HOME")
                     .map(PathBuf::from)
