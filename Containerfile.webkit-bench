@@ -1,0 +1,88 @@
+# WebKit WebDriver benchmark container: warm WebKitGTK + in-guest fixture server.
+#
+# The WebKit twin of Containerfile.chromium-bench: same shared-nothing design
+# (snapshot AFTER warmup, fan out clones, one render per clone), same fixture
+# pageserver, same warm-marker + HEALTHCHECK golden-snapshot gate — but the
+# engine is WebKitGTK driven over the W3C WebDriver classic protocol instead of
+# CDP, because WebKitGTK has no CDP endpoint.
+#
+# Engine stack (Debian bookworm arm64, probed 2026-08-14):
+#   webkit2gtk-driver  — /usr/bin/WebKitWebDriver (WebDriver HTTP on :9515) and
+#                        the MiniBrowser binary it launches with --automation.
+#                        WPE (the headless-native flavor) has no current arm64
+#                        Debian packages, and headless GTK rendering needs an X
+#                        server, so MiniBrowser runs under Xvfb.
+#   xvfb               — virtual display; WebKitGTK cannot render truly headless.
+#   fonts-dejavu-core  — deterministic text (same as the Chromium image).
+#
+# Request path: host -> fcvm published TCP 9515 -> WebKitWebDriver -> MiniBrowser.
+# WebDriver classic has NO session-discovery API, so the warm session is created
+# in entry-webkit.sh BEFORE the golden snapshot and its id is persisted to
+# /run/bench-session-id (health check) and pages/webdriver-session.txt (host
+# driver, served by the pageserver). Every clone inherits the same id.
+#
+# Build (repo root context; .dockerignore excludes target/):
+#   podman build --format docker -t localhost/webkit-bench -f Containerfile.webkit-bench .
+#
+# --format docker is LOAD-BEARING for the same reason as the Chromium image:
+# podman's OCI default silently DROPS the HEALTHCHECK, fcvm treats a missing
+# healthcheck as PASS, and the golden snapshot fires on a COLD browser.
+#
+# Host smoke test (fast loop, no VM):
+#   podman run -d --name wb localhost/webkit-bench
+#   podman logs -f wb          # wait for WEBKIT_BENCH_READY
+#   podman exec wb python3 /opt/bench/wddrive.py http://127.0.0.1:8000/medium.html \
+#       --host 127.0.0.1:9515 --session-file /run/bench-session-id --out-prefix /tmp/medium
+
+FROM docker.io/library/debian:bookworm-slim
+
+# The trailing rm also drops /var/cache/apt/archives/partial (_apt-owned, mode
+# 0700): rootless fcvm packs the image store with an unprivileged mkfs.ext4 -d
+# outside the user namespace, and any non-root-owned dir without world rx makes
+# that fail with "__populate_fs: Permission denied".
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    webkit2gtk-driver \
+    xvfb \
+    python3 \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial
+
+# Fail the BUILD, not the first boot, if the engine binaries moved. MiniBrowser
+# lives under the versioned libexec dir (/usr/lib/*/webkit2gtk-4.1/MiniBrowser
+# on bookworm); resolve it once into a stable path the entry script and the
+# WebDriver capabilities can name. GTK opens the display before parsing argv,
+# so even --version needs a display — a raw Xvfb (exactly how entry-webkit.sh
+# runs it; xvfb-run would drag in xauth) makes this a real "MiniBrowser can
+# start under a virtual display" check rather than a file-exists check.
+RUN set -e; \
+    test -x /usr/bin/WebKitWebDriver; \
+    MB=$(find /usr -name MiniBrowser -type f -perm -111 | head -1); \
+    test -n "$MB"; \
+    ln -s "$MB" /usr/local/bin/MiniBrowser; \
+    Xvfb :91 -screen 0 640x480x24 -nolisten tcp & \
+    XVFB_PID=$!; \
+    sleep 1; \
+    DISPLAY=:91 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
+        /usr/local/bin/MiniBrowser --version; \
+    kill "$XVFB_PID"
+
+COPY bench/chromium/pages/ /opt/bench/pages/
+COPY bench/chromium/pageserver.py bench/chromium/entry-webkit.sh \
+     bench/chromium/wddrive.py bench/chromium/wd_health.py /opt/bench/
+RUN chmod +x /opt/bench/entry-webkit.sh /opt/bench/pageserver.py \
+     /opt/bench/wddrive.py /opt/bench/wd_health.py
+
+# WebKitWebDriver's HTTP endpoint. fcvm DNATs eligible published TCP ports to
+# guest loopback, so `--publish 9515:9515` reaches the driver directly.
+EXPOSE 9515
+
+# fcvm's health gate is the golden-snapshot trigger (no --health-check URL, so
+# `Healthy` = container running AND this HEALTHCHECK). wd_health.py requires the
+# warm marker AND a live WebDriver round trip on the WARM SESSION — classic
+# WebDriver's /status reports "ready" even when no browser is running, so the
+# probe is GET /session/<id>/url, which fails once the session or browser dies.
+# start-period covers Xvfb + MiniBrowser cold launch + the warm render.
+HEALTHCHECK --interval=1s --timeout=5s --start-period=90s --retries=3 \
+    CMD ["python3", "/opt/bench/wd_health.py"]
+
+CMD ["/opt/bench/entry-webkit.sh"]
