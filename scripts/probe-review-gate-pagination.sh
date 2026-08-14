@@ -24,9 +24,21 @@ GATE="$HERE/check-review-threads.sh"
 
 REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || exit 2
 OWNER=${REPO%%/*}; NAME=${REPO##*/}
-BRANCH="scratch/gate-pagination-probe"
+# Unique per invocation. A fixed name meant two concurrent probes force-pushed over each
+# other, and teardown could delete a branch the other one was still using — or clobber an
+# unrelated branch that happened to share the name.
+BRANCH="scratch/gate-pagination-probe-$$-$(date +%s)"
 PRNUM=""
 START_REF=$(git rev-parse --abbrev-ref HEAD)
+
+# Never fold the caller's work into the probe commit. `git commit` records the whole index,
+# so staged changes would ride along into a branch this script later DELETES — recoverable
+# only via reflog. Refuse to run rather than put someone's staged work at risk.
+if ! git diff --cached --quiet 2>/dev/null; then
+  echo "PROBE ABORTED: you have staged changes. This probe commits and then deletes a" >&2
+  echo "scratch branch; it will not touch your index. Commit or stash them first." >&2
+  exit 2
+fi
 
 cleanup() {
   echo "=== teardown ==="
@@ -58,9 +70,15 @@ open("/tmp/gate.B.firstlast.sh", "w").write(b2)
 PY
 
 git fetch -q origin main && git checkout -qB "$BRANCH" origin/main || die branch
-printf 'scratch\n' > PAGINATION_PROBE.md && git add PAGINATION_PROBE.md
-git commit -qm "scratch: pagination probe" || die commit
-git push -qf origin "$BRANCH" || die push
+printf 'scratch\n' > PAGINATION_PROBE.md
+# `--only` cannot commit a path git has never seen, so stage it first — safe, because the
+# clean-index check above already refused to run on top of anyone's staged work. `--only`
+# then guarantees this commit carries that one file and nothing else.
+git add PAGINATION_PROBE.md || die "stage probe file"
+git commit -q --only PAGINATION_PROBE.md -m "scratch: pagination probe" || die commit
+# No --force: the branch name is unique, so a rejected push means a real collision worth
+# hearing about rather than something to bulldoze.
+git push -q origin "$BRANCH" || die push
 PRNUM=$(gh pr create --repo "$REPO" --draft --base main --head "$BRANCH" \
   --title "scratch: gate pagination probe (auto-closed)" \
   --body "Throwaway PR verifying thread-comment pagination. Closed automatically." \
@@ -90,14 +108,36 @@ echo
 rc_all=0
 check() { # name, gate, expected exit
   local out rc
-  out=$(COMMENTS_PAGE_SIZE=1 bash "$2" "$PRNUM" 2>&1); rc=$?
+  out=$(COMMENTS_PAGE_SIZE=1 REVIEWS_PAGE_SIZE=1 bash "$2" "$PRNUM" 2>&1); rc=$?
   printf '  %-26s exit=%s ' "$1" "$rc"
   if [ "$rc" = "$3" ]; then echo "PASS"; else echo "FAIL (want $3)"; rc_all=1; fi
 }
-check "A first page only"   /tmp/gate.A.firstonly.sh 1
+echo "comment paging — disposition at #2 of 3:"
+check "A first page only"    /tmp/gate.A.firstonly.sh 1
 check "B first page + last"  /tmp/gate.B.firstlast.sh 1
 check "C full cursor paging" "$GATE"                  0
+
+# The reviews connection is separate and pages separately. Post a defect claim as a REVIEW
+# BODY with no disposition: it sits after the (empty-bodied) review that carried the inline
+# comment, so a gate that only ever reads the first review page cannot see it.
 echo
-[ "$rc_all" = 0 ] && echo "pagination VERIFIED: only full paging sees a disposition in the middle" \
-                  || echo "pagination NOT verified"
+echo "reviews paging — unanswered claim in a review body on page 2:"
+gh pr review "$PRNUM" --repo "$REPO" --comment \
+  -b "P1 probe finding posted in a REVIEW BODY, deliberately left unanswered." >/dev/null \
+  || die "review body"
+python3 - "$GATE" <<'PY' || die "could not build reviews variant"
+import sys
+s = open(sys.argv[1]).read()
+old = """    [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break"""
+assert old in s, "reviews paging break not found"
+open("/tmp/gate.D.reviewsfirst.sh", "w").write(s.replace(old, "    break", 1))
+PY
+check "D reviews unpaged"    /tmp/gate.D.reviewsfirst.sh 0
+check "E reviews paged"      "$GATE"                     1
+
+echo
+[ "$rc_all" = 0 ] \
+  && echo "VERIFIED: only full paging sees a mid-thread disposition, and only a separately" \
+  && [ "$rc_all" = 0 ] && echo "paged reviews connection sees a claim past the first review page." \
+  || echo "pagination NOT verified"
 exit $rc_all

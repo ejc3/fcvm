@@ -253,8 +253,11 @@ moment the change reached a PR whose base *was* main.
 **Before treating any PR as green, prove the checks EXIST, then that they passed:**
 ```bash
 SHA=$(gh api repos/{o}/{r}/pulls/<N> --jq .head.sha)
-gh api repos/{o}/{r}/commits/$SHA/check-runs \
+gh api --paginate repos/{o}/{r}/commits/$SHA/check-runs \
   --jq '.check_runs[] | select(.conclusion != "skipped") | "\(.name)\t\(.conclusion)"' | sort -u
+# --paginate is not optional: the first page holds 30 runs, so on a busy commit a required
+# job can be absent from the output while present on the PR — the check-EXISTS assertion
+# below then fails for a job that is actually there, or worse, passes for one that is not.
 # An expected job missing from this list is a FAILURE to verify, not a pass.
 ```
 Any monitor, gate, or script that renders a verdict from `statusCheckRollup` must assert the
@@ -1169,7 +1172,8 @@ checks, and bind results to a SHA rather than to the PR:
 ```bash
 gh pr view <pr> --json state,headRefOid --jq '"\(.state) head=\(.headRefOid)"'
 git rev-parse HEAD   # must equal headRefOid; if it does not, the checks are for other code
-gh api repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs --jq '.check_runs | length'
+gh api --paginate --slurp repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs \
+  --jq '[.[].check_runs[]] | length'
 # 0 => nothing ran for this commit. `gh pr reopen <pr>` resyncs the head and triggers CI.
 ```
 **Reopening is not guaranteed to start CI.** It fires a `reopened` event, which a workflow
@@ -1178,7 +1182,8 @@ then `paths`/`paths-ignore` still applies, so a PR whose every changed file matc
 ignored pattern gets a `reopened` event and **still runs nothing**. Docs-only and
 bench-only PRs land in exactly that hole. Check, and fall back to an explicit dispatch:
 ```bash
-gh api repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs --jq '.check_runs | length'
+gh api --paginate --slurp repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs \
+  --jq '[.[].check_runs[]] | length'
 # still 0 after reopen => the workflow filtered this PR out, not a sync problem
 gh workflow run ci.yml --ref "$(git branch --show-current)"
 ```

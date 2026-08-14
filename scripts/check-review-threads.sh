@@ -46,9 +46,39 @@ REPO_NAME=${REPO_NAME:-fcvm}
 # which GitHub secondary-rate-limits into silent partial failure. Shrinking the page
 # makes the same code path reachable with three comments.
 COMMENTS_PAGE_SIZE=${COMMENTS_PAGE_SIZE:-100}
+# Same idea for the reviews connection, so its paging is reachable on an ordinary PR
+# instead of one with 100+ submitted reviews.
+REVIEWS_PAGE_SIZE=${REVIEWS_PAGE_SIZE:-100}
 
 fetch_payload() {
   local pr=$1 cursor=null threads='[]' reviews='[]'
+
+  # Reviews are their OWN connection and must be paged on their OWN cursor. They used to
+  # ride along inside the reviewThreads loop, which was wrong twice over: past 100 reviews
+  # a defect claim in review 101 was never fetched at all (CLEAR with nothing answered),
+  # and on a PR with 2+ pages of THREADS the same first review page was appended once per
+  # iteration, duplicating every claim.
+  local rcursor=null rafter="" rresp
+  while :; do
+    [ "$rcursor" != "null" ] && rafter=", after: \"$rcursor\""
+    rresp=$(gh api graphql -f query="
+      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $pr) {
+            reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login } state body submittedAt }
+            } } } }" 2>/dev/null) || return 1
+    if [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$rresp")" = "null" ]; then
+      echo "verdict: BLOCKED — no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is" >&2
+      echo "not visible to this token). Refusing to report CLEAR for a PR never read." >&2
+      return 2
+    fi
+    reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
+          <(echo "$reviews") <(echo "$rresp"))
+    [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
+    rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
+  done
+
   while :; do
     local after="" resp
     # `\"` here, NOT `\\\"`: the latter puts a literal backslash into the GraphQL
@@ -58,7 +88,6 @@ fetch_payload() {
     resp=$(gh api graphql -f query="
       { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
           pullRequest(number: $pr) {
-            reviews(first: 100) { nodes { author { login } state body submittedAt } }
             reviewThreads(first: 100$after) {
               pageInfo { hasNextPage endCursor }
               nodes {
@@ -82,8 +111,6 @@ fetch_payload() {
 
     threads=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviewThreads.nodes // [])' \
           <(echo "$threads") <(echo "$resp"))
-    reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
-          <(echo "$reviews") <(echo "$resp"))
     [ "$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$resp")" = "true" ] || break
     cursor=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$resp")
   done
