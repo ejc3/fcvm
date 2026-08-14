@@ -667,6 +667,7 @@ cmd_verify() {
     # golden with an empty pool; grow it here, not only at golden time.
     # unknown refuses: jq missing or an unreadable config would otherwise
     # skip provisioning fail-OPEN and die mid-serve instead.
+    acquire_generation_lock || return 1
     local huge_state
     huge_state=$(hugepage_snapshot_state)
     if [ "$huge_state" = unknown ]; then
@@ -822,15 +823,60 @@ ensure_hugepage_pool() {
         return 1
     fi
     need=$(( (mem / 2) * 4 ))
+    # The pool is host-global state shared by every harness (reqbench,
+    # faultbench, bench.sh, make setup-hugepages). One flock serializes all
+    # of them (codex P1, PR #815): a phase that DEPENDS on the pool keeps the
+    # fd open holding it SHARED for the phase lifetime; a grow upgrades to
+    # EXCLUSIVE and atomically downgrades. Bounded waits fail closed rather
+    # than hanging behind a stuck owner.
+    local wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
+    local pool_lock="$DATA_ROOT/hugepage-pool.lock"
+    touch "$pool_lock" 2>/dev/null || true
+    if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
+        exec {REQBENCH_POOL_LOCK_FD}<>"$pool_lock"
+    fi
+    if ! flock -s -w "$wait_s" "$REQBENCH_POOL_LOCK_FD"; then
+        log "hugepages: pool lock busy for ${wait_s}s; refusing to race the owner"
+        return 1
+    fi
     cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
     if [ "$cur" -lt "$need" ]; then
-        log "hugepages: growing pool $cur -> $need (${mem}MiB guest x4)"
-        sudo sh -c 'echo "$1" > "$2"' _ "$need" "$HUGEPAGE_POOL_FILE"
+        if ! flock -x -w "$wait_s" "$REQBENCH_POOL_LOCK_FD"; then
+            log "hugepages: pool lock busy for ${wait_s}s; refusing to race the owner"
+            return 1
+        fi
+        # Re-read under the exclusive lock: another grower may have won.
         cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
+        if [ "$cur" -lt "$need" ]; then
+            log "hugepages: growing pool $cur -> $need (${mem}MiB guest x4)"
+            # Literal sudo, NOT $SUDO: $SUDO is empty by default (rootless
+            # needs no privilege), but writing the kernel pool knob requires
+            # root in every mode. $SUDO here would break the rootless path.
+            sudo sh -c 'echo "$1" > "$2"' _ "$need" "$HUGEPAGE_POOL_FILE"
+            cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
+        fi
+        flock -s "$REQBENCH_POOL_LOCK_FD"
         if [ "$cur" -lt "$need" ]; then
             log "hugepages: pool only $cur/$need pages (fragmentation?)"
             return 1
         fi
+    fi
+    # fd stays open: the SHARED lease lives until the phase shell exits.
+}
+
+# Shared generation lock, held (via fd inheritance) from backend
+# classification through the driver handoff, so another fcvm command cannot
+# replace $TAG between the hugepage check and the measured run (codex P1,
+# PR #815): fcvm snapshot create/delete take this lock exclusive.
+acquire_generation_lock() {
+    local gen_lock="$DATA_ROOT/snapshots/$TAG.lock"
+    touch "$gen_lock" 2>/dev/null || true
+    if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
+        exec {REQBENCH_GEN_LOCK_FD}<>"$gen_lock"
+    fi
+    if ! flock -s -w "${HUGEPAGE_POOL_LOCK_WAIT:-60}" "$REQBENCH_GEN_LOCK_FD"; then
+        log "generation lock busy for '$TAG'; refusing to classify a moving target"
+        return 1
     fi
 }
 
@@ -849,6 +895,7 @@ cmd_run() {
     # file-backed — fcvm silently starts a UFFD server and the record would
     # say backend=file, so the analyzer would gate MISLABELED data. unknown
     # (unreadable config.json) refuses too: fail closed, never guess.
+    acquire_generation_lock || return 1
     local huge_state
     huge_state=$(hugepage_snapshot_state)
     if [ "$BACKEND" = file ] && [ "$huge_state" != normal ]; then
@@ -857,6 +904,12 @@ cmd_run() {
     fi
     if [ "$huge_state" = huge ]; then
         ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
+    fi
+    if [ -n "${REQBENCH_DRIVER_HOOK:-}" ]; then
+        # Test seam: runs inside the held generation + pool locks, exactly
+        # where the driver handoff happens.
+        "$REQBENCH_DRIVER_HOOK"
+        return $?
     fi
     local guard_rc=0
     guard_quiet || guard_rc=$?

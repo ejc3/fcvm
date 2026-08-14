@@ -587,7 +587,9 @@ setup-hugepages:
 		echo "==> Hugepages already allocated: $$current (need $(HUGEPAGE_POOL_TESTS))"; \
 	else \
 		echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TESTS) pages = $$(( $(HUGEPAGE_POOL_TESTS) * 2 ))MB)..."; \
-		sudo sh -c 'echo $(HUGEPAGE_POOL_TESTS) > /proc/sys/vm/nr_hugepages'; \
+		sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true; \
+		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock \
+			sudo sh -c 'echo $(HUGEPAGE_POOL_TESTS) > /proc/sys/vm/nr_hugepages'; \
 	fi
 
 setup-btrfs:
@@ -772,16 +774,17 @@ FAULT_POOL ?= 4096
 bench-chromium-fault: build setup-default
 	@test -n "$(FAULT_OUT)" || (echo "ERROR: FAULT_OUT required (results directory)"; exit 1)
 	@if ls -d /mnt/fcvm-btrfs/snapshots/cb-golden-huge* >/dev/null 2>&1; then \
-		current=$$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0); \
-		if [ "$$current" -lt "$(FAULT_POOL)" ]; then \
-			echo "==> Growing hugepage pool $$current -> $(FAULT_POOL) for the huge cells..."; \
-			sudo sh -c 'echo $(FAULT_POOL) > /proc/sys/vm/nr_hugepages'; \
-			after=$$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0); \
-			if [ "$$after" -lt "$(FAULT_POOL)" ]; then \
-				echo "ERROR: hugepage pool only $$after/$(FAULT_POOL) pages (fragmentation)"; \
-				exit 1; \
-			fi; \
-		fi; \
+		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock sh -c ' \
+			current=$$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0); \
+			if [ "$$current" -lt "$(FAULT_POOL)" ]; then \
+				echo "==> Growing hugepage pool $$current -> $(FAULT_POOL) for the huge cells..."; \
+				sudo sh -c "echo $(FAULT_POOL) > /proc/sys/vm/nr_hugepages"; \
+				after=$$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0); \
+				if [ "$$after" -lt "$(FAULT_POOL)" ]; then \
+					echo "ERROR: hugepage pool only $$after/$(FAULT_POOL) pages (fragmentation)"; \
+					exit 1; \
+				fi; \
+			fi'; \
 	fi
 	@echo "==> Running per-request page-fault benchmark..."
 	@python3 bench/chromium/faultbench.py --out "$(FAULT_OUT)" $(FAULT_ARGS)

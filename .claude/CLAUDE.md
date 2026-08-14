@@ -406,11 +406,11 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | Target | Deps | Knobs (command-line vars; make exports them) |
 |--------|------|----------------------------------------------|
 | `bench-chromium-request-build` | `build` | container image only |
-| `bench-chromium-request-golden` | `-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=` |
+| `bench-chromium-request-golden` | `bench-chromium-request-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=` |
 | `bench-chromium-request-verify` | none (sealed bundle) | `TAG=` |
 | `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=` |
 | `bench-chromium-request-all` | `build` + `setup-default` | all of the above, one seal |
-| `bench-chromium-hostcdp` | `-build` | host-container CDP baseline, no VM |
+| `bench-chromium-hostcdp` | `bench-chromium-request-build` | host-container CDP baseline, no VM |
 | `bench-chromium-fault` | `build` + `setup-default` | `FAULT_OUT=` (required), `FAULT_ARGS=` |
 
 - **verify/run must never gain a `build` dependency.** reqbench.sh seals

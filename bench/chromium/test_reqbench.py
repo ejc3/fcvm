@@ -5380,6 +5380,11 @@ class MakefileBenchGraph(unittest.TestCase):
         # run must not reserve gigabytes it will never touch.
         self.assertIn("cb-golden-huge", recipe,
                       "pool growth must be gated on the huge golden")
+        # And the grow must hold the cross-harness pool lock (codex P1,
+        # PR #815): the pool is host-global and reqbench/faultbench/bench.sh
+        # all write it.
+        self.assertIn("hugepage-pool.lock", recipe,
+                      "fault recipe must serialize on the shared pool lock")
 
     def test_run_help_documents_tag(self):
         # Following the documented huge flow without TAG= on the run line
@@ -5406,6 +5411,7 @@ class MakefileBenchGraph(unittest.TestCase):
         # with no firecracker asset. Its survival (including as a stray
         # .PHONY entry) means the clean break did not happen.
         self.assertNotIn("bench-chromium-request", self.rules)
+        self.assertNotIn("bench-chromium-request", self.phony)
 
 
 class HugepageGuards(unittest.TestCase):
@@ -5426,7 +5432,12 @@ class HugepageGuards(unittest.TestCase):
 
     def _bash(self, snippet, env_extra=None, hugepages="true"):
         d = tempfile.mkdtemp(prefix="hugeguard-")
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+
+        def _cleanup(path=d):
+            shutil.rmtree(path)
+            assert not os.path.exists(path), f"cleanup left {path}"
+
+        self.addCleanup(_cleanup)
         snapdir = os.path.join(d, "data", "snapshots", "tag-under-test")
         os.makedirs(snapdir)
         with open(os.path.join(snapdir, "config.json"), "w") as f:
@@ -5528,3 +5539,52 @@ class HugepageGuardsRound2(unittest.TestCase):
         r, _ = self._bash( "TAG=missing-tag cmd_verify")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("hugepage state", r.stdout + r.stderr)
+
+
+class SnapshotLockHeldAcrossRun(unittest.TestCase):
+    """Codex P1 (PR #815): the backend classification must happen under the
+    snapshot generation lock and the lock must stay held through the driver
+    handoff — otherwise another fcvm command can replace $TAG between the
+    hugepage_snapshot_state read and the run, and a same-shaped hugepage
+    generation slips past the BACKEND=file refusal (mislabeled data).
+
+    Watched red 2026-08-14: the exclusive-flock probe inside the stub driver
+    SUCCEEDED (no lock held during the run) and the pool-lease probe likewise.
+    """
+
+    SH = HugepageGuards.SH
+    _bash = HugepageGuards._bash
+
+    def test_generation_lock_held_shared_through_driver(self):
+        # The stub driver tries to take the generation lock EXCLUSIVE; if
+        # cmd_run holds it SHARED across the handoff, that must fail.
+        r, _ = self._bash(
+            'mkdir -p "$RESULTS/logs"; '
+            'probe() { flock -x -n "$DATA_ROOT/snapshots/$TAG.lock" true '
+            '  && echo LOCK-FREE || echo LOCK-HELD; }; '
+            'export -f probe; '
+            'REQBENCH_DRIVER_HOOK="probe" cmd_run',
+            {"BACKEND": "uffd", "UFFD_MODE": "minor"})
+        self.assertIn("LOCK-HELD", r.stdout + r.stderr)
+
+    def test_pool_lease_held_shared_through_phase(self):
+        r, _ = self._bash(
+            'mkdir -p "$RESULTS/logs"; '
+            'probe() { flock -x -n "$DATA_ROOT/hugepage-pool.lock" true '
+            '  && echo POOL-FREE || echo POOL-HELD; }; '
+            'export -f probe; '
+            'REQBENCH_DRIVER_HOOK="probe" cmd_run',
+            {"BACKEND": "uffd", "UFFD_MODE": "minor"})
+        self.assertIn("POOL-HELD", r.stdout + r.stderr)
+
+    def test_pool_grow_respects_exclusive_holder(self):
+        # While another process holds the pool lock exclusive, a grow must
+        # not proceed concurrently: bounded wait, then fail closed.
+        r, pool = self._bash(
+            'touch "$DATA_ROOT/hugepage-pool.lock"; '
+            'exec 9<>"$DATA_ROOT/hugepage-pool.lock"; flock -x 9; '
+            'HUGEPAGE_POOL_LOCK_WAIT=1 ensure_hugepage_pool')
+        self.assertNotEqual(r.returncode, 0,
+                            "grow must not race a concurrent pool owner")
+        self.assertEqual(open(pool).read().strip(), "100",
+                         "pool must be untouched while another owner holds it")

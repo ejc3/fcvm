@@ -34,7 +34,9 @@ Knobs pass as make command-line variables (make exports them to the recipe
 environment): `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `UFFD_MODE=`,
 `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=`. Hugepage goldens
 are part of the snapshot identity — give them their own tag
-(`make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`).
+(`make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`;
+the same `TAG=` must then be passed to `-verify` and `-run`, or they select
+the default snapshot).
 
 `verify` and `run` deliberately have NO build dependency: reqbench.sh seals
 fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and the
