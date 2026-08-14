@@ -685,8 +685,18 @@ def _validate_schedule(dataset):
                 if not isinstance(render, dict) or render.get("ok") is not True:
                     errors.append(f"{rlabel} successful CDP record has no successful render")
                 else:
+                    # Multi-URL runs declare meta.urls and cycle rep-modulo;
+                    # the expected URL for THIS record is re-derived from the
+                    # schedule, which is stricter than set membership: a
+                    # record rendering the right URL at the wrong rep is a
+                    # schedule violation.
+                    urls = meta.get("urls")
+                    if isinstance(urls, list) and urls:
+                        expected_url = urls[record.get("rep", 0) % len(urls)]
+                    else:
+                        expected_url = meta.get("url")
                     expected_fields = {
-                        "url": meta.get("url"),
+                        "url": expected_url,
                         "format": meta.get("format"),
                         "cdp_host": record.get("endpoint"),
                     }

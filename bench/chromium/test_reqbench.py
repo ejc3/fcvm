@@ -5785,3 +5785,52 @@ class ExecArmIsOptional(unittest.TestCase):
         self.assertTrue(
             control, "a noop-less schedule must be rejected by the same rule"
         )
+
+
+class CorpusMixUrls(unittest.TestCase):
+    """Multi-URL runs for the corpus arm (Cloudflare 14-URL mix).
+
+    Watched red 2026-08-14: --url with a comma list was passed through as one
+    junk URL (no cycling, no per-record url, no warmup floor), and the
+    analyzer's schedule validation rejected any record whose render.url
+    differed from the single meta.url.
+    """
+
+    def _parse(self, extra):
+        argv = sys.argv
+        sys.argv = ["reqbench.py", "--out-dir", "/tmp"] + extra
+        import io as _io
+        from contextlib import redirect_stderr
+        err = _io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    reqbench.main()
+            return cm.exception.code, err.getvalue()
+        finally:
+            sys.argv = argv
+
+    def test_urls_helper_cycles_deterministically(self):
+        urls = reqbench.parse_urls("http://a/,http://b/,http://c/")
+        self.assertEqual(urls, ["http://a/", "http://b/", "http://c/"])
+        self.assertEqual([reqbench.url_for_rep(urls, r) for r in range(5)],
+                         ["http://a/", "http://b/", "http://c/",
+                          "http://a/", "http://b/"])
+
+    def test_mix_requires_warmup_of_two_cycles(self):
+        # A mix trains the prefetch working set during its first cycle; the
+        # baseline is not stationary until every URL has run. Fail closed
+        # when warmup cannot cover two full cycles.
+        rc, err = self._parse(["--url", "http://a/,http://b/,http://c/",
+                               "--arms", "noop,cdp", "--warmup", "2",
+                               "--serve-pid", "7"])
+        self.assertEqual(rc, 2)
+        self.assertIn("warmup", err.lower())
+
+    def test_analyzer_accepts_declared_url_set(self):
+        import reqanalyze
+        src = open(os.path.join(HERE, "reqanalyze.py")).read()
+        body = src.split("def _validate_schedule")[1]
+        self.assertIn('meta.get("urls")', body,
+                      "schedule validation must accept a declared URL set, "
+                      "not only a single meta.url")

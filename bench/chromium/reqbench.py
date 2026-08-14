@@ -2790,7 +2790,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None) -> dict:
             rec["ws_url_prewired"] = bool(ws_url)
             drive_args = argparse.Namespace(
                 cdp_host=endpoint,
-                url=args.url,
+                url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
                 format=args.format,
                 quality=args.quality,
                 timeout=max(1.0, deadline - time.monotonic()),
@@ -3099,7 +3099,8 @@ def run_exec_request(args, rep: int) -> dict:
     name = f"rb-{args.run_id}-{rep}-exec"
     log = os.path.join(args.out_dir, f"{name}.log")
     driver = shlex.join([
-        "python3", "/opt/bench/render.py", args.url,
+        "python3", "/opt/bench/render.py",
+        url_for_rep(getattr(args, "urls", None) or [args.url], rep),
         "--out-prefix", "/tmp/rb",
         "--format", args.format,
         "--quality", str(args.quality),
@@ -3469,6 +3470,16 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
     return run_cdp_request(args, rep, fast=(arm == "cdp-fast"), probe=probe)
 
 
+def parse_urls(spec):
+    """Split a comma-separated --url value; single URLs pass through as [url]."""
+    return [u.strip() for u in spec.split(",") if u.strip()]
+
+
+def url_for_rep(urls, rep):
+    """Deterministic uniform cycle: rep r renders urls[r % len(urls)]."""
+    return urls[rep % len(urls)]
+
+
 def main() -> int:
     """Run one schedule and release every whole-run resource on every exit."""
     with ExitStack() as resources:
@@ -3481,7 +3492,9 @@ def main_with_resources(resources: ExitStack) -> int:
                    help="UFFD serve pid (omit when using --snapshot-tag)")
     p.add_argument("--snapshot-tag", default="",
                    help="FILE-backed restore from this tag instead of a UFFD serve")
-    p.add_argument("--url", required=True)
+    p.add_argument("--url", required=True,
+                   help="page URL, or a comma-separated list cycled across "
+                        "reps (the corpus-mix arm)")
     p.add_argument("--arms", default="exec,cdp,cdp-fast,noop")
     p.add_argument("--reps", type=int, default=10)
     p.add_argument("--warmup", type=int, default=2, help="discarded EXPLICITLY, and reported")
@@ -3624,6 +3637,21 @@ def main_with_resources(resources: ExitStack) -> int:
     if "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
         p.error("publication runs require noop and at least one CDP arm")
 
+    urls = parse_urls(args.url)
+    if not urls:
+        p.error("--url must name at least one URL")
+    if len(urls) > 1 and args.warmup < 2 * len(urls):
+        # A mix trains the prefetch working set during its first cycle; the
+        # noop baseline is not stationary until every URL has faulted its
+        # pages in (measured 2026-08-14: the drift gate rejects runs whose
+        # working set converges inside the measured window). Two full cycles
+        # of warmup cover convergence.
+        p.error(
+            f"multi-URL runs need --warmup >= {2 * len(urls)} "
+            f"(2x the URL count, working-set convergence); got {args.warmup}"
+        )
+    args.urls = urls
+
     args.run_id = args.run_id or uuid.uuid4().hex
     if (
         len(args.run_id) != 32
@@ -3669,7 +3697,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "kind": "meta", "run_id": run_id, "seed": args.seed,
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
             "uffd_mode": uffd_mode,
-            "warmup": args.warmup, "url": args.url, "format": args.format,
+            "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
             "quality": args.quality,
             "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,
@@ -3741,6 +3769,7 @@ def main_with_resources(resources: ExitStack) -> int:
                 }
                 fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
+            rec["url"] = url_for_rep(getattr(args, "urls", None) or [args.url], rep)
             rec["run_id"] = run_id
             rec["record_id"] = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"
             rec["loadavg1"] = float(read_trimmed("/proc/loadavg").split()[0])

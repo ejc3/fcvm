@@ -3069,6 +3069,7 @@ fn run_args_from_snapshot_metadata(
         .collect();
 
     RunArgs {
+        dns: None,
         name,
         cpu,
         mem,

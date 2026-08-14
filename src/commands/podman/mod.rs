@@ -1475,7 +1475,7 @@ async fn prepare_vm_for_lifecycle(
     // network.setup() may fail partway through (it tears nothing down itself),
     // so any error from here until the run_vm_setup error handler below must
     // run network.cleanup() to remove partially-created host network state.
-    let network_config = match network.setup().await.context("setting up network") {
+    let mut network_config = match network.setup().await.context("setting up network") {
         Ok(config) => config,
         Err(e) => {
             if let Err(cleanup_err) = network.cleanup().await {
@@ -1488,6 +1488,13 @@ async fn prepare_vm_for_lifecycle(
             return Err(e);
         }
     };
+
+    // --dns overrides the mode's DNS choice. fc-agent writes it to the
+    // guest's resolv.conf at boot, so a snapshot taken from this VM bakes it
+    // in; restored clones resolve through it with no further configuration.
+    if let Some(ref dns) = args.dns {
+        network_config.dns_server = Some(dns.clone());
+    }
 
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 

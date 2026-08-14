@@ -153,7 +153,7 @@ def selfsigned(tmpdir: Path):
     return crt, key
 
 
-def dns_responder(addr: str, port: int):
+def dns_responder(addr: str, port: int, answer_ip: str = "127.0.0.1"):
     """Answer every A query with 127.0.0.1 (AAAA answered empty, forcing v4).
 
     Browser-agnostic host mapping for the replay arm: the replay container
@@ -181,7 +181,7 @@ def dns_responder(addr: str, port: int):
             qtype = struct.unpack(">H", qd[i + 1:i + 3])[0]
             if qtype == 1:  # A
                 answer = (b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 5, 4)
-                          + socket.inet_aton("127.0.0.1"))
+                          + socket.inet_aton(answer_ip))
                 resp = txid + flags + struct.pack(">HHHH", 1, 1, 0, 0) + question + answer
             else:  # empty NOERROR (esp. AAAA -> fall back to A)
                 resp = txid + flags + struct.pack(">HHHH", 1, 0, 0, 0) + question
@@ -197,14 +197,19 @@ def main():
     ap.add_argument("--tls-port", type=int, default=443)
     ap.add_argument("--dns-addr", default="127.0.0.2")
     ap.add_argument("--dns-port", type=int, default=53)
+    # The address DNS answers point at. Host-side replay: 127.0.0.1. In-guest
+    # replay: 10.0.2.2, the pasta gateway, which maps guest connections onto
+    # the host's loopback where this server listens.
+    ap.add_argument("--answer-ip", default="127.0.0.1")
     args = ap.parse_args()
 
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
     print(f"loaded {len(Handler.exact)} urls", flush=True)
 
-    threading.Thread(target=dns_responder, args=(args.dns_addr, args.dns_port),
+    threading.Thread(target=dns_responder,
+                     args=(args.dns_addr, args.dns_port, args.answer_ip),
                      daemon=True).start()
-    print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> 127.0.0.1", flush=True)
+    print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> {args.answer_ip}", flush=True)
 
     plain = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
