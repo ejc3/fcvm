@@ -178,6 +178,34 @@ run_case "a review covering the head clears" \
 run_case "no reviews at all is not this check's business" \
   "$(wrap5 deadbeef '[]')" 0 "CLEAR"
 
+echo "== finding 17: authorship does not decide what is a finding =="
+run_case "author's own defect report is claimable" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"me","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this drops records"}]')" \
+  1 "BLOCKED"
+run_case "a standalone bot finding with no review history is claimable" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"codex","__typename":"Bot"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  1 "BLOCKED"
+run_case "an APPROVED review body is not a finding" \
+  "$(wrap4 me '[]' '[{"author":{"login":"reviewer"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z","body":"LGTM, nice work"}]' '[]')" \
+  0 "CLEAR"
+run_case "a COMMENTED review body still is" \
+  "$(wrap4 me '[]' '[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"LGTM, nice work"}]' '[]')" \
+  1 "BLOCKED"
+run_case "a bare @codex trigger is not a finding" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"anyone","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"@codex review"}]')" \
+  0 "CLEAR"
+run_case "a finding that merely mentions @codex still blocks" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"anyone","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"@codex review this: P1 it drops rows"}]')" \
+  1 "BLOCKED"
+
+echo "== finding 18: the author reviewing their own push is not coverage =="
+run_case "only the author reviewed the head" \
+  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}},{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"NOT-A-DEFECT: fixed","commit":{"oid":"deadbeef"}}]')" \
+  1 "UNREVIEWED HEAD"
+run_case "someone else reviewed the head" \
+  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]')" \
+  0 "CLEAR"
+
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
   "$(wrap '[{"isResolved":false,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"something"}]}}]')" \

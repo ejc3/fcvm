@@ -182,6 +182,20 @@ fetch_payload() {
       'map(if .id == $id then .comments.nodes = $c else . end)' <<<"$threads")
   done
 
+  # Re-read the head AFTER all paging. A push landing mid-evaluation would otherwise leave
+  # $headoid describing the commit captured by the first query, and the coverage check
+  # would happily certify a SHA the PR no longer points at.
+  local headnow
+  headnow=$(gh api graphql -f query="
+    { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+        pullRequest(number: $pr) { headRefOid } } }" \
+    --jq '.data.repository.pullRequest.headRefOid' 2>/dev/null) || return 1
+  if [ -n "$headnow" ] && [ "$headnow" != "$headoid" ]; then
+    echo "verdict: BLOCKED — the head moved from ${headoid:0:9} to ${headnow:0:9} while this" >&2
+    echo "gate was reading the PR. Re-run against a branch that is holding still." >&2
+    return 2
+  fi
+
   jq -n --argjson t "$threads" --argjson r "$reviews" --argjson c "$prcomments" \
         --arg a "$prauthor" --arg h "$headoid" \
      '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
@@ -254,29 +268,43 @@ fi
 # statement. Judge them as one list, so an answer posted either way settles a claim posted
 # either way. `at` normalises submittedAt/createdAt.
 #
-# `claimable` is the part that took two tries. Treating EVERY non-empty body as an
-# outstanding claim blocked PRs that had no findings at all: `gh pr comment --body "@codex
-# review"` — the command this skill's own docs tell you to run — became an unanswered
-# claim, as did deploy notifications and approval chatter. A gate that blocks on ordinary
-# conversation is a gate people switch off. Two exclusions, neither of them a guess about
-# what a finding looks like:
-#   - the PR AUTHOR's own words are never a claim against themselves;
-#   - a Bot's TOP-LEVEL comment is a notification, not a review finding.
-# Bot REVIEWS still count in full: Codex reviews as an App, and its review bodies are
-# exactly what this check exists to catch.
+# `claimable` — what needs an answer — took several tries, and every wrong version made
+# the same mistake: inferring whether something is a FINDING from who wrote it.
+#
+#   v1: every non-empty body counts. Blocked on `@codex review` — the trigger this skill
+#       documents — and on deploy notifications. A gate that blocks on ordinary traffic
+#       gets switched off.
+#   v2: exclude the PR author, and bots. But Codex IS a bot, and posts findings as plain
+#       comments; and a genuine self-reported defect from the author still needs a RED
+#       test, which this skill says explicitly. Silenced both.
+#   v3: exclude bots that have never submitted a review. A bot whose FIRST finding is a
+#       top-level comment has no review history yet — silenced exactly the case the
+#       adjacent comment warned about.
+#
+# Authorship cannot answer the question. So this no longer asks it. Two explicit signals
+# do the work, and both fail CLOSED for anything unrecognised:
+#
+#   - REVIEWS carry a state. GitHub's own APPROVED means "I am not asking for changes";
+#     that is a semantic fact, not a guess about the prose. COMMENTED and
+#     CHANGES_REQUESTED carry findings and need answers — from anyone, author included.
+#   - TOP-LEVEL COMMENTS have no state, so everything counts unless it is on a short,
+#     documented ignore list: bot logins that only ever post notifications, and the
+#     literal trigger phrases this skill tells you to post. An unknown bot counts.
+#
+# Add to IGNORED_COMMENT_AUTHORS deliberately, and never a bot that reviews.
+IGNORED_COMMENT_AUTHORS=${IGNORED_COMMENT_AUTHORS:-vercel,vercel[bot],dependabot,dependabot[bot],github-actions,github-actions[bot],codecov,codecov[bot]}
+# Comments that are ONLY a trigger, e.g. "@codex review". Anchored and whole-body: a
+# finding that merely mentions @codex still counts.
+TRIGGER_RE='\A[[:space:]]*@[A-Za-z0-9_-]+([[:space:]]+[A-Za-z-]+)?[[:space:]]*\z'
+
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
-# Bot-ness alone is the WRONG test for a top-level comment, and a first version got this
-# wrong: Codex is `__typename: Bot`, and it does sometimes post its findings as a plain PR
-# comment rather than a review — so excluding every bot comment would hide exactly the
-# findings this gate exists to catch. What actually separates a deploy notification from a
-# finding is whether its author reviews at all. Vercel never submits a review; Codex does.
-bodies=$(jq -s --arg me "$prauthor" \
-   '(.[0] | map(.author.login) | unique) as $reviewers
-  | (.[0] | map({author, state, body, at: .submittedAt, claimable: (.author.login != $me)}))
+bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" \
+   '($ignore | split(",")) as $skip
+  | (.[0] | map({author, state, body, at: .submittedAt,
+                 claimable: ((.state // "COMMENTED") != "APPROVED")}))
   + (.[1] | map({author, state: "COMMENT", body, at: .createdAt,
-                 claimable: (.author.login != $me
-                             and ((.author.__typename // "User") != "Bot"
-                                  or (.author.login | IN($reviewers[]))))}))' \
+                 claimable: ((.author.login | IN($skip[]) | not)
+                             and ((.body // "") | test($trig) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 
@@ -416,9 +444,19 @@ fi
 # is the right place for that policy).
 headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$payload" 2>/dev/null)
 if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
-  reviewed=$(jq -r --arg h "$headoid" '[ .[] | select((.commit.oid // "") == $h) ] | length' \
-             <<<"$reviews" 2>/dev/null || echo 0)
-  anyreview=$(jq -r 'length' <<<"$reviews" 2>/dev/null || echo 0)
+  # Only SOMEONE ELSE's review is coverage. Counting any review on the head meant the
+  # author's own `gh pr review --comment` disposition — posted after the push, as the
+  # workflow requires — marked the commit reviewed. The check certified precisely the
+  # race it was built to catch.
+  reviewed=$(jq -r --arg h "$headoid" --arg me "$prauthor" \
+             '[ .[] | select((.commit.oid // "") == $h) | select(.author.login != $me) ] | length' \
+             <<<"$reviews") || {
+    echo "verdict: BLOCKED — could not evaluate head-commit review coverage." >&2; exit 2; }
+  # No `|| echo 0`. That fallback turned "jq died" into "no reviews exist", which skips
+  # this block entirely and prints CLEAR — the fail-open shape this gate exists to refuse.
+  anyreview=$(jq -r --arg me "$prauthor" '[ .[] | select(.author.login != $me) ] | length' \
+              <<<"$reviews") || {
+    echo "verdict: BLOCKED — could not count reviews." >&2; exit 2; }
   if [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ]; then
     echo
     echo "  UNREVIEWED HEAD  ${headoid:0:9} — reviews exist, none of them cover this commit"
