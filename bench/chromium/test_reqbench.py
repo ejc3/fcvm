@@ -3862,6 +3862,11 @@ exit 1
         os.makedirs(provenance_dir, exist_ok=True)
         with open(os.path.join(provenance_dir, "reqbench-provenance.json"), "w") as f:
             json.dump({"image_id": "sha256:" + "1" * 64}, f)
+        # Every real installed snapshot carries config.json; without it the
+        # hugepage guard reads state "unknown" and (correctly) refuses
+        # BACKEND=file fail-closed rather than risking a mislabeled record.
+        with open(os.path.join(provenance_dir, "config.json"), "w") as f:
+            json.dump({"metadata": {"hugepages": False}}, f)
         argv = os.path.join(d, "argv.log")
         pyargv = os.path.join(d, "pyargv.log")
         driver_env = os.path.join(d, "driver-env.log")
@@ -5250,3 +5255,352 @@ class TimedWsUpgradeDiagnostics(unittest.TestCase):
         self.assertEqual(diagnostics["socket_local"][0], "127.0.0.1")
         self.assertEqual(diagnostics["socket_peer"][1], port)
         self.assertIsInstance(diagnostics["socket_so_error"], int)
+
+
+class MakefileBenchGraph(unittest.TestCase):
+    """The Chromium bench make targets must encode their real dependencies.
+
+    Watched red 2026-08-13 against the PHASE?=run single-target Makefile:
+    every assertion failed with "bench-chromium-request-golden not found in
+    make database" (and the PHASE target still present). That day's golden had
+    failed at RUNTIME instead — "Custom firecracker not found ... Run: fcvm
+    setup --kernel-profile default" — because the only make entry point
+    depended on `build` alone and nothing expressed the asset dependency.
+    """
+
+    REPO = os.path.dirname(os.path.dirname(HERE))
+
+    @classmethod
+    def setUpClass(cls):
+        out = subprocess.run(
+            ["make", "-C", cls.REPO, "-pq", "help"],
+            capture_output=True, text=True, timeout=120)
+        # -q exits 0/1 for up-to-date/rebuild-needed; 2 means make itself
+        # FAILED to parse — and it still prints a partial database, so
+        # trusting stdout alone lets a broken Makefile pass every structural
+        # assertion below (codex P2, 2026-08-14).
+        cls.make_rc = out.returncode
+        cls.make_stderr = out.stderr[-2000:]
+        cls.rules = {}
+        cls.recipes = {}
+        cls.phony = set()
+        cur = None
+        for line in out.stdout.splitlines():
+            if line.startswith("\t") and cur:
+                cls.recipes.setdefault(cur, []).append(line)
+                continue
+            if line.startswith(".PHONY:"):
+                cls.phony.update(line.partition(":")[2].split())
+                continue
+            if line.startswith("#"):
+                # -p interleaves "# recipe to execute (from ...)" comments
+                # between a rule and its recipe: keep cur so the recipe
+                # lines that follow still attach to their target.
+                continue
+            # Rule lines sit at column 0 as "target: prereqs". Skip recipes,
+            # special targets, and target-specific variable lines
+            # ("bench-quick: BENCH_ARGS := ..."), which contain "=".
+            if not line or line[0] in "\t." or "=" in line or ":" not in line:
+                cur = None
+                continue
+            tgt, _, prereqs = line.partition(":")
+            cur = tgt.strip()
+            cls.rules.setdefault(cur, set()).update(prereqs.split())
+
+    def prereqs(self, target):
+        self.assertIn(target, self.rules,
+                      f"{target} not found in make database")
+        return self.rules[target]
+
+    def closure(self, target):
+        seen, stack = set(), [target]
+        while stack:
+            for p in self.rules.get(stack.pop(), ()):
+                if p not in seen:
+                    seen.add(p)
+                    stack.append(p)
+        return seen
+
+    def test_make_database_is_from_a_parsable_makefile(self):
+        self.assertIn(self.make_rc, (0, 1),
+                      f"make -pq exited {self.make_rc} (fatal parse error) — "
+                      f"the database below it is partial and every other "
+                      f"assertion in this class is vacuous. stderr: "
+                      f"{self.make_stderr}")
+
+    def test_golden_depends_on_binary_and_assets(self):
+        p = self.prereqs("bench-chromium-request-golden")
+        self.assertIn("bench-chromium-request-build", p)
+        self.assertIn("setup-default", p)
+
+    def test_image_build_depends_on_fcvm_build(self):
+        self.assertIn("build", self.prereqs("bench-chromium-request-build"))
+
+    def test_measured_phases_never_rebuild(self):
+        # verify/run stage the CURRENT binary into the runtime bundle, and the
+        # run refuses a golden whose provenance records a different bundle
+        # hash. A `build` prerequisite here could swap the binary between
+        # golden and run: the seal would fail closed, but the chain would be
+        # self-breaking. The binary under test comes from the golden-time
+        # build, so these targets must not rebuild anything — TRANSITIVELY:
+        # a direct-only check passes `run: bench-chromium-request-build`,
+        # which rebuilds through its own deps (codex P2, 2026-08-14).
+        for t in ("bench-chromium-request-run", "bench-chromium-request-verify"):
+            c = self.closure(t)
+            for forbidden in ("build", "setup-default", "cargo-target-link"):
+                self.assertNotIn(forbidden, c,
+                                 f"{t} transitively reaches {forbidden}")
+
+    def test_bench_targets_are_phony(self):
+        # A stray file named like a target silently suppresses its recipe;
+        # make then reports "up to date" and nothing runs.
+        for t in ("bench-chromium-request-build", "bench-chromium-request-golden",
+               "bench-chromium-request-verify", "bench-chromium-request-run",
+               "bench-chromium-request-all", "bench-chromium-hostcdp",
+               "bench-chromium-fault"):
+            self.assertIn(t, self.phony, f"{t} missing from .PHONY")
+
+    def test_fault_target_provisions_its_hugepage_pool(self):
+        # faultbench selects uffd-huge-minor whenever the huge golden exists,
+        # and bench.sh restores the pool (commonly to zero) after creating
+        # that golden — so without provisioning here the new entry point
+        # fails immediately after the workflow that creates its own
+        # prerequisite (codex P1, 2026-08-14).
+        recipe = "\n".join(self.recipes.get("bench-chromium-fault", []))
+        # Three reads of the knob: current-value cat, the grow write, and
+        # the POST-WRITE reread. Linux accepts the write even when
+        # fragmentation delivers fewer pages, so a recipe that never
+        # rereads reports a pool it does not have (codex round 2).
+        self.assertGreaterEqual(recipe.count("nr_hugepages"), 3,
+                                "fault recipe must reread the pool "
+                                "after growing it")
+        self.assertIn("ERROR", recipe,
+                      "short delivery must fail the target")
+        # Growth is gated on the huge golden existing: a file-4k-only
+        # run must not reserve gigabytes it will never touch.
+        self.assertIn("cb-golden-huge", recipe,
+                      "pool growth must be gated on the huge golden")
+        # And the grow must hold the cross-harness pool lock (codex P1,
+        # PR #815): the pool is host-global and reqbench/faultbench/bench.sh
+        # all write it.
+        self.assertIn("hugepage-pool.lock", recipe,
+                      "fault recipe must serialize on the shared pool lock")
+        # The lock file must be creatable by unprivileged callers even when
+        # the data root is root-owned (fresh boxes): the recipe pre-creates
+        # it with sudo before flock (CodeRabbit round 2, PR #815).
+        self.assertRegex(recipe, r"sudo[^\n]*touch[^\n]*hugepage-pool\.lock",
+                         "fault recipe must sudo-pre-create the pool lock")
+
+    def test_run_help_documents_tag(self):
+        # Following the documented huge flow without TAG= on the run line
+        # measures the DEFAULT 4K tag while the huge golden sits unused
+        # (codex P2, 2026-08-14).
+        help_lines = [ln for ln in self.recipes.get("help", [])
+                      if "bench-chromium-request-run" in ln]
+        self.assertTrue(help_lines, "run target missing from help")
+        self.assertIn("TAG=", help_lines[0])
+
+    def test_full_chain_and_companion_benches(self):
+        p = self.prereqs("bench-chromium-request-all")
+        self.assertIn("build", p)
+        self.assertIn("setup-default", p)
+        self.assertIn("bench-chromium-request-build",
+                      self.prereqs("bench-chromium-hostcdp"))
+        fp = self.prereqs("bench-chromium-fault")
+        self.assertIn("build", fp)
+        self.assertIn("setup-default", fp)
+
+    def test_phase_indirection_is_gone(self):
+        # NO LEGACY: the PHASE?=run single target could not express
+        # inter-phase dependencies and is exactly how a golden ran on a box
+        # with no firecracker asset. Its survival (including as a stray
+        # .PHONY entry) means the clean break did not happen.
+        self.assertNotIn("bench-chromium-request", self.rules)
+        self.assertNotIn("bench-chromium-request", self.phony)
+
+
+class HugepageGuards(unittest.TestCase):
+    """reqbench.sh must fail closed around hugepage goldens.
+
+    Watched red 2026-08-14 before the fix: `ensure_hugepage_pool` and
+    `hugepage_snapshot_state` did not exist (bash: command not found), and
+    `cmd_run BACKEND=file` against a hugepage-snapshot fixture sailed past
+    the missing check into guard_quiet. Codex P1s: (a) a hugepage golden
+    restored with BACKEND=file silently starts a UFFD server while the
+    record says backend=file — the analyzer then gates MISLABELED data;
+    (b) the pool grow was golden-only and fixed at 2048 pages, ignoring
+    MEM and later phases (a 2050 MiB guest needs 4100 pages; a rebooted
+    box re-runs verify/run with an empty pool).
+    """
+
+    SH = os.path.join(HERE, "reqbench.sh")
+
+    def _bash(self, snippet, env_extra=None, hugepages="true"):
+        d = tempfile.mkdtemp(prefix="hugeguard-")
+
+        def _cleanup(path=d):
+            shutil.rmtree(path)
+            assert not os.path.exists(path), f"cleanup left {path}"
+
+        self.addCleanup(_cleanup)
+        snapdir = os.path.join(d, "data", "snapshots", "tag-under-test")
+        os.makedirs(snapdir)
+        with open(os.path.join(snapdir, "config.json"), "w") as f:
+            f.write('{"metadata": {"hugepages": %s, "memory_mib": 4096}}'
+                    % hugepages)
+        pool = os.path.join(d, "nr_hugepages")
+        with open(pool, "w") as f:
+            f.write("100\n")
+        binx = os.path.join(d, "bin")
+        os.makedirs(binx)
+        with open(os.path.join(binx, "sudo"), "w") as f:
+            f.write('#!/bin/bash\nexec "$@"\n')
+        os.chmod(os.path.join(binx, "sudo"), 0o755)
+        env = dict(os.environ)
+        env.update(
+            PATH=binx + os.pathsep + env["PATH"],
+            TAG="tag-under-test",
+            STATE_DIR=os.path.join(d, "data", "state"),
+            HUGEPAGE_POOL_FILE=pool,
+            MEM="1024",
+            RESULTS=os.path.join(d, "results"),
+        )
+        env.update(env_extra or {})
+        r = subprocess.run(
+            ["bash", "-c", f'source "{self.SH}" && {snippet}'],
+            capture_output=True, text=True, env=env, timeout=60)
+        return r, pool
+
+    def test_pool_grows_to_mem_derived_need(self):
+        r, pool = self._bash("ensure_hugepage_pool")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # 1024 MiB / 2 MiB per page = 512 per VM; x4 for backing + prepare
+        # VM + two teardown-overlapping clones.
+        self.assertEqual(open(pool).read().strip(), "2048")
+
+    def test_pool_need_scales_with_mem(self):
+        r, pool = self._bash("ensure_hugepage_pool", {"MEM": "2050"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(open(pool).read().strip(), "4100")
+
+    def test_pool_grow_failure_is_fatal(self):
+        # sudo "succeeds" but the write never lands (the kernel could not
+        # deliver contiguous pages): the phase must stop, not measure a
+        # hugepage cell on a starved pool.
+        r, _ = self._bash('sudo() { :; }; ensure_hugepage_pool')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("pool only", r.stdout + r.stderr,
+                      "must fail via the reread check, not incidentally")
+
+    def test_snapshot_state_reads_metadata(self):
+        for js, want in (("true", "huge"), ("false", "normal")):
+            r, _ = self._bash("hugepage_snapshot_state", hugepages=js)
+            self.assertEqual(r.stdout.strip(), want, r.stderr)
+        r, _ = self._bash('TAG=missing-tag hugepage_snapshot_state')
+        self.assertEqual(r.stdout.strip(), "unknown")
+
+    def test_cmd_run_refuses_file_backend_on_hugepage_snapshot(self):
+        r, _ = self._bash("BACKEND=file cmd_run")
+        self.assertEqual(r.returncode, 2, f"stdout={r.stdout} stderr={r.stderr}")
+        self.assertIn("BACKEND=uffd", r.stdout + r.stderr)
+
+
+class HugepageGuardsRound2(unittest.TestCase):
+    """Second codex round on the hugepage guards.
+
+    Watched red 2026-08-14 before the fix: `snapshot_memory_mib` did not
+    exist; `ensure_hugepage_pool` accepted odd MEM (2051 -> grew the pool,
+    exit 0) and sized from ambient MEM rather than the snapshot's recorded
+    memory_mib; `cmd_verify` treated unknown hugepage state as non-huge and
+    sailed on toward serve (fail-open when jq or the config is missing).
+    """
+
+    SH = HugepageGuards.SH
+    _bash = HugepageGuards._bash
+
+    def test_pool_sizes_from_snapshot_memory(self):
+        # The fixture snapshot records memory_mib=4096: verify/run must size
+        # from THAT, not from the caller's ambient MEM (default 1024) — an
+        # 8 GiB golden verified after a reboot would otherwise provision a
+        # quarter of what the first clone needs.
+        r, pool = self._bash(
+            'ensure_hugepage_pool "$(snapshot_memory_mib)"')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(open(pool).read().strip(), "8192")
+
+    def test_pool_rejects_odd_mem(self):
+        r, pool = self._bash( "ensure_hugepage_pool",
+                                   {"MEM": "2051"})
+        self.assertNotEqual(r.returncode, 0,
+                            "odd MEM must fail before touching the pool "
+                            "(fcvm rejects it AFTER we would have reserved "
+                            "gigabytes)")
+        self.assertEqual(open(pool).read().strip(), "100",
+                         "pool must be untouched on rejection")
+
+    def test_verify_fails_closed_on_unknown_state(self):
+        # jq missing / config unreadable => unknown. Proceeding as if
+        # non-huge is exactly the fail-open shape this repo bans.
+        r, _ = self._bash( "TAG=missing-tag cmd_verify")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("hugepage state", r.stdout + r.stderr)
+
+
+class SnapshotLockHeldAcrossRun(unittest.TestCase):
+    """Codex P1 (PR #815): the backend classification must happen under the
+    snapshot generation lock and the lock must stay held through the driver
+    handoff — otherwise another fcvm command can replace $TAG between the
+    hugepage_snapshot_state read and the run, and a same-shaped hugepage
+    generation slips past the BACKEND=file refusal (mislabeled data).
+
+    Watched red 2026-08-14: the exclusive-flock probe inside the stub driver
+    SUCCEEDED (no lock held during the run) and the pool-lease probe likewise.
+    """
+
+    SH = HugepageGuards.SH
+    _bash = HugepageGuards._bash
+
+    def test_fcvm_data_dir_is_aligned_with_data_root(self):
+        # fcvm resolves its snapshot paths (and therefore the generation
+        # lock file) from FCVM_DATA_DIR; reqbench derives DATA_ROOT
+        # independently. Without exporting the alignment, the two processes
+        # can lock DIFFERENT files and the generation lock is theater
+        # (CodeRabbit round 2, PR #815).
+        r, _ = self._bash('echo "FCVM_DATA_DIR=[$FCVM_DATA_DIR]"')
+        self.assertIn("FCVM_DATA_DIR=[", r.stdout)
+        self.assertNotIn("FCVM_DATA_DIR=[]", r.stdout,
+                         "reqbench.sh must export FCVM_DATA_DIR=$DATA_ROOT")
+
+    def test_generation_lock_held_shared_through_driver(self):
+        # The stub driver tries to take the generation lock EXCLUSIVE; if
+        # cmd_run holds it SHARED across the handoff, that must fail.
+        r, _ = self._bash(
+            'mkdir -p "$RESULTS/logs"; '
+            'probe() { flock -x -n "$DATA_ROOT/snapshots/$TAG.lock" true '
+            '  && echo LOCK-FREE || echo LOCK-HELD; }; '
+            'export -f probe; '
+            'REQBENCH_DRIVER_HOOK="probe" cmd_run',
+            {"BACKEND": "uffd", "UFFD_MODE": "minor"})
+        self.assertIn("LOCK-HELD", r.stdout + r.stderr)
+
+    def test_pool_lease_held_shared_through_phase(self):
+        r, _ = self._bash(
+            'mkdir -p "$RESULTS/logs"; '
+            'probe() { flock -x -n "$DATA_ROOT/hugepage-pool.lock" true '
+            '  && echo POOL-FREE || echo POOL-HELD; }; '
+            'export -f probe; '
+            'REQBENCH_DRIVER_HOOK="probe" cmd_run',
+            {"BACKEND": "uffd", "UFFD_MODE": "minor"})
+        self.assertIn("POOL-HELD", r.stdout + r.stderr)
+
+    def test_pool_grow_respects_exclusive_holder(self):
+        # While another process holds the pool lock exclusive, a grow must
+        # not proceed concurrently: bounded wait, then fail closed.
+        r, pool = self._bash(
+            'touch "$DATA_ROOT/hugepage-pool.lock"; '
+            'exec 9<>"$DATA_ROOT/hugepage-pool.lock"; flock -x 9; '
+            'HUGEPAGE_POOL_LOCK_WAIT=1 ensure_hugepage_pool')
+        self.assertNotEqual(r.returncode, 0,
+                            "grow must not race a concurrent pool owner")
+        self.assertEqual(open(pool).read().strip(), "100",
+                         "pool must be untouched while another owner holds it")

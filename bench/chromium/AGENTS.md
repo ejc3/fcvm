@@ -13,23 +13,38 @@ nothing. Every rule below exists because one of them broke.
 
 ## Running the gated request benchmark end to end
 
-The phases are separate subcommands and the order is not optional. `golden`
-does NOT build the image — on a box that has never built it, `golden` dies
-with `localhost/chromium-bench-req: image not known`, so `build` comes first.
-After rebuilding fcvm or fc-agent, `make setup-fcvm` must run before `golden`:
-the initrd is content-addressed by the fc-agent binary's SHA, `make build`
-does not create it, and `podman prepare` refuses rather than auto-creating
-("fc-agent initrd not found. Run 'fcvm setup' first"):
+The phases are separate make targets and the order is not optional. The
+dependency graph is IN the Makefile now, so make — not the operator — walks
+it: the golden depends on the container image build and on `setup-default`
+(kernel, rootfs, initrd, firecracker; their absence is the runtime failure
+"Custom firecracker not found ... Run: fcvm setup"), and the image build
+depends on the fcvm binary build. Drive the phases through make; the raw
+`bash bench/chromium/reqbench.sh <phase>` route skips the dependency graph
+and is how goldens died on half-set-up boxes (2026-08-13, twice in one day):
 
 ```bash
-cd ~/src/fcvm            # phases resolve the repo root from the script path
-make build && make setup-fcvm            # setup-fcvm creates the initrd for the NEW fc-agent SHA
-bash bench/chromium/reqbench.sh build    # podman build --format docker (HEALTHCHECK is load-bearing)
-bash bench/chromium/reqbench.sh golden   # podman prepare: cold build, snapshot at the health gate
-bash bench/chromium/reqbench.sh verify   # prove all three hops on a RESTORED clone before measuring
-BACKEND=uffd REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-uffd-200 bash bench/chromium/reqbench.sh run
-BACKEND=file REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-file-200 bash bench/chromium/reqbench.sh run
+cd ~/src/fcvm
+make bench-chromium-request-golden       # deps: fcvm build -> image build -> setup-default -> golden
+make bench-chromium-request-verify       # prove all three hops on a RESTORED clone before measuring
+make bench-chromium-request-run BACKEND=uffd REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-uffd-200
+make bench-chromium-request-run BACKEND=file REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-file-200
 ```
+
+Knobs pass as make command-line variables (make exports them to the recipe
+environment): `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `UFFD_MODE=`,
+`UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=`. Hugepage goldens
+are part of the snapshot identity — give them their own tag
+(`make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`;
+the same `TAG=` must then be passed to `-verify` and `-run`, or they select
+the default snapshot).
+
+`verify` and `run` deliberately have NO build dependency: reqbench.sh seals
+fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and the
+run refuses a golden whose provenance records a different bundle hash.
+Rebuilding — or editing any sealed file — between golden and run therefore
+invalidates the chain; regolden instead of fighting the seal. The structural
+pin for all of this is `MakefileBenchGraph` in `test_reqbench.py`
+(`make test-chromium-request`).
 
 The acceptance gate is >=200 measured requests PER BACKEND (`uffd` and `file`)
 at zero failures. For anything long-running on a remote box, write the chain

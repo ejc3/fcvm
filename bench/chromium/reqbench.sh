@@ -83,6 +83,11 @@ URL="${URL:-http://127.0.0.1:8000/medium.html}"
 
 STATE_DIR="${STATE_DIR:-/mnt/fcvm-btrfs/state}"
 DATA_ROOT="${DATA_ROOT:-$(dirname "$STATE_DIR")}"
+# fcvm resolves snapshots/ (and the generation lock this harness shares with
+# it) from FCVM_DATA_DIR. reqbench derives DATA_ROOT independently; export
+# the alignment so both processes always lock the SAME files even when the
+# caller overrides the paths.
+export FCVM_DATA_DIR="$DATA_ROOT"
 LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 QUIET_LOADAVG1_LIMIT="2.0"
 QUIET_GUARD_LOADAVG1=""
@@ -442,7 +447,7 @@ cmd_build() {
 }
 
 cmd_golden() {
-    log "golden: podman prepare --tag $TAG (cold build, snapshot at the image health gate)"
+    log "golden: podman prepare --tag $TAG (cold build, snapshot at the image health gate, hugepages=$HUGEPAGES)"
     local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
     local image_record image_digest image_id image_cache_key
     # One inspect binds the mutable tag's manifest digest and immutable image ID
@@ -485,7 +490,12 @@ cmd_golden() {
     # captured separately from the log so the provenance below can be bound to
     # THAT generation rather than to whatever currently sits under the tag.
     local prepared_json="$RESULTS/logs/golden-prepared.json"
-    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force \
+    local huge_flag=""
+    if [ "$HUGEPAGES" = 1 ]; then
+        huge_flag="--hugepages"
+        ensure_hugepage_pool || return 1
+    fi
+    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag \
         --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
         --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" 2>"$lf" >"$prepared_json" \
         || { log "golden: PREPARE FAILED"; tail -20 "$lf" >&2; return 1; }
@@ -658,6 +668,20 @@ cmd_verify() {
     # after printing three FAILED lines. verify is documented as the gate; a gate
     # that cannot fail is not a gate.
     local fail=0
+    # A rebooted or pool-shrunk box re-runs verify against a persisted huge
+    # golden with an empty pool; grow it here, not only at golden time.
+    # unknown refuses: jq missing or an unreadable config would otherwise
+    # skip provisioning fail-OPEN and die mid-serve instead.
+    acquire_generation_lock || return 1
+    local huge_state
+    huge_state=$(hugepage_snapshot_state)
+    if [ "$huge_state" = unknown ]; then
+        log "verify: cannot determine hugepage state for '$TAG' (config.json unreadable or jq missing)"
+        return 1
+    fi
+    if [ "$huge_state" = huge ]; then
+        ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
+    fi
     log "verify: starting serve for $TAG"
     local sf="$RESULTS/logs/verify-serve.log"
     $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
@@ -763,8 +787,145 @@ UFFD_MODE="${UFFD_MODE:-copy}"
 # binary default and an env override could not be excluded, making replay's
 # contribution unattributable.
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
+# Hugepage-backed guest memory (2MB pages). Part of the snapshot identity, so
+# the golden must be CREATED with it; serve/restore inherit it from snapshot
+# metadata. Use a distinct TAG (e.g. cb-req-golden-huge) so plain and huge
+# goldens coexist. faultbench measured huge+minor at zero userspace faults
+# per render — this knob puts that configuration on the request path.
+HUGEPAGES="${HUGEPAGES:-0}"
+# Overridable for unit tests only; production is the real kernel knob.
+HUGEPAGE_POOL_FILE="${HUGEPAGE_POOL_FILE:-/proc/sys/vm/nr_hugepages}"
+
+# "huge", "normal", or "unknown" for the INSTALLED snapshot under $TAG.
+# unknown (unreadable/missing config.json) must be treated fail-closed by
+# callers that would mislabel data on a wrong guess.
+hugepage_snapshot_state() {
+    local v
+    v=$($SUDO jq -r '.metadata.hugepages' \
+        "$DATA_ROOT/snapshots/$TAG/config.json" 2>/dev/null) || { echo unknown; return; }
+    case "$v" in
+        true) echo huge ;;
+        false|null) echo normal ;;
+        *) echo unknown ;;
+    esac
+}
+
+# 2MB pages: a MEM-MiB guest needs MEM/2 pages. Sized for the worst
+# concurrent set — serve backing memfd + the prepare/verify VM + two clones
+# overlapping across a teardown boundary => 4x. Grow-only, and fails closed
+# when the kernel cannot deliver the pages (fragmentation): a hugepage phase
+# quietly starting on a starved pool would die mid-measurement, or worse,
+# measure a mixed-page configuration.
+ensure_hugepage_pool() {
+    # $1: guest MiB to size for (defaults to $MEM). Measured phases pass the
+    # SNAPSHOT's recorded memory_mib — sizing from the caller's ambient MEM
+    # under-provisions when a big golden is verified with default knobs.
+    local mem="${1:-$MEM}" need cur
+    if [ $((mem % 2)) -ne 0 ]; then
+        # fcvm rejects odd MEM too, but only AFTER we would have reserved
+        # gigabytes of pool for an invocation that can never boot.
+        log "hugepages: MEM=${mem} is not divisible by 2 (2MB pages)"
+        return 1
+    fi
+    need=$(( (mem / 2) * 4 ))
+    # The pool is host-global state shared by every harness (reqbench,
+    # faultbench, bench.sh, make setup-hugepages). One flock serializes all
+    # of them (codex P1, PR #815): a phase that DEPENDS on the pool keeps the
+    # fd open holding it SHARED for the phase lifetime; a grow upgrades to
+    # EXCLUSIVE and atomically downgrades. Bounded waits fail closed rather
+    # than hanging behind a stuck owner.
+    local wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
+    local pool_lock="$DATA_ROOT/hugepage-pool.lock"
+    mkdir -p "$DATA_ROOT" 2>/dev/null || true
+    touch "$pool_lock" 2>/dev/null || true
+    if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
+        exec {REQBENCH_POOL_LOCK_FD}<>"$pool_lock" || true
+    fi
+    if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
+        log "hugepages: pool lock unavailable at $pool_lock"
+        return 1
+    fi
+    if ! flock -s -w "$wait_s" "$REQBENCH_POOL_LOCK_FD"; then
+        log "hugepages: pool lock busy for ${wait_s}s; refusing to race the owner"
+        return 1
+    fi
+    cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
+    if [ "$cur" -lt "$need" ]; then
+        if ! flock -x -w "$wait_s" "$REQBENCH_POOL_LOCK_FD"; then
+            log "hugepages: pool lock busy for ${wait_s}s; refusing to race the owner"
+            return 1
+        fi
+        # Re-read under the exclusive lock: another grower may have won.
+        cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
+        if [ "$cur" -lt "$need" ]; then
+            log "hugepages: growing pool $cur -> $need (${mem}MiB guest x4)"
+            # Literal sudo, NOT $SUDO: $SUDO is empty by default (rootless
+            # needs no privilege), but writing the kernel pool knob requires
+            # root in every mode. $SUDO here would break the rootless path.
+            sudo sh -c 'echo "$1" > "$2"' _ "$need" "$HUGEPAGE_POOL_FILE"
+            cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
+        fi
+        flock -s "$REQBENCH_POOL_LOCK_FD"
+        if [ "$cur" -lt "$need" ]; then
+            log "hugepages: pool only $cur/$need pages (fragmentation?)"
+            return 1
+        fi
+    fi
+    # fd stays open: the SHARED lease lives until the phase shell exits.
+}
+
+# Shared generation lock, held (via fd inheritance) from backend
+# classification through the driver handoff, so another fcvm command cannot
+# replace $TAG between the hugepage check and the measured run (codex P1,
+# PR #815): fcvm snapshot create/delete take this lock exclusive.
+acquire_generation_lock() {
+    local gen_lock="$DATA_ROOT/snapshots/$TAG.lock"
+    mkdir -p "$(dirname "$gen_lock")" 2>/dev/null || true
+    touch "$gen_lock" 2>/dev/null || true
+    if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
+        exec {REQBENCH_GEN_LOCK_FD}<>"$gen_lock" || true
+    fi
+    if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
+        log "generation lock unavailable at $gen_lock"
+        return 1
+    fi
+    if ! flock -s -w "${HUGEPAGE_POOL_LOCK_WAIT:-60}" "$REQBENCH_GEN_LOCK_FD"; then
+        log "generation lock busy for '$TAG'; refusing to classify a moving target"
+        return 1
+    fi
+}
+
+# The installed snapshot's guest size; falls back to ambient MEM when the
+# config predates the field.
+snapshot_memory_mib() {
+    local v
+    v=$($SUDO jq -er '.metadata.memory_mib' \
+        "$DATA_ROOT/snapshots/$TAG/config.json" 2>/dev/null) || v="$MEM"
+    echo "$v"
+}
 
 cmd_run() {
+    # Backend/pool sanity BEFORE the quiet gate: these are configuration
+    # errors, not load conditions. A hugepage snapshot cannot be restored
+    # file-backed — fcvm silently starts a UFFD server and the record would
+    # say backend=file, so the analyzer would gate MISLABELED data. unknown
+    # (unreadable config.json) refuses too: fail closed, never guess.
+    acquire_generation_lock || return 1
+    local huge_state
+    huge_state=$(hugepage_snapshot_state)
+    if [ "$BACKEND" = file ] && [ "$huge_state" != normal ]; then
+        log "run: BACKEND=file refused: snapshot '$TAG' hugepage state is '$huge_state' (a hugepage snapshot restores via an implicit UFFD server and the record would be mislabeled); use BACKEND=uffd or a non-hugepage TAG"
+        return 2
+    fi
+    if [ "$huge_state" = huge ]; then
+        ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
+    fi
+    if [ -n "${REQBENCH_DRIVER_HOOK:-}" ]; then
+        # Test seam: runs inside the held generation + pool locks, exactly
+        # where the driver handoff happens.
+        "$REQBENCH_DRIVER_HOOK"
+        return $?
+    fi
     local guard_rc=0
     guard_quiet || guard_rc=$?
     if [ "$guard_rc" -ne 0 ]; then

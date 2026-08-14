@@ -395,6 +395,47 @@ may both be reports about code you are not editing. Use the appropriate Make tar
 believing a result, confirm `readlink -f target` resolves to this worktree's unique target
 directory and the `Running .../deps/<binary>` line points beneath it.
 
+### Chromium bench harness is make-driven (bench/chromium)
+
+Drive every bench phase through make — the dependency graph lives in the
+Makefile, so half-set-up boxes fail at `make` time instead of mid-golden
+(2026-08-13: two goldens died at runtime, first on a missing fcvm binary,
+then on "Custom firecracker not found", because a hand-rolled runner called
+`reqbench.sh` directly):
+
+| Target | Deps | Knobs (command-line vars; make exports them) |
+|--------|------|----------------------------------------------|
+| `bench-chromium-request-build` | `build` | container image only |
+| `bench-chromium-request-golden` | `bench-chromium-request-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=` |
+| `bench-chromium-request-verify` | none (sealed bundle) | `TAG=` |
+| `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=` |
+| `bench-chromium-request-all` | `build` + `setup-default` | all of the above, one seal |
+| `bench-chromium-hostcdp` | `bench-chromium-request-build` | host-container CDP baseline, no VM |
+| `bench-chromium-fault` | `build` + `setup-default` | `FAULT_OUT=` (required), `FAULT_ARGS=` |
+
+- **verify/run must never gain a `build` dependency.** reqbench.sh seals
+  fcvm + fc-agent + its five sources into a hash-bound runtime bundle; the
+  run refuses a golden recorded under a different bundle hash. A rebuild (or
+  any edit to a sealed file) between golden and run invalidates the chain —
+  regolden, don't fight the seal. Sealed set: reqbench.{sh,py},
+  reqanalyze.py, cdpdrive.py, render.py, fcvm, fc-agent — the Makefile and
+  test files are NOT sealed and stay editable mid-run.
+- Hugepage goldens are part of the snapshot identity: distinct tag, e.g.
+  `make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`
+  (the golden grows the pool to 2048x2MB pages and fails closed if the
+  kernel cannot deliver them).
+- Quiet-box gates: `run` refuses when 1-min load exceeds 2.0 or stray
+  fcvm/firecracker processes exist (hostcdp refuses at >= 1.0, faultbench above 1.0).
+  Do not start builds — or ANY box-local work, including analysis scripts and
+  background agents — while a measured run is in flight; the noop drift gate
+  catches the contamination and voids the run (burned twice, 2026-08-13).
+- BACKEND=file is refused against a hugepage TAG (fcvm restores those via an
+  implicit UFFD server; the record would be mislabeled), and the pool is
+  ensured MEM-derived (4 x MEM/2 pages) at golden, verify, AND run time.
+- Structural pin: `MakefileBenchGraph` in bench/chromium/test_reqbench.py
+  (`make test-chromium-request`) — it fails if the dependency graph or the
+  no-rebuild property of the measured phases regresses.
+
 ## NEVER ROUTE AROUND BUILD PROCESSES
 
 **If a build fails, FIX THE BUILD. Never manually copy files.**
