@@ -997,15 +997,16 @@ fn continue_hit_present_page(e: &userfaultfd::Error) -> bool {
 /// whole virtio plane dead. A failed wake is the hang this call exists to prevent, so it
 /// propagates into the fail-closed kill path rather than being logged and limped past.
 fn wake_eexist_waiters(uffd: &Uffd, addr: usize, len: usize) -> Result<()> {
-    uffd.wake(addr as *mut std::ffi::c_void, len).map_err(|wake_error| {
-        anyhow!(
-            "UFFDIO_WAKE after EEXIST failed at 0x{:x}+{}: {:?} — a stranded faulter \
+    uffd.wake(addr as *mut std::ffi::c_void, len)
+        .map_err(|wake_error| {
+            anyhow!(
+                "UFFDIO_WAKE after EEXIST failed at 0x{:x}+{}: {:?} — a stranded faulter \
              would hang its thread permanently",
-            addr,
-            len,
-            wake_error
-        )
-    })
+                addr,
+                len,
+                wake_error
+            )
+        })
 }
 
 /// Whether a UFFDIO_CONTINUE error is the kernel saying "not now, try again".
@@ -3670,20 +3671,16 @@ mod tests {
         // CONTROL device: the real uffd comes from its USERFAULTFD_IOC_NEW ioctl
         // (_IO(0xAA, 0x00)), with the O_* flags as the ioctl argument.
         const USERFAULTFD_IOC_NEW: libc::c_ulong = 0xAA00;
-        let dev = unsafe { libc::open(c"/dev/userfaultfd".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        let dev =
+            unsafe { libc::open(c"/dev/userfaultfd".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         assert!(
             dev >= 0,
             "open /dev/userfaultfd: {}",
             std::io::Error::last_os_error()
         );
         // SAFETY: valid control fd; IOC_NEW returns a fresh uffd fd.
-        let raw = unsafe {
-            libc::ioctl(
-                dev,
-                USERFAULTFD_IOC_NEW,
-                libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
+        let raw =
+            unsafe { libc::ioctl(dev, USERFAULTFD_IOC_NEW, libc::O_CLOEXEC | libc::O_NONBLOCK) };
         assert!(
             raw >= 0,
             "USERFAULTFD_IOC_NEW: {}",
@@ -3798,8 +3795,7 @@ mod tests {
             .expect("winner's CONTINUE must succeed");
 
         // The handler under test answers the consumed fault: it must see EEXIST and wake.
-        let outcome =
-            continue_page(&uffd, "eexist-wake-test", addr, PAGE).expect("continue_page");
+        let outcome = continue_page(&uffd, "eexist-wake-test", addr, PAGE).expect("continue_page");
         assert!(matches!(outcome, ContinueOutcome::Resolved));
 
         let got = rx.recv_timeout(Duration::from_secs(5)).expect(
