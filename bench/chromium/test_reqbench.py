@@ -5834,3 +5834,42 @@ class CorpusMixUrls(unittest.TestCase):
         self.assertIn('meta.get("urls")', body,
                       "schedule validation must accept a declared URL set, "
                       "not only a single meta.url")
+
+
+class PortProbeResolution(unittest.TestCase):
+    """wait_port must measure readiness on a fine grid.
+
+    Watched red 2026-08-14: with the 1ms x1.5 backoff capped at 20 ms, probe
+    attempts land ~17-20 ms apart past the ramp (cumulative sleeps ~39.8,
+    56.9, 76.9 ms), so a port that opens at 45 ms was reported as ~57 ms.
+    That grid quantized a ~1-2 ms real teardown-adjacency effect into the
+    "17 ms bimodal restore floor" that consumed 2026-08-14; every published
+    restore figure sat on these grid points rather than on true readiness.
+    """
+
+    def test_readiness_is_resolved_within_3ms(self):
+        import socket as _socket
+        import threading
+
+        srv = _socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        ready_at_s = 0.045
+
+        def open_late():
+            time.sleep(ready_at_s)
+            srv.listen(1)
+
+        t = threading.Thread(target=open_late)
+        t.start()
+        try:
+            measured = reqbench.wait_port(
+                f"127.0.0.1:{port}", time.monotonic() + 10.0)
+        finally:
+            t.join()
+            srv.close()
+        self.assertGreaterEqual(measured, ready_at_s * 1000 - 1)
+        self.assertLessEqual(
+            measured, ready_at_s * 1000 + 3.5,
+            f"wait_port reported {measured:.1f} ms for a port ready at "
+            f"{ready_at_s * 1000:.0f} ms: the probe grid is too coarse")

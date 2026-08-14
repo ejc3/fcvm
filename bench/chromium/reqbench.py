@@ -911,7 +911,13 @@ def wait_port(
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(delay, remaining))
-            delay = min(delay * 1.5, 0.02)
+            # Cap at 2 ms, not 20: with a 20 ms cap the attempts past the
+            # ramp land ~17-20 ms apart (cumulative ~39.8/56.9/76.9 ms), and
+            # every restore-readiness figure snapped to those grid points —
+            # a ~1-2 ms real effect near an attempt boundary read as a clean
+            # "17 ms bimodal restore floor" (2026-08-14). ~20 extra connect
+            # attempts per 40 ms wait is noise; measurement resolution is not.
+            delay = min(delay * 1.5, 0.002)
 
 
 def sha256_file(path: str) -> str:
