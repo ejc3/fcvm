@@ -5873,3 +5873,18 @@ class PortProbeResolution(unittest.TestCase):
             measured, ready_at_s * 1000 + 3.5,
             f"wait_port reported {measured:.1f} ms for a port ready at "
             f"{ready_at_s * 1000:.0f} ms: the probe grid is too coarse")
+
+
+class GuestDnsKnob(unittest.TestCase):
+    """GUEST_DNS must reach the golden's podman prepare as --dns.
+
+    Watched red 2026-08-14: the knob did not exist and the prepare argv
+    carried no --dns.
+    """
+
+    SH = HugepageGuards.SH
+
+    def test_guest_dns_reaches_prepare_argv(self):
+        src = open(self.SH).read()
+        self.assertIn('GUEST_DNS="${GUEST_DNS:-}"', src)
+        self.assertIn('--dns "$GUEST_DNS"', src)
