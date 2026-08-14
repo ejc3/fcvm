@@ -173,7 +173,7 @@ fi
 #                          fixture server; must be baked in BEFORE the snapshot
 # --disable-gpu          : no GPU on this platform; forces deterministic software raster
 # --disable-dev-shm-usage: podman default /dev/shm is 64MB; raster buffers go to /tmp
-# --user-data-dir=/tmp   : keep profile writes in /tmp so a --tmpfs /tmp mount keeps
+# --user-data-dir=/dev/shm/ud   : keep profile writes in /tmp so a --tmpfs /tmp mount keeps
 #                          dirtied rootfs extents (and destroy cost) down
 # remaining flags        : startup-variance reduction (no first-run, no background
 #                          fetches, no crash uploader, fixed window)
@@ -189,7 +189,7 @@ HOME=/tmp chromium \
     --remote-allow-origins='*' \
     --ignore-certificate-errors \
     --disable-gpu \
-    --disable-dev-shm-usage \
+    --disk-cache-size=0 \
     --window-size=1280,800 \
     --hide-scrollbars \
     --mute-audio \
@@ -198,7 +198,7 @@ HOME=/tmp chromium \
     --disable-background-networking \
     --disable-breakpad \
     --disable-component-update \
-    --user-data-dir=/tmp/chrome-profile \
+    --user-data-dir=/dev/shm/ud/chrome-profile \
     $SITE_ISO_FLAGS \
     ${CHROMIUM_EXTRA_FLAGS:-} \
     about:blank &
