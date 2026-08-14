@@ -3069,7 +3069,10 @@ fn run_args_from_snapshot_metadata(
         .collect();
 
     RunArgs {
-        dns: None,
+        // The captured resolver, not None: fc-agent rewrites resolv.conf on a
+        // cold boot from this synthesized config, and falling back to the
+        // current host DNS would silently replace what the snapshot baked in.
+        dns: meta.network_config.dns_server.clone(),
         name,
         cpu,
         mem,
@@ -3360,6 +3363,16 @@ mod tests {
         meta2.username = None;
         let args2 = run_args_from_snapshot_metadata(&meta2, "c".to_string(), 1, 512, false, None);
         assert!(args2.env.is_empty());
+
+        // The captured resolver must survive into a cold boot: fc-agent
+        // rewrites resolv.conf from these synthesized args, and dns: None
+        // means "current host DNS", silently replacing what the snapshot
+        // baked in.
+        let mut meta_dns = meta.clone();
+        meta_dns.network_config.dns_server = Some("192.0.2.53".to_string());
+        let args_dns =
+            run_args_from_snapshot_metadata(&meta_dns, "c".to_string(), 1, 512, false, None);
+        assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
         // Recorded NFS shares must survive into the cold-boot RunArgs (a
         // disk-only clone of an NFS VM used to silently lose its shares).

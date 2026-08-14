@@ -272,10 +272,7 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // Additional boot args from RuntimeConfig (kernel profile) or FCVM_BOOT_ARGS env var
-    let extra_boot_args = runtime_config
-        .boot_args
-        .clone()
-        .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok());
+    let extra_boot_args = effective_extra_boot_args(runtime_config);
     if let Some(ref extra) = extra_boot_args {
         if !boot_args.is_empty() {
             boot_args.push(' ');
@@ -974,6 +971,19 @@ pub(super) async fn run_vm_setup(
 ///   * initial `fcvm podman run` (run_vm_setup_inner, cache miss)
 ///   * the snapshot-restore path's up-front reboot plan (a rebooted restored clone
 ///     cold-boots from its current provisioned disk — disk-only-clone semantics)
+/// The extra kernel boot args a launch will actually append: the kernel
+/// profile's `boot_args`, or the FCVM_BOOT_ARGS env fallback. One derivation,
+/// used both by the snapshot-key config (hashed) and by the runtime cmdline
+/// assembly (applied), so the hashed value and the applied value cannot drift.
+pub(crate) fn effective_extra_boot_args(
+    runtime_config: &crate::commands::common::RuntimeConfig,
+) -> Option<String> {
+    runtime_config
+        .boot_args
+        .clone()
+        .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok())
+}
+
 pub(crate) fn build_launch_config(
     args: &RunArgs,
     rootfs_path: &std::path::Path,
@@ -1038,6 +1048,9 @@ pub(crate) fn build_launch_config(
         // Cache-key isolation for guest failpoints (see field docs): the spec is
         // forwarded to the guest by build_runtime_boot_args from the same env var.
         guest_failpoint: std::env::var("FCVM_GUEST_FAILPOINT").ok(),
+        dns_server: args.dns.clone(),
+        agent_strace: args.strace_agent,
+        extra_boot_args: effective_extra_boot_args(runtime_config),
         // Launch-only config: never hashed into a snapshot key, so the image
         // disk's build identity is not resolved here.
         image_disk_identity: None,
@@ -1523,6 +1536,106 @@ mod tests {
     }
 
     use super::*;
+
+    /// Fail-closed inventory of the runtime kernel-cmdline tokens. Everything
+    /// build_runtime_boot_args emits is guest-visible, so each token must be
+    /// either derived from a hashed FirecrackerConfig field or consciously
+    /// listed here as per-instance (excluded from the snapshot key by design)
+    /// or as tracked unhashed state (#821). A new push_str token fails this
+    /// test until its author hashes it into the key or adds it below with a
+    /// disposition — the fail-open alternative is a --dns-style silent
+    /// cache-hit bug.
+    #[test]
+    fn runtime_boot_arg_tokens_are_hashed_or_allowlisted() {
+        const EXPECTED: &[(&str, &str)] = &[
+            (
+                "ip",
+                "per-instance addresses; excluded from the key by design",
+            ),
+            (
+                "ipv6",
+                "per-instance addresses; excluded from the key by design",
+            ),
+            (
+                "fcvm_dns",
+                "--dns override hashed via FirecrackerConfig.dns_server; the \
+                 no-override host fallback is tracked in #821",
+            ),
+            (
+                "fcvm_dns_search",
+                "host-derived at launch; unhashed, tracked in #821",
+            ),
+            (
+                "fc_agent_strace",
+                "hashed via FirecrackerConfig.agent_strace",
+            ),
+            (
+                "fuse_readers",
+                "guest-visible knob; unhashed, tracked in #821",
+            ),
+            (
+                "fuse_trace_rate",
+                "guest-visible knob; unhashed, tracked in #821",
+            ),
+            (
+                "fcvm_failpoint",
+                "hashed via FirecrackerConfig.guest_failpoint",
+            ),
+            (
+                "fuse_max_write",
+                "guest-visible knob; unhashed, tracked in #821",
+            ),
+            (
+                "no_writeback_cache",
+                "guest-visible knob; unhashed, tracked in #821",
+            ),
+        ];
+        let src = include_str!("vm_config.rs");
+        let start = src
+            .find("fn build_runtime_boot_args")
+            .expect("build_runtime_boot_args present in vm_config.rs");
+        let end = src[start..]
+            .find("\npub(super) async fn attach_extra_disks")
+            .expect("attach_extra_disks still follows build_runtime_boot_args")
+            + start;
+        let body = &src[start..end];
+        // Extract the token name from every push_str carrying a string
+        // literal, including multi-line format! calls (the ip= literal sits
+        // on the line after its push_str). A ')' before the next '"' means
+        // the call carries no literal at all — push_str(extra), which is
+        // hashed whole via FirecrackerConfig.extra_boot_args.
+        let mut found: Vec<String> = Vec::new();
+        let mut rest = body;
+        while let Some(i) = rest.find("push_str") {
+            rest = &rest[i + "push_str".len()..];
+            let (Some(q), Some(c)) = (rest.find('"'), rest.find(')')) else {
+                continue;
+            };
+            if c < q {
+                continue;
+            }
+            let lit = &rest[q + 1..];
+            let token: String = lit
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect();
+            if token.is_empty() {
+                continue;
+            }
+            assert!(
+                lit[token.len()..].starts_with('='),
+                "cmdline literal starting {token:?} must have the shape token=value"
+            );
+            found.push(token);
+        }
+        let expected: Vec<&str> = EXPECTED.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            found, expected,
+            "runtime boot-arg token inventory changed: hash the new token into \
+             FirecrackerConfig (see the guest_failpoint field for the pattern) \
+             or add it to EXPECTED with a disposition"
+        );
+    }
 
     #[test]
     fn test_rebuild_proxy_url_preserves_auth_and_query() {

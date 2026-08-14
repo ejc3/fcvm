@@ -1191,6 +1191,7 @@ async fn prepare_vm_for_lifecycle(
             resolved_mode,
             runtime_config.firecracker_bin.as_deref(),
             image_disk_identity.clone(),
+            vm_config::effective_extra_boot_args(&runtime_config),
         );
         let key = config.snapshot_key();
 
@@ -2695,11 +2696,60 @@ mod tests {
             non_blocking_output: false,
             label: vec![],
             ipv6_prefix: None,
+            dns: None,
             image: "alpine:latest".to_string(),
             command_args: vec![],
             rootfs_override: None,
             image_disk_override: None,
         }
+    }
+
+    /// Guest-visible launch inputs must change the snapshot key. --dns is
+    /// baked into the guest's resolv.conf, so two runs differing only in --dns
+    /// must never share a snapshot; before FirecrackerConfig carried these
+    /// fields the keys came out equal and a cache hit silently kept the old
+    /// resolver. Same guarantee for --strace-agent and extra boot args.
+    #[test]
+    fn guest_visible_inputs_change_snapshot_key() {
+        use std::path::Path;
+        let key = |args: &RunArgs, extra: Option<String>| {
+            build_firecracker_config(
+                args,
+                "sha256:test",
+                Path::new("/kernel"),
+                Path::new("/rootfs"),
+                Path::new("/initrd"),
+                None,
+                ImageMode::Overlay,
+                None,
+                None,
+                extra,
+            )
+            .snapshot_key()
+        };
+        let base = test_args();
+
+        let mut with_dns = test_args();
+        with_dns.dns = Some("10.0.2.2".to_string());
+        assert_ne!(
+            key(&base, None),
+            key(&with_dns, None),
+            "--dns must change the key"
+        );
+
+        let mut with_strace = test_args();
+        with_strace.strace_agent = true;
+        assert_ne!(
+            key(&base, None),
+            key(&with_strace, None),
+            "--strace-agent must change the key"
+        );
+
+        assert_ne!(
+            key(&base, None),
+            key(&base, Some("arm64.nv2".to_string())),
+            "extra boot args must change the key"
+        );
     }
 
     #[test]

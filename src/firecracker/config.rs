@@ -124,6 +124,26 @@ pub struct FirecrackerConfig {
     /// entries. None (the default) is skip-serialized so existing keys are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_failpoint: Option<String>,
+    /// DNS override from --dns. fc-agent writes it into the guest's resolv.conf
+    /// at boot, so it is baked into any snapshot taken from the VM; without this
+    /// field a run with a different --dns cache-hits a snapshot answering with
+    /// the old resolver and the flag is silently ignored. None (the default,
+    /// mode-derived DNS) is skip-serialized so existing keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_server: Option<String>,
+    /// Whether fc-agent straces the container (fc_agent_strace=1 on the kernel
+    /// cmdline, from --strace-agent). Guest-visible boot behavior baked into
+    /// snapshots, so part of the cache key. false is skip-serialized so
+    /// existing keys are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_strace: bool,
+    /// Effective extra kernel boot args (RuntimeConfig.boot_args or
+    /// FCVM_BOOT_ARGS). Appended to the runtime cmdline at launch and therefore
+    /// baked into the guest, so part of the cache key — a profile with
+    /// different boot args must never share a snapshot with one without them.
+    /// None (the default) is skip-serialized so existing keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_boot_args: Option<String>,
     /// Build identity (inode:size:mtime) of the attached image-delivery disk
     /// (overlay storage image or Docker archive). The disk's PATH is
     /// content-addressed by image digest and so survives rebuilds — but
@@ -166,6 +186,9 @@ impl Default for FirecrackerConfig {
             portable_volumes: false,
             firecracker_bin: None,
             guest_failpoint: None,
+            dns_server: None,
+            agent_strace: false,
+            extra_boot_args: None,
             image_disk_identity: None,
         }
     }

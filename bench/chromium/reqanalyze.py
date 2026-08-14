@@ -49,6 +49,18 @@ import uuid
 
 
 MIN_CDP_ATTEMPTS_PER_BACKEND = 200
+
+
+def is_cdp_class(arm):
+    """Arms that pay the per-request CDP handshake: cdp, cdp-fast, and html.
+
+    Both the sample-size gate and the stage decomposition key off this
+    predicate. A name test scattered as startswith("cdp") let the html arm
+    fall out of both: a mixed run could publish an html latency from fewer
+    than 200 measured attempts, and analysis.json dropped every
+    connection/extraction stage for it.
+    """
+    return isinstance(arm, str) and (arm.startswith("cdp") or arm == "html")
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
@@ -1524,10 +1536,10 @@ def analyze_backend(
     expected_cdp_arms = set()
     for meta in metas:
         for arm in meta.get("arms") or []:
-            if isinstance(arm, str) and arm.startswith("cdp"):
+            if is_cdp_class(arm):
                 expected_cdp_arms.add(arm)
     if not expected_cdp_arms:
-        expected_cdp_arms.update(a for a in arms if a.startswith("cdp"))
+        expected_cdp_arms.update(a for a in arms if is_cdp_class(a))
     expected_cdp_arms = sorted(expected_cdp_arms)
     cdp_counts = {
         a: len(measured_attempted.get(a, [])) for a in expected_cdp_arms
@@ -1668,7 +1680,13 @@ def analyze_backend(
     print("-" * 78)
     stage_keys = ["resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms", "connect_total_ms",
                   "navigate_ms", "screenshot_ms", "total_ms"]
-    for a in [x for x in arms if x.startswith("cdp")]:
+    for a in [x for x in arms if is_cdp_class(x)]:
+        # html swaps the terminal screenshot stage for extract (no image);
+        # every other stage is the same CDP handshake all cdp-class arms pay.
+        arm_stage_keys = [
+            ("extract_ms" if (k == "screenshot_ms" and a == "html") else k)
+            for k in stage_keys
+        ]
         print(f"  [{a}]")
         for metric, explanation in (
             ("spawn_to_port_ms", "process spawn -> first TCP accept; stable readiness boundary"),
@@ -1689,7 +1707,7 @@ def analyze_backend(
             print("    resolve_ms       SKIPPED (--ws-url prewired; NOT measured)")
         elif len(prewired) > 1:
             print("    resolve_ms       MIXED prewired/measured records -- refusing to pool")
-        for k in stage_keys:
+        for k in arm_stage_keys:
             if k == "resolve_ms" and (prewired == {True} or len(prewired) > 1):
                 continue
             # cdpdrive nests its timings under render.stages; reading render[k]

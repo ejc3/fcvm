@@ -940,6 +940,10 @@ cmd_run() {
     fi
     local rc=0 spid="" serve_bg=""
     local backend_args=()
+    # --prewire only for PREWIRE=1: ${PREWIRE:+--prewire} treats the ordinary
+    # false-like PREWIRE=0 as ON, silently changing the measured operation.
+    local prewire_args=()
+    [ "${PREWIRE:-0}" = "1" ] && prewire_args=(--prewire)
     local image_id provenance="$DATA_ROOT/snapshots/$TAG/reqbench-provenance.json"
     image_id=$($SUDO jq -er '.image_id | select(type == "string")' "$provenance") \
         || { log "run: cannot read immutable image identity from $provenance"; return 1; }
@@ -989,7 +993,7 @@ cmd_run() {
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
         --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" \
-        ${PREWIRE:+--prewire} &
+        "${prewire_args[@]}" &
     local driver_bg=$!
     track "$driver_bg"
     ACTIVE_DRIVER_BG="$driver_bg"

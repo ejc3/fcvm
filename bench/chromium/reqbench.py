@@ -912,11 +912,12 @@ def wait_port(
             if remaining > 0:
                 time.sleep(min(delay, remaining))
             # Cap at 2 ms, not 20: with a 20 ms cap the attempts past the
-            # ramp land ~17-20 ms apart (cumulative ~39.8/56.9/76.9 ms), and
-            # every restore-readiness figure snapped to those grid points —
-            # a ~1-2 ms real effect near an attempt boundary read as a clean
-            # "17 ms bimodal restore floor" (2026-08-14). ~20 extra connect
-            # attempts per 40 ms wait is noise; measurement resolution is not.
+            # ramp land ~17-20 ms apart, so restore-readiness figures snapped
+            # to the probe grid — a small real effect near an attempt boundary
+            # read as a clean bimodal restore floor until the fine-grid gated
+            # run (reqbench-20260814-035757) showed readiness is unimodal.
+            # ~20 extra connect attempts per 40 ms wait is noise; measurement
+            # resolution is not.
             delay = min(delay * 1.5, 0.002)
 
 
@@ -2822,7 +2823,16 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
-            if args.prewire and not args.ws_url and rec["ok"] and result.get("target_id"):
+            # getattr, not args.prewire: failure-path fixtures drive this
+            # function with bare Namespaces, and the attribute lookup runs
+            # before the rec["ok"] guard — an AttributeError here replaced
+            # every failure label with its own traceback.
+            if (
+                getattr(args, "prewire", False)
+                and not args.ws_url
+                and rec["ok"]
+                and result.get("target_id")
+            ):
                 # Discovery-once: pin the page target's WS URL for every later
                 # rep. clone_ws_url() re-hosts it onto each clone's endpoint, so
                 # only the path — the guest-side target id, identical across
@@ -3652,7 +3662,7 @@ def main_with_resources(resources: ExitStack) -> int:
     if not arms or len(set(arms)) != len(arms) or any(a not in allowed_arms for a in arms):
         p.error(
             "--arms must be a non-empty, duplicate-free subset of "
-            "exec,cdp,cdp-fast,noop"
+            "exec,cdp,cdp-fast,html,noop"
         )
     # exec is ALLOWED but no longer REQUIRED: it is retired from measurement
     # (no published claim rests on it), and run reqbench-20260814-022254-uffd

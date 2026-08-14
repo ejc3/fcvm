@@ -5840,11 +5840,12 @@ class PortProbeResolution(unittest.TestCase):
     """wait_port must measure readiness on a fine grid.
 
     Watched red 2026-08-14: with the 1ms x1.5 backoff capped at 20 ms, probe
-    attempts land ~17-20 ms apart past the ramp (cumulative sleeps ~39.8,
-    56.9, 76.9 ms), so a port that opens at 45 ms was reported as ~57 ms.
-    That grid quantized a ~1-2 ms real teardown-adjacency effect into the
-    "17 ms bimodal restore floor" that consumed 2026-08-14; every published
-    restore figure sat on these grid points rather than on true readiness.
+    attempts land ~17-20 ms apart past the ramp, so a port that opens at
+    45 ms was reported as ~57 ms — readiness figures sat on the probe grid
+    rather than on true readiness, and a small real teardown-adjacency
+    effect near an attempt boundary read as a clean bimodal restore floor
+    until the fine-grid gated run (reqbench-20260814-035757) showed
+    readiness is unimodal.
     """
 
     def test_readiness_is_resolved_within_3ms(self):
@@ -5890,6 +5891,34 @@ class GuestDnsKnob(unittest.TestCase):
         self.assertIn('--dns "$GUEST_DNS"', src)
 
 
+class CorpusServeAnswerIp(unittest.TestCase):
+    """--answer-ip must fail at startup, not by silently dropping A queries.
+
+    inet_aton runs inside the DNS responder's broad exception handler, so a
+    malformed address left every server running while every A query vanished
+    without a trace.
+    """
+
+    def test_malformed_answer_ip_exits_before_serving(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus_serve.py"),
+                "--answer-ip",
+                "not-an-ip",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("answer-ip", proc.stderr)
+        self.assertNotIn(
+            "wildcard DNS", proc.stdout,
+            "the DNS responder must never start under an unusable answer address",
+        )
+
+
 class HtmlArmAndPrewire(unittest.TestCase):
     """The html op and target-prewiring, validated through the FULL analyzer.
 
@@ -5917,9 +5946,9 @@ class HtmlArmAndPrewire(unittest.TestCase):
         with open(path, "w") as target:
             target.write("\n".join(json.dumps(row) for row in rows) + "\n")
 
-    def _dataset_with_html_arm(self, path):
+    def _dataset_with_html_arm(self, path, reps=6):
         """Clean dataset whose exec arm is rewritten as an html arm."""
-        AnalyzerAvailability._write_clean_backend(path, "file", 6, 384.0)
+        AnalyzerAvailability._write_clean_backend(path, "file", reps, 384.0)
         rows = self._rows(path)
         cdp_by_key = {
             (row["rep"], row["warmup"]): row
@@ -5955,6 +5984,88 @@ class HtmlArmAndPrewire(unittest.TestCase):
                 if metric not in identity and metric not in row:
                     row[metric] = value
         self._write(path, rows)
+
+    def test_short_html_arm_fails_the_sample_size_gate(self):
+        """A mixed run must not publish while its html arm is short.
+
+        expected_cdp_arms matched only names starting with "cdp", so a run
+        whose cdp arms reached 200 passed publication with the html arm at
+        any count — an html latency published from a sample the gate never
+        examined.
+        """
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._dataset_with_html_arm(src, reps=200)
+            rows = self._rows(src)
+            victim = next(
+                r for r in rows
+                if r.get("arm") == "html" and r.get("warmup") is False
+            )
+            rows.remove(victim)
+            self._write(src, rows)
+            buf = io.StringIO()
+            with (
+                mock.patch.object(
+                    reqanalyze, "median_ci", AnalyzerAvailability._fast_median_ci
+                ),
+                mock.patch.object(
+                    reqanalyze,
+                    "hodges_lehmann_shift",
+                    AnalyzerAvailability._fast_shift,
+                ),
+                redirect_stdout(buf),
+            ):
+                rc = reqanalyze.main_with(["--json-out", dst, src])
+            with open(dst) as f:
+                out = json.load(f)
+            sample = out["gate"]["cdp_sample_size"]
+            self.assertEqual(
+                sample["measured_non_warmup_attempts_per_arm"].get("html"), 199
+            )
+            self.assertIs(sample["passed"], False)
+            self.assertIs(out["publishable"], False)
+            self.assertEqual(rc, 5, buf.getvalue())
+
+    def test_html_arm_gets_stage_decomposition(self):
+        """analysis.json must carry the html arm's per-stage metrics.
+
+        The stage loop keyed on startswith("cdp") dropped every connection
+        and extraction stage for html even though the arm pays the same
+        per-request CDP handshake; only aggregate blocking and wall time
+        survived into analysis.json.
+        """
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._dataset_with_html_arm(src)
+            buf = io.StringIO()
+            with (
+                mock.patch.object(
+                    reqanalyze, "median_ci", AnalyzerAvailability._fast_median_ci
+                ),
+                mock.patch.object(
+                    reqanalyze,
+                    "hodges_lehmann_shift",
+                    AnalyzerAvailability._fast_shift,
+                ),
+                redirect_stdout(buf),
+            ):
+                reqanalyze.main_with(["--json-out", dst, src, "--no-gate"])
+            with open(dst) as f:
+                out = json.load(f)
+            html_arm = out["arms"]["html"]
+            for metric in ("connect_total_ms", "navigate_ms", "extract_ms", "total_ms"):
+                self.assertIn(metric, html_arm, f"html arm must publish {metric}")
+            self.assertNotIn(
+                "screenshot_ms", html_arm,
+                "html renders no screenshot; a summary here means the arm was "
+                "pooled with the wrong stage list",
+            )
 
     def test_html_arm_dataset_validates_cleanly(self):
         with tempfile.TemporaryDirectory() as d:

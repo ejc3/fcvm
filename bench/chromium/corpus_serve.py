@@ -202,6 +202,14 @@ def main():
     # the host's loopback where this server listens.
     ap.add_argument("--answer-ip", default="127.0.0.1")
     args = ap.parse_args()
+    # Validate up front: inet_aton runs inside the responder's broad exception
+    # handler, so a malformed address would silently drop every A query while
+    # the servers keep running — the failure has to happen before any thread
+    # starts.
+    try:
+        socket.inet_aton(args.answer_ip)
+    except OSError:
+        ap.error(f"--answer-ip is not a valid IPv4 address: {args.answer_ip!r}")
 
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
     print(f"loaded {len(Handler.exact)} urls", flush=True)
