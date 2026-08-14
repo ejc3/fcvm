@@ -986,6 +986,28 @@ fn continue_hit_present_page(e: &userfaultfd::Error) -> bool {
     )
 }
 
+/// Wake any faulter stranded on an EEXIST'd granule.
+///
+/// EEXIST from UFFDIO_CONTINUE or UFFDIO_COPY proves the PTE/page is present — NOT that
+/// the faulter was woken. The kernel's check-then-sleep window lets a faulter enqueue
+/// AFTER the racing winner's wake scan, and userfaultfd(2) requires an explicit
+/// UFFDIO_WAKE after EEXIST for exactly that case (Linux's own uffd selftests wake after
+/// COPY EEXIST). Without it the faulter sleeps forever: the 4K-minor clone wedge — VMM
+/// device thread parked in `handle_userfault`, victim uffd fdinfo `pending:0 total:1`,
+/// whole virtio plane dead. A failed wake is the hang this call exists to prevent, so it
+/// propagates into the fail-closed kill path rather than being logged and limped past.
+fn wake_eexist_waiters(uffd: &Uffd, addr: usize, len: usize) -> Result<()> {
+    uffd.wake(addr as *mut std::ffi::c_void, len).map_err(|wake_error| {
+        anyhow!(
+            "UFFDIO_WAKE after EEXIST failed at 0x{:x}+{}: {:?} — a stranded faulter \
+             would hang its thread permanently",
+            addr,
+            len,
+            wake_error
+        )
+    })
+}
+
 /// Whether a UFFDIO_CONTINUE error is the kernel saying "not now, try again".
 ///
 /// The ioctl fails with `EAGAIN` (and zero progress) while the context's `mmap_changing`
@@ -1076,23 +1098,9 @@ fn continue_page(
                     fault_addr = format!("0x{:x}", page + done),
                     "UFFDIO_CONTINUE skipped - page already mapped (EEXIST), waking waiters"
                 );
-                // EEXIST proves the PTE is present — NOT that the faulter was woken. The
-                // kernel's check-then-sleep window lets a faulter enqueue AFTER the racing
-                // winner's wake scan, and userfaultfd(2) requires an explicit UFFDIO_WAKE
-                // here for exactly that case. Without it the faulter sleeps forever: the
-                // 4K-minor clone wedge (VMM device thread parked in handle_userfault,
-                // victim uffd fdinfo `pending:0 total:1`, whole virtio plane dead).
-                // A failed wake is the hang this arm exists to prevent — propagate it
-                // into the fail-closed kill path rather than logging and limping on.
-                uffd.wake(addr, remaining).map_err(|wake_error| {
-                    anyhow!(
-                        "UFFDIO_WAKE after EEXIST failed at 0x{:x}+{}: {:?} — a stranded \
-                         faulter would hang its thread permanently",
-                        page + done,
-                        remaining,
-                        wake_error
-                    )
-                })?;
+                // See wake_eexist_waiters: EEXIST != woken; the explicit wake is the
+                // userfaultfd(2) contract and the fix for the 4K-minor clone wedge.
+                wake_eexist_waiters(uffd, page + done, remaining)?;
                 // EEXIST refers to the granule at the current position; with per-granule
                 // requests that is the whole remaining range.
                 done += remaining;
@@ -1842,8 +1850,13 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                     target: "uffd",
                                     vm_id = %vm_id,
                                     fault_addr = format!("0x{:x}", fault_page),
-                                    "UFFD copy skipped - page already filled (EEXIST)"
+                                    "UFFD copy skipped - page already filled (EEXIST), waking waiters"
                                 );
+                                // See wake_eexist_waiters: the COPY backend has the same
+                                // check-then-sleep window as CONTINUE, this fault event is
+                                // already consumed, and Linux's uffd selftests wake after
+                                // COPY EEXIST for exactly this reason.
+                                wake_eexist_waiters(uffd, fault_page, page_size)?;
                                 if let Some(t) = state.trace.as_mut() {
                                     let t1 = t.now_ns();
                                     t.record(offset_in_file as u64, trace_t0, t1);
@@ -3592,6 +3605,23 @@ mod tests {
         assert_eq!(a, Path::new("/data/uffd-snap-42-1000.sock"));
     }
 
+    /// Poll the kernel until `tid` is parked in `handle_userfault`, or panic. This is
+    /// the oracle that makes the stranded-faulter tests deterministic: a queued fault
+    /// event does NOT imply the faulter finished its final PTE recheck and slept, and a
+    /// PTE installed inside that window lets the faulter skip sleeping entirely —
+    /// turning the test into a false green on an unfixed tree.
+    fn wait_parked_in_handle_userfault(tid: libc::pid_t) {
+        for _ in 0..5000 {
+            let wchan =
+                std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan")).unwrap_or_default();
+            if wchan.trim() == "handle_userfault" {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("faulter (tid {tid}) never parked in handle_userfault within 5s");
+    }
+
     /// EEXIST from UFFDIO_CONTINUE proves the PTE is present — NOT that the faulter was
     /// woken. The kernel's check-then-sleep window lets a faulter enqueue AFTER a racing
     /// winner's wake scan, which is why userfaultfd(2) requires an explicit UFFDIO_WAKE
@@ -3726,13 +3756,19 @@ mod tests {
         let uffd = unsafe { Uffd::from_raw_fd(raw) };
 
         let addr = base as usize;
+        let (tid_tx, tid_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
+            // SAFETY: gettid on the current thread.
+            tid_tx.send(unsafe { libc::gettid() }).ok();
             // Minor-faults (page resident, PTE absent) and sleeps until woken.
             // SAFETY: addr is a live registered mapping for the test's lifetime.
             let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
             tx.send(got).ok();
         });
+        let reader_tid = tid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader tid");
 
         let mut pfd = libc::pollfd {
             fd: uffd.as_raw_fd(),
@@ -3749,8 +3785,15 @@ mod tests {
             other => panic!("expected the reader's pagefault event, got {other:?}"),
         }
 
+        // ORACLE: the event proves the reader QUEUED, not that it finished its final
+        // PTE recheck and slept. If the winner's PTE lands inside that window the
+        // reader never sleeps and the test would pass without any fix. Proceed only
+        // once the kernel reports the reader parked in handle_userfault.
+        wait_parked_in_handle_userfault(reader_tid);
+
         // The racing winner: installs the PTE with NO wake. The fault event is already
-        // consumed above, so nothing else will ever wake the reader.
+        // consumed above and the reader is PROVEN asleep, so nothing else will ever
+        // wake it.
         uffd.r#continue(base, PAGE, false)
             .expect("winner's CONTINUE must succeed");
 
@@ -3769,6 +3812,118 @@ mod tests {
         unsafe {
             libc::munmap(base, PAGE);
             libc::close(memfd);
+        }
+    }
+
+    /// The COPY twin of the stranded-faulter test: the default (file-backed) serve mode
+    /// resolves MISSING faults with UFFDIO_COPY, whose EEXIST has the same
+    /// check-then-sleep window — Linux's own uffd selftests wake after COPY EEXIST.
+    /// Constructs the stranded state with the parked-oracle, then runs the exact
+    /// sequence the demand COPY arm runs: attempt the copy, observe EEXIST, wake.
+    #[test]
+    fn eexist_copy_resolution_wakes_the_stranded_faulter() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const PAGE: usize = 4096;
+        // SAFETY: fresh anonymous mapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let uffd = userfaultfd::UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .user_mode_only(true)
+            .create()
+            .expect("creating userfaultfd");
+        uffd.register(base, PAGE).expect("MISSING registration");
+
+        let addr = base as usize;
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            // SAFETY: gettid on the current thread.
+            tid_tx.send(unsafe { libc::gettid() }).ok();
+            // MISSING-faults and sleeps until woken.
+            // SAFETY: addr is a live registered mapping for the test's lifetime.
+            let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
+            tx.send(got).ok();
+        });
+        let reader_tid = tid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader tid");
+
+        let mut pfd = libc::pollfd {
+            fd: uffd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised pollfd, owned fd.
+        assert!(
+            unsafe { libc::poll(&mut pfd, 1, 5000) } > 0,
+            "no fault event within 5s"
+        );
+        match uffd.read_event() {
+            Ok(Some(userfaultfd::Event::Pagefault { .. })) => {}
+            other => panic!("expected the reader's pagefault event, got {other:?}"),
+        }
+        wait_parked_in_handle_userfault(reader_tid);
+
+        // The racing winner: fills the page with NO wake; the event is consumed and
+        // the reader is proven asleep.
+        let src = vec![0xA5u8; PAGE];
+        // SAFETY: src outlives the ioctl; base is the registered page.
+        unsafe { uffd.copy(src.as_ptr().cast(), base, PAGE, false) }
+            .expect("winner's COPY must succeed");
+
+        // The demand COPY arm's exact sequence: attempt, observe EEXIST, wake.
+        // SAFETY: same as above.
+        let err = unsafe { uffd.copy(src.as_ptr().cast(), base, PAGE, true) }
+            .expect_err("second COPY must report EEXIST");
+        assert!(
+            matches!(&err, userfaultfd::Error::CopyFailed(errno) if (*errno as i32) == libc::EEXIST),
+            "expected CopyFailed(EEXIST), got {err:?}"
+        );
+        wake_eexist_waiters(&uffd, addr, PAGE).expect("wake after COPY EEXIST");
+
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "faulter still asleep after COPY EEXIST — the demand COPY arm must wake \
+             (userfaultfd(2) contract; COPY-mode half of the clone wedge)",
+        );
+        assert_eq!(got, 0xA5, "reader must observe the winner's bytes");
+        reader.join().expect("reader thread");
+        // SAFETY: unmapping our own mapping.
+        unsafe { libc::munmap(base, PAGE) };
+    }
+
+    /// The behavioral tests above bind wake_eexist_waiters' SEMANTICS; this binds the
+    /// CALL SITES. The demand COPY arm lives inline in drain_events and cannot be
+    /// driven directly by a unit test, so removing its wake would leave every
+    /// behavioral test green — this assertion goes red instead.
+    #[test]
+    fn both_eexist_arms_wake_their_waiters() {
+        let source = include_str!("server.rs");
+        for anchor in [
+            "UFFDIO_CONTINUE skipped - page already mapped (EEXIST), waking waiters",
+            "UFFD copy skipped - page already filled (EEXIST), waking waiters",
+        ] {
+            let at = source.find(anchor).unwrap_or_else(|| {
+                panic!("EEXIST arm anchor missing (renamed without updating this test): {anchor}")
+            });
+            let window = &source[at..source.len().min(at + 800)];
+            assert!(
+                window.contains("wake_eexist_waiters("),
+                "the EEXIST arm at {anchor:?} no longer wakes its waiters — \
+                 that is the stranded-faulter hang, do not remove the wake"
+            );
         }
     }
 }
