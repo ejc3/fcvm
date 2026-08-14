@@ -173,8 +173,8 @@ fi
 #                          fixture server; must be baked in BEFORE the snapshot
 # --disable-gpu          : no GPU on this platform; forces deterministic software raster
 # --disable-dev-shm-usage: podman default /dev/shm is 64MB; raster buffers go to /tmp
-# --user-data-dir=/dev/shm/ud   : keep profile writes in /tmp so a --tmpfs /tmp mount keeps
-#                          dirtied rootfs extents (and destroy cost) down
+# --user-data-dir=/dev/shm/ud   : keep profile writes in /dev/shm (tmpfs = guest RAM)
+#                          so they never dirty rootfs extents (and destroy cost stays down)
 # remaining flags        : startup-variance reduction (no first-run, no background
 #                          fetches, no crash uploader, fixed window)
 # CHROMIUM_EXTRA_FLAGS   : env passthrough (word-split on purpose) for run-scoped

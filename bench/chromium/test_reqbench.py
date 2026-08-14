@@ -5759,20 +5759,29 @@ class ExecArmIsOptional(unittest.TestCase):
             )
 
     def test_analyzer_accepts_schedule_without_exec(self):
-        dataset = {
-            "metadata_errors": [],
-            "meta": {"arms": ["noop", "cdp"]},
-        }
+        """Drive the analyzer's REAL arm rule, not its source text.
+
+        The previous version probed a helper that did not exist and always
+        fell back to scanning reqanalyze.py for one exact string — a rewritten
+        exec requirement with different wording would have passed (CodeRabbit
+        finding on #816). _validate_arms is the rule _validate_schedule now
+        calls; an exec-less publication schedule must produce no errors, and
+        the negative control proves this test exercises the rule at all.
+        """
         import reqanalyze
-        # _validate_schedule appends its errors; build the minimal call the
-        # arms check participates in and inspect the messages.
+
         errors = []
-        try:
-            reqanalyze._validate_arms_for_test(["noop", "cdp"], errors)
-        except AttributeError:
-            # No seam yet: fall back to scanning the source contract.
-            src = open(os.path.join(HERE, "reqanalyze.py")).read()
-            self.assertNotIn('"exec" not in arms', src,
-                             "analyzer still hard-requires the exec arm")
-            return
-        self.assertFalse([e for e in errors if "exec" in e])
+        reqanalyze._validate_arms(["noop", "cdp"], "run", errors)
+        self.assertEqual(
+            errors, [],
+            "an exec-less noop+cdp schedule must validate cleanly",
+        )
+
+        # Negative control: the rule still rejects a schedule missing its
+        # REQUIRED arms — proving the helper under test is the live rule,
+        # not a stub.
+        control = []
+        reqanalyze._validate_arms(["cdp"], "run", control)
+        self.assertTrue(
+            control, "a noop-less schedule must be rejected by the same rule"
+        )

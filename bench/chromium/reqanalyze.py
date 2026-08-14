@@ -390,6 +390,31 @@ def metric_summary(records, getter):
     return result
 
 
+def _validate_arms(arms, label, errors):
+    """Validate the publication arms list, appending findings to `errors`.
+
+    Extracted from _validate_schedule so tests exercise the ACTUAL rule rather
+    than scanning source text (a rewritten requirement with different wording
+    defeated the old source-scan). exec is ALLOWED but not REQUIRED: it is
+    retired from measurement, and requiring it forced the arm that pollutes
+    the shared prefetch working set into every publication run (run citation
+    in reqbench.py's arm validation).
+    """
+    if (
+        not isinstance(arms, list)
+        or not arms
+        or any(not isinstance(arm, str) or not arm for arm in arms)
+        or len(arms) != len(set(arms))
+    ):
+        errors.append(f"{label} metadata has no valid duplicate-free arms list")
+    elif any(arm not in {"exec", "cdp", "cdp-fast", "noop"} for arm in arms):
+        errors.append(f"{label} metadata declares an unsupported arm")
+    elif "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
+        errors.append(
+            f"{label} publication schedule requires noop and a CDP arm"
+        )
+
+
 def _validate_schedule(dataset):
     """Validate one producer invocation's declared, complete arm schedule."""
     if len(dataset.get("metas", [])) != 1:
@@ -428,22 +453,7 @@ def _validate_schedule(dataset):
         errors.append(f"{label} metadata has no numeric started timestamp")
     if not isinstance(seed, int) or isinstance(seed, bool):
         errors.append(f"{label} metadata has no integer seed")
-    if (
-        not isinstance(arms, list)
-        or not arms
-        or any(not isinstance(arm, str) or not arm for arm in arms)
-        or len(arms) != len(set(arms))
-    ):
-        errors.append(f"{label} metadata has no valid duplicate-free arms list")
-    elif any(arm not in {"exec", "cdp", "cdp-fast", "noop"} for arm in arms):
-        errors.append(f"{label} metadata declares an unsupported arm")
-    elif "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
-        # exec is optional: retired from measurement, and measured to
-        # destabilize the noop canary via working-set pollution (see
-        # reqbench.py arm validation for the run citation).
-        errors.append(
-            f"{label} publication schedule requires noop and a CDP arm"
-        )
+    _validate_arms(arms, label, errors)
     if not isinstance(reps, int) or isinstance(reps, bool) or reps <= 0:
         errors.append(f"{label} metadata has no positive reps count")
     if not isinstance(warmup, int) or isinstance(warmup, bool) or warmup <= 0:
