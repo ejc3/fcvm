@@ -1172,8 +1172,8 @@ checks, and bind results to a SHA rather than to the PR:
 ```bash
 gh pr view <pr> --json state,headRefOid --jq '"\(.state) head=\(.headRefOid)"'
 git rev-parse HEAD   # must equal headRefOid; if it does not, the checks are for other code
-gh api --paginate --slurp repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs \
-  --jq '[.[].check_runs[]] | length'
+gh api --paginate repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs \
+  --jq '.check_runs[].id' | wc -l   # --slurp is rejected alongside --jq; count the stream
 # 0 => nothing ran for this commit. `gh pr reopen <pr>` resyncs the head and triggers CI.
 ```
 **Reopening is not guaranteed to start CI.** It fires a `reopened` event, which a workflow
@@ -1182,8 +1182,8 @@ then `paths`/`paths-ignore` still applies, so a PR whose every changed file matc
 ignored pattern gets a `reopened` event and **still runs nothing**. Docs-only and
 bench-only PRs land in exactly that hole. Check, and fall back to an explicit dispatch:
 ```bash
-gh api --paginate --slurp repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs \
-  --jq '[.[].check_runs[]] | length'
+gh api --paginate repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs \
+  --jq '.check_runs[].id' | wc -l   # --slurp is rejected alongside --jq; count the stream
 # still 0 after reopen => the workflow filtered this PR out, not a sync problem
 gh workflow run ci.yml --ref "$(git branch --show-current)"
 ```
