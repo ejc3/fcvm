@@ -971,10 +971,12 @@ pub(super) async fn run_vm_setup(
 ///   * initial `fcvm podman run` (run_vm_setup_inner, cache miss)
 ///   * the snapshot-restore path's up-front reboot plan (a rebooted restored clone
 ///     cold-boots from its current provisioned disk — disk-only-clone semantics)
-/// The extra kernel boot args a launch will actually append: the kernel
-/// profile's `boot_args`, or the FCVM_BOOT_ARGS env fallback. One derivation,
-/// used both by the snapshot-key config (hashed) and by the runtime cmdline
-/// assembly (applied), so the hashed value and the applied value cannot drift.
+/// The extra kernel boot args a launch will actually append.
+///
+/// Resolves the kernel profile's `boot_args`, falling back to FCVM_BOOT_ARGS.
+/// One derivation, used both by the snapshot-key config (hashed) and by the
+/// runtime cmdline assembly (applied), so the hashed value and the applied
+/// value cannot drift.
 pub(crate) fn effective_extra_boot_args(
     runtime_config: &crate::commands::common::RuntimeConfig,
 ) -> Option<String> {
