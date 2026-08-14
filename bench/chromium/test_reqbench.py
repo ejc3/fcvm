@@ -5385,6 +5385,11 @@ class MakefileBenchGraph(unittest.TestCase):
         # all write it.
         self.assertIn("hugepage-pool.lock", recipe,
                       "fault recipe must serialize on the shared pool lock")
+        # The lock file must be creatable by unprivileged callers even when
+        # the data root is root-owned (fresh boxes): the recipe pre-creates
+        # it with sudo before flock (CodeRabbit round 2, PR #815).
+        self.assertRegex(recipe, r"sudo[^\n]*touch[^\n]*hugepage-pool\.lock",
+                         "fault recipe must sudo-pre-create the pool lock")
 
     def test_run_help_documents_tag(self):
         # Following the documented huge flow without TAG= on the run line
@@ -5554,6 +5559,17 @@ class SnapshotLockHeldAcrossRun(unittest.TestCase):
 
     SH = HugepageGuards.SH
     _bash = HugepageGuards._bash
+
+    def test_fcvm_data_dir_is_aligned_with_data_root(self):
+        # fcvm resolves its snapshot paths (and therefore the generation
+        # lock file) from FCVM_DATA_DIR; reqbench derives DATA_ROOT
+        # independently. Without exporting the alignment, the two processes
+        # can lock DIFFERENT files and the generation lock is theater
+        # (CodeRabbit round 2, PR #815).
+        r, _ = self._bash('echo "FCVM_DATA_DIR=[$FCVM_DATA_DIR]"')
+        self.assertIn("FCVM_DATA_DIR=[", r.stdout)
+        self.assertNotIn("FCVM_DATA_DIR=[]", r.stdout,
+                         "reqbench.sh must export FCVM_DATA_DIR=$DATA_ROOT")
 
     def test_generation_lock_held_shared_through_driver(self):
         # The stub driver tries to take the generation lock EXCLUSIVE; if
