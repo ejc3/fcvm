@@ -1,6 +1,11 @@
 # Adversarial review ledger — chromium shared-nothing bench
 
-Three runs are on record. **Quote only from `20260808-corrected`.**
+**Quote only from sealed runs that passed their gates and were never withdrawn.**
+When this ledger was written (2026-08-08) three runs existed and the only quotable
+one was `20260808-corrected`; every later gated reqbench run (noop drift canary
+inside its CI band, generation and runtime-bundle seals verified) joins the record
+under the same rule. Withdrawn runs stay unquotable forever — the table below
+records why.
 
 | run | date | verdict |
 |---|---|---|
