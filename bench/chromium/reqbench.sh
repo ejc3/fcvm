@@ -988,7 +988,8 @@ cmd_run() {
         --image "$IMAGE" --image-id "$image_id" --snapshot-name "$TAG" \
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
-        --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" &
+        --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" \
+        ${PREWIRE:+--prewire} &
     local driver_bg=$!
     track "$driver_bg"
     ACTIVE_DRIVER_BG="$driver_bg"

@@ -387,34 +387,65 @@ def drive(args) -> dict:
                 out["idle_timeout"] = 1
         stages["idle_ms"] = (time.monotonic() - t) * 1000
 
-        stage = "screenshot"
-        stage_started = time.monotonic()
-        t = time.monotonic()
-        params = {"format": args.format}
-        if args.format == "jpeg":
-            params["quality"] = args.quality
-        shot = cdp.cmd("Page.captureScreenshot", params, deadline=deadline)
-        stages["screenshot_ms"] = (time.monotonic() - t) * 1000
+        if getattr(args, "op", "screenshot") == "html":
+            # HTML-extraction op: the page's serialized DOM instead of pixels —
+            # the second operation Kitesurf's table prices. Same connect and
+            # navigate path; the terminal stage swaps.
+            stage = "extract"
+            stage_started = time.monotonic()
+            t = time.monotonic()
+            result = cdp.cmd(
+                "Runtime.evaluate",
+                {
+                    "expression": "document.documentElement.outerHTML",
+                    "returnByValue": True,
+                },
+                deadline=deadline,
+            )
+            html = result.get("result", {}).get("value")
+            if not isinstance(html, str) or "</html>" not in html.lower():
+                raise RuntimeError(
+                    "outerHTML extraction returned no closed document "
+                    f"({type(html).__name__}, {len(html) if isinstance(html, str) else 0} chars)"
+                )
+            encoded = html.encode()
+            out.update(
+                html_bytes=len(encoded),
+                html_sha256=hashlib.sha256(encoded).hexdigest(),
+            )
+            stages["extract_ms"] = (time.monotonic() - t) * 1000
+            if args.out_prefix:
+                with open(f"{args.out_prefix}.html", "w") as f:
+                    f.write(html)
+        else:
+            stage = "screenshot"
+            stage_started = time.monotonic()
+            t = time.monotonic()
+            params = {"format": args.format}
+            if args.format == "jpeg":
+                params["quality"] = args.quality
+            shot = cdp.cmd("Page.captureScreenshot", params, deadline=deadline)
+            stages["screenshot_ms"] = (time.monotonic() - t) * 1000
 
-        stage = "decode"
-        stage_started = time.monotonic()
-        t = time.monotonic()
-        raw = base64.b64decode(shot["data"])
-        magic = b"\x89PNG" if args.format == "png" else b"\xff\xd8\xff"
-        if not raw.startswith(magic):
-            raise RuntimeError(f"captureScreenshot returned non-{args.format.upper()} data")
-        w, h = image_dimensions(raw)
-        out.update(
-            image_bytes=len(raw),
-            image_sha256=hashlib.sha256(raw).hexdigest(),
-            width=w,
-            height=h,
-            quality=args.quality if args.format == "jpeg" else 0,
-        )
-        stages["decode_ms"] = (time.monotonic() - t) * 1000
-        if args.out_prefix:
-            with open(f"{args.out_prefix}.{args.format}", "wb") as f:
-                f.write(raw)
+            stage = "decode"
+            stage_started = time.monotonic()
+            t = time.monotonic()
+            raw = base64.b64decode(shot["data"])
+            magic = b"\x89PNG" if args.format == "png" else b"\xff\xd8\xff"
+            if not raw.startswith(magic):
+                raise RuntimeError(f"captureScreenshot returned non-{args.format.upper()} data")
+            w, h = image_dimensions(raw)
+            out.update(
+                image_bytes=len(raw),
+                image_sha256=hashlib.sha256(raw).hexdigest(),
+                width=w,
+                height=h,
+                quality=args.quality if args.format == "jpeg" else 0,
+            )
+            stages["decode_ms"] = (time.monotonic() - t) * 1000
+            if args.out_prefix:
+                with open(f"{args.out_prefix}.{args.format}", "wb") as f:
+                    f.write(raw)
 
         if args.nav_timing:
             stage = "nav-timing"

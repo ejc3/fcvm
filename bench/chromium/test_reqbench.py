@@ -5888,3 +5888,136 @@ class GuestDnsKnob(unittest.TestCase):
         src = open(self.SH).read()
         self.assertIn('GUEST_DNS="${GUEST_DNS:-}"', src)
         self.assertIn('--dns "$GUEST_DNS"', src)
+
+
+class HtmlArmAndPrewire(unittest.TestCase):
+    """The html op and target-prewiring, validated through the FULL analyzer.
+
+    Both features change what a valid record looks like, so the tests build a
+    complete clean dataset, transform it, and hold the analyzer to zero
+    metadata errors — then break one field and demand the specific error, so
+    the validation under test is proven live rather than skipped.
+    """
+
+    @staticmethod
+    def _load_errors(path):
+        return [
+            error
+            for dataset in reqanalyze.load([path])
+            for error in dataset["metadata_errors"]
+        ]
+
+    @staticmethod
+    def _rows(path):
+        with open(path) as source:
+            return [json.loads(line) for line in source]
+
+    @staticmethod
+    def _write(path, rows):
+        with open(path, "w") as target:
+            target.write("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    def _dataset_with_html_arm(self, path):
+        """Clean dataset whose exec arm is rewritten as an html arm."""
+        AnalyzerAvailability._write_clean_backend(path, "file", 6, 384.0)
+        rows = self._rows(path)
+        cdp_by_key = {
+            (row["rep"], row["warmup"]): row
+            for row in rows
+            if row.get("arm") == "cdp"
+        }
+        for row in rows:
+            if row.get("kind") == "meta":
+                row["arms"] = ["html" if a == "exec" else a for a in row["arms"]]
+                continue
+            if row.get("arm") != "exec":
+                continue
+            template = cdp_by_key[(row["rep"], row["warmup"])]
+            row["arm"] = "html"
+            row["record_id"] = row["record_id"].replace(":exec:", ":html:")
+            row["teardown"] = dict(template["teardown"])
+            row["endpoint"] = template["endpoint"]
+            render = json.loads(json.dumps(template["render"]))
+            stages = render["stages"]
+            for gone in ("screenshot_ms", "decode_ms"):
+                stages.pop(gone, None)
+            stages["extract_ms"] = 1.0
+            for gone in ("image_bytes", "image_sha256", "width", "height"):
+                render.pop(gone, None)
+            render["html_bytes"] = 2048
+            render["html_sha256"] = "a" * 64
+            row["render"] = render
+            # The html record carries every per-record metric a cdp record
+            # does; identity fields stay the (renamed) exec record's own.
+            identity = {"arm", "rep", "warmup", "record_id", "name", "run_id",
+                        "render", "teardown", "endpoint"}
+            for metric, value in template.items():
+                if metric not in identity and metric not in row:
+                    row[metric] = value
+        self._write(path, rows)
+
+    def test_html_arm_dataset_validates_cleanly(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "html.jsonl")
+            self._dataset_with_html_arm(path)
+            self.assertEqual(self._load_errors(path), [])
+
+    def test_html_record_without_payload_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "html.jsonl")
+            self._dataset_with_html_arm(path)
+            rows = self._rows(path)
+            victim = next(
+                r for r in rows
+                if r.get("arm") == "html" and r.get("warmup") is False
+            )
+            del victim["render"]["html_bytes"]
+            self._write(path, rows)
+            errors = self._load_errors(path)
+            self.assertTrue(
+                any("html_bytes" in e for e in errors),
+                f"dropping html_bytes must be caught, got: {errors[:3]}",
+            )
+
+    def _dataset_with_prewire(self, path):
+        """Clean dataset in prewire mode: discovery on one warmup, pinned after."""
+        AnalyzerAvailability._write_clean_backend(path, "file", 6, 384.0)
+        rows = self._rows(path)
+        first_warmup_seen = False
+        for row in rows:
+            if row.get("kind") == "meta":
+                row["ws_url_prewired"] = True
+                continue
+            render = row.get("render")
+            if not isinstance(render, dict):
+                continue
+            if row.get("warmup") and not first_warmup_seen:
+                first_warmup_seen = True
+                render["target_prewired"] = False  # the discovery rep
+            else:
+                render["target_prewired"] = True
+                render["stages"]["resolve_ms"] = 0.0
+        self._write(path, rows)
+
+    def test_prewire_discovery_warmup_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "prewire.jsonl")
+            self._dataset_with_prewire(path)
+            self.assertEqual(self._load_errors(path), [])
+
+    def test_prewire_mismatch_on_measured_rep_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "prewire.jsonl")
+            self._dataset_with_prewire(path)
+            rows = self._rows(path)
+            victim = next(
+                r for r in rows
+                if isinstance(r.get("render"), dict) and r.get("warmup") is False
+            )
+            victim["render"]["target_prewired"] = False
+            self._write(path, rows)
+            errors = self._load_errors(path)
+            self.assertTrue(
+                any("prewire" in e for e in errors),
+                f"an unprewired MEASURED rep must be caught, got: {errors[:3]}",
+            )

@@ -2741,12 +2741,15 @@ def spawn_clone_process(cmd: list[str], log: str, env: dict) -> subprocess.Popen
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def run_cdp_request(args, rep: int, fast: bool, probe=None) -> dict:
+def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
-    name = f"rb-{args.run_id}-{rep}-{'fast' if fast else 'norm'}"
+    arm_name = "html" if op == "html" else ("cdp-fast" if fast else "cdp")
+    # The clone name carries the arm: cdp and html arms share rep indices, and a
+    # shared name would collide two live clones.
+    name = f"rb-{args.run_id}-{rep}-{'html' if op == 'html' else ('fast' if fast else 'norm')}"
     log = os.path.join(args.out_dir, f"{name}.log")
-    rec: dict = {"arm": "cdp-fast" if fast else "cdp", "rep": rep, "name": name}
+    rec: dict = {"arm": arm_name, "rep": rep, "name": name}
 
     cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
@@ -2812,12 +2815,21 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None) -> dict:
                 # and is swallowed by the `except Exception` below, failing every
                 # cdp rep. cdpdrive also reads it with getattr; both halves.
                 host_header="",
+                op=op,
                 render_module=os.path.join(HERE, "render.py"),
             )
             result = cdpdrive.drive(drive_args)
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
+            if args.prewire and not args.ws_url and rec["ok"] and result.get("target_id"):
+                # Discovery-once: pin the page target's WS URL for every later
+                # rep. clone_ws_url() re-hosts it onto each clone's endpoint, so
+                # only the path — the guest-side target id, identical across
+                # clones because it is snapshot state — is load-bearing. This
+                # lands on a warmup rep by schedule construction (warmups run
+                # first); the analyzer holds measured reps to meta.ws_url_prewired.
+                args.ws_url = f"ws://{endpoint}/devtools/page/{result['target_id']}"
             if not rec["ok"]:
                 # LIFT THE DIAGNOSTIC TO THE TOP LEVEL. cdpdrive can return
                 # ok=false WITHOUT raising, in which case the `except` below never
@@ -3473,7 +3485,10 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
         return run_exec_request(args, rep)
     if arm == "noop":
         return run_noop_request(args, rep)
+    if arm == "html":
+        return run_cdp_request(args, rep, fast=False, probe=probe, op="html")
     return run_cdp_request(args, rep, fast=(arm == "cdp-fast"), probe=probe)
+
 
 
 def parse_urls(spec):
@@ -3504,6 +3519,12 @@ def main_with_resources(resources: ExitStack) -> int:
     p.add_argument("--arms", default="exec,cdp,cdp-fast,noop")
     p.add_argument("--reps", type=int, default=10)
     p.add_argument("--warmup", type=int, default=2, help="discarded EXPLICITLY, and reported")
+    p.add_argument("--prewire", action="store_true",
+                   help="discover the CDP page target once (on the first successful cdp "
+                        "rep, a warmup by schedule construction) and pin its re-hosted "
+                        "WebSocket URL for every later rep, skipping per-request "
+                        "/json/list discovery; the target id is guest-side snapshot "
+                        "state, identical across clones like a WebDriver session id")
     p.add_argument("--seed", type=int, default=20260808)
     p.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
     p.add_argument("--quality", type=int, default=80)
@@ -3627,7 +3648,7 @@ def main_with_resources(resources: ExitStack) -> int:
             )
     os.makedirs(args.out_dir, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    allowed_arms = {"exec", "cdp", "cdp-fast", "noop"}
+    allowed_arms = {"exec", "cdp", "cdp-fast", "html", "noop"}
     if not arms or len(set(arms)) != len(arms) or any(a not in allowed_arms for a in arms):
         p.error(
             "--arms must be a non-empty, duplicate-free subset of "
@@ -3724,7 +3745,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "cpu": snapshot["vcpu"],
             "memory_mib": snapshot["memory_mib"],
             "rust_log": args.rust_log,
-            "ws_url_prewired": bool(args.ws_url),
+            "ws_url_prewired": bool(args.ws_url) or bool(args.prewire),
             "allow_busy": os.environ.get("ALLOW_BUSY", "0") == "1",
             "quiet_guard_passed": os.environ.get("REQBENCH_QUIET_GUARD") == "1",
             "quiet_guard_loadavg1": quiet_guard_loadavg1,

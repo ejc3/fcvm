@@ -407,7 +407,7 @@ def _validate_arms(arms, label, errors):
         or len(arms) != len(set(arms))
     ):
         errors.append(f"{label} metadata has no valid duplicate-free arms list")
-    elif any(arm not in {"exec", "cdp", "cdp-fast", "noop"} for arm in arms):
+    elif any(arm not in {"exec", "cdp", "cdp-fast", "html", "noop"} for arm in arms):
         errors.append(f"{label} metadata declares an unsupported arm")
     elif "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
         errors.append(
@@ -677,7 +677,7 @@ def _validate_schedule(dataset):
                     errors.append(f"{rlabel} successful exec did not exit cleanly")
                 if not finite_nonnegative(record.get("render_total_ms")):
                     errors.append(f"{rlabel} successful exec has no render_total_ms")
-            elif arm in ("cdp", "cdp-fast"):
+            elif arm in ("cdp", "cdp-fast", "html"):
                 for metric in ("state_to_port_ms", "spawn_to_port_ms"):
                     if not finite_nonnegative(record.get(metric)):
                         errors.append(f"{rlabel} successful CDP record has no {metric}")
@@ -710,14 +710,34 @@ def _validate_schedule(dataset):
                         errors.append(
                             f"{rlabel} CDP render did not complete its declared idle policy"
                         )
-                    if render.get("target_prewired") is not meta.get("ws_url_prewired"):
+                    prewired_expected = meta.get("ws_url_prewired")
+                    discovery_warmup = (
+                        is_warmup
+                        and prewired_expected is True
+                        and render.get("target_prewired") is False
+                    )
+                    # --prewire pins the URL on the first successful warmup rep,
+                    # which itself necessarily runs unprewired; measured reps are
+                    # held strictly to the metadata.
+                    if not discovery_warmup and (
+                        render.get("target_prewired") is not prewired_expected
+                    ):
                         errors.append(f"{rlabel} CDP target prewire mode mismatches metadata")
                     stages = render.get("stages")
-                    required_stages = (
-                        "resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms",
-                        "connect_total_ms", "navigate_ms", "idle_ms",
-                        "screenshot_ms", "decode_ms", "nav_timing_ms", "total_ms",
-                    )
+                    if arm == "html":
+                        # The html op swaps the terminal screenshot+decode stages
+                        # for a single DOM-extraction stage.
+                        required_stages = (
+                            "resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms",
+                            "connect_total_ms", "navigate_ms", "idle_ms",
+                            "extract_ms", "nav_timing_ms", "total_ms",
+                        )
+                    else:
+                        required_stages = (
+                            "resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms",
+                            "connect_total_ms", "navigate_ms", "idle_ms",
+                            "screenshot_ms", "decode_ms", "nav_timing_ms", "total_ms",
+                        )
                     if not isinstance(stages, dict):
                         errors.append(f"{rlabel} successful CDP render has no stages")
                     else:
@@ -726,15 +746,30 @@ def _validate_schedule(dataset):
                                 errors.append(
                                     f"{rlabel} successful CDP render has invalid {stage}"
                                 )
+                    if arm == "html":
+                        html_bytes = render.get("html_bytes")
+                        html_sha256 = render.get("html_sha256")
+                        if (
+                            not isinstance(html_bytes, int)
+                            or isinstance(html_bytes, bool)
+                            or html_bytes <= 0
+                        ):
+                            errors.append(f"{rlabel} html render has no positive html_bytes")
+                        if (
+                            not isinstance(html_sha256, str)
+                            or len(html_sha256) != 64
+                            or any(c not in "0123456789abcdef" for c in html_sha256)
+                        ):
+                            errors.append(f"{rlabel} html render has invalid html_sha256")
                     image_bytes = render.get("image_bytes")
                     image_sha256 = render.get("image_sha256")
-                    if (
+                    if arm != "html" and (
                         not isinstance(image_bytes, int)
                         or isinstance(image_bytes, bool)
                         or image_bytes <= 0
                     ):
                         errors.append(f"{rlabel} CDP render has no positive image_bytes")
-                    if (
+                    if arm != "html" and (
                         not isinstance(image_sha256, str)
                         or len(image_sha256) != 64
                         or any(
@@ -743,7 +778,7 @@ def _validate_schedule(dataset):
                         )
                     ):
                         errors.append(f"{rlabel} CDP render has invalid image_sha256")
-                    for dimension in ("width", "height"):
+                    for dimension in (() if arm == "html" else ("width", "height")):
                         value = render.get(dimension)
                         if (
                             not isinstance(value, int)
@@ -752,7 +787,7 @@ def _validate_schedule(dataset):
                         ):
                             errors.append(f"{rlabel} CDP render has invalid {dimension}")
                     expected_quality = meta["quality"] if meta["format"] == "jpeg" else 0
-                    if render.get("quality") != expected_quality:
+                    if arm != "html" and render.get("quality") != expected_quality:
                         errors.append(f"{rlabel} CDP render quality mismatches metadata")
                     nav = render.get("nav")
                     nav_fields = (
