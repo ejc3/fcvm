@@ -48,6 +48,45 @@ async fn is_ip_in_use_on_veth(ip: &str) -> bool {
     false
 }
 
+/// The /30 peer of a derived host-side veth address (.1 → .2).
+fn peer_of(host_ip: &str) -> Option<String> {
+    let (prefix, last) = host_ip.rsplit_once('.')?;
+    let n: u8 = last.parse().ok()?;
+    Some(format!("{}.{}", prefix, n.checked_add(1)?))
+}
+
+/// After the candidate /30 is assigned, ask the kernel where the pair's
+/// namespace-side address routes NOW. Anything but our veth means a more
+/// specific host route claims it and the subnet is unusable (#820): AWS DHCP
+/// installs a /32 to the VPC resolver (`10.0.0.2 via <gw> dev <primary>` in a
+/// 10.0.0.0/16 VPC), which beats the /30 drawn by subnet_id 0, so that
+/// clone's forwarded ports timed out for its whole life — a 1-in-16384
+/// silent death. No route-table policy is modeled here: the kernel answers
+/// the exact question the data path will ask.
+async fn kernel_routes_peer_via_veth(veth_name: &str, peer_ip: &str) -> bool {
+    let output = match tokio::process::Command::new("ip")
+        .args(["route", "get", peer_ip])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        // Can't ask — keep the pre-#820 behavior rather than failing every
+        // allocation on a broken `ip` binary.
+        _ => return true,
+    };
+    route_get_names_dev(&String::from_utf8_lossy(&output.stdout), veth_name)
+}
+
+/// Token-exact scan of `ip route get` output for `dev <veth_name>`.
+/// Token-exact so veth0-vm-abc12 never matches veth0-vm-abc123 (same trap as
+/// veth.rs route_nexthop).
+fn route_get_names_dev(route_get_output: &str, veth_name: &str) -> bool {
+    let tokens: Vec<&str> = route_get_output.split_whitespace().collect();
+    tokens
+        .windows(2)
+        .any(|w| w[0] == "dev" && w[1] == veth_name)
+}
+
 /// Bridged networking using network namespace isolation with veth pairs
 ///
 /// This mode requires sudo/root for network namespace and iptables setup.
@@ -163,16 +202,61 @@ impl NetworkManager for BridgedNetwork {
             .await
             .context("acquiring bridged subnet allocation lock")?;
 
-        // Check for subnet collisions with live VMs and retry with incremented ID
+        // Namespace and veth pair are subnet-independent; they exist before
+        // subnet selection so each candidate /30 can be assigned to the real
+        // veth and verified against the kernel's actual routing decision.
+        let namespace_id = format!("fcvm-{}", truncate_id(&self.vm_id, 8));
+        namespace::create_namespace(&namespace_id)
+            .await
+            .context("creating network namespace")?;
+        self.namespace_id = Some(namespace_id.clone());
+
+        let host_veth = format!("veth0-{}", truncate_id(&self.vm_id, 8));
+        let guest_veth = format!("veth1-{}", truncate_id(&self.vm_id, 8));
+        if let Err(e) = veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id).await {
+            let _ = self.cleanup().await;
+            return Err(e).context("creating veth pair");
+        }
+        self.host_veth = Some(host_veth.clone());
+        self.guest_veth = Some(guest_veth.clone());
+
+        // Select a subnet: skip candidates whose address is already on a
+        // veth (live VM), then assign the /30 and require the kernel to
+        // route the pair's namespace-side address through OUR veth. A more
+        // specific host route claiming it (#820: AWS DHCP's /32 to the VPC
+        // resolver beats the /30 drawn by subnet_id 0) fails the probe and
+        // the candidate is stripped and skipped instead of producing a
+        // clone whose forwarded ports time out for its whole life.
         let subnet_id = {
             let mut attempts = 0u32;
             loop {
                 let host_ip = derive_host_ip(subnet_id, self.is_clone);
                 if !is_ip_in_use_on_veth(&host_ip).await {
-                    break subnet_id;
+                    let host_ip_with_cidr = format!("{}/30", host_ip);
+                    if let Err(e) = veth::setup_host_veth(&host_veth, &host_ip_with_cidr).await {
+                        let _ = self.cleanup().await;
+                        return Err(e).context("configuring host veth");
+                    }
+                    // Derived addresses always end .1 with a .2 peer; a
+                    // candidate the derivation cannot pair is accepted
+                    // unprobed rather than failing every allocation.
+                    match peer_of(&host_ip) {
+                        None => break subnet_id,
+                        Some(peer) => {
+                            if kernel_routes_peer_via_veth(&host_veth, &peer).await {
+                                break subnet_id;
+                            }
+                        }
+                    }
+                    // Strip the losing address before trying the next /30.
+                    let _ = tokio::process::Command::new("ip")
+                        .args(["addr", "del", &host_ip_with_cidr, "dev", &host_veth])
+                        .output()
+                        .await;
                 }
                 attempts += 1;
                 if attempts >= 100 {
+                    let _ = self.cleanup().await;
                     anyhow::bail!(
                         "subnet allocation failed: no free subnet found after {} attempts",
                         attempts
@@ -264,32 +348,9 @@ impl NetworkManager for BridgedNetwork {
         self.subnet_cidr = Some(veth_subnet.clone());
         self.veth_inner_ip = veth_inner_ip.clone();
 
-        // Step 1: Create network namespace
-        let namespace_id = format!("fcvm-{}", truncate_id(&self.vm_id, 8));
-        namespace::create_namespace(&namespace_id)
-            .await
-            .context("creating network namespace")?;
-        self.namespace_id = Some(namespace_id.clone());
-
-        // Step 2: Create veth pair
-        let host_veth = format!("veth0-{}", truncate_id(&self.vm_id, 8));
-        let guest_veth = format!("veth1-{}", truncate_id(&self.vm_id, 8));
-
-        if let Err(e) = veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id).await {
-            let _ = self.cleanup().await;
-            return Err(e).context("creating veth pair");
-        }
-        self.host_veth = Some(host_veth.clone());
-        self.guest_veth = Some(guest_veth.clone());
-
-        // Step 3: Configure host side of veth
-        if let Err(e) = veth::setup_host_veth(&host_veth, &host_ip_with_cidr).await {
-            let _ = self.cleanup().await;
-            return Err(e).context("configuring host veth");
-        }
-
-        // Host IP is now assigned to the veth, so other processes' collision checks
-        // can see it. The remaining steps don't touch subnet allocation state.
+        // The winning host IP was assigned inside the selection loop, so other
+        // processes' collision checks can see it. The remaining steps don't
+        // touch subnet allocation state.
         drop(subnet_lock);
 
         // Step 4: Create TAP device inside namespace
@@ -510,5 +571,45 @@ impl NetworkManager for BridgedNetwork {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The #820 collision as the kernel reports it, verbatim from the box
+    /// that hit it: with the veth's 10.0.0.1/30 assigned, `ip route get
+    /// 10.0.0.2` still resolves via the VPC gateway because AWS DHCP's /32
+    /// host route to the VPC resolver beats the /30. The probe must reject.
+    #[test]
+    fn dhcp_claimed_peer_resolves_off_veth_and_fails_probe() {
+        let out = "10.0.0.2 via 10.0.1.1 dev enP1s33 src 10.0.1.49 uid 0 \n    cache \n";
+        assert!(!route_get_names_dev(out, "veth0-vm-7f55a"));
+    }
+
+    /// The healthy case: the connected /30 wins and the kernel names our
+    /// veth as the device.
+    #[test]
+    fn unclaimed_peer_resolves_on_veth_and_passes_probe() {
+        let out = "10.31.23.94 dev veth0-vm-8fe5a scope link src 10.31.23.93 uid 0 \n    cache \n";
+        assert!(route_get_names_dev(out, "veth0-vm-8fe5a"));
+    }
+
+    /// Token-exact device match: a longer veth name sharing our prefix is a
+    /// different interface (same trap as veth.rs route_nexthop).
+    #[test]
+    fn dev_match_is_token_exact() {
+        let out = "10.31.23.94 dev veth0-vm-8fe5a4 scope link src 10.31.23.93 \n";
+        assert!(!route_get_names_dev(out, "veth0-vm-8fe5a"));
+    }
+
+    #[test]
+    fn peer_of_increments_last_octet() {
+        assert_eq!(peer_of("10.0.0.1").as_deref(), Some("10.0.0.2"));
+        assert_eq!(peer_of("172.30.23.93").as_deref(), Some("172.30.23.94"));
+        assert_eq!(peer_of("not-an-ip"), None);
+        // .255 cannot have a /30 peer above it; refuse rather than wrap.
+        assert_eq!(peer_of("10.0.0.255"), None);
     }
 }
