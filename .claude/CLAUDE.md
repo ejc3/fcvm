@@ -118,6 +118,10 @@ Three rules the gate enforces, each of them a hole it once had:
   used to clear a PR-level defect claim that, posted inline, would have demanded a real
   disposition — the same finding adjudicated or waved through depending on where the
   reviewer happened to click.
+- **All three containers count.** A finding can arrive as an inline thread, a review body,
+  or a plain top-level PR comment (`gh pr comment`). The last of those was invisible to the
+  gate for a while, which meant a claim posted exactly the way the docs suggested could sit
+  on a PR reporting CLEAR.
 
 Earlier versions also guessed which findings were defects from a `panic|crash|leak|...` regex.
 That failed BOTH ways: "this drops the final game from the schedule" matched nothing and closed
