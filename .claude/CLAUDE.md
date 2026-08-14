@@ -100,8 +100,21 @@ branch logged 0 times across 137 runs, a `grep '^ *FAIL'` blind to nextest's `TR
 Every one of them was green for its whole life.
 
 Enforcement: `scripts/check-review-threads.sh <pr>` fails while any review thread is
-unresolved, AND while any thread that *describes* broken behaviour has been resolved without a
-`RED-VERIFIED: <test>` reply. CI state cannot tell you whether a finding was answered.
+unresolved, while any RESOLVED thread carries no disposition reply, and while any PR-level
+review body carries no `REVIEW-ACK:`. Every resolved thread needs one of:
+
+| `RED-VERIFIED: <test>` | a defect claim, closed by a test watched failing without the fix |
+| `NOT-A-DEFECT: <reason>` | naming, docs, style |
+| `DISAGREE: <reason>` | a defect claim you are rejecting, with reasoning |
+
+Earlier versions guessed which findings were defects from a `panic|crash|leak|...` regex. That
+failed BOTH ways: "this drops the final game from the schedule" matched nothing and closed on an
+assertion, while a *wrong* defect claim could never be closed at all. Do not guess; answer.
+
+The gate has its own tests, each written against the unfixed script and observed failing first:
+`scripts/test-check-review-threads.sh`, plus `scripts/probe-review-gate-pagination.sh` for the
+live oversized-thread path that fixtures cannot reach. CI state cannot tell you whether a
+finding was answered.
 
 ### A GATE MUST FAIL CLOSED — check your dependencies before you trust your verdict
 

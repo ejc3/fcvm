@@ -366,3 +366,13 @@ done
 
 **What to look for:** Full error messages (CI truncates stderr), timestamps (compare failing
 vs passing for contention), boot sequence (fc-agent startup stalls), dmesg artifacts.
+
+## Answering review findings
+
+`scripts/check-review-threads.sh <pr>` is the gate. It blocks on UNRESOLVED threads,
+UNDISPOSED resolved threads, and UNACKED PR-level review bodies. A defect claim is closed
+by `RED-VERIFIED: <test>` naming a test you watched **fail without the fix** — not by an
+assertion that it is fixed. `NOT-A-DEFECT:` and `DISAGREE:` are equally valid dispositions;
+silence is not one.
+
+Verify the gate itself with `scripts/test-check-review-threads.sh` before trusting a CLEAR.

@@ -1,13 +1,14 @@
 #!/bin/bash
 # Fail while a PR has UNRESOLVED inline review threads.
 #
-# This is the enforcement half of the review-comment rules in .claude/CLAUDE.md.
+# This is the enforcement half of the review rules in CLAUDE.md.
 # A doc that says "read the inline findings before merging" cannot fire. This can.
 #
-# It exists because on 2026-08-08 a PR sat at 15 green checks / 0 failures /
+# It exists because CI state says nothing about whether a review was ANSWERED.
+# Ported from ejc3/fcvm, where a PR sat at 15 green checks / 0 failures /
 # MERGEABLE with 19 unresolved inline findings, and another merged carrying four
-# unread Major findings behind a green `CodeRabbit pass`. CI state says nothing
-# about whether a human or bot review was answered.
+# unread Major findings behind a green `CodeRabbit pass`. Codex reviews this repo,
+# so the same shape is available here the moment a review has findings.
 #
 # Why GraphQL and not `created_at` heuristics: an earlier version of the docs
 # said "comment older than your fix commit => already addressed". That is wrong
@@ -38,8 +39,14 @@ done
 REPO_OWNER=${REPO_OWNER:-ejc3}
 REPO_NAME=${REPO_NAME:-fcvm}
 
-fetch_threads() {
-  local pr=$1 cursor=null all='[]'
+# The GitHub page size for comments within one thread. Only tests override it:
+# reproducing an oversized thread honestly costs 100+ comment-creation API calls,
+# which GitHub secondary-rate-limits into silent partial failure. Shrinking the page
+# makes the same code path reachable with three comments.
+COMMENTS_PAGE_SIZE=${COMMENTS_PAGE_SIZE:-100}
+
+fetch_payload() {
+  local pr=$1 cursor=null threads='[]' reviews='[]'
   while :; do
     local after="" resp
     # `\"` here, NOT `\\\"`: the latter puts a literal backslash into the GraphQL
@@ -49,26 +56,65 @@ fetch_threads() {
     resp=$(gh api graphql -f query="
       { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
           pullRequest(number: $pr) {
+            reviews(first: 100) { nodes { author { login } state body } }
             reviewThreads(first: 100$after) {
               pageInfo { hasNextPage endCursor }
               nodes {
-                isResolved isOutdated
-                comments(first: 100) { nodes { author { login } path line originalLine body } }
+                id isResolved isOutdated
+                comments(first: $COMMENTS_PAGE_SIZE) { totalCount nodes { author { login } path line originalLine body } }
               } } } } }" 2>/dev/null) || return 1
-    all=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviewThreads.nodes // [])' \
-          <(echo "$all") <(echo "$resp"))
+
+    # A wrong PR number, a renamed repo, or a permissions problem all return a NULL
+    # pullRequest with no GraphQL error. Coalescing that to [] turned "I could not find
+    # this PR" into "this PR has nothing to answer" and exited CLEAR. A gate that cannot
+    # find its subject must block, never bless it.
+    if [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$resp")" = "null" ]; then
+      echo "verdict: BLOCKED — no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is" >&2
+      echo "not visible to this token). Refusing to report CLEAR for a PR never read." >&2
+      return 2
+    fi
+
+    threads=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviewThreads.nodes // [])' \
+          <(echo "$threads") <(echo "$resp"))
+    reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
+          <(echo "$reviews") <(echo "$resp"))
     [ "$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$resp")" = "true" ] || break
     cursor=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$resp")
   done
-  echo "$all"
+
+  # A disposition is a REPLY, so it lands at the END of a long thread. comments(first:100)
+  # silently truncated exactly there: a thread with 100+ comments reported UNPROVEN even
+  # though its RED-VERIFIED reply existed, with no way for a later reply to become
+  # visible. Re-fetch the tail of any oversized thread and merge it in.
+  local oversized
+  oversized=$(jq -r --argjson page "$COMMENTS_PAGE_SIZE" \
+  '[.[] | select((.comments.totalCount // 0) > $page) | .id] | .[]' <<<"$threads")
+  local tid
+  for tid in $oversized; do
+    local tail
+    tail=$(gh api graphql -f query="
+      { node(id: \"$tid\") { ... on PullRequestReviewThread {
+          comments(last: $COMMENTS_PAGE_SIZE) { nodes { author { login } path line originalLine body } } } } }" 2>/dev/null) || continue
+    threads=$(jq --arg id "$tid" --argjson tail "$(jq '.data.node.comments.nodes // []' <<<"$tail")" \
+      'def dedupe_stable: reduce .[] as $c ([]; if any(.[]; . == $c) then . else . + [$c] end);
+       map(if .id == $id
+           then .comments.nodes = ((.comments.nodes + $tail) | dedupe_stable)
+           else . end)' \
+      <<<"$threads")
+  done
+
+  jq -n --argjson t "$threads" --argjson r "$reviews" \
+     '{data:{repository:{pullRequest:{reviewThreads:{nodes:$t}, reviews:{nodes:$r}}}}}'
 }
 
 if [ "${1:-}" = "--from-file" ]; then
-  threads=$(jq '.data.repository.pullRequest.reviewThreads.nodes' "${2:?need a json file}")
+  payload=$(cat "${2:?need a json file}")
 else
   pr=${1:?usage: check-review-threads.sh <pr-number> | --from-file <json>}
-  threads=$(fetch_threads "$pr") || { echo "could not query review threads for #$pr" >&2; exit 2; }
+  payload=$(fetch_payload "$pr") || exit 2
 fi
+threads=$(jq '.data.repository.pullRequest.reviewThreads.nodes' <<<"$payload" 2>/dev/null)
+reviews=$(jq '.data.repository.pullRequest.reviews.nodes // []' <<<"$payload" 2>/dev/null)
 
 # Prove the payload is what we think before counting it. `jq` emits `null` for a missing
 # path and an empty string on a parse error, and `[ "" -gt 0 ]` is a shell error, not a
@@ -79,10 +125,14 @@ if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$threads"; then
   echo "this gate could not parse. Re-run, or re-capture the fixture." >&2
   exit 2
 fi
-if ! jq -e 'all(has("isResolved") and (.comments.nodes | type == "array"))' \
+# has("isResolved") was presence-only: `null` and the STRING "true" both satisfied it,
+# then matched neither the resolved nor the unresolved selector and vanished from both
+# counts into a CLEAR verdict. Require the actual type.
+if ! jq -e 'all((.isResolved | type) == "boolean" and (.comments.nodes | type == "array"))' \
      >/dev/null 2>&1 <<<"$threads"; then
-  echo "verdict: BLOCKED — a thread is missing isResolved or its comments array. The" >&2
-  echo "only field that means 'resolved' is isResolved; without it nothing can be judged." >&2
+  echo "verdict: BLOCKED — a thread has a non-boolean isResolved or a bad comments array." >&2
+  echo "The only field that means 'resolved' is isResolved; a null or string value is not" >&2
+  echo "an answer, and a thread that matches neither selector must not slip through." >&2
   exit 2
 fi
 
@@ -103,40 +153,71 @@ if [ "$unresolved" -gt 0 ]; then
   rc=1
 fi
 
-# A finding that claims BROKEN BEHAVIOUR cannot be closed by asserting it is
-# fixed. Closing it requires a test that fails without the fix — otherwise the
-# only evidence the bug is gone is the same judgement that shipped it.
+# EVERY resolved thread must carry an explicit disposition reply. The previous version
+# only demanded proof when a regex spotted defect wording, which failed both ways:
+#   - ordinary phrasing slipped past it ("this drops the final game", "this omits an
+#     event" match none of panic|crash|leak|...), so a real defect closed on an assertion;
+#   - and a defect claim that was WRONG could never be closed at all, because only a RED
+#     marker counted, leaving no way to record a reasoned disagreement.
+# Guessing which findings are defects is the wrong job. Requiring an answer to each one
+# is the right one, and it is regex-free.
 #
-# Mark such a resolution by replying in the thread with:
-#     RED-VERIFIED: <test name or path>
-# and having actually watched it fail with the fix reverted.
+#   RED-VERIFIED: <test>    a defect claim, closed by a test watched failing without the fix
+#   NOT-A-DEFECT: <reason>  not a defect (naming, docs, style) — say what you did
+#   DISAGREE: <reason>      a defect claim you are rejecting, with the reasoning
 #
-# `defect_re` deliberately errs toward over-matching. A false positive costs one
-# reply naming the test; a false negative closes a real bug on an assertion.
-defect_re='panic|crash|hang|deadlock|leak|corrupt|race|overflow|truncat|silently|wrong|incorrect|breaks|broken|fails|unsound|use-after|out of bounds|off-by-one'
+# `[^[:space:]]` after the colon is required: a bare "RED-VERIFIED:" — or a comment
+# merely ASKING someone for proof — previously satisfied a plain substring test.
+disposition_re='(RED-VERIFIED|NOT-A-DEFECT|DISAGREE):[[:space:]]*[^[:space:]]'
 
-needs_proof=$(jq -r --arg re "$defect_re" '
+undisposed=$(jq -r --arg re "$disposition_re" '
   [ .[] | select(.isResolved == true)
-        | select([.comments.nodes[].body] | join(" ") | test($re; "i"))
-        | select(([.comments.nodes[1:][].body] | join(" ") | test("RED-VERIFIED:"; "i")) | not) ]
+        | select(([.comments.nodes[1:][].body] | join(" ") | test($re)) | not) ]
   | length' <<<"$threads" 2>/dev/null || echo 0)
 
-if [ "${needs_proof:-0}" -gt 0 ]; then
+if [ "${undisposed:-0}" -gt 0 ]; then
   echo
-  jq -r --arg re "$defect_re" '.[] | select(.isResolved == true)
-    | select([.comments.nodes[].body] | join(" ") | test($re; "i"))
-    | select(([.comments.nodes[1:][].body] | join(" ") | test("RED-VERIFIED:"; "i")) | not)
+  jq -r --arg re "$disposition_re" '.[] | select(.isResolved == true)
+    | select(([.comments.nodes[1:][].body] | join(" ") | test($re)) | not)
     | .comments.nodes[0]
-    | "  UNPROVEN   \(.author.login)  \(.path):\(.line // .originalLine // "?")\n    \(.body | split("\n")[0][0:150])"' \
+    | "  UNDISPOSED \(.author.login)  \(.path):\(.line // .originalLine // "?")\n    \(.body | split("\n")[0][0:150])"' \
     <<<"$threads"
   echo
-  echo "verdict: BLOCKED — $needs_proof resolved thread(s) describe broken behaviour with no test cited."
-  echo "Reply in the thread with 'RED-VERIFIED: <test>' after watching that test fail"
-  echo "with the fix reverted. A test that has never been red proves nothing."
+  echo "verdict: BLOCKED — $undisposed resolved thread(s) carry no disposition reply."
+  echo "Reply in the thread with one of:"
+  echo "  RED-VERIFIED: <test>    after watching that test fail with the fix reverted"
+  echo "  NOT-A-DEFECT: <reason>  for naming/docs/style findings"
+  echo "  DISAGREE: <reason>      to reject a defect claim, with the reasoning"
+  echo "Resolving without replying closes a finding without answering it."
+  rc=1
+fi
+
+# A defect claim can also arrive in a PR-LEVEL REVIEW BODY, which is not a thread and has
+# no isResolved. Those never appeared in reviewThreads at all, so a review whose entire
+# content was "P1: this silently drops events" left the gate reporting 0 threads / CLEAR.
+# Require an explicit acknowledgement comment for each non-empty review body.
+# Count only bodies that are NOT themselves acknowledgements. An ACK reply carries a
+# body too, and counting it as one more thing needing acknowledgement made a correctly
+# acked PR block forever — the fail-closed-permanently twin of the bug this replaced.
+unacked=$(jq -r '
+  ([ .[] | select((.body // "") | test("[^[:space:]]"))
+          | select((.body // "") | test("REVIEW-ACK:") | not) ] | length) as $needing
+  | ([ .[] | select((.body // "") | test("REVIEW-ACK:[[:space:]]*[^[:space:]]")) ] | length) as $acks
+  | if $acks > 0 then 0 else $needing end' <<<"$reviews" 2>/dev/null || echo 0)
+
+if [ "${unacked:-0}" -gt 0 ]; then
+  echo
+  jq -r '.[] | select((.body // "") | test("[^[:space:]]"))
+    | select((.body // "") | test("REVIEW-ACK:") | not)
+    | "  UNACKED    \(.author.login) (\(.state))\n    \(.body | split("\n")[0][0:150])"' <<<"$reviews"
+  echo
+  echo "verdict: BLOCKED — $unacked PR-level review body/bodies not acknowledged."
+  echo "A finding in a review body is not a thread and cannot be 'resolved'. Reply on the"
+  echo "PR with 'REVIEW-ACK: <what you did>' once you have read and answered it."
   rc=1
 fi
 
 if [ "$rc" -eq 0 ]; then
-  echo "verdict: CLEAR — every thread resolved, every defect claim backed by a red-verified test."
+  echo "verdict: CLEAR — every thread resolved and disposed, every review body acknowledged."
 fi
 exit $rc
