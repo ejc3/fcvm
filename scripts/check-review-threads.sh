@@ -265,10 +265,18 @@ fi
 # Bot REVIEWS still count in full: Codex reviews as an App, and its review bodies are
 # exactly what this check exists to catch.
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
+# Bot-ness alone is the WRONG test for a top-level comment, and a first version got this
+# wrong: Codex is `__typename: Bot`, and it does sometimes post its findings as a plain PR
+# comment rather than a review — so excluding every bot comment would hide exactly the
+# findings this gate exists to catch. What actually separates a deploy notification from a
+# finding is whether its author reviews at all. Vercel never submits a review; Codex does.
 bodies=$(jq -s --arg me "$prauthor" \
-   '(.[0] | map({author, state, body, at: .submittedAt, claimable: (.author.login != $me)}))
+   '(.[0] | map(.author.login) | unique) as $reviewers
+  | (.[0] | map({author, state, body, at: .submittedAt, claimable: (.author.login != $me)}))
   + (.[1] | map({author, state: "COMMENT", body, at: .createdAt,
-                 claimable: (.author.login != $me and (.author.__typename // "User") != "Bot")}))' \
+                 claimable: (.author.login != $me
+                             and ((.author.__typename // "User") != "Bot"
+                                  or (.author.login | IN($reviewers[]))))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 

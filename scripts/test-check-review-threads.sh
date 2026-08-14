@@ -160,6 +160,9 @@ run_case "deploy bot notification does not block" \
 run_case "a human finding in a top-level comment still blocks" \
   "$(wrap4 me '[]' '[]' '[{"author":{"login":"reviewer","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]')" \
   1 "BLOCKED"
+run_case "a reviewing bot's top-level comment still blocks" \
+  "$(wrap4 me '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":""}]' '[{"author":{"login":"codex","__typename":"Bot"},"createdAt":"2026-01-02T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  1 "BLOCKED"
 run_case "a bot REVIEW body still blocks" \
   "$(wrap4 me '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]' '[]')" \
   1 "BLOCKED"
