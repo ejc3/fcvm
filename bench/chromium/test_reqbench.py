@@ -3862,6 +3862,11 @@ exit 1
         os.makedirs(provenance_dir, exist_ok=True)
         with open(os.path.join(provenance_dir, "reqbench-provenance.json"), "w") as f:
             json.dump({"image_id": "sha256:" + "1" * 64}, f)
+        # Every real installed snapshot carries config.json; without it the
+        # hugepage guard reads state "unknown" and (correctly) refuses
+        # BACKEND=file fail-closed rather than risking a mislabeled record.
+        with open(os.path.join(provenance_dir, "config.json"), "w") as f:
+            json.dump({"metadata": {"hugepages": False}}, f)
         argv = os.path.join(d, "argv.log")
         pyargv = os.path.join(d, "pyargv.log")
         driver_env = os.path.join(d, "driver-env.log")
@@ -5270,20 +5275,58 @@ class MakefileBenchGraph(unittest.TestCase):
         out = subprocess.run(
             ["make", "-C", cls.REPO, "-pq", "help"],
             capture_output=True, text=True, timeout=120)
+        # -q exits 0/1 for up-to-date/rebuild-needed; 2 means make itself
+        # FAILED to parse — and it still prints a partial database, so
+        # trusting stdout alone lets a broken Makefile pass every structural
+        # assertion below (codex P2, 2026-08-14).
+        cls.make_rc = out.returncode
+        cls.make_stderr = out.stderr[-2000:]
         cls.rules = {}
+        cls.recipes = {}
+        cls.phony = set()
+        cur = None
         for line in out.stdout.splitlines():
+            if line.startswith("\t") and cur:
+                cls.recipes.setdefault(cur, []).append(line)
+                continue
+            if line.startswith(".PHONY:"):
+                cls.phony.update(line.partition(":")[2].split())
+                continue
+            if line.startswith("#"):
+                # -p interleaves "# recipe to execute (from ...)" comments
+                # between a rule and its recipe: keep cur so the recipe
+                # lines that follow still attach to their target.
+                continue
             # Rule lines sit at column 0 as "target: prereqs". Skip recipes,
-            # comments, special targets, and target-specific variable lines
+            # special targets, and target-specific variable lines
             # ("bench-quick: BENCH_ARGS := ..."), which contain "=".
-            if not line or line[0] in "\t# ." or "=" in line or ":" not in line:
+            if not line or line[0] in "\t." or "=" in line or ":" not in line:
+                cur = None
                 continue
             tgt, _, prereqs = line.partition(":")
-            cls.rules.setdefault(tgt.strip(), set()).update(prereqs.split())
+            cur = tgt.strip()
+            cls.rules.setdefault(cur, set()).update(prereqs.split())
 
     def prereqs(self, target):
         self.assertIn(target, self.rules,
                       f"{target} not found in make database")
         return self.rules[target]
+
+    def closure(self, target):
+        seen, stack = set(), [target]
+        while stack:
+            for p in self.rules.get(stack.pop(), ()):
+                if p not in seen:
+                    seen.add(p)
+                    stack.append(p)
+        return seen
+
+    def test_make_database_is_from_a_parsable_makefile(self):
+        self.assertIn(self.make_rc, (0, 1),
+                      f"make -pq exited {self.make_rc} (fatal parse error) — "
+                      f"the database below it is partial and every other "
+                      f"assertion in this class is vacuous. stderr: "
+                      f"{self.make_stderr}")
 
     def test_golden_depends_on_binary_and_assets(self):
         p = self.prereqs("bench-chromium-request-golden")
@@ -5299,10 +5342,43 @@ class MakefileBenchGraph(unittest.TestCase):
         # hash. A `build` prerequisite here could swap the binary between
         # golden and run: the seal would fail closed, but the chain would be
         # self-breaking. The binary under test comes from the golden-time
-        # build, so these targets must not rebuild anything.
+        # build, so these targets must not rebuild anything — TRANSITIVELY:
+        # a direct-only check passes `run: bench-chromium-request-build`,
+        # which rebuilds through its own deps (codex P2, 2026-08-14).
         for t in ("bench-chromium-request-run", "bench-chromium-request-verify"):
-            self.assertNotIn("build", self.prereqs(t), t)
-            self.assertNotIn("setup-default", self.prereqs(t), t)
+            c = self.closure(t)
+            for forbidden in ("build", "setup-default", "cargo-target-link"):
+                self.assertNotIn(forbidden, c,
+                                 f"{t} transitively reaches {forbidden}")
+
+    def test_bench_targets_are_phony(self):
+        # A stray file named like a target silently suppresses its recipe;
+        # make then reports "up to date" and nothing runs.
+        for t in ("bench-chromium-request-build", "bench-chromium-request-golden",
+               "bench-chromium-request-verify", "bench-chromium-request-run",
+               "bench-chromium-request-all", "bench-chromium-hostcdp",
+               "bench-chromium-fault"):
+            self.assertIn(t, self.phony, f"{t} missing from .PHONY")
+
+    def test_fault_target_provisions_its_hugepage_pool(self):
+        # faultbench selects uffd-huge-minor whenever the huge golden exists,
+        # and bench.sh restores the pool (commonly to zero) after creating
+        # that golden — so without provisioning here the new entry point
+        # fails immediately after the workflow that creates its own
+        # prerequisite (codex P1, 2026-08-14).
+        recipe = "\n".join(self.recipes.get("bench-chromium-fault", []))
+        self.assertIn("nr_hugepages", recipe,
+                      "bench-chromium-fault recipe does not provision the "
+                      "hugepage pool its default cell matrix needs")
+
+    def test_run_help_documents_tag(self):
+        # Following the documented huge flow without TAG= on the run line
+        # measures the DEFAULT 4K tag while the huge golden sits unused
+        # (codex P2, 2026-08-14).
+        help_lines = [ln for ln in self.recipes.get("help", [])
+                      if "bench-chromium-request-run" in ln]
+        self.assertTrue(help_lines, "run target missing from help")
+        self.assertIn("TAG=", help_lines[0])
 
     def test_full_chain_and_companion_benches(self):
         p = self.prereqs("bench-chromium-request-all")
@@ -5320,3 +5396,83 @@ class MakefileBenchGraph(unittest.TestCase):
         # with no firecracker asset. Its survival (including as a stray
         # .PHONY entry) means the clean break did not happen.
         self.assertNotIn("bench-chromium-request", self.rules)
+
+
+class HugepageGuards(unittest.TestCase):
+    """reqbench.sh must fail closed around hugepage goldens.
+
+    Watched red 2026-08-14 before the fix: `ensure_hugepage_pool` and
+    `hugepage_snapshot_state` did not exist (bash: command not found), and
+    `cmd_run BACKEND=file` against a hugepage-snapshot fixture sailed past
+    the missing check into guard_quiet. Codex P1s: (a) a hugepage golden
+    restored with BACKEND=file silently starts a UFFD server while the
+    record says backend=file — the analyzer then gates MISLABELED data;
+    (b) the pool grow was golden-only and fixed at 2048 pages, ignoring
+    MEM and later phases (a 2050 MiB guest needs 4100 pages; a rebooted
+    box re-runs verify/run with an empty pool).
+    """
+
+    SH = os.path.join(HERE, "reqbench.sh")
+
+    def _bash(self, snippet, env_extra=None, hugepages="true"):
+        d = tempfile.mkdtemp(prefix="hugeguard-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        snapdir = os.path.join(d, "data", "snapshots", "tag-under-test")
+        os.makedirs(snapdir)
+        with open(os.path.join(snapdir, "config.json"), "w") as f:
+            f.write('{"metadata": {"hugepages": %s}}' % hugepages)
+        pool = os.path.join(d, "nr_hugepages")
+        with open(pool, "w") as f:
+            f.write("100\n")
+        binx = os.path.join(d, "bin")
+        os.makedirs(binx)
+        with open(os.path.join(binx, "sudo"), "w") as f:
+            f.write('#!/bin/bash\nexec "$@"\n')
+        os.chmod(os.path.join(binx, "sudo"), 0o755)
+        env = dict(os.environ)
+        env.update(
+            PATH=binx + os.pathsep + env["PATH"],
+            TAG="tag-under-test",
+            STATE_DIR=os.path.join(d, "data", "state"),
+            HUGEPAGE_POOL_FILE=pool,
+            MEM="1024",
+            RESULTS=os.path.join(d, "results"),
+        )
+        env.update(env_extra or {})
+        r = subprocess.run(
+            ["bash", "-c", f'source "{self.SH}" && {snippet}'],
+            capture_output=True, text=True, env=env, timeout=60)
+        return r, pool
+
+    def test_pool_grows_to_mem_derived_need(self):
+        r, pool = self._bash("ensure_hugepage_pool")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # 1024 MiB / 2 MiB per page = 512 per VM; x4 for backing + prepare
+        # VM + two teardown-overlapping clones.
+        self.assertEqual(open(pool).read().strip(), "2048")
+
+    def test_pool_need_scales_with_mem(self):
+        r, pool = self._bash("ensure_hugepage_pool", {"MEM": "2050"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(open(pool).read().strip(), "4100")
+
+    def test_pool_grow_failure_is_fatal(self):
+        # sudo "succeeds" but the write never lands (the kernel could not
+        # deliver contiguous pages): the phase must stop, not measure a
+        # hugepage cell on a starved pool.
+        r, _ = self._bash(
+            'cp "$HUGEPAGE_POOL_FILE" /tmp/keep-$$; '
+            'sudo() { :; }; ensure_hugepage_pool')
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_snapshot_state_reads_metadata(self):
+        for js, want in (("true", "huge"), ("false", "normal")):
+            r, _ = self._bash("hugepage_snapshot_state", hugepages=js)
+            self.assertEqual(r.stdout.strip(), want, r.stderr)
+        r, _ = self._bash('TAG=missing-tag hugepage_snapshot_state')
+        self.assertEqual(r.stdout.strip(), "unknown")
+
+    def test_cmd_run_refuses_file_backend_on_hugepage_snapshot(self):
+        r, _ = self._bash("BACKEND=file cmd_run")
+        self.assertEqual(r.returncode, 2, f"stdout={r.stdout} stderr={r.stderr}")
+        self.assertIn("BACKEND=uffd", r.stdout + r.stderr)

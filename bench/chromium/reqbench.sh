@@ -488,21 +488,7 @@ cmd_golden() {
     local huge_flag=""
     if [ "$HUGEPAGES" = 1 ]; then
         huge_flag="--hugepages"
-        # One 1024MiB guest = 512 2MB pages; golden build + serve + clones in
-        # flight need headroom. Grow the pool if short and fail closed if the
-        # kernel could not deliver (fragmentation) — a golden quietly built
-        # on 4K pages would poison every later A/B against this tag.
-        local huge_need=2048 huge_cur
-        huge_cur=$(cat /proc/sys/vm/nr_hugepages)
-        if [ "$huge_cur" -lt "$huge_need" ]; then
-            log "golden: growing hugepage pool $huge_cur -> $huge_need"
-            sudo sh -c "echo $huge_need > /proc/sys/vm/nr_hugepages"
-            huge_cur=$(cat /proc/sys/vm/nr_hugepages)
-            if [ "$huge_cur" -lt "$huge_need" ]; then
-                log "golden: hugepage pool only $huge_cur/$huge_need pages"
-                return 1
-            fi
-        fi
+        ensure_hugepage_pool || return 1
     fi
     $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag \
         --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
@@ -677,6 +663,11 @@ cmd_verify() {
     # after printing three FAILED lines. verify is documented as the gate; a gate
     # that cannot fail is not a gate.
     local fail=0
+    # A rebooted or pool-shrunk box re-runs verify against a persisted huge
+    # golden with an empty pool; grow it here, not only at golden time.
+    if [ "$(hugepage_snapshot_state)" = huge ]; then
+        ensure_hugepage_pool || return 1
+    fi
     log "verify: starting serve for $TAG"
     local sf="$RESULTS/logs/verify-serve.log"
     $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
@@ -788,8 +779,59 @@ UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 # goldens coexist. faultbench measured huge+minor at zero userspace faults
 # per render — this knob puts that configuration on the request path.
 HUGEPAGES="${HUGEPAGES:-0}"
+# Overridable for unit tests only; production is the real kernel knob.
+HUGEPAGE_POOL_FILE="${HUGEPAGE_POOL_FILE:-/proc/sys/vm/nr_hugepages}"
+
+# "huge", "normal", or "unknown" for the INSTALLED snapshot under $TAG.
+# unknown (unreadable/missing config.json) must be treated fail-closed by
+# callers that would mislabel data on a wrong guess.
+hugepage_snapshot_state() {
+    local v
+    v=$($SUDO jq -r '.metadata.hugepages' \
+        "$DATA_ROOT/snapshots/$TAG/config.json" 2>/dev/null) || { echo unknown; return; }
+    case "$v" in
+        true) echo huge ;;
+        false|null) echo normal ;;
+        *) echo unknown ;;
+    esac
+}
+
+# 2MB pages: a MEM-MiB guest needs MEM/2 pages. Sized for the worst
+# concurrent set — serve backing memfd + the prepare/verify VM + two clones
+# overlapping across a teardown boundary => 4x. Grow-only, and fails closed
+# when the kernel cannot deliver the pages (fragmentation): a hugepage phase
+# quietly starting on a starved pool would die mid-measurement, or worse,
+# measure a mixed-page configuration.
+ensure_hugepage_pool() {
+    local per_vm=$((MEM / 2)) need cur
+    need=$((per_vm * 4))
+    cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
+    if [ "$cur" -lt "$need" ]; then
+        log "hugepages: growing pool $cur -> $need (MEM=${MEM}MiB x4)"
+        sudo sh -c "echo $need > '$HUGEPAGE_POOL_FILE'"
+        cur=$(cat "$HUGEPAGE_POOL_FILE" 2>/dev/null || echo 0)
+        if [ "$cur" -lt "$need" ]; then
+            log "hugepages: pool only $cur/$need pages (fragmentation?)"
+            return 1
+        fi
+    fi
+}
 
 cmd_run() {
+    # Backend/pool sanity BEFORE the quiet gate: these are configuration
+    # errors, not load conditions. A hugepage snapshot cannot be restored
+    # file-backed — fcvm silently starts a UFFD server and the record would
+    # say backend=file, so the analyzer would gate MISLABELED data. unknown
+    # (unreadable config.json) refuses too: fail closed, never guess.
+    local huge_state
+    huge_state=$(hugepage_snapshot_state)
+    if [ "$BACKEND" = file ] && [ "$huge_state" != normal ]; then
+        log "run: BACKEND=file refused: snapshot '$TAG' hugepage state is '$huge_state' (a hugepage snapshot restores via an implicit UFFD server and the record would be mislabeled); use BACKEND=uffd or a non-hugepage TAG"
+        return 2
+    fi
+    if [ "$huge_state" = huge ]; then
+        ensure_hugepage_pool || return 1
+    fi
     local guard_rc=0
     guard_quiet || guard_rc=$?
     if [ "$guard_rc" -ne 0 ]; then

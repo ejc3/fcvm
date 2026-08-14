@@ -408,7 +408,7 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | `bench-chromium-request-build` | `build` | container image only |
 | `bench-chromium-request-golden` | `-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=` |
 | `bench-chromium-request-verify` | none (sealed bundle) | `TAG=` |
-| `bench-chromium-request-run` | none (sealed bundle) | `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `ARMS=`, `RESULTS=` |
+| `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=` |
 | `bench-chromium-request-all` | `build` + `setup-default` | all of the above, one seal |
 | `bench-chromium-hostcdp` | `-build` | host-container CDP baseline, no VM |
 | `bench-chromium-fault` | `build` + `setup-default` | `FAULT_OUT=` (required), `FAULT_ARGS=` |
@@ -424,9 +424,14 @@ then on "Custom firecracker not found", because a hand-rolled runner called
   `make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`
   (the golden grows the pool to 2048x2MB pages and fails closed if the
   kernel cannot deliver them).
-- Quiet-box gates: `run` refuses at 1-min load >= 2.0 or with stray
-  fcvm/firecracker processes (hostcdp and faultbench refuse at 1.0). Do not
-  start builds while a measured run is in flight.
+- Quiet-box gates: `run` refuses when 1-min load exceeds 2.0 or stray
+  fcvm/firecracker processes exist (hostcdp and faultbench refuse above 1.0).
+  Do not start builds — or ANY box-local work, including analysis scripts and
+  background agents — while a measured run is in flight; the noop drift gate
+  catches the contamination and voids the run (burned twice, 2026-08-13).
+- BACKEND=file is refused against a hugepage TAG (fcvm restores those via an
+  implicit UFFD server; the record would be mislabeled), and the pool is
+  ensured MEM-derived (4 x MEM/2 pages) at golden, verify, AND run time.
 - Structural pin: `MakefileBenchGraph` in bench/chromium/test_reqbench.py
   (`make test-chromium-request`) — it fails if the dependency graph or the
   no-rebuild property of the measured phases regresses.

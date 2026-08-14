@@ -295,7 +295,7 @@ help:
 	@echo "  bench-chromium-request-build   Build the request-bench container image"
 	@echo "  bench-chromium-request-golden  Create golden snapshot (TAG=, HUGEPAGES=1, NETMODE=)"
 	@echo "  bench-chromium-request-verify  Prove CDP hops on a restored clone (TAG=)"
-	@echo "  bench-chromium-request-run     Measured run (BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, ARMS=, RESULTS=)"
+	@echo "  bench-chromium-request-run     Measured run (TAG=, BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, WARMUP=, ARMS=, RESULTS=)"
 	@echo "  bench-chromium-request-all     Full chain: image, golden, verify, run"
 	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
@@ -763,8 +763,19 @@ bench-chromium-hostcdp: bench-chromium-request-build
 
 # Per-request guest page-fault count/cost per memory backend. Requires the
 # bench.sh goldens (cb-golden-*) to exist; cells without one are skipped.
+# faultbench selects uffd-huge-minor whenever the huge golden exists, and
+# bench.sh restores the pool (commonly to zero) after creating that golden —
+# so the pool must be provisioned HERE or the entry point fails immediately
+# after the workflow that created its own prerequisite. Default sized for
+# --guest-mib 2048: backing memfd (1024 pages) + concurrent clones.
+FAULT_POOL ?= 4096
 bench-chromium-fault: build setup-default
 	@test -n "$(FAULT_OUT)" || (echo "ERROR: FAULT_OUT required (results directory)"; exit 1)
+	@current=$$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0); \
+	if [ "$$current" -lt "$(FAULT_POOL)" ]; then \
+		echo "==> Growing hugepage pool $$current -> $(FAULT_POOL) for the huge cells..."; \
+		sudo sh -c 'echo $(FAULT_POOL) > /proc/sys/vm/nr_hugepages'; \
+	fi
 	@echo "==> Running per-request page-fault benchmark..."
 	@python3 bench/chromium/faultbench.py --out "$(FAULT_OUT)" $(FAULT_ARGS)
 
