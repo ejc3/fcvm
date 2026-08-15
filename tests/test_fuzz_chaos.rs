@@ -73,6 +73,17 @@ enum Op {
     SnapshotCreate,
     /// Flood the console/exec stream with 5000 lines of output.
     ConsoleFlood,
+    /// Restore a clone from a snapshot this seed took and immediately hit its
+    /// forwarded port — the readiness contract a caller relies on.
+    ///
+    /// This is the op that reaches the restore-time network path: a restored
+    /// guest inherits the snapshot's conntrack table and its published-port
+    /// DNAT, and fcvm declares the clone ready only after the guest answers a
+    /// TCP probe. A clone handed over before that path settles shows up here
+    /// as a failed curl against a clone fcvm called ready. Observed in the
+    /// wild at roughly 1 in 400 restores (2026-08-15), which no single-VM op
+    /// in this harness could ever reach.
+    CloneRestore,
     /// Seeded 0-400ms sleep (also substituted when the snapshot budget is
     /// spent, keeping rng consumption uniform at one draw per op).
     JitterSleep,
@@ -87,6 +98,7 @@ const OP_WEIGHTS: &[(Op, u32)] = &[
     (Op::StateRead, 15),
     (Op::SnapshotCreate, 6),
     (Op::ConsoleFlood, 9),
+    (Op::CloneRestore, 12),
     (Op::JitterSleep, 20),
 ];
 
@@ -375,6 +387,46 @@ async fn apply_op(
             );
             Ok(format!("{} bytes", out.len()))
         }
+        Op::CloneRestore => {
+            // Nothing to restore until this seed has taken a snapshot; the
+            // draw is still consumed above, so the schedule stays a pure
+            // function of the seed.
+            let Some(tag) = snapshots.last().cloned() else {
+                return Ok("no snapshot yet".to_string());
+            };
+            let clone_name = format!("{}-clone-{}", snap_base, op_idx);
+            // No --publish here: `snapshot run` takes none, because a clone
+            // INHERITS the snapshot's port mappings. In rootless mode each
+            // clone gets its own loopback IP, so the inherited host port is
+            // reached at that address (same shape as
+            // test_clone_port_forward_rootless).
+            let (mut clone_child, clone_pid) =
+                common::spawn_fcvm(&["snapshot", "run", "--snapshot", &tag, "--name", &clone_name])
+                    .await
+                    .with_context(|| format!("restoring clone from {}", tag))?;
+
+            // fcvm only reports a clone up after its own post-restore
+            // port-forward verification, so a curl that fails here means the
+            // readiness contract was declared on something the data path does
+            // not honour — the exact defect this op exists to catch.
+            let verdict = async {
+                common::poll_health_by_pid(clone_pid, 60)
+                    .await
+                    .context("restored clone never became healthy")?;
+                let clone_ip = common::get_loopback_ip(clone_pid)
+                    .await
+                    .context("clone has no loopback IP after restore")?;
+                curl_once(&clone_ip, port)
+                    .await
+                    .context("clone reported healthy but its inherited forwarded port is dead")
+            }
+            .await;
+
+            common::kill_process(clone_pid).await;
+            let _ = clone_child.wait().await;
+            let detail = verdict?;
+            Ok(format!("clone={} {}", clone_name, detail))
+        }
         Op::JitterSleep => {
             let ms = draw % 401; // 0-400ms
             tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -480,6 +532,18 @@ async fn run_seed_body(
         seed,
         boot_start.elapsed().as_secs_f64()
     );
+
+    // One baseline snapshot BEFORE the op loop, so CloneRestore has something
+    // to restore from its first draw. Without it most CloneRestore ops fall
+    // through as "no snapshot yet" (5 of 6 in the first run of this rung), and
+    // a defect that appears roughly once in 400 restores needs every restore
+    // the budget allows. Taken outside the loop, so it consumes no rng draw
+    // and the schedule stays a pure function of the seed.
+    let baseline_tag = format!("{}-base", snap_base);
+    common::create_snapshot_by_pid(pid, &baseline_tag)
+        .await
+        .with_context(|| format!("seed {}: baseline snapshot for clone restores", seed))?;
+    snapshots.push(baseline_tag);
 
     let ip = common::get_loopback_ip(pid).await?;
     let vm_id = {
