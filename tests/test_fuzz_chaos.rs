@@ -47,6 +47,40 @@ const OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Snapshot create pauses the VM and writes a multi-GB memory image; give it
 /// a larger (still hard) budget than ordinary ops.
 const SNAPSHOT_OP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Budget for a CloneRestore op. Deliberately LARGER than the waits inside it
+/// (60s health poll + a 5s curl): if the outer timeout fired first, the op
+/// future would be dropped mid-await and its clone teardown skipped, leaving a
+/// restored VM running while the seed tears down around it (review finding on
+/// #837). The registry below is the belt to this suspenders.
+const CLONE_OP_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Clone PIDs a CloneRestore op spawned and has not yet reaped.
+///
+/// The op kills its own clone on every path it can reach, but a future that is
+/// DROPPED (outer timeout, or a panic unwinding through it) runs no cleanup at
+/// all. Recording the pid the moment it exists lets the seed teardown reap what
+/// the op could not, so a fuzz failure never leaves a live VM to poison the
+/// next seed (review finding on #837).
+static LIVE_CLONES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn register_clone(pid: u32) {
+    LIVE_CLONES.lock().unwrap().push(pid);
+}
+
+fn unregister_clone(pid: u32) {
+    LIVE_CLONES.lock().unwrap().retain(|p| *p != pid);
+}
+
+/// Kill any clone a dropped op left running. Returns how many it reaped.
+async fn reap_leaked_clones() -> usize {
+    let leaked: Vec<u32> = std::mem::take(&mut *LIVE_CLONES.lock().unwrap());
+    for pid in &leaked {
+        eprintln!("FUZZ reaping leaked clone pid={}", pid);
+        common::kill_process(*pid).await;
+    }
+    leaked.len()
+}
 /// At most this many SnapshotCreate ops per seed (disk: each is multi-GB).
 const MAX_SNAPSHOTS_PER_SEED: usize = 2;
 /// Bounded wait for first-healthy (covers cold-cache boot incl. the pre-start
@@ -332,6 +366,7 @@ async fn apply_op(
     seed: u64,
     op_idx: usize,
     pid: u32,
+    serve_pid: u32,
     ip: &str,
     port: u16,
     snap_base: &str,
@@ -388,22 +423,23 @@ async fn apply_op(
             Ok(format!("{} bytes", out.len()))
         }
         Op::CloneRestore => {
-            // Nothing to restore until this seed has taken a snapshot; the
-            // draw is still consumed above, so the schedule stays a pure
-            // function of the seed.
-            let Some(tag) = snapshots.last().cloned() else {
-                return Ok("no snapshot yet".to_string());
-            };
             let clone_name = format!("{}-clone-{}", snap_base, op_idx);
             // No --publish here: `snapshot run` takes none, because a clone
             // INHERITS the snapshot's port mappings. In rootless mode each
             // clone gets its own loopback IP, so the inherited host port is
             // reached at that address (same shape as
             // test_clone_port_forward_rootless).
-            let (mut clone_child, clone_pid) =
-                common::spawn_fcvm(&["snapshot", "run", "--snapshot", &tag, "--name", &clone_name])
-                    .await
-                    .with_context(|| format!("restoring clone from {}", tag))?;
+            let (mut clone_child, clone_pid) = common::spawn_fcvm(&[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid.to_string(),
+                "--name",
+                &clone_name,
+            ])
+            .await
+            .with_context(|| format!("restoring clone via serve {}", serve_pid))?;
+            register_clone(clone_pid);
 
             // fcvm only reports a clone up after its own post-restore
             // port-forward verification, so a curl that fails here means the
@@ -424,6 +460,7 @@ async fn apply_op(
 
             common::kill_process(clone_pid).await;
             let _ = clone_child.wait().await;
+            unregister_clone(clone_pid);
             let detail = verdict?;
             Ok(format!("clone={} {}", clone_name, detail))
         }
@@ -498,6 +535,16 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
         common::kill_process(pid).await;
         let _ = child.wait().await;
     }
+    // Reap before deleting snapshots: a leaked clone still holds the snapshot
+    // it restored from, and deleting underneath it is how a "cleanup" turns
+    // into the next seed's mystery.
+    let reaped = reap_leaked_clones().await;
+    if reaped > 0 {
+        eprintln!(
+            "FUZZ seed={} reaped {} clone(s) a dropped op left behind",
+            seed, reaped
+        );
+    }
     for tag in &snapshots {
         let _ = common::delete_snapshot(tag).await;
     }
@@ -540,10 +587,36 @@ async fn run_seed_body(
     // the budget allows. Taken outside the loop, so it consumes no rng draw
     // and the schedule stays a pure function of the seed.
     let baseline_tag = format!("{}-base", snap_base);
-    common::create_snapshot_by_pid(pid, &baseline_tag)
+    // Bounded by the same budget a SnapshotCreate op gets: unbounded, a stalled
+    // snapshot would sit here until nextest's two-hour test timeout instead of
+    // failing the seed at the documented budget (review finding on #837).
+    tokio::time::timeout(
+        SNAPSHOT_OP_TIMEOUT,
+        common::create_snapshot_by_pid(pid, &baseline_tag),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "seed {}: baseline snapshot did not finish within {:?}",
+            seed,
+            SNAPSHOT_OP_TIMEOUT
+        )
+    })?
+    .with_context(|| format!("seed {}: baseline snapshot for clone restores", seed))?;
+    snapshots.push(baseline_tag.clone());
+
+    // Restore through a UFFD memory server, not the file backend.
+    //
+    // This is the path the request benchmark actually uses (BACKEND=uffd is
+    // its default) and the path both 2026-08-15 failures came from. An earlier
+    // version of this rung restored with `--snapshot`, i.e. the FILE backend,
+    // and 351 clean restores said nothing about the failing path at all.
+    let (mut serve_child, serve_pid) = common::spawn_fcvm(&["snapshot", "serve", &baseline_tag])
         .await
-        .with_context(|| format!("seed {}: baseline snapshot for clone restores", seed))?;
-    snapshots.push(baseline_tag);
+        .with_context(|| format!("seed {}: starting UFFD serve", seed))?;
+    common::poll_serve_ready(&baseline_tag, serve_pid, 60)
+        .await
+        .with_context(|| format!("seed {}: UFFD serve never became ready", seed))?;
 
     let ip = common::get_loopback_ip(pid).await?;
     let vm_id = {
@@ -585,16 +658,16 @@ async fn run_seed_body(
             op = Op::JitterSleep;
         }
         println!("FUZZ seed={} op={}/{} {:?}", seed, i, total_ops, op);
-        let timeout = if op == Op::SnapshotCreate {
-            SNAPSHOT_OP_TIMEOUT
-        } else {
-            OP_TIMEOUT
+        let timeout = match op {
+            Op::SnapshotCreate => SNAPSHOT_OP_TIMEOUT,
+            Op::CloneRestore => CLONE_OP_TIMEOUT,
+            _ => OP_TIMEOUT,
         };
         let t0 = Instant::now();
         let outcome = tokio::time::timeout(
             timeout,
             apply_op(
-                op, draw, seed, i, pid, &ip, host_port, snap_base, nonces, snapshots,
+                op, draw, seed, i, pid, serve_pid, &ip, host_port, snap_base, nonces, snapshots,
             ),
         )
         .await;
@@ -621,6 +694,13 @@ async fn run_seed_body(
             ),
         }
     }
+
+    // The UFFD serve goes first: it is an fcvm process this seed started, and
+    // the leak oracles below (correctly) refuse to see stray fcvm/firecracker
+    // processes after shutdown. Killing it here also proves the clones that
+    // used it are already gone — a serve with live clones refuses to exit.
+    common::kill_process(serve_pid).await;
+    let _ = serve_child.wait().await;
 
     // -- Graceful shutdown --------------------------------------------------
     println!("FUZZ seed={} shutting down (SIGTERM to {})", seed, pid);
