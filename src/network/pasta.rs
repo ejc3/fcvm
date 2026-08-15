@@ -516,13 +516,25 @@ impl PastaNetwork {
     /// fail-open shape this project keeps paying for.
     async fn dump_unreachable_guest_forensics(&self, holder_pid: u32, probe_port: u16) {
         let prefix = self.build_nsenter_prefix(holder_pid);
-        let probes: [(&str, Vec<&str>); 6] = [
+        let probes: [(&str, Vec<&str>); 7] = [
             ("neighbours", vec!["ip", "neigh", "show"]),
             ("links + counters", vec!["ip", "-s", "link"]),
             ("addresses", vec!["ip", "-o", "addr", "show"]),
             ("routes", vec!["ip", "route", "show"]),
             ("sockets", vec!["ss", "-tanp"]),
             ("nat rules", vec!["iptables", "-t", "nat", "-S"]),
+            // Conntrack last and deliberately: a restored guest keeps the
+            // snapshot's conntrack table (restore destroys SOCKETS via
+            // cookie-bound SOCK_DESTROY but never flushes conntrack), and the
+            // guest's loopback containment DROPS eth0 traffic to 127.0.0.0/8
+            // unless conntrack records that WE translated it. A stale entry
+            // colliding with a fresh probe's 5-tuple would therefore produce
+            // exactly the silence observed, and nothing else in this dump can
+            // tell that apart from a lost packet.
+            (
+                "conntrack",
+                vec!["conntrack", "-L", "-p", "tcp", "--dport", "9222"],
+            ),
         ];
         warn!(
             guest_ip = GUEST_IP,
