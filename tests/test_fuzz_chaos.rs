@@ -562,7 +562,9 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
             "--",
             "sh",
             "-c",
-            "echo total=$(grep -c . /proc/net/nf_conntrack); grep -E '127.0.0.1|dport=80 ' /proc/net/nf_conntrack | head -8",
+            // 169.254.169.254 is fc-agent's MMDS polling and it drowns
+            // everything else; the inbound published-port flow is what matters.
+            "echo total=$(grep -c . /proc/net/nf_conntrack); grep -v 169.254.169.254 /proc/net/nf_conntrack | head -12",
         ],
         left().min(Duration::from_secs(5)),
     )
@@ -609,10 +611,43 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
         None => println!("  [namespace] no holder_pid in state — cannot enter the VM's netns"),
         Some(h) => {
             let ns = format!("--net=/proc/{}/ns/net", h);
+            // THE discriminator between the two remaining suspects.
+            //
+            // `connect` to the published address only proves pasta accepted:
+            // 127.0.0.2:<port> is pasta's own listening socket on the host
+            // loopback, which is why a healthy-looking 113us connect can sit in
+            // front of a connection that never returns a byte. Reaching the
+            // guest from inside the VM's namespace bypasses pasta entirely:
+            //   answers here      -> the guest is fine; pasta is not forwarding
+            //   silent here too   -> the guest stopped answering on eth0, and
+            //                        pasta is just relaying that silence
+            let guest_url = format!("http://10.0.2.100:{}/", port);
+            probe(
+                "ns-curl-guest-direct",
+                &[
+                    "nsenter",
+                    ns.as_str(),
+                    "curl",
+                    "-sS",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "connect=%{time_connect} starttransfer=%{time_starttransfer} code=%{http_code} exit=%{exitcode}\n",
+                    "--max-time",
+                    "4",
+                    &guest_url,
+                ],
+                left().min(Duration::from_secs(6)),
+            )
+            .await;
+
             for (label, cmd) in [
                 ("ns-addr", "ip -br addr"),
                 ("ns-neigh", "ip neigh"),
                 ("ns-listeners", "ss -ltnp"),
+                // Untruncated: the -t mapping says which guest port pasta
+                // forwards to, which the probe above has to match.
+                ("ns-pasta-argv", "sh -c 'tr \\0 \\n </proc/self/cmdline'"),
             ] {
                 let parts: Vec<&str> = cmd.split_whitespace().collect();
                 let mut args = vec!["nsenter", ns.as_str()];
@@ -815,14 +850,28 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
         common::kill_process(pid).await;
         let _ = child.wait().await;
     }
+    // Clones FIRST, then the serve. A serve with live clones refuses to exit,
+    // so killing it first can block the wait below on exactly the condition
+    // reaping clears -- the same unbounded-wait-behind-a-held-resource shape
+    // that made a failing seed look like an 18-minute hang. Killing the pager
+    // out from under a clone that is still faulting is the other half of it.
+    //
+    // Reaping also has to precede deleting snapshots: a leaked clone still
+    // holds the snapshot it restored from, and deleting underneath it is how a
+    // "cleanup" turns into the next seed's mystery.
+    let reaped = reap_leaked_clones().await;
     if let Some((mut serve_child, serve_pid)) = serve.take() {
         common::kill_process(serve_pid).await;
-        let _ = serve_child.wait().await;
+        if tokio::time::timeout(CLEANUP_OP_TIMEOUT, serve_child.wait())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "FUZZ seed={} serve {} did not exit within {:?} of SIGTERM",
+                seed, serve_pid, CLEANUP_OP_TIMEOUT
+            );
+        }
     }
-    // Reap before deleting snapshots: a leaked clone still holds the snapshot
-    // it restored from, and deleting underneath it is how a "cleanup" turns
-    // into the next seed's mystery.
-    let reaped = reap_leaked_clones().await;
     if reaped > 0 {
         eprintln!(
             "FUZZ seed={} reaped {} clone(s) a dropped op left behind",
@@ -1196,7 +1245,9 @@ async fn a_disarmed_clone_guard_leaves_the_process_alone() {
     let pid = child.id().expect("child pid");
     register_clone(pid);
 
-    CloneGuard { pid, armed: false }.disarm();
+    // ARMED, then disarmed: constructing it already-disarmed would pass even if
+    // the body of `disarm` were deleted, which is a test that cannot fail.
+    CloneGuard { pid, armed: true }.disarm();
 
     // Still alive: a disarmed guard must not have signalled it.
     let early = tokio::time::timeout(Duration::from_millis(300), child.wait()).await;
