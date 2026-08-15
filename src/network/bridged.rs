@@ -644,6 +644,44 @@ mod tests {
         assert!(!route_get_names_dev(out, "veth0-vm-8fe5a"));
     }
 
+    /// The probe must FAIL, not accept, when it cannot get a verdict.
+    ///
+    /// RED before the fix: kernel_routes_peer_via_veth returned `true` on any
+    /// spawn error or nonzero exit, so a candidate nobody could verify was
+    /// taken as verified — the same silent acceptance #820 is about. The fake
+    /// `ip` here exits 1; nextest runs each test in its own process, so
+    /// prepending to PATH cannot leak into a sibling test.
+    #[tokio::test]
+    async fn an_unavailable_route_verdict_is_an_error_not_an_acceptance() {
+        let dir = std::env::temp_dir().join(format!("fcvm-fakeip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ip");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'RTNETLINK answers: Network is unreachable' >&2\nexit 1\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prev = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), prev));
+
+        let verdict = kernel_routes_peer_via_veth("veth0-vm-abc12", "10.0.0.2").await;
+
+        std::env::set_var("PATH", prev);
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = verdict.expect_err(
+            "an `ip route get` that cannot answer must be an error; returning true \
+             accepts an unverified subnet, which is the #820 failure itself",
+        );
+        assert!(
+            format!("{err:#}").contains("ip route get"),
+            "the error must name the probe that failed: {err:#}"
+        );
+    }
+
     #[test]
     fn peer_of_increments_last_octet() {
         assert_eq!(peer_of("10.0.0.1").as_deref(), Some("10.0.0.2"));
