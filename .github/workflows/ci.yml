@@ -767,6 +767,25 @@ jobs:
         if: always()
         run: |
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
+      # The runners already run sysstat, and nothing was reading it. Without this,
+      # every deadline miss in a test invites "the box was busy" as an explanation
+      # that cannot be checked -- and on the run this was added for, the box was
+      # 95% idle with a run queue of 1. Capture the record so the question is
+      # answered from data instead of argued from intuition.
+      - name: Capture host load record
+        if: always()
+        run: |
+          {
+            echo "### /proc/loadavg at capture time"
+            cat /proc/loadavg
+            echo "### nproc"
+            nproc
+            echo "### sar -q (run queue and load average, whole day)"
+            LC_ALL=C sar -q 2>&1 || echo "sar -q unavailable"
+            echo "### sar -u (CPU utilisation, whole day)"
+            LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
+          } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
+          echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
