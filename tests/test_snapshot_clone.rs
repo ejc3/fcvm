@@ -4218,12 +4218,27 @@ async fn snapshot_leaves_the_source_network_untouched() -> anyhow::Result<()> {
 
     // `ip neigh` is deliberately included: it is the table that regressed, and
     // the one a "reinstate the routes" fix did not cover.
+    //
+    // PERMANENT-ness is part of the sample, not decoration. An earlier version
+    // printed only address/device/MAC, and a purge could not be seen through
+    // it: the entry is re-learned by the next packet, and since the bridge MAC
+    // is pinned the re-learned line is byte-identical. Watched failing to
+    // discover that -- with a deliberate `ip neigh del` on the resume path, the
+    // test still PASSED. Transient churn among REACHABLE/STALE/DELAY is
+    // tolerated; losing the pin is not.
+    //
+    // IPv6 link-local (fe80::) neighbours are excluded. The kernel discovers
+    // and expires those continuously from router advertisements, so they churn
+    // on their own schedule and would make this test fail for reasons that have
+    // nothing to do with snapshotting. Everything a purge would destroy is
+    // still compared: the IPv4 entries, global IPv6 entries, routes and
+    // addresses.
     let sample = || async move {
         common::exec_in_vm(
             pid,
             &["sh -c 'PATH=/usr/sbin:/sbin:/usr/bin:/bin; \
                echo ROUTES; ip route show | sort; \
-               echo NEIGH; ip neigh show | awk \"{print \\$1, \\$3, \\$5}\" | sort; \
+               echo NEIGH; ip neigh show | grep -v \"^fe80:\" | awk \"{p=(\\$NF==\\\"PERMANENT\\\")?\\\"PERMANENT\\\":\\\"dynamic\\\"; print \\$1, \\$3, \\$5, p}\" | sort; \
                echo ADDR; ip -br addr show | sort'"],
         )
         .await

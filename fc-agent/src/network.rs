@@ -163,6 +163,39 @@ fn send_ethernet_broadcast(interface: &str, frame: &[u8]) -> std::io::Result<()>
 const NAMESPACE_IP: &str = "10.0.2.1";
 const NAMESPACE_MAC: &str = "02:fc:00:00:02:01";
 
+/// Drop every learned neighbour on the external link. RESTORE ONLY.
+///
+/// A restored clone runs in a NEW namespace: its bridge, veth and gateway are
+/// different devices with different MACs from the ones the snapshot recorded.
+/// Every dynamic entry it inherits therefore names hardware that does not exist
+/// on its segment, and the guest will happily send to those addresses until the
+/// entries expire.
+///
+/// The old boundary cleared them as a side effect of taking the link down. When
+/// that purge was removed (it also destroyed routes, which is the defect this
+/// work exists to fix), bridged clones inherited stale gateway MACs and lost all
+/// egress: healthy VM, DNS and HTTP both dead. This does the clearing
+/// deliberately and narrowly instead: one device, no routes touched, on the
+/// restore path only.
+///
+/// The source never runs this. Its neighbours are correct and it is not to be
+/// disturbed.
+pub fn flush_stale_neighbours() {
+    match std::process::Command::new("ip")
+        .args(["neigh", "flush", "dev", "eth0"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            eprintln!("[fc-agent] flushed inherited neighbours on eth0 (restored clone)");
+        }
+        Ok(out) => eprintln!(
+            "[fc-agent] WARNING: could not flush inherited neighbours: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(error) => eprintln!("[fc-agent] WARNING: ip neigh flush failed: {error}"),
+    }
+}
+
 /// Pin an AUTHORITATIVE neighbour entry for the host's health-check address.
 ///
 /// Both the bridge (which owns 10.0.2.1) and pasta (which answers for the
