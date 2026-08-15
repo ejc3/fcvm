@@ -63,18 +63,28 @@ fn peer_of(host_ip: &str) -> Option<String> {
 /// clone's forwarded ports timed out for its whole life — a 1-in-16384
 /// silent death. No route-table policy is modeled here: the kernel answers
 /// the exact question the data path will ask.
-async fn kernel_routes_peer_via_veth(veth_name: &str, peer_ip: &str) -> bool {
-    let output = match tokio::process::Command::new("ip")
+/// Fails closed: an unavailable verdict is an error, never an acceptance. The
+/// whole point of the probe is that an unverified candidate costs a clone its
+/// entire life on a hung port, and every other step here shells out to the
+/// same `ip` binary, so a run that cannot ask this question was never going
+/// to finish setup anyway.
+async fn kernel_routes_peer_via_veth(veth_name: &str, peer_ip: &str) -> Result<bool> {
+    let output = tokio::process::Command::new("ip")
         .args(["route", "get", peer_ip])
         .output()
         .await
-    {
-        Ok(o) if o.status.success() => o,
-        // Can't ask — keep the pre-#820 behavior rather than failing every
-        // allocation on a broken `ip` binary.
-        _ => return true,
-    };
-    route_get_names_dev(&String::from_utf8_lossy(&output.stdout), veth_name)
+        .with_context(|| format!("running `ip route get {peer_ip}`"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`ip route get {peer_ip}` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(route_get_names_dev(
+        &String::from_utf8_lossy(&output.stdout),
+        veth_name,
+    ))
 }
 
 /// Token-exact scan of `ip route get` output for `dev <veth_name>`.
@@ -237,22 +247,52 @@ impl NetworkManager for BridgedNetwork {
                         let _ = self.cleanup().await;
                         return Err(e).context("configuring host veth");
                     }
-                    // Derived addresses always end .1 with a .2 peer; a
-                    // candidate the derivation cannot pair is accepted
-                    // unprobed rather than failing every allocation.
-                    match peer_of(&host_ip) {
-                        None => break subnet_id,
-                        Some(peer) => {
-                            if kernel_routes_peer_via_veth(&host_veth, &peer).await {
-                                break subnet_id;
-                            }
+                    // Derived addresses always end .1 with a .2 peer, so a
+                    // candidate the derivation cannot pair is a bug in
+                    // derive_host_ip, not a routing verdict — fail rather
+                    // than accept it unprobed.
+                    let peer = match peer_of(&host_ip) {
+                        Some(peer) => peer,
+                        None => {
+                            let _ = self.cleanup().await;
+                            anyhow::bail!("derived host IP {host_ip} has no /30 peer address");
+                        }
+                    };
+                    match kernel_routes_peer_via_veth(&host_veth, &peer).await {
+                        Ok(true) => break subnet_id,
+                        Ok(false) => {}
+                        Err(e) => {
+                            let _ = self.cleanup().await;
+                            return Err(e).context("verifying the candidate subnet's routing");
                         }
                     }
                     // Strip the losing address before trying the next /30.
-                    let _ = tokio::process::Command::new("ip")
+                    // Checked, not discarded: a failed delete leaves the
+                    // rejected address on the veth, and the next accepted
+                    // candidate would return with that routed address still
+                    // configured alongside it.
+                    let del = tokio::process::Command::new("ip")
                         .args(["addr", "del", &host_ip_with_cidr, "dev", &host_veth])
                         .output()
                         .await;
+                    match del {
+                        Ok(o) if o.status.success() => {}
+                        Ok(o) => {
+                            let _ = self.cleanup().await;
+                            anyhow::bail!(
+                                "removing rejected address {host_ip_with_cidr} from {host_veth} \
+                                 failed ({}): {}",
+                                o.status,
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            );
+                        }
+                        Err(e) => {
+                            let _ = self.cleanup().await;
+                            return Err(e).context(format!(
+                                "removing rejected address {host_ip_with_cidr} from {host_veth}"
+                            ));
+                        }
+                    }
                 }
                 attempts += 1;
                 if attempts >= 100 {
