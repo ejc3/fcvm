@@ -89,6 +89,12 @@ const HEALTHY_TIMEOUT_SECS: u64 = 300;
 /// Bounded wait for fcvm to exit after SIGTERM. Not exiting in time FAILS the
 /// seed — graceful shutdown hanging is a bug, not something to force-kill over.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounded per-item cleanup. Cleanup is best-effort by nature, so it may not
+/// block the run: it reports what it could not finish and moves on.
+const CLEANUP_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total wall-clock budget for the forensics dump fired when a forwarded port
+/// goes silent. Diagnostics must never outlive the failure they explain.
+const FORENSICS_BUDGET: Duration = Duration::from_secs(12);
 
 const GUEST_NONCE_FILE: &str = "/mnt/fuzz/nonces.txt";
 
@@ -343,8 +349,15 @@ async fn exec_tty_echo(pid: u32, token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn curl_once(ip: &str, port: u16) -> Result<String> {
+async fn curl_once(pid: u32, ip: &str, port: u16) -> Result<String> {
     let r = common::curl_check(ip, port, 5).await;
+    if !(r.success && r.body_len > 0) {
+        // A forwarded port that has gone silent is the failure we most need
+        // evidence for, and every source of it (conntrack, the NAT rules, the
+        // namespace, the guest itself) is gone the moment the seed tears the
+        // VM down. Capture it HERE, while it is still true.
+        dump_port_silence_forensics(pid, ip, port).await;
+    }
     ensure!(
         r.success && r.body_len > 0,
         "curl {}:{} failed (success={} body_len={} err={})",
@@ -355,6 +368,138 @@ async fn curl_once(ip: &str, port: u16) -> Result<String> {
         r.error
     );
     Ok(format!("body_len={}", r.body_len))
+}
+
+/// Run one diagnostic and print it, whatever it says. A probe that fails is
+/// itself evidence, so its exit status and stderr are reported rather than
+/// swallowed — a silent section is indistinguishable from a clean one.
+async fn probe(label: &str, args: &[&str], budget: Duration) {
+    let Some((bin, rest)) = args.split_first() else {
+        return;
+    };
+    let run = tokio::process::Command::new(bin).args(rest).output();
+    match tokio::time::timeout(budget, run).await {
+        Err(_) => println!("  [{}] TIMED OUT after {:?}", label, budget),
+        Ok(Err(e)) => println!("  [{}] could not run ({}): {}", label, args.join(" "), e),
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let body = if stdout.trim().is_empty() {
+                "(no output)".to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            println!("  [{}] exit={:?}", label, out.status.code());
+            for line in body.lines().take(40) {
+                println!("    {}", line);
+            }
+            if !stderr.trim().is_empty() {
+                println!(
+                    "    stderr: {}",
+                    stderr
+                        .trim()
+                        .lines()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+            }
+        }
+    }
+}
+
+/// Everything that could explain "the port accepted nothing and said nothing".
+///
+/// Ordered most-discriminating first: if the guest still serves its own port
+/// while the host sees silence, the guest is fine and the host-side forwarding
+/// path (pasta, the loopback DNAT, or a stale conntrack entry) is what broke.
+async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
+    let deadline = Instant::now() + FORENSICS_BUDGET;
+    let left = || deadline.saturating_duration_since(Instant::now());
+    println!(
+        "FUZZ ===== port {}:{} went silent — forensics =====",
+        ip, port
+    );
+
+    let fcvm_path = match common::find_fcvm_binary() {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  [fcvm] binary not found: {}", e);
+            return;
+        }
+    };
+    let fcvm = fcvm_path.to_string_lossy().to_string();
+    let pid_s = pid.to_string();
+
+    // 1. Does the guest still serve itself? Splits host-side from guest-side.
+    probe(
+        "guest-self-curl",
+        &[
+            &fcvm,
+            "exec",
+            "--pid",
+            &pid_s,
+            "--",
+            "curl -s -o /dev/null -w guest_http=%{http_code} --max-time 3 http://localhost/",
+        ],
+        left().min(Duration::from_secs(5)),
+    )
+    .await;
+
+    // 2. What does fcvm believe about this VM right now?
+    probe(
+        "fcvm-ls",
+        &[&fcvm, "ls", "--json", "--pid", &pid_s],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+
+    // 3. Host side: is anything still listening on the published address, and
+    //    is there a conntrack entry pointing somewhere stale?
+    probe(
+        "host-listeners",
+        &["ss", "-ltnp"],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+    let dport = port.to_string();
+    probe(
+        "conntrack",
+        &["conntrack", "-L", "-p", "tcp", "--dport", &dport],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+
+    // 4. The pasta processes serving this VM carry their -t mappings in argv.
+    probe(
+        "pasta-argv",
+        &["pgrep", "-a", "pasta"],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+
+    // 5. Inside the VM's namespace: addresses, neighbours, listeners.
+    let holder = read_vm_state(pid)
+        .await
+        .ok()
+        .and_then(|vms| vms.first().and_then(|v| v.vm.holder_pid));
+    match holder {
+        None => println!("  [namespace] no holder_pid in state — cannot enter the VM's netns"),
+        Some(h) => {
+            let ns = format!("--net=/proc/{}/ns/net", h);
+            for (label, cmd) in [
+                ("ns-addr", "ip -br addr"),
+                ("ns-neigh", "ip neigh"),
+                ("ns-listeners", "ss -ltnp"),
+            ] {
+                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                let mut args = vec!["nsenter", ns.as_str()];
+                args.extend(parts);
+                probe(label, &args, left().min(Duration::from_secs(3))).await;
+            }
+        }
+    }
+    println!("FUZZ ===== end forensics =====");
 }
 
 /// Execute one op. `draw` is the op's pre-drawn randomness (one u64 per op).
@@ -387,7 +532,7 @@ async fn apply_op(
             exec_tty_echo(pid, &token).await?;
             Ok(format!("token={}", token))
         }
-        Op::CurlPort => curl_once(ip, port).await,
+        Op::CurlPort => curl_once(pid, ip, port).await,
         Op::StateRead => {
             let vms = read_vm_state(pid).await?;
             ensure!(
@@ -399,7 +544,7 @@ async fn apply_op(
             if matches!(status, fcvm::state::HealthStatus::Healthy) {
                 // Healthy⇒live oracle: a state file claiming Healthy must be
                 // backed by a VM that actually serves traffic RIGHT NOW.
-                let detail = curl_once(ip, port)
+                let detail = curl_once(pid, ip, port)
                     .await
                     .context("state says Healthy but the forwarded port is dead")?;
                 Ok(format!("status={:?} chained-curl {}", status, detail))
@@ -452,7 +597,7 @@ async fn apply_op(
                 let clone_ip = common::get_loopback_ip(clone_pid)
                     .await
                     .context("clone has no loopback IP after restore")?;
-                curl_once(&clone_ip, port)
+                curl_once(clone_pid, &clone_ip, port)
                     .await
                     .context("clone reported healthy but its inherited forwarded port is dead")
             }
@@ -514,6 +659,11 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
 
     let mut nonces: Vec<String> = Vec::new();
     let mut snapshots: Vec<String> = Vec::new();
+    // The UFFD serve is spawned deep inside the body (it needs a snapshot of a
+    // healthy VM first), but it is OWNED here, because the body can bail from
+    // any op and skip its own teardown. Handing the handle back out through
+    // this slot is what makes "kill the serve" run on the failure path too.
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
     let body = run_seed_body(
         seed,
         total_ops,
@@ -526,6 +676,7 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
         &snap_base,
         &mut nonces,
         &mut snapshots,
+        &mut serve,
     )
     .await;
 
@@ -534,6 +685,10 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
     if body.is_err() {
         common::kill_process(pid).await;
         let _ = child.wait().await;
+    }
+    if let Some((mut serve_child, serve_pid)) = serve.take() {
+        common::kill_process(serve_pid).await;
+        let _ = serve_child.wait().await;
     }
     // Reap before deleting snapshots: a leaked clone still holds the snapshot
     // it restored from, and deleting underneath it is how a "cleanup" turns
@@ -545,8 +700,19 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
             seed, reaped
         );
     }
+    // Bounded, and loud when it expires. An unbounded delete here is how a
+    // 5-second op failure turned into an 18-minute wedge: the baseline
+    // snapshot cannot be deleted while a serve still holds it, so a leaked
+    // serve made cleanup block forever and the whole run looked hung.
     for tag in &snapshots {
-        let _ = common::delete_snapshot(tag).await;
+        match tokio::time::timeout(CLEANUP_OP_TIMEOUT, common::delete_snapshot(tag)).await {
+            Ok(_) => {}
+            Err(_) => eprintln!(
+                "FUZZ seed={} snapshot {} could not be deleted within {:?} \
+                 (something still holds it); leaving it and continuing",
+                seed, tag, CLEANUP_OP_TIMEOUT
+            ),
+        }
     }
     let _ = std::fs::remove_dir_all(&scratch);
 
@@ -568,6 +734,7 @@ async fn run_seed_body(
     snap_base: &str,
     nonces: &mut Vec<String>,
     snapshots: &mut Vec<String>,
+    serve_slot: &mut Option<(tokio::process::Child, u32)>,
 ) -> Result<()> {
     // -- Boot: bounded wait for first-healthy -------------------------------
     let boot_start = Instant::now();
@@ -611,9 +778,12 @@ async fn run_seed_body(
     // its default) and the path both 2026-08-15 failures came from. An earlier
     // version of this rung restored with `--snapshot`, i.e. the FILE backend,
     // and 351 clean restores said nothing about the failing path at all.
-    let (mut serve_child, serve_pid) = common::spawn_fcvm(&["snapshot", "serve", &baseline_tag])
+    let (serve_child, serve_pid) = common::spawn_fcvm(&["snapshot", "serve", &baseline_tag])
         .await
         .with_context(|| format!("seed {}: starting UFFD serve", seed))?;
+    // Hand it to the caller BEFORE the first thing that can fail, so no early
+    // return can strand it.
+    *serve_slot = Some((serve_child, serve_pid));
     common::poll_serve_ready(&baseline_tag, serve_pid, 60)
         .await
         .with_context(|| format!("seed {}: UFFD serve never became ready", seed))?;
@@ -699,8 +869,10 @@ async fn run_seed_body(
     // the leak oracles below (correctly) refuse to see stray fcvm/firecracker
     // processes after shutdown. Killing it here also proves the clones that
     // used it are already gone — a serve with live clones refuses to exit.
-    common::kill_process(serve_pid).await;
-    let _ = serve_child.wait().await;
+    if let Some((mut serve_child, serve_pid)) = serve_slot.take() {
+        common::kill_process(serve_pid).await;
+        let _ = serve_child.wait().await;
+    }
 
     // -- Graceful shutdown --------------------------------------------------
     println!("FUZZ seed={} shutting down (SIGTERM to {})", seed, pid);
