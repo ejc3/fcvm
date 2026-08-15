@@ -5786,6 +5786,37 @@ class ExecArmIsOptional(unittest.TestCase):
             control, "a noop-less schedule must be rejected by the same rule"
         )
 
+    def test_the_analyzer_accepts_an_html_publication_schedule(self):
+        """Both sides of the harness must agree on what a CDP arm is.
+
+        The producer's publication_arms_ok learned that html is CDP-class,
+        but this validator still spelled the rule as {"cdp","cdp-fast"} —
+        so `--arms noop,html` would run its full 200+ reps and then be
+        rejected here as an invalid schedule, paying for a campaign that
+        could never publish (codex finding on #836).
+        """
+        import reqanalyze
+
+        errors = []
+        reqanalyze._validate_arms(["noop", "html"], "run", errors)
+        self.assertEqual(
+            errors, [],
+            "noop+html is a publication schedule: html pays the CDP handshake",
+        )
+
+        # The producer and the analyzer must not drift apart again.
+        import reqbench
+
+        self.assertTrue(reqbench.publication_arms_ok(["noop", "html"]))
+        for arm in sorted(reqbench.CDP_CLASS_ARMS):
+            with self.subTest(arm=arm):
+                side = []
+                reqanalyze._validate_arms(["noop", arm], "run", side)
+                self.assertEqual(
+                    side, [],
+                    f"producer calls {arm} CDP-class; the analyzer must agree",
+                )
+
 
 class CorpusMixUrls(unittest.TestCase):
     """Multi-URL runs for the corpus arm (Cloudflare 14-URL mix).
@@ -5889,6 +5920,37 @@ class GuestDnsKnob(unittest.TestCase):
         src = open(self.SH).read()
         self.assertIn('GUEST_DNS="${GUEST_DNS:-}"', src)
         self.assertIn('--dns "$GUEST_DNS"', src)
+
+
+class PublicationArmSets(unittest.TestCase):
+    """html is a CDP-class arm on BOTH sides of the harness.
+
+    The analyzer classified html as CDP-class (is_cdp_class) while the
+    producer still spelled the requirement inline as {"cdp","cdp-fast"}, so a
+    legitimate `--arms noop,html` publication run was refused with "requires
+    at least one CDP arm". Found by running exactly that during the corpus
+    campaign, 2026-08-15.
+    """
+
+    def test_noop_plus_html_is_a_publication_set(self):
+        self.assertTrue(reqbench.publication_arms_ok(["noop", "html"]))
+
+    def test_the_other_cdp_class_arms_still_qualify(self):
+        self.assertTrue(reqbench.publication_arms_ok(["noop", "cdp"]))
+        self.assertTrue(reqbench.publication_arms_ok(["noop", "cdp-fast"]))
+        self.assertTrue(
+            reqbench.publication_arms_ok(["noop", "cdp", "cdp-fast", "html"])
+        )
+
+    def test_a_rendering_arm_is_required(self):
+        """noop alone measures no render, so it cannot back a published cell."""
+        self.assertFalse(reqbench.publication_arms_ok(["noop"]))
+        self.assertFalse(reqbench.publication_arms_ok(["noop", "exec"]))
+
+    def test_the_drift_canary_is_required(self):
+        """Without noop there is no baseline to judge drift against."""
+        self.assertFalse(reqbench.publication_arms_ok(["cdp"]))
+        self.assertFalse(reqbench.publication_arms_ok(["html", "cdp-fast"]))
 
 
 class CorpusServeAnswerIp(unittest.TestCase):
