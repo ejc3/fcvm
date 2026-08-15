@@ -45,6 +45,74 @@ another what changed and why. Say that and stop.
 - Read it back as if a colleague sent it to you. If it reads like marketing or an essay,
   rewrite it.
 
+## SUSPENDING A VM DOES NOT DISTURB IT
+
+**`snapshot create` is a read of the source VM, not a reconfiguration of it.** A
+caller asked for a copy. They must not get their running VM altered to produce
+one, and nothing on the snapshot path may leave state the resume has to repair.
+
+What the boundary needs is narrow, and both halves are non-destructive:
+
+| need | mechanism | reversible? |
+|------|-----------|-------------|
+| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: one rule added, then removed |
+| packets already in receive processing must drain | AF_PACKET open/close, whose release runs `synchronize_net()` | nothing to reverse |
+| restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
+
+The dump has to happen at snapshot time and cannot move to restore: by the time
+a clone runs, the restored workload and an early published-port client can both
+have created sockets, so a restore-time dump cannot describe a fixed generation,
+and a four-tuple is not a socket identity (95ce328a).
+
+### Never take the link down. Never purge kernel tables.
+
+`ip link set eth0 down` was once part of this sequence. It prevented sockets the
+gate already rejects, and paid for it by purging the device's **routes and
+neighbours**. Everything purged then had to be remembered and reinstated by
+hand, and that list was wrong twice:
+
+- **2026-08-10 (`ee3f5c30`)** the route table. *"A restored clone came up
+  reachable at L2 and routed nowhere."* Fixed by capturing and reinstating routes.
+- **2026-08-15** the neighbour table, which the same link-down purged and nobody
+  reinstated. After a snapshot the guest re-ARPed for the bridge address every
+  health check and published connection arrives from. Both the bridge (which
+  owns it) and pasta (which answers for the subnet it routes) reply, so the
+  guest kept whichever landed first. When pasta won:
+
+```
+SYN      br0-mac   > guest-mac           10.0.2.1 > 10.0.2.100  [S]
+SYN-ACK  guest-mac > 9a:55:9a:55:9a:55   10.0.2.100 > 10.0.2.1  [S.]   <- pasta
+RST      9a:55:9a:55:9a:55 > guest-mac   10.0.2.1 > 10.0.2.100  [R]
+```
+
+  The guest answered the wrong MAC and pasta correctly reset a connection it had
+  never opened. A published port that accepts and then returns zero bytes, about
+  1 snapshot in 10, with **no drop counted at any layer** - because nothing was
+  dropped. Latency was bimodal (421 requests under 0.1s, **zero** between 0.1s
+  and 4.5s, 8 at the 5s deadline), which is what ruled out contention.
+
+Two bugs, one shape: *the link-down purged X and nobody put X back.* The fix was
+to delete the purge, not to grow the repair list. Nothing in the boundary now
+touches the link, so there are no routes and no neighbours to reinstate.
+
+**Rules:**
+
+1. **Nothing on the snapshot path may down a link, flush a table, or otherwise
+   destroy kernel state in the guest being snapshotted.** If a step needs
+   quiescence, use a reversible gate.
+2. **A repair list is a smell.** Needing to remember what a step destroyed means
+   the step is wrong. The next table nobody thought of is the next outage.
+3. **The bridge MAC is pinned** (`NAMESPACE_MAC`, `src/network/pasta.rs`) so a
+   clone inheriting the source's neighbour table holds entries that are correct
+   in its own namespace. fc-agent hardcodes the same constant; the pair is
+   asserted by `namespace_neighbour_matches_host_constants`.
+
+**Enforcement:** `snapshot_leaves_the_source_network_untouched`
+(`tests/test_snapshot_clone.rs`) diffs the guest's routes, neighbours and
+addresses across one snapshot and fails on any difference. The `ModelBarrier`
+and `ModelDiag` invariants in `fc-agent/src/snapshot_network.rs` fail if any
+boundary step takes the link down, on the source or the clone path.
+
 ## MAXIMUM REUSE / CACHEABILITY
 
 **The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,
@@ -144,6 +212,43 @@ The gate has its own tests, each written against the unfixed script and observed
 `scripts/test-check-review-threads.sh`, plus `scripts/probe-review-gate-pagination.sh` for the
 live oversized-thread path that fixtures cannot reach. CI state cannot tell you whether a
 finding was answered.
+
+### A FUZZ CATCH IS A LEAD, NOT A REGRESSION TEST
+
+**When the chaos fuzz (or any stochastic harness) finds a defect, the fix is not
+done until a DETERMINISTIC test fails on it.** The fuzz found the bug by landing
+inside a timing window. It will pass ten, twenty, fifty times before it lands
+there again, so leaving it as the guard means the next regression ships and is
+discovered by a flake weeks later.
+
+The fuzz's job is DISCOVERY. Something else has to hold the line.
+
+Convert every catch into a test that fails **every run**:
+
+| the catch | what pins it |
+|---|---|
+| an ordering window (A must happen before B) | a source-level ordering assertion, or an event-log model like `ModelBarrier`/`ModelDiag` in `fc-agent/src/snapshot_network.rs` |
+| a state invariant (X must survive Y) | compare X directly across Y, as `snapshot_leaves_the_source_network_untouched` does |
+| a race that needs a precise interleaving | a named failpoint case in `test_lifecycle_interleave.rs` (crate `failpoint/`) |
+| a constant that two files must agree on | read the other file and assert, as `namespace_neighbour_matches_host_constants` does |
+
+Observed 2026-08-15, twice in one change:
+
+- CI's fuzz failed with `guest 10.0.2.100 never appeared at L2`, while the
+  forensics dumped moments later showed that guest `REACHABLE`. The guest was
+  not missing, it was LATE: removing the snapshot boundary's link cycle also
+  removed the thing that made a restored clone announce itself, so the host's
+  namespace had not learned its MAC before verification gave up. The fuzz hit
+  that window; `the_clone_announces_itself_before_the_boundary_publishes` now
+  fails on the ordering itself, every time.
+- The same run's seed had passed **20 consecutive local hunts** on a different
+  seed. A stochastic pass count is not evidence about a code path; it is
+  evidence about the schedule that seed happens to generate.
+
+**Corollary: do not certify a fix with the fuzz configuration you were already
+hunting with.** Run the configuration CI runs (`SEEDS=1 OPS=10` is the default),
+and run it enough times to say something. A green hunt on the seed you have been
+staring at proves the least interesting thing available.
 
 ### A GATE MUST FAIL CLOSED — check your dependencies before you trust your verdict
 
@@ -2258,6 +2363,44 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 - `-i`: forward stdin
 - `-it`: both (interactive shell)
 - neither: plain exec
+
+### `fcvm exec` LANDS IN THE CONTAINER BY DEFAULT. The guest needs `--vm`.
+
+```
+-c, --container    Execute inside container (default)
+    --vm           Execute in the VM instead of inside the container
+```
+
+A bare `fcvm exec --pid <pid> -- <cmd>` runs in the **container**, not the guest OS.
+They are different machines with different tooling, so a diagnostic aimed at the wrong
+one comes back EMPTY rather than wrong, which reads like a finding:
+
+| | container (`nginx:alpine`) | guest (Ubuntu 24.04, `--vm`) |
+|---|---|---|
+| `iptables` | absent | `/usr/sbin/iptables` |
+| `bash` / `ss` / `curl` | absent | `/usr/bin/{bash,ss,curl}` |
+| `sh`, `wget`, `netstat` | busybox | present |
+
+On 2026-08-15 that cost several rounds of a flake hunt. Netfilter probes returned
+nothing, and the conclusion written down was "the guest rootfs carries no iptables and no
+nft, so guest netfilter state is unreadable" - a statement about alpine, presented as a
+fact about Ubuntu, and committed as a code comment. The rules were readable the whole
+time, and reading them is what exonerated the loopback containment DROP (packet counter
+still 0 at failure) and moved the search to the virtio-net RX path.
+
+Two rules follow:
+
+1. **An empty probe result is not evidence. It is a broken probe until proven otherwise.**
+   Run every diagnostic against a HEALTHY VM first and confirm it returns real output.
+   Both of these looked like findings and were defects in the instrument: `exit=127` from
+   `curl` in a guest image that has no curl, and `exit=127` from passing a whole command
+   line as one argv - `fcvm exec -- 'ss -ltn | head'` execs that string as a program
+   name, so it needs `sh -c` as separate arguments.
+2. **Use absolute paths.** exec hands over a minimal PATH: `iptables` fails where
+   `/usr/sbin/iptables` works.
+
+The same split exists in the test helpers: `exec_in_vm(pid, &cmd)` versus
+`exec_in_container(pid, &cmd)` (`tests/common/mod.rs`).
 
 **NO backward compatibility wrappers.** When the API changed from `run_tty_mode(stream)` to `run_tty_mode(stream, interactive)`, all callers were updated directly - no deprecated functions or compatibility shims.
 

@@ -47,6 +47,82 @@ const OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Snapshot create pauses the VM and writes a multi-GB memory image; give it
 /// a larger (still hard) budget than ordinary ops.
 const SNAPSHOT_OP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Budget for a CloneRestore op. Deliberately LARGER than the waits inside it
+/// (60s health poll + a 5s curl): if the outer timeout fired first, the op
+/// future would be dropped mid-await and its clone teardown skipped, leaving a
+/// restored VM running while the seed tears down around it (review finding on
+/// #837). The registry below is the belt to this suspenders.
+const CLONE_OP_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Clone PIDs a CloneRestore op spawned and has not yet reaped.
+///
+/// The op kills its own clone on every path it can reach, but a future that is
+/// DROPPED (outer timeout, or a panic unwinding through it) runs no cleanup at
+/// all. Recording the pid the moment it exists lets the seed teardown reap what
+/// the op could not, so a fuzz failure never leaves a live VM to poison the
+/// next seed (review finding on #837).
+static LIVE_CLONES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn register_clone(pid: u32) {
+    LIVE_CLONES.lock().unwrap().push(pid);
+}
+
+fn unregister_clone(pid: u32) {
+    LIVE_CLONES.lock().unwrap().retain(|p| *p != pid);
+}
+
+/// Kills its clone the instant it is dropped, however the drop happens.
+///
+/// The registry above reaps at seed teardown, which is too late in one case
+/// that matters: a dropped op (outer timeout, or a panic unwinding through it)
+/// runs no async cleanup at all, so the clone keeps running while the rest of
+/// the seed continues around it. Worse, a stranded fcvm child holds the test
+/// binary's stdout pipe open, and nextest waits on that pipe — that is exactly
+/// how a leaked `snapshot serve` turned a 5-second op failure into an
+/// 18-minute apparent hang.
+///
+/// `Drop` cannot await, so this signals directly rather than going through
+/// `kill_process`. SIGKILL, not SIGTERM: this path only runs when cleanup was
+/// already skipped, and a clone that ignores TERM would keep the pipe open.
+struct CloneGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl CloneGuard {
+    /// Call once the child has been waited for. Signalling a pid that has been
+    /// reaped is not harmless — the kernel is free to hand that number to an
+    /// unrelated process — so the normal path disarms rather than relying on
+    /// ESRCH. On the drop path the child was never waited, so it is either
+    /// alive or an unreaped zombie, and its pid cannot have been reused.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CloneGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Safety: kill(2) on a pid this process spawned and has not reaped.
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+        unregister_clone(self.pid);
+    }
+}
+
+/// Kill any clone a dropped op left running. Returns how many it reaped.
+async fn reap_leaked_clones() -> usize {
+    let leaked: Vec<u32> = std::mem::take(&mut *LIVE_CLONES.lock().unwrap());
+    for pid in &leaked {
+        eprintln!("FUZZ reaping leaked clone pid={}", pid);
+        common::kill_process(*pid).await;
+    }
+    leaked.len()
+}
 /// At most this many SnapshotCreate ops per seed (disk: each is multi-GB).
 const MAX_SNAPSHOTS_PER_SEED: usize = 2;
 /// Bounded wait for first-healthy (covers cold-cache boot incl. the pre-start
@@ -55,6 +131,12 @@ const HEALTHY_TIMEOUT_SECS: u64 = 300;
 /// Bounded wait for fcvm to exit after SIGTERM. Not exiting in time FAILS the
 /// seed — graceful shutdown hanging is a bug, not something to force-kill over.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounded per-item cleanup. Cleanup is best-effort by nature, so it may not
+/// block the run: it reports what it could not finish and moves on.
+const CLEANUP_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total wall-clock budget for the forensics dump fired when a forwarded port
+/// goes silent. Diagnostics must never outlive the failure they explain.
+const FORENSICS_BUDGET: Duration = Duration::from_secs(40);
 
 const GUEST_NONCE_FILE: &str = "/mnt/fuzz/nonces.txt";
 
@@ -73,6 +155,17 @@ enum Op {
     SnapshotCreate,
     /// Flood the console/exec stream with 5000 lines of output.
     ConsoleFlood,
+    /// Restore a clone from a snapshot this seed took and immediately hit its
+    /// forwarded port — the readiness contract a caller relies on.
+    ///
+    /// This is the op that reaches the restore-time network path: a restored
+    /// guest inherits the snapshot's conntrack table and its published-port
+    /// DNAT, and fcvm declares the clone ready only after the guest answers a
+    /// TCP probe. A clone handed over before that path settles shows up here
+    /// as a failed curl against a clone fcvm called ready. Observed in the
+    /// wild at roughly 1 in 400 restores (2026-08-15), which no single-VM op
+    /// in this harness could ever reach.
+    CloneRestore,
     /// Seeded 0-400ms sleep (also substituted when the snapshot budget is
     /// spent, keeping rng consumption uniform at one draw per op).
     JitterSleep,
@@ -87,6 +180,7 @@ const OP_WEIGHTS: &[(Op, u32)] = &[
     (Op::StateRead, 15),
     (Op::SnapshotCreate, 6),
     (Op::ConsoleFlood, 9),
+    (Op::CloneRestore, 12),
     (Op::JitterSleep, 20),
 ];
 
@@ -297,8 +391,15 @@ async fn exec_tty_echo(pid: u32, token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn curl_once(ip: &str, port: u16) -> Result<String> {
+async fn curl_once(pid: u32, ip: &str, port: u16) -> Result<String> {
     let r = common::curl_check(ip, port, 5).await;
+    if !(r.success && r.body_len > 0) {
+        // A forwarded port that has gone silent is the failure we most need
+        // evidence for, and every source of it (conntrack, the NAT rules, the
+        // namespace, the guest itself) is gone the moment the seed tears the
+        // VM down. Capture it HERE, while it is still true.
+        dump_port_silence_forensics(pid, ip, port).await;
+    }
     ensure!(
         r.success && r.body_len > 0,
         "curl {}:{} failed (success={} body_len={} err={})",
@@ -311,6 +412,479 @@ async fn curl_once(ip: &str, port: u16) -> Result<String> {
     Ok(format!("body_len={}", r.body_len))
 }
 
+/// Run one diagnostic and print it, whatever it says. A probe that fails is
+/// itself evidence, so its exit status and stderr are reported rather than
+/// swallowed — a silent section is indistinguishable from a clean one.
+/// Like `probe`, but returns the output instead of printing it, for numbers
+/// that only mean something when compared against each other.
+async fn capture(args: &[&str], budget: Duration) -> Option<String> {
+    let (bin, rest) = args.split_first()?;
+    let run = tokio::process::Command::new(bin).args(rest).output();
+    match tokio::time::timeout(budget, run).await {
+        Ok(Ok(out)) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        _ => None,
+    }
+}
+
+async fn probe(label: &str, args: &[&str], budget: Duration) {
+    let Some((bin, rest)) = args.split_first() else {
+        return;
+    };
+    let run = tokio::process::Command::new(bin).args(rest).output();
+    match tokio::time::timeout(budget, run).await {
+        Err(_) => println!("  [{}] TIMED OUT after {:?}", label, budget),
+        Ok(Err(e)) => println!("  [{}] could not run ({}): {}", label, args.join(" "), e),
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let body = if stdout.trim().is_empty() {
+                "(no output)".to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            println!("  [{}] exit={:?}", label, out.status.code());
+            for line in body.lines().take(40) {
+                println!("    {}", line);
+            }
+            if !stderr.trim().is_empty() {
+                println!(
+                    "    stderr: {}",
+                    stderr
+                        .trim()
+                        .lines()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+            }
+        }
+    }
+}
+
+/// Everything that could explain "the port accepted nothing and said nothing".
+///
+/// Ordered most-discriminating first: if the guest still serves its own port
+/// while the host sees silence, the guest is fine and the host-side forwarding
+/// path (pasta, the loopback DNAT, or a stale conntrack entry) is what broke.
+async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
+    let deadline = Instant::now() + FORENSICS_BUDGET;
+    let left = || deadline.saturating_duration_since(Instant::now());
+    println!(
+        "FUZZ ===== port {}:{} went silent — forensics =====",
+        ip, port
+    );
+
+    let fcvm_path = match common::find_fcvm_binary() {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  [fcvm] binary not found: {}", e);
+            return;
+        }
+    };
+    let fcvm = fcvm_path.to_string_lossy().to_string();
+    let pid_s = pid.to_string();
+
+    // 0. THE suspect, measured before anything else can eat the budget.
+    //
+    // The published port reaches the service through a DNAT to 127.0.0.1:80,
+    // and that only works while net.ipv4.conf.eth0.route_localnet=1. fc-agent
+    // sets it at boot precisely because, quoting its own comment, "the kernel
+    // treats a packet routed to 127.0.0.0/8 that arrived on a non-loopback
+    // interface as a martian source and drops it".
+    //
+    // A martian drop happens in ROUTING, before INPUT. That is consistent with
+    // every measurement taken so far: the containment DROP counter stays 0, no
+    // RST is emitted, eth0's RX counters keep climbing, and guest-local traffic
+    // to 127.0.0.1 and to 10.0.2.100 keeps working because neither crosses eth0.
+    //
+    // TcpPassiveOpens is the corroborating half: if the SYN never reaches TCP,
+    // it cannot increment, whatever the NIC counters say.
+    for (label, cmd) in [
+        (
+            "guest-route-localnet",
+            "for f in eth0 all default; do \
+               printf '%s=' \"$f\"; \
+               cat /proc/sys/net/ipv4/conf/$f/route_localnet 2>/dev/null || echo '?'; \
+             done",
+        ),
+        (
+            "guest-tcp-counters",
+            "awk '/^Tcp:/{n=$0; getline; print n; print}' /proc/net/snmp | tail -2; \
+             grep -iE 'listen|martian' /proc/net/netstat 2>/dev/null | head -2",
+        ),
+    ] {
+        probe(
+            label,
+            &[
+                &fcvm, "exec", "--pid", &pid_s, "--vm", "--", "sh", "-c", cmd,
+            ],
+            left().min(Duration::from_secs(5)),
+        )
+        .await;
+    }
+
+    // 1. Does the SERVICE still answer itself, inside the container? This is
+    //    the probe that splits the layers, so it has to use a binary that is
+    //    actually there: the first version shelled out to curl in the guest OS
+    //    and came back exit=127 (not installed), which told us nothing at the
+    //    exact moment we most needed an answer. nginx:alpine has busybox wget.
+    probe(
+        "container-self-http",
+        &[
+            &fcvm,
+            "exec",
+            "--pid",
+            &pid_s,
+            "--container",
+            "--",
+            "sh",
+            "-c",
+            "wget -q -O- --timeout=3 http://127.0.0.1/ 2>&1 | head -c 60; echo \" rc=$?\"",
+        ],
+        left().min(Duration::from_secs(6)),
+    )
+    .await;
+
+    // 2. Is the service even alive, and listening where we think?
+    probe(
+        "container-listeners",
+        &[
+            &fcvm,
+            "exec",
+            "--pid",
+            &pid_s,
+            "--container",
+            "--",
+            "sh",
+            "-c",
+            "netstat -ltn | head -5; echo --; ps -o pid,comm | grep -i nginx | head -3",
+        ],
+        left().min(Duration::from_secs(6)),
+    )
+    .await;
+
+    // 3. Guest side of the hop: listeners, the published-port DNAT, and the
+    //    loopback containment rules that DROP eth0 traffic to 127/8 unless
+    //    conntrack recorded our translation. If the DNAT is intact and the
+    //    container answers itself, the guest's conntrack state is the suspect.
+    // Guest netfilter state is NOT probeable from here, and it is worth saying
+    // so rather than shipping probes that always come back empty: fc-agent
+    // installs the DNAT and the containment DROP from the initrd, and the guest
+    // rootfs carries no iptables and no nft (`command -v iptables` -> 127,
+    // `find / -name "*iptables*"` -> nothing). The rules live in the kernel
+    // where no shell in the running guest can read them back.
+    //
+    // What replaces them is the measurement that actually discriminates, taken
+    // from this side: WHERE the five seconds went. `--max-time` spans connect
+    // AND transfer, so the timeout alone cannot tell a dropped SYN from a
+    // service that accepted and never answered.
+    //   time_connect == 0        -> the handshake never completed; the packet
+    //                               died before any listener saw it
+    //   time_connect ~ 0.001 and
+    //   time_starttransfer == 0  -> the guest ACCEPTED the connection, so eth0
+    //                               ingress and the DNAT both worked, and the
+    //                               service is what went quiet
+    probe(
+        "host-curl-timing",
+        &[
+            "curl",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "connect=%{time_connect} starttransfer=%{time_starttransfer} code=%{http_code} exit=%{exitcode}\n",
+            "--max-time",
+            "5",
+            &format!("http://{}:{}/", ip, port),
+        ],
+        left().min(Duration::from_secs(7)),
+    )
+    .await;
+
+    // `fcvm exec` defaults to --container; the GUEST needs --vm. Everything
+    // below was previously running inside nginx:alpine, which is why the
+    // netfilter probes came back empty and produced a confident, wrong note
+    // that the guest had no iptables. Ubuntu has /usr/sbin/iptables, plus
+    // bash, ss, curl and wget. Absolute paths, because exec hands over a
+    // minimal PATH.
+    //
+    // The DROP counter is THE measurement. On a healthy VM it reads:
+    //   0  0  DROP  eth0  0.0.0.0/0  127.0.0.0/8  ! ctstate DNAT
+    // so any non-zero value at failure names the containment rule as the
+    // thing eating the connection, and a still-zero value exonerates it.
+    for (label, cmd) in [
+        (
+            "guest-input-counters",
+            "/usr/sbin/iptables -L INPUT -n -v -x | head -6",
+        ),
+        (
+            "guest-nat-rules",
+            "/usr/sbin/iptables -t nat -S PREROUTING | head -6",
+        ),
+        ("guest-listeners", "/usr/bin/ss -ltnp | head -8"),
+        // The reply path. Packets demonstrably arrive (rx differential) and
+        // nothing drops them (DROP counter 0), so if the guest cannot answer
+        // 10.0.2.1 the reason is here: the route purged by the snapshot
+        // link-down and not reinstated, or a neighbour entry it cannot
+        // re-resolve. TX errors/dropped on eth0 would show the same thing from
+        // the device's side.
+        ("guest-routes", "PATH=/usr/sbin:/sbin:/usr/bin:/bin; ip route show"),
+        ("guest-neigh", "PATH=/usr/sbin:/sbin:/usr/bin:/bin; ip neigh show"),
+        (
+            "guest-eth0-link",
+            "PATH=/usr/sbin:/sbin:/usr/bin:/bin; ip -s link show eth0 | head -8",
+        ),
+        // Both sides of the DNAT, from inside the guest: 127.0.0.1 is where
+        // the rule points, 10.0.2.100 is the address the outside world uses.
+        // Answers on loopback but not on eth0 -> the ingress path; silent on
+        // both -> whatever is behind the published port.
+        (
+            "guest-http-loopback",
+            "/usr/bin/curl -sS -o /dev/null -w 'connect=%{time_connect} code=%{http_code} exit=%{exitcode}\n' --max-time 4 http://127.0.0.1:80/",
+        ),
+        (
+            "guest-http-eth0",
+            "/usr/bin/curl -sS -o /dev/null -w 'connect=%{time_connect} code=%{http_code} exit=%{exitcode}\n' --max-time 4 http://10.0.2.100:80/",
+        ),
+    ] {
+        probe(
+            label,
+            &[&fcvm, "exec", "--pid", &pid_s, "--vm", "--", "sh", "-c", cmd],
+            left().min(Duration::from_secs(6)),
+        )
+        .await;
+    }
+
+    // Firecracker's device event loop starving its virtio queues after a
+    // pause/resume is a documented failure mode (AGENTS.md, NV2 section): one
+    // thread spins while every queue goes unserviced. Per-thread jiffies.
+    probe(
+        "firecracker-thread-cpu",
+        &[
+            "sh",
+            "-c",
+            &format!(
+                "for t in /proc/$(pgrep -P {} -x firecracker | head -1)/task/*/stat; do \
+                   [ -r \"$t\" ] || continue; \
+                   awk '{{print $2, \"utime=\" $14, \"stime=\" $15}}' \"$t\"; \
+                 done | head -8",
+                pid
+            ),
+        ],
+        left().min(Duration::from_secs(5)),
+    )
+    .await;
+
+    // Conntrack DOES read back, straight out of /proc, no binary needed.
+    probe(
+        "guest-conntrack",
+        &[
+            &fcvm,
+            "exec",
+            "--pid",
+            &pid_s,
+            "--vm",
+            "--",
+            "sh",
+            "-c",
+            // 169.254.169.254 is fc-agent's MMDS polling and it drowns
+            // everything else; the inbound published-port flow is what matters.
+            "echo total=$(grep -c . /proc/net/nf_conntrack); grep -v 169.254.169.254 /proc/net/nf_conntrack | head -12",
+        ],
+        left().min(Duration::from_secs(5)),
+    )
+    .await;
+
+    // 4. What does fcvm believe about this VM right now?
+    probe(
+        "fcvm-ls",
+        &[&fcvm, "ls", "--json", "--pid", &pid_s],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+
+    // 5. Host side: is anything still listening on the published address, and
+    //    is there a conntrack entry pointing somewhere stale?
+    probe(
+        "host-listeners",
+        &["ss", "-ltnp"],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+    let dport = port.to_string();
+    probe(
+        "conntrack",
+        &["conntrack", "-L", "-p", "tcp", "--dport", &dport],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+
+    // 6. The pasta processes serving this VM carry their -t mappings in argv.
+    probe(
+        "pasta-argv",
+        &["pgrep", "-a", "pasta"],
+        left().min(Duration::from_secs(3)),
+    )
+    .await;
+
+    // 7. Inside the VM namespace: addresses, neighbours, listeners.
+    let holder = read_vm_state(pid)
+        .await
+        .ok()
+        .and_then(|vms| vms.first().and_then(|v| v.vm.holder_pid));
+    match holder {
+        None => println!("  [namespace] no holder_pid in state — cannot enter the VM's netns"),
+        Some(h) => {
+            let ns = format!("--net=/proc/{}/ns/net", h);
+            // THE differential, at TCP level.
+            //
+            // eth0's rx_packets was the wrong counter: ambient DNS, NTP and
+            // MMDS traffic move it constantly, so a non-zero delta proved
+            // nothing about OUR SYN. Tcp.PassiveOpens counts inbound
+            // connections the guest's TCP actually accepted, and nothing else
+            // in this VM generates those.
+            //
+            //   delta >= 1 -> the guest ACCEPTED it, so the reply is what is
+            //                 lost (bridge/tap egress side)
+            //   delta = 0  -> the SYN never reached the guest's TCP, and the
+            //                 fault is in front of it: bridge FDB, tap, pasta
+            let passive = [
+                fcvm.as_str(),
+                "exec",
+                "--pid",
+                &pid_s,
+                "--vm",
+                "--",
+                "sh",
+                "-c",
+                "awk '/^Tcp:/{h=$0; getline; d=$0} END{n=split(h,H,\" \"); for(i=1;i<=n;i++) if(H[i]==\"PassiveOpens\"){split(d,D,\" \"); print D[i]}}' /proc/net/snmp",
+            ];
+            let before = capture(&passive, Duration::from_secs(5)).await;
+            let _ = capture(
+                &[
+                    "nsenter",
+                    ns.as_str(),
+                    "curl",
+                    "-sS",
+                    "-o",
+                    "/dev/null",
+                    "--max-time",
+                    "3",
+                    "http://10.0.2.100:80/",
+                ],
+                Duration::from_secs(5),
+            )
+            .await;
+            let after = capture(&passive, Duration::from_secs(5)).await;
+            let parse = |v: &Option<String>| v.as_ref().and_then(|x| x.trim().parse::<u64>().ok());
+            match (parse(&before), parse(&after)) {
+                (Some(b), Some(a)) => println!(
+                    "  [tcp-passiveopens-differential] before={} after={} delta={} ({})",
+                    b,
+                    a,
+                    a.saturating_sub(b),
+                    if a > b {
+                        "guest ACCEPTED it — the REPLY is what is lost"
+                    } else {
+                        "SYN never reached guest TCP — bridge FDB / tap / pasta"
+                    }
+                ),
+                _ => println!(
+                    "  [tcp-passiveopens-differential] unreadable (before={:?} after={:?})",
+                    before, after
+                ),
+            }
+
+            // Observe the WIRE, not counters. Every counter says the packet is
+            // neither delivered nor dropped, and a packet that is neither is
+            // queued. tcpdump on the tap settles where it stops:
+            //   SYN appears on the tap -> the bridge forwarded it and the
+            //     virtio-net RX side is not consuming it (Firecracker)
+            //   SYN absent from the tap -> it never left the bridge
+            probe(
+                "ns-tap-tcpdump",
+                &[
+                    "nsenter",
+                    ns.as_str(),
+                    "sh",
+                    "-c",
+                    "TAP=$(ip -o link show | sed -n 's/.*: \\(tap-[^:@]*\\).*/\\1/p' | head -1); \
+                     echo \"tap=$TAP\"; \
+                     ( timeout 4 tcpdump -i \"$TAP\" -e -n -c 8 'tcp port 80' 2>&1 | sed 's/^/    tap /' ) & \
+                     ( timeout 4 tcpdump -i pasta0 -e -n -c 8 'tcp port 80' 2>&1 | sed 's/^/    pasta0 /' ) & \
+                     ( timeout 4 tcpdump -i br0 -e -n -c 8 'tcp port 80' 2>&1 | sed 's/^/    br0 /' ) & \
+                     sleep 0.7; \
+                     curl -s -o /dev/null --max-time 2 http://10.0.2.100:80/ 2>/dev/null; \
+                     wait",
+                ],
+                left().min(Duration::from_secs(10)),
+            )
+            .await;
+
+            // Where the bridge thinks the guest's MAC lives. This repo already
+            // carries scripts/passt-addr-seen.patch because pasta's forwarding
+            // target could be retargeted by overheard bridge traffic; an FDB
+            // entry pointing at pasta0 rather than the tap is that bug, visible.
+            for (label, cmd) in [
+                ("ns-bridge-fdb", "bridge fdb show"),
+                ("ns-tap-stats", "ip -s link show"),
+            ] {
+                probe(
+                    label,
+                    &["nsenter", ns.as_str(), "sh", "-c", cmd],
+                    left().min(Duration::from_secs(5)),
+                )
+                .await;
+            }
+
+            // THE discriminator between the two remaining suspects.
+            //
+            // `connect` to the published address only proves pasta accepted:
+            // 127.0.0.2:<port> is pasta's own listening socket on the host
+            // loopback, which is why a healthy-looking 113us connect can sit in
+            // front of a connection that never returns a byte. Reaching the
+            // guest from inside the VM's namespace bypasses pasta entirely:
+            //   answers here      -> the guest is fine; pasta is not forwarding
+            //   silent here too   -> the guest stopped answering on eth0, and
+            //                        pasta is just relaying that silence
+            let guest_url = format!("http://10.0.2.100:{}/", port);
+            probe(
+                "ns-curl-guest-direct",
+                &[
+                    "nsenter",
+                    ns.as_str(),
+                    "curl",
+                    "-sS",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "connect=%{time_connect} starttransfer=%{time_starttransfer} code=%{http_code} exit=%{exitcode}\n",
+                    "--max-time",
+                    "4",
+                    &guest_url,
+                ],
+                left().min(Duration::from_secs(6)),
+            )
+            .await;
+
+            for (label, cmd) in [
+                ("ns-addr", "ip -br addr"),
+                ("ns-neigh", "ip neigh"),
+                ("ns-listeners", "ss -ltnp"),
+                // Untruncated: the -t mapping says which guest port pasta
+                // forwards to, which the probe above has to match.
+                ("ns-pasta-argv", "sh -c 'tr \\0 \\n </proc/self/cmdline'"),
+            ] {
+                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                let mut args = vec!["nsenter", ns.as_str()];
+                args.extend(parts);
+                probe(label, &args, left().min(Duration::from_secs(3))).await;
+            }
+        }
+    }
+    println!("FUZZ ===== end forensics =====");
+}
+
 /// Execute one op. `draw` is the op's pre-drawn randomness (one u64 per op).
 /// Returns a short human detail for the trace line.
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +894,7 @@ async fn apply_op(
     seed: u64,
     op_idx: usize,
     pid: u32,
+    serve_pid: u32,
     ip: &str,
     port: u16,
     snap_base: &str,
@@ -340,7 +915,7 @@ async fn apply_op(
             exec_tty_echo(pid, &token).await?;
             Ok(format!("token={}", token))
         }
-        Op::CurlPort => curl_once(ip, port).await,
+        Op::CurlPort => curl_once(pid, ip, port).await,
         Op::StateRead => {
             let vms = read_vm_state(pid).await?;
             ensure!(
@@ -352,7 +927,7 @@ async fn apply_op(
             if matches!(status, fcvm::state::HealthStatus::Healthy) {
                 // Healthy⇒live oracle: a state file claiming Healthy must be
                 // backed by a VM that actually serves traffic RIGHT NOW.
-                let detail = curl_once(ip, port)
+                let detail = curl_once(pid, ip, port)
                     .await
                     .context("state says Healthy but the forwarded port is dead")?;
                 Ok(format!("status={:?} chained-curl {}", status, detail))
@@ -374,6 +949,55 @@ async fn apply_op(
                 out.len()
             );
             Ok(format!("{} bytes", out.len()))
+        }
+        Op::CloneRestore => {
+            let clone_name = format!("{}-clone-{}", snap_base, op_idx);
+            // No --publish here: `snapshot run` takes none, because a clone
+            // INHERITS the snapshot's port mappings. In rootless mode each
+            // clone gets its own loopback IP, so the inherited host port is
+            // reached at that address (same shape as
+            // test_clone_port_forward_rootless).
+            let (mut clone_child, clone_pid) = common::spawn_fcvm(&[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid.to_string(),
+                "--name",
+                &clone_name,
+            ])
+            .await
+            .with_context(|| format!("restoring clone via serve {}", serve_pid))?;
+            register_clone(clone_pid);
+            // Armed BEFORE the first await that can be cancelled, so no path
+            // out of this op leaves the clone running.
+            let guard = CloneGuard {
+                pid: clone_pid,
+                armed: true,
+            };
+
+            // fcvm only reports a clone up after its own post-restore
+            // port-forward verification, so a curl that fails here means the
+            // readiness contract was declared on something the data path does
+            // not honour — the exact defect this op exists to catch.
+            let verdict = async {
+                common::poll_health_by_pid(clone_pid, 60)
+                    .await
+                    .context("restored clone never became healthy")?;
+                let clone_ip = common::get_loopback_ip(clone_pid)
+                    .await
+                    .context("clone has no loopback IP after restore")?;
+                curl_once(clone_pid, &clone_ip, port)
+                    .await
+                    .context("clone reported healthy but its inherited forwarded port is dead")
+            }
+            .await;
+
+            common::kill_process(clone_pid).await;
+            let _ = clone_child.wait().await;
+            unregister_clone(clone_pid);
+            guard.disarm();
+            let detail = verdict?;
+            Ok(format!("clone={} {}", clone_name, detail))
         }
         Op::JitterSleep => {
             let ms = draw % 401; // 0-400ms
@@ -425,6 +1049,11 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
 
     let mut nonces: Vec<String> = Vec::new();
     let mut snapshots: Vec<String> = Vec::new();
+    // The UFFD serve is spawned deep inside the body (it needs a snapshot of a
+    // healthy VM first), but it is OWNED here, because the body can bail from
+    // any op and skip its own teardown. Handing the handle back out through
+    // this slot is what makes "kill the serve" run on the failure path too.
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
     let body = run_seed_body(
         seed,
         total_ops,
@@ -437,6 +1066,7 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
         &snap_base,
         &mut nonces,
         &mut snapshots,
+        &mut serve,
     )
     .await;
 
@@ -446,8 +1076,47 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
         common::kill_process(pid).await;
         let _ = child.wait().await;
     }
+    // Clones FIRST, then the serve. A serve with live clones refuses to exit,
+    // so killing it first can block the wait below on exactly the condition
+    // reaping clears -- the same unbounded-wait-behind-a-held-resource shape
+    // that made a failing seed look like an 18-minute hang. Killing the pager
+    // out from under a clone that is still faulting is the other half of it.
+    //
+    // Reaping also has to precede deleting snapshots: a leaked clone still
+    // holds the snapshot it restored from, and deleting underneath it is how a
+    // "cleanup" turns into the next seed's mystery.
+    let reaped = reap_leaked_clones().await;
+    if let Some((mut serve_child, serve_pid)) = serve.take() {
+        common::kill_process(serve_pid).await;
+        if tokio::time::timeout(CLEANUP_OP_TIMEOUT, serve_child.wait())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "FUZZ seed={} serve {} did not exit within {:?} of SIGTERM",
+                seed, serve_pid, CLEANUP_OP_TIMEOUT
+            );
+        }
+    }
+    if reaped > 0 {
+        eprintln!(
+            "FUZZ seed={} reaped {} clone(s) a dropped op left behind",
+            seed, reaped
+        );
+    }
+    // Bounded, and loud when it expires. An unbounded delete here is how a
+    // 5-second op failure turned into an 18-minute wedge: the baseline
+    // snapshot cannot be deleted while a serve still holds it, so a leaked
+    // serve made cleanup block forever and the whole run looked hung.
     for tag in &snapshots {
-        let _ = common::delete_snapshot(tag).await;
+        match tokio::time::timeout(CLEANUP_OP_TIMEOUT, common::delete_snapshot(tag)).await {
+            Ok(_) => {}
+            Err(_) => eprintln!(
+                "FUZZ seed={} snapshot {} could not be deleted within {:?} \
+                 (something still holds it); leaving it and continuing",
+                seed, tag, CLEANUP_OP_TIMEOUT
+            ),
+        }
     }
     let _ = std::fs::remove_dir_all(&scratch);
 
@@ -469,6 +1138,7 @@ async fn run_seed_body(
     snap_base: &str,
     nonces: &mut Vec<String>,
     snapshots: &mut Vec<String>,
+    serve_slot: &mut Option<(tokio::process::Child, u32)>,
 ) -> Result<()> {
     // -- Boot: bounded wait for first-healthy -------------------------------
     let boot_start = Instant::now();
@@ -480,6 +1150,47 @@ async fn run_seed_body(
         seed,
         boot_start.elapsed().as_secs_f64()
     );
+
+    // One baseline snapshot BEFORE the op loop, so CloneRestore has something
+    // to restore from its first draw. Without it most CloneRestore ops fall
+    // through as "no snapshot yet" (5 of 6 in the first run of this rung), and
+    // a defect that appears roughly once in 400 restores needs every restore
+    // the budget allows. Taken outside the loop, so it consumes no rng draw
+    // and the schedule stays a pure function of the seed.
+    let baseline_tag = format!("{}-base", snap_base);
+    // Bounded by the same budget a SnapshotCreate op gets: unbounded, a stalled
+    // snapshot would sit here until nextest's two-hour test timeout instead of
+    // failing the seed at the documented budget (review finding on #837).
+    tokio::time::timeout(
+        SNAPSHOT_OP_TIMEOUT,
+        common::create_snapshot_by_pid(pid, &baseline_tag),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "seed {}: baseline snapshot did not finish within {:?}",
+            seed,
+            SNAPSHOT_OP_TIMEOUT
+        )
+    })?
+    .with_context(|| format!("seed {}: baseline snapshot for clone restores", seed))?;
+    snapshots.push(baseline_tag.clone());
+
+    // Restore through a UFFD memory server, not the file backend.
+    //
+    // This is the path the request benchmark actually uses (BACKEND=uffd is
+    // its default) and the path both 2026-08-15 failures came from. An earlier
+    // version of this rung restored with `--snapshot`, i.e. the FILE backend,
+    // and 351 clean restores said nothing about the failing path at all.
+    let (serve_child, serve_pid) = common::spawn_fcvm(&["snapshot", "serve", &baseline_tag])
+        .await
+        .with_context(|| format!("seed {}: starting UFFD serve", seed))?;
+    // Hand it to the caller BEFORE the first thing that can fail, so no early
+    // return can strand it.
+    *serve_slot = Some((serve_child, serve_pid));
+    common::poll_serve_ready(&baseline_tag, serve_pid, 60)
+        .await
+        .with_context(|| format!("seed {}: UFFD serve never became ready", seed))?;
 
     let ip = common::get_loopback_ip(pid).await?;
     let vm_id = {
@@ -521,16 +1232,16 @@ async fn run_seed_body(
             op = Op::JitterSleep;
         }
         println!("FUZZ seed={} op={}/{} {:?}", seed, i, total_ops, op);
-        let timeout = if op == Op::SnapshotCreate {
-            SNAPSHOT_OP_TIMEOUT
-        } else {
-            OP_TIMEOUT
+        let timeout = match op {
+            Op::SnapshotCreate => SNAPSHOT_OP_TIMEOUT,
+            Op::CloneRestore => CLONE_OP_TIMEOUT,
+            _ => OP_TIMEOUT,
         };
         let t0 = Instant::now();
         let outcome = tokio::time::timeout(
             timeout,
             apply_op(
-                op, draw, seed, i, pid, &ip, host_port, snap_base, nonces, snapshots,
+                op, draw, seed, i, pid, serve_pid, &ip, host_port, snap_base, nonces, snapshots,
             ),
         )
         .await;
@@ -556,6 +1267,15 @@ async fn run_seed_body(
                 seed, i, total_ops, op, took, detail
             ),
         }
+    }
+
+    // The UFFD serve goes first: it is an fcvm process this seed started, and
+    // the leak oracles below (correctly) refuse to see stray fcvm/firecracker
+    // processes after shutdown. Killing it here also proves the clones that
+    // used it are already gone — a serve with live clones refuses to exit.
+    if let Some((mut serve_child, serve_pid)) = serve_slot.take() {
+        common::kill_process(serve_pid).await;
+        let _ = serve_child.wait().await;
     }
 
     // -- Graceful shutdown --------------------------------------------------
@@ -695,4 +1415,74 @@ async fn test_fuzz_lifecycle_chaos() {
         );
     }
     println!("FUZZ all {} seed(s) passed", seeds.len());
+}
+
+// ---------------------------------------------------------------------------
+// CloneGuard: mechanism-level, no VMs, milliseconds.
+//
+// Written against the unfixed tree first. With the Drop impl removed (or armed
+// left false), `child.wait()` below never returns and the 5s timeout fails the
+// test — which is exactly the property under test: the clone dies even when no
+// cleanup code runs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_dropped_clone_guard_kills_the_clone_it_guards() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawning sleep");
+    let pid = child.id().expect("child pid");
+    register_clone(pid);
+
+    {
+        let _guard = CloneGuard { pid, armed: true };
+        // No cleanup here on purpose: this models the op future being dropped
+        // mid-await, where nothing async gets to run.
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("guard did not kill the clone: still running 5s after drop")
+        .expect("waiting for the killed clone");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "clone exited, but not from the guard's SIGKILL: {:?}",
+        status
+    );
+    assert!(
+        !LIVE_CLONES.lock().unwrap().contains(&pid),
+        "guard killed the clone but left it in the live-clone registry"
+    );
+}
+
+#[tokio::test]
+async fn a_disarmed_clone_guard_leaves_the_process_alone() {
+    // The normal path waits for the child itself, then disarms. Signalling
+    // after a reap could hit an unrelated process that inherited the number,
+    // so disarm must actually suppress the kill.
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawning sleep");
+    let pid = child.id().expect("child pid");
+    register_clone(pid);
+
+    // ARMED, then disarmed: constructing it already-disarmed would pass even if
+    // the body of `disarm` were deleted, which is a test that cannot fail.
+    CloneGuard { pid, armed: true }.disarm();
+
+    // Still alive: a disarmed guard must not have signalled it.
+    let early = tokio::time::timeout(Duration::from_millis(300), child.wait()).await;
+    assert!(
+        early.is_err(),
+        "disarmed guard killed the process anyway: {:?}",
+        early
+    );
+    unregister_clone(pid);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }

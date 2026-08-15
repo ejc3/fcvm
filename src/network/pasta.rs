@@ -16,6 +16,24 @@ const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.2";
 /// Namespace IP on bridge — enables nsenter health checks to route to guest
 const NAMESPACE_IP: &str = "10.0.2.1";
+/// Fixed MAC for the bridge, so the guest can hold an AUTHORITATIVE neighbour
+/// entry for NAMESPACE_IP instead of racing for one.
+///
+/// Both the bridge and pasta answer ARP for 10.0.2.1: the bridge because it
+/// owns the address, pasta because it answers for the subnet it routes. Whoever
+/// wins that race decides where the guest sends its replies. When pasta won,
+/// the guest sent its SYN-ACK to pasta's MAC, pasta correctly reset a
+/// connection it had never opened, and the published port went silent with no
+/// drop recorded anywhere (2026-08-15). Measured directly on the wire:
+///
+///   SYN      br0-mac  > guest-mac   10.0.2.1 > 10.0.2.100  [S]
+///   SYN-ACK  guest-mac > 9a:55:...  10.0.2.100 > 10.0.2.1  [S.]   <- pasta, not br0
+///   RST      9a:55:... > guest-mac  10.0.2.1 > 10.0.2.100  [R]
+///
+/// A fixed MAC lets fc-agent install a PERMANENT neighbour entry, which ARP
+/// replies cannot override, so the race has no outcome to win. pasta already
+/// uses a fixed MAC (9a:55:9a:55:9a:55) for the same kind of reason.
+pub const NAMESPACE_MAC: &str = "02:fc:00:00:02:01";
 
 /// Guest IPv6 addressing (pasta copies host IPv6 with fd00::/64 fallback)
 const GUEST_IPV6: &str = "fd00::100";
@@ -725,6 +743,10 @@ impl PastaNetwork {
                 (
                     format!("create L2 bridge {}", bridge),
                     format!("link add {} type bridge", bridge),
+                ),
+                (
+                    format!("pin bridge {} MAC to {}", bridge, NAMESPACE_MAC),
+                    format!("link set {} address {}", bridge, NAMESPACE_MAC),
                 ),
                 (
                     format!("bring bridge {} up", bridge),
@@ -1915,6 +1937,80 @@ mod tests {
         );
     }
 
+    /// Every bridge the guest reaches through NAMESPACE_IP must carry
+    /// NAMESPACE_MAC.
+    ///
+    /// The guest pins ONE permanent neighbour entry for 10.0.2.1 and cannot
+    /// tell which networking mode it booted under. Rootless mode reaches that
+    /// address on pasta's bridge; ROUTED mode uses the very same address as the
+    /// guest's DEFAULT GATEWAY on a bridge of its own. Pinning the MAC in only
+    /// one of them sends every reply in the other to an address nothing owns --
+    /// which is not a degraded published port there, it is all IPv4 egress.
+    /// That regression shipped once and CI caught it as eight routed-mode
+    /// failures across both architectures.
+    #[test]
+    fn every_bridge_on_the_namespace_address_pins_the_same_mac() {
+        let routed = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/network/routed.rs"),
+        )
+        .expect("reading src/network/routed.rs");
+
+        assert!(
+            routed.contains("NAMESPACE_MAC"),
+            "routed mode does not pin its bridge to NAMESPACE_MAC. Its guests \
+             reach {} as their default gateway and hold a permanent neighbour \
+             entry for {}; an unpinned bridge MAC breaks all of their IPv4.",
+            NAMESPACE_IP,
+            NAMESPACE_MAC
+        );
+        assert!(
+            routed.contains("\"address\","),
+            "routed mode references NAMESPACE_MAC but never sets a link address \
+             with it"
+        );
+        assert!(
+            routed.contains(&format!("GUEST_GATEWAY: &str = \"{}\"", NAMESPACE_IP)),
+            "routed mode's gateway is no longer {}; re-check whether the guest's \
+             pinned neighbour entry still names the right address",
+            NAMESPACE_IP
+        );
+    }
+
+    /// fc-agent hardcodes the same pair (it has no boot-plan field for them),
+    /// so a change here that is not mirrored there silently reopens the ARP
+    /// race that made published ports go silent. Read the guest's copy rather
+    /// than trusting a comment.
+    #[test]
+    fn namespace_neighbour_matches_host_constants() {
+        let agent = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fc-agent/src/network.rs"),
+        )
+        .expect("reading fc-agent/src/network.rs");
+
+        for (label, value) in [
+            ("NAMESPACE_IP", NAMESPACE_IP),
+            ("NAMESPACE_MAC", NAMESPACE_MAC),
+        ] {
+            let needle = format!("const {}: &str = \"{}\";", label, value);
+            assert!(
+                agent.contains(&needle),
+                "fc-agent does not define {} as {:?}. The guest pins a permanent \
+                 neighbour entry using its own copy of this constant; if the two \
+                 disagree, the entry points at the wrong MAC and inbound \
+                 connections are reset by pasta. Expected line: {}",
+                label,
+                value,
+                needle
+            );
+        }
+
+        assert!(
+            agent.contains("nud"),
+            "fc-agent no longer installs a permanent neighbour entry; a dynamic \
+             one loses to pasta's ARP reply about 1 time in 10"
+        );
+    }
+
     #[test]
     fn pasta_retry_stderr_isolated_from_late_previous_attempt_output() {
         let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
@@ -2218,6 +2314,9 @@ mod tests {
             vec![
                 "link set pasta0 up",
                 "link add br0 type bridge",
+                // Pinned so the guest can hold an authoritative neighbour entry
+                // for the health-check address instead of racing pasta for one.
+                "link set br0 address 02:fc:00:00:02:01",
                 "link set br0 up",
                 "link set pasta0 master br0",
                 "link set tap-fc master br0",
@@ -2240,7 +2339,7 @@ mod tests {
 
         // `ip -batch` aborts at the first failing line and reports `-:<line>`.
         let msg = script.describe_failure("RTNETLINK answers: File exists\nCommand failed -:2\n");
-        assert!(msg.contains("step 2/6"), "missing step index: {msg}");
+        assert!(msg.contains("step 2/7"), "missing step index: {msg}");
         assert!(
             msg.contains("create L2 bridge br0"),
             "missing step name: {msg}"

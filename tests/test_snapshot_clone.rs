@@ -4167,3 +4167,138 @@ async fn a_panicking_clone_handler_returns_its_slot() -> Result<()> {
     );
     Ok(())
 }
+
+/// Snapshotting must leave the SOURCE VM's network exactly as it found it.
+///
+/// A caller asked for a copy. It must not get its live VM reconfigured to
+/// produce one, and this is the guard that says so.
+///
+/// The boundary that makes a snapshot cloneable needs two things: no NEW socket
+/// may appear while the cookie dump runs, and packets already in receive
+/// processing must drain first. The NEW-flow gate delivers the first and the
+/// AF_PACKET barrier the second; both are reversible and destroy nothing.
+///
+/// A `link.down()` used to sit between them, preventing sockets the gate already
+/// rejected and purging the device's routes and neighbours to do it. Everything
+/// it purged then had to be reinstated by hand, and twice that list was
+/// incomplete:
+///
+///   2026-08-10 ee3f5c30  the ROUTE table     -> "a restored clone came up
+///                                               reachable at L2 and routed nowhere"
+///   2026-08-15           the NEIGHBOUR table -> the guest re-ARPed for the bridge,
+///                                               sometimes learned pasta's MAC,
+///                                               answered inbound SYNs to the wrong
+///                                               MAC and had them RST. A published
+///                                               port died ~1 snapshot in 10 with no
+///                                               drop counted anywhere.
+///
+/// The link-down is gone, so the purge is gone, so the repair lists are gone.
+/// This test is what keeps them gone: it compares the guest's routes, neighbours
+/// and addresses across one snapshot and fails on any difference.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn snapshot_leaves_the_source_network_untouched() -> anyhow::Result<()> {
+    let (vm_name, _, snap_tag, _) = common::unique_names("snapsrc");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await?;
+    common::poll_health(&mut child, 300).await?;
+
+    // `ip neigh` is deliberately included: it is the table that regressed, and
+    // the one a "reinstate the routes" fix did not cover.
+    //
+    // PERMANENT-ness is part of the sample, not decoration. An earlier version
+    // printed only address/device/MAC, and a purge could not be seen through
+    // it: the entry is re-learned by the next packet, and since the bridge MAC
+    // is pinned the re-learned line is byte-identical. Watched failing to
+    // discover that -- with a deliberate `ip neigh del` on the resume path, the
+    // test still PASSED. Transient churn among REACHABLE/STALE/DELAY is
+    // tolerated; losing the pin is not.
+    //
+    // IPv6 link-local (fe80::) neighbours are excluded. The kernel discovers
+    // and expires those continuously from router advertisements, so they churn
+    // on their own schedule and would make this test fail for reasons that have
+    // nothing to do with snapshotting. Everything a purge would destroy is
+    // still compared: the IPv4 entries, global IPv6 entries, routes and
+    // addresses.
+    let sample = || async move {
+        common::exec_in_vm(
+            pid,
+            &["sh -c 'PATH=/usr/sbin:/sbin:/usr/bin:/bin; \
+               echo ROUTES; ip route show | sort; \
+               echo NEIGH; ip neigh show | grep -v \"^fe80:\" | awk \"{p=(\\$NF==\\\"PERMANENT\\\")?\\\"PERMANENT\\\":\\\"dynamic\\\"; print \\$1, \\$3, \\$5, p}\" | sort; \
+               echo ADDR; ip -br addr show | sort'"],
+        )
+        .await
+    };
+
+    // Everything between here and teardown is captured, never `?`-propagated:
+    // an early return would leak this VM and its snapshot into the rest of the
+    // suite, which is exactly the kind of cross-test contamination that makes a
+    // later failure unreadable.
+    let outcome = async {
+        let before = sample().await?;
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+        // The source resumed; give its publication a moment to finish.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let after = sample().await?;
+        anyhow::Ok((before, after))
+    }
+    .await;
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+
+    let (before, after) = outcome?;
+
+    // The invariant is that nothing is LOST OR ALTERED, not that nothing is
+    // learned. A guest goes on discovering neighbours while the snapshot is
+    // taken -- CI caught this test failing because the guest legitimately
+    // learned its IPv6 gateway (fd00::2) during the window. Additions are
+    // normal operation; a line that was there before and is gone or changed
+    // afterwards is the defect, and that is exactly what a purge looks like.
+    let before_lines: std::collections::BTreeSet<&str> =
+        before.trim().lines().map(str::trim).collect();
+    let after_lines: std::collections::BTreeSet<&str> =
+        after.trim().lines().map(str::trim).collect();
+    let lost: Vec<&&str> = before_lines.difference(&after_lines).collect();
+    if !lost.is_empty() {
+        let gained: Vec<&&str> = after_lines.difference(&before_lines).collect();
+        anyhow::bail!(
+            "the source VM lost or altered network state across one snapshot.\n\
+             Snapshotting must READ the source, never reconfigure it: nothing on \
+             that path may down a link, flush a table, or otherwise destroy \
+             kernel state. Inspect prepare_with and reopen_with in \
+             fc-agent/src/snapshot_network.rs for a step that mutates and does \
+             not fully undo itself.\n\
+             GONE after the snapshot:\n{}\n\
+             (appeared, which is fine and shown only for context:\n{})\n\n\
+             --- before ---\n{}\n--- after ---\n{}",
+            lost.iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            gained
+                .iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            before.trim(),
+            after.trim()
+        );
+    }
+    Ok(())
+}

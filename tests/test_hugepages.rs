@@ -68,7 +68,7 @@ async fn ensure_hugepages(mem_mib: u32) -> Result<()> {
             );
         }
 
-        if start.elapsed().as_secs() % 10 == 0 && start.elapsed().as_secs() > 0 {
+        if start.elapsed().as_secs().is_multiple_of(10) && start.elapsed().as_secs() > 0 {
             println!(
                 "  Waiting for hugepages: {} free, need {} ({} in use)...",
                 free, needed, in_use

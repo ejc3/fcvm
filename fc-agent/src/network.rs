@@ -157,6 +157,89 @@ fn send_ethernet_broadcast(interface: &str, frame: &[u8]) -> std::io::Result<()>
 /// first real packet regardless, and a reply wait on the restore critical
 /// path can stall up to a full second when the gateway stays silent. ARP
 /// rather than ICMP ping because pasta doesn't answer ICMP in rootless mode.
+/// The host's health-check address on the bridge, and the MAC the host pins it
+/// to (`NAMESPACE_IP` / `NAMESPACE_MAC` in src/network/pasta.rs). Kept in sync
+/// by `namespace_neighbour_matches_host_constants` in that file.
+const NAMESPACE_IP: &str = "10.0.2.1";
+const NAMESPACE_MAC: &str = "02:fc:00:00:02:01";
+
+/// Drop every learned neighbour on the external link. RESTORE ONLY.
+///
+/// A restored clone runs in a NEW namespace: its bridge, veth and gateway are
+/// different devices with different MACs from the ones the snapshot recorded.
+/// Every dynamic entry it inherits therefore names hardware that does not exist
+/// on its segment, and the guest will happily send to those addresses until the
+/// entries expire.
+///
+/// The old boundary cleared them as a side effect of taking the link down. When
+/// that purge was removed (it also destroyed routes, which is the defect this
+/// work exists to fix), bridged clones inherited stale gateway MACs and lost all
+/// egress: healthy VM, DNS and HTTP both dead. This does the clearing
+/// deliberately and narrowly instead: one device, no routes touched, on the
+/// restore path only.
+///
+/// The source never runs this. Its neighbours are correct and it is not to be
+/// disturbed.
+pub fn flush_stale_neighbours() {
+    match std::process::Command::new("ip")
+        .args(["neigh", "flush", "dev", "eth0"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            eprintln!("[fc-agent] flushed inherited neighbours on eth0 (restored clone)");
+        }
+        Ok(out) => eprintln!(
+            "[fc-agent] WARNING: could not flush inherited neighbours: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(error) => eprintln!("[fc-agent] WARNING: ip neigh flush failed: {error}"),
+    }
+}
+
+/// Pin an AUTHORITATIVE neighbour entry for the host's health-check address.
+///
+/// Both the bridge (which owns 10.0.2.1) and pasta (which answers for the
+/// subnet it routes) reply to the guest's ARP for that address, and the winner
+/// decides where this guest sends its replies. When pasta won, every inbound
+/// connection died in a way that left no trace: the guest SYN-ACKed to pasta's
+/// MAC, pasta reset a connection it had never opened, and no counter anywhere
+/// recorded a drop. Captured on the wire 2026-08-15:
+///
+///   SYN      br0  > guest  10.0.2.1 > 10.0.2.100  [S]
+///   SYN-ACK  guest > 9a:55:9a:55:9a:55 (pasta)     [S.]
+///   RST      9a:55:9a:55:9a:55 > guest             [R]
+///
+/// A `nud permanent` entry is not replaced by ARP replies, so the race has no
+/// outcome left to win. Idempotent, and re-applied after restore because a
+/// restored guest inherits the snapshot's neighbour table.
+pub fn pin_namespace_neighbour() {
+    match std::process::Command::new("ip")
+        .args([
+            "neigh",
+            "replace",
+            NAMESPACE_IP,
+            "lladdr",
+            NAMESPACE_MAC,
+            "dev",
+            "eth0",
+            "nud",
+            "permanent",
+        ])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            eprintln!("[fc-agent] pinned {NAMESPACE_IP} to {NAMESPACE_MAC} (permanent)");
+        }
+        Ok(out) => eprintln!(
+            "[fc-agent] WARNING: could not pin {NAMESPACE_IP}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(error) => {
+            eprintln!("[fc-agent] WARNING: could not run ip neigh for {NAMESPACE_IP}: {error}")
+        }
+    }
+}
+
 pub fn refresh_gateway_arp() {
     let route_table = match std::fs::read_to_string("/proc/net/route") {
         Ok(table) => table,
