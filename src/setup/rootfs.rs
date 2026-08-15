@@ -2628,6 +2628,14 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
     #[test]
     fn explicit_default_profiles_inherit_global_firecracker_without_overriding_profile() {
         let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        // Read the global pin from the config under test rather than naming a
+        // branch here: this asserts the inheritance rule, and hardcoding the
+        // value made every repin of [firecracker] fail an unrelated test.
+        let global = plan
+            .firecracker
+            .as_ref()
+            .expect("embedded config declares a global [firecracker] pin")
+            .clone();
         let arm64 = plan
             .kernel_profiles
             .get_mut("default")
@@ -2648,10 +2656,13 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
         assert_eq!(arm64.firecracker_branch.as_deref(), Some("profile-branch"));
 
         let amd64 = defaults.get("amd64").unwrap();
-        assert_eq!(amd64.firecracker_repo.as_deref(), Some("ejc3/firecracker"));
+        assert_eq!(
+            amd64.firecracker_repo.as_deref(),
+            Some(global.repo.as_str())
+        );
         assert_eq!(
             amd64.firecracker_branch.as_deref(),
-            Some("bump-vsock-max-connections")
+            Some(global.branch.as_str())
         );
     }
 }

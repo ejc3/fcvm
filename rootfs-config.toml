@@ -33,13 +33,16 @@ repo = "https://passt.top/passt"
 commit = "e1a6d9ef626aa6dbcfeef97dbbab3bd69c35b4b1"
 
 # Default Firecracker binary
-# Build from fork with diff snapshot fix for multi-slot VMs (>3GB RAM).
+# Build from the fork's restacked patch chain on current upstream main
+# (2c4604808, 2026-08): vsock muxer capacity + the bounded UFFD-minor memory
+# backend. The old bump-vsock-max-connections branch sat on a 2026-02 base and
+# carried serial (THRE) and dump_dirty patches that upstream has since fixed
+# itself (firecracker-microvm#5764; v1.14.2), so both are dropped as redundant.
 # `fcvm setup` builds this automatically; `find_firecracker()` uses it.
 # Kernel profiles can override with their own firecracker_repo/branch.
-# Upstream PR: https://github.com/firecracker-microvm/firecracker/pull/5696
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "bump-vsock-max-connections"
+branch = "agent/uffd-minor"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
