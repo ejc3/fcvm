@@ -72,6 +72,48 @@ fn unregister_clone(pid: u32) {
     LIVE_CLONES.lock().unwrap().retain(|p| *p != pid);
 }
 
+/// Kills its clone the instant it is dropped, however the drop happens.
+///
+/// The registry above reaps at seed teardown, which is too late in one case
+/// that matters: a dropped op (outer timeout, or a panic unwinding through it)
+/// runs no async cleanup at all, so the clone keeps running while the rest of
+/// the seed continues around it. Worse, a stranded fcvm child holds the test
+/// binary's stdout pipe open, and nextest waits on that pipe — that is exactly
+/// how a leaked `snapshot serve` turned a 5-second op failure into an
+/// 18-minute apparent hang.
+///
+/// `Drop` cannot await, so this signals directly rather than going through
+/// `kill_process`. SIGKILL, not SIGTERM: this path only runs when cleanup was
+/// already skipped, and a clone that ignores TERM would keep the pipe open.
+struct CloneGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl CloneGuard {
+    /// Call once the child has been waited for. Signalling a pid that has been
+    /// reaped is not harmless — the kernel is free to hand that number to an
+    /// unrelated process — so the normal path disarms rather than relying on
+    /// ESRCH. On the drop path the child was never waited, so it is either
+    /// alive or an unreaped zombie, and its pid cannot have been reused.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CloneGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Safety: kill(2) on a pid this process spawned and has not reaped.
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+        unregister_clone(self.pid);
+    }
+}
+
 /// Kill any clone a dropped op left running. Returns how many it reaped.
 async fn reap_leaked_clones() -> usize {
     let leaked: Vec<u32> = std::mem::take(&mut *LIVE_CLONES.lock().unwrap());
@@ -431,22 +473,102 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
     let fcvm = fcvm_path.to_string_lossy().to_string();
     let pid_s = pid.to_string();
 
-    // 1. Does the guest still serve itself? Splits host-side from guest-side.
+    // 1. Does the SERVICE still answer itself, inside the container? This is
+    //    the probe that splits the layers, so it has to use a binary that is
+    //    actually there: the first version shelled out to curl in the guest OS
+    //    and came back exit=127 (not installed), which told us nothing at the
+    //    exact moment we most needed an answer. nginx:alpine has busybox wget.
     probe(
-        "guest-self-curl",
+        "container-self-http",
+        &[
+            &fcvm,
+            "exec",
+            "--pid",
+            &pid_s,
+            "-c",
+            "--",
+            "sh",
+            "-c",
+            "wget -q -O- --timeout=3 http://127.0.0.1/ 2>&1 | head -c 60; echo \" rc=$?\"",
+        ],
+        left().min(Duration::from_secs(6)),
+    )
+    .await;
+
+    // 2. Is the service even alive, and listening where we think?
+    probe(
+        "container-listeners",
+        &[
+            &fcvm,
+            "exec",
+            "--pid",
+            &pid_s,
+            "-c",
+            "--",
+            "sh",
+            "-c",
+            "netstat -ltn | head -5; echo --; ps -o pid,comm | grep -i nginx | head -3",
+        ],
+        left().min(Duration::from_secs(6)),
+    )
+    .await;
+
+    // 3. Guest side of the hop: listeners, the published-port DNAT, and the
+    //    loopback containment rules that DROP eth0 traffic to 127/8 unless
+    //    conntrack recorded our translation. If the DNAT is intact and the
+    //    container answers itself, the guest's conntrack state is the suspect.
+    // Guest netfilter state is NOT probeable from here, and it is worth saying
+    // so rather than shipping probes that always come back empty: fc-agent
+    // installs the DNAT and the containment DROP from the initrd, and the guest
+    // rootfs carries no iptables and no nft (`command -v iptables` -> 127,
+    // `find / -name "*iptables*"` -> nothing). The rules live in the kernel
+    // where no shell in the running guest can read them back.
+    //
+    // What replaces them is the measurement that actually discriminates, taken
+    // from this side: WHERE the five seconds went. `--max-time` spans connect
+    // AND transfer, so the timeout alone cannot tell a dropped SYN from a
+    // service that accepted and never answered.
+    //   time_connect == 0        -> the handshake never completed; the packet
+    //                               died before any listener saw it
+    //   time_connect ~ 0.001 and
+    //   time_starttransfer == 0  -> the guest ACCEPTED the connection, so eth0
+    //                               ingress and the DNAT both worked, and the
+    //                               service is what went quiet
+    probe(
+        "host-curl-timing",
+        &[
+            "curl",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "connect=%{time_connect} starttransfer=%{time_starttransfer} code=%{http_code} exit=%{exitcode}\n",
+            "--max-time",
+            "5",
+            &format!("http://{}:{}/", ip, port),
+        ],
+        left().min(Duration::from_secs(7)),
+    )
+    .await;
+
+    // Conntrack DOES read back, straight out of /proc, no binary needed.
+    probe(
+        "guest-conntrack",
         &[
             &fcvm,
             "exec",
             "--pid",
             &pid_s,
             "--",
-            "curl -s -o /dev/null -w guest_http=%{http_code} --max-time 3 http://localhost/",
+            "sh",
+            "-c",
+            "echo total=$(grep -c . /proc/net/nf_conntrack); grep -E '127.0.0.1|dport=80 ' /proc/net/nf_conntrack | head -8",
         ],
         left().min(Duration::from_secs(5)),
     )
     .await;
 
-    // 2. What does fcvm believe about this VM right now?
+    // 4. What does fcvm believe about this VM right now?
     probe(
         "fcvm-ls",
         &[&fcvm, "ls", "--json", "--pid", &pid_s],
@@ -454,7 +576,7 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
     )
     .await;
 
-    // 3. Host side: is anything still listening on the published address, and
+    // 5. Host side: is anything still listening on the published address, and
     //    is there a conntrack entry pointing somewhere stale?
     probe(
         "host-listeners",
@@ -470,7 +592,7 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
     )
     .await;
 
-    // 4. The pasta processes serving this VM carry their -t mappings in argv.
+    // 6. The pasta processes serving this VM carry their -t mappings in argv.
     probe(
         "pasta-argv",
         &["pgrep", "-a", "pasta"],
@@ -478,7 +600,7 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
     )
     .await;
 
-    // 5. Inside the VM's namespace: addresses, neighbours, listeners.
+    // 7. Inside the VM namespace: addresses, neighbours, listeners.
     let holder = read_vm_state(pid)
         .await
         .ok()
@@ -585,6 +707,12 @@ async fn apply_op(
             .await
             .with_context(|| format!("restoring clone via serve {}", serve_pid))?;
             register_clone(clone_pid);
+            // Armed BEFORE the first await that can be cancelled, so no path
+            // out of this op leaves the clone running.
+            let guard = CloneGuard {
+                pid: clone_pid,
+                armed: true,
+            };
 
             // fcvm only reports a clone up after its own post-restore
             // port-forward verification, so a curl that fails here means the
@@ -606,6 +734,7 @@ async fn apply_op(
             common::kill_process(clone_pid).await;
             let _ = clone_child.wait().await;
             unregister_clone(clone_pid);
+            guard.disarm();
             let detail = verdict?;
             Ok(format!("clone={} {}", clone_name, detail))
         }
@@ -1011,4 +1140,72 @@ async fn test_fuzz_lifecycle_chaos() {
         );
     }
     println!("FUZZ all {} seed(s) passed", seeds.len());
+}
+
+// ---------------------------------------------------------------------------
+// CloneGuard: mechanism-level, no VMs, milliseconds.
+//
+// Written against the unfixed tree first. With the Drop impl removed (or armed
+// left false), `child.wait()` below never returns and the 5s timeout fails the
+// test — which is exactly the property under test: the clone dies even when no
+// cleanup code runs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_dropped_clone_guard_kills_the_clone_it_guards() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawning sleep");
+    let pid = child.id().expect("child pid");
+    register_clone(pid);
+
+    {
+        let _guard = CloneGuard { pid, armed: true };
+        // No cleanup here on purpose: this models the op future being dropped
+        // mid-await, where nothing async gets to run.
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("guard did not kill the clone: still running 5s after drop")
+        .expect("waiting for the killed clone");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "clone exited, but not from the guard's SIGKILL: {:?}",
+        status
+    );
+    assert!(
+        !LIVE_CLONES.lock().unwrap().contains(&pid),
+        "guard killed the clone but left it in the live-clone registry"
+    );
+}
+
+#[tokio::test]
+async fn a_disarmed_clone_guard_leaves_the_process_alone() {
+    // The normal path waits for the child itself, then disarms. Signalling
+    // after a reap could hit an unrelated process that inherited the number,
+    // so disarm must actually suppress the kill.
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawning sleep");
+    let pid = child.id().expect("child pid");
+    register_clone(pid);
+
+    CloneGuard { pid, armed: false }.disarm();
+
+    // Still alive: a disarmed guard must not have signalled it.
+    let early = tokio::time::timeout(Duration::from_millis(300), child.wait()).await;
+    assert!(
+        early.is_err(),
+        "disarmed guard killed the process anyway: {:?}",
+        early
+    );
+    unregister_clone(pid);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
