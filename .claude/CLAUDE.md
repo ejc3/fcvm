@@ -2259,6 +2259,44 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 - `-it`: both (interactive shell)
 - neither: plain exec
 
+### `fcvm exec` LANDS IN THE CONTAINER BY DEFAULT. The guest needs `--vm`.
+
+```
+-c, --container    Execute inside container (default)
+    --vm           Execute in the VM instead of inside the container
+```
+
+A bare `fcvm exec --pid <pid> -- <cmd>` runs in the **container**, not the guest OS.
+They are different machines with different tooling, so a diagnostic aimed at the wrong
+one comes back EMPTY rather than wrong, which reads like a finding:
+
+| | container (`nginx:alpine`) | guest (Ubuntu 24.04, `--vm`) |
+|---|---|---|
+| `iptables` | absent | `/usr/sbin/iptables` |
+| `bash` / `ss` / `curl` | absent | `/usr/bin/{bash,ss,curl}` |
+| `sh`, `wget`, `netstat` | busybox | present |
+
+On 2026-08-15 that cost several rounds of a flake hunt. Netfilter probes returned
+nothing, and the conclusion written down was "the guest rootfs carries no iptables and no
+nft, so guest netfilter state is unreadable" - a statement about alpine, presented as a
+fact about Ubuntu, and committed as a code comment. The rules were readable the whole
+time, and reading them is what exonerated the loopback containment DROP (packet counter
+still 0 at failure) and moved the search to the virtio-net RX path.
+
+Two rules follow:
+
+1. **An empty probe result is not evidence. It is a broken probe until proven otherwise.**
+   Run every diagnostic against a HEALTHY VM first and confirm it returns real output.
+   Both of these looked like findings and were defects in the instrument: `exit=127` from
+   `curl` in a guest image that has no curl, and `exit=127` from passing a whole command
+   line as one argv - `fcvm exec -- 'ss -ltn | head'` execs that string as a program
+   name, so it needs `sh -c` as separate arguments.
+2. **Use absolute paths.** exec hands over a minimal PATH: `iptables` fails where
+   `/usr/sbin/iptables` works.
+
+The same split exists in the test helpers: `exec_in_vm(pid, &cmd)` versus
+`exec_in_container(pid, &cmd)` (`tests/common/mod.rs`).
+
 **NO backward compatibility wrappers.** When the API changed from `run_tty_mode(stream)` to `run_tty_mode(stream, interactive)`, all callers were updated directly - no deprecated functions or compatibility shims.
 
 ## References
