@@ -4263,36 +4263,39 @@ async fn snapshot_leaves_the_source_network_untouched() -> anyhow::Result<()> {
     let _ = common::delete_snapshot(&snap_tag).await;
 
     let (before, after) = outcome?;
-    if before.trim() != after.trim() {
-        let (b_lines, a_lines): (Vec<&str>, Vec<&str>) = (
-            before.trim().lines().collect(),
-            after.trim().lines().collect(),
-        );
-        let mut diff: Vec<String> = b_lines
-            .iter()
-            .zip(a_lines.iter())
-            .filter(|(b, a)| b != a)
-            .map(|(b, a)| format!("  before: {b}\n  after:  {a}"))
-            .collect();
-        // zip stops at the shorter side, so a line that exists on only one side
-        // would vanish from the report -- and a DISAPPEARING neighbour entry is
-        // precisely the shape of the defect this test exists to catch.
-        if b_lines.len() != a_lines.len() {
-            diff.push(format!(
-                "  line count changed: before={} after={} (entries were added or removed)",
-                b_lines.len(),
-                a_lines.len()
-            ));
-        }
+
+    // The invariant is that nothing is LOST OR ALTERED, not that nothing is
+    // learned. A guest goes on discovering neighbours while the snapshot is
+    // taken -- CI caught this test failing because the guest legitimately
+    // learned its IPv6 gateway (fd00::2) during the window. Additions are
+    // normal operation; a line that was there before and is gone or changed
+    // afterwards is the defect, and that is exactly what a purge looks like.
+    let before_lines: std::collections::BTreeSet<&str> =
+        before.trim().lines().map(str::trim).collect();
+    let after_lines: std::collections::BTreeSet<&str> =
+        after.trim().lines().map(str::trim).collect();
+    let lost: Vec<&&str> = before_lines.difference(&after_lines).collect();
+    if !lost.is_empty() {
+        let gained: Vec<&&str> = after_lines.difference(&before_lines).collect();
         anyhow::bail!(
-            "the source VM's network state changed across one snapshot.\n\
+            "the source VM lost or altered network state across one snapshot.\n\
              Snapshotting must READ the source, never reconfigure it: nothing on \
              that path may down a link, flush a table, or otherwise destroy \
              kernel state. Inspect prepare_with and reopen_with in \
              fc-agent/src/snapshot_network.rs for a step that mutates and does \
              not fully undo itself.\n\
-             differing lines:\n{}\n\n--- before ---\n{}\n--- after ---\n{}",
-            diff.join("\n"),
+             GONE after the snapshot:\n{}\n\
+             (appeared, which is fine and shown only for context:\n{})\n\n\
+             --- before ---\n{}\n--- after ---\n{}",
+            lost.iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            gained
+                .iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             before.trim(),
             after.trim()
         );
