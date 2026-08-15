@@ -4217,8 +4217,8 @@ async fn snapshot_leaves_the_source_network_untouched() -> anyhow::Result<()> {
     common::poll_health(&mut child, 300).await?;
 
     // `ip neigh` is deliberately included: it is the table that regressed, and
-    // the one a "reinstate the routes" fix does not cover.
-    let sample = |label: &'static str| async move {
+    // the one a "reinstate the routes" fix did not cover.
+    let sample = || async move {
         common::exec_in_vm(
             pid,
             &["sh -c 'PATH=/usr/sbin:/sbin:/usr/bin:/bin; \
@@ -4227,31 +4227,55 @@ async fn snapshot_leaves_the_source_network_untouched() -> anyhow::Result<()> {
                echo ADDR; ip -br addr show | sort'"],
         )
         .await
-        .map(|out| (label, out))
     };
 
-    let (_, before) = sample("before").await?;
-    common::create_snapshot_by_pid(pid, &snap_tag).await?;
-    // The source resumed; give its reopen path a moment to finish publishing.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let (_, after) = sample("after").await?;
+    // Everything between here and teardown is captured, never `?`-propagated:
+    // an early return would leak this VM and its snapshot into the rest of the
+    // suite, which is exactly the kind of cross-test contamination that makes a
+    // later failure unreadable.
+    let outcome = async {
+        let before = sample().await?;
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+        // The source resumed; give its publication a moment to finish.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let after = sample().await?;
+        anyhow::Ok((before, after))
+    }
+    .await;
 
     common::kill_process(pid).await;
     let _ = child.wait().await;
     let _ = common::delete_snapshot(&snap_tag).await;
 
+    let (before, after) = outcome?;
     if before.trim() != after.trim() {
-        let diff: Vec<String> = before
-            .lines()
-            .zip(after.lines())
+        let (b_lines, a_lines): (Vec<&str>, Vec<&str>) = (
+            before.trim().lines().collect(),
+            after.trim().lines().collect(),
+        );
+        let mut diff: Vec<String> = b_lines
+            .iter()
+            .zip(a_lines.iter())
             .filter(|(b, a)| b != a)
             .map(|(b, a)| format!("  before: {b}\n  after:  {a}"))
             .collect();
+        // zip stops at the shorter side, so a line that exists on only one side
+        // would vanish from the report -- and a DISAPPEARING neighbour entry is
+        // precisely the shape of the defect this test exists to catch.
+        if b_lines.len() != a_lines.len() {
+            diff.push(format!(
+                "  line count changed: before={} after={} (entries were added or removed)",
+                b_lines.len(),
+                a_lines.len()
+            ));
+        }
         anyhow::bail!(
-            "snapshotting mutated the source VM's network and did not put it back.\n\
-             The snapshot boundary takes eth0 down, which purges routes AND \
-             neighbours; whatever is missing here was purged and never reinstated \
-             (see reopen_with in fc-agent/src/snapshot_network.rs).\n\
+            "the source VM's network state changed across one snapshot.\n\
+             Snapshotting must READ the source, never reconfigure it: nothing on \
+             that path may down a link, flush a table, or otherwise destroy \
+             kernel state. Inspect prepare_with and reopen_with in \
+             fc-agent/src/snapshot_network.rs for a step that mutates and does \
+             not fully undo itself.\n\
              differing lines:\n{}\n\n--- before ---\n{}\n--- after ---\n{}",
             diff.join("\n"),
             before.trim(),

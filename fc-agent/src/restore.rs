@@ -266,13 +266,21 @@ pub async fn handle_clone_restore(
     spawn_restore_side_job(restart_journald());
 
     // Reconfigure IPv6 — before any network traffic can use the old address.
-    // The link is still down here (the snapshot captured it down), so the new
-    // address sits tentative until the boundary republishes the link.
+    // The link is UP throughout (the boundary no longer takes it down), so the
+    // gate is what holds inbound traffic off until the cleanup below finishes.
     let ipv6_started = std::time::Instant::now();
     if let Some(new_ipv6) = clone_ipv6 {
         network::reconfigure_ipv6(new_ipv6).await;
     }
     phases.ipv6_ms = elapsed_ms(ipv6_started);
+
+    // Pin the neighbour entry BEFORE the boundary reopens the gate. The clone
+    // inherits the source's neighbour table, and restore_snapshot_network ends
+    // by publishing; anything answered between publication and a later pin
+    // could still go to the inherited MAC, which is the exact SYN-ACK/RST
+    // failure this boundary work exists to remove. Safe to do early: nothing
+    // purges the neighbour table any more.
+    network::pin_namespace_neighbour();
 
     let tcp_cleanup_started = std::time::Instant::now();
     eprintln!(
@@ -298,10 +306,6 @@ pub async fn handle_clone_restore(
     // boundary. One broadcast ARP request refreshes the gateway and teaches the
     // new bridge/pasta path without deleting unrelated/current neighbors.
     let neighbor_started = std::time::Instant::now();
-    // A restored guest inherits the snapshot's neighbour table, which may hold
-    // the losing side of the ARP race from whichever namespace took the
-    // snapshot. Re-pin before the gateway probe.
-    network::pin_namespace_neighbour();
     network::refresh_gateway_arp();
     phases.neighbor_ms = elapsed_ms(neighbor_started);
 

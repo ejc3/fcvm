@@ -1503,12 +1503,33 @@ pub async fn resume_source_network() -> Result<()> {
     let store = FileManifestStore::default();
     // No routes to read back: the boundary never takes the link down, so it
     // purges nothing. The manifest is retired purely to clear the armed marker.
-    store
-        .remove()
-        .context("retiring source snapshot network manifest before publication")?;
-    reopen_with(&gate)
+    //
+    // ORDER: publish FIRST, retire the marker second. The gate is live traffic
+    // policy on a VM that was only supposed to be READ; the manifest is a local
+    // file. Retiring first meant a removal failure returned early with the gate
+    // still closed, leaving the source unpublished until an operator noticed --
+    // the same "snapshot disturbed the source" failure this boundary exists to
+    // avoid, arriving by the error path instead.
+    let reopened = reopen_with(&gate)
         .await
-        .context("reopening source VM network")?;
+        .context("reopening source VM network");
+    let retired = store
+        .remove()
+        .context("retiring source snapshot network manifest after publication");
+    match (reopened, retired) {
+        (Ok(()), Ok(())) => {}
+        // Publication failed: report it, and say if the marker also survived.
+        (Err(reopen), retire) => {
+            return Err(match retire {
+                Ok(()) => reopen,
+                Err(retire) => anyhow::anyhow!("{reopen:#}; additionally {retire:#}"),
+            })
+        }
+        // Published, but the marker survives. Still an error -- a stale marker
+        // keeps the restore watcher on the restore-only control generation --
+        // and the source is at least back in service.
+        (Ok(()), Err(retire)) => return Err(retire),
+    }
     eprintln!(
         "[fc-agent] source VM snapshot network reopened: gate=open \
          (link never taken down)"

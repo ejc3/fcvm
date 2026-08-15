@@ -2063,6 +2063,9 @@ mod tests {
             vec![
                 "link set pasta0 up",
                 "link add br0 type bridge",
+                // Pinned so the guest can hold an authoritative neighbour entry
+                // for the health-check address instead of racing pasta for one.
+                "link set br0 address 02:fc:00:00:02:01",
                 "link set br0 up",
                 "link set pasta0 master br0",
                 "link set tap-fc master br0",
@@ -2085,7 +2088,7 @@ mod tests {
 
         // `ip -batch` aborts at the first failing line and reports `-:<line>`.
         let msg = script.describe_failure("RTNETLINK answers: File exists\nCommand failed -:2\n");
-        assert!(msg.contains("step 2/6"), "missing step index: {msg}");
+        assert!(msg.contains("step 2/7"), "missing step index: {msg}");
         assert!(
             msg.contains("create L2 bridge br0"),
             "missing step name: {msg}"
