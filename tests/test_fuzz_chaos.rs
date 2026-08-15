@@ -136,7 +136,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Total wall-clock budget for the forensics dump fired when a forwarded port
 /// goes silent. Diagnostics must never outlive the failure they explain.
-const FORENSICS_BUDGET: Duration = Duration::from_secs(12);
+const FORENSICS_BUDGET: Duration = Duration::from_secs(40);
 
 const GUEST_NONCE_FILE: &str = "/mnt/fuzz/nonces.txt";
 
@@ -415,6 +415,17 @@ async fn curl_once(pid: u32, ip: &str, port: u16) -> Result<String> {
 /// Run one diagnostic and print it, whatever it says. A probe that fails is
 /// itself evidence, so its exit status and stderr are reported rather than
 /// swallowed — a silent section is indistinguishable from a clean one.
+/// Like `probe`, but returns the output instead of printing it, for numbers
+/// that only mean something when compared against each other.
+async fn capture(args: &[&str], budget: Duration) -> Option<String> {
+    let (bin, rest) = args.split_first()?;
+    let run = tokio::process::Command::new(bin).args(rest).output();
+    match tokio::time::timeout(budget, run).await {
+        Ok(Ok(out)) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        _ => None,
+    }
+}
+
 async fn probe(label: &str, args: &[&str], budget: Duration) {
     let Some((bin, rest)) = args.split_first() else {
         return;
@@ -472,6 +483,45 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
     };
     let fcvm = fcvm_path.to_string_lossy().to_string();
     let pid_s = pid.to_string();
+
+    // 0. THE suspect, measured before anything else can eat the budget.
+    //
+    // The published port reaches the service through a DNAT to 127.0.0.1:80,
+    // and that only works while net.ipv4.conf.eth0.route_localnet=1. fc-agent
+    // sets it at boot precisely because, quoting its own comment, "the kernel
+    // treats a packet routed to 127.0.0.0/8 that arrived on a non-loopback
+    // interface as a martian source and drops it".
+    //
+    // A martian drop happens in ROUTING, before INPUT. That is consistent with
+    // every measurement taken so far: the containment DROP counter stays 0, no
+    // RST is emitted, eth0's RX counters keep climbing, and guest-local traffic
+    // to 127.0.0.1 and to 10.0.2.100 keeps working because neither crosses eth0.
+    //
+    // TcpPassiveOpens is the corroborating half: if the SYN never reaches TCP,
+    // it cannot increment, whatever the NIC counters say.
+    for (label, cmd) in [
+        (
+            "guest-route-localnet",
+            "for f in eth0 all default; do \
+               printf '%s=' \"$f\"; \
+               cat /proc/sys/net/ipv4/conf/$f/route_localnet 2>/dev/null || echo '?'; \
+             done",
+        ),
+        (
+            "guest-tcp-counters",
+            "awk '/^Tcp:/{n=$0; getline; print n; print}' /proc/net/snmp | tail -2; \
+             grep -iE 'listen|martian' /proc/net/netstat 2>/dev/null | head -2",
+        ),
+    ] {
+        probe(
+            label,
+            &[
+                &fcvm, "exec", "--pid", &pid_s, "--vm", "--", "sh", "-c", cmd,
+            ],
+            left().min(Duration::from_secs(5)),
+        )
+        .await;
+    }
 
     // 1. Does the SERVICE still answer itself, inside the container? This is
     //    the probe that splits the layers, so it has to use a binary that is
@@ -572,6 +622,18 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
             "/usr/sbin/iptables -t nat -S PREROUTING | head -6",
         ),
         ("guest-listeners", "/usr/bin/ss -ltnp | head -8"),
+        // The reply path. Packets demonstrably arrive (rx differential) and
+        // nothing drops them (DROP counter 0), so if the guest cannot answer
+        // 10.0.2.1 the reason is here: the route purged by the snapshot
+        // link-down and not reinstated, or a neighbour entry it cannot
+        // re-resolve. TX errors/dropped on eth0 would show the same thing from
+        // the device's side.
+        ("guest-routes", "PATH=/usr/sbin:/sbin:/usr/bin:/bin; ip route show"),
+        ("guest-neigh", "PATH=/usr/sbin:/sbin:/usr/bin:/bin; ip neigh show"),
+        (
+            "guest-eth0-link",
+            "PATH=/usr/sbin:/sbin:/usr/bin:/bin; ip -s link show eth0 | head -8",
+        ),
         // Both sides of the DNAT, from inside the guest: 127.0.0.1 is where
         // the rule points, 10.0.2.100 is the address the outside world uses.
         // Answers on loopback but not on eth0 -> the ingress path; silent on
@@ -592,6 +654,26 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
         )
         .await;
     }
+
+    // Firecracker's device event loop starving its virtio queues after a
+    // pause/resume is a documented failure mode (AGENTS.md, NV2 section): one
+    // thread spins while every queue goes unserviced. Per-thread jiffies.
+    probe(
+        "firecracker-thread-cpu",
+        &[
+            "sh",
+            "-c",
+            &format!(
+                "for t in /proc/$(pgrep -P {} -x firecracker | head -1)/task/*/stat; do \
+                   [ -r \"$t\" ] || continue; \
+                   awk '{{print $2, \"utime=\" $14, \"stime=\" $15}}' \"$t\"; \
+                 done | head -8",
+                pid
+            ),
+        ],
+        left().min(Duration::from_secs(5)),
+    )
+    .await;
 
     // Conntrack DOES read back, straight out of /proc, no binary needed.
     probe(
@@ -654,6 +736,107 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
         None => println!("  [namespace] no holder_pid in state — cannot enter the VM's netns"),
         Some(h) => {
             let ns = format!("--net=/proc/{}/ns/net", h);
+            // THE differential, at TCP level.
+            //
+            // eth0's rx_packets was the wrong counter: ambient DNS, NTP and
+            // MMDS traffic move it constantly, so a non-zero delta proved
+            // nothing about OUR SYN. Tcp.PassiveOpens counts inbound
+            // connections the guest's TCP actually accepted, and nothing else
+            // in this VM generates those.
+            //
+            //   delta >= 1 -> the guest ACCEPTED it, so the reply is what is
+            //                 lost (bridge/tap egress side)
+            //   delta = 0  -> the SYN never reached the guest's TCP, and the
+            //                 fault is in front of it: bridge FDB, tap, pasta
+            let passive = [
+                fcvm.as_str(),
+                "exec",
+                "--pid",
+                &pid_s,
+                "--vm",
+                "--",
+                "sh",
+                "-c",
+                "awk '/^Tcp:/{h=$0; getline; d=$0} END{n=split(h,H,\" \"); for(i=1;i<=n;i++) if(H[i]==\"PassiveOpens\"){split(d,D,\" \"); print D[i]}}' /proc/net/snmp",
+            ];
+            let before = capture(&passive, Duration::from_secs(5)).await;
+            let _ = capture(
+                &[
+                    "nsenter",
+                    ns.as_str(),
+                    "curl",
+                    "-sS",
+                    "-o",
+                    "/dev/null",
+                    "--max-time",
+                    "3",
+                    "http://10.0.2.100:80/",
+                ],
+                Duration::from_secs(5),
+            )
+            .await;
+            let after = capture(&passive, Duration::from_secs(5)).await;
+            let parse = |v: &Option<String>| v.as_ref().and_then(|x| x.trim().parse::<u64>().ok());
+            match (parse(&before), parse(&after)) {
+                (Some(b), Some(a)) => println!(
+                    "  [tcp-passiveopens-differential] before={} after={} delta={} ({})",
+                    b,
+                    a,
+                    a.saturating_sub(b),
+                    if a > b {
+                        "guest ACCEPTED it — the REPLY is what is lost"
+                    } else {
+                        "SYN never reached guest TCP — bridge FDB / tap / pasta"
+                    }
+                ),
+                _ => println!(
+                    "  [tcp-passiveopens-differential] unreadable (before={:?} after={:?})",
+                    before, after
+                ),
+            }
+
+            // Observe the WIRE, not counters. Every counter says the packet is
+            // neither delivered nor dropped, and a packet that is neither is
+            // queued. tcpdump on the tap settles where it stops:
+            //   SYN appears on the tap -> the bridge forwarded it and the
+            //     virtio-net RX side is not consuming it (Firecracker)
+            //   SYN absent from the tap -> it never left the bridge
+            probe(
+                "ns-tap-tcpdump",
+                &[
+                    "nsenter",
+                    ns.as_str(),
+                    "sh",
+                    "-c",
+                    "TAP=$(ip -o link show | sed -n 's/.*: \\(tap-[^:@]*\\).*/\\1/p' | head -1); \
+                     echo \"tap=$TAP\"; \
+                     ( timeout 4 tcpdump -i \"$TAP\" -e -n -c 8 'tcp port 80' 2>&1 | sed 's/^/    tap /' ) & \
+                     ( timeout 4 tcpdump -i pasta0 -e -n -c 8 'tcp port 80' 2>&1 | sed 's/^/    pasta0 /' ) & \
+                     ( timeout 4 tcpdump -i br0 -e -n -c 8 'tcp port 80' 2>&1 | sed 's/^/    br0 /' ) & \
+                     sleep 0.7; \
+                     curl -s -o /dev/null --max-time 2 http://10.0.2.100:80/ 2>/dev/null; \
+                     wait",
+                ],
+                left().min(Duration::from_secs(10)),
+            )
+            .await;
+
+            // Where the bridge thinks the guest's MAC lives. This repo already
+            // carries scripts/passt-addr-seen.patch because pasta's forwarding
+            // target could be retargeted by overheard bridge traffic; an FDB
+            // entry pointing at pasta0 rather than the tap is that bug, visible.
+            for (label, cmd) in [
+                ("ns-bridge-fdb", "bridge fdb show"),
+                ("ns-tap-stats", "ip -s link show"),
+            ] {
+                probe(
+                    label,
+                    &["nsenter", ns.as_str(), "sh", "-c", cmd],
+                    left().min(Duration::from_secs(5)),
+                )
+                .await;
+            }
+
             // THE discriminator between the two remaining suspects.
             //
             // `connect` to the published address only proves pasta accepted:

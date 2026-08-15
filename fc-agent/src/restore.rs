@@ -298,6 +298,10 @@ pub async fn handle_clone_restore(
     // boundary. One broadcast ARP request refreshes the gateway and teaches the
     // new bridge/pasta path without deleting unrelated/current neighbors.
     let neighbor_started = std::time::Instant::now();
+    // A restored guest inherits the snapshot's neighbour table, which may hold
+    // the losing side of the ARP race from whichever namespace took the
+    // snapshot. Re-pin before the gateway probe.
+    network::pin_namespace_neighbour();
     network::refresh_gateway_arp();
     phases.neighbor_ms = elapsed_ms(neighbor_started);
 

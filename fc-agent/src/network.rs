@@ -157,6 +157,56 @@ fn send_ethernet_broadcast(interface: &str, frame: &[u8]) -> std::io::Result<()>
 /// first real packet regardless, and a reply wait on the restore critical
 /// path can stall up to a full second when the gateway stays silent. ARP
 /// rather than ICMP ping because pasta doesn't answer ICMP in rootless mode.
+/// The host's health-check address on the bridge, and the MAC the host pins it
+/// to (`NAMESPACE_IP` / `NAMESPACE_MAC` in src/network/pasta.rs). Kept in sync
+/// by `namespace_neighbour_matches_host_constants` in that file.
+const NAMESPACE_IP: &str = "10.0.2.1";
+const NAMESPACE_MAC: &str = "02:fc:00:00:02:01";
+
+/// Pin an AUTHORITATIVE neighbour entry for the host's health-check address.
+///
+/// Both the bridge (which owns 10.0.2.1) and pasta (which answers for the
+/// subnet it routes) reply to the guest's ARP for that address, and the winner
+/// decides where this guest sends its replies. When pasta won, every inbound
+/// connection died in a way that left no trace: the guest SYN-ACKed to pasta's
+/// MAC, pasta reset a connection it had never opened, and no counter anywhere
+/// recorded a drop. Captured on the wire 2026-08-15:
+///
+///   SYN      br0  > guest  10.0.2.1 > 10.0.2.100  [S]
+///   SYN-ACK  guest > 9a:55:9a:55:9a:55 (pasta)     [S.]
+///   RST      9a:55:9a:55:9a:55 > guest             [R]
+///
+/// A `nud permanent` entry is not replaced by ARP replies, so the race has no
+/// outcome left to win. Idempotent, and re-applied after restore because a
+/// restored guest inherits the snapshot's neighbour table.
+pub fn pin_namespace_neighbour() {
+    match std::process::Command::new("ip")
+        .args([
+            "neigh",
+            "replace",
+            NAMESPACE_IP,
+            "lladdr",
+            NAMESPACE_MAC,
+            "dev",
+            "eth0",
+            "nud",
+            "permanent",
+        ])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            eprintln!("[fc-agent] pinned {NAMESPACE_IP} to {NAMESPACE_MAC} (permanent)");
+        }
+        Ok(out) => eprintln!(
+            "[fc-agent] WARNING: could not pin {NAMESPACE_IP}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(error) => {
+            eprintln!("[fc-agent] WARNING: could not run ip neigh for {NAMESPACE_IP}: {error}")
+        }
+    }
+}
+
 pub fn refresh_gateway_arp() {
     let route_table = match std::fs::read_to_string("/proc/net/route") {
         Ok(table) => table,

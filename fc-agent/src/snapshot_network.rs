@@ -309,21 +309,8 @@ trait FirewallGate {
     async fn is_closed(&self) -> Result<bool>;
 }
 
-trait ExternalLink {
-    async fn down(&self) -> Result<()>;
-    async fn up(&self) -> Result<()>;
-}
-
 trait PacketReceiveBarrier {
     fn synchronize(&self) -> Result<()>;
-}
-
-trait RouteTable {
-    /// Read the routes that must be reinstated after the link returns.
-    async fn capture(&self) -> Result<Vec<CapturedRoute>>;
-    /// Reinstate them. Idempotent: `ip route replace` accepts a route that is
-    /// already present, so a partial restore can simply be repeated.
-    async fn reinstate(&self, routes: &[CapturedRoute]) -> Result<()>;
 }
 
 trait CommandRunner {
@@ -369,220 +356,6 @@ impl CommandRunner for SystemCommandRunner {
         stdin.write_all(input).await?;
         drop(stdin);
         child.wait_with_output().await
-    }
-}
-
-/// Name the guest's one external interface by asking sysfs which netdev is
-/// backed by a bus device.
-///
-/// The name is not fixed across hypervisors, so hardcoding one silently breaks
-/// the other: Firecracker's MMIO virtio-net keeps the kernel's `eth0`, while
-/// Cloud Hypervisor's PCI virtio-net is renamed by udev under predictable
-/// naming to `enp0s4` (both measured). The kernel `ip=` boot argument names
-/// `eth0` because it runs before that rename, so the address survives and every
-/// later by-name operation does not.
-///
-/// Only `lo` lacks the `device` symlink, so this also stays correct if the netns
-/// ever gains a bridge or veth. Unlike reading an address or a default route it
-/// is valid mid-boundary, where the link is down and the routes are purged.
-fn external_interface_in(sysfs_net: &Path) -> Result<String> {
-    let entries = std::fs::read_dir(sysfs_net)
-        .with_context(|| format!("listing network interfaces in {}", sysfs_net.display()))?;
-    let mut all = Vec::new();
-    let mut backed = Vec::new();
-    for entry in entries {
-        let entry = entry.with_context(|| {
-            format!(
-                "reading a network interface entry in {}",
-                sysfs_net.display()
-            )
-        })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.path().join("device").exists() {
-            backed.push(name.clone());
-        }
-        all.push(name);
-    }
-    all.sort();
-    backed.sort();
-    match backed.len() {
-        1 => Ok(backed.remove(0)),
-        _ => bail!(
-            "expected exactly one device-backed external interface, found {:?} among {:?}",
-            backed,
-            all
-        ),
-    }
-}
-
-fn external_interface() -> Result<String> {
-    external_interface_in(Path::new(SYSFS_NET_PATH))
-}
-
-/// The guest's one external interface, driven through direct syscalls.
-struct IpLink {
-    interface: String,
-}
-
-impl IpLink {
-    fn new(interface: String) -> Self {
-        Self { interface }
-    }
-}
-
-/// Set or clear IFF_UP on an interface with SIOCSIFFLAGS.
-///
-/// The kernel call `ip link set dev X up|down` makes, without the process
-/// spawn. The boundary drives the link on every clone restore, where a spawn
-/// costs far more than the syscall: the restored process image faults its
-/// text and libraries back in through the memory backend. Spawn-free is also
-/// what makes re-asserting the link-down on every restore affordable, and
-/// that re-assert is what keeps the cleanup sound against a privileged
-/// workload sharing this namespace.
-fn set_interface_up(interface: &str, up: bool) -> Result<()> {
-    use std::os::fd::AsRawFd;
-
-    // `as _` on the request numbers is load-bearing across targets: the guest
-    // binary is musl, whose `ioctl` takes an i32 request, while glibc takes a
-    // c_ulong. A host-target build hides that difference entirely.
-
-    let fd = crate::network::open_raw_socket(libc::AF_INET, libc::SOCK_DGRAM, 0)
-        .context("opening a control socket for the snapshot network link")?;
-    // SAFETY: ifreq is a plain C struct; zeroing is its valid empty state.
-    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name = interface.as_bytes();
-    if name.len() >= request.ifr_name.len() {
-        bail!("interface name {interface:?} does not fit in an ifreq");
-    }
-    for (slot, byte) in request.ifr_name.iter_mut().zip(name) {
-        *slot = *byte as libc::c_char;
-    }
-    // SAFETY: the fd is a live AF_INET socket and `request` is initialized
-    // with a NUL-terminated name; SIOCGIFFLAGS fills the flags union member.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut request) } < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("reading interface flags for {interface}"));
-    }
-    // SAFETY: SIOCGIFFLAGS just populated the flags member of the union.
-    let flags = unsafe { request.ifr_ifru.ifru_flags } as libc::c_int;
-    let updated = if up {
-        flags | libc::IFF_UP
-    } else {
-        flags & !libc::IFF_UP
-    };
-    request.ifr_ifru.ifru_flags = updated as libc::c_short;
-    // SAFETY: same fd and struct, now carrying the flags to install.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request) } < 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "setting interface {interface} {}",
-                if up { "up" } else { "down" }
-            )
-        });
-    }
-    Ok(())
-}
-
-impl ExternalLink for IpLink {
-    async fn down(&self) -> Result<()> {
-        set_interface_up(&self.interface, false)
-    }
-
-    async fn up(&self) -> Result<()> {
-        set_interface_up(&self.interface, true)
-    }
-}
-
-struct IpRoutes<R> {
-    runner: R,
-}
-
-impl<R> IpRoutes<R> {
-    fn new(runner: R) -> Self {
-        Self { runner }
-    }
-}
-
-impl<R: CommandRunner + Sync> IpRoutes<R> {
-    async fn run(&self, args: &[&str]) -> Result<std::process::Output> {
-        let output = self
-            .runner
-            .output("ip", args)
-            .await
-            .context("spawning ip to read or reinstate the snapshot route table")?;
-        if !output.status.success() {
-            bail!(
-                "snapshot network route command failed: {}",
-                command_failure("ip", args, &output)
-            );
-        }
-        Ok(output)
-    }
-
-    async fn capture_family(&self, family: u8, routes: &mut Vec<CapturedRoute>) -> Result<()> {
-        let flag = if family == 6 { "-6" } else { "-4" };
-        let output = self.run(&[flag, "route", "show"]).await?;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let spec = line.trim();
-            if spec.is_empty() {
-                continue;
-            }
-            // `proto kernel` routes come back on their own when the link does,
-            // measured on both families, so reinstating them is noise at best.
-            if spec.contains("proto kernel") {
-                continue;
-            }
-            // A route the kernel is aging out cannot be re-added verbatim:
-            // `expires` is state, not an argument `ip route replace` accepts.
-            if spec.contains("expires") {
-                continue;
-            }
-            routes.push(CapturedRoute {
-                family,
-                spec: spec.to_string(),
-            });
-        }
-        Ok(())
-    }
-}
-
-impl<R: CommandRunner + Sync> RouteTable for IpRoutes<R> {
-    async fn capture(&self) -> Result<Vec<CapturedRoute>> {
-        let mut routes = Vec::new();
-        self.capture_family(4, &mut routes).await?;
-        self.capture_family(6, &mut routes).await?;
-        Ok(routes)
-    }
-
-    async fn reinstate(&self, routes: &[CapturedRoute]) -> Result<()> {
-        // One `ip -batch -` spawn per family instead of one per route: the
-        // family flag is global to the ip invocation, and each avoided spawn
-        // is restore latency on a cold clone.
-        for family in [4u8, 6u8] {
-            let lines: Vec<String> = routes
-                .iter()
-                .filter(|route| route.family == family)
-                .map(|route| format!("route replace {}", route.spec))
-                .collect();
-            if lines.is_empty() {
-                continue;
-            }
-            let flag = if family == 6 { "-6" } else { "-4" };
-            let payload = lines.join("\n") + "\n";
-            let args = [flag, "-batch", "-"];
-            let output = self
-                .runner
-                .output_with_input("ip", &args, payload.as_bytes())
-                .await
-                .context("spawning ip to reinstate the snapshot route table")?;
-            if !output.status.success() {
-                bail!(
-                    "snapshot network route batch failed: {} (batch input {payload:?})",
-                    command_failure("ip", &args, &output)
-                );
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1492,38 +1265,23 @@ fn parse_destroy_reply(bytes: &[u8], sequence: u32) -> Result<Option<DestroyOutc
     Ok(outcome)
 }
 
-async fn reopen_with<G: FirewallGate, L: ExternalLink, T: RouteTable>(
-    gate: &G,
-    link: &L,
-    routes: &T,
-    captured: &[CapturedRoute],
-) -> Result<()> {
-    // Remove both family-specific hooks while the link is still down, then make
-    // the link visible as the final publication step.  Removing IPv4 and IPv6
-    // hooks cannot be one iptables transaction; doing it behind link-down
-    // prevents a partial gate removal from publishing either family.
+/// Publish the network again by removing the gate, and nothing else.
+///
+/// Nothing else is left to do: with the link-down gone the boundary destroys no
+/// kernel state, so there are no routes and no neighbours to put back. This
+/// function used to reinstate routes, and a neighbour repair was on its way into
+/// it before the purge itself was removed instead.
+async fn reopen_with<G: FirewallGate>(gate: &G) -> Result<()> {
+    // Removing the IPv4 and IPv6 hooks cannot be one iptables transaction, so a
+    // failure between them leaves one family open. That fails closed: the caller
+    // reports it and the clone stays unpublished.
     gate.open()
         .await
-        .context("opening the snapshot TCP NEW-flow gate while the link is down")?;
-    link.up()
-        .await
-        .context("bringing the external link up after opening the snapshot TCP NEW-flow gate")?;
-    // Only now: a route needs its device up, and the kernel has just put back
-    // the connected routes these ones depend on.
-    routes
-        .reinstate(captured)
-        .await
-        .context("reinstating the routes the link-down purged")
+        .context("opening the snapshot TCP NEW-flow gate")
 }
 
-async fn rollback_preparation<G: FirewallGate, L: ExternalLink, T: RouteTable>(
-    error: anyhow::Error,
-    gate: &G,
-    link: &L,
-    routes: &T,
-    captured: &[CapturedRoute],
-) -> anyhow::Error {
-    match reopen_with(gate, link, routes, captured).await {
+async fn rollback_preparation<G: FirewallGate>(error: anyhow::Error, gate: &G) -> anyhow::Error {
+    match reopen_with(gate).await {
         Ok(()) => error,
         Err(reopen) => {
             anyhow::anyhow!("{error:#}; additionally failed to restore source network: {reopen:#}")
@@ -1533,49 +1291,46 @@ async fn rollback_preparation<G: FirewallGate, L: ExternalLink, T: RouteTable>(
 
 async fn prepare_with<
     G: FirewallGate,
-    L: ExternalLink,
     B: PacketReceiveBarrier,
     D: SocketDiagnostic,
     S: ManifestStore,
-    T: RouteTable,
 >(
     gate: &G,
-    link: &L,
     receive_barrier: &B,
     diagnostic: &mut D,
     store: &S,
-    route_table: &T,
 ) -> Result<usize> {
-    // Read the route table while it still exists: the link-down below empties
-    // it, and every rollback and restore path from here on has to put it back.
-    let captured_routes = match route_table
-        .capture()
-        .await
-        .context("capturing the routes the snapshot boundary is about to purge")
-    {
-        Ok(routes) => routes,
-        // Nothing is torn down yet, so there is nothing to roll back.
-        Err(error) => return Err(error),
-    };
+    // THE VM BEING SNAPSHOTTED IS NOT DISTURBED. A caller asked for a copy; it
+    // must not get its live VM reconfigured to produce one.
+    //
+    // The boundary needs exactly two things: no NEW socket may appear while the
+    // cookie dump runs, and packets already in receive processing must drain
+    // first. The gate delivers the first (a directional NEW-flow REJECT) and the
+    // AF_PACKET barrier the second. Both are reversible and destroy no kernel
+    // state: the gate is one iptables rule added then removed, the barrier an
+    // open/close whose release runs synchronize_net().
+    //
+    // `link.down()` used to sit between them. It prevented sockets the gate
+    // already rejects, and purged the device's routes AND neighbours to do it.
+    // Both purges reached production as silent failures: routes in ee3f5c30
+    // ("a restored clone came up reachable at L2 and routed nowhere"), and
+    // neighbours on 2026-08-15, where the guest re-ARPed for the bridge,
+    // sometimes learned pasta's MAC, answered inbound SYNs to the wrong MAC and
+    // had them RST -- a published port dead ~1 snapshot in 10 with no drop
+    // counted anywhere. Removing the purge removes the class, which is why the
+    // route capture went with it instead of gaining a neighbour-shaped sibling.
     if let Err(error) = gate
         .close()
         .await
         .context("closing snapshot TCP NEW-flow gate")
     {
-        return Err(rollback_preparation(error, gate, link, route_table, &captured_routes).await);
-    }
-    if let Err(error) = link
-        .down()
-        .await
-        .context("bringing the external link down before snapshot")
-    {
-        return Err(rollback_preparation(error, gate, link, route_table, &captured_routes).await);
+        return Err(rollback_preparation(error, gate).await);
     }
     if let Err(error) = receive_barrier
         .synchronize()
         .context("waiting for pre-boundary packet receive processing")
     {
-        return Err(rollback_preparation(error, gate, link, route_table, &captured_routes).await);
+        return Err(rollback_preparation(error, gate).await);
     }
     let prepared = (|| -> Result<Vec<TcpSocketIdentity>> {
         let sockets = diagnostic
@@ -1592,37 +1347,32 @@ async fn prepare_with<
     })();
     let sockets = match prepared {
         Ok(sockets) => sockets,
-        Err(error) => {
-            return Err(
-                rollback_preparation(error, gate, link, route_table, &captured_routes).await,
-            )
-        }
+        Err(error) => return Err(rollback_preparation(error, gate).await),
     };
     let manifest = SnapshotNetworkManifest {
         version: MANIFEST_VERSION,
         sockets,
-        routes: captured_routes.clone(),
+        // Empty by construction: nothing purges the route table any more, so
+        // there is nothing to put back. The field stays so the manifest format
+        // does not fork; reinstating an empty list is a no-op.
+        routes: Vec::new(),
     };
     if let Err(error) = store.save(&manifest) {
-        return Err(rollback_preparation(error, gate, link, route_table, &captured_routes).await);
+        return Err(rollback_preparation(error, gate).await);
     }
     Ok(manifest.sockets.len())
 }
 
 async fn restore_with<
     G: FirewallGate,
-    L: ExternalLink,
     B: PacketReceiveBarrier,
     D: SocketDiagnostic,
     S: ManifestStore,
-    T: RouteTable,
 >(
     gate: &G,
-    link: &L,
     receive_barrier: &B,
     diagnostic: &mut D,
     store: &S,
-    route_table: &T,
     budget: std::time::Duration,
 ) -> Result<RestoreNetworkReport> {
     // The gate chains are VERIFIED rather than reinstalled; the link-down and
@@ -1670,9 +1420,11 @@ async fn restore_with<
             .await
             .context("ensuring restored snapshot TCP NEW-flow gate is closed")?;
     }
-    link.down()
-        .await
-        .context("ensuring the restored external link is down during socket cleanup")?;
+    // No link-down here either. The clone inherits a CLOSED gate inside the
+    // artifact, so no new flow can appear while the recorded cookies are
+    // destroyed, and the barrier below drains what was already in flight.
+    // Downing the link would purge this clone's routes and neighbours, and the
+    // boundary no longer captures routes to put them back.
     receive_barrier
         .synchronize()
         .context("waiting for restored packet receive processing to quiesce")?;
@@ -1713,7 +1465,7 @@ async fn restore_with<
         .context("retiring snapshot network manifest after cookie-bound cleanup")?;
     let destroy_ms = destroy_started.elapsed().as_secs_f64() * 1000.0;
     let reopen_started = std::time::Instant::now();
-    reopen_with(gate, link, route_table, &manifest.routes)
+    reopen_with(gate)
         .await
         .context("publishing restored network after cookie-bound cleanup")?;
     Ok(RestoreNetworkReport {
@@ -1729,21 +1481,17 @@ async fn restore_with<
 pub async fn prepare_snapshot_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(external_interface()?);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic;
-    let route_table = IpRoutes::new(SystemCommandRunner);
     let captured = prepare_with(
         &gate,
-        &link,
         &receive_barrier,
         &mut diagnostic,
         &FileManifestStore::default(),
-        &route_table,
     )
     .await?;
     eprintln!(
-        "[fc-agent] snapshot network boundary prepared: gate=closed link=down \
+        "[fc-agent] snapshot network boundary prepared: gate=closed link=UNTOUCHED \
          external_socket_cookies={captured}"
     );
     Ok(())
@@ -1752,56 +1500,38 @@ pub async fn prepare_snapshot_network() -> Result<()> {
 pub async fn resume_source_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(external_interface()?);
-    let route_table = IpRoutes::new(SystemCommandRunner);
     let store = FileManifestStore::default();
-    // Read the routes out before retiring the manifest that holds them: this
-    // is the source VM resuming after its own snapshot, and its link-down
-    // purged the same routes a clone's would.
-    let captured = store.load().map(|manifest| manifest.routes);
-    let routes = match captured {
-        Ok(routes) => routes,
-        // The source can be resumed without a manifest (a preparation that
-        // failed before saving one). Publishing the link still has to happen;
-        // there is simply nothing recorded to reinstate.
-        Err(error) => {
-            eprintln!(
-                "[fc-agent] no snapshot network manifest to read routes from, \
-                 reopening without reinstating any: {error:#}"
-            );
-            Vec::new()
-        }
-    };
+    // No routes to read back: the boundary never takes the link down, so it
+    // purges nothing. The manifest is retired purely to clear the armed marker.
     store
         .remove()
         .context("retiring source snapshot network manifest before publication")?;
-    reopen_with(&gate, &link, &route_table, &routes)
+    reopen_with(&gate)
         .await
         .context("reopening source VM network")?;
-    eprintln!("[fc-agent] source VM snapshot network reopened: link=up gate=open");
+    eprintln!(
+        "[fc-agent] source VM snapshot network reopened: gate=open \
+         (link never taken down)"
+    );
     Ok(())
 }
 
 pub async fn restore_snapshot_network() -> Result<RestoreNetworkReport> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let link = IpLink::new(external_interface()?);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic;
-    let route_table = IpRoutes::new(SystemCommandRunner);
     let report = restore_with(
         &gate,
-        &link,
         &receive_barrier,
         &mut diagnostic,
         &FileManifestStore::default(),
-        &route_table,
         CLEANUP_BUDGET,
     )
     .await?;
     eprintln!(
         "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
-         verified_armed={} link=up gate=open",
+         verified_armed={} link=UNTOUCHED gate=open",
         report.tally.destroyed, report.tally.already_gone, report.verified_armed
     );
     Ok(report)
@@ -1921,61 +1651,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct ModelLink(Arc<Mutex<ModelState>>);
-
-    impl ExternalLink for ModelLink {
-        async fn down(&self) -> Result<()> {
-            let mut state = self.0.lock().unwrap();
-            state.link_down = true;
-            // Measured on a bridged guest: the whole table goes with the link.
-            state.live_routes.clear();
-            state.events.push("link-down");
-            Ok(())
-        }
-
-        async fn up(&self) -> Result<()> {
-            let mut state = self.0.lock().unwrap();
-            assert!(
-                !state.gate_closed,
-                "link publication raced ahead of complete gate removal"
-            );
-            state.link_down = false;
-            state.events.push("link-up");
-            Ok(())
-        }
-    }
-
-    #[derive(Clone)]
-    struct ModelRoutes(Arc<Mutex<ModelState>>);
-
-    impl RouteTable for ModelRoutes {
-        async fn capture(&self) -> Result<Vec<CapturedRoute>> {
-            let mut state = self.0.lock().unwrap();
-            assert!(
-                !state.link_down,
-                "routes were captured after the link went down, when the table is already empty"
-            );
-            state.events.push("routes-capture");
-            Ok(state.live_routes.clone())
-        }
-
-        async fn reinstate(&self, routes: &[CapturedRoute]) -> Result<()> {
-            let mut state = self.0.lock().unwrap();
-            assert!(
-                !state.link_down,
-                "routes were reinstated while the link was still down, where they cannot bind"
-            );
-            state.events.push("routes-reinstate");
-            for route in routes {
-                if !state.live_routes.contains(route) {
-                    state.live_routes.push(route.clone());
-                }
-            }
-            Ok(())
-        }
-    }
-
     fn model_routes() -> Vec<CapturedRoute> {
         vec![
             CapturedRoute {
@@ -1998,9 +1673,15 @@ mod tests {
                 state.gate_closed,
                 "receive barrier ran before the NEW-flow gate"
             );
+            // The link is deliberately never touched: the gate already rejects
+            // NEW flows, and downing the link additionally purged the device's
+            // routes and neighbours. Both purges reached production as silent
+            // failures (ee3f5c30; the 2026-08-15 published-port flake). A
+            // boundary that starts downing links again fails here.
             assert!(
-                state.link_down,
-                "receive barrier ran before the link was down"
+                !state.link_down,
+                "the snapshot boundary took the link down: it must not disturb \
+                 the VM being snapshotted"
             );
             state.events.push("rx-barrier");
             if state.fail_barrier {
@@ -2019,7 +1700,15 @@ mod tests {
                 state.gate_closed,
                 "cookie dump raced ahead of the NEW-flow gate"
             );
-            assert!(state.link_down, "cookie dump raced ahead of link-down");
+            assert!(
+                state.events.contains(&"rx-barrier"),
+                "cookie dump raced ahead of the receive barrier"
+            );
+            assert!(
+                !state.link_down,
+                "the snapshot boundary took the link down: it must not disturb \
+                 the VM being snapshotted"
+            );
             state.events.push("cookie-dump");
             if state.fail_dump {
                 bail!("injected socket dump failure");
@@ -2033,9 +1722,12 @@ mod tests {
                 state.gate_closed,
                 "restore opened the gate before destroying sockets"
             );
+            // The closed gate is what protects the cleanup; the link stays up
+            // throughout so the clone's routes and neighbours survive.
             assert!(
-                state.link_down,
-                "restore brought the link up before destroying sockets"
+                !state.link_down,
+                "restore took the link down: the boundary must not purge the \
+                 clone's routes and neighbours"
             );
             state.events.push("cookie-destroy");
             if state.fail_destroy {
@@ -2360,65 +2052,6 @@ COMMIT\\n\"",
         assert_eq!(calls.lock().unwrap().as_slice(), ["iptables -w -S"]);
     }
 
-    /// Build a `/sys/class/net` where the `backed` interfaces carry the
-    /// `device` symlink a bus-attached netdev has and the others do not.
-    fn fake_sysfs_net(interfaces: &[(&str, bool)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let devices = dir.path().join("devices");
-        std::fs::create_dir_all(&devices).unwrap();
-        for (name, backed) in interfaces {
-            let interface = dir.path().join(name);
-            std::fs::create_dir_all(&interface).unwrap();
-            if *backed {
-                let device = devices.join(name);
-                std::fs::create_dir_all(&device).unwrap();
-                std::os::unix::fs::symlink(&device, interface.join("device")).unwrap();
-            }
-        }
-        dir
-    }
-
-    #[test]
-    fn external_interface_is_the_device_backed_netdev_under_either_hypervisor() {
-        // Measured in live guests: Cloud Hypervisor's PCI virtio-net is renamed
-        // to enp0s4, Firecracker's MMIO virtio-net keeps eth0, and on both only
-        // `lo` lacks the device symlink.
-        let cloud_hypervisor = fake_sysfs_net(&[("enp0s4", true), ("lo", false)]);
-        assert_eq!(
-            external_interface_in(cloud_hypervisor.path()).unwrap(),
-            "enp0s4"
-        );
-
-        let firecracker = fake_sysfs_net(&[("eth0", true), ("lo", false)]);
-        assert_eq!(external_interface_in(firecracker.path()).unwrap(), "eth0");
-    }
-
-    #[test]
-    fn an_ambiguous_interface_set_fails_instead_of_guessing() {
-        let loopback_only = fake_sysfs_net(&[("lo", false)]);
-        let err = external_interface_in(loopback_only.path())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("found []"), "{err}");
-
-        let two = fake_sysfs_net(&[("enp0s4", true), ("eth0", true), ("lo", false)]);
-        let err = external_interface_in(two.path()).unwrap_err().to_string();
-        assert!(err.contains("enp0s4") && err.contains("eth0"), "{err}");
-    }
-
-    #[test]
-    fn an_overlong_interface_name_is_refused_rather_than_truncated() {
-        // ifreq's name field is fixed-size; a silently truncated name would
-        // drive the WRONG interface's flags.
-        let too_long = "x".repeat(64);
-        let error = set_interface_up(&too_long, false)
-            .expect_err("an interface name that cannot fit must be refused");
-        assert!(
-            format!("{error:#}").contains("does not fit"),
-            "unexpected diagnostic: {error:#}"
-        );
-    }
-
     #[tokio::test]
     async fn snapshot_boundary_closes_new_flows_before_cookie_dump() {
         let state = Arc::new(Mutex::new(ModelState {
@@ -2426,97 +2059,67 @@ COMMIT\\n\"",
             ..Default::default()
         }));
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
         let store = MemoryStore::default();
 
         assert_eq!(
-            prepare_with(&gate, &link, &barrier, &mut diag, &store, &route_table)
+            prepare_with(&gate, &barrier, &mut diag, &store)
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(
             state.lock().unwrap().events,
-            vec![
-                "routes-capture",
-                "gate-close",
-                "link-down",
-                "rx-barrier",
-                "cookie-dump"
-            ]
+            vec!["gate-close", "rx-barrier", "cookie-dump"]
         );
         let state_guard = state.lock().unwrap();
         assert!(state_guard.gate_closed);
-        assert!(state_guard.link_down);
+        assert!(!state_guard.link_down, "the source's link was taken down");
         drop(state_guard);
         assert_eq!(store.load().unwrap().sockets[0].id.cookie, [11, 0]);
     }
 
     /// The boundary must hand back the route table it took away.
     ///
-    /// Taking the link down purges every route; bringing it up restores only the
-    /// kernel's own. Measured on a bridged guest (Graviton3, 6.18.44), a
-    /// prepare/resume cycle left `default via 172.30.95.37` and the MMDS route
-    /// `169.254.169.254` permanently gone — the guest's only path off-box and
-    /// the address fc-agent reads its restore epoch from. Before the fix, this
-    /// observed an empty table after the cycle.
+    /// The boundary must not purge the route table at all.
+    ///
+    /// This test used to prove the opposite: that the link-down emptied the
+    /// table and the boundary put it back. That repair was the design, and it
+    /// was incomplete twice - routes were reinstated (ee3f5c30) but neighbours
+    /// were not, and the missing neighbour entry made published ports die about
+    /// 1 snapshot in 10. The link-down is gone, so nothing is purged and there
+    /// is nothing to reinstate. This is what keeps it that way.
     #[tokio::test]
-    async fn the_boundary_reinstates_the_routes_its_link_down_purged() {
+    async fn the_boundary_never_purges_the_route_table() {
         let state = Arc::new(Mutex::new(ModelState::default()));
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
         let store = MemoryStore::default();
 
-        prepare_with(&gate, &link, &barrier, &mut diag, &store, &route_table)
+        prepare_with(&gate, &barrier, &mut diag, &store)
             .await
             .expect("preparation");
-        assert!(
-            state.lock().unwrap().live_routes.is_empty(),
-            "the model must reproduce the kernel's purge, or this test cannot fail"
-        );
-        assert_eq!(
-            store.load().unwrap().routes,
-            model_routes(),
-            "the manifest must carry the routes across the snapshot"
-        );
-
-        restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .expect("restore");
         assert_eq!(
             state.lock().unwrap().live_routes,
             model_routes(),
-            "a restored clone was published without the routes it needs to reach anything"
+            "preparing the boundary purged the source's routes"
         );
 
-        let events = state.lock().unwrap().events.clone();
-        let reinstate = events
-            .iter()
-            .rposition(|event| *event == "routes-reinstate")
-            .expect("routes were never reinstated");
-        let link_up = events
-            .iter()
-            .rposition(|event| *event == "link-up")
-            .expect("the link was never published");
+        restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .expect("restore");
+        assert_eq!(
+            state.lock().unwrap().live_routes,
+            model_routes(),
+            "restoring purged the clone's routes"
+        );
         assert!(
-            link_up < reinstate,
-            "routes were reinstated before the link came up, where they cannot bind: {events:?}"
+            store.load().is_err(),
+            "the manifest must be retired after cleanup"
         );
     }
 
@@ -2531,15 +2134,13 @@ COMMIT\\n\"",
             ..Default::default()
         }));
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state);
         let store = MemoryStore::default();
 
         assert_eq!(
-            prepare_with(&gate, &link, &barrier, &mut diag, &store, &route_table)
+            prepare_with(&gate, &barrier, &mut diag, &store)
                 .await
                 .unwrap(),
             1
@@ -2554,29 +2155,18 @@ COMMIT\\n\"",
             ..Default::default()
         }));
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
         let store = MemoryStore::default();
 
-        prepare_with(&gate, &link, &barrier, &mut diag, &store, &route_table)
+        prepare_with(&gate, &barrier, &mut diag, &store)
             .await
             .expect_err("snapshot preparation must fail when cookie capture fails");
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec![
-                "routes-capture",
-                "gate-close",
-                "link-down",
-                "rx-barrier",
-                "cookie-dump",
-                "gate-open",
-                "link-up",
-                "routes-reinstate"
-            ]
+            vec!["gate-close", "rx-barrier", "cookie-dump", "gate-open",]
         );
         assert!(
             !state.gate_closed,
@@ -2592,29 +2182,16 @@ COMMIT\\n\"",
             ..Default::default()
         }));
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
         let store = MemoryStore::default();
 
-        prepare_with(&gate, &link, &barrier, &mut diag, &store, &route_table)
+        prepare_with(&gate, &barrier, &mut diag, &store)
             .await
             .expect_err("snapshot preparation must fail without a receive grace period");
         let state = state.lock().unwrap();
-        assert_eq!(
-            state.events,
-            vec![
-                "routes-capture",
-                "gate-close",
-                "link-down",
-                "rx-barrier",
-                "gate-open",
-                "link-up",
-                "routes-reinstate"
-            ]
-        );
+        assert_eq!(state.events, vec!["gate-close", "rx-barrier", "gate-open",]);
         assert!(!state.gate_closed);
         assert!(!state.link_down);
         assert!(
@@ -2630,27 +2207,16 @@ COMMIT\\n\"",
             ..Default::default()
         }));
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
         let store = MemoryStore::default();
 
-        prepare_with(&gate, &link, &barrier, &mut diag, &store, &route_table)
+        prepare_with(&gate, &barrier, &mut diag, &store)
             .await
             .expect_err("partial gate installation must abort snapshot preparation");
         let state = state.lock().unwrap();
-        assert_eq!(
-            state.events,
-            vec![
-                "routes-capture",
-                "gate-close",
-                "gate-open",
-                "link-up",
-                "routes-reinstate"
-            ]
-        );
+        assert_eq!(state.events, vec!["gate-close", "gate-open",]);
         assert!(!state.gate_closed);
         assert!(!state.link_down);
     }
@@ -2661,7 +2227,6 @@ COMMIT\\n\"",
         let replacement = socket(22, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
-            link_down: true,
             live: vec![replacement],
             ..Default::default()
         }));
@@ -2674,9 +2239,7 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
@@ -2685,17 +2248,9 @@ COMMIT\\n\"",
         // replacement. A cookie-bound destroy must therefore report
         // already_gone and leave the replacement alone; a tuple-based one would
         // report a destroy and take the wrong socket with it.
-        let report = restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .unwrap();
+        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .unwrap();
         assert_eq!(
             report.tally,
             CleanupTally {
@@ -2708,15 +2263,7 @@ COMMIT\\n\"",
         assert_eq!(state.live, vec![replacement]);
         assert_eq!(
             state.events,
-            vec![
-                "gate-verify",
-                "link-down",
-                "rx-barrier",
-                "cookie-destroy",
-                "gate-open",
-                "link-up",
-                "routes-reinstate"
-            ]
+            vec!["gate-verify", "rx-barrier", "cookie-destroy", "gate-open",]
         );
         assert!(!state.gate_closed);
         assert!(!state.link_down);
@@ -2732,7 +2279,6 @@ COMMIT\\n\"",
         let stale = socket(28, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
-            link_down: true,
             live: vec![stale],
             fail_gate_verify: true,
             ..Default::default()
@@ -2746,22 +2292,12 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .expect("an unverifiable boundary must repair, not fail the restore");
+        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .expect("an unverifiable boundary must repair, not fail the restore");
         assert!(!report.verified_armed);
         let state = state.lock().unwrap();
         assert_eq!(
@@ -2769,12 +2305,9 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "gate-close",
-                "link-down",
                 "rx-barrier",
                 "cookie-destroy",
                 "gate-open",
-                "link-up",
-                "routes-reinstate"
             ]
         );
     }
@@ -2783,7 +2316,7 @@ COMMIT\\n\"",
     /// packets can arrive on it: the boundary must down it and take a fresh
     /// grace period before retiring any socket, whatever the gate says.
     #[tokio::test]
-    async fn a_raised_link_is_downed_and_re_barriered_before_cleanup() {
+    async fn restore_re_barriers_before_cleanup_without_touching_the_link() {
         let stale = socket(29, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
@@ -2800,52 +2333,42 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .unwrap();
+        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .unwrap();
         assert!(report.verified_armed, "the gate itself was intact");
         let events = state.lock().unwrap().events.clone();
         let barrier = events
             .iter()
             .position(|e| *e == "rx-barrier")
             .expect("barrier");
-        let down = events
-            .iter()
-            .position(|e| *e == "link-down")
-            .expect("link-down");
+        assert!(
+            !events.contains(&"link-down"),
+            "restore took the link down: the boundary must not purge the clone's \
+             routes and neighbours"
+        );
         let destroy = events
             .iter()
             .position(|e| *e == "cookie-destroy")
             .expect("cleanup");
         assert!(
-            down < barrier && barrier < destroy,
-            "a raised link must be downed and re-barriered BEFORE cleanup: {events:?}"
+            barrier < destroy,
+            "the receive barrier must run BEFORE cleanup: {events:?}"
         );
     }
 
     /// The gate chains frozen into a current snapshot are verified, not
-    /// reinstalled. The link-down and the receive barrier are asserted
-    /// regardless, because a privileged workload sharing this namespace can
-    /// raise the link between any observation and the cleanup.
+    /// reinstalled. The receive barrier still runs regardless, because a
+    /// privileged workload sharing this namespace can put packets in flight
+    /// between any observation and the cleanup.
     #[tokio::test]
     async fn restore_verifies_the_armed_boundary_instead_of_reasserting_it() {
         let stale = socket(26, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
-            link_down: true,
             live: vec![stale],
             ..Default::default()
         }));
@@ -2858,22 +2381,12 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .unwrap();
+        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .unwrap();
         assert!(report.verified_armed);
         let state = state.lock().unwrap();
         assert!(
@@ -2883,15 +2396,7 @@ COMMIT\\n\"",
         );
         assert_eq!(
             state.events,
-            vec![
-                "gate-verify",
-                "link-down",
-                "rx-barrier",
-                "cookie-destroy",
-                "gate-open",
-                "link-up",
-                "routes-reinstate"
-            ],
+            vec!["gate-verify", "rx-barrier", "cookie-destroy", "gate-open",],
             "the link and the barrier must be re-asserted even on the fast path"
         );
     }
@@ -2915,22 +2420,12 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .unwrap();
+        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .unwrap();
         assert!(!report.verified_armed);
         let state = state.lock().unwrap();
         assert_eq!(
@@ -2938,12 +2433,9 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "gate-close",
-                "link-down",
                 "rx-barrier",
                 "cookie-destroy",
                 "gate-open",
-                "link-up",
-                "routes-reinstate"
             ]
         );
         assert!(!state.gate_closed);
@@ -2955,7 +2447,6 @@ COMMIT\\n\"",
         let stale = socket(23, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
-            link_down: true,
             live: vec![stale],
             fail_destroy: true,
             ..Default::default()
@@ -2969,30 +2460,23 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
-        restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .expect_err("a failed exact destroy must fail restore closed");
+        restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .expect_err("a failed exact destroy must fail restore closed");
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-verify", "link-down", "rx-barrier", "cookie-destroy"]
+            vec!["gate-verify", "rx-barrier", "cookie-destroy"]
         );
         assert!(state.gate_closed, "failed restore published ingress");
-        assert!(state.link_down, "failed restore raised the external link");
+        assert!(
+            !state.link_down,
+            "a failed restore must not have downed the link"
+        );
         assert!(
             store.load().is_ok(),
             "failed restore removed its identity manifest"
@@ -3004,7 +2488,6 @@ COMMIT\\n\"",
         let stale = socket(24, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
-            link_down: true,
             live: vec![stale],
             ..Default::default()
         }));
@@ -3017,23 +2500,13 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
-        let error = restore_with(
-            &gate,
-            &link,
-            &barrier,
-            &mut diag,
-            &store,
-            &route_table,
-            CLEANUP_BUDGET,
-        )
-        .await
-        .expect_err("manifest retirement failure must prevent clone publication");
+        let error = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
+            .await
+            .expect_err("manifest retirement failure must prevent clone publication");
         assert!(
             format!("{error:#}").contains("retiring snapshot network manifest"),
             "unexpected diagnostic: {error:#}"
@@ -3041,10 +2514,10 @@ COMMIT\\n\"",
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-verify", "link-down", "rx-barrier", "cookie-destroy"]
+            vec!["gate-verify", "rx-barrier", "cookie-destroy"]
         );
         assert!(state.gate_closed);
-        assert!(state.link_down);
+        assert!(!state.link_down, "the boundary took the link down");
     }
 
     #[tokio::test]
@@ -3052,7 +2525,6 @@ COMMIT\\n\"",
         let stale = socket(25, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
-            link_down: true,
             live: vec![stale],
             ..Default::default()
         }));
@@ -3065,9 +2537,7 @@ COMMIT\\n\"",
             })
             .unwrap();
         let gate = ModelGate(state.clone());
-        let link = ModelLink(state.clone());
         let barrier = ModelBarrier(state.clone());
-        let route_table = ModelRoutes(state.clone());
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
@@ -3077,11 +2547,9 @@ COMMIT\\n\"",
         // never publish, and never retire the manifest.
         let error = restore_with(
             &gate,
-            &link,
             &barrier,
             &mut diag,
             &store,
-            &route_table,
             std::time::Duration::ZERO,
         )
         .await
@@ -3092,11 +2560,12 @@ COMMIT\\n\"",
         );
 
         let state = state.lock().unwrap();
-        assert_eq!(state.events, vec!["gate-verify", "link-down", "rx-barrier"]);
+        assert_eq!(state.events, vec!["gate-verify", "rx-barrier"]);
         assert!(state.gate_closed, "a timed-out cleanup published ingress");
         assert!(
-            state.link_down,
-            "a timed-out cleanup raised the external link"
+            !state.link_down,
+            "a timed-out cleanup took the link down: even the failure path must \
+             not purge the clone's routes and neighbours"
         );
         assert!(
             store.load().is_ok(),

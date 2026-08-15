@@ -4167,3 +4167,96 @@ async fn a_panicking_clone_handler_returns_its_slot() -> Result<()> {
     );
     Ok(())
 }
+
+/// Snapshotting must leave the SOURCE VM's network exactly as it found it.
+///
+/// A caller asked for a copy. It must not get its live VM reconfigured to
+/// produce one, and this is the guard that says so.
+///
+/// The boundary that makes a snapshot cloneable needs two things: no NEW socket
+/// may appear while the cookie dump runs, and packets already in receive
+/// processing must drain first. The NEW-flow gate delivers the first and the
+/// AF_PACKET barrier the second; both are reversible and destroy nothing.
+///
+/// A `link.down()` used to sit between them, preventing sockets the gate already
+/// rejected and purging the device's routes and neighbours to do it. Everything
+/// it purged then had to be reinstated by hand, and twice that list was
+/// incomplete:
+///
+///   2026-08-10 ee3f5c30  the ROUTE table     -> "a restored clone came up
+///                                               reachable at L2 and routed nowhere"
+///   2026-08-15           the NEIGHBOUR table -> the guest re-ARPed for the bridge,
+///                                               sometimes learned pasta's MAC,
+///                                               answered inbound SYNs to the wrong
+///                                               MAC and had them RST. A published
+///                                               port died ~1 snapshot in 10 with no
+///                                               drop counted anywhere.
+///
+/// The link-down is gone, so the purge is gone, so the repair lists are gone.
+/// This test is what keeps them gone: it compares the guest's routes, neighbours
+/// and addresses across one snapshot and fails on any difference.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn snapshot_leaves_the_source_network_untouched() -> anyhow::Result<()> {
+    let (vm_name, _, snap_tag, _) = common::unique_names("snapsrc");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await?;
+    common::poll_health(&mut child, 300).await?;
+
+    // `ip neigh` is deliberately included: it is the table that regressed, and
+    // the one a "reinstate the routes" fix does not cover.
+    let sample = |label: &'static str| async move {
+        common::exec_in_vm(
+            pid,
+            &["sh -c 'PATH=/usr/sbin:/sbin:/usr/bin:/bin; \
+               echo ROUTES; ip route show | sort; \
+               echo NEIGH; ip neigh show | awk \"{print \\$1, \\$3, \\$5}\" | sort; \
+               echo ADDR; ip -br addr show | sort'"],
+        )
+        .await
+        .map(|out| (label, out))
+    };
+
+    let (_, before) = sample("before").await?;
+    common::create_snapshot_by_pid(pid, &snap_tag).await?;
+    // The source resumed; give its reopen path a moment to finish publishing.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let (_, after) = sample("after").await?;
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+
+    if before.trim() != after.trim() {
+        let diff: Vec<String> = before
+            .lines()
+            .zip(after.lines())
+            .filter(|(b, a)| b != a)
+            .map(|(b, a)| format!("  before: {b}\n  after:  {a}"))
+            .collect();
+        anyhow::bail!(
+            "snapshotting mutated the source VM's network and did not put it back.\n\
+             The snapshot boundary takes eth0 down, which purges routes AND \
+             neighbours; whatever is missing here was purged and never reinstated \
+             (see reopen_with in fc-agent/src/snapshot_network.rs).\n\
+             differing lines:\n{}\n\n--- before ---\n{}\n--- after ---\n{}",
+            diff.join("\n"),
+            before.trim(),
+            after.trim()
+        );
+    }
+    Ok(())
+}
