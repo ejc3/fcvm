@@ -284,6 +284,18 @@ pub async fn handle_clone_restore(
     // host's health checks depend on. Flushing after the pin would delete it.
     network::flush_stale_neighbours();
     network::pin_namespace_neighbour();
+    // ANNOUNCE, as early as possible. The host cannot forward a packet to this
+    // clone until its namespace has learned the guest's MAC, and it only learns
+    // that when the guest transmits. The old boundary got this for free: taking
+    // the link down and up made the guest announce itself the moment it came
+    // back. With the link never cycled -- deliberately, because cycling it
+    // purged routes and neighbours -- nothing was announcing until this probe
+    // ran at the END of the restore sequence, and fcvm's post-restore port
+    // verification could time out first ("guest 10.0.2.100 never appeared at L2"
+    // while the namespace's own table showed it REACHABLE moments later).
+    //
+    // One broadcast ARP costs nothing and teaches the whole segment.
+    network::refresh_gateway_arp();
 
     let tcp_cleanup_started = std::time::Instant::now();
     eprintln!(
@@ -309,7 +321,8 @@ pub async fn handle_clone_restore(
     // boundary. One broadcast ARP request refreshes the gateway and teaches the
     // new bridge/pasta path without deleting unrelated/current neighbors.
     let neighbor_started = std::time::Instant::now();
-    network::refresh_gateway_arp();
+    // Already announced above, before the boundary work, so the host learns
+    // this clone's MAC as early as possible rather than at the end.
     phases.neighbor_ms = elapsed_ms(neighbor_started);
 
     // Remount NFS shares: their kernel TCP connections to the host's NFS
@@ -652,5 +665,62 @@ mod tests {
             .wait_for_output_readiness()
             .await
             .expect("late subscriber must observe retained Succeeded");
+    }
+
+    /// A restored clone must ANNOUNCE itself before the boundary publishes.
+    ///
+    /// The host cannot forward a packet to a clone until its namespace has
+    /// learned the guest's MAC, and a namespace learns that only when the guest
+    /// transmits. The old snapshot boundary got this for free: it cycled the
+    /// link, and coming back up made the guest announce itself immediately.
+    /// That cycle was removed because it also purged the device's routes and
+    /// neighbours -- the defect this whole change exists to fix.
+    ///
+    /// With nothing announcing, the only transmission was the gateway ARP probe
+    /// at the END of the restore sequence, and fcvm's post-restore port
+    /// verification could time out first. CI caught it as
+    ///
+    ///   Error: port forwarding verification failed after snapshot restore:
+    ///          guest 10.0.2.100 never appeared at L2 within ...
+    ///
+    /// while the namespace's own table showed `10.0.2.100 ... REACHABLE` in the
+    /// forensics dumped moments later. The guest was not missing; it was late.
+    ///
+    /// The chaos fuzz found that, but only by landing inside the window. This
+    /// pins the ordering that makes the window impossible, so a regression
+    /// fails here every time rather than one run in N.
+    #[test]
+    fn the_clone_announces_itself_before_the_boundary_publishes() {
+        let source = include_str!("restore.rs");
+        let announce = source
+            .find("network::refresh_gateway_arp()")
+            .expect("the restore path no longer announces the clone at all");
+        let publish = source
+            .find("crate::snapshot_network::restore_snapshot_network()")
+            .expect("the restore path no longer runs the snapshot boundary");
+        assert!(
+            announce < publish,
+            "the clone announces itself AFTER the boundary publishes. The host \
+             learns a clone's MAC only when the guest transmits, so publishing \
+             first opens a window where fcvm's post-restore verification can \
+             time out with \"guest never appeared at L2\" on a guest that is \
+             perfectly healthy. Move network::refresh_gateway_arp() above \
+             restore_snapshot_network()."
+        );
+
+        // Flushing inherited entries after pinning would delete the pin, and
+        // announcing before flushing would teach the segment and then discard
+        // what we learned in return.
+        let flush = source
+            .find("network::flush_stale_neighbours()")
+            .expect("the restore path no longer flushes inherited neighbours");
+        let pin = source
+            .find("network::pin_namespace_neighbour()")
+            .expect("the restore path no longer pins the health-check neighbour");
+        assert!(
+            flush < pin && pin < announce,
+            "restore must flush inherited neighbours, then pin the health-check \
+             entry, then announce. Got flush={flush} pin={pin} announce={announce}"
+        );
     }
 }

@@ -213,6 +213,43 @@ The gate has its own tests, each written against the unfixed script and observed
 live oversized-thread path that fixtures cannot reach. CI state cannot tell you whether a
 finding was answered.
 
+### A FUZZ CATCH IS A LEAD, NOT A REGRESSION TEST
+
+**When the chaos fuzz (or any stochastic harness) finds a defect, the fix is not
+done until a DETERMINISTIC test fails on it.** The fuzz found the bug by landing
+inside a timing window. It will pass ten, twenty, fifty times before it lands
+there again, so leaving it as the guard means the next regression ships and is
+discovered by a flake weeks later.
+
+The fuzz's job is DISCOVERY. Something else has to hold the line.
+
+Convert every catch into a test that fails **every run**:
+
+| the catch | what pins it |
+|---|---|
+| an ordering window (A must happen before B) | a source-level ordering assertion, or an event-log model like `ModelBarrier`/`ModelDiag` in `fc-agent/src/snapshot_network.rs` |
+| a state invariant (X must survive Y) | compare X directly across Y, as `snapshot_leaves_the_source_network_untouched` does |
+| a race that needs a precise interleaving | a named failpoint case in `test_lifecycle_interleave.rs` (crate `failpoint/`) |
+| a constant that two files must agree on | read the other file and assert, as `namespace_neighbour_matches_host_constants` does |
+
+Observed 2026-08-15, twice in one change:
+
+- CI's fuzz failed with `guest 10.0.2.100 never appeared at L2`, while the
+  forensics dumped moments later showed that guest `REACHABLE`. The guest was
+  not missing, it was LATE: removing the snapshot boundary's link cycle also
+  removed the thing that made a restored clone announce itself, so the host's
+  namespace had not learned its MAC before verification gave up. The fuzz hit
+  that window; `the_clone_announces_itself_before_the_boundary_publishes` now
+  fails on the ordering itself, every time.
+- The same run's seed had passed **20 consecutive local hunts** on a different
+  seed. A stochastic pass count is not evidence about a code path; it is
+  evidence about the schedule that seed happens to generate.
+
+**Corollary: do not certify a fix with the fuzz configuration you were already
+hunting with.** Run the configuration CI runs (`SEEDS=1 OPS=10` is the default),
+and run it enough times to say something. A green hunt on the seed you have been
+staring at proves the least interesting thing available.
+
 ### A GATE MUST FAIL CLOSED — check your dependencies before you trust your verdict
 
 A check that cannot run must **block**, never pass. Passing is a claim, and a tool that could
