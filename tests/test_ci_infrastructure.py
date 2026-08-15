@@ -222,6 +222,40 @@ class CiInfrastructureClassificationTests(unittest.TestCase):
             ["api", "--include", "repos/owner/repo/actions/jobs/20/logs"]
         )
 
+    def test_log_fetch_records_the_blob_write_time(self) -> None:
+        """The stale-gap witness is useless if nothing populates its input.
+
+        `--include` already returns headers, so this costs no extra request.
+        A header-shaped line in the log BODY must not be mistaken for one.
+        """
+        available = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "HTTP/2.0 200\n"
+                "Last-Modified: Fri, 14 Aug 2026 18:32:20 GMT\n"
+                "\n"
+                "2026-08-14T18:32:20Z Last-Modified: not a header, this is output\n"
+            ),
+            stderr="",
+        )
+
+        with mock.patch.object(CLASSIFIER, "_run_gh", return_value=available):
+            evidence = CLASSIFIER._fetch_log("owner/repo", 21)
+
+        self.assertEqual(evidence["status"], "available")
+        self.assertEqual(evidence["last_modified"], "Fri, 14 Aug 2026 18:32:20 GMT")
+
+    def test_log_fetch_omits_blob_write_time_when_absent(self) -> None:
+        available = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="HTTP/2.0 200\n\nlog body\n", stderr=""
+        )
+
+        with mock.patch.object(CLASSIFIER, "_run_gh", return_value=available):
+            evidence = CLASSIFIER._fetch_log("owner/repo", 22)
+
+        self.assertNotIn("last_modified", evidence)
+
     def test_explicit_runner_shutdown_is_rerun_once(self) -> None:
         result = classify_fixture("explicit-runner-shutdown.json")
 
@@ -238,6 +272,36 @@ class CiInfrastructureClassificationTests(unittest.TestCase):
         self.assertEqual(result["classification"], "infrastructure")
         self.assertTrue(result["rerun_failed_jobs"])
         self.assertEqual(result["jobs"][0]["kind"], "infrastructure_silent")
+
+    def test_silent_null_step_with_stale_log_blob_is_infrastructure(self) -> None:
+        """A runner that dies leaves a log blob that EXISTS but stopped growing.
+
+        The missing-blob branch only fires when the blob 404s, so the variant
+        where GitHub kept a truncated blob classified `unknown` and the run
+        read as a code failure. Measured on the live API, the two populations
+        do not overlap: runner-concluded jobs write their blob within 0-2s of
+        `completed_at` (n=66), while jobs whose agent died show 569-1149s
+        (n=6). Verified independently here: run 31823415675's dead job shows
+        597s while every other job in it shows 0-1s, and run 31906708922, a
+        genuine test failure, shows at most 1s across all 15 jobs.
+        """
+        result = classify_fixture("truncated-log-runner-loss.json")
+
+        self.assertEqual(result["classification"], "infrastructure")
+        self.assertTrue(result["rerun_failed_jobs"])
+        self.assertEqual(result["jobs"][0]["kind"], "infrastructure_silent")
+
+    def test_silent_null_step_with_fresh_log_blob_is_not_infrastructure(self) -> None:
+        """The gap is the witness, not the null-step shape on its own.
+
+        Without this the fix could classify any interrupted job as
+        infrastructure and rerun genuine failures forever.
+        """
+        result = classify_fixture("truncated-log-fresh-blob.json")
+
+        self.assertEqual(result["classification"], "not_infrastructure")
+        self.assertFalse(result["rerun_failed_jobs"])
+        self.assertEqual(result["jobs"][0]["kind"], "unknown")
 
     def test_genuine_failure_is_not_infrastructure(self) -> None:
         result = classify_fixture("genuine-failure.json")

@@ -962,6 +962,32 @@ jobs:
       #
       # `skipped` is deliberately not a failure: skip-check legitimately skips the
       # matrix when this tree SHA already passed on a PR branch.
+      # Runs BEFORE the gate below, which exits 1 and would skip anything after
+      # it. A dead runner agent produces a job failure indistinguishable from a
+      # test failure, so without this the operator re-reads a passing test suite
+      # hunting a bug that was never there. The classifier is narrow and
+      # fail-closed; this step is a diagnostic and must never turn a green run
+      # red, so every failure inside it degrades to silence.
+      - name: Diagnose runner loss
+        if: contains(needs.*.result, 'failure')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          VERDICT=$(python3 fcvm/scripts/classify_ci_failure.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" 2>/dev/null)
+          [ -n "$VERDICT" ] || exit 0
+          [ "$(printf '%s' "$VERDICT" | jq -r '.classification' 2>/dev/null)" = infrastructure ] || exit 0
+          printf '%s' "$VERDICT" | jq -r '
+            .jobs[]
+            | select(.kind | startswith("infrastructure"))
+            | "::error::\(.name): the runner agent died mid-job (\(.reason)). This is NOT a test failure."
+          ' 2>/dev/null
+          exit 0
+
       - name: Fail if any gating job did not succeed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         env:
