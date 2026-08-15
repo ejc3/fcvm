@@ -911,7 +911,14 @@ def wait_port(
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(delay, remaining))
-            delay = min(delay * 1.5, 0.02)
+            # Cap at 2 ms, not 20: with a 20 ms cap the attempts past the
+            # ramp land ~17-20 ms apart, so restore-readiness figures snapped
+            # to the probe grid — a small real effect near an attempt boundary
+            # read as a clean bimodal restore floor until the fine-grid gated
+            # run (reqbench-20260814-035757) showed readiness is unimodal.
+            # ~20 extra connect attempts per 40 ms wait is noise; measurement
+            # resolution is not.
+            delay = min(delay * 1.5, 0.002)
 
 
 def sha256_file(path: str) -> str:
@@ -2735,12 +2742,15 @@ def spawn_clone_process(cmd: list[str], log: str, env: dict) -> subprocess.Popen
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def run_cdp_request(args, rep: int, fast: bool, probe=None) -> dict:
+def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
-    name = f"rb-{args.run_id}-{rep}-{'fast' if fast else 'norm'}"
+    arm_name = "html" if op == "html" else ("cdp-fast" if fast else "cdp")
+    # The clone name carries the arm: cdp and html arms share rep indices, and a
+    # shared name would collide two live clones.
+    name = f"rb-{args.run_id}-{rep}-{'html' if op == 'html' else ('fast' if fast else 'norm')}"
     log = os.path.join(args.out_dir, f"{name}.log")
-    rec: dict = {"arm": "cdp-fast" if fast else "cdp", "rep": rep, "name": name}
+    rec: dict = {"arm": arm_name, "rep": rep, "name": name}
 
     cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
@@ -2790,7 +2800,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None) -> dict:
             rec["ws_url_prewired"] = bool(ws_url)
             drive_args = argparse.Namespace(
                 cdp_host=endpoint,
-                url=args.url,
+                url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
                 format=args.format,
                 quality=args.quality,
                 timeout=max(1.0, deadline - time.monotonic()),
@@ -2806,12 +2816,30 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None) -> dict:
                 # and is swallowed by the `except Exception` below, failing every
                 # cdp rep. cdpdrive also reads it with getattr; both halves.
                 host_header="",
+                op=op,
                 render_module=os.path.join(HERE, "render.py"),
             )
             result = cdpdrive.drive(drive_args)
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
+            # getattr, not args.prewire: failure-path fixtures drive this
+            # function with bare Namespaces, and the attribute lookup runs
+            # before the rec["ok"] guard — an AttributeError here replaced
+            # every failure label with its own traceback.
+            if (
+                getattr(args, "prewire", False)
+                and not args.ws_url
+                and rec["ok"]
+                and result.get("target_id")
+            ):
+                # Discovery-once: pin the page target's WS URL for every later
+                # rep. clone_ws_url() re-hosts it onto each clone's endpoint, so
+                # only the path — the guest-side target id, identical across
+                # clones because it is snapshot state — is load-bearing. This
+                # lands on a warmup rep by schedule construction (warmups run
+                # first); the analyzer holds measured reps to meta.ws_url_prewired.
+                args.ws_url = f"ws://{endpoint}/devtools/page/{result['target_id']}"
             if not rec["ok"]:
                 # LIFT THE DIAGNOSTIC TO THE TOP LEVEL. cdpdrive can return
                 # ok=false WITHOUT raising, in which case the `except` below never
@@ -3099,7 +3127,8 @@ def run_exec_request(args, rep: int) -> dict:
     name = f"rb-{args.run_id}-{rep}-exec"
     log = os.path.join(args.out_dir, f"{name}.log")
     driver = shlex.join([
-        "python3", "/opt/bench/render.py", args.url,
+        "python3", "/opt/bench/render.py",
+        url_for_rep(getattr(args, "urls", None) or [args.url], rep),
         "--out-prefix", "/tmp/rb",
         "--format", args.format,
         "--quality", str(args.quality),
@@ -3466,7 +3495,20 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
         return run_exec_request(args, rep)
     if arm == "noop":
         return run_noop_request(args, rep)
+    if arm == "html":
+        return run_cdp_request(args, rep, fast=False, probe=probe, op="html")
     return run_cdp_request(args, rep, fast=(arm == "cdp-fast"), probe=probe)
+
+
+
+def parse_urls(spec):
+    """Split a comma-separated --url value; single URLs pass through as [url]."""
+    return [u.strip() for u in spec.split(",") if u.strip()]
+
+
+def url_for_rep(urls, rep):
+    """Deterministic uniform cycle: rep r renders urls[r % len(urls)]."""
+    return urls[rep % len(urls)]
 
 
 def main() -> int:
@@ -3481,10 +3523,18 @@ def main_with_resources(resources: ExitStack) -> int:
                    help="UFFD serve pid (omit when using --snapshot-tag)")
     p.add_argument("--snapshot-tag", default="",
                    help="FILE-backed restore from this tag instead of a UFFD serve")
-    p.add_argument("--url", required=True)
+    p.add_argument("--url", required=True,
+                   help="page URL, or a comma-separated list cycled across "
+                        "reps (the corpus-mix arm)")
     p.add_argument("--arms", default="exec,cdp,cdp-fast,noop")
     p.add_argument("--reps", type=int, default=10)
     p.add_argument("--warmup", type=int, default=2, help="discarded EXPLICITLY, and reported")
+    p.add_argument("--prewire", action="store_true",
+                   help="discover the CDP page target once (on the first successful cdp "
+                        "rep, a warmup by schedule construction) and pin its re-hosted "
+                        "WebSocket URL for every later rep, skipping per-request "
+                        "/json/list discovery; the target id is guest-side snapshot "
+                        "state, identical across clones like a WebDriver session id")
     p.add_argument("--seed", type=int, default=20260808)
     p.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
     p.add_argument("--quality", type=int, default=80)
@@ -3608,11 +3658,11 @@ def main_with_resources(resources: ExitStack) -> int:
             )
     os.makedirs(args.out_dir, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    allowed_arms = {"exec", "cdp", "cdp-fast", "noop"}
+    allowed_arms = {"exec", "cdp", "cdp-fast", "html", "noop"}
     if not arms or len(set(arms)) != len(arms) or any(a not in allowed_arms for a in arms):
         p.error(
             "--arms must be a non-empty, duplicate-free subset of "
-            "exec,cdp,cdp-fast,noop"
+            "exec,cdp,cdp-fast,html,noop"
         )
     # exec is ALLOWED but no longer REQUIRED: it is retired from measurement
     # (no published claim rests on it), and run reqbench-20260814-022254-uffd
@@ -3623,6 +3673,21 @@ def main_with_resources(resources: ExitStack) -> int:
     # the arm that corrupts the baseline into every publication run.
     if "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
         p.error("publication runs require noop and at least one CDP arm")
+
+    urls = parse_urls(args.url)
+    if not urls:
+        p.error("--url must name at least one URL")
+    if len(urls) > 1 and args.warmup < 2 * len(urls):
+        # A mix trains the prefetch working set during its first cycle; the
+        # noop baseline is not stationary until every URL has faulted its
+        # pages in (measured 2026-08-14: the drift gate rejects runs whose
+        # working set converges inside the measured window). Two full cycles
+        # of warmup cover convergence.
+        p.error(
+            f"multi-URL runs need --warmup >= {2 * len(urls)} "
+            f"(2x the URL count, working-set convergence); got {args.warmup}"
+        )
+    args.urls = urls
 
     args.run_id = args.run_id or uuid.uuid4().hex
     if (
@@ -3669,7 +3734,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "kind": "meta", "run_id": run_id, "seed": args.seed,
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
             "uffd_mode": uffd_mode,
-            "warmup": args.warmup, "url": args.url, "format": args.format,
+            "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
             "quality": args.quality,
             "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,
@@ -3690,7 +3755,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "cpu": snapshot["vcpu"],
             "memory_mib": snapshot["memory_mib"],
             "rust_log": args.rust_log,
-            "ws_url_prewired": bool(args.ws_url),
+            "ws_url_prewired": bool(args.ws_url) or bool(args.prewire),
             "allow_busy": os.environ.get("ALLOW_BUSY", "0") == "1",
             "quiet_guard_passed": os.environ.get("REQBENCH_QUIET_GUARD") == "1",
             "quiet_guard_loadavg1": quiet_guard_loadavg1,
@@ -3741,6 +3806,7 @@ def main_with_resources(resources: ExitStack) -> int:
                 }
                 fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
+            rec["url"] = url_for_rep(getattr(args, "urls", None) or [args.url], rep)
             rec["run_id"] = run_id
             rec["record_id"] = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"
             rec["loadavg1"] = float(read_trimmed("/proc/loadavg").split()[0])

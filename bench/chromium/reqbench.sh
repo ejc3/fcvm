@@ -495,7 +495,9 @@ cmd_golden() {
         huge_flag="--hugepages"
         ensure_hugepage_pool || return 1
     fi
-    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag \
+    local dns_flag=()
+    [ -n "$GUEST_DNS" ] && dns_flag=(--dns "$GUEST_DNS")
+    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag "${dns_flag[@]}" \
         --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
         --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" 2>"$lf" >"$prepared_json" \
         || { log "golden: PREPARE FAILED"; tail -20 "$lf" >&2; return 1; }
@@ -793,6 +795,10 @@ UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 # goldens coexist. faultbench measured huge+minor at zero userspace faults
 # per render — this knob puts that configuration on the request path.
 HUGEPAGES="${HUGEPAGES:-0}"
+# Guest DNS override for the golden (baked into resolv.conf at boot). The
+# corpus replay arm sets GUEST_DNS=10.0.2.2 so every corpus hostname
+# resolves through the host-loopback replay server via the pasta gateway.
+GUEST_DNS="${GUEST_DNS:-}"
 # Overridable for unit tests only; production is the real kernel knob.
 HUGEPAGE_POOL_FILE="${HUGEPAGE_POOL_FILE:-/proc/sys/vm/nr_hugepages}"
 
@@ -934,6 +940,10 @@ cmd_run() {
     fi
     local rc=0 spid="" serve_bg=""
     local backend_args=()
+    # --prewire only for PREWIRE=1: ${PREWIRE:+--prewire} treats the ordinary
+    # false-like PREWIRE=0 as ON, silently changing the measured operation.
+    local prewire_args=()
+    [ "${PREWIRE:-0}" = "1" ] && prewire_args=(--prewire)
     local image_id provenance="$DATA_ROOT/snapshots/$TAG/reqbench-provenance.json"
     image_id=$($SUDO jq -er '.image_id | select(type == "string")' "$provenance") \
         || { log "run: cannot read immutable image identity from $provenance"; return 1; }
@@ -982,7 +992,8 @@ cmd_run() {
         --image "$IMAGE" --image-id "$image_id" --snapshot-name "$TAG" \
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
-        --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" &
+        --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" \
+        "${prewire_args[@]}" &
     local driver_bg=$!
     track "$driver_bg"
     ACTIVE_DRIVER_BG="$driver_bg"

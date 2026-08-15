@@ -275,6 +275,7 @@ async fn create_sandbox(
 
     // Build RunArgs for start_vm
     let args = crate::cli::RunArgs {
+        dns: None,
         name: name.clone(),
         cpu: req.cpu.unwrap_or(2),
         mem: req.memory_mib.unwrap_or(2048),

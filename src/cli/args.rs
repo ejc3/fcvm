@@ -190,6 +190,14 @@ pub struct RunArgs {
     #[arg(long, default_value = "10G")]
     pub rootfs_size: String,
 
+    /// Override the guest DNS server. Written to the guest's resolv.conf at
+    /// boot, so it is baked into any snapshot taken from this VM. Rootless
+    /// guests reach host loopback services via the pasta gateway 10.0.2.2,
+    /// so `--dns 10.0.2.2` points the guest at a DNS server bound on host
+    /// 127.0.0.1 (the corpus replay benchmark arm).
+    #[arg(long)]
+    pub dns: Option<String>,
+
     /// Volume mapping(s): HOST:GUEST[:ro] (repeat for multiple)
     #[arg(long, action = clap::ArgAction::Append)]
     pub map: Vec<String>,
@@ -860,5 +868,17 @@ mod tests {
         ]);
         assert_eq!(run.publish, vec!["8080:80", "8443:443"]);
         assert_eq!(run.forward_localhost, vec![1421u16, 9099]);
+    }
+
+    #[test]
+    fn dns_override_parses_on_run_and_prepare() {
+        // The corpus replay arm points guests at a host-loopback DNS server
+        // through the pasta gateway; the flag must reach both run and
+        // prepare (goldens bake resolv.conf at boot).
+        let run = parse_run(&["--dns", "10.0.2.2", "nginx:alpine"]);
+        assert_eq!(run.dns.as_deref(), Some("10.0.2.2"));
+        let prep = parse_prepare(&["--name", "t", "--dns", "10.0.2.2", "nginx:alpine"]);
+        assert_eq!(prep.run.dns.as_deref(), Some("10.0.2.2"));
+        assert_eq!(parse_run(&["nginx:alpine"]).dns, None);
     }
 }

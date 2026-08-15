@@ -5785,3 +5785,350 @@ class ExecArmIsOptional(unittest.TestCase):
         self.assertTrue(
             control, "a noop-less schedule must be rejected by the same rule"
         )
+
+
+class CorpusMixUrls(unittest.TestCase):
+    """Multi-URL runs for the corpus arm (Cloudflare 14-URL mix).
+
+    Watched red 2026-08-14: --url with a comma list was passed through as one
+    junk URL (no cycling, no per-record url, no warmup floor), and the
+    analyzer's schedule validation rejected any record whose render.url
+    differed from the single meta.url.
+    """
+
+    def _parse(self, extra):
+        argv = sys.argv
+        sys.argv = ["reqbench.py", "--out-dir", "/tmp"] + extra
+        import io as _io
+        from contextlib import redirect_stderr
+        err = _io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    reqbench.main()
+            return cm.exception.code, err.getvalue()
+        finally:
+            sys.argv = argv
+
+    def test_urls_helper_cycles_deterministically(self):
+        urls = reqbench.parse_urls("http://a/,http://b/,http://c/")
+        self.assertEqual(urls, ["http://a/", "http://b/", "http://c/"])
+        self.assertEqual([reqbench.url_for_rep(urls, r) for r in range(5)],
+                         ["http://a/", "http://b/", "http://c/",
+                          "http://a/", "http://b/"])
+
+    def test_mix_requires_warmup_of_two_cycles(self):
+        # A mix trains the prefetch working set during its first cycle; the
+        # baseline is not stationary until every URL has run. Fail closed
+        # when warmup cannot cover two full cycles.
+        rc, err = self._parse(["--url", "http://a/,http://b/,http://c/",
+                               "--arms", "noop,cdp", "--warmup", "2",
+                               "--serve-pid", "7"])
+        self.assertEqual(rc, 2)
+        self.assertIn("warmup", err.lower())
+
+    def test_analyzer_accepts_declared_url_set(self):
+        import reqanalyze
+        src = open(os.path.join(HERE, "reqanalyze.py")).read()
+        body = src.split("def _validate_schedule")[1]
+        self.assertIn('meta.get("urls")', body,
+                      "schedule validation must accept a declared URL set, "
+                      "not only a single meta.url")
+
+
+class PortProbeResolution(unittest.TestCase):
+    """wait_port must measure readiness on a fine grid.
+
+    Watched red 2026-08-14: with the 1ms x1.5 backoff capped at 20 ms, probe
+    attempts land ~17-20 ms apart past the ramp, so a port that opens at
+    45 ms was reported as ~57 ms — readiness figures sat on the probe grid
+    rather than on true readiness, and a small real teardown-adjacency
+    effect near an attempt boundary read as a clean bimodal restore floor
+    until the fine-grid gated run (reqbench-20260814-035757) showed
+    readiness is unimodal.
+    """
+
+    def test_readiness_is_resolved_within_3ms(self):
+        import socket as _socket
+        import threading
+
+        srv = _socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        ready_at_s = 0.045
+
+        def open_late():
+            time.sleep(ready_at_s)
+            srv.listen(1)
+
+        t = threading.Thread(target=open_late)
+        t.start()
+        try:
+            measured = reqbench.wait_port(
+                f"127.0.0.1:{port}", time.monotonic() + 10.0)
+        finally:
+            t.join()
+            srv.close()
+        self.assertGreaterEqual(measured, ready_at_s * 1000 - 1)
+        self.assertLessEqual(
+            measured, ready_at_s * 1000 + 3.5,
+            f"wait_port reported {measured:.1f} ms for a port ready at "
+            f"{ready_at_s * 1000:.0f} ms: the probe grid is too coarse")
+
+
+class GuestDnsKnob(unittest.TestCase):
+    """GUEST_DNS must reach the golden's podman prepare as --dns.
+
+    Watched red 2026-08-14: the knob did not exist and the prepare argv
+    carried no --dns.
+    """
+
+    SH = HugepageGuards.SH
+
+    def test_guest_dns_reaches_prepare_argv(self):
+        src = open(self.SH).read()
+        self.assertIn('GUEST_DNS="${GUEST_DNS:-}"', src)
+        self.assertIn('--dns "$GUEST_DNS"', src)
+
+
+class CorpusServeAnswerIp(unittest.TestCase):
+    """--answer-ip must fail at startup, not by silently dropping A queries.
+
+    inet_aton runs inside the DNS responder's broad exception handler, so a
+    malformed address left every server running while every A query vanished
+    without a trace.
+    """
+
+    def test_malformed_answer_ip_exits_before_serving(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus_serve.py"),
+                "--answer-ip",
+                "not-an-ip",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("answer-ip", proc.stderr)
+        self.assertNotIn(
+            "wildcard DNS", proc.stdout,
+            "the DNS responder must never start under an unusable answer address",
+        )
+
+
+class HtmlArmAndPrewire(unittest.TestCase):
+    """The html op and target-prewiring, validated through the FULL analyzer.
+
+    Both features change what a valid record looks like, so the tests build a
+    complete clean dataset, transform it, and hold the analyzer to zero
+    metadata errors — then break one field and demand the specific error, so
+    the validation under test is proven live rather than skipped.
+    """
+
+    @staticmethod
+    def _load_errors(path):
+        return [
+            error
+            for dataset in reqanalyze.load([path])
+            for error in dataset["metadata_errors"]
+        ]
+
+    @staticmethod
+    def _rows(path):
+        with open(path) as source:
+            return [json.loads(line) for line in source]
+
+    @staticmethod
+    def _write(path, rows):
+        with open(path, "w") as target:
+            target.write("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    def _dataset_with_html_arm(self, path, reps=6):
+        """Clean dataset whose exec arm is rewritten as an html arm."""
+        AnalyzerAvailability._write_clean_backend(path, "file", reps, 384.0)
+        rows = self._rows(path)
+        cdp_by_key = {
+            (row["rep"], row["warmup"]): row
+            for row in rows
+            if row.get("arm") == "cdp"
+        }
+        for row in rows:
+            if row.get("kind") == "meta":
+                row["arms"] = ["html" if a == "exec" else a for a in row["arms"]]
+                continue
+            if row.get("arm") != "exec":
+                continue
+            template = cdp_by_key[(row["rep"], row["warmup"])]
+            row["arm"] = "html"
+            row["record_id"] = row["record_id"].replace(":exec:", ":html:")
+            row["teardown"] = dict(template["teardown"])
+            row["endpoint"] = template["endpoint"]
+            render = json.loads(json.dumps(template["render"]))
+            stages = render["stages"]
+            for gone in ("screenshot_ms", "decode_ms"):
+                stages.pop(gone, None)
+            stages["extract_ms"] = 1.0
+            for gone in ("image_bytes", "image_sha256", "width", "height"):
+                render.pop(gone, None)
+            render["html_bytes"] = 2048
+            render["html_sha256"] = "a" * 64
+            row["render"] = render
+            # The html record carries every per-record metric a cdp record
+            # does; identity fields stay the (renamed) exec record's own.
+            identity = {"arm", "rep", "warmup", "record_id", "name", "run_id",
+                        "render", "teardown", "endpoint"}
+            for metric, value in template.items():
+                if metric not in identity and metric not in row:
+                    row[metric] = value
+        self._write(path, rows)
+
+    def test_short_html_arm_fails_the_sample_size_gate(self):
+        """A mixed run must not publish while its html arm is short.
+
+        expected_cdp_arms matched only names starting with "cdp", so a run
+        whose cdp arms reached 200 passed publication with the html arm at
+        any count — an html latency published from a sample the gate never
+        examined.
+        """
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._dataset_with_html_arm(src, reps=200)
+            rows = self._rows(src)
+            victim = next(
+                r for r in rows
+                if r.get("arm") == "html" and r.get("warmup") is False
+            )
+            rows.remove(victim)
+            self._write(src, rows)
+            buf = io.StringIO()
+            with (
+                mock.patch.object(
+                    reqanalyze, "median_ci", AnalyzerAvailability._fast_median_ci
+                ),
+                mock.patch.object(
+                    reqanalyze,
+                    "hodges_lehmann_shift",
+                    AnalyzerAvailability._fast_shift,
+                ),
+                redirect_stdout(buf),
+            ):
+                rc = reqanalyze.main_with(["--json-out", dst, src])
+            with open(dst) as f:
+                out = json.load(f)
+            sample = out["gate"]["cdp_sample_size"]
+            self.assertEqual(
+                sample["measured_non_warmup_attempts_per_arm"].get("html"), 199
+            )
+            self.assertIs(sample["passed"], False)
+            self.assertIs(out["publishable"], False)
+            self.assertEqual(rc, 5, buf.getvalue())
+
+    def test_html_arm_gets_stage_decomposition(self):
+        """analysis.json must carry the html arm's per-stage metrics.
+
+        The stage loop keyed on startswith("cdp") dropped every connection
+        and extraction stage for html even though the arm pays the same
+        per-request CDP handshake; only aggregate blocking and wall time
+        survived into analysis.json.
+        """
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._dataset_with_html_arm(src)
+            buf = io.StringIO()
+            with (
+                mock.patch.object(
+                    reqanalyze, "median_ci", AnalyzerAvailability._fast_median_ci
+                ),
+                mock.patch.object(
+                    reqanalyze,
+                    "hodges_lehmann_shift",
+                    AnalyzerAvailability._fast_shift,
+                ),
+                redirect_stdout(buf),
+            ):
+                reqanalyze.main_with(["--json-out", dst, src, "--no-gate"])
+            with open(dst) as f:
+                out = json.load(f)
+            html_arm = out["arms"]["html"]
+            for metric in ("connect_total_ms", "navigate_ms", "extract_ms", "total_ms"):
+                self.assertIn(metric, html_arm, f"html arm must publish {metric}")
+            self.assertNotIn(
+                "screenshot_ms", html_arm,
+                "html renders no screenshot; a summary here means the arm was "
+                "pooled with the wrong stage list",
+            )
+
+    def test_html_arm_dataset_validates_cleanly(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "html.jsonl")
+            self._dataset_with_html_arm(path)
+            self.assertEqual(self._load_errors(path), [])
+
+    def test_html_record_without_payload_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "html.jsonl")
+            self._dataset_with_html_arm(path)
+            rows = self._rows(path)
+            victim = next(
+                r for r in rows
+                if r.get("arm") == "html" and r.get("warmup") is False
+            )
+            del victim["render"]["html_bytes"]
+            self._write(path, rows)
+            errors = self._load_errors(path)
+            self.assertTrue(
+                any("html_bytes" in e for e in errors),
+                f"dropping html_bytes must be caught, got: {errors[:3]}",
+            )
+
+    def _dataset_with_prewire(self, path):
+        """Clean dataset in prewire mode: discovery on one warmup, pinned after."""
+        AnalyzerAvailability._write_clean_backend(path, "file", 6, 384.0)
+        rows = self._rows(path)
+        first_warmup_seen = False
+        for row in rows:
+            if row.get("kind") == "meta":
+                row["ws_url_prewired"] = True
+                continue
+            render = row.get("render")
+            if not isinstance(render, dict):
+                continue
+            if row.get("warmup") and not first_warmup_seen:
+                first_warmup_seen = True
+                render["target_prewired"] = False  # the discovery rep
+            else:
+                render["target_prewired"] = True
+                render["stages"]["resolve_ms"] = 0.0
+        self._write(path, rows)
+
+    def test_prewire_discovery_warmup_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "prewire.jsonl")
+            self._dataset_with_prewire(path)
+            self.assertEqual(self._load_errors(path), [])
+
+    def test_prewire_mismatch_on_measured_rep_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "prewire.jsonl")
+            self._dataset_with_prewire(path)
+            rows = self._rows(path)
+            victim = next(
+                r for r in rows
+                if isinstance(r.get("render"), dict) and r.get("warmup") is False
+            )
+            victim["render"]["target_prewired"] = False
+            self._write(path, rows)
+            errors = self._load_errors(path)
+            self.assertTrue(
+                any("prewire" in e for e in errors),
+                f"an unprewired MEASURED rep must be caught, got: {errors[:3]}",
+            )

@@ -49,6 +49,18 @@ import uuid
 
 
 MIN_CDP_ATTEMPTS_PER_BACKEND = 200
+
+
+def is_cdp_class(arm):
+    """Arms that pay the per-request CDP handshake: cdp, cdp-fast, and html.
+
+    Both the sample-size gate and the stage decomposition key off this
+    predicate. A name test scattered as startswith("cdp") let the html arm
+    fall out of both: a mixed run could publish an html latency from fewer
+    than 200 measured attempts, and analysis.json dropped every
+    connection/extraction stage for it.
+    """
+    return isinstance(arm, str) and (arm.startswith("cdp") or arm == "html")
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
@@ -407,7 +419,7 @@ def _validate_arms(arms, label, errors):
         or len(arms) != len(set(arms))
     ):
         errors.append(f"{label} metadata has no valid duplicate-free arms list")
-    elif any(arm not in {"exec", "cdp", "cdp-fast", "noop"} for arm in arms):
+    elif any(arm not in {"exec", "cdp", "cdp-fast", "html", "noop"} for arm in arms):
         errors.append(f"{label} metadata declares an unsupported arm")
     elif "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
         errors.append(
@@ -677,7 +689,7 @@ def _validate_schedule(dataset):
                     errors.append(f"{rlabel} successful exec did not exit cleanly")
                 if not finite_nonnegative(record.get("render_total_ms")):
                     errors.append(f"{rlabel} successful exec has no render_total_ms")
-            elif arm in ("cdp", "cdp-fast"):
+            elif arm in ("cdp", "cdp-fast", "html"):
                 for metric in ("state_to_port_ms", "spawn_to_port_ms"):
                     if not finite_nonnegative(record.get(metric)):
                         errors.append(f"{rlabel} successful CDP record has no {metric}")
@@ -685,8 +697,18 @@ def _validate_schedule(dataset):
                 if not isinstance(render, dict) or render.get("ok") is not True:
                     errors.append(f"{rlabel} successful CDP record has no successful render")
                 else:
+                    # Multi-URL runs declare meta.urls and cycle rep-modulo;
+                    # the expected URL for THIS record is re-derived from the
+                    # schedule, which is stricter than set membership: a
+                    # record rendering the right URL at the wrong rep is a
+                    # schedule violation.
+                    urls = meta.get("urls")
+                    if isinstance(urls, list) and urls:
+                        expected_url = urls[record.get("rep", 0) % len(urls)]
+                    else:
+                        expected_url = meta.get("url")
                     expected_fields = {
-                        "url": meta.get("url"),
+                        "url": expected_url,
                         "format": meta.get("format"),
                         "cdp_host": record.get("endpoint"),
                     }
@@ -700,14 +722,34 @@ def _validate_schedule(dataset):
                         errors.append(
                             f"{rlabel} CDP render did not complete its declared idle policy"
                         )
-                    if render.get("target_prewired") is not meta.get("ws_url_prewired"):
+                    prewired_expected = meta.get("ws_url_prewired")
+                    discovery_warmup = (
+                        is_warmup
+                        and prewired_expected is True
+                        and render.get("target_prewired") is False
+                    )
+                    # --prewire pins the URL on the first successful warmup rep,
+                    # which itself necessarily runs unprewired; measured reps are
+                    # held strictly to the metadata.
+                    if not discovery_warmup and (
+                        render.get("target_prewired") is not prewired_expected
+                    ):
                         errors.append(f"{rlabel} CDP target prewire mode mismatches metadata")
                     stages = render.get("stages")
-                    required_stages = (
-                        "resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms",
-                        "connect_total_ms", "navigate_ms", "idle_ms",
-                        "screenshot_ms", "decode_ms", "nav_timing_ms", "total_ms",
-                    )
+                    if arm == "html":
+                        # The html op swaps the terminal screenshot+decode stages
+                        # for a single DOM-extraction stage.
+                        required_stages = (
+                            "resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms",
+                            "connect_total_ms", "navigate_ms", "idle_ms",
+                            "extract_ms", "nav_timing_ms", "total_ms",
+                        )
+                    else:
+                        required_stages = (
+                            "resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms",
+                            "connect_total_ms", "navigate_ms", "idle_ms",
+                            "screenshot_ms", "decode_ms", "nav_timing_ms", "total_ms",
+                        )
                     if not isinstance(stages, dict):
                         errors.append(f"{rlabel} successful CDP render has no stages")
                     else:
@@ -716,15 +758,30 @@ def _validate_schedule(dataset):
                                 errors.append(
                                     f"{rlabel} successful CDP render has invalid {stage}"
                                 )
+                    if arm == "html":
+                        html_bytes = render.get("html_bytes")
+                        html_sha256 = render.get("html_sha256")
+                        if (
+                            not isinstance(html_bytes, int)
+                            or isinstance(html_bytes, bool)
+                            or html_bytes <= 0
+                        ):
+                            errors.append(f"{rlabel} html render has no positive html_bytes")
+                        if (
+                            not isinstance(html_sha256, str)
+                            or len(html_sha256) != 64
+                            or any(c not in "0123456789abcdef" for c in html_sha256)
+                        ):
+                            errors.append(f"{rlabel} html render has invalid html_sha256")
                     image_bytes = render.get("image_bytes")
                     image_sha256 = render.get("image_sha256")
-                    if (
+                    if arm != "html" and (
                         not isinstance(image_bytes, int)
                         or isinstance(image_bytes, bool)
                         or image_bytes <= 0
                     ):
                         errors.append(f"{rlabel} CDP render has no positive image_bytes")
-                    if (
+                    if arm != "html" and (
                         not isinstance(image_sha256, str)
                         or len(image_sha256) != 64
                         or any(
@@ -733,7 +790,7 @@ def _validate_schedule(dataset):
                         )
                     ):
                         errors.append(f"{rlabel} CDP render has invalid image_sha256")
-                    for dimension in ("width", "height"):
+                    for dimension in (() if arm == "html" else ("width", "height")):
                         value = render.get(dimension)
                         if (
                             not isinstance(value, int)
@@ -742,7 +799,7 @@ def _validate_schedule(dataset):
                         ):
                             errors.append(f"{rlabel} CDP render has invalid {dimension}")
                     expected_quality = meta["quality"] if meta["format"] == "jpeg" else 0
-                    if render.get("quality") != expected_quality:
+                    if arm != "html" and render.get("quality") != expected_quality:
                         errors.append(f"{rlabel} CDP render quality mismatches metadata")
                     nav = render.get("nav")
                     nav_fields = (
@@ -1479,10 +1536,10 @@ def analyze_backend(
     expected_cdp_arms = set()
     for meta in metas:
         for arm in meta.get("arms") or []:
-            if isinstance(arm, str) and arm.startswith("cdp"):
+            if is_cdp_class(arm):
                 expected_cdp_arms.add(arm)
     if not expected_cdp_arms:
-        expected_cdp_arms.update(a for a in arms if a.startswith("cdp"))
+        expected_cdp_arms.update(a for a in arms if is_cdp_class(a))
     expected_cdp_arms = sorted(expected_cdp_arms)
     cdp_counts = {
         a: len(measured_attempted.get(a, [])) for a in expected_cdp_arms
@@ -1623,7 +1680,13 @@ def analyze_backend(
     print("-" * 78)
     stage_keys = ["resolve_ms", "tcp_ms", "upgrade_ms", "enable_ms", "connect_total_ms",
                   "navigate_ms", "screenshot_ms", "total_ms"]
-    for a in [x for x in arms if x.startswith("cdp")]:
+    for a in [x for x in arms if is_cdp_class(x)]:
+        # html swaps the terminal screenshot stage for extract (no image);
+        # every other stage is the same CDP handshake all cdp-class arms pay.
+        arm_stage_keys = [
+            ("extract_ms" if (k == "screenshot_ms" and a == "html") else k)
+            for k in stage_keys
+        ]
         print(f"  [{a}]")
         for metric, explanation in (
             ("spawn_to_port_ms", "process spawn -> first TCP accept; stable readiness boundary"),
@@ -1644,7 +1707,7 @@ def analyze_backend(
             print("    resolve_ms       SKIPPED (--ws-url prewired; NOT measured)")
         elif len(prewired) > 1:
             print("    resolve_ms       MIXED prewired/measured records -- refusing to pool")
-        for k in stage_keys:
+        for k in arm_stage_keys:
             if k == "resolve_ms" and (prewired == {True} or len(prewired) > 1):
                 continue
             # cdpdrive nests its timings under render.stages; reading render[k]
