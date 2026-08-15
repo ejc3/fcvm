@@ -421,7 +421,7 @@ def _validate_arms(arms, label, errors):
         errors.append(f"{label} metadata has no valid duplicate-free arms list")
     elif any(arm not in {"exec", "cdp", "cdp-fast", "html", "noop"} for arm in arms):
         errors.append(f"{label} metadata declares an unsupported arm")
-    elif "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
+    elif "noop" not in arms or not any(is_cdp_class(arm) for arm in arms):
         errors.append(
             f"{label} publication schedule requires noop and a CDP arm"
         )
