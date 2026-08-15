@@ -151,17 +151,41 @@ impl GuestProbe for NsenterGuestProbe {
             .context("TCP probe exceeded pasta's readiness deadline")?
             .context("running the TCP probe via nsenter in namespace")?;
 
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         // Exit 0: connected (SYN-ACK). "Connection refused": the guest's kernel
         // sent an RST — it is alive, nothing is bound on the port yet, and that
         // is still an answer. Exit 124 is `timeout` reporting silence; anything
         // else (no route, probe misconfiguration) is treated as silence and
         // retried, with the detail carried into the deadline error.
-        let answered = output.status.success() || detail.contains("Connection refused");
-        Ok(TcpAnswer {
-            answered,
-            detail: if answered { String::new() } else { detail },
-        })
+        let answered = output.status.success() || stderr.contains("Connection refused");
+        // Always name the exit status. `timeout` kills bash mid-connect, so a
+        // silent guest leaves stderr EMPTY — and an empty detail then reads
+        // identically to "the probe itself produced nothing", which is a
+        // different failure. Distinguishing them is the whole diagnosis: exit
+        // 124 with no RST means packets are not reaching the guest's TCP stack
+        // (an L3/L4 path problem), whereas an RST would have counted as an
+        // answer and passed. Observed 2026-08-15 as `detail=` with no way to
+        // tell the two apart.
+        let detail = if answered {
+            String::new()
+        } else {
+            let code = output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            let meaning = if code == "124" {
+                "timeout: no SYN-ACK and no RST, the guest's stack never replied"
+            } else {
+                "probe error"
+            };
+            if stderr.is_empty() {
+                format!("exit={code} ({meaning}), prober said nothing")
+            } else {
+                format!("exit={code} ({meaning}): {stderr}")
+            }
+        };
+        Ok(TcpAnswer { answered, detail })
     }
 
     async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String> {
@@ -467,6 +491,59 @@ pub struct PastaNetwork {
 }
 
 impl PastaNetwork {
+    /// Dump where the packets stopped, from inside the VM's own network
+    /// namespace, while it still exists.
+    ///
+    /// Ordered L2 -> L4 so the reader can see how far a packet got: the
+    /// neighbour table (did we ever learn the guest's MAC), the tap and bridge
+    /// counters (did frames actually leave the host), the namespace's routes
+    /// and addresses, and the sockets pasta is holding. Every command is
+    /// bounded and its failure is logged rather than swallowed, because a
+    /// silently missing section reads as "nothing was wrong" — the same
+    /// fail-open shape this project keeps paying for.
+    async fn dump_unreachable_guest_forensics(&self, holder_pid: u32, probe_port: u16) {
+        let prefix = self.build_nsenter_prefix(holder_pid);
+        let probes: [(&str, Vec<&str>); 6] = [
+            ("neighbours", vec!["ip", "neigh", "show"]),
+            ("links + counters", vec!["ip", "-s", "link"]),
+            ("addresses", vec!["ip", "-o", "addr", "show"]),
+            ("routes", vec!["ip", "route", "show"]),
+            ("sockets", vec!["ss", "-tanp"]),
+            ("nat rules", vec!["iptables", "-t", "nat", "-S"]),
+        ];
+        warn!(
+            guest_ip = GUEST_IP,
+            probe_port,
+            holder_pid,
+            "guest never answered; dumping namespace forensics before teardown"
+        );
+        for (label, args) in probes {
+            let mut command = Command::new(&prefix[0]);
+            command
+                .args(&prefix[1..])
+                .args(&args)
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            match tokio::time::timeout(std::time::Duration::from_secs(2), command.output()).await {
+                Ok(Ok(output)) => {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    let text = text.trim();
+                    if text.is_empty() {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        warn!(section = label, stderr = %err.trim(), "forensics section empty");
+                    } else {
+                        for line in text.lines().take(40) {
+                            warn!(section = label, "{}", line);
+                        }
+                    }
+                }
+                Ok(Err(error)) => warn!(section = label, %error, "forensics command failed"),
+                Err(_) => warn!(section = label, "forensics command timed out"),
+            }
+        }
+    }
+
     pub fn new(vm_id: String, tap_device: String, port_mappings: Vec<PortMapping>) -> Self {
         Self {
             vm_id,
@@ -1478,7 +1555,16 @@ impl NetworkManager for PastaNetwork {
         let deadline = tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE;
         let mut probe = NsenterGuestProbe::new(self.build_nsenter_prefix(holder_pid));
 
-        wait_for_guest_to_answer(&mut probe, probe_port, deadline).await?;
+        if let Err(error) = wait_for_guest_to_answer(&mut probe, probe_port, deadline).await {
+            // The namespace is about to be torn down, taking every piece of
+            // evidence with it. A once-in-hundreds failure that destroys its
+            // own diagnosis costs an entire benchmark campaign and teaches
+            // nothing (observed 2026-08-15), so dump the L2/L3/L4 state that
+            // says WHERE the packets stopped before returning the error.
+            self.dump_unreachable_guest_forensics(holder_pid, probe_port)
+                .await;
+            return Err(error);
+        }
         self.wait_for_port_forwarding_until(deadline).await
     }
 
