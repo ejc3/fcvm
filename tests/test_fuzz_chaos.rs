@@ -485,7 +485,7 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
             "exec",
             "--pid",
             &pid_s,
-            "-c",
+            "--container",
             "--",
             "sh",
             "-c",
@@ -503,7 +503,7 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
             "exec",
             "--pid",
             &pid_s,
-            "-c",
+            "--container",
             "--",
             "sh",
             "-c",
@@ -551,6 +551,48 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
     )
     .await;
 
+    // `fcvm exec` defaults to --container; the GUEST needs --vm. Everything
+    // below was previously running inside nginx:alpine, which is why the
+    // netfilter probes came back empty and produced a confident, wrong note
+    // that the guest had no iptables. Ubuntu has /usr/sbin/iptables, plus
+    // bash, ss, curl and wget. Absolute paths, because exec hands over a
+    // minimal PATH.
+    //
+    // The DROP counter is THE measurement. On a healthy VM it reads:
+    //   0  0  DROP  eth0  0.0.0.0/0  127.0.0.0/8  ! ctstate DNAT
+    // so any non-zero value at failure names the containment rule as the
+    // thing eating the connection, and a still-zero value exonerates it.
+    for (label, cmd) in [
+        (
+            "guest-input-counters",
+            "/usr/sbin/iptables -L INPUT -n -v -x | head -6",
+        ),
+        (
+            "guest-nat-rules",
+            "/usr/sbin/iptables -t nat -S PREROUTING | head -6",
+        ),
+        ("guest-listeners", "/usr/bin/ss -ltnp | head -8"),
+        // Both sides of the DNAT, from inside the guest: 127.0.0.1 is where
+        // the rule points, 10.0.2.100 is the address the outside world uses.
+        // Answers on loopback but not on eth0 -> the ingress path; silent on
+        // both -> whatever is behind the published port.
+        (
+            "guest-http-loopback",
+            "/usr/bin/curl -sS -o /dev/null -w 'connect=%{time_connect} code=%{http_code} exit=%{exitcode}\n' --max-time 4 http://127.0.0.1:80/",
+        ),
+        (
+            "guest-http-eth0",
+            "/usr/bin/curl -sS -o /dev/null -w 'connect=%{time_connect} code=%{http_code} exit=%{exitcode}\n' --max-time 4 http://10.0.2.100:80/",
+        ),
+    ] {
+        probe(
+            label,
+            &[&fcvm, "exec", "--pid", &pid_s, "--vm", "--", "sh", "-c", cmd],
+            left().min(Duration::from_secs(6)),
+        )
+        .await;
+    }
+
     // Conntrack DOES read back, straight out of /proc, no binary needed.
     probe(
         "guest-conntrack",
@@ -559,6 +601,7 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
             "exec",
             "--pid",
             &pid_s,
+            "--vm",
             "--",
             "sh",
             "-c",
