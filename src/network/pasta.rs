@@ -105,6 +105,33 @@ struct TcpAnswer {
     detail: String,
 }
 
+/// Total wall-clock budget for the post-failure forensic dump.
+const FORENSICS_BUDGET_SECS: u64 = 4;
+
+/// Describe a probe that got no answer, so the reason is never blank.
+///
+/// `timeout` kills the probing bash mid-connect, so a silent guest leaves
+/// stderr EMPTY — indistinguishable from "the prober itself printed nothing",
+/// a different failure. Exit 124 means no SYN-ACK and no RST were OBSERVED
+/// before the deadline, and that is all it means: a dropped SYN, a guest
+/// firewall DROP, and a lost reply are equally consistent with it, so this
+/// must not claim the guest never received the packet.
+fn describe_silent_probe(code: Option<i32>, stderr: &str) -> String {
+    let code = code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let meaning = if code == "124" {
+        "timeout: no SYN-ACK or RST observed before the deadline"
+    } else {
+        "probe error"
+    };
+    if stderr.is_empty() {
+        format!("exit={code} ({meaning}), prober said nothing")
+    } else {
+        format!("exit={code} ({meaning}): {stderr}")
+    }
+}
+
 /// Production [`GuestProbe`]: runs the probes inside the VM's network namespace
 /// via the holder PID.
 struct NsenterGuestProbe {
@@ -151,17 +178,27 @@ impl GuestProbe for NsenterGuestProbe {
             .context("TCP probe exceeded pasta's readiness deadline")?
             .context("running the TCP probe via nsenter in namespace")?;
 
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         // Exit 0: connected (SYN-ACK). "Connection refused": the guest's kernel
         // sent an RST — it is alive, nothing is bound on the port yet, and that
         // is still an answer. Exit 124 is `timeout` reporting silence; anything
         // else (no route, probe misconfiguration) is treated as silence and
         // retried, with the detail carried into the deadline error.
-        let answered = output.status.success() || detail.contains("Connection refused");
-        Ok(TcpAnswer {
-            answered,
-            detail: if answered { String::new() } else { detail },
-        })
+        let answered = output.status.success() || stderr.contains("Connection refused");
+        // Always name the exit status. `timeout` kills bash mid-connect, so a
+        // silent guest leaves stderr EMPTY — and an empty detail then reads
+        // identically to "the probe itself produced nothing", which is a
+        // different failure. Distinguishing them is the whole diagnosis: exit
+        // 124 with no RST means packets are not reaching the guest's TCP stack
+        // (an L3/L4 path problem), whereas an RST would have counted as an
+        // answer and passed. Observed 2026-08-15 as `detail=` with no way to
+        // tell the two apart.
+        let detail = if answered {
+            String::new()
+        } else {
+            describe_silent_probe(output.status.code(), &stderr)
+        };
+        Ok(TcpAnswer { answered, detail })
     }
 
     async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String> {
@@ -467,6 +504,98 @@ pub struct PastaNetwork {
 }
 
 impl PastaNetwork {
+    /// Dump where the packets stopped, from inside the VM's own network
+    /// namespace, while it still exists.
+    ///
+    /// Ordered L2 -> L4 so the reader can see how far a packet got: the
+    /// neighbour table (did we ever learn the guest's MAC), the tap and bridge
+    /// counters (did frames actually leave the host), the namespace's routes
+    /// and addresses, and the sockets pasta is holding. Every command is
+    /// bounded and its failure is logged rather than swallowed, because a
+    /// silently missing section reads as "nothing was wrong" — the same
+    /// fail-open shape this project keeps paying for.
+    async fn dump_unreachable_guest_forensics(&self, holder_pid: u32, probe_port: u16) {
+        let prefix = self.build_nsenter_prefix(holder_pid);
+        let probes: [(&str, Vec<&str>); 7] = [
+            ("neighbours", vec!["ip", "neigh", "show"]),
+            ("links + counters", vec!["ip", "-s", "link"]),
+            ("addresses", vec!["ip", "-o", "addr", "show"]),
+            ("routes", vec!["ip", "route", "show"]),
+            ("sockets", vec!["ss", "-tanp"]),
+            ("nat rules", vec!["iptables", "-t", "nat", "-S"]),
+            // Conntrack last and deliberately: a restored guest keeps the
+            // snapshot's conntrack table (restore destroys SOCKETS via
+            // cookie-bound SOCK_DESTROY but never flushes conntrack), and the
+            // guest's loopback containment DROPS eth0 traffic to 127.0.0.0/8
+            // unless conntrack records that WE translated it. A stale entry
+            // colliding with a fresh probe's 5-tuple would therefore produce
+            // exactly the silence observed, and nothing else in this dump can
+            // tell that apart from a lost packet.
+            (
+                "conntrack",
+                vec!["conntrack", "-L", "-p", "tcp", "--dport", "9222"],
+            ),
+        ];
+        warn!(
+            guest_ip = GUEST_IP,
+            probe_port,
+            holder_pid,
+            "guest never answered; dumping namespace forensics before teardown"
+        );
+        // ONE budget for the whole dump, not one per command: six serial 2s
+        // commands could add 12s to the failure path before teardown, changing
+        // the timing of the very flow being diagnosed.
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(FORENSICS_BUDGET_SECS);
+        for (label, args) in probes {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    section = label,
+                    "forensics budget exhausted; section skipped"
+                );
+                continue;
+            }
+            let mut command = Command::new(&prefix[0]);
+            command
+                .args(&prefix[1..])
+                .args(&args)
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            match tokio::time::timeout(remaining, command.output()).await {
+                Ok(Ok(output)) => {
+                    // Report a non-zero exit even when the command wrote to
+                    // stdout: `ss` and `iptables` can print a partial answer and
+                    // still fail, and rendering that as success is how a
+                    // diagnostic starts lying.
+                    if !output.status.success() {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        warn!(
+                            section = label,
+                            status = %output.status,
+                            stderr = %err.trim(),
+                            "forensics command exited non-zero"
+                        );
+                    }
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    let text = text.trim();
+                    if text.is_empty() {
+                        if output.status.success() {
+                            warn!(section = label, "forensics section empty");
+                        }
+                    } else {
+                        for line in text.lines().take(40) {
+                            warn!(section = label, "{}", line);
+                        }
+                    }
+                }
+                Ok(Err(error)) => warn!(section = label, %error, "forensics command failed"),
+                Err(_) => warn!(section = label, "forensics command timed out"),
+            }
+        }
+    }
+
     pub fn new(vm_id: String, tap_device: String, port_mappings: Vec<PortMapping>) -> Self {
         Self {
             vm_id,
@@ -1478,7 +1607,16 @@ impl NetworkManager for PastaNetwork {
         let deadline = tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE;
         let mut probe = NsenterGuestProbe::new(self.build_nsenter_prefix(holder_pid));
 
-        wait_for_guest_to_answer(&mut probe, probe_port, deadline).await?;
+        if let Err(error) = wait_for_guest_to_answer(&mut probe, probe_port, deadline).await {
+            // The namespace is about to be torn down, taking every piece of
+            // evidence with it. A once-in-hundreds failure that destroys its
+            // own diagnosis costs an entire benchmark campaign and teaches
+            // nothing (observed 2026-08-15), so dump the L2/L3/L4 state that
+            // says WHERE the packets stopped before returning the error.
+            self.dump_unreachable_guest_forensics(holder_pid, probe_port)
+                .await;
+            return Err(error);
+        }
         self.wait_for_port_forwarding_until(deadline).await
     }
 
@@ -1490,6 +1628,73 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End to end: the readiness ERROR must carry the probe's exit status.
+    ///
+    /// The pure describer tests above cannot see whether answers_tcp actually
+    /// uses it, and the failure a reader gets is the error string, not the
+    /// TcpAnswer. This drives the real readiness loop with a guest that is
+    /// silent behind a resolved neighbour — the captured shape — and requires
+    /// the exit status to survive into the message. Before this change the
+    /// same path produced "probe: (silence)".
+    #[tokio::test(start_paused = true)]
+    async fn the_readiness_error_carries_the_probe_exit_status() {
+        let mut guest = ScriptedGuest::silent_behind_resolved_neighbor();
+        let error = wait_for_guest_to_answer(&mut guest, PROBE_PORT, paused_deadline())
+            .await
+            .expect_err("a silent guest must fail readiness");
+        let text = format!("{error:#}");
+        assert!(text.contains("exit=124"), "{text}");
+        assert!(text.contains("no SYN-ACK or RST"), "{text}");
+        assert!(
+            !text.contains("(silence)"),
+            "the blank detail is gone: {text}"
+        );
+    }
+
+    /// A silent probe must name its exit status, because `timeout` kills the
+    /// probing bash mid-connect and stderr comes back EMPTY.
+    ///
+    /// RED before this change: the detail was the raw stderr, so a guest that
+    /// never answered and a prober that printed nothing both produced `""`,
+    /// and the readiness error said `probe: (silence)` either way. That is the
+    /// distinction the whole diagnosis turns on.
+    #[test]
+    fn a_silent_probe_reports_its_exit_status_not_an_empty_string() {
+        let detail = describe_silent_probe(Some(124), "");
+        assert!(detail.contains("exit=124"), "{detail}");
+        assert!(detail.contains("no SYN-ACK or RST"), "{detail}");
+        assert!(!detail.is_empty());
+    }
+
+    /// Exit 124 says only what was OBSERVED. A dropped SYN, a guest firewall
+    /// DROP and a lost reply are all consistent with it, so the wording must
+    /// not assert the guest never received the packet (review finding).
+    #[test]
+    fn the_timeout_wording_claims_only_what_was_observed() {
+        let detail = describe_silent_probe(Some(124), "");
+        assert!(
+            !detail.contains("never replied") && !detail.contains("never received"),
+            "must not infer where the packet was lost: {detail}"
+        );
+    }
+
+    /// A prober that failed for its own reasons is not the guest's silence.
+    #[test]
+    fn a_prober_error_is_distinguishable_from_guest_silence() {
+        let detail = describe_silent_probe(Some(127), "bash: line 1: nsenter: not found");
+        assert!(detail.contains("exit=127"), "{detail}");
+        assert!(detail.contains("probe error"), "{detail}");
+        assert!(detail.contains("nsenter: not found"), "{detail}");
+    }
+
+    /// A probe killed by a signal has no exit code; it still must not be blank.
+    #[test]
+    fn a_signalled_probe_still_reports_something() {
+        let detail = describe_silent_probe(None, "");
+        assert!(detail.contains("signal"), "{detail}");
+    }
+
     use crate::utils::{DirEventSource, ProcessWatch};
     use std::future::{poll_fn, Future};
     use std::pin::Pin;
@@ -1809,9 +2014,16 @@ mod tests {
             }
             Ok(TcpAnswer {
                 // The captured failure logged nothing on stderr: the probe simply
-                // timed out waiting for an answer, it did not fail to run.
+                // timed out waiting for an answer, it did not fail to run. The
+                // real prober turns that empty stderr into an exit-status
+                // description, so the scripted one uses the same function
+                // rather than a hand-written string that could drift from it.
                 answered: self.last_answer,
-                detail: String::new(),
+                detail: if self.last_answer {
+                    String::new()
+                } else {
+                    describe_silent_probe(Some(124), "")
+                },
             })
         }
 
