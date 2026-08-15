@@ -484,6 +484,25 @@ impl NetworkManager for RoutedNetwork {
         namespace::exec_in_namespace_checked(&ns_name, &["ip", "link", "set", &guest_veth, "up"])
             .await?;
 
+        // Pin the bridge MAC before it carries traffic. The guest holds a
+        // PERMANENT neighbour entry for GUEST_GATEWAY pointing at this exact
+        // address (fc-agent's NAMESPACE_MAC), so a kernel-assigned MAC here
+        // would send every reply to an address nothing owns. Routed mode uses
+        // 10.0.2.1 as the guest's DEFAULT GATEWAY, so that is not a degraded
+        // published port -- it is all IPv4 egress.
+        namespace::exec_in_namespace_checked(
+            &ns_name,
+            &[
+                "ip",
+                "link",
+                "set",
+                BRIDGE_DEVICE,
+                "address",
+                crate::network::pasta::NAMESPACE_MAC,
+            ],
+        )
+        .await?;
+
         // 5. Assign gateway IPs to bridge (VM connects here via TAP)
         let gw_cidr = format!("{}/24", GUEST_GATEWAY);
         namespace::exec_in_namespace_checked(

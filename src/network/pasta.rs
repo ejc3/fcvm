@@ -1732,6 +1732,45 @@ mod tests {
         );
     }
 
+    /// Every bridge the guest reaches through NAMESPACE_IP must carry
+    /// NAMESPACE_MAC.
+    ///
+    /// The guest pins ONE permanent neighbour entry for 10.0.2.1 and cannot
+    /// tell which networking mode it booted under. Rootless mode reaches that
+    /// address on pasta's bridge; ROUTED mode uses the very same address as the
+    /// guest's DEFAULT GATEWAY on a bridge of its own. Pinning the MAC in only
+    /// one of them sends every reply in the other to an address nothing owns --
+    /// which is not a degraded published port there, it is all IPv4 egress.
+    /// That regression shipped once and CI caught it as eight routed-mode
+    /// failures across both architectures.
+    #[test]
+    fn every_bridge_on_the_namespace_address_pins_the_same_mac() {
+        let routed = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/network/routed.rs"),
+        )
+        .expect("reading src/network/routed.rs");
+
+        assert!(
+            routed.contains("NAMESPACE_MAC"),
+            "routed mode does not pin its bridge to NAMESPACE_MAC. Its guests \
+             reach {} as their default gateway and hold a permanent neighbour \
+             entry for {}; an unpinned bridge MAC breaks all of their IPv4.",
+            NAMESPACE_IP,
+            NAMESPACE_MAC
+        );
+        assert!(
+            routed.contains("\"address\","),
+            "routed mode references NAMESPACE_MAC but never sets a link address \
+             with it"
+        );
+        assert!(
+            routed.contains(&format!("GUEST_GATEWAY: &str = \"{}\"", NAMESPACE_IP)),
+            "routed mode's gateway is no longer {}; re-check whether the guest's \
+             pinned neighbour entry still names the right address",
+            NAMESPACE_IP
+        );
+    }
+
     /// fc-agent hardcodes the same pair (it has no boot-plan field for them),
     /// so a change here that is not mirrored there silently reopens the ARP
     /// race that made published ports go silent. Read the guest's copy rather
