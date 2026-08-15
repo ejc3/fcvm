@@ -185,6 +185,12 @@ impl GuestProbe for NsenterGuestProbe {
             "env",
             "LC_ALL=C",
             "timeout",
+            // SIGKILL shortly after the TERM. `kill_on_drop` reaps only the
+            // direct child, so an abandoned attempt's `bash` is reachable only
+            // through this timeout; if TERM alone did not land, one process per
+            // retry would sit in the namespace holding a socket.
+            "-k",
+            "0.1",
             &format!("{probe_timeout:.2}"),
             "bash",
             "-c",
@@ -352,17 +358,30 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
             ));
         }
         let attempt = remaining.min(GUEST_PROBE_ATTEMPT_BUDGET);
+        // A stalled query keeps the previous reading for the ERROR MESSAGE only:
+        // an empty string means "no entry", and a query that never returned has
+        // not learned that. It must not count as evidence of readiness. Both
+        // halves have to hold in the SAME round, or a neighbour seen REACHABLE
+        // in round 1 could pair with round 2's TCP answer and declare a guest
+        // ready whose entry has since gone FAILED, which is precisely the
+        // stale-evidence failure this function exists to prevent.
+        let neighbor_is_fresh;
         match tokio::time::timeout(attempt, probe.neighbor(attempt)).await {
-            Ok(Ok(neighbor)) => last_neighbor = neighbor,
-            // Keep the previous reading rather than blanking it: an empty string
-            // means "no entry", and a stalled query has not learned that.
+            Ok(Ok(neighbor)) => {
+                last_neighbor = neighbor;
+                neighbor_is_fresh = true;
+            }
             Ok(Err(error)) if error.to_string().contains("readiness deadline") => {
                 stalled_attempts += 1;
+                neighbor_is_fresh = false;
             }
             Ok(Err(error)) => return Err(error),
-            Err(_elapsed) => stalled_attempts += 1,
+            Err(_elapsed) => {
+                stalled_attempts += 1;
+                neighbor_is_fresh = false;
+            }
         }
-        let resolved = neighbor_is_resolved(&last_neighbor);
+        let resolved = neighbor_is_fresh && neighbor_is_resolved(&last_neighbor);
 
         if answer.answered && resolved {
             // Report HOW LONG readiness took, on success as well as failure.
@@ -2289,6 +2308,59 @@ mod tests {
             "the loop must retry after abandoning the stalled attempt, but made \
              only {} attempt(s)",
             probe.attempts
+        );
+    }
+
+    /// A guest whose neighbour query answers once and then stalls forever,
+    /// while its TCP probe answers from the second round on.
+    struct StaleNeighborGuest {
+        rounds: u32,
+    }
+
+    impl GuestProbe for StaleNeighborGuest {
+        async fn answers_tcp(
+            &mut self,
+            _port: u16,
+            _budget: std::time::Duration,
+        ) -> Result<TcpAnswer> {
+            self.rounds += 1;
+            // Silent on round 1, answering afterwards: this is what makes the
+            // stale reading the only "resolved" evidence available.
+            Ok(TcpAnswer {
+                answered: self.rounds > 1,
+                detail: String::new(),
+            })
+        }
+
+        async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String> {
+            if self.rounds <= 1 {
+                return Ok("10.0.2.100 dev br0 lladdr 02:2c:77:3e:ae:5a REACHABLE".to_string());
+            }
+            // Never returns within the attempt budget again.
+            tokio::time::sleep(budget * 4).await;
+            Ok(String::new())
+        }
+    }
+
+    /// Both halves must hold in the SAME round.
+    ///
+    /// Keeping the last neighbour reading across a stalled query is right for
+    /// the error message and wrong for the verdict: pairing round 1's REACHABLE
+    /// with round 2's TCP answer would declare ready a guest whose entry may
+    /// since have gone FAILED. That is the stale-evidence failure this function
+    /// was written to prevent, so a stalled query must not satisfy the
+    /// neighbour half.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_neighbor_query_cannot_satisfy_readiness() {
+        let mut probe = StaleNeighborGuest { rounds: 0 };
+        let deadline = tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE;
+
+        let result = wait_for_guest_to_answer(&mut probe, PROBE_PORT, deadline).await;
+
+        assert!(
+            result.is_err(),
+            "readiness must not be declared from a neighbour reading taken in an \
+             earlier round when this round's query never returned"
         );
     }
 
