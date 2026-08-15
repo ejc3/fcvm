@@ -3501,6 +3501,26 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
 
 
 
+# Arms that drive Chromium over CDP and therefore pay the per-request
+# handshake. html belongs here: it navigates and extracts the DOM over the
+# same connection, differing from cdp only in the terminal stage. Keeping this
+# set in one place is the point — it was spelled inline as {"cdp","cdp-fast"}
+# while the analyzer already classified html as CDP-class, so a legitimate
+# `--arms noop,html` publication run was refused with "requires at least one
+# CDP arm" (observed 2026-08-15, corpus campaign).
+CDP_CLASS_ARMS = frozenset({"cdp", "cdp-fast", "html"})
+
+
+def publication_arms_ok(arms) -> bool:
+    """Whether an arm set can back a publication run.
+
+    noop is the drift canary every published cell is judged against, and at
+    least one CDP-class arm has to actually render something.
+    """
+    arms = set(arms)
+    return "noop" in arms and bool(CDP_CLASS_ARMS & arms)
+
+
 def parse_urls(spec):
     """Split a comma-separated --url value; single URLs pass through as [url]."""
     return [u.strip() for u in spec.split(",") if u.strip()]
@@ -3671,8 +3691,11 @@ def main_with_resources(resources: ExitStack) -> int:
     # faults a large run-varying page set that pollutes the shared prefetch
     # working set and destabilizes the noop drift canary. Requiring it forced
     # the arm that corrupts the baseline into every publication run.
-    if "noop" not in arms or not ({"cdp", "cdp-fast"} & set(arms)):
-        p.error("publication runs require noop and at least one CDP arm")
+    if not publication_arms_ok(arms):
+        p.error(
+            "publication runs require noop and at least one CDP arm "
+            "(cdp, cdp-fast, or html)"
+        )
 
     urls = parse_urls(args.url)
     if not urls:
