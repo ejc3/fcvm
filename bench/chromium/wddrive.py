@@ -77,6 +77,9 @@ def create_session(host, timeout=120.0):
             "alwaysMatch": {
                 "browserName": "MiniBrowser",
                 "acceptInsecureCerts": True,
+                # pageLoadStrategy "none" is a WORKAROUND for a WebKit defect,
+                # not a shortcut. See navigate() below for the evidence.
+                "pageLoadStrategy": "none",
                 "webkitgtk:browserOptions": {
                     "binary": MINIBROWSER,
                     "args": ["--automation"],
@@ -88,8 +91,53 @@ def create_session(host, timeout=120.0):
     return value["sessionId"]
 
 
-def navigate(host, session, url, timeout=120.0):
+def navigate(host, session, url, timeout=120.0, poll_s=0.01):
+    """Navigate, then wait for readyState ourselves rather than trusting WebDriver.
+
+    WebKitGTK loses the navigation-completion notification. Measured on
+    2.52.5 (current upstream stable) AND 2.50.6: POST /session/<id>/url never
+    returns on 13 of 31 fresh sessions (42%, 95% CI [26%, 59%]) for a page that
+    does a large synchronous layout plus a canvas readback. It is not a hang.
+    Probed during a CONFIRMED stall, 25 s in, with the navigate still
+    outstanding:
+
+        document.readyState  -> "complete"
+        page's own marker    -> "done layout_ms=1145.0 canvas_ms=160.0 checksum=65030"
+        document.querySelectorAll("tr").length -> 1200
+        GET /status, /url, /title -> 200 in under 3 ms
+
+    So the page finished in ~1.3 s, JavaScript still executes, and only the
+    COMMAND fails to complete. Nor does anything rescue it: the driver arms no
+    timer of its own (Session::go just sends navigateBrowsingContext and waits),
+    and the browser-side deadline never fired -- one navigate ran 390 s against
+    a 300 s pageLoad timeout. A client that waits on this command waits forever.
+
+    So do not wait on it. With pageLoadStrategy "none",
+    WebAutomationSession::waitForNavigationToCompleteOnPage returns immediately
+    by its own first branch:
+
+        if (loadStrategy == PageLoadStrategy::None || (!pageLoadState->isLoading()
+            && !pageLoadState->hasUncommittedLoad())) { callback({ }); return; }
+
+    and readiness is then established by polling document.readyState over
+    execute/sync -- a different command path, demonstrably alive throughout the
+    stall. That also makes navigate_ms mean the same thing as Chromium's
+    navigate-to-load-event rather than "whenever WebKit felt like replying".
+    """
+    deadline = time.monotonic() + timeout
     wd(host, "POST", f"/session/{session}/url", {"url": url}, timeout=timeout)
+    while True:
+        state = wd(host, "POST", f"/session/{session}/execute/sync",
+                   {"script": "return document.readyState", "args": []},
+                   timeout=max(1.0, deadline - time.monotonic()))
+        if state == "complete":
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"document.readyState={state!r} after {timeout:.0f}s; the page "
+                "never reached complete (this is a REAL load failure, unlike the "
+                "lost-notification defect this poll works around)")
+        time.sleep(poll_s)
 
 
 def screenshot(host, session, timeout=60.0):
