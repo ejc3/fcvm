@@ -352,12 +352,19 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
     // answered (its own TIME-WAIT socket was in the namespace dump). Carry the
     // state rather than inferring it from an absence.
     let mut last_answered = false;
+    // Whether `last_neighbor` came from a query that COMPLETED this round. A
+    // reading kept across a stalled query is useful context and must not be
+    // presented as current state: a resolved entry from an earlier round would
+    // otherwise steer the error into the "resolved to a MAC but never answered"
+    // arm while TCP had in fact answered, making one message contradict itself.
+    let mut last_neighbor_fresh = false;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(guest_unanswered_error(
                 &last_neighbor,
+                last_neighbor_fresh,
                 &last_detail,
                 last_answered,
                 rounds,
@@ -410,6 +417,7 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
         if remaining.is_zero() {
             return Err(guest_unanswered_error(
                 &last_neighbor,
+                last_neighbor_fresh,
                 &last_detail,
                 last_answered,
                 rounds,
@@ -429,15 +437,18 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
             Ok(Ok(neighbor)) => {
                 last_neighbor = neighbor;
                 neighbor_is_fresh = true;
+                last_neighbor_fresh = true;
             }
             Ok(Err(error)) if error.to_string().contains("readiness deadline") => {
                 stalled_attempts += 1;
                 neighbor_is_fresh = false;
+                last_neighbor_fresh = false;
             }
             Ok(Err(error)) => return Err(error),
             Err(_elapsed) => {
                 stalled_attempts += 1;
                 neighbor_is_fresh = false;
+                last_neighbor_fresh = false;
             }
         }
         let resolved = neighbor_is_fresh && neighbor_is_resolved(&last_neighbor);
@@ -464,6 +475,7 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
         if remaining.is_zero() {
             return Err(guest_unanswered_error(
                 &last_neighbor,
+                last_neighbor_fresh,
                 &last_detail,
                 last_answered,
                 rounds,
@@ -506,6 +518,7 @@ fn host_load_snapshot() -> String {
 
 fn guest_unanswered_error(
     neighbor: &str,
+    neighbor_fresh: bool,
     detail: &str,
     answered: bool,
     rounds: u32,
@@ -521,17 +534,27 @@ fn guest_unanswered_error(
         (false, true) => "(silence)",
         (false, false) => detail,
     };
-    if neighbor_is_resolved(neighbor) {
+    // Only a reading from THIS round describes the current state. A stale one
+    // is labelled as such rather than silently standing in for a fresh answer.
+    let neighbor_note = if neighbor_fresh {
+        ""
+    } else if neighbor.is_empty() {
+        " (never read: every neighbour query stalled)"
+    } else {
+        " (STALE: this round's query stalled; reading is from an earlier round)"
+    };
+    if neighbor_fresh && neighbor_is_resolved(neighbor) && !answered {
         // The failure this whole path exists to catch: pasta can reach the
         // guest's MAC, so every host-side check passes, but nothing is answering
         // behind it. Report it here rather than letting a client discover it.
         anyhow::anyhow!(
             "guest {} resolved to a MAC but never answered a TCP probe within {:?}: \
              the guest is not reachable even though its neighbour entry is present; \
-             neighbour: {}; probe: {}; rounds {} ({} stalled); host {}",
+             neighbour: {}{}; probe: {}; rounds {} ({} stalled); host {}",
             GUEST_IP,
             GUEST_ANSWER_DEADLINE,
             neighbor,
+            neighbor_note,
             detail,
             rounds,
             stalled_attempts,
@@ -539,7 +562,7 @@ fn guest_unanswered_error(
         )
     } else {
         anyhow::anyhow!(
-            "guest {} never appeared at L2 within {:?}: {}; neighbour: {:?}; \
+            "guest {} never appeared at L2 within {:?}: {}; neighbour: {:?}{}; \
              probe: {}; rounds {} ({} stalled); host {}",
             GUEST_IP,
             GUEST_ANSWER_DEADLINE,
@@ -552,6 +575,7 @@ fn guest_unanswered_error(
                 "no resolved neighbour entry and no TCP answer"
             },
             neighbor,
+            neighbor_note,
             detail,
             rounds,
             stalled_attempts,
@@ -2429,10 +2453,25 @@ mod tests {
 
         let result = wait_for_guest_to_answer(&mut probe, PROBE_PORT, deadline).await;
 
-        assert!(
-            result.is_err(),
+        let error = result.expect_err(
             "readiness must not be declared from a neighbour reading taken in an \
-             earlier round when this round's query never returned"
+             earlier round when this round's query never returned",
+        );
+        let text = error.to_string();
+
+        // The verdict was right; the DIAGNOSTIC must be too. A stale resolved
+        // entry must not steer the message into "resolved to a MAC but never
+        // answered" while TCP did answer, which would make one error contradict
+        // itself, and must never be presented as the current reading.
+        assert!(
+            text.contains("STALE") || text.contains("never read"),
+            "a neighbour reading kept across a stalled query must be labelled, not \
+             presented as this round's state: {text}"
+        );
+        assert!(
+            !text.contains("never answered a TCP probe"),
+            "TCP answered, so the error must not select the never-answered arm on \
+             the strength of a stale neighbour entry: {text}"
         );
     }
 
