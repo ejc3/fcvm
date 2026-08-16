@@ -176,7 +176,11 @@ pub async fn export_image_archive(image_id: &str, repo_tag: &str, dest: &Path) -
     let output = tokio::process::Command::new("skopeo")
         .args([
             "copy",
-            &format!("containers-storage:{}", image_id),
+            &format!(
+                "containers-storage:{}{}",
+                podman_store_specifier().await,
+                image_id
+            ),
             &format!("docker-archive:{}:{}", dest_str, repo_tag),
         ])
         .output()
@@ -202,6 +206,87 @@ pub async fn export_image_archive(image_id: &str, repo_tag: &str, dest: &Path) -
     }
 
     Ok(())
+}
+
+/// The explicit `[driver@graphroot+runroot]` store specifier for skopeo's
+/// `containers-storage:` transport, taken from the store podman itself uses.
+///
+/// skopeo resolves the store from storage.conf alone and does not apply
+/// podman's rootless remap, so on a host whose /etc/containers/storage.conf
+/// pins a root-only runroot (e.g. `/run/containers/storage`), a rootless
+/// `skopeo copy containers-storage:<id>` fails with `mkdir ... permission
+/// denied` for an image rootless podman built moments earlier. Naming the
+/// store explicitly makes skopeo read the same store podman wrote. Empty on
+/// any failure: the bare transport then behaves exactly as before.
+async fn podman_store_specifier() -> String {
+    let output = tokio::process::Command::new("podman")
+        .args([
+            "info",
+            "--format",
+            "{{.Store.GraphDriverName}}@{{.Store.GraphRoot}}+{{.Store.RunRoot}}",
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            store_specifier(String::from_utf8_lossy(&out.stdout).trim())
+        }
+        _ => String::new(),
+    }
+}
+
+/// Format podman's `driver@graphroot+runroot` triple as a skopeo store
+/// specifier, or empty when the triple is incomplete (skopeo then falls back
+/// to its own storage.conf resolution rather than getting a malformed name).
+fn store_specifier(triple: &str) -> String {
+    // `podman info` can print warnings around the formatted line; a specifier
+    // built from multi-line output would embed a newline in the skopeo source
+    // name. Require exactly one line.
+    if triple.lines().count() != 1 {
+        return String::new();
+    }
+    let (driver, paths) = match triple.split_once('@') {
+        Some(parts) => parts,
+        None => return String::new(),
+    };
+    let (graphroot, runroot) = match paths.split_once('+') {
+        Some(parts) => parts,
+        None => return String::new(),
+    };
+    if driver.is_empty() || !graphroot.starts_with('/') || !runroot.starts_with('/') {
+        return String::new();
+    }
+    format!("[{}]", triple)
+}
+
+#[cfg(test)]
+mod store_specifier_tests {
+    use super::store_specifier;
+
+    #[test]
+    fn well_formed_triple_becomes_a_bracketed_specifier() {
+        assert_eq!(
+            store_specifier(
+                "overlay@/home/u/.local/share/containers/storage+/run/user/1000/containers"
+            ),
+            "[overlay@/home/u/.local/share/containers/storage+/run/user/1000/containers]"
+        );
+    }
+
+    #[test]
+    fn incomplete_triples_fall_back_to_the_bare_transport() {
+        // A malformed specifier would make skopeo fail on EVERY host; an
+        // empty one only fails on hosts whose storage.conf is wrong for
+        // rootless, which is the pre-existing behavior.
+        assert_eq!(store_specifier(""), "");
+        assert_eq!(store_specifier("overlay"), "");
+        assert_eq!(store_specifier("overlay@/graph"), "");
+        assert_eq!(store_specifier("@/graph+/run"), "");
+        assert_eq!(store_specifier("overlay@graph+run"), "");
+        // A warning line around the triple must not become part of a
+        // bracketed source name with an embedded newline.
+        assert_eq!(store_specifier("overlay@/graph+/run\nWARN: something"), "");
+    }
 }
 
 /// Create an ext4 disk image from a directory's contents.
