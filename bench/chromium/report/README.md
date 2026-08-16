@@ -147,6 +147,16 @@ all publishable, zero failures. 2 vCPUs measures **982.9 ms**, 4 measures 695.7,
 round trip costs 6.8 ms on 2 vCPUs and 3.9 ms on 4 -- and the host-container
 control moved only +9.5% because it gets all 64 cores.
 
+What the curve supports: vCPU count is baked into the golden, so the three
+points are three goldens, and this file's own rule is that absolutes are
+per-golden. The spread is measured, not assumed -- the 2 vCPU configuration was
+measured three times across three goldens at 916.9, 951.2 and 982.9 ms, so
+golden-to-golden plus run-to-run variation is at least 66 ms here. The 2->4
+step (287 ms) is four times that and holds; the 4->8 step (48 ms) is smaller
+than it and does NOT. Eight vCPUs is not shown to be faster than four, only not
+slower. Each point is also one gated run: 202 samples, one experimental unit,
+so the harness's intervals are within-run and carry no run-to-run variance.
+
 Ruled out with the run that did it: working-set replay, the memory backend,
 the firecracker binary (including rebuilding the sealed run's own branch), port
 forwarding, the restore path, metric drift, host CPU, guest CPU, guest kernel.
