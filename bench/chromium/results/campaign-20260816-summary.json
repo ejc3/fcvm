@@ -1,4 +1,5 @@
 {
+  "_note": "Every cell's binary identity is recorded per run. reqbench.sh seals fcvm, fc-agent and its five harness sources into runtime_bundle_sha256 and REFUSES a golden recorded under a different bundle hash, so a rebuild between golden and measurement fails the run rather than silently mixing binaries.",
   "sealed-2026-08-14-2vcpu-minor": {
     "record": "archived: bench-evidence-archive reqbench-20260814-042319-uffd",
     "publishable": true,
@@ -10,6 +11,10 @@
     "snapshot": "cb-req-corpus",
     "image_id": "sha256:2636a9e21e32",
     "source_revision": "50d343f8b45f",
+    "fcvm_sha256": "a4a07b9d84303fbc",
+    "harness_sha256": "a2d18cdde602b7a3",
+    "runtime_bundle_sha256": "3357ce1f29b089b1",
+    "snapshot_generation_id": "6ef72c0c-fda2-4a42-a4ab-c48dc42d8cb8",
     "cdp": {
       "resolve_ms": 129.3286950003676,
       "tcp_ms": 0.07611700129928067,
@@ -33,6 +38,10 @@
     "snapshot": "cb-req-corpus",
     "image_id": "sha256:efdfd9969560",
     "source_revision": "e4e4df8de131",
+    "fcvm_sha256": "3976d0ba3b914b4c",
+    "harness_sha256": "94fd07e56819c351",
+    "runtime_bundle_sha256": "97c5f2d3cdcae29b",
+    "snapshot_generation_id": "bd947faa-9bae-4710-925f-ea0622e64ca8",
     "cdp": {
       "resolve_ms": 155.264754500422,
       "tcp_ms": 0.05689249974238919,
@@ -56,6 +65,10 @@
     "snapshot": "cb-req-corpus",
     "image_id": "sha256:efdfd9969560",
     "source_revision": "e4e4df8de131",
+    "fcvm_sha256": "3976d0ba3b914b4c",
+    "harness_sha256": "94fd07e56819c351",
+    "runtime_bundle_sha256": "97c5f2d3cdcae29b",
+    "snapshot_generation_id": "bd947faa-9bae-4710-925f-ea0622e64ca8",
     "cdp": {
       "resolve_ms": 156.6685234997749,
       "tcp_ms": 0.05735949980589794,
@@ -79,6 +92,10 @@
     "snapshot": "cb-req-corpus",
     "image_id": "sha256:efdfd9969560",
     "source_revision": "e4e4df8de131",
+    "fcvm_sha256": "3976d0ba3b914b4c",
+    "harness_sha256": "94fd07e56819c351",
+    "runtime_bundle_sha256": "97c5f2d3cdcae29b",
+    "snapshot_generation_id": "bd947faa-9bae-4710-925f-ea0622e64ca8",
     "cdp": {
       "resolve_ms": 212.33849750024092,
       "tcp_ms": 0.05971300015517045,
@@ -102,6 +119,10 @@
     "snapshot": "cb-req-corpus",
     "image_id": "sha256:efdfd9969560",
     "source_revision": "e4e4df8de131",
+    "fcvm_sha256": "3976d0ba3b914b4c",
+    "harness_sha256": "94fd07e56819c351",
+    "runtime_bundle_sha256": "97c5f2d3cdcae29b",
+    "snapshot_generation_id": "bd947faa-9bae-4710-925f-ea0622e64ca8",
     "cdp": {
       "resolve_ms": 157.8215764993729,
       "tcp_ms": 0.05841550046170596,
@@ -125,6 +146,10 @@
     "snapshot": "cb-req-corpus-oldfc",
     "image_id": "sha256:efdfd9969560",
     "source_revision": "efee22086511",
+    "fcvm_sha256": "f1fb5376617bc89e",
+    "harness_sha256": "94fd07e56819c351",
+    "runtime_bundle_sha256": "72fd5e8ee5fdd466",
+    "snapshot_generation_id": "6ba1c78f-7512-4490-8350-5731622f969c",
     "cdp": {
       "resolve_ms": 154.40031549951527,
       "tcp_ms": 0.05748799958382733,
@@ -148,6 +173,10 @@
     "snapshot": "cb-req-corpus-cpu4",
     "image_id": "sha256:efdfd9969560",
     "source_revision": "efee22086511",
+    "fcvm_sha256": "3f85bd26f3a9a53a",
+    "harness_sha256": "94fd07e56819c351",
+    "runtime_bundle_sha256": "99d68836299b0f84",
+    "snapshot_generation_id": "3002181e-7c05-4e5b-8496-69710c37e552",
     "cdp": {
       "resolve_ms": 153.79768349976075,
       "tcp_ms": 0.05491199954121839,
@@ -171,6 +200,10 @@
     "snapshot": "cb-req-corpus-cpu8",
     "image_id": "sha256:efdfd9969560",
     "source_revision": "efee22086511",
+    "fcvm_sha256": "3f85bd26f3a9a53a",
+    "harness_sha256": "94fd07e56819c351",
+    "runtime_bundle_sha256": "99d68836299b0f84",
+    "snapshot_generation_id": "2ebb4dd9-2fc0-4265-a4be-f9b1cf1928ea",
     "cdp": {
       "resolve_ms": 204.4307595006103,
       "tcp_ms": 0.05617300030280603,
