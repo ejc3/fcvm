@@ -365,6 +365,11 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
     // otherwise steer the error into the "resolved to a MAC but never answered"
     // arm while TCP had in fact answered, making one message contradict itself.
     let mut last_neighbor_fresh = false;
+    // Whether ANY neighbour query completed, across every round. This separates
+    // "we looked and the entry was not resolved" from "we never managed to
+    // look", which the error message already distinguished in words while the
+    // verdict treated them identically. See the deadline arm below.
+    let mut neighbor_ever_read = false;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -445,6 +450,7 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
                 last_neighbor = neighbor;
                 neighbor_is_fresh = true;
                 last_neighbor_fresh = true;
+                neighbor_ever_read = true;
             }
             Ok(Err(error)) if error.to_string().contains("readiness deadline") => {
                 stalled_attempts += 1;
@@ -480,6 +486,37 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            // A stalled `ip neigh` is a failure to OBSERVE, not an observation
+            // of failure. The TCP answer is direct end-to-end evidence over the
+            // same path the forwarded traffic takes; the neighbour entry is a
+            // proxy for it. When the direct evidence is positive and the proxy
+            // was never readable at all, failing the guest reports a HOST
+            // scheduling problem as guest unreachability.
+            //
+            // Observed 2026-08-16 killing a restored clone in
+            // test_fuzz_lifecycle_chaos on two unrelated PRs, with the host at
+            // load 155.57 and 7618 tasks: "the guest ANSWERED TCP but its
+            // neighbour entry never resolved; neighbour: "" (never read: every
+            // neighbour query stalled); rounds 5 (5 stalled)".
+            //
+            // Deliberately narrow. It requires the probe to have answered AND
+            // every neighbour query across every round to have stalled. A
+            // neighbour entry that was READ and found unresolved still fails,
+            // and so does a guest that never answered — including the
+            // resolved-MAC-but-silent case this function exists to catch.
+            if last_answered && !neighbor_ever_read {
+                warn!(
+                    guest_ip = GUEST_IP,
+                    probe_port,
+                    rounds,
+                    stalled_attempts,
+                    host = %host_load_snapshot(),
+                    "guest answered TCP but the neighbour table was never readable; \
+                     accepting on the TCP evidence. This means the host was too loaded \
+                     to run `ip neigh` within the budget, not that the guest was slow"
+                );
+                return Ok(());
+            }
             return Err(guest_unanswered_error(
                 &last_neighbor,
                 last_neighbor_fresh,
@@ -498,6 +535,32 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
         );
         tokio::time::sleep(remaining.min(GUEST_ANSWER_RETRY_DELAY)).await;
     }
+}
+
+/// The deadline for the port-forward wait, which is NOT the remainder of the
+/// guest-answer wait.
+///
+/// The two stages prove different things in sequence: that the guest's stack
+/// answers, then that pasta's forward is wired. They used to share one
+/// `GUEST_ANSWER_DEADLINE`, so a slow first stage starved the second — and the
+/// first stage is slowest on exactly the hosts where the second one also needs
+/// time.
+///
+/// That became reachable the moment `wait_for_guest_to_answer` learned to
+/// accept on TCP evidence when every neighbour query stalled: it now returns Ok
+/// AT the deadline instead of Err, so the port-forward wait was handed zero.
+/// Observed on a CI runner at load 155:
+///
+/// ```text
+/// WARN  guest answered TCP but the neighbour table was never readable; accepting on the TCP evidence
+/// ERROR pasta port forward not ready within caller readiness budget 0ns: 127.0.0.7:27972
+/// ```
+///
+/// A working VM was torn down for a budget it was never given. Each stage gets
+/// its own, so the worst case is two budgets rather than one shared one — which
+/// is the cost of not killing a guest that answered.
+fn port_forward_deadline(now: tokio::time::Instant) -> tokio::time::Instant {
+    now + GUEST_ANSWER_DEADLINE
 }
 
 /// Deadline error for [`wait_for_guest_to_answer`], naming which half was missing.
@@ -1862,7 +1925,8 @@ impl NetworkManager for PastaNetwork {
                 .await;
             return Err(error);
         }
-        self.wait_for_port_forwarding_until(deadline).await
+        self.wait_for_port_forwarding_until(port_forward_deadline(tokio::time::Instant::now()))
+            .await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1873,6 +1937,35 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest-answer wait that consumed its whole budget must not starve the
+    /// port-forward wait that follows it.
+    ///
+    /// RED WITHOUT THE FIX: the two shared one deadline, so when the first
+    /// stage ran to it — which is what the accept-on-TCP-evidence branch does
+    /// by construction — the second was handed 0ns and failed immediately.
+    /// Observed in CI as `pasta port forward not ready within caller readiness
+    /// budget 0ns`, one line after the WARN saying the guest had answered.
+    #[test]
+    fn the_port_forward_wait_gets_its_own_budget() {
+        let start = tokio::time::Instant::now();
+        let guest_answer_deadline = start + GUEST_ANSWER_DEADLINE;
+        // Stage one used every microsecond it had.
+        let after_stage_one = guest_answer_deadline;
+
+        let deadline = port_forward_deadline(after_stage_one);
+        let budget = deadline.saturating_duration_since(after_stage_one);
+
+        assert_eq!(
+            budget, GUEST_ANSWER_DEADLINE,
+            "the port-forward wait inherited the exhausted guest-answer deadline, \
+             so a guest that ANSWERED is torn down for a budget it never got"
+        );
+        assert!(
+            !budget.is_zero(),
+            "zero budget: the wait fails before it can make a single attempt"
+        );
+    }
 
     /// End to end: the readiness ERROR must carry the probe's exit status.
     ///
@@ -2411,6 +2504,85 @@ mod tests {
             "the loop must retry after abandoning the stalled attempt, but made \
              only {} attempt(s)",
             probe.attempts
+        );
+    }
+
+    /// A guest that answers TCP while every neighbour query stalls.
+    ///
+    /// The shape observed on a saturated x64 CI runner (load 155.57, 7618
+    /// tasks): the probe answered every round, and `ip neigh` never once
+    /// returned inside its budget.
+    struct UnobservableNeighborGuest {
+        rounds: u32,
+        stall: std::time::Duration,
+    }
+
+    impl GuestProbe for UnobservableNeighborGuest {
+        async fn answers_tcp(
+            &mut self,
+            _port: u16,
+            _budget: std::time::Duration,
+        ) -> Result<TcpAnswer> {
+            self.rounds += 1;
+            Ok(TcpAnswer {
+                answered: true,
+                detail: String::new(),
+            })
+        }
+
+        async fn neighbor(&mut self, _budget: std::time::Duration) -> Result<String> {
+            tokio::time::sleep(self.stall).await;
+            Ok("10.0.2.100 dev br0 lladdr 02:2c:77:3e:ae:5a REACHABLE".to_string())
+        }
+    }
+
+    /// A guest that ANSWERS must not be failed because the host could not be
+    /// scheduled to look at its ARP cache.
+    ///
+    /// RED BEFORE THE FIX: success required `answered && resolved`, and
+    /// `resolved` requires a FRESH neighbour read, so a host too loaded to run
+    /// `ip neigh` inside the budget failed a guest that was demonstrably
+    /// reachable. Observed on 2026-08-16 killing a restored clone in
+    /// test_fuzz_lifecycle_chaos on two unrelated PRs:
+    ///
+    ///   port forwarding verification failed after snapshot restore: guest
+    ///   10.0.2.100 never appeared at L2 within 5s: the guest ANSWERED TCP but
+    ///   its neighbour entry never resolved; neighbour: "" (never read: every
+    ///   neighbour query stalled); probe: answered (SYN-ACK or RST); rounds 5
+    ///   (5 stalled); host load 155.57/56.96/27.93, runnable 8/7618
+    ///
+    /// A stalled query is a failure to OBSERVE, not an observation of failure.
+    /// The TCP answer is direct end-to-end evidence over the same path the
+    /// forwarded traffic takes; the neighbour entry is a proxy for it. When the
+    /// direct evidence is positive and the proxy is unreadable, the proxy must
+    /// not override it.
+    ///
+    /// The opposite case is untouched and still fails: a guest whose neighbour
+    /// entry IS readable and resolved but which never answers is caught by
+    /// `a_resolved_neighbour_that_never_answers_is_reported_as_such`.
+    #[tokio::test(start_paused = true)]
+    async fn an_answering_guest_survives_an_unreadable_neighbour_table() {
+        let mut probe = UnobservableNeighborGuest {
+            rounds: 0,
+            // Every neighbour query outlives its per-attempt budget.
+            stall: GUEST_ANSWER_DEADLINE * 6,
+        };
+        let deadline = tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE;
+
+        let result = wait_for_guest_to_answer(&mut probe, PROBE_PORT, deadline).await;
+
+        assert!(
+            result.is_ok(),
+            "the guest answered every round; failing it because `ip neigh` could \
+             not be scheduled reports a host-side observability failure as guest \
+             unreachability: {:?}",
+            result.err()
+        );
+        assert!(
+            probe.rounds >= 2,
+            "the loop must keep probing while the neighbour query stalls, but \
+             made only {} round(s)",
+            probe.rounds
         );
     }
 

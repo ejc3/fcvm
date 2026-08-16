@@ -78,6 +78,55 @@ def spawn_mixed_parent(linger_bin, fast_bin):
     return subprocess.Popen([sys.executable, "-c", code, linger_bin, fast_bin])
 
 
+def wait_for_execed_children(pid, want, timeout):
+    """Wait until `pid` has `want` children that have finished exec'ing.
+
+    Waiting for the fork alone is not enough. `fork()` copies the parent's
+    `comm`, and `execve` is what replaces it, so between the two a child of a
+    python parent reads back as "python3". A loop that stops at
+    `len(children_of(pid)) >= want` therefore races the exec, and any assertion
+    on the names is a coin flip weighted by how loaded the box is. On this
+    64-core host the exec effectively always won; on a shared GitHub-hosted
+    runner it did not, and the precondition failed as
+
+        AssertionError: Lists differ: ['lingersleep', 'python3'] != ['lingersleep', 'fastexit']
+
+    Returns (pids, comms) whatever happens — the caller still asserts, so a
+    child that never execs fails the test rather than hanging it.
+    """
+    parent_comm = reqbench.proc_comm(pid)
+    deadline = time.monotonic() + timeout
+    kids, comms = [], []
+    while True:
+        kids = reqbench.children_of(pid)
+        comms = [reqbench.proc_comm(k) for k in kids]
+        settled = len(kids) >= want and all(
+            c is not None and c != parent_comm for c in comms
+        )
+        if settled or time.monotonic() >= deadline:
+            return kids, comms
+        time.sleep(0.005)
+
+
+def spawn_slow_exec_parent(child_bin, preexec_delay_s):
+    """A parent whose child sits in `preexec_fn` for a known interval.
+
+    `preexec_fn` runs in the child AFTER fork and BEFORE exec, which makes the
+    otherwise sub-millisecond pre-exec window wide enough to observe on purpose.
+    That is what lets the race above be reproduced deterministically instead of
+    waited for.
+    """
+    code = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.argv[1],'300'],"
+        " preexec_fn=lambda: time.sleep(float(sys.argv[2])));"
+        "time.sleep(3600)"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", code, child_bin, str(preexec_delay_s)]
+    )
+
+
 def spawn_pdeathsig_parent_ignoring_sigterm(child_argv):
     """A parent that IGNORES SIGTERM but whose child dies with it.
 
@@ -943,6 +992,19 @@ class TeardownFastCpuAccounting(unittest.TestCase):
     harness's own `pass` loop, then multiplied by the whole reclaim window.
     """
 
+    def setUp(self):
+        # machine_counter_tracks_this_process memoizes into a module global,
+        # because whether /proc/stat encloses this process is a property of the
+        # host and re-measuring it burns a core for ~320 ms per call. That is
+        # right in production and wrong across tests: the frozen-counter test
+        # mocks the counter, caches False, and every later test then reads that
+        # cached answer instead of asking. Observed as
+        #   test_the_probe_reports_this_host_tracks_its_own_processes
+        #   AssertionError: False is not true
+        # on a host that tracks perfectly well. Reset per test so each one
+        # measures what it claims to.
+        reqbench._MACHINE_COUNTER_TRACKS = None
+
     def test_control_window_does_not_measure_our_own_spin(self):
         from unittest import mock
 
@@ -1013,9 +1075,167 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         self.assertIs(normal["clamped"], False)
 
     def test_cpu_residual_rejects_an_impossible_negative_delta(self):
+        """A machine counter that MOVED, but by less than the harness it encloses.
+
+        The machine figure must be non-zero. A zero is a different condition
+        entirely (the counter does not track this process at all) and is
+        asserted separately below; using zero here made this test pass for a
+        reason it did not intend.
+
+        `tracks` states the environment: a host whose /proc/stat DOES enclose
+        its processes. On such a host a shortfall this large is a real
+        accounting bug and must still be raised as one.
+        """
         with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
             reqbench.bounded_cpu_residual(
-                0.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 10.0
+                10.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 100.0,
+                tracks=lambda: True,
+            )
+
+    def test_a_dead_machine_counter_is_named_not_reported_as_a_violation(self):
+        """machine=0 while the harness burned CPU means the counter is unusable.
+
+        Observed on GitHub-hosted runners: machine=0.000000ms against
+        harness=150.000000ms. That is not the measurement disagreeing with
+        itself, it is /proc/stat not tracking this process, and reporting it as
+        an enclosure violation sent a reader hunting an accounting bug that did
+        not exist while the bench suite passed on every real bench host.
+        """
+        with self.assertRaises(reqbench.MachineCpuCounterUnusable) as caught:
+            reqbench.bounded_cpu_residual(
+                0.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 10.0,
+                tracks=lambda: False,
+            )
+        self.assertIn("does not track this process", str(caught.exception))
+
+        # And it must NOT fire when the harness used nothing worth enclosing:
+        # a genuinely idle window legitimately reads zero on both counters.
+        quiet = reqbench.bounded_cpu_residual(0.0, 0.0)
+        self.assertEqual(quiet["raw_ms"], 0.0)
+
+    def test_one_tick_of_movement_is_not_tracking_either(self):
+        """RED BEFORE THE FIX: the guard asked `machine_ms == 0.0`.
+
+        That classified the GitHub-hosted runner correctly the first time
+        (machine=0.000000ms harness=150.000000ms) and wrongly the next, when the
+        same host reported
+
+            machine=10.000000ms harness=160.000000ms raw=-150.000000ms
+
+        One 10 ms jiffy is the counter's resolution, not evidence that it
+        tracks us, so the `== 0.0` test let the identical environment through as
+        an enclosure violation and failed the bench suite again.
+
+        The classifier is now the probe, not the magnitude of the shortfall, so
+        the SAME numbers land on either side depending only on what the host can
+        actually do.
+        """
+        observed = (10.0, 160.0)  # verbatim from the failing CI job
+        with self.assertRaises(reqbench.MachineCpuCounterUnusable):
+            reqbench.bounded_cpu_residual(*observed, tracks=lambda: False)
+        with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
+            reqbench.bounded_cpu_residual(*observed, tracks=lambda: True)
+
+    def test_a_cpu_measurement_failure_does_not_abort_the_teardown(self):
+        """RED BEFORE THE FIX: teardown reported "NOT reaped" for a reaped VM.
+
+        bounded_cpu_residual runs AFTER the kill, the wait and t_gone, so by the
+        time it can fail the process set is already terminal. Letting it
+        propagate made teardown_fast raise SurvivedTeardown with
+
+            state  and data  NOT reaped: host CPU delta is smaller than
+            enclosed harness CPU delta: machine=30.000000ms harness=160.000000ms
+
+        which is a statement about the MEASUREMENT dressed up as a statement
+        about the PROCESSES. On GitHub-hosted runners it failed the bench suite
+        for a teardown that had worked, and it set disk_reap_skipped on a VM
+        whose disk was safe to reap.
+
+        Fail-closed belongs on PUBLICATION: the figure is withheld and the error
+        recorded, so a reader gets a KeyError rather than a plausible number.
+        """
+        from unittest import mock
+
+        p = spawn_pdeathsig_parent(["sleep", "300"])
+        wait_for_child(p.pid)
+        kids = reqbench.children_of(p.pid)
+        self.assertEqual(len(kids), 1, "parent never forked its child")
+
+        boom = RuntimeError("host CPU delta is smaller than enclosed harness CPU delta")
+        with mock.patch.object(reqbench, "bounded_cpu_residual", side_effect=boom):
+            out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
+
+        self.assertTrue(out["all_gone"], "the process set must still be reaped")
+        self.assertNotIn("disk_reap_skipped", out,
+                         "a measurement failure must not skip the disk reap")
+        self.assertIn("per_child_cpu", out,
+                      "per-child CPU is measured before the residual and must survive it")
+        self.assertIn("RuntimeError", out["cpu_residual_error"] or "",
+                      "the measurement error must be recorded, not swallowed")
+        for absent in ("machine_cpu_ms_net", "control_busy_cores",
+                       "cpu_residual_uncertainty_ms"):
+            self.assertNotIn(absent, out,
+                             f"{absent} must be ABSENT, not zeroed, when unmeasurable")
+        for pid in kids:
+            self.assertFalse(reqbench.proc_stat_fields(pid),
+                             f"child {pid} survived a teardown that reported success")
+
+    def test_the_probe_reports_this_host_tracks_its_own_processes(self):
+        """The probe must say yes HERE, or it would excuse every real violation.
+
+        A probe that answered "not tracking" on a normal Linux host would turn
+        the enclosure check into a no-op everywhere — the fail-open shape this
+        repo keeps finding. This is a bench host; /proc/stat encloses it.
+        """
+        self.assertTrue(
+            reqbench.machine_counter_tracks_this_process(),
+            "/proc/stat did not reflect a deliberate CPU burn by this process; "
+            "if that is true of this host the enclosure check cannot work here",
+        )
+
+    def test_the_probe_reports_a_frozen_counter_as_untracked(self):
+        """And it must say no when the machine counter does not move."""
+        from unittest import mock
+
+        with mock.patch.object(reqbench, "machine_cpu_ms", return_value=100.0):
+            self.assertFalse(
+                reqbench.machine_counter_tracks_this_process(),
+                "a machine counter frozen across a deliberate burn is not tracking",
+            )
+
+    def test_ambient_load_alone_does_not_look_like_tracking(self):
+        """The case a single burn window cannot distinguish.
+
+        A counter that EXCLUDES this process but advances steadily because the
+        box is busy satisfies `machine_delta >= spent - tolerance` on its own.
+        The probe then declares the host healthy, and bounded_cpu_residual
+        raises RuntimeError -- "your accounting is wrong" -- where it should
+        raise MachineCpuCounterUnusable -- "this host cannot be measured". The
+        operator is sent to debug the wrong thing, and nothing in the record
+        says so.
+
+        Here the stub counter grows purely with WALL time at 4 cores' worth of
+        ambient load and never reflects our burn. Paired windows cancel it: the
+        idle and burn windows are the same length, so ambient contributes
+        equally to both and the difference is ~0.
+
+        RED WITHOUT THE PAIRED DESIGN: the single-window version compared
+        4 x window against our ~1 x window of burn and answered True.
+        """
+        from unittest import mock
+
+        start = time.monotonic()
+
+        def ambient_only():
+            # 4 cores of unrelated work, entirely independent of what we burn.
+            return (time.monotonic() - start) * 1000.0 * 4
+
+        with mock.patch.object(reqbench, "machine_cpu_ms", side_effect=ambient_only):
+            self.assertFalse(
+                reqbench.machine_counter_tracks_this_process(),
+                "a counter that only reflects ambient load was read as tracking "
+                "this process; on a busy host that turns the enclosure check "
+                "into a no-op",
             )
 
     def test_reclaim_sampler_does_not_burn_a_core(self):
@@ -1073,6 +1293,56 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 self.assertTrue(c["below_resolution"])
                 self.assertEqual(c["reclaim_cpu_ms_hi"], 2 * out["tick_ms"])
 
+    def test_the_child_wait_settles_on_exec_not_on_fork(self):
+        """The pre-exec window is real, and waiting for the fork does not close it.
+
+        RED BEFORE THE FIX: `test_every_tracked_child_gets_a_cpu_sample` waited
+        for `len(children_of(pid)) >= 2` and then read `proc_comm`. Between fork
+        and execve a child still carries its parent's comm, so that read can
+        return "python3" for a child that will become "lingersleep". It did, on
+        a GitHub-hosted runner, on 2026-08-16.
+
+        This makes the window deterministic with a 0.5 s `preexec_fn` instead of
+        hoping to catch a sub-millisecond one, and asserts both halves: the
+        fork-only wait observes the parent's comm, and the exec-aware wait does
+        not.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            child = os.path.join(d, "slowexec")
+            shutil.copy("/bin/sleep", child)
+            p = spawn_slow_exec_parent(child, 0.5)
+            try:
+                # The fork-only wait: exactly what the old precondition did.
+                deadline = time.monotonic() + 10
+                while (
+                    len(reqbench.children_of(p.pid)) < 1
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                kids = reqbench.children_of(p.pid)
+                self.assertEqual(len(kids), 1, "parent never forked its child")
+                self.assertEqual(
+                    reqbench.proc_comm(kids[0]),
+                    reqbench.proc_comm(p.pid),
+                    "the pre-exec window did not reproduce, so this test proves "
+                    "nothing about the wait — the child already carried its own "
+                    "comm the moment the fork became visible",
+                )
+                # The exec-aware wait, on the same live process.
+                kids, comms = wait_for_execed_children(p.pid, 1, 10)
+                self.assertEqual(
+                    comms, ["slowexec"],
+                    "wait_for_execed_children returned before execve replaced comm",
+                )
+            finally:
+                p.kill()
+                p.wait(timeout=5)
+                for k in kids:
+                    try:
+                        os.kill(k, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
     def test_every_tracked_child_gets_a_cpu_sample(self):
         """A fast child must not be skipped because a slow one was sampled first.
 
@@ -1094,15 +1364,12 @@ class TeardownFastCpuAccounting(unittest.TestCase):
             shutil.copy("/bin/sleep", fast)
             p = spawn_mixed_parent(linger, fast)
             try:
-                deadline = time.monotonic() + 10
-                while len(reqbench.children_of(p.pid)) < 2 and time.monotonic() < deadline:
-                    time.sleep(0.005)
-                kids = reqbench.children_of(p.pid)
+                kids, comms = wait_for_execed_children(p.pid, 2, 10)
                 self.assertEqual(len(kids), 2, "parent never forked both children")
                 # Precondition: the child that dies FIRST must be SECOND in fork
                 # order, or this test is not exercising the ordering defect at all.
                 self.assertEqual(
-                    [reqbench.proc_comm(k) for k in kids], ["lingersleep", "fastexit"],
+                    comms, ["lingersleep", "fastexit"],
                     "fork order is not [linger, fast]; the ordering defect is not exercised",
                 )
                 # `lingersleep` has no pdeathsig, so it survives and teardown_fast
@@ -1111,6 +1378,29 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 with self.assertRaises(reqbench.SurvivedTeardown) as cm:
                     reqbench.teardown_fast(p.pid, "", "", "", 1.0)
                 out = cm.exception.teardown
+                # Name the failure. teardown_fast raises SurvivedTeardown from
+                # three points BEFORE it samples CPU (attribution unprovable,
+                # owner set unpinnable, measure_fast_reap failed), and on those
+                # paths the record has no per_child_cpu at all. Reading it blind
+                # turned a diagnosable environment failure into a bare KeyError
+                # in CI, which said nothing about which path fired.
+                # This used to branch on a MachineCpuCounterUnusable cause and
+                # return early. That branch can no longer fire: the residual
+                # errors are now caught inside measure_fast_reap and converted
+                # to cpu_residual_error, so neither MachineCpuCounterUnusable
+                # nor a plain enclosure RuntimeError escapes as a cause, and
+                # per_child_cpu is produced on every host. A branch that cannot
+                # execute is the shape AGENTS.md names, so it is gone rather
+                # than left looking like it covers something.
+                self.assertIn(
+                    "per_child_cpu",
+                    out,
+                    "teardown failed BEFORE the CPU sampling this test inspects. "
+                    f"reason={cm.exception.args[0] if cm.exception.args else '?'} "
+                    f"attribution={out.get('child_attribution_established')} "
+                    f"measurement_error={out.get('measurement_error')} "
+                    f"keys={sorted(out)}",
+                )
                 missing = [n for n, c in out["per_child_cpu"].items()
                            if c["cpu_final_ms"] is None]
                 self.assertEqual(
@@ -6194,3 +6484,59 @@ class HtmlArmAndPrewire(unittest.TestCase):
                 any("prewire" in e for e in errors),
                 f"an unprewired MEASURED rep must be caught, got: {errors[:3]}",
             )
+
+
+class PerRequestPrivateDirty(unittest.TestCase):
+    """The delta a request costs, sampled where it can still be sampled.
+
+    A clone starts as a view of the shared snapshot, so Private_Dirty is what it
+    PRIVATISED: pages written, not read. It is read alive, immediately before
+    the kill, because smaps_rollup dies with the address space and cannot be
+    recovered from a zombie the way CPU can.
+
+    Reported on the same record as the latency, so a memory/latency frontier is
+    one measurement rather than a join across two harnesses on two goldens.
+    """
+
+    def test_a_live_process_reports_private_dirty(self) -> None:
+        got = reqbench.proc_private_dirty_kb(os.getpid())
+        self.assertIsNotNone(
+            got.get("private_dirty_kb"),
+            f"could not sample this process: {got.get('unavailable')}",
+        )
+        self.assertGreater(got["private_dirty_kb"], 0, got)
+
+    def test_an_unreadable_process_reports_a_reason_not_a_zero(self) -> None:
+        """A zero with no uncertainty is a claim. An unreadable file does not
+        support one, and reporting 0 KiB would silently understate every clone
+        whose sample failed."""
+        got = reqbench.proc_private_dirty_kb(999_999_999)
+        self.assertIsNone(got.get("private_dirty_kb"), got)
+        self.assertTrue(got.get("unavailable"), "no reason given for the missing sample")
+
+    def test_a_partial_sample_totals_none_not_a_smaller_number(self) -> None:
+        """Calls the production rule, not a copy of it.
+
+        The previous version of this test inlined the expression and asserted on
+        its own arithmetic, so deleting every out[...] assignment in reqbench
+        left the suite green. It proved that Python sums the way Python sums.
+
+        The case that matters: firecracker exits between the pin and the read.
+        The survivors total a few MiB against its few hundred, and a number is
+        what a reader takes at face value.
+        """
+        self.assertIsNone(
+            reqbench.private_dirty_total_kb(
+                {"firecracker": {"private_dirty_kb": None, "unavailable": "exited"},
+                 "pasta": {"private_dirty_kb": 2048}}
+            ),
+            "a partial sum was published as an ordinary number",
+        )
+        self.assertIsNone(reqbench.private_dirty_total_kb({}), "an empty set has no total")
+        self.assertEqual(
+            reqbench.private_dirty_total_kb(
+                {"firecracker": {"private_dirty_kb": 300_000}, "pasta": {"private_dirty_kb": 2048}}
+            ),
+            302_048,
+            "a complete sample must still total",
+        )

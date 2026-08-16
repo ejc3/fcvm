@@ -231,6 +231,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium analyze-chromium-request bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-chromium-request-golden bench-chromium-request-verify \
+	bench-chromium-corpus bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
@@ -297,6 +298,8 @@ help:
 	@echo "  bench-chromium-request-verify  Prove CDP hops on a restored clone (TAG=)"
 	@echo "  bench-chromium-request-run     Measured run (TAG=, BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, WARMUP=, ARMS=, RESULTS=)"
 	@echo "  bench-chromium-request-all     Full chain: image, golden, verify, run"
+	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=)"
+	@echo "  bench-stop                    Stop all bench processes, reap stray VMs, restore dnsmasq"
 	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
@@ -757,6 +760,154 @@ bench-chromium-request-all: build setup-default
 	@echo "==> Full request-bench chain (image, golden, verify, measured run) under one seal..."
 	@BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
 		bash bench/chromium/reqbench.sh all
+
+# Corpus campaign, PACKAGED PER RUN.
+#
+# corpus_campaign.sh is the orchestrator, and bash reads a script incrementally
+# by byte offset: editing it while it runs resumes mid-line and executes
+# whatever the shifted bytes happen to spell. Observed 2026-08-16, inserting a
+# block into a running campaign:
+#     corpus_campaign.sh: line 201: not: command not found
+# which killed a three-cell sweep after its first cell had already gated clean.
+#
+# reqbench.sh already solves this FOR ITSELF: it stages its five sources plus
+# the two binaries into a content-addressed bundle, chmod 0555, and execs the
+# copy. This applies the same discipline one layer up, from make, so a campaign
+# is immune to edits in the working tree for its whole lifetime. Everything for
+# one run -- the frozen orchestrator, its manifest, the source revision, and
+# every reqbench record -- lands under a single directory.
+.PHONY: bench-stop
+# `:=` NOT `?=`/`=`. A recursively expanded $(shell date) re-runs on every
+# reference, so a run that crosses a second boundary creates one directory and
+# writes later artifacts into another -- the exact contamination this per-run
+# packaging exists to prevent. checkmake flags the recursive form for this
+# reason (timestampexpanded). An explicit CORPUS_STAMP= on the command line
+# still wins, because make gives command-line variables precedence.
+CORPUS_STAMP := $(shell date +%Y%m%d-%H%M%S)
+CORPUS_RUN_DIR := $(CURDIR)/bench/chromium/results/corpus-$(CORPUS_STAMP)
+# Stop every benchmark process cleanly, and put the host back.
+#
+# A killed campaign leaves three kinds of debris: its own orchestrator and
+# samplers, the microVMs it had in flight, and the host services it borrowed.
+# The campaign script stops dnsmasq to take 127.0.0.1:53 for the replay server
+# and restores it from an EXIT trap -- which does not run when the script is
+# SIGKILLed, so a killed campaign leaves the box with no dnsmasq.
+#
+# It NEVER kills its own process tree. `pkill -f` matches whole command lines,
+# so it will happily kill the shell that invoked make whenever that shell's
+# command line merely MENTIONS a pattern -- which happens constantly: an editor
+# session, a grep, a heredoc containing these very comments. Bracketing the
+# pattern is not enough, because the mention may be unbracketed in the caller.
+# Observed here: make died with 144 before restoring dnsmasq, because the
+# invoking shell's command line contained the campaign script's name in prose.
+# So matches are filtered against this process's own ancestor chain first.
+#
+# Stray microVM groups are delegated to ci-stray-vm-guard.sh rather than
+# reimplemented: it captures per-TID kernel stacks, wchan and status BEFORE
+# killing, which is exactly the state SIGKILL destroys and exactly what you
+# need when a firecracker is stuck non-zombie in D state.
+.PHONY: bench-stop
+bench-stop:
+	@echo "==> stopping benchmark orchestrators and samplers"
+	@# PPid from /proc/<pid>/status, NOT field 4 of /proc/<pid>/stat: comm sits in
+	@# field 2 wrapped in parens and may contain spaces, which shifts every later
+	@# field. That misparse read the state field and failed with
+	@#   [: S: integer expression expected
+	@ancestors=" $$$$ "; pid=$$$$; \
+	while [ "$$pid" -gt 1 ]; do \
+		pid=$$(awk '/^PPid:/{print $$2}' /proc/$$pid/status 2>/dev/null); \
+		case "$$pid" in ''|*[!0-9]*) break ;; esac; \
+		ancestors="$$ancestors$$pid "; \
+	done; \
+	for pat in 'corpus_campaign\.sh' 'cpuprobe\.py' 'reqbench\.sh' 'reqbench\.py' \
+	           'reqscale\.py' 'corpus_serve\.py'; do \
+		for victim in $$(pgrep -f "$$pat" 2>/dev/null || true); do \
+			case "$$ancestors" in *" $$victim "*) continue ;; esac; \
+			echo "  kill $$victim ($$pat)"; \
+			kill "$$victim" 2>/dev/null || sudo kill "$$victim" 2>/dev/null || true; \
+		done; \
+	done
+	@sleep 2
+	@echo "==> reaping stray microVM process groups (evidence captured first)"
+	@-sudo bash scripts/ci-stray-vm-guard.sh bench-stop || true
+	@echo "==> restoring host services the campaign borrows"
+	@# The campaign takes 127.0.0.1:53 from dnsmasq. corpus_serve.py can still be
+	@# holding that port while it shuts down, so `systemctl start` loses the race
+	@# and, suppressed, this target printed "clean" over a box left with NO DNS
+	@# resolution -- the failure a teardown target exists to prevent. Retry until
+	@# the port is free, then REPORT the outcome rather than asserting it.
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		sudo systemctl start dnsmasq >/dev/null 2>&1 && break; \
+		sleep 1; \
+	done; \
+	state=$$(systemctl is-active dnsmasq 2>/dev/null || echo unknown); \
+	echo "dnsmasq=$$state"; \
+	if [ "$$state" != active ]; then \
+		echo "FAILED: dnsmasq is $$state after teardown; this box has no DNS. \
+Check for a process still holding :53 (sudo ss -lnup 'sport = :53')." >&2; \
+		exit 1; \
+	fi
+	@echo "==> clean"
+
+# A campaign against a DIRTY tree records a source_revision that does not
+# contain the code that ran. The seal binds the revision and the runtime bundle
+# hash, but an uncommitted edit leaves the revision identical while changing the
+# behaviour, so the record looks sealed and is unreproducible. Untracked files
+# are fine (results/, scratch); modifications to tracked files are not.
+.PHONY: require-clean-tree
+require-clean-tree:
+	@dirty="$$(git -C "$(CURDIR)" status --porcelain --untracked-files=no)"; \
+	if [ -n "$$dirty" ]; then \
+		echo "REFUSING: uncommitted changes to tracked files. A measured run would record a"; \
+		echo "source_revision that does not describe what ran. Commit or stash first:"; \
+		echo "$$dirty"; \
+		exit 2; \
+	fi
+
+bench-chromium-corpus: require-clean-tree build setup-default
+	@mkdir -p "$(dir $(CORPUS_RUN_DIR))"
+	@# Reserve, do not reuse: plain mkdir FAILS on collision. `mkdir -p` would
+	@# accept an existing directory and interleave a second campaign's records
+	@# with the first's under one stamp, which is unrecoverable after the fact
+	@# because nothing in a record says which run wrote it.
+	@mkdir "$(CORPUS_RUN_DIR)" || { \
+		echo "REFUSING: $(CORPUS_RUN_DIR) already exists; pass CORPUS_STAMP=<new> for a second run" >&2; \
+		exit 1; }
+	@mkdir -p "$(CORPUS_RUN_DIR)/orchestrator"
+	@cp bench/chromium/corpus_campaign.sh "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
+	@chmod 0555 "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
+	@cd "$(CORPUS_RUN_DIR)/orchestrator" && sha256sum corpus_campaign.sh > MANIFEST.sha256
+	@sha256sum "$(CURDIR)/target/release/fcvm" >> "$(CORPUS_RUN_DIR)/orchestrator/MANIFEST.sha256"
+	@git -C "$(CURDIR)" rev-parse HEAD > "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REVISION"
+	@# Pin the revision behind a ref of its own. Every record cites
+	@# source_revision, and reqbench REFUSES a golden whose revision differs from
+	@# the running tree -- so a record is only reproducible while its commit is
+	@# still reachable. A squash-merge or a deleted branch makes that SHA
+	@# unreachable and the record becomes an orphan citation. Branches are cheap;
+	@# an unreproducible measurement is not.
+	@rev="$$(git -C "$(CURDIR)" rev-parse HEAD)"; \
+	ref="bench-run/$(CORPUS_STAMP)-$${rev%$${rev#??????????}}"; \
+	if existing="$$(git -C "$(CURDIR)" rev-parse --verify -q "refs/heads/$$ref")"; then \
+		[ "$$existing" = "$$rev" ] || { \
+			echo "REFUSING: $$ref already pins $$existing, not $$rev; an earlier record cites it" >&2; \
+			exit 1; }; \
+	else \
+		git -C "$(CURDIR)" branch "$$ref" "$$rev" >/dev/null || { \
+			echo "REFUSING: could not pin $$rev behind $$ref; the record would cite an unreachable commit" >&2; \
+			exit 1; }; \
+	fi; \
+	echo "$$ref" > "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REF"; \
+	if git -C "$(CURDIR)" push -q origin "refs/heads/$$ref:refs/heads/$$ref" 2>/dev/null; then \
+		echo "pushed" >> "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REF"; \
+		echo "==> revision pinned: $$ref (pushed)"; \
+	else \
+		echo "LOCAL-ONLY" >> "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REF"; \
+		echo "==> WARNING: $$ref exists only locally; push it or this run's revision"; \
+		echo "    can be lost to a squash-merge and the records become unreproducible"; \
+	fi
+	@echo "==> campaign frozen at $(CORPUS_RUN_DIR)/orchestrator (read-only; edits to the tree cannot reach this run)"
+	@REPO="$(CURDIR)" RESULTS="$(CORPUS_RUN_DIR)/reqbench" \
+		bash "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
 
 # Host-container direct-CDP baseline (no VM): same image, same driver, warm
 # pool on the host. Needs only the container image, not VM assets.

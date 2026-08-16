@@ -16,7 +16,8 @@
 # snapshot fires on "container is running" — a COLD browser — and every
 # restored clone's "warm" latency is really a first-paint number. Verify:
 #   podman inspect localhost/chromium-bench --format '{{json .HealthCheck}}'
-# must print the Test array containing cdp_health.
+# must print the Test array containing health_state.sh (the cheap reader;
+# the CDP round trip itself is done by the resident cdp_health.py --loop).
 #
 # Host smoke test (fast loop, no VM):
 #   podman run -d --name cb localhost/chromium-bench
@@ -70,9 +71,9 @@ ENV VK_ICD_FILENAMES=/usr/lib/chromium/./vk_swiftshader_icd.json
 
 COPY bench/chromium/pages/ /opt/bench/pages/
 COPY bench/chromium/pageserver.py bench/chromium/render.py bench/chromium/entry.sh \
-     bench/chromium/cdp_health.py /opt/bench/
+     bench/chromium/cdp_health.py bench/chromium/health_state.sh /opt/bench/
 RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py \
-     /opt/bench/cdp_health.py
+     /opt/bench/cdp_health.py /opt/bench/health_state.sh
 
 # The request path IS Chromium's DevTools Protocol endpoint -- no wrapper of
 # ours parses, re-encodes or re-frames a single CDP message:
@@ -95,11 +96,18 @@ EXPOSE 9222
 # fcvm's health gate is the golden-snapshot trigger. With no `--health-check`
 # URL, `Healthy` = container running AND podman's HEALTHCHECK healthy
 # (src/health.rs, "AND logic"), so THIS is what decides when the snapshot is
-# taken. cdp_health.py requires a warm marker AND a live CDP round trip that
+# taken. The resident cdp_health.py --loop requires a warm marker AND a live
+# CDP round trip that
 # finds a page target: healthy means provably able to screenshot.
 # start-period covers Chromium's cold launch + the warm render; interval is the
 # resolution of the snapshot trigger, so it is short.
+# The check itself is a file read: cdp_health.py --loop is resident (started by
+# entry.sh) and publishes its verdict; this reads it and demands FRESH healthy.
+# As a per-second HEALTHCHECK the python form cost a fresh interpreter in every
+# clone forever: 9.1ms startup, 43.6ms for the whole check, measured in this
+# image. Resident, that cost is paid once at the golden and its dirtied pages
+# are shared by every clone.
 HEALTHCHECK --interval=1s --timeout=5s --start-period=90s --retries=3 \
-    CMD ["python3", "/opt/bench/cdp_health.py"]
+    CMD ["/opt/bench/health_state.sh"]
 
 CMD ["/opt/bench/entry.sh"]

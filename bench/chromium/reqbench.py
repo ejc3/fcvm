@@ -136,6 +136,79 @@ CONTROL_WINDOW_S = 0.05
 # ---------------------------------------------------------------- procfs utils
 
 
+def private_dirty_total_kb(per_child: dict) -> int | None:
+    """Total privatised memory, or None when the total would be a fiction.
+
+    None unless EVERY pinned process was sampled, and None for an empty set. A
+    partial sum is not a smaller measurement, it is a different one: if
+    firecracker exits between the pin and the read, the remaining processes
+    total a few MiB against its few hundred, and a number is what a reader
+    takes at face value.
+
+    A function rather than an inline expression so a test can call the rule the
+    record is actually built from. Inlining a copy into the test proved only
+    that Python sums the way Python sums.
+    """
+    if not per_child:
+        return None
+    values = [m.get("private_dirty_kb") for m in per_child.values()]
+    if any(v is None for v in values):
+        return None
+    return sum(values)
+
+
+def proc_private_dirty_kb(pid: int) -> dict:
+    """What this process has PRIVATISED, from /proc/<pid>/smaps_rollup.
+
+    NOT "the pages it wrote". What Private_Dirty counts depends on the memory
+    backend, and the two the harness compares do not agree:
+
+      uffd copy   UFFDIO_COPY populates ANONYMOUS memory, so every page the
+                  server fills is private the moment it is filled, written or
+                  not. With --uffd-prefetch on (the default) the whole recorded
+                  working set, about 56k pages, is replayed BEFORE the guest
+                  runs and all of it counts here.
+      uffd minor  UFFDIO_CONTINUE installs a read-only PTE to the shared page,
+                  so a replayed page costs nothing until it is written. This is
+                  the arm where the field really does mean "pages written".
+      file        MAP_PRIVATE over the page cache: only real writes count.
+
+    So this number is comparable ACROSS CLONES of one configuration, and NOT
+    across backends or across prefetch settings, unless the reader also has
+    those settings. The caller records them beside the figure for that reason.
+
+    Read alive, immediately before the kill, so it describes the request that
+    just completed. It cannot be recovered afterwards the way CPU can, because
+    smaps_rollup dies with the address space.
+
+    Not readable from a zombie. smaps_rollup disappears with the address space,
+    which is why this cannot be sampled alongside the CPU figures after exit.
+
+    Returns the reason rather than a zero when it cannot measure. A zero with no
+    uncertainty is a claim, and an unreadable file does not support one.
+    """
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", "r", encoding="ascii") as handle:
+            rollup = handle.read()
+    except FileNotFoundError:
+        return {"private_dirty_kb": None, "unavailable": "no smaps_rollup (exited, or kernel lacks CONFIG_PROC_PAGE_MONITOR)"}
+    except PermissionError as error:
+        return {"private_dirty_kb": None, "unavailable": f"permission: {error}"}
+    except OSError as error:
+        return {"private_dirty_kb": None, "unavailable": f"{type(error).__name__}: {error}"}
+    fields = {}
+    for line in rollup.splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("Private_Dirty", "Private_Clean", "Shared_Clean", "Shared_Dirty", "Pss", "Rss"):
+            try:
+                fields[key.lower() + "_kb"] = int(rest.strip().split()[0])
+            except (IndexError, ValueError):
+                pass
+    if "private_dirty_kb" not in fields:
+        return {"private_dirty_kb": None, "unavailable": "smaps_rollup carried no Private_Dirty"}
+    return fields
+
+
 def proc_stat_fields(pid: int):
     """(state, utime_ticks, stime_ticks, starttime) or None if the pid is gone.
 
@@ -183,7 +256,115 @@ def self_cpu_ms() -> float:
     )
 
 
-def bounded_cpu_residual(machine_ms: float, harness_ms: float) -> dict:
+# Answer to machine_counter_tracks_this_process(), which is a property of the
+# host and therefore constant for the life of the process. None until asked.
+_MACHINE_COUNTER_TRACKS = None
+# Paired idle/burn windows per probe. Five is the smallest count that gives a
+# median with a majority behind it, so one unlucky window cannot decide the
+# answer on a host whose ambient load moves between windows.
+CPU_TRACKING_PAIRS = 5
+
+
+class MachineCpuCounterUnusable(RuntimeError):
+    """The machine-wide CPU counter does not track this process.
+
+    Distinct from an enclosure violation. A violation means the measurement
+    disagreed with itself and the numbers are wrong; this means the environment
+    cannot produce the measurement at all. Conflating them turned an
+    unsupported CI runner into what looked like a correctness bug in the
+    accounting.
+    """
+
+
+def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
+    """Burn a known amount of CPU and check that /proc/stat noticed.
+
+    The enclosure property the accounting rests on is that the machine-wide
+    counter includes this process. That is a property of the HOST, and it is
+    directly testable: burn CPU deliberately, read both counters around it, and
+    see whether the machine counter advanced by at least what we spent.
+
+    This exists because thresholding the symptom does not work. The first
+    version of the guard below asked `machine_ms == 0.0`, which classified the
+    GitHub-hosted runner correctly on one run and not the next: the same host
+    later reported `machine=10.000000ms harness=160.000000ms` — one 10 ms jiffy
+    of movement against 160 ms of our own CPU. A counter that moves by one tick
+    is no more tracking us than one that does not move at all, but no fixed
+    cutoff on the observed shortfall can say so without also swallowing real
+    accounting bugs, whose shortfall is resolution-scale by construction.
+
+    A controlled burn separates them, because it fixes the quantity the counter
+    is supposed to reproduce.
+    """
+    # The burn has to clear the residual tolerance, or the comparison below is
+    # inside the noise and the probe answers "tracks" no matter what the host
+    # does. Caught by test_the_probe_reports_a_frozen_counter_as_untracked: a
+    # 60 ms burn against this tolerance (8 quanta, 80 ms at 100 Hz) took the
+    # cannot-distinguish branch and called a frozen counter healthy.
+    if burn_ms is None:
+        burn_ms = 4 * CPU_RESIDUAL_UNCERTAINTY_MS
+    # Whether /proc/stat encloses this process is a property of the HOST, so it
+    # cannot change between reps and there is no reason to re-measure it. It is
+    # also expensive to ask: the probe burns a full core for ~320 ms, and
+    # bounded_cpu_residual calls it on every violation, so on a host that
+    # violates every rep a 202-rep campaign would spend a minute of busy-spin
+    # INSIDE the teardown path -- landing in the ambient control window of the
+    # reps either side and inflating exactly the baseline the accounting
+    # subtracts. Answer once per process.
+    global _MACHINE_COUNTER_TRACKS
+    if _MACHINE_COUNTER_TRACKS is not None:
+        return _MACHINE_COUNTER_TRACKS
+    # PAIRED windows, not one burn. A single burn compares machine movement
+    # against our own spend, and on a busy host AMBIENT load supplies that
+    # movement all by itself -- so the probe answered "tracks" for a counter
+    # that excludes us entirely, purely because the box was busy. The failure is
+    # quiet: bounded_cpu_residual then raises RuntimeError (a real accounting
+    # bug) where it should raise MachineCpuCounterUnusable (an unusable host),
+    # so the operator is sent to debug the wrong thing.
+    #
+    # Each pair measures machine movement over an IDLE window and over an
+    # equal-length BURN window. Ambient load appears in both and cancels in the
+    # difference; only work attributable to this process survives it. Five pairs
+    # because one difference is a single noisy sample of a quantity that varies
+    # with whatever else the box is doing -- the median is what makes the answer
+    # about the host rather than about the moment.
+    #
+    # Cost: 5 * 2 * burn_ms, about 3.2s, paid ONCE per process (memoized). The
+    # expense that mattered was calling this on every violation -- 202 reps of a
+    # 320ms spin inside the teardown path, landing in the ambient control window
+    # of the reps either side. Memoization fixed that, and it fixes this.
+    window_s = burn_ms / 1000.0
+    excesses = []
+    spends = []
+    for _ in range(CPU_TRACKING_PAIRS):
+        idle_m0 = machine_cpu_ms()
+        time.sleep(window_s)  # sleep, NOT spin: the idle window must stay idle
+        idle_delta = machine_cpu_ms() - idle_m0
+
+        burn_m0, h0 = machine_cpu_ms(), self_cpu_ms()
+        end = time.monotonic() + window_s
+        while time.monotonic() < end:
+            pass
+        burn_delta, spent = machine_cpu_ms() - burn_m0, self_cpu_ms() - h0
+        excesses.append(burn_delta - idle_delta)
+        spends.append(spent)
+
+    excesses.sort()
+    spends.sort()
+    middle = len(excesses) // 2
+    excess, spent = excesses[middle], spends[middle]
+    if spent <= CPU_RESIDUAL_UNCERTAINTY_MS:
+        # We failed to burn measurably more than the tolerance (a preempted or
+        # heavily throttled probe), so it cannot distinguish anything. Fail
+        # toward "tracks", which keeps the real-violation path live rather than
+        # excusing it. NOT memoized: this is a statement about the probe, not
+        # about the host, so a later attempt may still answer the question.
+        return True
+    _MACHINE_COUNTER_TRACKS = excess >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
+    return _MACHINE_COUNTER_TRACKS
+
+
+def bounded_cpu_residual(machine_ms: float, harness_ms: float, tracks=None) -> dict:
     """Constrain M-H only within the counters' declared resolution.
 
     Both inputs are deltas of cumulative counters, so each contributes two
@@ -193,7 +374,29 @@ def bounded_cpu_residual(machine_ms: float, harness_ms: float) -> dict:
     """
     raw_ms = machine_ms - harness_ms
     uncertainty_ms = CPU_RESIDUAL_UNCERTAINTY_MS
+    # A machine counter that did not move AT ALL while this process
+    # demonstrably burned CPU is not an enclosure violation, it is a counter
+    # that does not track this process. Observed on GitHub-hosted runners:
+    # machine=0.000000ms against harness=150.000000ms. Reporting that as
+    # "host CPU delta is smaller than enclosed harness CPU delta" sends the
+    # reader hunting a measurement bug that is not there, and it is the reason
+    # the bench suite failed in CI while passing on every real bench host.
+    #
+    # Named separately so the two cases cannot be confused. A REAL violation
+    # (the machine counter moved, but by less than the harness) still raises
+    # below and still invalidates the measurement.
     if raw_ms < -uncertainty_ms:
+        # Which of the two is it? Ask the host, do not guess from the shortfall.
+        probe = machine_counter_tracks_this_process if tracks is None else tracks
+        if not probe():
+            raise MachineCpuCounterUnusable(
+                f"/proc/stat does not track this process: a controlled CPU burn "
+                f"did not move the machine-wide counter by what this process "
+                f"spent, so it cannot enclose it. The measurement that triggered "
+                f"this check read machine={machine_ms:.6f}ms against "
+                f"harness={harness_ms:.6f}ms. This needs a host whose /proc/stat "
+                f"reflects its own processes; GitHub-hosted runners do not."
+            )
         raise RuntimeError(
             "host CPU delta is smaller than enclosed harness CPU delta: "
             f"machine={machine_ms:.6f}ms harness={harness_ms:.6f}ms "
@@ -1377,6 +1580,17 @@ def measure_fast_reap(
     """Measure one fast reap while guaranteeing a stopped owner cannot escape."""
     all_fds = [parent_fd, *fds.values()]
     try:
+        # Memory FIRST, then the CPU baseline. Both must be read while the
+        # processes are alive (smaps_rollup dies with the address space), but
+        # the ORDER is load-bearing: only the fcvm parent is frozen here, so
+        # firecracker, holder and pasta keep burning CPU while this runs, and
+        # any CPU they burn between the baseline and the kill lands in
+        # reclaim_cpu_ms as if the reap had caused it. Walking smaps_rollup
+        # costs 3.9-6.6 ms on a 722 MB RSS process (about 6-9 ms per GiB),
+        # which is the order of the 10 ms CLK_TCK quantum this function is
+        # careful to bound. Sampling before the baseline removes the window
+        # entirely rather than making it small.
+        pre_memory = {name: proc_private_dirty_kb(pid) for name, pid in tracked.items()}
         pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
         missing_pre = [name for name, fields in pre.items() if fields is None]
         if missing_pre:
@@ -1429,10 +1643,33 @@ def measure_fast_reap(
         ctl_wall_ms = (time.monotonic() - ctl_t0) * 1000.0
         if ctl_wall_ms <= 0.0:
             raise RuntimeError("ambient control window was not positive")
-        reclaim_cpu = bounded_cpu_residual(machine1 - machine0, self_ms)
-        control_cpu = bounded_cpu_residual(ctl_machine_ms, ctl_self_ms)
+        # The process set is ALREADY terminal here: the kill, the wait and
+        # t_gone all happened above. A CPU-accounting self-check that fails at
+        # this point says the MEASUREMENT is unusable on this host; it says
+        # nothing about whether teardown worked. Letting it propagate conflated
+        # the two and made teardown_fast report "state and data NOT reaped" for
+        # a process set that was gone, on GitHub-hosted runners whose /proc/stat
+        # under-reports (machine=30ms against harness=160ms in one window while
+        # a controlled burn tracked fine).
+        #
+        # The figure is withheld rather than guessed. Publication already fails
+        # closed without reading this field: reqanalyze requires ~20 CPU fields
+        # and rejects the run with "fast teardown has no valid
+        # machine_cpu_ms_net" when they are absent. Those messages name the
+        # SYMPTOM, so this field carries the CAUSE for whoever reads the record.
+        # Nothing consumes it programmatically; saying it gates publication
+        # would credit it with work the required-field checks are doing.
+        cpu_residual_error = None
+        try:
+            reclaim_cpu = bounded_cpu_residual(machine1 - machine0, self_ms)
+            control_cpu = bounded_cpu_residual(ctl_machine_ms, ctl_self_ms)
+        except (MachineCpuCounterUnusable, RuntimeError) as err:
+            reclaim_cpu = None
+            control_cpu = None
+            cpu_residual_error = f"{type(err).__name__}: {err}"
         return {
             "all_gone": all_gone,
+            "cpu_residual_error": cpu_residual_error,
             "cpu": cpu,
             "ctl_machine_ms": ctl_machine_ms,
             "ctl_self_ms": ctl_self_ms,
@@ -1443,6 +1680,7 @@ def measure_fast_reap(
             "machine_window_ms": machine_window_ms,
             "parent_live": parent_live,
             "pre": pre,
+            "pre_memory": pre_memory,
             "reclaim_cpu": reclaim_cpu,
             "sample_period_s": sample_period_s,
             "self_ms": self_ms,
@@ -1548,6 +1786,7 @@ def teardown_fast(
     machine_cpu_ms = measured["machine_ms"]
     machine_window_ms = measured["machine_window_ms"]
     pre = measured["pre"]
+    pre_memory = measured.get("pre_memory", {})
     # Absolute CPU each pinned child had burned at the kill instant. The VM
     # lives exactly one request, so firecracker's figure IS the per-request
     # VMM+vCPU cost; subtracting the noop arm's (restore + idle) yields
@@ -1565,38 +1804,44 @@ def teardown_fast(
     out["signal_ms"] = measured["signal_ms"]
 
     window_s = t_gone - t_kill
-    ctl_rate = control_cpu["point_ms"] / ctl_wall_ms
-    ctl_rate_lo = control_cpu["lo_ms"] / ctl_wall_ms
-    ctl_rate_hi = control_cpu["hi_ms"] / ctl_wall_ms
-    excess_ms = reclaim_cpu["point_ms"] - ctl_rate * machine_window_ms
-    excess_lo_ms = reclaim_cpu["lo_ms"] - ctl_rate_hi * machine_window_ms
-    excess_hi_ms = reclaim_cpu["hi_ms"] - ctl_rate_lo * machine_window_ms
     out["reap_wall_ms"] = window_s * 1000
     out["all_gone"] = all_gone
     out["machine_cpu_ms"] = machine_cpu_ms
     out["harness_cpu_ms"] = self_ms
     out["machine_cpu_window_ms"] = machine_window_ms
-    out["machine_cpu_ms_raw"] = reclaim_cpu["raw_ms"]
-    out["machine_cpu_ms_net"] = reclaim_cpu["point_ms"]
-    out["machine_cpu_ms_net_lo"] = reclaim_cpu["lo_ms"]
-    out["machine_cpu_ms_net_hi"] = reclaim_cpu["hi_ms"]
-    out["machine_cpu_ms_subtraction_clamped"] = reclaim_cpu["clamped"]
-    out["machine_cpu_ms_excess"] = excess_ms
-    out["machine_cpu_ms_excess_lo"] = excess_lo_ms
-    out["machine_cpu_ms_excess_hi"] = excess_hi_ms
-    out["control_machine_cpu_ms"] = ctl_machine_ms
-    out["control_harness_cpu_ms"] = ctl_self_ms
-    out["control_wall_ms"] = ctl_wall_ms
-    out["control_target_ms"] = CONTROL_WINDOW_S * 1000.0
-    out["control_cpu_ms_raw"] = control_cpu["raw_ms"]
-    out["control_cpu_ms_net"] = control_cpu["point_ms"]
-    out["control_cpu_ms_net_lo"] = control_cpu["lo_ms"]
-    out["control_cpu_ms_net_hi"] = control_cpu["hi_ms"]
-    out["control_cpu_ms_subtraction_clamped"] = control_cpu["clamped"]
-    out["control_busy_cores"] = ctl_rate
-    out["control_busy_cores_lo"] = ctl_rate_lo
-    out["control_busy_cores_hi"] = ctl_rate_hi
-    out["cpu_residual_uncertainty_ms"] = reclaim_cpu["uncertainty_ms"]
+    out["cpu_residual_error"] = measured.get("cpu_residual_error")
+    # A host that cannot support the enclosure measurement still gets a full
+    # teardown and a full per-child CPU record below; only the residual-DERIVED
+    # figures are withheld, and they are ABSENT rather than zeroed, so a reader
+    # gets a KeyError instead of a plausible wrong number.
+    if reclaim_cpu is not None and control_cpu is not None:
+        ctl_rate = control_cpu["point_ms"] / ctl_wall_ms
+        ctl_rate_lo = control_cpu["lo_ms"] / ctl_wall_ms
+        ctl_rate_hi = control_cpu["hi_ms"] / ctl_wall_ms
+        excess_ms = reclaim_cpu["point_ms"] - ctl_rate * machine_window_ms
+        excess_lo_ms = reclaim_cpu["lo_ms"] - ctl_rate_hi * machine_window_ms
+        excess_hi_ms = reclaim_cpu["hi_ms"] - ctl_rate_lo * machine_window_ms
+        out["machine_cpu_ms_raw"] = reclaim_cpu["raw_ms"]
+        out["machine_cpu_ms_net"] = reclaim_cpu["point_ms"]
+        out["machine_cpu_ms_net_lo"] = reclaim_cpu["lo_ms"]
+        out["machine_cpu_ms_net_hi"] = reclaim_cpu["hi_ms"]
+        out["machine_cpu_ms_subtraction_clamped"] = reclaim_cpu["clamped"]
+        out["machine_cpu_ms_excess"] = excess_ms
+        out["machine_cpu_ms_excess_lo"] = excess_lo_ms
+        out["machine_cpu_ms_excess_hi"] = excess_hi_ms
+        out["control_machine_cpu_ms"] = ctl_machine_ms
+        out["control_harness_cpu_ms"] = ctl_self_ms
+        out["control_wall_ms"] = ctl_wall_ms
+        out["control_target_ms"] = CONTROL_WINDOW_S * 1000.0
+        out["control_cpu_ms_raw"] = control_cpu["raw_ms"]
+        out["control_cpu_ms_net"] = control_cpu["point_ms"]
+        out["control_cpu_ms_net_lo"] = control_cpu["lo_ms"]
+        out["control_cpu_ms_net_hi"] = control_cpu["hi_ms"]
+        out["control_cpu_ms_subtraction_clamped"] = control_cpu["clamped"]
+        out["control_busy_cores"] = ctl_rate
+        out["control_busy_cores_lo"] = ctl_rate_lo
+        out["control_busy_cores_hi"] = ctl_rate_hi
+        out["cpu_residual_uncertainty_ms"] = reclaim_cpu["uncertainty_ms"]
     out["machine_cpu_source"] = MACHINE_CPU_SOURCE
     out["machine_cpu_resolution_ms"] = MACHINE_CPU_RESOLUTION_MS
     out["harness_cpu_source"] = HARNESS_CPU_SOURCE
@@ -1633,6 +1878,28 @@ def teardown_fast(
             # False -> reaper won the race, figure is a LOWER BOUND.
             "complete": s["zombie_seen"],
         }
+
+    # Private_Dirty as read at ONE INSTANT, per pinned process -- an absolute
+    # reading, NOT a delta: no baseline is subtracted anywhere. Calling it a
+    # delta invites the reader to treat it as "what this request cost", and it
+    # is not. With --uffd-prefetch on, the whole recorded working set (~56k
+    # pages) is already private before the guest executes an instruction, and
+    # every page of it is counted here. proc_private_dirty_kb's docstring is the
+    # long form of what the number does and does not include.
+    #
+    # Reported next to the latency on the SAME record, so a memory/latency
+    # frontier is one measurement rather than a join across two experiments on
+    # two goldens.
+    out["per_child_memory"] = dict(pre_memory)
+    out["private_dirty_unmeasured"] = [
+        name for name, m in pre_memory.items() if m.get("private_dirty_kb") is None
+    ]
+    # None unless EVERY pinned process was sampled. A partial sum is not a
+    # smaller measurement, it is a different one: if firecracker exits between
+    # the pin and the read, the remaining processes total a few MiB against its
+    # few hundred, and a reader who does not separately consult
+    # private_dirty_unmeasured would take that at face value.
+    out["private_dirty_total_kb"] = private_dirty_total_kb(pre_memory)
 
     if not all_gone:
         survivors = dict(measured["live_exact"])

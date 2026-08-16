@@ -363,7 +363,7 @@ gates on, so there is one gate to keep correct rather than two:
 
 ```bash
 podman image inspect <img> --format '{{json .HealthCheck}}' \
-  | grep -q cdp_health || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
+  | grep -q health_state || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
 ```
 
 **2. `--remote-debugging-address=0.0.0.0` IS IGNORED by chromium 151.0.7922.71
