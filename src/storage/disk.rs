@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Configuration for a VM disk
 #[derive(Debug, Clone)]
@@ -66,35 +66,36 @@ impl DiskManager {
 
             if !reflink_output.status.success() {
                 let stderr = String::from_utf8_lossy(&reflink_output.stderr);
-
-                // Check if this is a cross-device error (common in nested VMs where
-                // source is on FUSE mount but destination is local filesystem)
-                if stderr.contains("cross-device") || stderr.contains("Invalid cross-device link") {
-                    warn!(
-                        base = %self.base_rootfs.display(),
-                        disk = %disk_path.display(),
-                        "reflink failed (cross-device), falling back to regular copy (slower)"
-                    );
-
-                    // Fall back to regular copy
-                    let copy_output = tokio::process::Command::new("cp")
-                        .arg(&self.base_rootfs)
-                        .arg(&disk_path)
-                        .output()
-                        .await
-                        .context("executing cp (fallback)")?;
-
-                    if !copy_output.status.success() {
-                        let copy_stderr = String::from_utf8_lossy(&copy_output.stderr);
-                        anyhow::bail!("Disk copy failed. Error: {}", copy_stderr);
+                // No copy fallback. A reflink that silently becomes a copy is
+                // not a slower success, it is a different operation: O(1)
+                // becomes O(image size), per VM, and the only trace is a WARN.
+                // Issue #810 lived seven months behind exactly that fallback
+                // (55ef6350), surfacing as nested tests timing out at 843s
+                // under load while passing on a quiet box. Fail loudly instead
+                // and name both causes, because the fix differs per cause.
+                let cross_device =
+                    stderr.contains("cross-device") || stderr.contains("Invalid cross-device link");
+                anyhow::bail!(
+                    "Reflink copy failed (required for CoW disk): {}\n\
+                     base: {}\n\
+                     disk: {}\n\
+                     {}",
+                    stderr.trim(),
+                    self.base_rootfs.display(),
+                    disk_path.display(),
+                    if cross_device {
+                        "Cause: the base image and the VM disk are on DIFFERENT filesystems, so \
+                         the kernel refuses FICLONE with EXDEV before the filesystem is ever \
+                         consulted. Put the data directory on the same filesystem as the base \
+                         image (for a nested VM, that is the mapped /mnt/fcvm-btrfs, not the \
+                         guest's local disk)."
+                    } else {
+                        "Cause: the filesystem holding these paths does not implement clone. \
+                         Ensure the kernel has FUSE_REMAP_FILE_RANGE support (a kernel profile \
+                         carrying kernel/patches/0001-fuse-add-remap_file_range-support.patch), \
+                         and that the backing store is btrfs."
                     }
-                } else {
-                    anyhow::bail!(
-                        "Reflink copy failed (required for CoW disk). Error: {}. \
-                        Ensure the kernel has FUSE_REMAP_FILE_RANGE support (requires a kernel profile with this patch).",
-                        stderr
-                    );
-                }
+                );
             }
         }
 
