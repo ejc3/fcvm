@@ -64,6 +64,13 @@ const PASTA_STDERR_TAIL_LINES: usize = 20;
 /// case of an inherited, still-open pipe.
 const PASTA_STDERR_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Bounded window for a dying pasta to become reapable when a network-setup
+/// step fails. pasta drops its TAP before it can be reaped, so the failing
+/// step routinely observes the vanished device a beat before `try_wait`
+/// reports the exit; sampling once would drop the diagnosis exactly when it
+/// is needed.
+const PASTA_EXIT_CONTEXT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Whether `ip neigh show` proves that the bridge resolved the guest's MAC.
 ///
 /// This is an L2 fact and nothing more. A resolved entry is necessary for
@@ -1326,11 +1333,16 @@ impl PastaNetwork {
         // can show what pasta actually printed. Without this, pasta's output is
         // silently discarded and a dead pasta only surfaces later as an
         // unrelated bridge setup failure.
+        //
+        // The target must live under `fcvm::` — every documented invocation
+        // filters with `RUST_LOG=fcvm=...`, and a bare `pasta` target is
+        // dropped by all of them, so a fatal line like "Listen failed for
+        // HOST TCP port ...: Address already in use" never reached any log.
         if let Some(stderr) = child.stderr.take() {
             self.stderr_reader = Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    warn!(target: "pasta", "{}", line);
+                    warn!(target: "fcvm::pasta", "{}", line);
                     if let Ok(mut tail) = stderr_tail.lock() {
                         if tail.len() >= PASTA_STDERR_TAIL_LINES {
                             tail.pop_front();
@@ -1437,6 +1449,48 @@ impl PastaNetwork {
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     // Safety tick: re-check the condition even without events.
+                }
+            }
+        }
+    }
+
+    /// pasta's exit status and captured stderr, for appending to
+    /// network-setup errors.
+    ///
+    /// pasta creates its TAP and writes its PID file before binding forwarded
+    /// ports, so a port conflict kills it after both readiness signals. The
+    /// next setup step then fails with "Cannot find device pasta0" while the
+    /// real cause ("Listen failed ...: Address already in use") is only in
+    /// pasta's stderr. A dying pasta drops its TAP before it becomes
+    /// reapable, so a single `try_wait` sample can race the exit; wait a
+    /// bounded moment for it, and when pasta is genuinely still running,
+    /// still report any stderr it produced rather than nothing.
+    async fn pasta_exit_context(&mut self) -> String {
+        let deadline = tokio::time::Instant::now() + PASTA_EXIT_CONTEXT_WAIT;
+        loop {
+            let Some(child) = self.pasta_process.as_mut() else {
+                return String::new();
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // pasta's exit closed the pipe; drain it so the tail is
+                    // complete.
+                    crate::utils::wait_for_stderr_eof(
+                        &mut self.stderr_reader,
+                        PASTA_STDERR_EOF_TIMEOUT,
+                    )
+                    .await;
+                    return format!(" (pasta exited: {}{})", status, self.stderr_tail_message());
+                }
+                Ok(None) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                _ => {
+                    let tail = self.stderr_tail_message();
+                    if tail.contains("no stderr output captured") {
+                        return String::new();
+                    }
+                    return format!(" (pasta still running{})", tail);
                 }
             }
         }
@@ -1746,8 +1800,9 @@ impl NetworkManager for PastaNetwork {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
-                "bridge setup failed: {}",
-                bridge_script.describe_failure(&stderr)
+                "bridge setup failed: {}{}",
+                bridge_script.describe_failure(&stderr),
+                self.pasta_exit_context().await
             );
         }
 
