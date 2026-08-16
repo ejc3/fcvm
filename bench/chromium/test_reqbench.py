@@ -1111,6 +1111,21 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 with self.assertRaises(reqbench.SurvivedTeardown) as cm:
                     reqbench.teardown_fast(p.pid, "", "", "", 1.0)
                 out = cm.exception.teardown
+                # Name the failure. teardown_fast raises SurvivedTeardown from
+                # three points BEFORE it samples CPU (attribution unprovable,
+                # owner set unpinnable, measure_fast_reap failed), and on those
+                # paths the record has no per_child_cpu at all. Reading it blind
+                # turned a diagnosable environment failure into a bare KeyError
+                # in CI, which said nothing about which path fired.
+                self.assertIn(
+                    "per_child_cpu",
+                    out,
+                    "teardown failed BEFORE the CPU sampling this test inspects. "
+                    f"reason={cm.exception.args[0] if cm.exception.args else '?'} "
+                    f"attribution={out.get('child_attribution_established')} "
+                    f"measurement_error={out.get('measurement_error')} "
+                    f"keys={sorted(out)}",
+                )
                 missing = [n for n, c in out["per_child_cpu"].items()
                            if c["cpu_final_ms"] is None]
                 self.assertEqual(
