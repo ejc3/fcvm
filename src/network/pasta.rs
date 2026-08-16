@@ -166,6 +166,13 @@ async fn run_probe_bounded(
     what: &str,
 ) -> Result<std::process::Output> {
     command.process_group(0);
+    // Both streams MUST be piped here, exactly as `Command::output()` does it.
+    // Spawning directly does not imply it: tokio's default is INHERIT, so a
+    // caller that piped only stderr (the neighbour query does) would have its
+    // stdout go to the parent's and be captured as empty. That reads as "no
+    // neighbour entry" for every probe, which is indistinguishable from the
+    // failure this whole path is diagnosing.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .with_context(|| format!("spawning {what}"))?;
@@ -2511,6 +2518,33 @@ mod tests {
             text.contains("ANSWERED TCP"),
             "the error must say which half actually failed, so the reader looks at \
              ARP and the bridge rather than at the guest: {text}"
+        );
+    }
+
+    /// A bounded probe must capture stdout, not inherit it.
+    ///
+    /// `Command::output()` forces both streams to piped; spawning directly does
+    /// not. The neighbour query pipes only stderr, so when this function
+    /// replaced `output()` its stdout went to the parent and every reading came
+    /// back empty. Four clone and port-forward tests failed in CI within 15s,
+    /// all reporting a neighbour entry that never resolved, because the reading
+    /// was being thrown away rather than missing.
+    #[tokio::test]
+    async fn a_bounded_probe_captures_stdout_even_when_the_caller_piped_only_stderr() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo neighbour-line"]);
+        // Exactly what neighbor() does, and what broke it.
+        command.stderr(Stdio::piped());
+
+        let output = run_probe_bounded(command, std::time::Duration::from_secs(5), "a test probe")
+            .await
+            .expect("the probe must run");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "neighbour-line",
+            "stdout was not captured. An inherited stdout reads as an empty result, \
+             which is indistinguishable from the guest having no neighbour entry."
         );
     }
 
