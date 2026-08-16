@@ -1239,3 +1239,96 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
         );
     }
 }
+
+/// Run the `changes` step's own script with a synthetic environment.
+///
+/// `gh` is never reached on the fail-open paths (they exit before the API
+/// call), which is exactly what makes those paths testable here.
+fn run_changes_step(event: &str) -> String {
+    let ci = parse_workflow("ci.yml");
+    let run = workflow_job(&ci, "changes")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`changes` job has no `steps:`")
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("case \"$f\" in"))
+        .expect("`changes` job no longer classifies paths — update this test")
+        .to_string();
+
+    let dir = std::env::temp_dir().join(format!("fcvm-changes-{}-{event}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let out_file = dir.join("github_output");
+    std::fs::write(&out_file, "").expect("seed GITHUB_OUTPUT");
+
+    let status = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&run)
+        .env("EVENT", event)
+        .env("GITHUB_OUTPUT", &out_file)
+        .env("REPO", "o/r")
+        .env("PR", "1")
+        .output()
+        .expect("run the changes step");
+    assert!(
+        status.status.success(),
+        "changes step failed for event {event}: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let outputs = std::fs::read_to_string(&out_file).expect("read GITHUB_OUTPUT");
+    let _ = std::fs::remove_dir_all(&dir);
+    outputs
+}
+
+/// A fail-open must open BOTH gates, not just the code one.
+///
+/// Both early exits write `code=true` and never write `bench` at all, so
+/// `bench-tests` — gated on `needs.changes.outputs.bench == 'true'` — is
+/// SKIPPED on push-to-main, `workflow_dispatch`, the `Build Kernels`
+/// `workflow_run`, and on the "empty file list" path whose own comment says it
+/// fails toward running the matrix. Summary treats skipped as non-failure, so
+/// the bench lints this file routes PRs to would never run on main at all,
+/// which matters precisely because the documented stacked-PR routine
+/// force-merges with `--admin` after cancelling the PR-side run.
+///
+/// "Fail open" has to mean every gate, or it is just a differently-shaped hole.
+#[test]
+fn a_fail_open_opens_the_bench_gate_too() {
+    for event in ["push", "workflow_dispatch", "workflow_run", "schedule"] {
+        let outputs = run_changes_step(event);
+        assert!(
+            outputs.contains("code=true"),
+            "event {event}: expected code=true, got {outputs:?}"
+        );
+        assert!(
+            outputs.contains("bench=true"),
+            "event {event}: fail-open set code but left bench unset, so bench-tests \
+             is skipped and its lints never run: {outputs:?}"
+        );
+    }
+}
+
+/// A rename must be classified by where it came FROM as well as where it went.
+///
+/// `gh api ... --jq '.[].filename'` reports only the post-rename path, so
+/// `git mv src/foo.rs bench/chromium/foo.rs` yields a single `bench/` entry:
+/// `code` stays false, the whole VM matrix skips, and a tree that no longer
+/// compiles is mergeable behind a green Summary. `previous_filename` is present
+/// on exactly the renamed entries and is what closes it.
+#[test]
+fn renames_are_classified_by_their_source_path_too() {
+    let ci = parse_workflow("ci.yml");
+    let run = workflow_job(&ci, "changes")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`changes` job has no `steps:`")
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("gh api"))
+        .expect("`changes` job no longer lists changed files");
+    assert!(
+        run.contains("previous_filename"),
+        "the changed-file query reads only `.filename`, so moving a source file into \
+         bench/ or docs/ hides it from the classifier and skips the matrix"
+    );
+}

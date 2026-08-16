@@ -76,15 +76,31 @@ jobs:
           set -euo pipefail
           # Only a pull_request has a well-defined changed-file set here; every
           # other trigger runs the full matrix rather than guess.
+          # A fail-open must open EVERY gate. Writing `code=true` alone left
+          # `bench` unset, and bench-tests is gated on it, so the bench lints
+          # were skipped on push-to-main, workflow_dispatch and the Build
+          # Kernels workflow_run — i.e. never ran on main at all, which matters
+          # because the documented stacked-PR routine force-merges with --admin
+          # after cancelling the PR-side run. Summary counts skipped as
+          # non-failure, so that read as green.
           if [ "$EVENT" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "bench=true" >> "$GITHUB_OUTPUT"
             echo "event $EVENT: running the full matrix"
             exit 0
           fi
-          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
+          # `.filename` is the POST-rename path only. `git mv src/foo.rs
+          # bench/chromium/foo.rs` would report one bench/ entry, leave code
+          # false, skip the whole VM matrix, and make a non-compiling tree
+          # mergeable behind a green Summary. `previous_filename` is present on
+          # exactly the renamed entries, so classifying both paths means a
+          # rename is judged by where it came from as well as where it went.
+          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
+            --jq '.[] | .filename, (.previous_filename // empty)')
           if [ -z "$files" ]; then
-            # An empty file list is unexpected, so fail toward running the matrix.
+            # An empty file list is unexpected, so fail toward running everything.
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "bench=true" >> "$GITHUB_OUTPUT"
             echo "no changed files reported: running the full matrix"
             exit 0
           fi
