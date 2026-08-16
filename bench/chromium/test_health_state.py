@@ -92,14 +92,23 @@ class HealthStateReader(unittest.TestCase):
         the file it wrote.
         """
         import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "cdp_health", Path(__file__).resolve().parent / "cdp_health.py"
-        )
-        cdp_health = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cdp_health)
+        import shutil
 
         with tempfile.TemporaryDirectory() as directory:
+            # Load from a COPY in a fresh directory. Loading the module in place
+            # reads bench/chromium/__pycache__, and a stale .pyc there executed
+            # a previous version of publish() while the source on disk was
+            # correct: the test reported drift that did not exist, and would
+            # equally have hidden drift that did. A directory with no cache
+            # cannot lie about which source ran.
+            source = shutil.copy(
+                Path(__file__).resolve().parent / "cdp_health.py",
+                os.path.join(directory, "cdp_health_under_test.py"),
+            )
+            spec = importlib.util.spec_from_file_location("cdp_health_under_test", source)
+            cdp_health = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cdp_health)
+
             state = os.path.join(directory, "bench-health")
             cdp_health.STATE_FILE = state
             cdp_health.publish("healthy", "pages=1 id=ABC")
