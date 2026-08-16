@@ -16,4 +16,5 @@ results/**
 !results/**/summary.md
 !results/campaign-*-summary.json
 !results/**/cpuprobe-*-curated.json
+!results/**/webkit-host-probe.json
 __pycache__/

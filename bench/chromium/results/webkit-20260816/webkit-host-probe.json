@@ -1,0 +1,49 @@
+{
+ "_note": "WebKitGTK engine probe, HOST-side (podman --network host, no VM), same fixture pageserver the guest uses. Not a corpus number and not VM-isolated: under the publication rule this is optimisation evidence, not a headline. The ENGINE arm is NOT wired into reqbench.sh/py -- WebDriver classic and CDP are different protocols -- so no gated in-guest WebKit number exists on any committed path.",
+ "image": "localhost/webkit-bench-req",
+ "driver": "wddrive.py (W3C WebDriver classic, port 9515)",
+ "fixture": "medium.html",
+ "screenshot_format": "png (WebKitGTK is PNG-only; Chromium arm used JPEG q80)",
+ "warm_renders": {
+  "n": 54,
+  "total_ms": {
+   "p50": 122.0,
+   "p95": 129.44
+  },
+  "connect_ms": {
+   "p50": 26.0
+  },
+  "navigate_ms": {
+   "p50": 45.9
+  },
+  "screenshot_ms": {
+   "p50": 50.4
+  }
+ },
+ "first_render_penalty": {
+  "observed_ms": {
+   "first_medium_screenshot": 997.4,
+   "steady_state_screenshot": 50.4
+  },
+  "finding": "A one-time, process-global initialisation costs ~950 ms and is triggered by the first render of a page that needs it. Once paid, EVERY page is fast (~46 ms). Verified on three fresh containers, including one where medium.html was rendered FIRST: 999.6 ms, then warmup.html 47.2, minimal.html 30.4, medium.html 47.5.",
+  "consequence": "entry-webkit.sh warms with warmup.html, which does NOT trigger it, so the golden snapshot freezes the browser with the init UNPAID and every clone pays it on its first real render. That is the mechanism behind the report's 'full first render ~1.9 s' for WebKit clones.",
+  "caveat": "warmup.html is self-contained BY DESIGN so the warm point shares zero byte-resources with measured fixtures, and Chromium's entry.sh warms with the same page. Any fix must trigger the init without sharing bytes with what is measured."
+ },
+ "heavy_html_hang": {
+  "webkit": "navigate POST times out after 120.0 s, deterministic, N=1, 2/2 fresh containers",
+  "chromium": {
+   "total_ms": 1387.6,
+   "navigate_load_event_ms": 1312.8,
+   "screenshot_ms": 40.9,
+   "image_bytes": 139227
+  },
+  "page": "3302 bytes, one <canvas 800x600> with getContext(\"2d\")",
+  "finding": "The report attributes a '120-second navigate-stall class Chromium does not show' to CONCURRENCY (N>=8, success 19/32 at N=32). It reproduces at N=1 and is triggered by page content. Chromium renders the same page in 1.39 s. Which page the N>=8 runs used is not recorded, so this does not prove the concurrency attribution wrong -- but 'at N>=8' is not a sufficient characterisation of a stall that occurs at N=1."
+ },
+ "chromium_host_reference": {
+  "p50_ms": 145.6,
+  "n": 200,
+  "source": "results/hostcdp-509059c1700d47bb89e9854ddd54bb73/hostcdp.jsonl",
+  "format": "jpeg q80"
+ }
+}
