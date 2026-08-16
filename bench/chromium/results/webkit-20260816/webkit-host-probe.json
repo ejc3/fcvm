@@ -30,15 +30,29 @@
   "caveat": "warmup.html is self-contained BY DESIGN so the warm point shares zero byte-resources with measured fixtures, and Chromium's entry.sh warms with the same page. Any fix must trigger the init without sharing bytes with what is measured."
  },
  "heavy_html_hang": {
-  "webkit": "navigate POST times out after 120.0 s, deterministic, N=1, 2/2 fresh containers",
-  "chromium": {
+  "corrected": "An earlier version of this record called the stall DETERMINISTIC on the strength of 2 observations that both stalled. That was wrong. It is INTERMITTENT.",
+  "measurement": {
+   "clean_fresh_container_attempts": 11,
+   "stalled": 4,
+   "completed": 7,
+   "stall_rate": "36%",
+   "completion_time_when_ok_s": 1.4,
+   "longest_observed_stall_s": 390,
+   "note": "390 s was curl's own timeout, not a return; the navigate had not completed."
+  },
+  "during_the_stall": {
+   "webkit_web_process_instantaneous_cpu": "0.3% of one core",
+   "cpu_consumed_total": "~8 CPU-seconds, all in the first ~6 s",
+   "session_responsive": "yes - GET /session/<id>/url returns the correct URL throughout",
+   "reading": "Not slow computation and not a crash. The page's work completes, the browser goes idle and stays responsive, and the navigate command simply never reports completion."
+  },
+  "chromium_same_page": {
    "total_ms": 1387.6,
    "navigate_load_event_ms": 1312.8,
-   "screenshot_ms": 40.9,
-   "image_bytes": 139227
+   "stalls_observed": 0
   },
-  "page": "3302 bytes, one <canvas 800x600> with getContext(\"2d\")",
-  "finding": "The report attributes a '120-second navigate-stall class Chromium does not show' to CONCURRENCY (N>=8, success 19/32 at N=32). It reproduces at N=1 and is triggered by page content. Chromium renders the same page in 1.39 s. Which page the N>=8 runs used is not recorded, so this does not prove the concurrency attribution wrong -- but 'at N>=8' is not a sufficient characterisation of a stall that occurs at N=1."
+  "page": "3302 bytes: a synchronous script building a 1200x6 table with a forced layout every 100 rows, then canvas gradients/arcs/text and a pixel readback, all before the load event",
+  "bearing_on_the_report": "The report attributes a '120-second navigate-stall class Chromium does not show' to CONCURRENCY (N>=8; 'success 19/32 at N=32' = 41% failure). This measures a 36% stall rate at N=1. Those rates are close enough to be the same underlying intermittent bug rather than a load effect. It does not PROVE the concurrency attribution wrong -- which page those runs rendered is not recorded -- but a stall that occurs 36% of the time at N=1 is not explained by concurrency."
  },
  "chromium_host_reference": {
   "p50_ms": 145.6,
