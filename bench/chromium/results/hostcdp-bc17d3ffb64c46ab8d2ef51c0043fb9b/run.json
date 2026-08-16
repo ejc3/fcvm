@@ -1,0 +1,4 @@
+{"image": "localhost/chromium-bench-req", "image_id": "372bdbc1ce513524bebfd38f7b99590421e71b1f52e81a0db45193d209037556",
+ "reps": 202, "warmup": 2, "url": "http://127.0.0.1:8000/medium.html", "cdp_port": 9222,
+ "driver": "cdpdrive.py", "network": "host (no VM, no DNAT)",
+ "host_kernel": "7.0.14-fcvm-cd6cd2b4b52e", "loadavg_at_start": "0.05"}
