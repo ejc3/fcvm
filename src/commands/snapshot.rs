@@ -382,9 +382,9 @@ where
 
 /// The serve's one-line machine-readable ready record.
 ///
-/// Consumers poll serve stdout for exactly this line (reqbench and the www
-/// container demo both did it by grepping human prose before this existed),
-/// so its fields are a contract: add, never rename or remove.
+/// Consumers poll serve stdout for exactly this line (external harnesses
+/// grepped the human prose banner before this existed), so its fields are a
+/// contract: add, never rename or remove.
 fn serve_ready_record(
     snapshot: &str,
     serve_pid: u32,
@@ -405,6 +405,54 @@ fn serve_ready_record(
     })
 }
 
+/// Outcome of the restore-completion gate: the guest acknowledged this exact
+/// restore generation (carrying its per-phase timing telemetry), or a
+/// shutdown request interrupted the wait.
+#[derive(Debug)]
+enum RestoreAck {
+    Acked { guest_phases: Option<String> },
+    Interrupted,
+}
+
+/// The clone's one-line machine-readable restored record, printed on stdout
+/// after the guest acknowledges the exact restore generation. Same contract
+/// rules as the serve record: add fields, never rename or remove them.
+///
+/// `backend` is the memory transport (`uffd` | `uffd-file` | `file`), the
+/// vocabulary benchmark arms use; `hypervisor` names the VMM, so a
+/// cloud-hypervisor file restore is distinguishable from a firecracker one.
+/// `ack_ms` is the host-observed clock from the start of the restore call to
+/// the guest's ACK. `guest_phases` embeds the agent's telemetry as parsed
+/// JSON; an unparseable payload is kept as a raw string rather than dropped,
+/// and null means no telemetry arrived, so absence is distinguishable from a
+/// parse failure.
+fn restored_record(
+    name: &str,
+    snapshot: &str,
+    vm_id: &str,
+    backend: &str,
+    hypervisor: &str,
+    ack_ms: u64,
+    guest_phases: Option<&str>,
+) -> serde_json::Value {
+    let phases = match guest_phases {
+        None => serde_json::Value::Null,
+        Some(raw) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        }
+    };
+    serde_json::json!({
+        "status": "restored",
+        "name": name,
+        "snapshot": snapshot,
+        "vm_id": vm_id,
+        "backend": backend,
+        "hypervisor": hypervisor,
+        "ack_ms": ack_ms,
+        "guest_phases": phases,
+    })
+}
+
 /// Wait for fc-agent to acknowledge this exact restore generation.
 ///
 /// This is the single correctness gate shared by ordinary, TTY, and `--exec`
@@ -419,7 +467,7 @@ async fn wait_for_restore_completion<F>(
     timeout: Duration,
     liveness_interval: &mut tokio::time::Interval,
     mut try_wait: F,
-) -> Result<bool>
+) -> Result<RestoreAck>
 where
     F: FnMut() -> Result<Option<std::process::ExitStatus>>,
 {
@@ -439,7 +487,7 @@ where
                             guest_phases = %guest_phases.as_deref().unwrap_or("<none>"),
                             "fc-agent acknowledged exact restore generation"
                         );
-                        return Ok(true);
+                        return Ok(RestoreAck::Acked { guest_phases });
                     }
                     Ok(Err(error)) => {
                         return Err(error).context(format!(
@@ -479,7 +527,7 @@ where
                     restore_epoch = %expected_epoch,
                     "shutdown requested while waiting for restore-completion ACK"
                 );
-                return Ok(false);
+                return Ok(RestoreAck::Interrupted);
             }
         }
     }
@@ -2088,6 +2136,9 @@ async fn cmd_snapshot_run_inner(
             .context("cleaning cancelled clone setup")?;
         anyhow::bail!("interrupted by signal during clone setup");
     }
+    // Host-observed end-to-end restore clock: from the start of the restore
+    // call through the guest's ACK. Published as ack_ms in the restored record.
+    let restore_started = std::time::Instant::now();
     let setup_result: Result<(
         Box<dyn crate::hypervisor::Hypervisor>,
         Option<tokio::process::Child>,
@@ -2181,7 +2232,7 @@ async fn cmd_snapshot_run_inner(
     // exec rebind → wait for confirmation → output.reconnect(). No host-side
     // notify needed — the listener will accept fc-agent's new connection naturally.
 
-    if matches!(&restore_completion_result, Ok(true)) {
+    if let Ok(RestoreAck::Acked { guest_phases }) = &restore_completion_result {
         let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
         if is_uffd {
             info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
@@ -2203,6 +2254,29 @@ async fn cmd_snapshot_run_inner(
             println!("  Memory loaded from file");
         }
         println!("  Disk uses CoW overlay");
+        let backend = if use_uffd {
+            "uffd"
+        } else if is_uffd {
+            "uffd-file"
+        } else {
+            "file"
+        };
+        println!(
+            "{}",
+            restored_record(
+                &vm_name,
+                &snapshot_name,
+                &vm_id,
+                backend,
+                if is_ch {
+                    "cloud-hypervisor"
+                } else {
+                    "firecracker"
+                },
+                restore_started.elapsed().as_millis() as u64,
+                guest_phases.as_deref(),
+            )
+        );
     }
 
     // Handle --exec: run command in container then cleanup and exit
@@ -2215,16 +2289,18 @@ async fn cmd_snapshot_run_inner(
         // cleanup_vm removes.
         let ready_result = match restore_completion_result {
             Err(error) => Err(error),
-            Ok(false) => Err(anyhow::anyhow!(
+            Ok(RestoreAck::Interrupted) => Err(anyhow::anyhow!(
                 "clone --exec interrupted by shutdown signal before restore-completion ACK"
             )),
-            Ok(true) => match lifecycle_gate.publish(&state_manager, &mut vm_state).await {
-                Ok(super::common::LifecycleReadyOutcome::Published) => Ok(()),
-                Ok(super::common::LifecycleReadyOutcome::Cancelled) => Err(anyhow::anyhow!(
-                    "clone --exec interrupted by shutdown signal before lifecycle readiness"
-                )),
-                Err(error) => Err(error),
-            },
+            Ok(RestoreAck::Acked { .. }) => {
+                match lifecycle_gate.publish(&state_manager, &mut vm_state).await {
+                    Ok(super::common::LifecycleReadyOutcome::Published) => Ok(()),
+                    Ok(super::common::LifecycleReadyOutcome::Cancelled) => Err(anyhow::anyhow!(
+                        "clone --exec interrupted by shutdown signal before lifecycle readiness"
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
         };
         let exec_result: Result<i32> = match ready_result {
             Err(error) => Err(error),
@@ -2374,8 +2450,8 @@ async fn cmd_snapshot_run_inner(
     // But poll VM liveness to avoid hanging forever if Firecracker crashes.
     let output_handshake_result = match restore_completion_result {
         Err(error) => Err(error),
-        Ok(false) => Ok(false),
-        Ok(true) if !tty_mode => {
+        Ok(RestoreAck::Interrupted) => Ok(false),
+        Ok(RestoreAck::Acked { .. }) if !tty_mode => {
             // First liveness check at 250ms, then every 5s: restore_from_snapshot no
             // longer sleeps post-resume (its old 200ms crash-window moved here, off
             // the hot path), so a VM that dies right after resume is still diagnosed
@@ -2394,7 +2470,7 @@ async fn cmd_snapshot_run_inner(
             )
             .await
         }
-        Ok(true) => Ok(false),
+        Ok(RestoreAck::Acked { .. }) => Ok(false),
     };
     let output_connected = matches!(&output_handshake_result, Ok(true));
 
@@ -3754,6 +3830,52 @@ mod tests {
         assert!(bare["working_set_bytes"].is_null());
     }
 
+    #[test]
+    fn restored_record_fields_are_a_stable_contract() {
+        // Harnesses poll clone stdout for this exact line; renaming or
+        // removing a field breaks them silently. Adding fields is fine.
+        let record = restored_record(
+            "clone1",
+            "warm-tested",
+            "vm-abc123",
+            "uffd",
+            "firecracker",
+            407,
+            Some(r#"{"total_ms":407,"exec_rebind_ms":12}"#),
+        );
+        assert_eq!(record["status"], "restored");
+        assert_eq!(record["name"], "clone1");
+        assert_eq!(record["snapshot"], "warm-tested");
+        assert_eq!(record["vm_id"], "vm-abc123");
+        // `backend` is the memory transport (the benchmark arm vocabulary);
+        // `hypervisor` names the VMM, so a cloud-hypervisor file restore is
+        // distinguishable from a firecracker one.
+        assert_eq!(record["backend"], "uffd");
+        assert_eq!(record["hypervisor"], "firecracker");
+        assert_eq!(record["ack_ms"], 407);
+        // Parseable telemetry embeds as JSON, so consumers index into it
+        // without a second parse.
+        assert_eq!(record["guest_phases"]["total_ms"], 407);
+
+        // Unparseable telemetry is kept raw, not dropped: a lossy record
+        // would hide the agent bug that produced it.
+        let raw = restored_record(
+            "c",
+            "s",
+            "v",
+            "file",
+            "cloud-hypervisor",
+            1,
+            Some("not json"),
+        );
+        assert_eq!(raw["guest_phases"], "not json");
+        assert_eq!(raw["hypervisor"], "cloud-hypervisor");
+
+        // No telemetry at all is null, distinguishable from a parse failure.
+        let none = restored_record("c", "s", "v", "uffd-file", "firecracker", 1, None);
+        assert!(none["guest_phases"].is_null());
+    }
+
     #[tokio::test]
     async fn restore_completion_timeout_fails_with_generation_and_phase() {
         let (_sender, mut receiver) = tokio::sync::oneshot::channel::<Result<Option<String>>>();
@@ -3819,7 +3941,7 @@ mod tests {
             )
             .await
             .expect("matching restore ACK should release the consumer");
-            assert!(acknowledged);
+            assert!(matches!(acknowledged, RestoreAck::Acked { .. }));
             published_after_ack.store(true, std::sync::atomic::Ordering::Release);
         });
 
