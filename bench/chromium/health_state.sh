@@ -26,7 +26,7 @@
 # (set_system_clock), so a wall-clock reader would judge every clone's freshly
 # written verdict to be hours old and fail the gate on every single clone.
 # /proc/uptime is CLOCK_BOOTTIME (ktime_get_boottime_ts64), not CLOCK_MONOTONIC,
-# and is exactly what the writer records -- see health_loop.monotonic_seconds,
+# and is exactly what the writer records -- see cdp_health.monotonic_seconds,
 # which explains why boottime continuity across restore is what makes this work.
 set -uo pipefail
 
