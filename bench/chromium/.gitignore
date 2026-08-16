@@ -1,4 +1,19 @@
-# Raw run output (requests/, samples/, logs/, raw.json, report.md per run).
-# Publishable runs get a curated summary.md + charts/*.svg committed separately.
-results/
+# Raw run output (requests/, samples/, logs/, raw.json, report.md per run) is
+# not tracked. The curated RECORDS are, and they must be visible to
+# `git status` rather than needing `git add -f`: the 2026-08-15 instance-store
+# wipe destroyed the evidence for six sections of the published report because
+# everything under here was ignored wholesale.
+#
+# `results/` alone cannot be negated inside: git does not descend into an
+# excluded DIRECTORY, so a `!results/.../x.json` after it never matches. The
+# `results/**` + `!results/**/` pair keeps the directories walkable so the file
+# negations below can take effect.
+results/**
+!results/**/
+!results/**/analysis.json
+!results/**/run.json
+!results/**/hostcdp.jsonl
+!results/**/summary.md
+!results/campaign-*-summary.json
+!results/**/cpuprobe-*-curated.json
 __pycache__/
