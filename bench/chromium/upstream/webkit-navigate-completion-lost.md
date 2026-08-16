@@ -1,5 +1,54 @@
 # WebKitGTK: navigate never completes, and its 300 s timeout never fires
 
+## ROOT CAUSE (traced in Source/, confirmed by a prediction)
+
+`WebPageProxy::didFinishLoadForFrame` (WebPageProxy.cpp:7996) gates the
+automation notification on the navigation still being registered:
+
+```cpp
+RefPtr<API::Navigation> navigation;
+if (frame->isMainFrame() && navigationID && m_navigationState->hasNavigation(*navigationID))
+    navigation = m_navigationState->navigation(*navigationID);
+
+bool isMainFrame = frame->isMainFrame();
+if (!isMainFrame || !navigationID || navigation) {          // <-- gate
+    ...
+    automationSession->navigationOccurredForFrame(*frame);
+    automationSession->loadCompletedForFrame(*frame, navigationID, WallTime::now());
+}
+```
+
+The sibling path does NOT gate it. `didFinishDocumentLoadForFrame`
+(WebPageProxy.cpp:7832) notifies automation unconditionally, before it even
+looks the navigation up. That asymmetry is the defect.
+
+Two IPC messages from the WebProcess race:
+
+* `DidDestroyNavigation`, sent by
+  `WebLocalFrameLoaderClient::documentLoaderDetached`
+  (WebProcess/WebCoreSupport/WebLocalFrameLoaderClient.cpp:218)
+* `DidFinishLoadForFrame`
+
+If the former is processed first the `API::Navigation` is already retired,
+`hasNavigation()` is false, the gate skips the whole block, and the WebDriver
+callback is left in `m_pendingNormalNavigationInBrowsingContextCallbacksPerPage`
+forever.
+
+**Confirming prediction.** WebDriver's `normal` strategy resolves via the GATED
+`navigationOccurredForFrame`; `eager` resolves via the UNGATED
+`documentLoadedForFrame`. So `eager` should never stall. Measured on 2.52.5,
+same page, same protocol, fresh container per trial:
+
+| pageLoadStrategy | stalled |
+|---|---|
+| normal | 13/31 (42%) |
+| **eager** | **0/8** |
+
+Proposed patch: `webkit-didFinishLoadForFrame-automation.patch` in this
+directory moves the automation notification out of the gate, matching
+`didFinishDocumentLoadForFrame`. NOT YET BUILT OR TESTED against a WebKit build.
+
+
 Two defects, filed together because the second is what makes the first fatal.
 Reproduced on **WebKitGTK 2.52.5** (current upstream stable) and **2.50.6**,
 aarch64, Debian trixie/bookworm, `WebKitWebDriver --port=9515 --host=all`,

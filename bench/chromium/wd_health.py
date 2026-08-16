@@ -45,10 +45,25 @@ def main() -> int:
         print(f"unhealthy: session file {SESSION_FILE} is empty", file=sys.stderr)
         return 1
 
-    url = f"http://{WD_HOST}/session/{session}/url"
+    # execute/sync, NOT GET /url. Automation.getBrowsingContext -- which backs
+    # GET /url -- builds its reply from page.pageLoadState().activeURL(), pure
+    # UI-process state with no IPC to the web process. A wedged or dead web
+    # content process still answers it 200, so using it as the liveness probe
+    # would let the golden snapshot fire on a browser that cannot render: the
+    # green-by-absence class AGENTS.md names. Evaluating a script proves the web
+    # process executes. `return 1` mutates nothing, so the warm point stays the
+    # quiescent about:blank the golden requires.
+    url = f"http://{WD_HOST}/session/{session}/execute/sync"
+    body = json.dumps({"script": "return 1", "args": []}).encode()
     try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             value = json.load(resp)["value"]
+        if value != 1:
+            print(f"unhealthy: web process returned {value!r}, expected 1",
+                  file=sys.stderr)
+            return 1
     except Exception as error:  # noqa: BLE001 - any transport/protocol failure = unhealthy
         print(f"unhealthy: warm-session probe failed: "
               f"{type(error).__name__}: {error}", file=sys.stderr)

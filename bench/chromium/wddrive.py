@@ -56,7 +56,11 @@ def wd(host, method, path, body=None, timeout=30.0):
             detail = json.load(error)["value"]
             raise WdError(f"{detail.get('error')}: {detail.get('message')} "
                           f"({method} {path})") from error
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, AttributeError, TypeError):
+            # `value` is not required to be an object. A proxy or error page can
+            # return {"value": "..."} , and .get() on a str raised AttributeError
+            # OUT of this handler -- past main()'s except, so the parseable
+            # RENDER_FAIL line was lost exactly when it was needed.
             raise WdError(f"HTTP {error.code} on {method} {path}") from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise WdError(
@@ -138,9 +142,18 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
            {"script": "window.__fcvmNavSentinel = 1; return 1", "args": []},
            timeout=max(1.0, deadline - time.monotonic()))
         sentinel = True
-    except Exception:
-        # No current document to plant on (fresh session): readyState alone is
-        # unambiguous there, because there is no previous document to confuse it.
+    except WdError as error:
+        # ONLY the fresh-session case may skip the sentinel: with no previous
+        # document there is nothing for a stale "complete" to come from. Any
+        # other failure must propagate, because falling back silently turns a
+        # transient error into the exact false-ready measurement this sentinel
+        # exists to prevent (navigate_ms=3.4 while 985 ms of layout was still
+        # pending, which then landed in screenshot_ms).
+        # WdError carries only a formatted message, so match on it. Narrow by
+        # design: anything else propagates.
+        if not any(k in str(error) for k in
+                   ("no such window", "no such execution context", "no such frame")):
+            raise
         sentinel = False
     wd(host, "POST", f"/session/{session}/url", {"url": url}, timeout=timeout)
     while True:
@@ -151,6 +164,22 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
                    timeout=max(1.0, deadline - time.monotonic()))
         ready, swapped = (state[0], state[1]) if isinstance(state, list) else (state, True)
         if ready == "complete" and (swapped or not sentinel):
+            # readyState "complete" is NOT proof the requested page loaded.
+            # WebKit's network-error page is a fresh document (sentinel wiped)
+            # that reaches complete, so without this check a dead pageserver
+            # yields RENDER_OK over a screenshot of "Unable to load page" -- and
+            # at the warm point it would freeze a golden whose browser never
+            # rendered the fixture, making every clone's "warm" number a
+            # first-paint number. render.py guards the Chromium twin by raising
+            # on nav["errorText"]; WebDriver classic exposes no such field, so
+            # compare the document we actually landed on.
+            landed = wd(host, "GET", f"/session/{session}/url",
+                        timeout=max(1.0, deadline - time.monotonic()))
+            if landed != url:
+                raise WdError(
+                    f"navigation landed elsewhere: requested {url!r} but "
+                    f"document.URL is {landed!r}; this is a failed load (error "
+                    "page, redirect, or a dead origin), not a render")
             return
         state = ready
         if time.monotonic() >= deadline:
@@ -223,9 +252,16 @@ def main():
             landed = current_url(args.host, session)
             if landed != "about:blank":
                 raise WdError(f"blank transition landed on {landed!r}")
-    except WdError as error:
+    except (WdError, OSError, KeyError, TypeError, ValueError) as error:
+        # NOT just WdError. navigate() raises TimeoutError, which is an OSError
+        # subclass, not a RuntimeError; open(session_file) raises OSError;
+        # create_session's value["sessionId"] raises KeyError/TypeError;
+        # b64decode raises ValueError. Each of those escaped as a traceback and
+        # took the parseable one-line contract with it -- losing RENDER_FAIL
+        # exactly in the failure case any harness keys on.
         total_ms = (mono() - t0) * 1000
-        print(f"RENDER_FAIL url={args.url} error={error} total_ms={total_ms:.1f}")
+        print(f"RENDER_FAIL url={args.url} error={type(error).__name__}: {error} "
+              f"total_ms={total_ms:.1f}")
         return 1
 
     total_ms = (mono() - t0) * 1000

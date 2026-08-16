@@ -52,6 +52,20 @@ echo "webkit-bench: starting Xvfb on $DISPLAY_NUM"
 Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 -nolisten tcp -noreset &
 export DISPLAY="$DISPLAY_NUM"
 
+# WAIT for the X socket. Nothing else here does: the two wait_http loops below
+# can each return on their first probe, and GTK opens the display before it
+# parses argv, so on a loaded box MiniBrowser reached the display before Xvfb
+# was listening, create_session failed, `set -e` killed PID 1, and the container
+# never became healthy. The Containerfile's own build-time probe sleeps 1 s for
+# exactly this reason; poll the socket instead of guessing a duration.
+x_socket="/tmp/.X11-unix/X${DISPLAY_NUM#:}"
+for _ in $(seq 1 200); do
+    [ -S "$x_socket" ] && break
+    sleep 0.05
+done
+[ -S "$x_socket" ] || { echo "FATAL: Xvfb never created $x_socket" >&2; exit 1; }
+echo "webkit-bench: Xvfb listening ($x_socket)"
+
 echo "webkit-bench: starting pageserver on $HTTP_ADDR:$HTTP_PORT"
 python3 /opt/bench/pageserver.py --root "$PAGES_DIR" --addr "$HTTP_ADDR" \
     --port "$HTTP_PORT" --ready-file "$READY_FILE" &

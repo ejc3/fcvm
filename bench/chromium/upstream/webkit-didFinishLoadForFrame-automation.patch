@@ -1,0 +1,39 @@
+diff --git a/Source/WebKit/UIProcess/WebPageProxy.cpp b/Source/WebKit/UIProcess/WebPageProxy.cpp
+index 5ab611d889..e740a81132 100644
+--- a/Source/WebKit/UIProcess/WebPageProxy.cpp
++++ b/Source/WebKit/UIProcess/WebPageProxy.cpp
+@@ -7985,11 +7985,6 @@ void WebPageProxy::didFinishLoadForFrame(IPC::Connection& connection, FrameIdent
+         if (isMainFrame)
+             protectedPageLoadState->didFinishLoad(transaction);
+ 
+-        if (RefPtr automationSession = activeAutomationSession()) {
+-            automationSession->navigationOccurredForFrame(*frame);
+-            automationSession->loadCompletedForFrame(*frame, navigationID, WallTime::now());
+-        }
+-
+         frame->didFinishLoad();
+ 
+         frame->notifyParentOfLoadCompletion(frame->protectedProcess());
+@@ -7997,6 +7992,22 @@ void WebPageProxy::didFinishLoadForFrame(IPC::Connection& connection, FrameIdent
+         protectedPageLoadState->commitChanges();
+     }
+ 
++    // Notify automation UNCONDITIONALLY, as didFinishDocumentLoadForFrame already
++    // does. Gating this on `navigation` being still registered loses the
++    // completion whenever DidDestroyNavigation (sent from
++    // WebLocalFrameLoaderClient::documentLoaderDetached) is processed before
++    // DidFinishLoadForFrame: the API::Navigation is already retired, so the
++    // enclosing branch above is skipped and a WebDriver `normal` page load wait
++    // never resolves. The wait then never times out either, because
++    // WebAutomationSession's single shared m_loadTimer is the only deadline and
++    // Session::go arms none of its own -- so the client hangs indefinitely.
++    // Measured on 2.52.5: 13 of 31 fresh sessions. `eager`, which resolves via
++    // the ungated documentLoadedForFrame path, never stalls (8/8).
++    if (RefPtr automationSession = activeAutomationSession()) {
++        automationSession->navigationOccurredForFrame(*frame);
++        automationSession->loadCompletedForFrame(*frame, navigationID, WallTime::now());
++    }
++
+     if (protectedPreferences()->siteIsolationEnabled())
+         frame->broadcastFrameTreeSyncData(frame->calculateFrameTreeSyncData());
+ 
