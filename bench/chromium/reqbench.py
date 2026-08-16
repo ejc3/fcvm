@@ -183,6 +183,17 @@ def self_cpu_ms() -> float:
     )
 
 
+class MachineCpuCounterUnusable(RuntimeError):
+    """The machine-wide CPU counter does not track this process.
+
+    Distinct from an enclosure violation. A violation means the measurement
+    disagreed with itself and the numbers are wrong; this means the environment
+    cannot produce the measurement at all. Conflating them turned an
+    unsupported CI runner into what looked like a correctness bug in the
+    accounting.
+    """
+
+
 def bounded_cpu_residual(machine_ms: float, harness_ms: float) -> dict:
     """Constrain M-H only within the counters' declared resolution.
 
@@ -193,6 +204,24 @@ def bounded_cpu_residual(machine_ms: float, harness_ms: float) -> dict:
     """
     raw_ms = machine_ms - harness_ms
     uncertainty_ms = CPU_RESIDUAL_UNCERTAINTY_MS
+    # A machine counter that did not move AT ALL while this process
+    # demonstrably burned CPU is not an enclosure violation, it is a counter
+    # that does not track this process. Observed on GitHub-hosted runners:
+    # machine=0.000000ms against harness=150.000000ms. Reporting that as
+    # "host CPU delta is smaller than enclosed harness CPU delta" sends the
+    # reader hunting a measurement bug that is not there, and it is the reason
+    # the bench suite failed in CI while passing on every real bench host.
+    #
+    # Named separately so the two cases cannot be confused. A REAL violation
+    # (the machine counter moved, but by less than the harness) still raises
+    # below and still invalidates the measurement.
+    if machine_ms == 0.0 and harness_ms > uncertainty_ms:
+        raise MachineCpuCounterUnusable(
+            f"/proc/stat aggregate did not advance while this process used "
+            f"{harness_ms:.1f}ms of CPU, so it does not track this process and "
+            f"cannot enclose it. This measurement needs a host whose /proc/stat "
+            f"reflects its own processes; GitHub-hosted runners do not."
+        )
     if raw_ms < -uncertainty_ms:
         raise RuntimeError(
             "host CPU delta is smaller than enclosed harness CPU delta: "

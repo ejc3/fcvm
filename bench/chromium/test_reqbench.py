@@ -1013,10 +1013,37 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         self.assertIs(normal["clamped"], False)
 
     def test_cpu_residual_rejects_an_impossible_negative_delta(self):
+        """A machine counter that MOVED, but by less than the harness it encloses.
+
+        The machine figure must be non-zero. A zero is a different condition
+        entirely (the counter does not track this process at all) and is
+        asserted separately below; using zero here made this test pass for a
+        reason it did not intend.
+        """
         with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
+            reqbench.bounded_cpu_residual(
+                10.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 100.0
+            )
+
+    def test_a_dead_machine_counter_is_named_not_reported_as_a_violation(self):
+        """machine=0 while the harness burned CPU means the counter is unusable.
+
+        Observed on GitHub-hosted runners: machine=0.000000ms against
+        harness=150.000000ms. That is not the measurement disagreeing with
+        itself, it is /proc/stat not tracking this process, and reporting it as
+        an enclosure violation sent a reader hunting an accounting bug that did
+        not exist while the bench suite passed on every real bench host.
+        """
+        with self.assertRaises(reqbench.MachineCpuCounterUnusable) as caught:
             reqbench.bounded_cpu_residual(
                 0.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 10.0
             )
+        self.assertIn("does not track this process", str(caught.exception))
+
+        # And it must NOT fire when the harness used nothing worth enclosing:
+        # a genuinely idle window legitimately reads zero on both counters.
+        quiet = reqbench.bounded_cpu_residual(0.0, 0.0)
+        self.assertEqual(quiet["raw_ms"], 0.0)
 
     def test_reclaim_sampler_does_not_burn_a_core(self):
         """The RECLAIM window must not spin either — the control window is only half.
@@ -1117,6 +1144,21 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 # paths the record has no per_child_cpu at all. Reading it blind
                 # turned a diagnosable environment failure into a bare KeyError
                 # in CI, which said nothing about which path fired.
+                # Two legitimate outcomes, and the test asserts real behaviour
+                # in both. On a host whose /proc/stat tracks its own processes,
+                # the sampling happened and the ordering below is the subject.
+                # On one where it does not (GitHub-hosted runners: machine=0ms
+                # against harness=150ms), the correct behaviour is to say so by
+                # name, and that is what gets asserted instead. This is not a
+                # skip: a REAL enclosure violation still raises RuntimeError and
+                # still fails here.
+                if isinstance(cm.exception.__cause__, reqbench.MachineCpuCounterUnusable):
+                    self.assertIn(
+                        "does not track this process",
+                        str(cm.exception.__cause__),
+                        "the unusable-counter case must name why it cannot measure",
+                    )
+                    return
                 self.assertIn(
                     "per_child_cpu",
                     out,
