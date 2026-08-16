@@ -992,6 +992,19 @@ class TeardownFastCpuAccounting(unittest.TestCase):
     harness's own `pass` loop, then multiplied by the whole reclaim window.
     """
 
+    def setUp(self):
+        # machine_counter_tracks_this_process memoizes into a module global,
+        # because whether /proc/stat encloses this process is a property of the
+        # host and re-measuring it burns a core for ~320 ms per call. That is
+        # right in production and wrong across tests: the frozen-counter test
+        # mocks the counter, caches False, and every later test then reads that
+        # cached answer instead of asking. Observed as
+        #   test_the_probe_reports_this_host_tracks_its_own_processes
+        #   AssertionError: False is not true
+        # on a host that tracks perfectly well. Reset per test so each one
+        # measures what it claims to.
+        reqbench._MACHINE_COUNTER_TRACKS = None
+
     def test_control_window_does_not_measure_our_own_spin(self):
         from unittest import mock
 
@@ -1336,21 +1349,14 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 # paths the record has no per_child_cpu at all. Reading it blind
                 # turned a diagnosable environment failure into a bare KeyError
                 # in CI, which said nothing about which path fired.
-                # Two legitimate outcomes, and the test asserts real behaviour
-                # in both. On a host whose /proc/stat tracks its own processes,
-                # the sampling happened and the ordering below is the subject.
-                # On one where it does not (GitHub-hosted runners: machine=0ms
-                # against harness=150ms), the correct behaviour is to say so by
-                # name, and that is what gets asserted instead. This is not a
-                # skip: a REAL enclosure violation still raises RuntimeError and
-                # still fails here.
-                if isinstance(cm.exception.__cause__, reqbench.MachineCpuCounterUnusable):
-                    self.assertIn(
-                        "does not track this process",
-                        str(cm.exception.__cause__),
-                        "the unusable-counter case must name why it cannot measure",
-                    )
-                    return
+                # This used to branch on a MachineCpuCounterUnusable cause and
+                # return early. That branch can no longer fire: the residual
+                # errors are now caught inside measure_fast_reap and converted
+                # to cpu_residual_error, so neither MachineCpuCounterUnusable
+                # nor a plain enclosure RuntimeError escapes as a cause, and
+                # per_child_cpu is produced on every host. A branch that cannot
+                # execute is the shape AGENTS.md names, so it is gone rather
+                # than left looking like it covers something.
                 self.assertIn(
                     "per_child_cpu",
                     out,

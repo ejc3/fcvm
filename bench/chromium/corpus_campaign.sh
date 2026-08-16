@@ -68,10 +68,24 @@ SERVE_PID=""
 
 cleanup() {
     set +e
-    if [ -n "$SERVE_PID" ] && kill -0 "$SERVE_PID" 2>/dev/null; then
+    # `sudo kill -0`, not bare `kill -0`: corpus_serve runs as root (sudo -b)
+    # while this script does not, so an unprivileged liveness probe gets EPERM
+    # and the guard is ALWAYS false. The server then survives holding
+    # 127.0.0.1:53/80/443, the `systemctl start dnsmasq` below cannot bind, and
+    # the next run picks up the leaked pid and records DNSMASQ_WAS_ACTIVE=no.
+    if [ -n "$SERVE_PID" ] && sudo kill -0 "$SERVE_PID" 2>/dev/null; then
         say "stopping corpus_serve ($SERVE_PID)"
         sudo kill "$SERVE_PID" 2>/dev/null
-        wait "$SERVE_PID" 2>/dev/null
+        # Not `wait`: the server is not a child of this shell (sudo -b detached
+        # it), so wait returns immediately and proves nothing. Poll instead.
+        for _ in $(seq 1 50); do
+            sudo kill -0 "$SERVE_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if sudo kill -0 "$SERVE_PID" 2>/dev/null; then
+            say "corpus_serve $SERVE_PID did not exit; escalating to SIGKILL"
+            sudo kill -9 "$SERVE_PID" 2>/dev/null
+        fi
     fi
     if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
         say "restarting dnsmasq"

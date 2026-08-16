@@ -1053,21 +1053,40 @@ mod tests {
 /// is a real directory rather than a symlink.
 const SBIN_DIRS: [&str; 2] = ["/usr/sbin", "/sbin"];
 
+/// Search path to fall back on when the environment carries none.
+///
+/// Mirrors what execvp would have used (`confstr(_CS_PATH)` is `/bin:/usr/bin`)
+/// plus the usual local prefix, so setting PATH never loses a directory the
+/// process could previously reach.
+const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
 /// Compute the PATH fcvm should run with, given the inherited one.
 ///
 /// Returns `None` when nothing needs to change, so the caller can leave the
 /// environment alone in the common case.
 fn path_with_sbin(current: &str) -> Option<String> {
+    // An ABSENT PATH is not an empty PATH. With no PATH set, execvp falls back
+    // to a built-in default (confstr(_CS_PATH), "/bin:/usr/bin"), so bare-name
+    // lookups still find podman, skopeo and tar. Appending only the sbin dirs
+    // to "" would SET PATH to "/usr/sbin:/sbin" and destroy that fallback,
+    // turning a fix for one class of ENOENT into a cause of another for
+    // anything launched with a cleared environment (`env -i`, a minimal
+    // systemd unit, a test harness that scrubs the env).
+    let base = if current.is_empty() {
+        DEFAULT_PATH
+    } else {
+        current
+    };
     let missing: Vec<&str> = SBIN_DIRS
         .iter()
         .copied()
         .filter(|dir| std::path::Path::new(dir).is_dir())
-        .filter(|dir| !std::env::split_paths(current).any(|p| p == std::path::Path::new(dir)))
+        .filter(|dir| !std::env::split_paths(base).any(|p| p == std::path::Path::new(dir)))
         .collect();
-    if missing.is_empty() {
+    if missing.is_empty() && base == current {
         return None;
     }
-    let mut out = String::from(current);
+    let mut out = String::from(base);
     for dir in missing {
         if !out.is_empty() {
             out.push(':');
@@ -1268,5 +1287,31 @@ mod sbin_path_tests {
             !repaired.starts_with(':') && !repaired.contains("::") && !repaired.ends_with(':'),
             "repaired PATH has an empty element, which means cwd: {repaired:?}"
         );
+    }
+
+    /// Repairing an ABSENT PATH must not cost the default search path.
+    ///
+    /// RED BEFORE THE FIX: `path_with_sbin("")` returned `"/usr/sbin:/sbin"`.
+    /// With no PATH set, execvp uses a built-in default, so `podman`, `skopeo`
+    /// and `tar` resolved from `/usr/bin` before this function existed; SETTING
+    /// PATH to the sbin dirs alone replaced that fallback with nothing and
+    /// turned a fix for one ENOENT into a cause of another, for anything
+    /// launched with a cleared environment.
+    #[test]
+    fn an_absent_path_keeps_the_default_search_directories() {
+        let repaired = path_with_sbin("").expect("sbin dirs exist on this host");
+        for tool in ["podman", "skopeo", "tar", "env"] {
+            let installed = ["/usr/local/bin", "/usr/bin", "/bin"]
+                .iter()
+                .any(|d| std::path::Path::new(d).join(tool).exists());
+            if !installed {
+                continue;
+            }
+            assert!(
+                std::env::split_paths(&repaired).any(|d| d.join(tool).exists()),
+                "{tool} is installed in the default search path but is unreachable from \
+                 the PATH built for an empty environment: {repaired:?}"
+            );
+        }
     }
 }

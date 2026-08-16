@@ -183,6 +183,11 @@ def self_cpu_ms() -> float:
     )
 
 
+# Answer to machine_counter_tracks_this_process(), which is a property of the
+# host and therefore constant for the life of the process. None until asked.
+_MACHINE_COUNTER_TRACKS = None
+
+
 class MachineCpuCounterUnusable(RuntimeError):
     """The machine-wide CPU counter does not track this process.
 
@@ -221,6 +226,17 @@ def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
     # cannot-distinguish branch and called a frozen counter healthy.
     if burn_ms is None:
         burn_ms = 4 * CPU_RESIDUAL_UNCERTAINTY_MS
+    # Whether /proc/stat encloses this process is a property of the HOST, so it
+    # cannot change between reps and there is no reason to re-measure it. It is
+    # also expensive to ask: the probe burns a full core for ~320 ms, and
+    # bounded_cpu_residual calls it on every violation, so on a host that
+    # violates every rep a 202-rep campaign would spend a minute of busy-spin
+    # INSIDE the teardown path -- landing in the ambient control window of the
+    # reps either side and inflating exactly the baseline the accounting
+    # subtracts. Answer once per process.
+    global _MACHINE_COUNTER_TRACKS
+    if _MACHINE_COUNTER_TRACKS is not None:
+        return _MACHINE_COUNTER_TRACKS
     m0, h0 = machine_cpu_ms(), self_cpu_ms()
     end = time.monotonic() + burn_ms / 1000.0
     while time.monotonic() < end:
@@ -231,9 +247,11 @@ def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
         # We failed to burn measurably more than the tolerance (a preempted or
         # heavily throttled probe), so it cannot distinguish anything. Fail
         # toward "tracks", which keeps the real-violation path live rather than
-        # excusing it.
+        # excusing it. NOT memoized: this is a statement about the probe, not
+        # about the host, so a later attempt may still answer the question.
         return True
-    return (m1 - m0) >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
+    _MACHINE_COUNTER_TRACKS = (m1 - m0) >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
+    return _MACHINE_COUNTER_TRACKS
 
 
 def bounded_cpu_residual(machine_ms: float, harness_ms: float, tracks=None) -> dict:
@@ -1513,9 +1531,13 @@ def measure_fast_reap(
         # under-reports (machine=30ms against harness=160ms in one window while
         # a controlled burn tracked fine).
         #
-        # The figure is withheld rather than guessed, and the error is carried
-        # so the publication gate can refuse to publish CPU numbers that rest
-        # on it. Fail-closed on PUBLICATION, not on teardown.
+        # The figure is withheld rather than guessed. Publication already fails
+        # closed without reading this field: reqanalyze requires ~20 CPU fields
+        # and rejects the run with "fast teardown has no valid
+        # machine_cpu_ms_net" when they are absent. Those messages name the
+        # SYMPTOM, so this field carries the CAUSE for whoever reads the record.
+        # Nothing consumes it programmatically; saying it gates publication
+        # would credit it with work the required-field checks are doing.
         cpu_residual_error = None
         try:
             reclaim_cpu = bounded_cpu_residual(machine1 - machine0, self_ms)

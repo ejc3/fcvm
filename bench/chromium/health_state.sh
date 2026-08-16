@@ -71,15 +71,29 @@ healthy | unhealthy) ;;
 	;;
 esac
 
+# `.*` and `[!0-9]*` are not redundant with the classes before them. Without
+# them a stamp of "." passed validation, `${stamp%.*}` stripped it to the empty
+# string, and `$(( now -  ))` died with "operand expected" followed by `set -u`
+# aborting on the unset `age` -- the right exit status for the wrong reason,
+# which is the exact accident the comment above says this guard exists to stop.
 case "${stamp:-}" in
-'' | *[!0-9.]* | *.*.*)
+'' | *[!0-9.]* | *.*.* | .* | [!0-9]*)
 	echo "unhealthy: unparsable stamp ${stamp:-(empty)} in $STATE_FILE" >&2
 	exit 1
 	;;
 esac
+case "${now:-}" in
+'' | *[!0-9.]* | *.*.* | .* | [!0-9]*)
+	echo "unhealthy: unparsable uptime ${now:-(empty)} from /proc/uptime" >&2
+	exit 1
+	;;
+esac
 
-# Bash has no floats; compare whole seconds. Both operands are validated above.
-age=$(( ${now%.*} - ${stamp%.*} ))
+# Bash has no floats; compare whole seconds. Both operands are validated above
+# to be digits with at most one dot and a leading digit, so both truncate to a
+# non-empty integer. `10#` forces base 10: without it a zero-padded stamp such
+# as "00012" is read as OCTAL, which is silently wrong rather than an error.
+age=$(( 10#${now%.*} - 10#${stamp%.*} ))
 
 if [ "$age" -lt 0 ]; then
 	# Monotonic time cannot go backwards within one boot, so this means the
