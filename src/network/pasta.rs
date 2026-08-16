@@ -2548,6 +2548,98 @@ mod tests {
         );
     }
 
+    /// `rounds` must equal the number of attempts actually made.
+    ///
+    /// It is reported in the deadline error as evidence of how much work the
+    /// check did. Incrementing at the top of the loop counted a round that
+    /// found the budget already spent and probed nothing, overstating it by
+    /// one. A diagnostic that is off by one is a diagnostic nobody can reason
+    /// from, which is the whole failure this PR is about.
+    #[tokio::test(start_paused = true)]
+    async fn the_reported_round_count_matches_the_probes_actually_made() {
+        let mut probe = ScriptedGuest::silent_behind_resolved_neighbor();
+
+        let error = wait_for_guest_to_answer(&mut probe, PROBE_PORT, paused_deadline())
+            .await
+            .expect_err("a silent guest must fail readiness");
+
+        let text = error.to_string();
+        let reported: usize = text
+            .split("rounds ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no `rounds N` field in the error: {text}"));
+
+        assert_eq!(
+            reported, probe.probes,
+            "the error reports {reported} rounds but the probe was called {} times. \
+             The count must describe attempts made, not loop iterations entered.\n{text}",
+            probe.probes
+        );
+    }
+
+    /// An abandoned attempt must leave no descendant behind.
+    ///
+    /// `kill_on_drop` reaps only the immediate child. The production probe is
+    /// nsenter -> env -> timeout -> bash, so killing the leader can leave bash
+    /// alive holding a reference to the VM's network namespace, once per retry.
+    /// Each attempt therefore leads its own process group and the group is
+    /// killed on expiry. This drives that with a child that IGNORES SIGTERM, so
+    /// only a group KILL can end it.
+    #[tokio::test]
+    async fn an_abandoned_probe_kills_its_whole_process_group() {
+        let marker = std::env::temp_dir().join(format!("fcvm-probe-pg-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = Command::new("bash");
+        command.args([
+            "-c",
+            &format!(
+                "trap '' TERM; sleep 300 & echo $! > {}; wait",
+                marker.display()
+            ),
+        ]);
+
+        let result = run_probe_bounded(
+            command,
+            std::time::Duration::from_millis(400),
+            "a group-kill probe",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the probe must time out to exercise the kill"
+        );
+
+        // The grandchild wrote its pid before sleeping; it must now be gone.
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .expect("the probe child must have recorded its grandchild's pid")
+            .trim()
+            .parse()
+            .expect("pid file must hold a number");
+        let _ = std::fs::remove_file(&marker);
+
+        let mut alive = true;
+        for _ in 0..50 {
+            // SAFETY: signal 0 only tests for existence.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if alive {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "grandchild {pid} survived the abandoned attempt. It ignores SIGTERM, so \
+             only a process-group kill ends it; without one, every retry strands a \
+             process holding the VM's network namespace."
+        );
+    }
+
     /// Any port; the scripted guest ignores it.
     const PROBE_PORT: u16 = 80;
 
