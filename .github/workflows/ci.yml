@@ -732,6 +732,14 @@ jobs:
           # instance is terminated with its artifacts — the live log pipe is
           # the only channel that survives, so the watchdog must share it.
           sudo ./scripts/ci-dstate-watchdog.sh & WD=$!
+          # Per-process CPU, sampled WHILE the tests run. `sar` is system-wide
+          # and the post-step snapshot is taken after the suite has finished, so
+          # neither can say WHICH process consumed the host at the moment a
+          # readiness probe timed out. pidstat can. One process, 30s samples,
+          # written to the artifact directory rather than the job log.
+          (pidstat -u -h 30 > /tmp/fcvm-test-logs/pidstat.log 2>&1 || \
+            echo "pidstat unavailable (sysstat not installed)" > /tmp/fcvm-test-logs/pidstat.log) &
+          PIDSTAT=$!
           SNAPSHOT_DIR="${FCVM_DATA_DIR:-/mnt/fcvm-btrfs/root}/snapshots"
           for i in $(seq 1 ${{ matrix.test_runs }}); do
             echo ""
@@ -751,6 +759,7 @@ jobs:
             fi
           done
           sudo kill $WD 2>/dev/null || true
+          kill $PIDSTAT 2>/dev/null || true
       - name: bench-vm
         if: matrix.mode == 'SnapshotEnabled'
         working-directory: fcvm

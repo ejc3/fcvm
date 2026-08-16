@@ -374,6 +374,39 @@ where nobody looks. Find the cheap equivalent:
 If after genuinely trying you cannot make it cheap, say so **in the test file**, with what it
 would take — never only in a commit message, where the next reader will not find it.
 
+## WHAT CI CAPTURES WHEN SOMETHING FAILS
+
+The rule behind all of it: **a failure must carry the evidence needed to attribute it.**
+Every unattributable failure this repo has chased ended the same way, with the state gone by
+the time anyone looked, and the argument settled by whoever sounded most confident.
+
+Host side, captured today:
+
+| What | Where | Why it is there |
+|---|---|---|
+| `sar -q` / `sar -u`, whole day | `host-load.log` artifact | sysstat already runs on every runner and nothing read it. 10-minute samples, so it answers "was the box busy", not "at this millisecond" |
+| `pidstat -u -h 30` during the suite | `pidstat.log` artifact | `sar` is system-wide and the post-step snapshot is taken after the suite ends, so neither can say WHICH process consumed the host at the moment of a timeout |
+| `/proc/loadavg` inline in the readiness error | the error text itself | so "the box was busy" is checkable in the message, without fetching anything |
+| filtered `dmesg` | `dmesg-filtered.log` artifact | host OOM, KVM, page-fault signatures |
+| D-state watchdog | live step log | prints nothing when healthy; an ephemeral runner dies with its artifacts, so the live log is the only channel that survives |
+
+Rules learned the hard way, each from a check that could not fire:
+
+- **Never conclude "no OOM" from a job log.** Guest console lines are DEBUG and filtered out of
+  it, and host `dmesg` only reaches an artifact. Measured: `grep -c "DEBUG firecracker"` on a
+  259,570-line job log returns 0. Render resource verdicts against `/tmp/fcvm-test-logs/*`, and
+  fail closed when the artifact is missing.
+- **Prefer `/proc/vmstat`'s `oom_kill` to dmesg.** It is monotonic and cannot wrap. The guest's
+  printk ring is 128 KiB (`CONFIG_LOG_BUF_SHIFT=17`) and a chatty boot does wrap it, so a
+  dmesg-only OOM check intermittently cannot fire.
+- **Never `statvfs` a path you have not proved is local.** On a wedged FUSE mount it parks in
+  uninterruptible sleep and no timeout can cancel it, turning a diagnostic into a second hang.
+  Read `/proc/self/mountinfo` first and skip anything that is not tmpfs/ext4/btrfs/xfs.
+- **Never read `/proc/<pid>/cmdline` in a wedge scan.** It faults the target's mm and hangs on
+  exactly the processes you are trying to inspect.
+- **A collector that cannot run must say so.** Silence from a diagnostic is indistinguishable
+  from a clean result, which is the same bug as a gate printing CLEAN because `jq` was missing.
+
 ## HOW TO INVESTIGATE A TIMEOUT
 
 A deadline miss says one thing only: the answer did not arrive in time. It does NOT say the

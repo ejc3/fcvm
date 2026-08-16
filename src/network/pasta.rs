@@ -150,6 +150,58 @@ fn describe_silent_probe(code: Option<i32>, stderr: &str) -> String {
     }
 }
 
+/// Run a bounded probe command, killing its whole process GROUP on expiry.
+///
+/// `kill_on_drop` reaps only the immediate child. The probe is
+/// `nsenter -> env -> timeout -> bash`, so dropping the future kills the
+/// leader and leaves `bash` with nobody to deliver the KILL that `timeout -k`
+/// promised. Each expiry could then strand a process holding a reference to
+/// the VM's network namespace, once per retry.
+///
+/// The child leads its own process group (`process_group(0)`, so pgid == pid),
+/// which makes the whole subtree addressable with one `killpg`.
+async fn run_probe_bounded(
+    mut command: Command,
+    budget: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawning {what}"))?;
+    let pgid = child.id().map(|id| id as i32);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let wait = async {
+        let status = child.wait().await?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Some(mut handle) = stdout {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut handle, &mut out).await;
+        }
+        if let Some(mut handle) = stderr {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut handle, &mut err).await;
+        }
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    };
+    match tokio::time::timeout(budget, wait).await {
+        Ok(result) => result.with_context(|| format!("running {what}")),
+        Err(_elapsed) => {
+            // SAFETY: pgid came from this child, which leads its own group.
+            // Killing a group we created cannot reach an unrelated process:
+            // the pid is not reused while we hold the un-reaped child.
+            if let Some(pgid) = pgid {
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+            anyhow::bail!("{what} exceeded pasta's readiness deadline")
+        }
+    }
+}
+
 /// Production [`GuestProbe`]: runs the probes inside the VM's network namespace
 /// via the holder PID.
 struct NsenterGuestProbe {
@@ -197,10 +249,7 @@ impl GuestProbe for NsenterGuestProbe {
             &script,
         ]);
         command.stdout(Stdio::null()).stderr(Stdio::piped());
-        let output = tokio::time::timeout(budget, command.output())
-            .await
-            .context("TCP probe exceeded pasta's readiness deadline")?
-            .context("running the TCP probe via nsenter in namespace")?;
+        let output = run_probe_bounded(command, budget, "the TCP probe").await?;
 
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         // Exit 0: connected (SYN-ACK). "Connection refused": the guest's kernel
@@ -229,10 +278,7 @@ impl GuestProbe for NsenterGuestProbe {
         let mut command =
             self.command(&["ip", "neigh", "show", "to", GUEST_IP, "dev", BRIDGE_DEVICE]);
         command.stderr(Stdio::piped());
-        let output = tokio::time::timeout(budget, command.output())
-            .await
-            .context("neighbor query exceeded pasta's readiness deadline")?
-            .context("reading guest neighbour entry via nsenter in namespace")?;
+        let output = run_probe_bounded(command, budget, "the neighbour query").await?;
         if !output.status.success() {
             anyhow::bail!(
                 "failed to inspect ARP entry for guest {} on {}: {}",
