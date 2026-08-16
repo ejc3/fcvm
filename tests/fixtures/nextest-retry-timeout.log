@@ -1,0 +1,4 @@
+        PASS [   0.012s] (1/1022) fcvm::test_state_manager test_save_and_load
+  TRY 1 TMT [ 900.002s] (───────) fcvm::test_pjdfstest_vm test_pjdfstest_vm_ftruncate
+  TRY 2 PASS [   6.991s] (999/1022) fcvm::test_pjdfstest_vm test_pjdfstest_vm_ftruncate
+     Summary [ 612.810s] 1022 tests run: 1022 passed (1 slow), 20 skipped
