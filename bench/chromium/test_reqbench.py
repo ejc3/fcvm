@@ -78,6 +78,55 @@ def spawn_mixed_parent(linger_bin, fast_bin):
     return subprocess.Popen([sys.executable, "-c", code, linger_bin, fast_bin])
 
 
+def wait_for_execed_children(pid, want, timeout):
+    """Wait until `pid` has `want` children that have finished exec'ing.
+
+    Waiting for the fork alone is not enough. `fork()` copies the parent's
+    `comm`, and `execve` is what replaces it, so between the two a child of a
+    python parent reads back as "python3". A loop that stops at
+    `len(children_of(pid)) >= want` therefore races the exec, and any assertion
+    on the names is a coin flip weighted by how loaded the box is. On this
+    64-core host the exec effectively always won; on a shared GitHub-hosted
+    runner it did not, and the precondition failed as
+
+        AssertionError: Lists differ: ['lingersleep', 'python3'] != ['lingersleep', 'fastexit']
+
+    Returns (pids, comms) whatever happens — the caller still asserts, so a
+    child that never execs fails the test rather than hanging it.
+    """
+    parent_comm = reqbench.proc_comm(pid)
+    deadline = time.monotonic() + timeout
+    kids, comms = [], []
+    while True:
+        kids = reqbench.children_of(pid)
+        comms = [reqbench.proc_comm(k) for k in kids]
+        settled = len(kids) >= want and all(
+            c is not None and c != parent_comm for c in comms
+        )
+        if settled or time.monotonic() >= deadline:
+            return kids, comms
+        time.sleep(0.005)
+
+
+def spawn_slow_exec_parent(child_bin, preexec_delay_s):
+    """A parent whose child sits in `preexec_fn` for a known interval.
+
+    `preexec_fn` runs in the child AFTER fork and BEFORE exec, which makes the
+    otherwise sub-millisecond pre-exec window wide enough to observe on purpose.
+    That is what lets the race above be reproduced deterministically instead of
+    waited for.
+    """
+    code = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.argv[1],'300'],"
+        " preexec_fn=lambda: time.sleep(float(sys.argv[2])));"
+        "time.sleep(3600)"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", code, child_bin, str(preexec_delay_s)]
+    )
+
+
 def spawn_pdeathsig_parent_ignoring_sigterm(child_argv):
     """A parent that IGNORES SIGTERM but whose child dies with it.
 
@@ -1100,6 +1149,56 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 self.assertTrue(c["below_resolution"])
                 self.assertEqual(c["reclaim_cpu_ms_hi"], 2 * out["tick_ms"])
 
+    def test_the_child_wait_settles_on_exec_not_on_fork(self):
+        """The pre-exec window is real, and waiting for the fork does not close it.
+
+        RED BEFORE THE FIX: `test_every_tracked_child_gets_a_cpu_sample` waited
+        for `len(children_of(pid)) >= 2` and then read `proc_comm`. Between fork
+        and execve a child still carries its parent's comm, so that read can
+        return "python3" for a child that will become "lingersleep". It did, on
+        a GitHub-hosted runner, on 2026-08-16.
+
+        This makes the window deterministic with a 0.5 s `preexec_fn` instead of
+        hoping to catch a sub-millisecond one, and asserts both halves: the
+        fork-only wait observes the parent's comm, and the exec-aware wait does
+        not.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            child = os.path.join(d, "slowexec")
+            shutil.copy("/bin/sleep", child)
+            p = spawn_slow_exec_parent(child, 0.5)
+            try:
+                # The fork-only wait: exactly what the old precondition did.
+                deadline = time.monotonic() + 10
+                while (
+                    len(reqbench.children_of(p.pid)) < 1
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                kids = reqbench.children_of(p.pid)
+                self.assertEqual(len(kids), 1, "parent never forked its child")
+                self.assertEqual(
+                    reqbench.proc_comm(kids[0]),
+                    reqbench.proc_comm(p.pid),
+                    "the pre-exec window did not reproduce, so this test proves "
+                    "nothing about the wait — the child already carried its own "
+                    "comm the moment the fork became visible",
+                )
+                # The exec-aware wait, on the same live process.
+                kids, comms = wait_for_execed_children(p.pid, 1, 10)
+                self.assertEqual(
+                    comms, ["slowexec"],
+                    "wait_for_execed_children returned before execve replaced comm",
+                )
+            finally:
+                p.kill()
+                p.wait(timeout=5)
+                for k in kids:
+                    try:
+                        os.kill(k, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
     def test_every_tracked_child_gets_a_cpu_sample(self):
         """A fast child must not be skipped because a slow one was sampled first.
 
@@ -1121,15 +1220,12 @@ class TeardownFastCpuAccounting(unittest.TestCase):
             shutil.copy("/bin/sleep", fast)
             p = spawn_mixed_parent(linger, fast)
             try:
-                deadline = time.monotonic() + 10
-                while len(reqbench.children_of(p.pid)) < 2 and time.monotonic() < deadline:
-                    time.sleep(0.005)
-                kids = reqbench.children_of(p.pid)
+                kids, comms = wait_for_execed_children(p.pid, 2, 10)
                 self.assertEqual(len(kids), 2, "parent never forked both children")
                 # Precondition: the child that dies FIRST must be SECOND in fork
                 # order, or this test is not exercising the ordering defect at all.
                 self.assertEqual(
-                    [reqbench.proc_comm(k) for k in kids], ["lingersleep", "fastexit"],
+                    comms, ["lingersleep", "fastexit"],
                     "fork order is not [linger, fast]; the ordering defect is not exercised",
                 )
                 # `lingersleep` has no pdeathsig, so it survives and teardown_fast
