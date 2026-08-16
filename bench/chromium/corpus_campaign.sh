@@ -110,8 +110,12 @@ SERVE_PIDFILE="$LOGDIR/corpus_serve.pid"
 sudo -b sh -c 'echo $$ > "$1"; exec python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2' \
     _ "$SERVE_PIDFILE" "$REPO/bench/chromium/corpus_serve.py" "$REPO/bench/chromium/corpus-live" \
     > "$LOGDIR/corpus_serve.log" 2>&1
+# `[ -s f ] && break` would be the last command in the body, so on the first
+# iteration (pidfile not written yet) it returns 1 and `set -e` kills the whole
+# script -- observed: the server started, loaded 781 urls, and the campaign
+# exited straight into cleanup.
 for _ in $(seq 1 50); do
-    [ -s "$SERVE_PIDFILE" ] && break
+    if [ -s "$SERVE_PIDFILE" ]; then break; fi
     sleep 0.1
 done
 SERVE_PID=$(cat "$SERVE_PIDFILE" 2>/dev/null || true)
@@ -123,10 +127,24 @@ sudo kill -0 "$SERVE_PID" 2>/dev/null || { echo "BLOCKED: corpus_serve pid $SERV
 # would otherwise surface as a corpus of 404s inside the guest.
 grep -q "loaded [1-9]" "$LOGDIR/corpus_serve.log" || {
     echo "BLOCKED: corpus_serve loaded no urls" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
-answer=$(dig +short +time=2 +tries=1 @127.0.0.1 blog.cloudflare.com A | head -1)
+# Readiness is not the pidfile. The wrapper writes $$ and THEN execs python,
+# which still has to load the corpus and bind 53/80/443, so the pid exists
+# several seconds before the sockets do. The original fixed `sleep 3` hid that;
+# after switching to a pidfile the curl below raced the TLS bind and returned
+# 000, which `set -e` turned into a bare exit 7. Poll the sockets instead, so
+# the wait is as long as it needs to be and no longer.
+answer=""
+code=""
+for _ in $(seq 1 100); do
+    answer=$(dig +short +time=2 +tries=1 @127.0.0.1 blog.cloudflare.com A 2>/dev/null | head -1 || true)
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+           --resolve 'blog.cloudflare.com:443:127.0.0.1' https://blog.cloudflare.com/ 2>/dev/null || true)
+    if [ "$answer" = "10.0.2.2" ] && [ "$code" = "200" ]; then break; fi
+    sudo kill -0 "$SERVE_PID" 2>/dev/null || { echo "BLOCKED: corpus_serve died during startup" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
+    sleep 0.2
+done
 [ "$answer" = "10.0.2.2" ] || { echo "BLOCKED: wildcard DNS answered '$answer', expected 10.0.2.2" >&2; exit 3; }
-code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve 'blog.cloudflare.com:443:127.0.0.1' https://blog.cloudflare.com/)
-[ "$code" = "200" ] || { echo "BLOCKED: HTTPS replay returned $code for blog.cloudflare.com" >&2; exit 3; }
+[ "$code" = "200" ] || { echo "BLOCKED: HTTPS replay returned '$code' for blog.cloudflare.com" >&2; exit 3; }
 say "replay server up: DNS -> 10.0.2.2, HTTPS 200"
 
 # --- golden ----------------------------------------------------------------
@@ -152,6 +170,27 @@ else
         say "reusing golden $TAG (NO working-set sidecar: this run records one cold)"
     fi
 fi
+
+# --- settle -----------------------------------------------------------------
+# Creating the golden is CPU-heavy (container build, cold boot, snapshot), so
+# the box is still hot when this phase ends. The run driver refuses above a
+# 1-min load of 2.0 and does not wait, so PHASE=all would throw away the golden
+# it just spent minutes building:
+#   REFUSING: box is busy (load=2.41, 0 firecracker/fcvm)
+# Wait for the average to decay instead. 1.5 leaves margin under the gate, and
+# the wait is bounded so a genuinely busy box still fails rather than hanging.
+settle_deadline=$(( $(date +%s) + 900 ))
+while :; do
+    load1=$(awk '{print $1}' /proc/loadavg)
+    if awk -v l="$load1" 'BEGIN{exit !(l < 1.5)}'; then break; fi
+    if [ "$(date +%s)" -ge "$settle_deadline" ]; then
+        echo "BLOCKED: load stayed at $load1 for 15 min; refusing to measure on a busy box" >&2
+        exit 4
+    fi
+    say "waiting for the box to go quiet (1-min load $load1, need < 1.5)"
+    sleep 20
+done
+say "box quiet (1-min load $load1)"
 
 # --- measured run ----------------------------------------------------------
 say "measured run: $REPS reps/arm, warmup $WARMUP, arms $ARMS, $BACKEND/$UFFD_MODE prefetch=$UFFD_PREFETCH"
