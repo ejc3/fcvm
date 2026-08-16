@@ -70,9 +70,9 @@ ENV VK_ICD_FILENAMES=/usr/lib/chromium/./vk_swiftshader_icd.json
 
 COPY bench/chromium/pages/ /opt/bench/pages/
 COPY bench/chromium/pageserver.py bench/chromium/render.py bench/chromium/entry.sh \
-     bench/chromium/cdp_health.py /opt/bench/
+     bench/chromium/cdp_health.py bench/chromium/health_state.sh /opt/bench/
 RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py \
-     /opt/bench/cdp_health.py
+     /opt/bench/cdp_health.py /opt/bench/health_state.sh
 
 # The request path IS Chromium's DevTools Protocol endpoint -- no wrapper of
 # ours parses, re-encodes or re-frames a single CDP message:
@@ -99,7 +99,13 @@ EXPOSE 9222
 # finds a page target: healthy means provably able to screenshot.
 # start-period covers Chromium's cold launch + the warm render; interval is the
 # resolution of the snapshot trigger, so it is short.
+# The check itself is a file read: cdp_health.py --loop is resident (started by
+# entry.sh) and publishes its verdict; this reads it and demands FRESH healthy.
+# As a per-second HEALTHCHECK the python form cost a fresh interpreter in every
+# clone forever: 9.1ms startup, 43.6ms for the whole check, measured in this
+# image. Resident, that cost is paid once at the golden and its dirtied pages
+# are shared by every clone.
 HEALTHCHECK --interval=1s --timeout=5s --start-period=90s --retries=3 \
-    CMD ["python3", "/opt/bench/cdp_health.py"]
+    CMD ["/opt/bench/health_state.sh"]
 
 CMD ["/opt/bench/entry.sh"]

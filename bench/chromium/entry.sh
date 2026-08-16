@@ -219,6 +219,13 @@ wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp
 # failures.
 # ---------------------------------------------------------------------------
 
+# Resident health checker. Started BEFORE the warm marker so the first verdict
+# is published while the golden is still being prepared, and so its interpreter
+# pages are dirtied pre-snapshot and shared by every clone rather than
+# re-dirtied per clone. The HEALTHCHECK reads its verdict; see health_state.sh.
+python3 /opt/bench/cdp_health.py --loop &
+echo "chromium-bench: resident health checker started (pid $!)"
+
 echo "chromium-bench: warming renderer"
 python3 /opt/bench/render.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
     --out-prefix /tmp/warmup --then-blank
