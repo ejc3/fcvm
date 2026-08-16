@@ -231,6 +231,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium analyze-chromium-request bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-chromium-request-golden bench-chromium-request-verify \
+	bench-chromium-corpus \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
@@ -297,6 +298,7 @@ help:
 	@echo "  bench-chromium-request-verify  Prove CDP hops on a restored clone (TAG=)"
 	@echo "  bench-chromium-request-run     Measured run (TAG=, BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, WARMUP=, ARMS=, RESULTS=)"
 	@echo "  bench-chromium-request-all     Full chain: image, golden, verify, run"
+	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=)"
 	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
@@ -757,6 +759,34 @@ bench-chromium-request-all: build setup-default
 	@echo "==> Full request-bench chain (image, golden, verify, measured run) under one seal..."
 	@BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
 		bash bench/chromium/reqbench.sh all
+
+# Corpus campaign, PACKAGED PER RUN.
+#
+# corpus_campaign.sh is the orchestrator, and bash reads a script incrementally
+# by byte offset: editing it while it runs resumes mid-line and executes
+# whatever the shifted bytes happen to spell. Observed 2026-08-16, inserting a
+# block into a running campaign:
+#     corpus_campaign.sh: line 201: not: command not found
+# which killed a three-cell sweep after its first cell had already gated clean.
+#
+# reqbench.sh already solves this FOR ITSELF: it stages its five sources plus
+# the two binaries into a content-addressed bundle, chmod 0555, and execs the
+# copy. This applies the same discipline one layer up, from make, so a campaign
+# is immune to edits in the working tree for its whole lifetime. Everything for
+# one run -- the frozen orchestrator, its manifest, the source revision, and
+# every reqbench record -- lands under a single directory.
+CORPUS_STAMP ?= $(shell date +%Y%m%d-%H%M%S)
+CORPUS_RUN_DIR ?= $(CURDIR)/bench/chromium/results/corpus-$(CORPUS_STAMP)
+bench-chromium-corpus: build setup-default
+	@mkdir -p "$(CORPUS_RUN_DIR)/orchestrator"
+	@cp bench/chromium/corpus_campaign.sh "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
+	@chmod 0555 "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
+	@cd "$(CORPUS_RUN_DIR)/orchestrator" && sha256sum corpus_campaign.sh > MANIFEST.sha256
+	@sha256sum "$(CURDIR)/target/release/fcvm" >> "$(CORPUS_RUN_DIR)/orchestrator/MANIFEST.sha256"
+	@git -C "$(CURDIR)" rev-parse HEAD > "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REVISION"
+	@echo "==> campaign frozen at $(CORPUS_RUN_DIR)/orchestrator (read-only; edits to the tree cannot reach this run)"
+	@REPO="$(CURDIR)" RESULTS="$(CORPUS_RUN_DIR)/reqbench" \
+		bash "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
 
 # Host-container direct-CDP baseline (no VM): same image, same driver, warm
 # pool on the host. Needs only the container image, not VM assets.
