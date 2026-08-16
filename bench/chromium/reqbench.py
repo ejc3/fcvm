@@ -1842,9 +1842,17 @@ def teardown_fast(
             "complete": s["zombie_seen"],
         }
 
-    # The delta this request cost, per pinned process. Reported next to the
-    # latency on the SAME record, so a memory/latency frontier is one
-    # measurement rather than a join across two experiments on two goldens.
+    # Private_Dirty as read at ONE INSTANT, per pinned process -- an absolute
+    # reading, NOT a delta: no baseline is subtracted anywhere. Calling it a
+    # delta invites the reader to treat it as "what this request cost", and it
+    # is not. With --uffd-prefetch on, the whole recorded working set (~56k
+    # pages) is already private before the guest executes an instruction, and
+    # every page of it is counted here. proc_private_dirty_kb's docstring is the
+    # long form of what the number does and does not include.
+    #
+    # Reported next to the latency on the SAME record, so a memory/latency
+    # frontier is one measurement rather than a join across two experiments on
+    # two goldens.
     out["per_child_memory"] = dict(pre_memory)
     out["private_dirty_unmeasured"] = [
         name for name, m in pre_memory.items() if m.get("private_dirty_kb") is None

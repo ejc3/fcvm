@@ -46,7 +46,15 @@ say() { printf '\n=== %s\n' "$*"; }
 # on only exists in fcvm=debug output, and a caller who omitted it would produce
 # a run whose records cannot be audited afterwards. Exported once here rather
 # than repeated per command, so no phase can be left out.
-export RUST_LOG="${RUST_LOG:-fcvm=debug}"
+# Forced, not defaulted. `${RUST_LOG:-...}` let a caller with RUST_LOG=info in
+# their shell produce a campaign with no stage records at all -- and nothing
+# downstream would say so, because a missing stage looks the same as a stage
+# that took no time. The one variable the analysis cannot do without is exactly
+# the one an ambient environment is most likely to have already set.
+if [ -n "${RUST_LOG:-}" ] && [ "${RUST_LOG}" != "fcvm=debug" ]; then
+    echo "note: overriding inherited RUST_LOG=${RUST_LOG} with fcvm=debug (stage attribution needs it)" >&2
+fi
+export RUST_LOG="fcvm=debug"
 
 # Pin the binary, and say which one. The seal already refuses a golden recorded
 # under a different runtime bundle, so a rebuild mid-campaign fails the run
@@ -164,6 +172,29 @@ done
 [ "$answer" = "10.0.2.2" ] || { echo "BLOCKED: wildcard DNS answered '$answer', expected 10.0.2.2" >&2; exit 3; }
 [ "$code" = "200" ] || { echo "BLOCKED: HTTPS replay returned '$code' for blog.cloudflare.com" >&2; exit 3; }
 say "replay server up: DNS -> 10.0.2.2, HTTPS 200"
+
+# Probe EVERY corpus member, not just the one used to detect startup. A corpus
+# holding only blog.cloudflare.com passed the check above, and the other 13 URLs
+# then failed INSIDE the measured run -- where a replay miss is a render of an
+# error page, which is a perfectly plausible-looking fast number rather than an
+# error. Cheap: 14 local requests against a server already proven up.
+missing=""
+for url in $(printf '%s\n' "$URLS" | tr ',' ' '); do
+    host=$(printf '%s' "$url" | sed -E 's#^https?://([^/]+).*#\1#')
+    ucode=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+            --resolve "$host:443:127.0.0.1" "$url" 2>/dev/null || true)
+    case "$ucode" in
+    200 | 30[1278]) ;;
+    *) missing="$missing\n  $ucode  $url" ;;
+    esac
+done
+if [ -n "$missing" ]; then
+    # shellcheck disable=SC2059
+    printf "BLOCKED: the corpus does not serve every configured URL:$missing\n" >&2
+    echo "A partial corpus measures error pages as renders. Re-record the corpus." >&2
+    exit 3
+fi
+say "corpus complete: all $(printf '%s' "$URLS" | tr ',' '\n' | wc -l) URLs replay locally"
 say "fcvm binary $FCVM_BIN sha256=$FCVM_SHA (recorded per run in cell.fcvm_sha256)"
 
 # --- golden ----------------------------------------------------------------

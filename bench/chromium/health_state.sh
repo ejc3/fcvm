@@ -25,7 +25,9 @@
 # file's mtime. fc-agent steps CLOCK_REALTIME on every restore
 # (set_system_clock), so a wall-clock reader would judge every clone's freshly
 # written verdict to be hours old and fail the gate on every single clone.
-# /proc/uptime is CLOCK_MONOTONIC and is exactly what the writer records.
+# /proc/uptime is CLOCK_BOOTTIME (ktime_get_boottime_ts64), not CLOCK_MONOTONIC,
+# and is exactly what the writer records -- see health_loop.monotonic_seconds,
+# which explains why boottime continuity across restore is what makes this work.
 set -uo pipefail
 
 STATE_FILE="${BENCH_HEALTH_STATE:-/run/bench-health}"
@@ -40,6 +42,18 @@ STATE_FILE="${BENCH_HEALTH_STATE:-/run/bench-health}"
 # refused. An earlier comment here claimed truncation could only shrink the
 # figure, and quoted a 10s budget that had already been changed to 6.
 MAX_AGE="${BENCH_HEALTH_MAX_AGE:-7}"
+# The budget was the one input this reader took on trust. verdict, stamp and
+# uptime are all validated below, but `[ "$age" -gt "$MAX_AGE" ]` with a
+# non-integer budget returns status 2 under `set -uo pipefail` (no `-e`), which
+# SKIPS the staleness branch and falls through to the healthy exit. Measured
+# with a verdict 9999 seconds old and BENCH_HEALTH_MAX_AGE=notanumber: "healthy
+# (age 9999s)", exit 0. A gate that cannot evaluate its budget must refuse.
+case "$MAX_AGE" in
+'' | *[!0-9]*)
+	echo "unhealthy: unusable BENCH_HEALTH_MAX_AGE=$MAX_AGE (whole seconds only)" >&2
+	exit 1
+	;;
+esac
 
 if [ ! -r "$STATE_FILE" ]; then
 	echo "unhealthy: no verdict at $STATE_FILE (is cdp_health.py --loop running?)" >&2

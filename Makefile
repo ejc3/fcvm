@@ -776,8 +776,15 @@ bench-chromium-request-all: build setup-default
 # is immune to edits in the working tree for its whole lifetime. Everything for
 # one run -- the frozen orchestrator, its manifest, the source revision, and
 # every reqbench record -- lands under a single directory.
-CORPUS_STAMP ?= $(shell date +%Y%m%d-%H%M%S)
-CORPUS_RUN_DIR ?= $(CURDIR)/bench/chromium/results/corpus-$(CORPUS_STAMP)
+.PHONY: bench-stop
+# `:=` NOT `?=`/`=`. A recursively expanded $(shell date) re-runs on every
+# reference, so a run that crosses a second boundary creates one directory and
+# writes later artifacts into another -- the exact contamination this per-run
+# packaging exists to prevent. checkmake flags the recursive form for this
+# reason (timestampexpanded). An explicit CORPUS_STAMP= on the command line
+# still wins, because make gives command-line variables precedence.
+CORPUS_STAMP := $(shell date +%Y%m%d-%H%M%S)
+CORPUS_RUN_DIR := $(CURDIR)/bench/chromium/results/corpus-$(CORPUS_STAMP)
 # Stop every benchmark process cleanly, and put the host back.
 #
 # A killed campaign leaves three kinds of debris: its own orchestrator and
@@ -824,8 +831,22 @@ bench-stop:
 	@echo "==> reaping stray microVM process groups (evidence captured first)"
 	@-sudo bash scripts/ci-stray-vm-guard.sh bench-stop || true
 	@echo "==> restoring host services the campaign borrows"
-	@-sudo systemctl start dnsmasq 2>/dev/null || true
-	@echo "dnsmasq=$$(systemctl is-active dnsmasq 2>/dev/null || echo unknown)"
+	@# The campaign takes 127.0.0.1:53 from dnsmasq. corpus_serve.py can still be
+	@# holding that port while it shuts down, so `systemctl start` loses the race
+	@# and, suppressed, this target printed "clean" over a box left with NO DNS
+	@# resolution -- the failure a teardown target exists to prevent. Retry until
+	@# the port is free, then REPORT the outcome rather than asserting it.
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		sudo systemctl start dnsmasq >/dev/null 2>&1 && break; \
+		sleep 1; \
+	done; \
+	state=$$(systemctl is-active dnsmasq 2>/dev/null || echo unknown); \
+	echo "dnsmasq=$$state"; \
+	if [ "$$state" != active ]; then \
+		echo "FAILED: dnsmasq is $$state after teardown; this box has no DNS. \
+Check for a process still holding :53 (sudo ss -lnup 'sport = :53')." >&2; \
+		exit 1; \
+	fi
 	@echo "==> clean"
 
 # A campaign against a DIRTY tree records a source_revision that does not
@@ -844,6 +865,14 @@ require-clean-tree:
 	fi
 
 bench-chromium-corpus: require-clean-tree build setup-default
+	@mkdir -p "$(dir $(CORPUS_RUN_DIR))"
+	@# Reserve, do not reuse: plain mkdir FAILS on collision. `mkdir -p` would
+	@# accept an existing directory and interleave a second campaign's records
+	@# with the first's under one stamp, which is unrecoverable after the fact
+	@# because nothing in a record says which run wrote it.
+	@mkdir "$(CORPUS_RUN_DIR)" || { \
+		echo "REFUSING: $(CORPUS_RUN_DIR) already exists; pass CORPUS_STAMP=<new> for a second run" >&2; \
+		exit 1; }
 	@mkdir -p "$(CORPUS_RUN_DIR)/orchestrator"
 	@cp bench/chromium/corpus_campaign.sh "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
 	@chmod 0555 "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
@@ -858,7 +887,15 @@ bench-chromium-corpus: require-clean-tree build setup-default
 	@# an unreproducible measurement is not.
 	@rev="$$(git -C "$(CURDIR)" rev-parse HEAD)"; \
 	ref="bench-run/$(CORPUS_STAMP)-$${rev%$${rev#??????????}}"; \
-	git -C "$(CURDIR)" branch -f "$$ref" "$$rev" >/dev/null 2>&1 || true; \
+	if existing="$$(git -C "$(CURDIR)" rev-parse --verify -q "refs/heads/$$ref")"; then \
+		[ "$$existing" = "$$rev" ] || { \
+			echo "REFUSING: $$ref already pins $$existing, not $$rev; an earlier record cites it" >&2; \
+			exit 1; }; \
+	else \
+		git -C "$(CURDIR)" branch "$$ref" "$$rev" >/dev/null || { \
+			echo "REFUSING: could not pin $$rev behind $$ref; the record would cite an unreachable commit" >&2; \
+			exit 1; }; \
+	fi; \
 	echo "$$ref" > "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REF"; \
 	if git -C "$(CURDIR)" push -q origin "refs/heads/$$ref:refs/heads/$$ref" 2>/dev/null; then \
 		echo "pushed" >> "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REF"; \

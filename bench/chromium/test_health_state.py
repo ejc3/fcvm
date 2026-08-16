@@ -63,6 +63,36 @@ class HealthStateReader(unittest.TestCase):
         )
         self.assertIn("old", result.stderr)
 
+    def test_an_unparsable_budget_does_not_wave_a_stale_verdict_through(self) -> None:
+        """The budget is the ONE input the reader took on trust.
+
+        verdict, stamp and uptime are all validated before the arithmetic; the
+        budget was not. The script runs under `set -uo pipefail` with no `-e`,
+        so `[ "$age" -gt "$MAX_AGE" ]` with a non-numeric budget returns status
+        2, the staleness branch is SKIPPED, and the reader falls through to the
+        healthy exit. Measured before the fix, with a verdict 9999 seconds old:
+
+            $ BENCH_HEALTH_MAX_AGE=notanumber health_state.sh
+            health_state.sh: line 106: [: notanumber: integer expression expected
+            healthy (age 9999s) ok
+            exit=0
+
+        A gate that cannot evaluate its own budget must refuse, not pass. This
+        is the same fail-open shape as `jq: command not found` printing
+        `verdict: CLEAR`: the check did not run, and its silence read as
+        success.
+        """
+        stale = f"healthy {max(0, monotonic_now() - 9999)} exit=0\n"
+        for budget in ("notanumber", "", "7s", "-1", "7.5"):
+            with self.subTest(budget=budget):
+                result = run_reader(stale, max_age=budget)
+                self.assertEqual(
+                    result.returncode, 1,
+                    f"a 9999s-old verdict passed the gate under budget {budget!r}; "
+                    "an unevaluable budget must fail closed\n"
+                    + result.stdout + result.stderr,
+                )
+
     def test_missing_state_is_not_healthy(self) -> None:
         """Fail closed: no verdict is not a passing verdict."""
         result = run_reader(None)
@@ -130,7 +160,7 @@ class HealthStateReader(unittest.TestCase):
         """The writer loops at 1s but its CDP probe may take 3s, so ~4s gaps are
         normal. The default budget must not fail a healthy guest on one slow
         iteration, or the golden gate would flap."""
-        result = run_reader(f"healthy {monotonic_now() - 4} exit=0\n")
+        result = run_reader(f"healthy {max(0, monotonic_now() - 4)} exit=0\n")
         self.assertEqual(
             result.returncode,
             0,

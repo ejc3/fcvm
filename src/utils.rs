@@ -1077,12 +1077,28 @@ fn path_with_sbin(current: &str) -> Option<String> {
     } else {
         current
     };
-    let missing: Vec<&str> = SBIN_DIRS
-        .iter()
-        .copied()
-        .filter(|dir| std::path::Path::new(dir).is_dir())
-        .filter(|dir| !std::env::split_paths(base).any(|p| p == std::path::Path::new(dir)))
+    // Compare CANONICAL paths, not literal ones. `is_dir()` follows symlinks,
+    // and on a merged-usr host (Ubuntu 24.04: /sbin -> usr/sbin) both entries
+    // are directories and neither matches the inherited PATH textually -- so
+    // the naive filter appended BOTH, putting two names for one directory on
+    // PATH. Harmless to lookups, and precisely the kind of thing that makes a
+    // later reader wonder which one is load-bearing.
+    let mut already: Vec<std::path::PathBuf> = std::env::split_paths(base)
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
         .collect();
+    let mut missing: Vec<&str> = Vec::new();
+    for dir in SBIN_DIRS {
+        let path = std::path::Path::new(dir);
+        if !path.is_dir() {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if already.contains(&canonical) {
+            continue;
+        }
+        already.push(canonical);
+        missing.push(dir);
+    }
     if missing.is_empty() && base == current {
         return None;
     }
@@ -1297,6 +1313,31 @@ mod sbin_path_tests {
     /// PATH to the sbin dirs alone replaced that fallback with nothing and
     /// turned a fix for one ENOENT into a cause of another, for anything
     /// launched with a cleared environment.
+    #[test]
+    fn the_sbin_directories_are_not_added_twice_under_merged_usr() {
+        // /sbin is a symlink to usr/sbin on every merged-usr distribution
+        // (Ubuntu 24.04 among them), and is_dir() follows symlinks -- so both
+        // SBIN_DIRS entries look like real, absent directories and both were
+        // appended. The result carried two names for one directory.
+        //
+        // One inherited entry, deliberately: /bin is ALSO a symlink to /usr/bin
+        // on merged-usr, and path_with_sbin only APPENDS -- it must not rewrite
+        // what the caller inherited, so the caller's own aliases are not this
+        // function's business and would make the check lie.
+        let result = path_with_sbin("/usr/bin").expect("sbin dirs are absent here");
+        let mut canonical: Vec<std::path::PathBuf> = std::env::split_paths(&result)
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+            .collect();
+        let before = canonical.len();
+        canonical.sort();
+        canonical.dedup();
+        assert_eq!(
+            canonical.len(),
+            before,
+            "PATH carries two entries for the same directory: {result}"
+        );
+    }
+
     #[test]
     fn an_absent_path_keeps_the_default_search_directories() {
         let repaired = path_with_sbin("").expect("sbin dirs exist on this host");

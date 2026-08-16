@@ -42,6 +42,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 
@@ -59,6 +60,37 @@ def read_comm(tid_dir: str) -> str:
             return handle.read().strip()
     except OSError:
         return ""
+
+
+def process_ended(pid: int) -> bool:
+    """True once the process is gone OR is a zombie awaiting its parent's wait().
+
+    An exited process keeps /proc/<pid>/task/<tid>/schedstat readable until it
+    is reaped, so "the directory disappeared" is NOT the end of a process -- it
+    is the end of a process whose parent already reaped it. Between exit and
+    reap, every counter is frozen and every delta is zero, which reads exactly
+    like a perfectly idle process. track() looped there forever.
+
+    Found by test_runtime_before_the_probe_attached_is_not_counted, which parks
+    its child in exactly that state: the probe hung with one thread in
+    nanosleep beside a <defunct> child. In the field this needs only a VMM
+    whose parent is slow to reap it, or an fcvm that died first -- and before
+    followers ran in threads, one zombie froze the ENTIRE scan loop, so every
+    later process went unmeasured with no error.
+
+    State comes from /proc/<pid>/status, not /proc/<pid>/stat: comm sits inside
+    parentheses in field 2 of stat and may contain spaces, so positional
+    parsing of the state field misreads any process whose name has one. That
+    same trap already bit the bench-stop ancestor walk.
+    """
+    try:
+        with open(f"/proc/{pid}/status") as handle:
+            for line in handle:
+                if line.startswith("State:"):
+                    return line.split()[1] == "Z"
+    except OSError:
+        return True
+    return True
 
 
 def read_schedstat(tid_dir: str):
@@ -123,7 +155,7 @@ def percentile(values, q):
     return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
 
 
-def track(pid: int, interval_s: float, want_wait: bool) -> dict:
+def track(pid: int, interval_s: float, want_wait: bool, stop=None) -> dict:
     """Follow one process to exit, returning its instantaneous-cores series.
 
     Per-thread counters are accumulated PER TID and carried forward, not summed
@@ -144,14 +176,24 @@ def track(pid: int, interval_s: float, want_wait: bool) -> dict:
     previous_t = started
     threads_seen: set[str] = set()
 
-    def collect():
-        """Advance the accumulators; returns (d_run, d_wait, d_vcpu_run) or None."""
+    def collect(accumulate=True):
+        """Advance the accumulators; returns (d_run, d_wait, d_vcpu_run) or None.
+
+        `accumulate=False` is the PRIMING call. It must populate `last` without
+        touching the totals: on the first pass `last` is empty, so every delta
+        is measured from zero and therefore equals that thread's whole runtime
+        SINCE PROCESS START. Folding those in charges the probe for work done
+        before it attached -- inflating total_run_ms and mean_cores by however
+        long the VMM had been alive, which for a snapshot restore is the entire
+        boot. The per-sample series was always correct; only the totals were
+        wrong, so nothing about the shape of a run revealed it.
+        """
         nonlocal run_total, wait_total, vcpu_run_total, vcpu_wait_total
         try:
             tids = os.listdir(task_root)
         except OSError:
             return None
-        d_run = d_wait = d_vcpu_run = 0
+        d_run = d_wait = d_vcpu_run = d_vcpu_wait = 0
         for tid in tids:
             tid_dir = os.path.join(task_root, tid)
             stat = read_schedstat(tid_dir)
@@ -170,20 +212,28 @@ def track(pid: int, interval_s: float, want_wait: bool) -> dict:
             d_wait += wait_ns - prev_wait
             if tid in vcpu_tids:
                 d_vcpu_run += run_ns - prev_run
-                vcpu_wait_total += wait_ns - prev_wait
+                d_vcpu_wait += wait_ns - prev_wait
             last[tid] = (run_ns, wait_ns)
-        run_total += d_run
-        wait_total += d_wait
-        vcpu_run_total += d_vcpu_run
+        if accumulate:
+            run_total += d_run
+            wait_total += d_wait
+            vcpu_run_total += d_vcpu_run
+            vcpu_wait_total += d_vcpu_wait
         return d_run, d_wait, d_vcpu_run
 
-    if collect() is None:
+    if collect(accumulate=False) is None:
         return {}
     while True:
         time.sleep(interval_s)
         now = time.monotonic()
         deltas = collect()
-        if deltas is None:
+        if deltas is None or process_ended(pid):
+            break
+        if stop is not None and stop.is_set():
+            # Asked to wind up while this process is still alive. Keep what was
+            # measured -- a partial series is data; discarding it because the
+            # run ended is not.
+            previous_t = now
             break
         span_ns = (now - previous_t) * 1e9
         if span_ns > 0:
@@ -261,7 +311,27 @@ def main() -> int:
     # that perturbs its subject by 4x is not measuring the subject.
     checked: set[int] = set()
     records = []
+    # One follower THREAD per process. track() runs until its process exits, so
+    # calling it inline froze the scan loop for that whole lifetime: any VMM
+    # that started AND finished during another's track was never even added to
+    # `checked`, and vanished from the record without a word. Concurrent clones
+    # -- the case the corpus campaign is built out of -- were reported as one
+    # process. Threads are the right tool here despite the GIL: every follower
+    # is blocked in time.sleep or a /proc read, so they interleave rather than
+    # compete, and the probe's own cost is unchanged.
+    stop = threading.Event()
+    sink_lock = threading.Lock()
+    followers: list[threading.Thread] = []
     with open(args.out, "w") as sink:
+        def follow(pid):
+            record = track(pid, interval_s, want_wait, stop=stop)
+            if not record:
+                return
+            with sink_lock:
+                records.append(record)
+                sink.write(json.dumps(record) + "\n")
+                sink.flush()
+
         try:
             while deadline is None or time.monotonic() < deadline:
                 for entry in os.listdir("/proc"):
@@ -279,14 +349,20 @@ def main() -> int:
                     # empty file and no error at all.
                     if not comm.startswith(args.watch[:15]):
                         continue
-                    record = track(pid, interval_s, want_wait)
-                    if record:
-                        records.append(record)
-                        sink.write(json.dumps(record) + "\n")
-                        sink.flush()
+                    follower = threading.Thread(target=follow, args=(pid,),
+                                                daemon=True)
+                    follower.start()
+                    followers.append(follower)
                 time.sleep(args.scan_ms / 1000.0)
         except KeyboardInterrupt:
             pass
+        finally:
+            # Wind the followers up and collect what they have. Without this the
+            # sink closes while they are still writing to it, and a run that was
+            # measured correctly loses its records on the way out.
+            stop.set()
+            for follower in followers:
+                follower.join(timeout=5.0)
 
     if not records:
         print("cpuprobe: no matching process was ever observed", file=sys.stderr)
@@ -294,6 +370,17 @@ def main() -> int:
     maxes = [r["cores_max"] for r in records if r.get("cores_max") is not None]
     means = [r["mean_cores"] for r in records if r.get("mean_cores") is not None]
     print(f"cpuprobe: {len(records)} process(es) of comm={args.watch!r}", file=sys.stderr)
+    # A process that exits before its second sample produces an empty series, so
+    # cores_max is None. With every record in that state percentile() returns
+    # None -- which `:.2f` raises TypeError on, and max([]) raises ValueError on.
+    # The records are already written and flushed by then, so the crash would
+    # discard only the summary, but it would also mask the real finding: the
+    # probe attached too late to measure anything.
+    if not maxes or not means:
+        print("  no process lived long enough for a second sample; the records "
+              "hold no instantaneous figures (raise --duration-s, or lower "
+              "--scan-ms so the probe attaches sooner)", file=sys.stderr)
+        return 1
     print(f"  mean cores   p50={percentile(means, 0.5):.2f}", file=sys.stderr)
     print(f"  PEAK cores   p50={percentile(maxes, 0.5):.2f} "
           f"p95={percentile(maxes, 0.95):.2f} max={max(maxes):.2f}", file=sys.stderr)
