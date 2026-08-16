@@ -136,6 +136,42 @@ CONTROL_WINDOW_S = 0.05
 # ---------------------------------------------------------------- procfs utils
 
 
+def proc_private_dirty_kb(pid: int) -> dict:
+    """What this process has PRIVATISED, from /proc/<pid>/smaps_rollup.
+
+    A clone starts as a view of the shared snapshot, so its Private_Dirty IS
+    the delta it cost: the pages it wrote rather than read. Read here, alive,
+    immediately before the kill, so the figure is the cost of the request that
+    just completed.
+
+    Not readable from a zombie. smaps_rollup disappears with the address space,
+    which is why this cannot be sampled alongside the CPU figures after exit.
+
+    Returns the reason rather than a zero when it cannot measure. A zero with no
+    uncertainty is a claim, and an unreadable file does not support one.
+    """
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", "r", encoding="ascii") as handle:
+            rollup = handle.read()
+    except FileNotFoundError:
+        return {"private_dirty_kb": None, "unavailable": "no smaps_rollup (exited, or kernel lacks CONFIG_PROC_PAGE_MONITOR)"}
+    except PermissionError as error:
+        return {"private_dirty_kb": None, "unavailable": f"permission: {error}"}
+    except OSError as error:
+        return {"private_dirty_kb": None, "unavailable": f"{type(error).__name__}: {error}"}
+    fields = {}
+    for line in rollup.splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("Private_Dirty", "Private_Clean", "Shared_Clean", "Shared_Dirty", "Pss", "Rss"):
+            try:
+                fields[key.lower() + "_kb"] = int(rest.strip().split()[0])
+            except (IndexError, ValueError):
+                pass
+    if "private_dirty_kb" not in fields:
+        return {"private_dirty_kb": None, "unavailable": "smaps_rollup carried no Private_Dirty"}
+    return fields
+
+
 def proc_stat_fields(pid: int):
     """(state, utime_ticks, stime_ticks, starttime) or None if the pid is gone.
 
@@ -1378,6 +1414,10 @@ def measure_fast_reap(
     all_fds = [parent_fd, *fds.values()]
     try:
         pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
+        # Memory MUST be read here: alive, request complete, before the kill.
+        # It cannot be recovered afterwards the way CPU can, because
+        # smaps_rollup dies with the address space.
+        pre_memory = {name: proc_private_dirty_kb(pid) for name, pid in tracked.items()}
         missing_pre = [name for name, fields in pre.items() if fields is None]
         if missing_pre:
             raise RuntimeError(
@@ -1443,6 +1483,7 @@ def measure_fast_reap(
             "machine_window_ms": machine_window_ms,
             "parent_live": parent_live,
             "pre": pre,
+            "pre_memory": pre_memory,
             "reclaim_cpu": reclaim_cpu,
             "sample_period_s": sample_period_s,
             "self_ms": self_ms,
@@ -1548,6 +1589,7 @@ def teardown_fast(
     machine_cpu_ms = measured["machine_ms"]
     machine_window_ms = measured["machine_window_ms"]
     pre = measured["pre"]
+    pre_memory = measured.get("pre_memory", {})
     # Absolute CPU each pinned child had burned at the kill instant. The VM
     # lives exactly one request, so firecracker's figure IS the per-request
     # VMM+vCPU cost; subtracting the noop arm's (restore + idle) yields
@@ -1633,6 +1675,18 @@ def teardown_fast(
             # False -> reaper won the race, figure is a LOWER BOUND.
             "complete": s["zombie_seen"],
         }
+
+    # The delta this request cost, per pinned process. Reported next to the
+    # latency on the SAME record, so a memory/latency frontier is one
+    # measurement rather than a join across two experiments on two goldens.
+    out["per_child_memory"] = dict(pre_memory)
+    dirty = [m.get("private_dirty_kb") for m in pre_memory.values()]
+    out["private_dirty_total_kb"] = (
+        sum(v for v in dirty if v is not None) if any(v is not None for v in dirty) else None
+    )
+    out["private_dirty_unmeasured"] = [
+        name for name, m in pre_memory.items() if m.get("private_dirty_kb") is None
+    ]
 
     if not all_gone:
         survivors = dict(measured["live_exact"])
