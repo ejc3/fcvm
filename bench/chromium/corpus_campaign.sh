@@ -100,14 +100,23 @@ if [ "$DNSMASQ_WAS_ACTIVE" = yes ]; then
 fi
 
 say "starting corpus_serve (DNS 127.0.0.1:53 answering 10.0.2.2; HTTP 80; HTTPS 443)"
-sudo -b python3 "$REPO/bench/chromium/corpus_serve.py" \
-    --root "$REPO/bench/chromium/corpus-live" \
-    --port 80 --tls-port 443 \
-    --dns-addr 127.0.0.1 --dns-port 53 \
-    --answer-ip 10.0.2.2 > "$LOGDIR/corpus_serve.log" 2>&1
-sleep 3
-SERVE_PID=$(pgrep -f 'corpus_serve.py .*--answer-ip 10.0.2.2' | head -1 || true)
+# The PID comes from THIS invocation, via a pidfile the wrapper shell writes
+# before exec'ing. `pgrep -f corpus_serve.py` would match any campaign's server,
+# so a concurrent run's cleanup could kill this one's and leave its own alive --
+# and the survivor still holds :53/:80/:443, so the next campaign's preflight
+# passes against a server nobody is tracking. `exec` means the shell BECOMES
+# python, so $$ is the server's own pid, not a parent's.
+SERVE_PIDFILE="$LOGDIR/corpus_serve.pid"
+sudo -b sh -c 'echo $$ > "$1"; exec python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2' \
+    _ "$SERVE_PIDFILE" "$REPO/bench/chromium/corpus_serve.py" "$REPO/bench/chromium/corpus-live" \
+    > "$LOGDIR/corpus_serve.log" 2>&1
+for _ in $(seq 1 50); do
+    [ -s "$SERVE_PIDFILE" ] && break
+    sleep 0.1
+done
+SERVE_PID=$(cat "$SERVE_PIDFILE" 2>/dev/null || true)
 [ -n "$SERVE_PID" ] || { echo "BLOCKED: corpus_serve did not start; see $LOGDIR/corpus_serve.log" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
+sudo kill -0 "$SERVE_PID" 2>/dev/null || { echo "BLOCKED: corpus_serve pid $SERVE_PID is not alive; see $LOGDIR/corpus_serve.log" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
 
 # Prove all three sockets answer before spending minutes on a golden. A replay
 # server that loaded zero urls, or a DNS socket that silently lost the bind,
