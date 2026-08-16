@@ -166,10 +166,10 @@ fn a_path_excluded_from_the_matrix_still_gets_a_check() {
     }
 
     let jobs = ci.get("jobs").expect("ci.yml has no jobs");
-    let bench_job = jobs
-        .get("bench-tests")
-        .expect("ci.yml classifies bench/** out of `code` but has no `bench-tests` job, so a \
-                 bench-only PR would run nothing that can fail");
+    let bench_job = jobs.get("bench-tests").expect(
+        "ci.yml classifies bench/** out of `code` but has no `bench-tests` job, so a \
+                 bench-only PR would run nothing that can fail",
+    );
 
     let condition = bench_job
         .get("if")
