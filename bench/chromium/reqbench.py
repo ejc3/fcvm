@@ -136,13 +136,50 @@ CONTROL_WINDOW_S = 0.05
 # ---------------------------------------------------------------- procfs utils
 
 
+def private_dirty_total_kb(per_child: dict) -> int | None:
+    """Total privatised memory, or None when the total would be a fiction.
+
+    None unless EVERY pinned process was sampled, and None for an empty set. A
+    partial sum is not a smaller measurement, it is a different one: if
+    firecracker exits between the pin and the read, the remaining processes
+    total a few MiB against its few hundred, and a number is what a reader
+    takes at face value.
+
+    A function rather than an inline expression so a test can call the rule the
+    record is actually built from. Inlining a copy into the test proved only
+    that Python sums the way Python sums.
+    """
+    if not per_child:
+        return None
+    values = [m.get("private_dirty_kb") for m in per_child.values()]
+    if any(v is None for v in values):
+        return None
+    return sum(values)
+
+
 def proc_private_dirty_kb(pid: int) -> dict:
     """What this process has PRIVATISED, from /proc/<pid>/smaps_rollup.
 
-    A clone starts as a view of the shared snapshot, so its Private_Dirty IS
-    the delta it cost: the pages it wrote rather than read. Read here, alive,
-    immediately before the kill, so the figure is the cost of the request that
-    just completed.
+    NOT "the pages it wrote". What Private_Dirty counts depends on the memory
+    backend, and the two the harness compares do not agree:
+
+      uffd copy   UFFDIO_COPY populates ANONYMOUS memory, so every page the
+                  server fills is private the moment it is filled, written or
+                  not. With --uffd-prefetch on (the default) the whole recorded
+                  working set, about 56k pages, is replayed BEFORE the guest
+                  runs and all of it counts here.
+      uffd minor  UFFDIO_CONTINUE installs a read-only PTE to the shared page,
+                  so a replayed page costs nothing until it is written. This is
+                  the arm where the field really does mean "pages written".
+      file        MAP_PRIVATE over the page cache: only real writes count.
+
+    So this number is comparable ACROSS CLONES of one configuration, and NOT
+    across backends or across prefetch settings, unless the reader also has
+    those settings. The caller records them beside the figure for that reason.
+
+    Read alive, immediately before the kill, so it describes the request that
+    just completed. It cannot be recovered afterwards the way CPU can, because
+    smaps_rollup dies with the address space.
 
     Not readable from a zombie. smaps_rollup disappears with the address space,
     which is why this cannot be sampled alongside the CPU figures after exit.
@@ -1506,11 +1543,18 @@ def measure_fast_reap(
     """Measure one fast reap while guaranteeing a stopped owner cannot escape."""
     all_fds = [parent_fd, *fds.values()]
     try:
-        pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
-        # Memory MUST be read here: alive, request complete, before the kill.
-        # It cannot be recovered afterwards the way CPU can, because
-        # smaps_rollup dies with the address space.
+        # Memory FIRST, then the CPU baseline. Both must be read while the
+        # processes are alive (smaps_rollup dies with the address space), but
+        # the ORDER is load-bearing: only the fcvm parent is frozen here, so
+        # firecracker, holder and pasta keep burning CPU while this runs, and
+        # any CPU they burn between the baseline and the kill lands in
+        # reclaim_cpu_ms as if the reap had caused it. Walking smaps_rollup
+        # costs 3.9-6.6 ms on a 722 MB RSS process (about 6-9 ms per GiB),
+        # which is the order of the 10 ms CLK_TCK quantum this function is
+        # careful to bound. Sampling before the baseline removes the window
+        # entirely rather than making it small.
         pre_memory = {name: proc_private_dirty_kb(pid) for name, pid in tracked.items()}
+        pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
         missing_pre = [name for name, fields in pre.items() if fields is None]
         if missing_pre:
             raise RuntimeError(
@@ -1802,13 +1846,15 @@ def teardown_fast(
     # latency on the SAME record, so a memory/latency frontier is one
     # measurement rather than a join across two experiments on two goldens.
     out["per_child_memory"] = dict(pre_memory)
-    dirty = [m.get("private_dirty_kb") for m in pre_memory.values()]
-    out["private_dirty_total_kb"] = (
-        sum(v for v in dirty if v is not None) if any(v is not None for v in dirty) else None
-    )
     out["private_dirty_unmeasured"] = [
         name for name, m in pre_memory.items() if m.get("private_dirty_kb") is None
     ]
+    # None unless EVERY pinned process was sampled. A partial sum is not a
+    # smaller measurement, it is a different one: if firecracker exits between
+    # the pin and the read, the remaining processes total a few MiB against its
+    # few hundred, and a reader who does not separately consult
+    # private_dirty_unmeasured would take that at face value.
+    out["private_dirty_total_kb"] = private_dirty_total_kb(pre_memory)
 
     if not all_gone:
         survivors = dict(measured["live_exact"])

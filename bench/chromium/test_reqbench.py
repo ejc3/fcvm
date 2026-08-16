@@ -6479,10 +6479,29 @@ class PerRequestPrivateDirty(unittest.TestCase):
         self.assertIsNone(got.get("private_dirty_kb"), got)
         self.assertTrue(got.get("unavailable"), "no reason given for the missing sample")
 
-    def test_the_total_is_none_when_nothing_could_be_sampled(self) -> None:
-        """Summing Nones as zero would publish a confident 0 KiB for a run that
-        measured nothing at all."""
-        per_child = {"a": {"private_dirty_kb": None, "unavailable": "x"}}
-        dirty = [m.get("private_dirty_kb") for m in per_child.values()]
-        total = sum(v for v in dirty if v is not None) if any(v is not None for v in dirty) else None
-        self.assertIsNone(total)
+    def test_a_partial_sample_totals_none_not_a_smaller_number(self) -> None:
+        """Calls the production rule, not a copy of it.
+
+        The previous version of this test inlined the expression and asserted on
+        its own arithmetic, so deleting every out[...] assignment in reqbench
+        left the suite green. It proved that Python sums the way Python sums.
+
+        The case that matters: firecracker exits between the pin and the read.
+        The survivors total a few MiB against its few hundred, and a number is
+        what a reader takes at face value.
+        """
+        self.assertIsNone(
+            reqbench.private_dirty_total_kb(
+                {"firecracker": {"private_dirty_kb": None, "unavailable": "exited"},
+                 "pasta": {"private_dirty_kb": 2048}}
+            ),
+            "a partial sum was published as an ordinary number",
+        )
+        self.assertIsNone(reqbench.private_dirty_total_kb({}), "an empty set has no total")
+        self.assertEqual(
+            reqbench.private_dirty_total_kb(
+                {"firecracker": {"private_dirty_kb": 300_000}, "pasta": {"private_dirty_kb": 2048}}
+            ),
+            302_048,
+            "a complete sample must still total",
+        )
