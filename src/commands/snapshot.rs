@@ -380,6 +380,31 @@ where
     }
 }
 
+/// The serve's one-line machine-readable ready record.
+///
+/// Consumers poll serve stdout for exactly this line (reqbench and the www
+/// container demo both did it by grepping human prose before this existed),
+/// so its fields are a contract: add, never rename or remove.
+fn serve_ready_record(
+    snapshot: &str,
+    serve_pid: u32,
+    socket: &std::path::Path,
+    uffd_mode: &str,
+    prefetch: bool,
+    working_set: Option<(u64, u64)>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "serving",
+        "snapshot": snapshot,
+        "serve_pid": serve_pid,
+        "socket": socket.display().to_string(),
+        "uffd_mode": uffd_mode,
+        "prefetch": prefetch,
+        "working_set_pages": working_set.map(|(pages, _)| pages),
+        "working_set_bytes": working_set.map(|(_, bytes)| bytes),
+    })
+}
+
 /// Wait for fc-agent to acknowledge this exact restore generation.
 ///
 /// This is the single correctness gate shared by ordinary, TTY, and `--exec`
@@ -890,6 +915,23 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("Clone VMs with: fcvm snapshot run --pid {}", my_pid);
     println!("Press Ctrl-C to stop");
     println!();
+    // One machine-readable ready line, the same contract `podman prepare`
+    // gives scripts. The prose above may change shape; this line only gains
+    // fields. It is truthful at this point: the socket is bound (connects
+    // queue in the backlog until the accept loop below runs) and the state
+    // file exists, so a consumer can clone by pid or find the serve in
+    // `fcvm ls --json` the moment it reads this.
+    println!(
+        "{}",
+        serve_ready_record(
+            &args.snapshot_name,
+            my_pid,
+            &socket_path,
+            backing.name(),
+            matches!(prefetch, Prefetch::On),
+            server.recorded_working_set(),
+        )
+    );
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -3675,6 +3717,41 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(format!("{error:#}").contains("pidfd unavailable"));
+    }
+
+    #[test]
+    fn serve_ready_record_fields_are_a_stable_contract() {
+        // Scripts poll serve stdout for this exact line; renaming or removing
+        // a field breaks them silently. Adding fields is fine.
+        let record = serve_ready_record(
+            "warm-tested",
+            4242,
+            std::path::Path::new("/mnt/fcvm-btrfs/uffd-warm-tested-4242-77.sock"),
+            "minor",
+            true,
+            Some((18979, 18979 * 4096)),
+        );
+        assert_eq!(record["status"], "serving");
+        assert_eq!(record["snapshot"], "warm-tested");
+        assert_eq!(record["serve_pid"], 4242);
+        assert_eq!(record["uffd_mode"], "minor");
+        assert_eq!(record["prefetch"], true);
+        assert_eq!(record["working_set_pages"], 18979);
+        assert_eq!(record["working_set_bytes"], 18979u64 * 4096);
+        assert!(record["socket"].as_str().unwrap().ends_with(".sock"));
+
+        // No recorded set (prefetch off or first serve): explicit nulls, not
+        // absent keys, so consumers can distinguish "no set" from "old fcvm".
+        let bare = serve_ready_record(
+            "s",
+            1,
+            std::path::Path::new("/tmp/x.sock"),
+            "copy",
+            false,
+            None,
+        );
+        assert!(bare["working_set_pages"].is_null());
+        assert!(bare["working_set_bytes"].is_null());
     }
 
     #[tokio::test]

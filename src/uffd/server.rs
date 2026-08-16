@@ -671,6 +671,17 @@ impl UffdServer {
     }
 
     /// Get the socket path for this server
+    /// Pages and bytes of the recorded restore working set this server
+    /// loaded, if prefetch is on and a usable record existed. What the
+    /// serve's ready record reports so a consumer knows whether its first
+    /// clone will be pre-warmed or will be the one doing the recording.
+    pub fn recorded_working_set(&self) -> Option<(u64, u64)> {
+        self.working_set.as_ref().map(|store| {
+            let set = store.to_prefetch();
+            (set.len(), set.bytes())
+        })
+    }
+
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
