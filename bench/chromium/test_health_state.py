@@ -83,7 +83,13 @@ class HealthStateReader(unittest.TestCase):
         success.
         """
         stale = f"healthy {max(0, monotonic_now() - 9999)} exit=0\n"
-        for budget in ("notanumber", "", "7s", "-1", "7.5"):
+        # The last two are all digits and still unusable: `[ -gt ]` compares as
+        # 64-bit integers, so a value that does not fit returns status 2 exactly
+        # like a non-numeric one. A digits-only check passes them and the gate
+        # falls open, which is the same defect wearing a disguise.
+        for budget in ("notanumber", "", "7s", "-1", "7.5",
+                       "99999999999999999999",
+                       "999999999999999999999999999999999999999999999999"):
             with self.subTest(budget=budget):
                 result = run_reader(stale, max_age=budget)
                 self.assertEqual(

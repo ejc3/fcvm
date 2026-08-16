@@ -54,6 +54,15 @@ case "$MAX_AGE" in
 	exit 1
 	;;
 esac
+# Digits are not enough. `[ -gt ]` compares as 64-bit integers, so an all-digit
+# value that does not fit returns status 2 exactly like a non-numeric one, and
+# the staleness branch is skipped again -- the same fail-open the check above
+# exists to close, wearing a disguise a digits-only test does not catch.
+# Nine digits is 31 years of seconds; a health budget is single digits.
+if [ "${#MAX_AGE}" -gt 9 ]; then
+	echo "unhealthy: BENCH_HEALTH_MAX_AGE=$MAX_AGE is too large to compare (max 9 digits)" >&2
+	exit 1
+fi
 
 if [ ! -r "$STATE_FILE" ]; then
 	echo "unhealthy: no verdict at $STATE_FILE (is cdp_health.py --loop running?)" >&2

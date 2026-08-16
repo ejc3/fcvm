@@ -151,7 +151,50 @@ class ConcurrentFollowing(unittest.TestCase):
 
 
 class EmptySummary(unittest.TestCase):
-    def test_a_run_with_no_usable_figure_reports_instead_of_crashing(self):
+    def test_a_record_with_no_instantaneous_figure_does_not_crash_the_summary(self):
+        """The guard the crash actually lives behind.
+
+        A process that exits before its second sample leaves an EMPTY series, so
+        cores_max and mean_cores are None while the record itself is real. That
+        is the state that reaches `percentile([])` -> None -> `:.2f` TypeError,
+        and `max([])` -> ValueError.
+
+        The sibling test below watches a process that never exists, so `records`
+        is empty and main() returns at the earlier no-match guard without ever
+        evaluating maxes or means. It covers the no-match branch and NOT this
+        one -- so on its own, weakening this guard would not have failed
+        anything. Caught in review; both branches are covered now.
+
+        track() is stubbed rather than raced, because producing an empty series
+        for real means killing a process inside the window between the priming
+        read and the first sample, which is a race this test would lose
+        intermittently and silently.
+        """
+        from unittest import mock
+
+        out = os.path.join(os.environ.get("TMPDIR", "/tmp"),
+                           f"cpuprobe-nofig-{os.getpid()}.jsonl")
+        self.addCleanup(lambda: os.path.exists(out) and os.unlink(out))
+        record = {"pid": 1, "lifetime_s": 0.0, "samples": 0, "threads": 1,
+                  "vcpu_threads": 0, "total_run_ms": 0.0, "vcpu_run_ms": 0.0,
+                  "mean_cores": None, "cores_p50": None, "cores_p95": None,
+                  "cores_max": None, "vcpu_cores_max": None, "series": []}
+        saved = sys.argv
+        sys.argv = ["cpuprobe.py", "--watch", os.path.basename(sys.executable)[:15],
+                    "--out", out, "--scan-ms", "20", "--duration-s", "0.3"]
+        try:
+            with mock.patch.object(cpuprobe, "track", return_value=record):
+                rc = cpuprobe.main()
+        finally:
+            sys.argv = saved
+        self.assertEqual(rc, 1,
+                         "a run whose records carry no instantaneous figure must "
+                         "report failure, not crash and not claim success")
+        with open(out) as handle:
+            self.assertTrue(handle.read().strip(),
+                            "the records were discarded along with the summary")
+
+    def test_a_run_that_observed_nothing_reports_instead_of_crashing(self):
         """percentile() returns None for an empty list, `:.2f` raises TypeError
         on it, and max([]) raises ValueError. A process that exits before its
         second sample leaves cores_max None, so a run of only such processes
