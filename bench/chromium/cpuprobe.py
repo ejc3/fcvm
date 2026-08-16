@@ -238,6 +238,9 @@ def main() -> int:
                         help="process comm to follow (exact match)")
     parser.add_argument("--out", required=True)
     parser.add_argument("--interval-ms", type=float, default=20.0)
+    parser.add_argument("--scan-ms", type=float, default=50.0,
+                        help="how often to look for new processes; the probe is "
+                             "idle between scans, so this bounds its own cost")
     parser.add_argument("--duration-s", type=float, default=0.0,
                         help="stop watching after this long; 0 means until SIGINT")
     args = parser.parse_args()
@@ -251,7 +254,12 @@ def main() -> int:
 
     interval_s = args.interval_ms / 1000.0
     deadline = time.monotonic() + args.duration_s if args.duration_s > 0 else None
-    seen: set[int] = set()
+    # EVERY pid examined is remembered, not just the matching ones. Caching only
+    # matches means re-reading /proc/<pid>/comm for every non-matching pid on
+    # every scan: ~1300 opens per pass at 100 Hz, measured at 52.6% of a core,
+    # and it slowed the renders being measured from ~950 ms to 4-5 s. A probe
+    # that perturbs its subject by 4x is not measuring the subject.
+    checked: set[int] = set()
     records = []
     with open(args.out, "w") as sink:
         try:
@@ -260,17 +268,23 @@ def main() -> int:
                     if not entry.isdigit():
                         continue
                     pid = int(entry)
-                    if pid in seen:
+                    if pid in checked:
                         continue
-                    if read_comm(f"/proc/{pid}") != args.watch:
+                    checked.add(pid)
+                    comm = read_comm(f"/proc/{pid}")
+                    # comm is TRUNCATED TO 15 BYTES by the kernel, so fcvm's
+                    # `firecracker-default-<hash>.bin` appears as
+                    # `firecracker-def`. An exact match on "firecracker" finds
+                    # nothing, silently: the first run of this probe produced an
+                    # empty file and no error at all.
+                    if not comm.startswith(args.watch[:15]):
                         continue
-                    seen.add(pid)
                     record = track(pid, interval_s, want_wait)
                     if record:
                         records.append(record)
                         sink.write(json.dumps(record) + "\n")
                         sink.flush()
-                time.sleep(0.01)
+                time.sleep(args.scan_ms / 1000.0)
         except KeyboardInterrupt:
             pass
 
