@@ -116,11 +116,49 @@ a { color: inherit; }
 <p class="dek">fcvm runs each browser-render request in its own Firecracker microVM: restored from a snapshot of an already-running Chromium, driven over the Chrome DevTools Protocol, destroyed after one page. This report measures what that costs, on one Graviton3 server, from benchmark runs of 2026-08-13/14. Each number cites the run that produced it.</p>
 
 <div class="verdict">
-  <div><span class="num">615.1 ms</span><span class="lbl">p50 on Cloudflare's 14-URL corpus, byte-replayed (gated)</span></div>
+  <div><span class="num">615.1 ms</span><span class="lbl">p50 on Cloudflare's 14-URL corpus, byte-replayed (gated) — measured 2026-08-14; a 2026-08-16 rerun measures 951.2 on 2 vCPUs and 654.5 on 8, see the reproduction section</span></div>
   <div><span class="num">348.7 ms</span><span class="lbl">direct-CDP p50 · best gated run (fine probe; hugepage minor + replay + no rootfs writes)</span></div>
   <div><span class="num">0</span><span class="lbl">failed requests in twelve gated runs · 202 per arm per run</span></div>
 </div>
 <p class="src">Numbers are cited by run id (RB, AB, PF, CPU, HM, HK, NC, FG, CX for the latency benchmark; FB for fault counts; HC for the host-container baseline; NM for the network-mode trio; LD and MH for the concurrency/memory ladders). Smaller instrumented probe sets (attribution, ablation, the CoW census) are cited by their directory names. The full index, with result directories, is in "Provenance and gates" at the end.</p>
+
+<h2>Reproduction, 2026-08-16: the headline does not reproduce</h2>
+<p>Every figure below this section was measured on 2026-08-13/14. Regenerating the corpus benchmark two days later, on the same host, with the same 14 URLs and the same knobs, does not reproduce the 615.1&nbsp;ms headline. Nine gated runs, all publishable, zero failed requests.</p>
+<div class="tbl">
+<table>
+  <tr><th>configuration</th><th class="n">resolve</th><th class="n">upgrade</th><th class="n">Page.enable</th><th class="n">navigate</th><th class="n">cdp p50</th><th class="n">noop</th></tr>
+  <tr><td>sealed 2026-08-14 · 2 vCPU · minor</td><td class="n">129.3</td><td class="n">1.4</td><td class="n">0.8</td><td class="n">337.2</td><td class="n">615.1 ms</td><td class="n">41.1</td></tr>
+  <tr><td>2026-08-16 · 2 vCPU · minor</td><td class="n">156.7</td><td class="n">7.5</td><td class="n">15.4</td><td class="n">503.9</td><td class="n">951.2 ms</td><td class="n">39.2</td></tr>
+  <tr><td>2026-08-16 · 2 vCPU · copy</td><td class="n">212.3</td><td class="n">31.7</td><td class="n">35.2</td><td class="n">462.9</td><td class="n">941.1 ms</td><td class="n">40.9</td></tr>
+  <tr><td>2026-08-16 · 2 vCPU · file (no UFFD)</td><td class="n">157.8</td><td class="n">9.1</td><td class="n">15.7</td><td class="n">473.8</td><td class="n">878.5 ms</td><td class="n">40.7</td></tr>
+  <tr><td>2026-08-16 · 2 vCPU · file · <em>sealed run's firecracker</em></td><td class="n">154.4</td><td class="n">9.6</td><td class="n">5.9</td><td class="n">611.6</td><td class="n">941.1 ms</td><td class="n">40.7</td></tr>
+  <tr><td>2026-08-16 · 4 vCPU · minor</td><td class="n">153.8</td><td class="n">2.8</td><td class="n">3.4</td><td class="n">386.7</td><td class="n">706.3 ms</td><td class="n">40.9</td></tr>
+  <tr><td>2026-08-16 · 8 vCPU · minor</td><td class="n">204.4</td><td class="n">3.2</td><td class="n">3.9</td><td class="n">312.1</td><td class="n">654.5 ms</td><td class="n">41.0</td></tr>
+</table>
+</div>
+<p class="src">All medians, ms, cdp arm, n=202 per arm per run, warmup 28 (two full 14-URL cycles) discarded explicitly. results/reqbench-20260816-*-corpus/analysis.json and results/campaign-20260816-summary.json; host baseline results/hostcdp-509059c1700d47bb89e9854ddd54bb73/run.json.</p>
+
+<p><strong>The guest is CPU-starved, not slow.</strong> <code>Page.enable</code> is one CDP round trip. It costs 15.4&nbsp;ms on 2 vCPUs and 3.4&nbsp;ms on 4, so it was waiting for a runnable core rather than for the network — TCP connect is 0.1&nbsp;ms in every run, including the sealed one. At 8 vCPUs <code>navigate</code> (312.1&nbsp;ms) is faster than the sealed run's 337.2.</p>
+
+<div class="viz"><svg viewBox="0 0 720 156" role="img" aria-label="corpus mix p50 by guest vCPU count"><line class="gridline" x1="300.0" y1="0" x2="300.0" y2="134"/><text class="axis" x="300.0" y="148" text-anchor="middle">0</text><line class="gridline" x1="378.0" y1="0" x2="378.0" y2="134"/><text class="axis" x="378.0" y="148" text-anchor="middle">200</text><line class="gridline" x1="456.0" y1="0" x2="456.0" y2="134"/><text class="axis" x="456.0" y="148" text-anchor="middle">400</text><line class="gridline" x1="534.0" y1="0" x2="534.0" y2="134"/><text class="axis" x="534.0" y="148" text-anchor="middle">600</text><line class="gridline" x1="612.0" y1="0" x2="612.0" y2="134"/><text class="axis" x="612.0" y="148" text-anchor="middle">800</text><line class="gridline" x1="690.0" y1="0" x2="690.0" y2="134"/><text class="axis" x="690.0" y="148" text-anchor="middle">1000</text><text class="lbl-cat" x="292" y="13.0" text-anchor="end">host container, no VM (64 cores)</text><path class="ref" d="M300,0 h56.8 a4,4 0 0 1 4,4 v10 a4,4 0 0 1 -4,4 h-56.8 z"><title>host container, no VM (64 cores): 146 ms</title></path><text class="lbl-val" x="366.8" y="13.0">146</text><text class="lbl-cat" x="292" y="39.0" text-anchor="end">sealed 2026-08-14 · 2 vCPU</text><path class="ref" d="M300,26 h239.9 a4,4 0 0 1 4,4 v10 a4,4 0 0 1 -4,4 h-239.9 z"><title>sealed 2026-08-14 · 2 vCPU: 615 ms</title></path><text class="lbl-val" x="549.9" y="39.0">615</text><text class="lbl-cat" x="292" y="65.0" text-anchor="end">2026-08-16 · 8 vCPU</text><path class="bar" d="M300,52 h255.3 a4,4 0 0 1 4,4 v10 a4,4 0 0 1 -4,4 h-255.3 z"><title>2026-08-16 · 8 vCPU: 654 ms</title></path><text class="lbl-val" x="565.3" y="65.0">654</text><text class="lbl-cat" x="292" y="91.0" text-anchor="end">2026-08-16 · 4 vCPU</text><path class="bar" d="M300,78 h275.5 a4,4 0 0 1 4,4 v10 a4,4 0 0 1 -4,4 h-275.5 z"><title>2026-08-16 · 4 vCPU: 706 ms</title></path><text class="lbl-val" x="585.5" y="91.0">706</text><text class="lbl-cat" x="292" y="117.0" text-anchor="end">2026-08-16 · 2 vCPU</text><path class="bar" d="M300,104 h371.0 a4,4 0 0 1 4,4 v10 a4,4 0 0 1 -4,4 h-371.0 z"><title>2026-08-16 · 2 vCPU: 951 ms</title></path><text class="lbl-val" x="681.0" y="117.0">951</text></svg></div>
+<p class="src">Corpus mix p50 by guest vCPU count, against the two references. results/campaign-20260816-summary.json</p>
+
+<p>Two independent controls agree that once CPU stops being the constraint, what is left is ordinary drift:</p>
+<div class="tbl">
+<table>
+  <tr><th>same container image, measured on</th><th class="n">then</th><th class="n">now</th><th class="n">delta</th></tr>
+  <tr><td>64 host cores (host-container pool, no VM)</td><td class="n">133.0 ms</td><td class="n">145.6 ms</td><td class="n">+9.5%</td></tr>
+  <tr><td>8 guest vCPUs</td><td class="n">615.1 ms</td><td class="n">654.5 ms</td><td class="n">+6.4%</td></tr>
+  <tr><td>2 guest vCPUs</td><td class="n">615.1 ms</td><td class="n">951.2 ms</td><td class="n">+55%</td></tr>
+</table>
+</div>
+<p>The host-container baseline gives the browser every core on the box, which is why a workload that costs 55% inside a 2-vCPU guest shows up there as 9.5%. That asymmetry is what made this look like an fcvm regression through six runs of bisection.</p>
+
+<p>Ruled out by measurement, each naming the run that did it: working-set replay (a warm sidecar was <em>slower</em>, 951.2 against 916.9 cold); the memory backend (<code>file</code> uses no UFFD and still regressed); the firecracker binary (rebuilding the sealed run's own <code>bump-vsock-max-connections</code> was slower still, 941.1); port forwarding (TCP connect 0.1&nbsp;ms throughout); the restore path (<code>noop</code> 39–41&nbsp;ms in every run including the sealed one); metric drift (the <code>enable_ms</code> code is byte-identical across the two revisions and <code>idle_wait_ms</code> is 0.0 in both); host CPU (19.7&nbsp;GB/s, the documented Graviton3 figure); guest CPU (17.8&nbsp;GB/s, normal virtualization overhead); and the guest kernel, whose pin did not move in the commit range.</p>
+
+<p><strong>What this does not establish.</strong> That the container image is the only remaining difference. The old image cannot be rebuilt, because the Debian package versions it pulled have moved, and the 2026-08-14 campaign's replay wiring was never recorded — the corpus procedure did not exist as a script until this reproduction, which is why regenerating it required reverse-engineering the invocation out of a sealed <code>analysis.json</code>. A replay that answered fewer hostnames would have rendered less and measured faster. The arithmetic is consistent with a browser that got hungrier; it does not prove it.</p>
+
+<p><strong>Consequence for everything below.</strong> The 615.1&nbsp;ms headline stands as what was measured on 2026-08-14 under a configuration that is only partly recorded. It is not a current figure for this system, and the same caution applies to every latency number in this report, all of which come from that campaign. The memory and concurrency figures are not affected by guest vCPU count in the same way, but they were measured on the same unrecorded footing.</p>
 
 <h2>The service being measured</h2>
 <p>One request: restore a clone from a golden snapshot, render one page (screenshot + DOM text) through Chromium's CDP endpoint, driven from the host over a forwarded port, then destroy the clone. Requests share nothing except the read-only snapshot. An earlier variant drove the render from a Python driver inside the guest (the "exec" arm below); it measured 645/714 ms p50 (uffd/file) on the morning golden, ~230 ms of which was starting that driver, and was retired. No other claim rests on it.<span class="cite">RB-uffd / RB-file analysis.json arms.exec.blocking_ms.median</span></p>

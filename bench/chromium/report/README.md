@@ -32,7 +32,7 @@ the tab by its icon. `description` is the gallery subtitle; omitting it on a
 redeploy drops the one already there.
 
 Publishing WITHOUT `url=` creates a second artifact. That already happened once:
-`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same 14 sections and differs
+`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same 15 sections and differs
 only in a cache-busting `<base href>`. It is stale the moment this file changes,
 and it is public.
 
@@ -59,7 +59,9 @@ What this rule costs the current document, so nobody rediscovers it:
 
 That leaves the corpus mix (615.1 ms [499.5, 719.0], n=202, 14 URLs cycled
 uniformly) as the publishable headline, and it is the one figure with both a
-surviving sealed record and a real workload behind it.
+surviving sealed record and a real workload behind it. See "The 615.1 ms
+headline does not reproduce" below: it remains the only publishable WORKLOAD,
+but the figure itself is dated rather than current.
 
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
@@ -133,4 +135,29 @@ fixed in the same pass:
 - "0 failures anywhere" is scoped to the runs in that table; a bridged attempt
   was refused by the zero-failure gate.
 - The run-id legend omitted NM, and the publish incantation omitted the required
-  `favicon` argument, and the section count said 15 against 14.
+  `favicon` argument, and the section count said 15 against an actual 14. (The
+  2026-08-16 reproduction section brings it back to 15; the count above is
+  current.)
+
+## The 615.1 ms headline does not reproduce
+
+Regenerated 2026-08-16, same host, same 14 URLs, same knobs: nine gated runs,
+all publishable, zero failures. 2 vCPUs measures **951.2 ms**, 4 measures 706.3,
+8 measures 654.5. The guest is CPU-starved rather than slow -- one `Page.enable`
+round trip costs 15.4 ms on 2 vCPUs and 3.4 ms on 4 -- and the host-container
+control moved only +9.5% because it gets all 64 cores.
+
+Ruled out with the run that did it: working-set replay, the memory backend,
+the firecracker binary (including rebuilding the sealed run's own branch), port
+forwarding, the restore path, metric drift, host CPU, guest CPU, guest kernel.
+Not established: that the container image is the only remaining difference.
+
+Consequence for this file's publication rule: the corpus mix is still the only
+publishable workload, but 615.1 is now a DATED measurement under a partly
+unrecorded configuration, not a current figure. Every latency number in the
+report comes from that same 2026-08-13/14 campaign and inherits the caveat.
+
+Records: `results/reqbench-20260816-*-corpus/analysis.json`,
+`results/campaign-20260816-summary.json`. Procedure: `../corpus_campaign.sh`,
+which did not exist before this reproduction -- regenerating the benchmark
+required reverse-engineering the invocation out of a sealed `analysis.json`.
