@@ -300,18 +300,29 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
     // the deadline error: it is the difference between "the guest said nothing"
     // and "this check never got an answer out of its own subprocess".
     let mut stalled_attempts: u32 = 0;
+    // Whether the guest's TCP probe answered on the LAST completed attempt. An
+    // answered probe leaves `detail` empty, and rendering "empty" as silence is
+    // what made run 31906708922 read as a dead guest when the guest had in fact
+    // answered (its own TIME-WAIT socket was in the namespace dump). Carry the
+    // state rather than inferring it from an absence.
+    let mut last_answered = false;
 
     loop {
-        rounds += 1;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(guest_unanswered_error(
                 &last_neighbor,
                 &last_detail,
+                last_answered,
                 rounds,
                 stalled_attempts,
             ));
         }
+        // Counted here, not at the top of the loop: a round that finds the
+        // deadline already spent probed nothing, and a reported count that
+        // includes it overstates the work by one. The number is a diagnostic,
+        // so it has to be the number of attempts actually made.
+        rounds += 1;
         // Each attempt is bounded separately from the deadline, so one stuck
         // attempt costs a round instead of the whole budget.
         let attempt = remaining.min(GUEST_PROBE_ATTEMPT_BUDGET);
@@ -338,6 +349,7 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
                     }
                 }
             };
+        last_answered = answer.answered;
         last_detail = answer.detail;
         if !answer.answered {
             debug!(
@@ -353,6 +365,7 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
             return Err(guest_unanswered_error(
                 &last_neighbor,
                 &last_detail,
+                last_answered,
                 rounds,
                 stalled_attempts,
             ));
@@ -406,6 +419,7 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
             return Err(guest_unanswered_error(
                 &last_neighbor,
                 &last_detail,
+                last_answered,
                 rounds,
                 stalled_attempts,
             ));
@@ -447,14 +461,19 @@ fn host_load_snapshot() -> String {
 fn guest_unanswered_error(
     neighbor: &str,
     detail: &str,
+    answered: bool,
     rounds: u32,
     stalled_attempts: u32,
 ) -> anyhow::Error {
     let neighbor = neighbor.trim();
-    let detail = if detail.is_empty() {
-        "(silence)"
-    } else {
-        detail
+    // An answered probe leaves `detail` empty, so empty means two opposite
+    // things and must never be rendered as one. Reporting "(silence)" for a
+    // guest that answered is what made run 31906708922 read as a dead guest
+    // while its own TIME-WAIT socket to the prober sat in the namespace dump.
+    let detail = match (answered, detail.is_empty()) {
+        (true, _) => "answered (SYN-ACK or RST)",
+        (false, true) => "(silence)",
+        (false, false) => detail,
     };
     if neighbor_is_resolved(neighbor) {
         // The failure this whole path exists to catch: pasta can reach the
@@ -474,11 +493,18 @@ fn guest_unanswered_error(
         )
     } else {
         anyhow::anyhow!(
-            "guest {} never appeared at L2 within {:?}: no resolved neighbour entry \
-             and no TCP answer; neighbour: {:?}; probe: {}; rounds {} ({} stalled); \
-             host {}",
+            "guest {} never appeared at L2 within {:?}: {}; neighbour: {:?}; \
+             probe: {}; rounds {} ({} stalled); host {}",
             GUEST_IP,
             GUEST_ANSWER_DEADLINE,
+            if answered {
+                // The guest is alive and talking; only its neighbour entry is
+                // missing. Naming that separately points at ARP or the bridge
+                // rather than at a dead guest.
+                "the guest ANSWERED TCP but its neighbour entry never resolved"
+            } else {
+                "no resolved neighbour entry and no TCP answer"
+            },
             neighbor,
             detail,
             rounds,
@@ -2361,6 +2387,45 @@ mod tests {
             result.is_err(),
             "readiness must not be declared from a neighbour reading taken in an \
              earlier round when this round's query never returned"
+        );
+    }
+
+    /// The deadline error must never call an answering guest silent.
+    ///
+    /// A probe that answered leaves `detail` empty, so "empty" carries two
+    /// opposite meanings and cannot be rendered as one. Run 31906708922 reported
+    /// `no TCP answer` and `probe: (silence)` for a guest that had demonstrably
+    /// answered: its own TIME-WAIT socket to the prober was in the namespace
+    /// dump and its neighbour entry was REACHABLE. Hours went into looking for a
+    /// dead guest that was never dead.
+    #[tokio::test(start_paused = true)]
+    async fn an_answering_guest_is_never_reported_as_silent() {
+        // Answers TCP every time; its neighbour entry never resolves.
+        let mut probe = ScriptedGuest {
+            answers: [true].into_iter().collect(),
+            last_answer: true,
+            neighbor: "10.0.2.100 dev br0 INCOMPLETE".to_string(),
+            probes: 0,
+        };
+
+        let error = wait_for_guest_to_answer(&mut probe, PROBE_PORT, paused_deadline())
+            .await
+            .expect_err("an unresolved neighbour must still fail readiness");
+        let text = error.to_string();
+
+        assert!(
+            !text.contains("no TCP answer"),
+            "the guest answered TCP, so the error must not claim otherwise: {text}"
+        );
+        assert!(
+            !text.contains("(silence)"),
+            "an answered probe leaves `detail` empty; rendering that as silence \
+             inverts the meaning: {text}"
+        );
+        assert!(
+            text.contains("ANSWERED TCP"),
+            "the error must say which half actually failed, so the reader looks at \
+             ARP and the bridge rather than at the guest: {text}"
         );
     }
 
