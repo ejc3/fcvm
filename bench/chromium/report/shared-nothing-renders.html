@@ -117,9 +117,9 @@ a { color: inherit; }
 
 <div class="verdict">
   <div><span class="num">615.1 ms</span><span class="lbl">p50 on Cloudflare's 14-URL corpus, byte-replayed (gated) — measured 2026-08-14; the 2026-08-16 single-binary rerun measures 982.9 on 2 vCPUs, 695.7 on 4 and 647.2 on 8, see the reproduction section</span></div>
-  <div><span class="num">Fixture</span><span class="lbl">the 348.7 ms direct-CDP figure is a <code>medium.html</code> MICRO-BENCHMARK, kept below as optimisation evidence and deliberately not a headline: published numbers come from the corpus mix only</span></div>
   <div><span class="num">0</span><span class="lbl">failed requests in twelve gated runs · 202 per arm per run</span></div>
 </div>
+<p class="src"><strong>The 348.7&nbsp;ms direct-CDP figure is not a headline.</strong> It is a <code>medium.html</code> micro-benchmark, kept below as optimisation evidence; published numbers come from the corpus mix only. It previously sat in the verdict block above as a caveat card, which put the number it warns against in the one place a skimming reader looks — the warning and its placement were arguing with each other.</p>
 <p class="src">Numbers are cited by run id (RB, AB, PF, CPU, HM, HK, NC, FG, CX for the latency benchmark; FB for fault counts; HC for the host-container baseline; NM for the network-mode trio; LD and MH for the concurrency/memory ladders). Smaller instrumented probe sets (attribution, ablation, the CoW census) are cited by their directory names. The full index, with result directories, is in "Provenance and gates" at the end.</p>
 
 <h2>What a render actually demands, instant by instant</h2>
