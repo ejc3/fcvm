@@ -1197,10 +1197,45 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         """And it must say no when the machine counter does not move."""
         from unittest import mock
 
-        with mock.patch.object(reqbench, "machine_cpu_ms", side_effect=[100.0, 100.0]):
+        with mock.patch.object(reqbench, "machine_cpu_ms", return_value=100.0):
             self.assertFalse(
                 reqbench.machine_counter_tracks_this_process(),
                 "a machine counter frozen across a deliberate burn is not tracking",
+            )
+
+    def test_ambient_load_alone_does_not_look_like_tracking(self):
+        """The case a single burn window cannot distinguish.
+
+        A counter that EXCLUDES this process but advances steadily because the
+        box is busy satisfies `machine_delta >= spent - tolerance` on its own.
+        The probe then declares the host healthy, and bounded_cpu_residual
+        raises RuntimeError -- "your accounting is wrong" -- where it should
+        raise MachineCpuCounterUnusable -- "this host cannot be measured". The
+        operator is sent to debug the wrong thing, and nothing in the record
+        says so.
+
+        Here the stub counter grows purely with WALL time at 4 cores' worth of
+        ambient load and never reflects our burn. Paired windows cancel it: the
+        idle and burn windows are the same length, so ambient contributes
+        equally to both and the difference is ~0.
+
+        RED WITHOUT THE PAIRED DESIGN: the single-window version compared
+        4 x window against our ~1 x window of burn and answered True.
+        """
+        from unittest import mock
+
+        start = time.monotonic()
+
+        def ambient_only():
+            # 4 cores of unrelated work, entirely independent of what we burn.
+            return (time.monotonic() - start) * 1000.0 * 4
+
+        with mock.patch.object(reqbench, "machine_cpu_ms", side_effect=ambient_only):
+            self.assertFalse(
+                reqbench.machine_counter_tracks_this_process(),
+                "a counter that only reflects ambient load was read as tracking "
+                "this process; on a busy host that turns the enclosure check "
+                "into a no-op",
             )
 
     def test_reclaim_sampler_does_not_burn_a_core(self):

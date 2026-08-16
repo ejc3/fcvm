@@ -259,6 +259,10 @@ def self_cpu_ms() -> float:
 # Answer to machine_counter_tracks_this_process(), which is a property of the
 # host and therefore constant for the life of the process. None until asked.
 _MACHINE_COUNTER_TRACKS = None
+# Paired idle/burn windows per probe. Five is the smallest count that gives a
+# median with a majority behind it, so one unlucky window cannot decide the
+# answer on a host whose ambient load moves between windows.
+CPU_TRACKING_PAIRS = 5
 
 
 class MachineCpuCounterUnusable(RuntimeError):
@@ -310,12 +314,45 @@ def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
     global _MACHINE_COUNTER_TRACKS
     if _MACHINE_COUNTER_TRACKS is not None:
         return _MACHINE_COUNTER_TRACKS
-    m0, h0 = machine_cpu_ms(), self_cpu_ms()
-    end = time.monotonic() + burn_ms / 1000.0
-    while time.monotonic() < end:
-        pass
-    m1, h1 = machine_cpu_ms(), self_cpu_ms()
-    spent = h1 - h0
+    # PAIRED windows, not one burn. A single burn compares machine movement
+    # against our own spend, and on a busy host AMBIENT load supplies that
+    # movement all by itself -- so the probe answered "tracks" for a counter
+    # that excludes us entirely, purely because the box was busy. The failure is
+    # quiet: bounded_cpu_residual then raises RuntimeError (a real accounting
+    # bug) where it should raise MachineCpuCounterUnusable (an unusable host),
+    # so the operator is sent to debug the wrong thing.
+    #
+    # Each pair measures machine movement over an IDLE window and over an
+    # equal-length BURN window. Ambient load appears in both and cancels in the
+    # difference; only work attributable to this process survives it. Five pairs
+    # because one difference is a single noisy sample of a quantity that varies
+    # with whatever else the box is doing -- the median is what makes the answer
+    # about the host rather than about the moment.
+    #
+    # Cost: 5 * 2 * burn_ms, about 3.2s, paid ONCE per process (memoized). The
+    # expense that mattered was calling this on every violation -- 202 reps of a
+    # 320ms spin inside the teardown path, landing in the ambient control window
+    # of the reps either side. Memoization fixed that, and it fixes this.
+    window_s = burn_ms / 1000.0
+    excesses = []
+    spends = []
+    for _ in range(CPU_TRACKING_PAIRS):
+        idle_m0 = machine_cpu_ms()
+        time.sleep(window_s)  # sleep, NOT spin: the idle window must stay idle
+        idle_delta = machine_cpu_ms() - idle_m0
+
+        burn_m0, h0 = machine_cpu_ms(), self_cpu_ms()
+        end = time.monotonic() + window_s
+        while time.monotonic() < end:
+            pass
+        burn_delta, spent = machine_cpu_ms() - burn_m0, self_cpu_ms() - h0
+        excesses.append(burn_delta - idle_delta)
+        spends.append(spent)
+
+    excesses.sort()
+    spends.sort()
+    middle = len(excesses) // 2
+    excess, spent = excesses[middle], spends[middle]
     if spent <= CPU_RESIDUAL_UNCERTAINTY_MS:
         # We failed to burn measurably more than the tolerance (a preempted or
         # heavily throttled probe), so it cannot distinguish anything. Fail
@@ -323,7 +360,7 @@ def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
         # excusing it. NOT memoized: this is a statement about the probe, not
         # about the host, so a later attempt may still answer the question.
         return True
-    _MACHINE_COUNTER_TRACKS = (m1 - m0) >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
+    _MACHINE_COUNTER_TRACKS = excess >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
     return _MACHINE_COUNTER_TRACKS
 
 

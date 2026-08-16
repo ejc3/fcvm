@@ -115,7 +115,25 @@ cleanup() {
     fi
     if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
         say "restarting dnsmasq"
-        sudo systemctl start dnsmasq
+        # Retry and REPORT. corpus_serve can still be releasing :53 as this runs
+        # (the poll above bounds its exit at 5s, it does not prove the socket is
+        # closed), so a single attempt loses the race. Unchecked, this trap left
+        # the box with no DNS resolution and said nothing -- the same defect
+        # bench-stop had, in the other code path that restores this service.
+        #
+        # Exiting non-zero FROM the trap is deliberate: a campaign that leaves
+        # the host unable to resolve anything has not finished successfully,
+        # whatever its measurements say, and the next run's preflight would fail
+        # somewhere far less obvious.
+        for _ in $(seq 1 10); do
+            sudo systemctl start dnsmasq >/dev/null 2>&1 && break
+            sleep 1
+        done
+        if ! systemctl is-active --quiet dnsmasq; then
+            echo "FAILED: dnsmasq did not restart; this box has no DNS." >&2
+            echo "Something still holds :53 -- check: sudo ss -lnup 'sport = :53'" >&2
+            exit 1
+        fi
     fi
 }
 trap cleanup EXIT
