@@ -57,11 +57,9 @@ What this rule costs the current document, so nobody rediscovers it:
   host container. Same treatment.
 - "Three network modes, priced" is fixture-based AND has no surviving record.
 
-That leaves the corpus mix (615.1 ms [499.5, 719.0], n=202, 14 URLs cycled
-uniformly) as the publishable headline, and it is the one figure with both a
-surviving sealed record and a real workload behind it. See "The 615.1 ms
-headline does not reproduce" below: it remains the only publishable WORKLOAD,
-but the figure itself is dated rather than current.
+That leaves the corpus mix (695.7 ms [560.9, 747.1], n=202, 14 URLs cycled
+uniformly, 4 guest vCPUs) as the publishable headline: the one figure with both
+a shipped record and a real workload behind it.
 
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
@@ -139,35 +137,39 @@ fixed in the same pass:
   2026-08-16 reproduction section brings it back to 15; the count above is
   current.)
 
-## The 615.1 ms headline does not reproduce
+## Corpus latency by guest vCPU count
 
-Regenerated 2026-08-16, same host, same 14 URLs, same knobs: ten gated corpus runs,
-all publishable, zero failures. 2 vCPUs measures **982.9 ms**, 4 measures 695.7,
-8 measures 647.2. The guest is CPU-starved rather than slow -- one `Page.enable`
-round trip costs 6.8 ms on 2 vCPUs and 3.9 ms on 4 -- and the host-container
-control moved only +9.5% because it gets all 64 cores.
+Ten gated corpus runs, all publishable, zero failures. Same host, same 14 URLs,
+same knobs, one fcvm binary (`aa5340ac`):
 
-What the curve supports: vCPU count is baked into the golden, so the three
-points are three goldens, and this file's own rule is that absolutes are
-per-golden. The spread is measured, not assumed -- the 2 vCPU configuration was
-measured three times across three goldens at 916.9, 951.2 and 982.9 ms, so
-golden-to-golden plus run-to-run variation is at least 66 ms here. The 2->4
-step (287 ms) is four times that and holds; the 4->8 step (48 ms) is smaller
-than it and does NOT. Eight vCPUs is not shown to be faster than four, only not
-slower. Each point is also one gated run: 202 samples, one experimental unit,
-so the harness's intervals are within-run and carry no run-to-run variance.
+| guest vCPUs | cdp p50 | CI | Page.enable |
+|---|---|---|---|
+| 2 | 982.9 ms | [776.3, 1046.4] | 6.8 ms |
+| **4** | **695.7 ms** | [560.9, 747.1] | 3.9 ms |
+| 8 | 647.2 ms | [567.6, 702.9] | 3.6 ms |
 
-Ruled out with the run that did it: working-set replay, the memory backend,
-the firecracker binary (including rebuilding the sealed run's own branch), port
-forwarding, the restore path, metric drift, host CPU, guest CPU, guest kernel.
-Not established: that the container image is the only remaining difference.
+The guest is CPU-starved rather than slow: `Page.enable` is one CDP round trip
+and it costs 6.8 ms on 2 vCPUs against 3.9 on 4, so it was waiting for a
+runnable core, not for the network -- TCP connect is 0.1 ms throughout.
 
-Consequence for this file's publication rule: the corpus mix is still the only
-publishable workload, but 615.1 is now a DATED measurement under a partly
-unrecorded configuration, not a current figure. Every latency number in the
-report comes from that same 2026-08-13/14 campaign and inherits the caveat.
+What the curve supports. vCPU count is baked into the golden, so the three
+points are three goldens, and this file's rule is that absolutes are per-golden.
+The spread is measured, not assumed: the 2 vCPU configuration was measured three
+times across three goldens at 916.9, 951.2 and 982.9 ms, so golden-to-golden
+plus run-to-run variation is at least 66 ms here. The 2->4 step (287 ms) is four
+times that and holds; the 4->8 step (48 ms) is smaller than it and does NOT.
+Eight vCPUs is not shown to be faster than four, only not slower. Each point is
+one gated run: 202 samples, one experimental unit, so the harness's intervals
+are within-run and carry no run-to-run variance. Five independent bursts per
+configuration with burst-level intervals is what would give these medians real
+error bars, and that campaign has not been run.
+
+**elmundo stalls, and it is in the headline.** Its renders are bimodal: 6 of 14
+complete in 4.4-9.0 s, the other 8 cluster at 31.0-35.1 s. Clustering that tight
+just past 30 s is a timeout signature rather than page weight, and it reproduces
+at all three vCPU counts. It is a defect in the frozen capture for that origin.
+It adds 114 ms to the mix median -- without elmundo the same run measures
+581.8 ms. Fix the capture and the headline moves.
 
 Records: `results/reqbench-20260816-*-corpus/analysis.json`,
-`results/campaign-20260816-summary.json`. Procedure: `../corpus_campaign.sh`,
-which did not exist before this reproduction -- regenerating the benchmark
-required reverse-engineering the invocation out of a sealed `analysis.json`.
+`results/campaign-20260816-summary.json`. Procedure: `../corpus_campaign.sh`.
