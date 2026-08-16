@@ -29,6 +29,34 @@ Publishing WITHOUT `url=` creates a second artifact. That already happened once:
 only in a cache-busting `<base href>`. It is stale the moment this file changes,
 and it is public.
 
+## Publication rule: corpus only
+
+**Published numbers come from the Cloudflare 14-URL corpus mix, and nothing
+else.** `medium.html` is a synthetic fixture: 1.4 KB of HTML, a 14-rule
+stylesheet, 806 B of JS and four generated PNGs, served with `Cache-Control:
+no-store` so every render re-fetches and re-compiles. That determinism is
+exactly what makes it a good MICRO-BENCHMARK for optimisation work, where the
+question is whether a configuration change moved a number. It is not a workload
+anyone runs, so it must not carry a published figure.
+
+What this rule costs the current document, so nobody rediscovers it:
+
+- The verdict box's second headline, `348.7 ms direct-CDP p50`, is a fixture
+  number. Not publishable as a headline.
+- The whole "Fixture latency ladder, direct CDP" section is fixture-based:
+  RB, AB, PF, HM, HK, NC, FG. Keep it as optimisation evidence, clearly marked,
+  or cut it.
+- "Where the isolation premium lives" decomposes a fixture render against the
+  host container. Same treatment.
+- "Three network modes, priced" is fixture-based AND has no surviving record.
+
+That leaves the corpus mix (615.1 ms [499.5, 719.0], n=202, 14 URLs cycled
+uniformly) as the publishable headline, and it is the one figure with both a
+surviving sealed record and a real workload behind it.
+
+Regeneration follows the same rule: anything intended for publication is a
+corpus run, not a fixture run.
+
 ## Known corrections outstanding
 
 Recorded here so an editor does not have to rediscover them. None are stylistic;
