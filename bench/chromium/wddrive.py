@@ -125,13 +125,34 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
     navigate-to-load-event rather than "whenever WebKit felt like replying".
     """
     deadline = time.monotonic() + timeout
+    # Plant a sentinel on the CURRENT document first. readyState alone is not a
+    # navigation signal: it is still "complete" from the PREVIOUS document at the
+    # instant the navigate is issued, so polling it races and can return before
+    # the new document has even started. Measured with the naive version -- a
+    # repeat navigation to the same URL reported navigate_ms=3.4 while the page
+    # was still doing 985 ms of layout, which then landed in screenshot_ms.
+    # A real document swap wipes the global, so its ABSENCE is the proof that
+    # this readyState belongs to the new document and not the old one.
+    try:
+        wd(host, "POST", f"/session/{session}/execute/sync",
+           {"script": "window.__fcvmNavSentinel = 1; return 1", "args": []},
+           timeout=max(1.0, deadline - time.monotonic()))
+        sentinel = True
+    except Exception:
+        # No current document to plant on (fresh session): readyState alone is
+        # unambiguous there, because there is no previous document to confuse it.
+        sentinel = False
     wd(host, "POST", f"/session/{session}/url", {"url": url}, timeout=timeout)
     while True:
         state = wd(host, "POST", f"/session/{session}/execute/sync",
-                   {"script": "return document.readyState", "args": []},
+                   {"script": ("return [document.readyState, "
+                               "typeof window.__fcvmNavSentinel === 'undefined']"),
+                    "args": []},
                    timeout=max(1.0, deadline - time.monotonic()))
-        if state == "complete":
+        ready, swapped = (state[0], state[1]) if isinstance(state, list) else (state, True)
+        if ready == "complete" and (swapped or not sentinel):
             return
+        state = ready
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"document.readyState={state!r} after {timeout:.0f}s; the page "
