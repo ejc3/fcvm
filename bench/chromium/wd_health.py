@@ -22,6 +22,8 @@ snapshot is meant to freeze.
 import json
 import os
 import sys
+
+import health_loop
 import urllib.error
 import urllib.request
 
@@ -31,7 +33,7 @@ SESSION_FILE = os.environ.get("BENCH_SESSION_FILE", "/run/bench-session-id")
 TIMEOUT = float(os.environ.get("BENCH_WD_HEALTH_TIMEOUT", "3"))
 
 
-def main() -> int:
+def main_with_reason() -> tuple[int, str]:
     if not os.path.exists(READY_FILE):
         print(f"unhealthy: warm marker {READY_FILE} absent", file=sys.stderr)
         return 1
@@ -39,11 +41,9 @@ def main() -> int:
         with open(SESSION_FILE) as source:
             session = source.read().strip()
     except OSError as error:
-        print(f"unhealthy: session file: {error}", file=sys.stderr)
-        return 1
+        return 1, f"session file: {error}"
     if not session:
-        print(f"unhealthy: session file {SESSION_FILE} is empty", file=sys.stderr)
-        return 1
+        return 1, f"session file {SESSION_FILE} is empty"
 
     # execute/sync, NOT GET /url. Automation.getBrowsingContext -- which backs
     # GET /url -- builds its reply from page.pageLoadState().activeURL(), pure
@@ -61,17 +61,23 @@ def main() -> int:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             value = json.load(resp)["value"]
         if value != 1:
-            print(f"unhealthy: web process returned {value!r}, expected 1",
-                  file=sys.stderr)
-            return 1
+            return 1, f"web process returned {value!r}, expected 1"
     except Exception as error:  # noqa: BLE001 - any transport/protocol failure = unhealthy
-        print(f"unhealthy: warm-session probe failed: "
-              f"{type(error).__name__}: {error}", file=sys.stderr)
-        return 1
+        return 1, f"warm-session probe failed: {type(error).__name__}: {error}"
 
-    print(f"healthy session={session} url={value}")
-    return 0
+    return 0, f"session={session}"
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Resident by default, exactly as cdp_health.py is: the per-second
+    # `python3 wd_health.py` HEALTHCHECK this file originally carried spends a
+    # fresh interpreter per clone per second forever, dirtying ~9 MB of private
+    # pages INSIDE the clone -- against the per-clone memory figure this bench
+    # exists to measure. health_state.sh is the cheap reader, and reqbench.sh
+    # asserts the image's HEALTHCHECK names it.
+    if "--loop" in sys.argv:
+        sys.exit(health_loop.loop(main_with_reason, "wd_health"))
+    code, reason = main_with_reason()
+    print(("healthy " if code == 0 else "unhealthy ") + reason,
+          file=sys.stdout if code == 0 else sys.stderr)
+    sys.exit(code)

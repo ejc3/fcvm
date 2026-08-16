@@ -146,6 +146,12 @@ class HealthStateReader(unittest.TestCase):
             spec.loader.exec_module(cdp_health)
 
             state = os.path.join(directory, "bench-health")
+            # Set the ENV, which is what health_state.sh reads too, rather than
+            # patching a module attribute. publish() resolves the path per call
+            # via the same variable, so this exercises the one resolution both
+            # sides actually use instead of a test-only back door.
+            os.environ["BENCH_HEALTH_STATE"] = state
+            self.addCleanup(os.environ.pop, "BENCH_HEALTH_STATE", None)
             cdp_health.STATE_FILE = state
             cdp_health.publish("healthy", "pages=1 id=ABC")
 

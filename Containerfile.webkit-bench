@@ -75,9 +75,10 @@ RUN set -e; \
 
 COPY bench/chromium/pages/ /opt/bench/pages/
 COPY bench/chromium/pageserver.py bench/chromium/entry-webkit.sh \
-     bench/chromium/wddrive.py bench/chromium/wd_health.py /opt/bench/
+     bench/chromium/wddrive.py bench/chromium/wd_health.py \
+     bench/chromium/health_loop.py bench/chromium/health_state.sh /opt/bench/
 RUN chmod +x /opt/bench/entry-webkit.sh /opt/bench/pageserver.py \
-     /opt/bench/wddrive.py /opt/bench/wd_health.py
+     /opt/bench/wddrive.py /opt/bench/wd_health.py /opt/bench/health_state.sh
 
 # WebKitWebDriver's HTTP endpoint. fcvm DNATs eligible published TCP ports to
 # guest loopback, so `--publish 9515:9515` reaches the driver directly.
@@ -89,7 +90,14 @@ EXPOSE 9515
 # WebDriver's /status reports "ready" even when no browser is running, so the
 # probe is GET /session/<id>/url, which fails once the session or browser dies.
 # start-period covers Xvfb + MiniBrowser cold launch + the warm render.
+# The reader, not the probe. A per-second `python3 wd_health.py` spends a
+# fresh interpreter in every clone forever -- 9.1ms startup, 43.6ms per check
+# measured in this image -- and dirties those pages INSIDE the clone, against
+# the per-clone memory figure this bench exists to measure. wd_health.py --loop
+# runs resident from entry-webkit.sh BEFORE the warm marker, so its pages join
+# the golden and are shared. reqbench.sh also asserts the HEALTHCHECK names
+# health_state.sh, so the image could not pass the golden gate as it was.
 HEALTHCHECK --interval=1s --timeout=5s --start-period=90s --retries=3 \
-    CMD ["python3", "/opt/bench/wd_health.py"]
+    CMD ["/opt/bench/health_state.sh"]
 
 CMD ["/opt/bench/entry-webkit.sh"]

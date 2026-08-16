@@ -103,12 +103,19 @@ python3 /opt/bench/wddrive.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
 # port; the health probe reads the /run copy.
 cp "$SESSION_FILE" "$PAGES_DIR/webdriver-session.txt"
 
+# Resident health checker, started BEFORE the warm marker so the interpreter's
+# pages are dirtied pre-snapshot and shared by every clone. stdout to /dev/null:
+# a per-second writer would otherwise grow podman's container log on the clone's
+# CoW disk forever.
+python3 /opt/bench/wd_health.py --loop >/dev/null 2>&1 &
+echo "webkit-bench: resident health checker started"
+
 # Warm marker. wddrive.py --then-blank returns zero only after the navigate,
 # the PNG screenshot, and a verified about:blank transition, and `set -e`
 # means any failure exits before this touch — same golden-snapshot contract as
 # the Chromium entry.
 touch "$READY_FILE"
-echo "WEBKIT_BENCH_READY wd=127.0.0.1:$WD_PORT pages=http://127.0.0.1:$HTTP_PORT session=$(cat "$SESSION_FILE")"
+echo "BENCH_READY engine=webkit wd=127.0.0.1:$WD_PORT pages=http://127.0.0.1:$HTTP_PORT session=$(cat "$SESSION_FILE")"
 
 # Hold the warm driver. wait exits with WebKitWebDriver's status if it dies so
 # the container stops instead of hiding a dead driver; the trap keeps `podman
