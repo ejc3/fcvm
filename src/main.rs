@@ -30,6 +30,12 @@ async fn main() -> Result<()> {
     // Raise resource limits early for fuse-pipe server
     raise_resource_limits();
 
+    // Make /usr/sbin and /sbin reachable before anything shells out. fcvm calls
+    // sfdisk, resize2fs, e2fsck, losetup and friends by bare name; sudo resolves
+    // those through secure_path, so only the unprivileged paths break, and they
+    // break with a bare ENOENT that names no tool.
+    fcvm::utils::ensure_sbin_on_path();
+
     // Arm deterministic lifecycle failpoints from FCVM_FAILPOINT (test-only
     // instrumentation; no-op when unset). Once, before any command runs.
     failpoint::arm_from_env();

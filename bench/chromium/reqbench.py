@@ -194,7 +194,49 @@ class MachineCpuCounterUnusable(RuntimeError):
     """
 
 
-def bounded_cpu_residual(machine_ms: float, harness_ms: float) -> dict:
+def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
+    """Burn a known amount of CPU and check that /proc/stat noticed.
+
+    The enclosure property the accounting rests on is that the machine-wide
+    counter includes this process. That is a property of the HOST, and it is
+    directly testable: burn CPU deliberately, read both counters around it, and
+    see whether the machine counter advanced by at least what we spent.
+
+    This exists because thresholding the symptom does not work. The first
+    version of the guard below asked `machine_ms == 0.0`, which classified the
+    GitHub-hosted runner correctly on one run and not the next: the same host
+    later reported `machine=10.000000ms harness=160.000000ms` — one 10 ms jiffy
+    of movement against 160 ms of our own CPU. A counter that moves by one tick
+    is no more tracking us than one that does not move at all, but no fixed
+    cutoff on the observed shortfall can say so without also swallowing real
+    accounting bugs, whose shortfall is resolution-scale by construction.
+
+    A controlled burn separates them, because it fixes the quantity the counter
+    is supposed to reproduce.
+    """
+    # The burn has to clear the residual tolerance, or the comparison below is
+    # inside the noise and the probe answers "tracks" no matter what the host
+    # does. Caught by test_the_probe_reports_a_frozen_counter_as_untracked: a
+    # 60 ms burn against this tolerance (8 quanta, 80 ms at 100 Hz) took the
+    # cannot-distinguish branch and called a frozen counter healthy.
+    if burn_ms is None:
+        burn_ms = 4 * CPU_RESIDUAL_UNCERTAINTY_MS
+    m0, h0 = machine_cpu_ms(), self_cpu_ms()
+    end = time.monotonic() + burn_ms / 1000.0
+    while time.monotonic() < end:
+        pass
+    m1, h1 = machine_cpu_ms(), self_cpu_ms()
+    spent = h1 - h0
+    if spent <= CPU_RESIDUAL_UNCERTAINTY_MS:
+        # We failed to burn measurably more than the tolerance (a preempted or
+        # heavily throttled probe), so it cannot distinguish anything. Fail
+        # toward "tracks", which keeps the real-violation path live rather than
+        # excusing it.
+        return True
+    return (m1 - m0) >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
+
+
+def bounded_cpu_residual(machine_ms: float, harness_ms: float, tracks=None) -> dict:
     """Constrain M-H only within the counters' declared resolution.
 
     Both inputs are deltas of cumulative counters, so each contributes two
@@ -215,14 +257,18 @@ def bounded_cpu_residual(machine_ms: float, harness_ms: float) -> dict:
     # Named separately so the two cases cannot be confused. A REAL violation
     # (the machine counter moved, but by less than the harness) still raises
     # below and still invalidates the measurement.
-    if machine_ms == 0.0 and harness_ms > uncertainty_ms:
-        raise MachineCpuCounterUnusable(
-            f"/proc/stat aggregate did not advance while this process used "
-            f"{harness_ms:.1f}ms of CPU, so it does not track this process and "
-            f"cannot enclose it. This measurement needs a host whose /proc/stat "
-            f"reflects its own processes; GitHub-hosted runners do not."
-        )
     if raw_ms < -uncertainty_ms:
+        # Which of the two is it? Ask the host, do not guess from the shortfall.
+        probe = machine_counter_tracks_this_process if tracks is None else tracks
+        if not probe():
+            raise MachineCpuCounterUnusable(
+                f"/proc/stat does not track this process: a controlled CPU burn "
+                f"did not move the machine-wide counter by what this process "
+                f"spent, so it cannot enclose it. The measurement that triggered "
+                f"this check read machine={machine_ms:.6f}ms against "
+                f"harness={harness_ms:.6f}ms. This needs a host whose /proc/stat "
+                f"reflects its own processes; GitHub-hosted runners do not."
+            )
         raise RuntimeError(
             "host CPU delta is smaller than enclosed harness CPU delta: "
             f"machine={machine_ms:.6f}ms harness={harness_ms:.6f}ms "

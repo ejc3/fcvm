@@ -1068,10 +1068,15 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         entirely (the counter does not track this process at all) and is
         asserted separately below; using zero here made this test pass for a
         reason it did not intend.
+
+        `tracks` states the environment: a host whose /proc/stat DOES enclose
+        its processes. On such a host a shortfall this large is a real
+        accounting bug and must still be raised as one.
         """
         with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
             reqbench.bounded_cpu_residual(
-                10.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 100.0
+                10.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 100.0,
+                tracks=lambda: True,
             )
 
     def test_a_dead_machine_counter_is_named_not_reported_as_a_violation(self):
@@ -1085,7 +1090,8 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         """
         with self.assertRaises(reqbench.MachineCpuCounterUnusable) as caught:
             reqbench.bounded_cpu_residual(
-                0.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 10.0
+                0.0, reqbench.CPU_RESIDUAL_UNCERTAINTY_MS + 10.0,
+                tracks=lambda: False,
             )
         self.assertIn("does not track this process", str(caught.exception))
 
@@ -1093,6 +1099,52 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         # a genuinely idle window legitimately reads zero on both counters.
         quiet = reqbench.bounded_cpu_residual(0.0, 0.0)
         self.assertEqual(quiet["raw_ms"], 0.0)
+
+    def test_one_tick_of_movement_is_not_tracking_either(self):
+        """RED BEFORE THE FIX: the guard asked `machine_ms == 0.0`.
+
+        That classified the GitHub-hosted runner correctly the first time
+        (machine=0.000000ms harness=150.000000ms) and wrongly the next, when the
+        same host reported
+
+            machine=10.000000ms harness=160.000000ms raw=-150.000000ms
+
+        One 10 ms jiffy is the counter's resolution, not evidence that it
+        tracks us, so the `== 0.0` test let the identical environment through as
+        an enclosure violation and failed the bench suite again.
+
+        The classifier is now the probe, not the magnitude of the shortfall, so
+        the SAME numbers land on either side depending only on what the host can
+        actually do.
+        """
+        observed = (10.0, 160.0)  # verbatim from the failing CI job
+        with self.assertRaises(reqbench.MachineCpuCounterUnusable):
+            reqbench.bounded_cpu_residual(*observed, tracks=lambda: False)
+        with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
+            reqbench.bounded_cpu_residual(*observed, tracks=lambda: True)
+
+    def test_the_probe_reports_this_host_tracks_its_own_processes(self):
+        """The probe must say yes HERE, or it would excuse every real violation.
+
+        A probe that answered "not tracking" on a normal Linux host would turn
+        the enclosure check into a no-op everywhere — the fail-open shape this
+        repo keeps finding. This is a bench host; /proc/stat encloses it.
+        """
+        self.assertTrue(
+            reqbench.machine_counter_tracks_this_process(),
+            "/proc/stat did not reflect a deliberate CPU burn by this process; "
+            "if that is true of this host the enclosure check cannot work here",
+        )
+
+    def test_the_probe_reports_a_frozen_counter_as_untracked(self):
+        """And it must say no when the machine counter does not move."""
+        from unittest import mock
+
+        with mock.patch.object(reqbench, "machine_cpu_ms", side_effect=[100.0, 100.0]):
+            self.assertFalse(
+                reqbench.machine_counter_tracks_this_process(),
+                "a machine counter frozen across a deliberate burn is not tracking",
+            )
 
     def test_reclaim_sampler_does_not_burn_a_core(self):
         """The RECLAIM window must not spin either — the control window is only half.

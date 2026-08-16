@@ -1047,6 +1047,61 @@ mod tests {
     }
 }
 
+/// Directories holding the system-administration tools fcvm shells out to.
+///
+/// `/usr/sbin` is the merged-usr location; `/sbin` is kept for hosts where it
+/// is a real directory rather than a symlink.
+const SBIN_DIRS: [&str; 2] = ["/usr/sbin", "/sbin"];
+
+/// Compute the PATH fcvm should run with, given the inherited one.
+///
+/// Returns `None` when nothing needs to change, so the caller can leave the
+/// environment alone in the common case.
+fn path_with_sbin(current: &str) -> Option<String> {
+    let missing: Vec<&str> = SBIN_DIRS
+        .iter()
+        .copied()
+        .filter(|dir| std::path::Path::new(dir).is_dir())
+        .filter(|dir| !std::env::split_paths(current).any(|p| p == std::path::Path::new(dir)))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut out = String::from(current);
+    for dir in missing {
+        if !out.is_empty() {
+            out.push(':');
+        }
+        out.push_str(dir);
+    }
+    Some(out)
+}
+
+/// Put `/usr/sbin` and `/sbin` on PATH so bare-name tool lookups resolve.
+///
+/// fcvm shells out to `sfdisk`, `resize2fs`, `e2fsck`, `dumpe2fs`, `mkfs.ext4`,
+/// `losetup`, `iptables` and friends by bare name. Under `sudo` those resolve
+/// through `secure_path`, which lists the sbin directories — so the privileged
+/// paths always worked and hid this. The documented rootless quickstart
+/// (`make setup-fcvm` as the unprivileged user) does not go through sudo, and
+/// on a login shell whose PATH omits the sbin directories every one of those
+/// lookups fails with a bare ENOENT:
+///
+/// ```text
+/// ERROR fcvm: Error: setting up rootfs: getting partition info:
+///     No such file or directory (os error 2)
+/// ```
+///
+/// which names neither the tool nor the reason. The binary is installed; only
+/// the lookup path is wrong.
+pub fn ensure_sbin_on_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if let Some(updated) = path_with_sbin(&current) {
+        // SAFETY: called once at startup, before any threads are spawned.
+        unsafe { std::env::set_var("PATH", updated) };
+    }
+}
+
 /// Build identity of a cached image-delivery artifact: inode, size, and mtime.
 ///
 /// The content-addressed cache path names the IMAGE the artifact was built
@@ -1134,6 +1189,84 @@ mod image_disk_identity_tests {
         assert!(
             format!("{err:#}").contains("image disk build changed"),
             "error must carry the snapshot-load-failure marker: {err:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sbin_path_tests {
+    use super::{path_with_sbin, SBIN_DIRS};
+    use std::path::Path;
+
+    /// The tools fcvm invokes by bare name that live only in the sbin dirs.
+    ///
+    /// RED BEFORE THE FIX: on a fresh box, `make setup-fcvm` as the documented
+    /// unprivileged user died at
+    ///   `setting up rootfs: getting partition info: No such file or directory`
+    /// because `Command::new("sfdisk")` cannot find `/usr/sbin/sfdisk` when the
+    /// login PATH omits the sbin directories. sudo hid it: `secure_path` lists
+    /// them, so every privileged call site resolved.
+    #[test]
+    fn sbin_tools_resolve_under_the_repaired_path() {
+        let bare = "/usr/local/bin:/usr/bin:/bin";
+        let repaired = path_with_sbin(bare).expect("sbin dirs exist on this host");
+
+        for tool in ["sfdisk", "resize2fs", "e2fsck", "dumpe2fs", "losetup"] {
+            let installed = SBIN_DIRS
+                .iter()
+                .map(|d| Path::new(d).join(tool))
+                .find(|p| p.exists());
+            let Some(installed) = installed else {
+                continue; // not installed here; nothing to say about lookup
+            };
+            assert!(
+                !std::env::split_paths(bare).any(|d| d.join(tool).exists()),
+                "{tool} is already reachable from {bare}, so this test proves \
+                 nothing — it would pass without the fix"
+            );
+            assert!(
+                std::env::split_paths(&repaired).any(|d| d.join(tool).exists()),
+                "{tool} is installed at {} but is still unreachable from the \
+                 repaired PATH {repaired}",
+                installed.display()
+            );
+        }
+    }
+
+    /// Repairing an already-correct PATH must be a no-op, not a duplication.
+    #[test]
+    fn a_path_that_already_has_sbin_is_left_alone() {
+        let full = "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        assert_eq!(
+            path_with_sbin(full),
+            None,
+            "an already-complete PATH must not be rewritten"
+        );
+    }
+
+    /// A directory that does not exist must never be appended.
+    #[test]
+    fn only_existing_directories_are_added() {
+        let repaired = path_with_sbin("/usr/bin").unwrap_or_default();
+        for dir in std::env::split_paths(&repaired) {
+            assert!(
+                dir.as_os_str().is_empty() || dir.is_dir(),
+                "{} was added to PATH but is not a directory",
+                dir.display()
+            );
+        }
+    }
+
+    /// An empty inherited PATH must not produce a leading empty element.
+    ///
+    /// An empty element in PATH means "the current directory", so a stray
+    /// leading colon turns every bare-name lookup into a cwd lookup first.
+    #[test]
+    fn an_empty_inherited_path_does_not_gain_a_cwd_element() {
+        let repaired = path_with_sbin("").expect("sbin dirs exist on this host");
+        assert!(
+            !repaired.starts_with(':') && !repaired.contains("::") && !repaired.ends_with(':'),
+            "repaired PATH has an empty element, which means cwd: {repaired:?}"
         );
     }
 }
