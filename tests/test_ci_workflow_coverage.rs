@@ -91,6 +91,109 @@ fn ci_runs_on_pull_requests_regardless_of_base_branch() {
 /// makes Summary *wait*, and with `if: always()` Summary then reports its own
 /// result regardless of theirs. `summary_fails_when_a_gating_job_fails` below
 /// covers the second half.
+/// Skipping draft PRs is only safe if marking one ready re-triggers CI.
+///
+/// `pull_request` defaults to opened, synchronize, reopened. `ready_for_review`
+/// is NOT in that set, so a workflow that skips drafts without adding it leaves
+/// a PR that was drafted and then marked ready sitting with no checks, forever,
+/// and GitHub renders that as nothing failing. It is the same green-by-absence
+/// hole this file already pins for `branches:` and `paths-ignore:`: a check set
+/// that cannot fail because it never ran.
+#[test]
+fn skipping_drafts_requires_ready_for_review() {
+    let ci = parse_workflow("ci.yml");
+    let text = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml must be readable");
+
+    // Does anything in this workflow branch on the draft flag?
+    let skips_drafts = text.contains("pull_request.draft");
+    if !skips_drafts {
+        return;
+    }
+
+    let pull_request = triggers(&ci)
+        .get("pull_request")
+        .expect("ci.yml has no `pull_request:` trigger");
+    let types = pull_request
+        .get("types")
+        .and_then(Value::as_sequence)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    assert!(
+        types.iter().any(|t| t == "ready_for_review"),
+        "ci.yml skips draft PRs but its `pull_request` types are {types:?}. Without \
+         `ready_for_review`, marking a draft ready fires no event, so the PR keeps \
+         zero checks and reads as green. Add it, or stop skipping drafts."
+    );
+
+    // The default types are implicit only when `types:` is absent. Once it is
+    // present, every needed event must be listed or it is silently dropped.
+    for needed in ["opened", "synchronize", "reopened"] {
+        assert!(
+            types.iter().any(|t| t == needed),
+            "ci.yml pins `pull_request` types to {types:?}, which drops `{needed}`. \
+             Listing types replaces the default set rather than extending it, so a \
+             {needed} event would now run nothing."
+        );
+    }
+}
+
+/// Excluding a path from the expensive matrix must ROUTE it, not silence it.
+///
+/// bench/** no longer sets `code`, because the self-hosted matrix does not
+/// exercise the benchmark harness. That is only safe while some job still runs
+/// for a bench-only PR. Otherwise such a PR gets Summary and actionlint alone,
+/// its four test files never execute, and the result reads as green because
+/// nothing that could fail was scheduled. That is the same hole this file pins
+/// for `branches:` and `paths-ignore:`.
+///
+/// Measured when this was written: `grep -c "bench/" ci.yml` was 0 while
+/// bench/chromium held 262 passing tests, including the MakefileBenchGraph
+/// structural pin AGENTS.md relies on.
+#[test]
+fn a_path_excluded_from_the_matrix_still_gets_a_check() {
+    let ci = parse_workflow("ci.yml");
+    let text = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml must be readable");
+
+    // Only binding once bench is classified separately from code.
+    if !text.contains("bench=true") {
+        return;
+    }
+
+    let jobs = ci.get("jobs").expect("ci.yml has no jobs");
+    let bench_job = jobs.get("bench-tests").expect(
+        "ci.yml classifies bench/** out of `code` but has no `bench-tests` job, so a \
+                 bench-only PR would run nothing that can fail",
+    );
+
+    let condition = bench_job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`bench-tests` has no `if:`; it must run exactly when bench changed");
+    assert!(
+        condition.contains("changes.outputs.bench"),
+        "`bench-tests` does not gate on `changes.outputs.bench` ({condition:?}), so it either \
+         never runs or always runs; neither routes a bench-only PR to the check that can fail"
+    );
+
+    let summary_needs = jobs
+        .get("summary")
+        .and_then(|s| s.get("needs"))
+        .and_then(Value::as_sequence)
+        .map(|l| l.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        summary_needs.contains(&"bench-tests"),
+        "`summary` does not depend on `bench-tests` (needs = {summary_needs:?}), so a failing \
+         bench suite would not fail the run's required check and would be advisory only"
+    );
+}
+
 #[test]
 fn gating_jobs_live_in_the_pull_request_workflow() {
     let ci = parse_workflow("ci.yml");

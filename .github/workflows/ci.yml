@@ -63,6 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.detect.outputs.code }}
+      bench: ${{ steps.detect.outputs.bench }}
     steps:
       - name: Detect whether any non-doc path changed
         id: detect
@@ -87,15 +88,41 @@ jobs:
             echo "no changed files reported: running the full matrix"
             exit 0
           fi
+          # bench/** is classified SEPARATELY, not lumped into code. The
+          # self-hosted matrix does not exercise the benchmark harness at all,
+          # so a bench-only PR was paying for the full matrix and getting no
+          # check of the thing it changed. It now runs bench-tests instead,
+          # which is the check that can actually fail for it. Skipping without
+          # routing would be the green-by-absence hole this file already
+          # documents twice.
           code=false
+          bench=false
           while IFS= read -r f; do
             case "$f" in
               scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*|docs/*|*.md) ;;
+              bench/*) bench=true; echo "bench path: $f" ;;
               *) code=true; echo "code path: $f" ;;
             esac
           done <<< "$files"
           echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "code_changed=$code"
+          echo "bench=$bench" >> "$GITHUB_OUTPUT"
+          echo "code_changed=$code bench_changed=$bench"
+
+  # The benchmark harness has four test files and, until now, CI ran none of
+  # them: `grep -c bench/ ci.yml` was 0 while bench/chromium/test_reqbench.py,
+  # test_fixture_isolation.py, test_faultbench.py and test_reqscale.py sat
+  # unexecuted, including the MakefileBenchGraph structural pin that AGENTS.md
+  # says protects the bench dependency graph. Pure python, no KVM, no runner.
+  bench-tests:
+    name: Bench Harness Tests
+    needs: [changes]
+    if: ${{ needs.changes.outputs.bench == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the bench harness test suite
+        run: |
+          python3 -m unittest discover -s bench/chromium -p 'test_*.py' -v
 
   # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
   # gates it: a PR that changes only `.github/workflows/claude*.yml` skips the
@@ -950,7 +977,7 @@ jobs:
   # Final summary job - runs after all test jobs
   summary:
     name: Summary
-    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, host, host-root, container]
+    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:
