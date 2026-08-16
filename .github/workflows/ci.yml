@@ -98,9 +98,23 @@ jobs:
           code=false
           bench=false
           while IFS= read -r f; do
+            # `bench/*` MUST precede the docs arm. A shell `case` glob matches
+            # `/`, so `*.md` swallows bench/chromium/README.md and that PR
+            # reports code=false bench=false: zero gating jobs, clean Summary.
+            # Meanwhile bench/chromium/test_reqbench.py carries lints that read
+            # exactly those files (the Clopper-Pearson bound lint on REVIEW.md,
+            # the JPEG figure and cited-path lints on AGENTS.md, the healthcheck
+            # lint on README.md), so the one class of change those lints exist
+            # to catch would be the one class that runs nothing.
+            #
+            # The `*.md` in `paths-ignore:` at the top of this file is NOT the
+            # same pattern: GitHub's filter globs stop at a slash, so there it
+            # means root-level markdown only. Identical spelling, different
+            # matcher — which is why this was easy to miss.
             case "$f" in
-              scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*|docs/*|*.md) ;;
+              scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*) ;;
               bench/*) bench=true; echo "bench path: $f" ;;
+              docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
           done <<< "$files"

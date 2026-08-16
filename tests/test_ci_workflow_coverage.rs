@@ -1126,3 +1126,116 @@ fn hygiene_script_refuses_a_home_that_is_not_the_users() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Run ci.yml's own `case "$f" in … esac` against a path and report how it
+/// classified it.
+///
+/// This lifts the SHIPPED globs out of the workflow rather than restating them,
+/// because the defect this guards is an ordering bug between two arms that are
+/// individually correct. A restatement would have the same ordering as whatever
+/// the test author believed, and would pass.
+fn classify_changed_path(path: &str) -> (bool, bool) {
+    let ci = parse_workflow("ci.yml");
+    let run = workflow_job(&ci, "changes")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`changes` job has no `steps:`")
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("case \"$f\" in"))
+        .expect("`changes` job no longer classifies paths with a `case` — update this test")
+        .to_string();
+
+    let start = run.find("case \"$f\" in").expect("case start");
+    let end = run[start..].find("esac").expect("unterminated case") + start + "esac".len();
+    let case_block = &run[start..end];
+
+    // The arms echo their own diagnostics ("bench path: …"), which land on
+    // stdout first, so key the result off a marker rather than off the leading
+    // two words. Reading the first two words instead makes `bench path: f`
+    // parse as code=`bench`, bench=`path:` — both false — which reports every
+    // correctly-classified bench source file as a defect.
+    let program = format!(
+        "code=false\nbench=false\nf={path:?}\n{case_block}\necho \"CLASSIFIED $code $bench\"\n"
+    );
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&program)
+        .output()
+        .expect("run the extracted classifier");
+    assert!(
+        out.status.success(),
+        "extracted classifier failed for {path}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let verdict = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("CLASSIFIED "))
+        .unwrap_or_else(|| panic!("classifier printed no verdict for {path}: {stdout}"));
+    let mut fields = verdict.split_whitespace();
+    let code = fields.next() == Some("true");
+    let bench = fields.next() == Some("true");
+    (code, bench)
+}
+
+/// A markdown file under `bench/` must route to `bench-tests`, not vanish.
+///
+/// `case` globs match `/`, so `*.md` in the docs arm swallows
+/// `bench/chromium/README.md` before the `bench/*` arm is ever considered. That
+/// PR then reports `code=false bench=false`: every gating job skips and Summary
+/// renders clean, while `bench/chromium/test_reqbench.py` carries lints that
+/// read exactly those files —
+/// `test_every_binomial_bound_matches_reqanalyze_clopper_pearson` (REVIEW.md),
+/// `test_agents_md_jpeg_figures_match_the_record_run` (AGENTS.md),
+/// `test_every_path_cited_in_a_doc_table_is_committed` (AGENTS.md, REVIEW.md)
+/// and `test_the_readme_healthcheck_verification_actually_fails` (README.md).
+///
+/// So the one class of change those lints exist to catch is the one class that
+/// runs nothing. That is the green-by-absence hole this file documents twice.
+#[test]
+fn a_bench_markdown_change_routes_to_the_bench_tests() {
+    for path in [
+        "bench/chromium/README.md",
+        "bench/chromium/AGENTS.md",
+        "bench/chromium/REVIEW.md",
+        "bench/chromium/report/README.md",
+    ] {
+        let (code, bench) = classify_changed_path(path);
+        assert!(
+            bench,
+            "`{path}` classified as code={code} bench={bench}: it matches the docs arm before \
+             `bench/*`, so a PR touching only it gets zero gating jobs while bench lints that \
+             read it exist"
+        );
+    }
+}
+
+/// The arms that surround `bench/*` must keep behaving as they did.
+///
+/// Reordering a `case` is exactly the kind of fix that trades one hole for
+/// another, so pin both directions: bench code still routes to bench, ordinary
+/// docs still skip everything, and source still runs the matrix.
+#[test]
+fn path_classification_holds_on_both_sides_of_the_bench_arm() {
+    for (path, want_code, want_bench) in [
+        ("bench/chromium/reqbench.py", false, true),
+        ("bench/chromium/test_reqbench.py", false, true),
+        ("README.md", false, false),
+        ("AGENTS.md", false, false),
+        ("docs/design.md", false, false),
+        (".claude/skills/pr-workflow/SKILL.md", false, false),
+        ("scripts/claude-assistant/index.ts", false, false),
+        ("src/main.rs", true, false),
+        ("scripts/scan-test-log.sh", true, false),
+        (".github/workflows/ci.yml", true, false),
+    ] {
+        let (code, bench) = classify_changed_path(path);
+        assert_eq!(
+            (code, bench),
+            (want_code, want_bench),
+            "`{path}` classified as code={code} bench={bench}, expected code={want_code} \
+             bench={want_bench}"
+        );
+    }
+}
