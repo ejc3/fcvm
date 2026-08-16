@@ -52,12 +52,44 @@
    "stalls_observed": 0
   },
   "page": "3302 bytes: a synchronous script building a 1200x6 table with a forced layout every 100 rows, then canvas gradients/arcs/text and a pixel readback, all before the load event",
-  "bearing_on_the_report": "The report attributes a '120-second navigate-stall class Chromium does not show' to CONCURRENCY (N>=8; 'success 19/32 at N=32' = 41% failure). This measures a 36% stall rate at N=1. Those rates are close enough to be the same underlying intermittent bug rather than a load effect. It does not PROVE the concurrency attribution wrong -- which page those runs rendered is not recorded -- but a stall that occurs 36% of the time at N=1 is not explained by concurrency."
+  "bearing_on_the_report": "The report attributes a '120-second navigate-stall class Chromium does not show' to CONCURRENCY (N>=8; 'success 19/32 at N=32' = 41% failure). This measures a 36% stall rate at N=1. Those rates are close enough to be the same underlying intermittent bug rather than a load effect. It does not PROVE the concurrency attribution wrong -- which page those runs rendered is not recorded -- but a stall that occurs 36% of the time at N=1 is not explained by concurrency.",
+  "upgrade_did_not_fix_it": {
+   "2.50.6": {
+    "stalled": 4,
+    "attempts": 11,
+    "rate": "36%",
+    "wilson95": "[15%, 65%]"
+   },
+   "2.52.5": {
+    "stalled": 6,
+    "attempts": 10,
+    "rate": "60%",
+    "wilson95": "[31%, 83%]"
+   },
+   "fisher_exact_two_sided_p": 0.395,
+   "reading": "Indistinguishable at this sample size: the upgrade did NOT fix the stall, and the apparent worsening is not significant. Pooled across both versions the stall rate is 10/21 = 48%. So this is a live defect in the CURRENT upstream stable WebKitGTK (2.52.5), not an artifact of Debian bookworm shipping an old series.",
+   "completion_time_when_ok_s": 1.6
+  }
  },
  "chromium_host_reference": {
   "p50_ms": 145.6,
   "n": 200,
   "source": "results/hostcdp-509059c1700d47bb89e9854ddd54bb73/hostcdp.jsonl",
   "format": "jpeg q80"
+ },
+ "version_audit": {
+  "chromium": {
+   "installed": "151.0.7922.137",
+   "bookworm_candidate": "151.0.7922.137-1~deb12u1",
+   "trixie_candidate": "151.0.7922.137-1~deb13u1",
+   "verdict": "already the latest packaged build; identical in both suites, so no upgrade available or needed"
+  },
+  "webkitgtk": {
+   "was": "2.50.6-1~deb12u2 (Debian bookworm)",
+   "now": "2.52.5-1~deb13u1 (Debian trixie)",
+   "upstream_stable": "2.52.5, released 2026-07-09; the 2.52 series opened 2026-03-18",
+   "verdict": "bookworm pinned one full stable series behind; base image moved to trixie"
+  },
+  "caveat": "The Chromium image stays on bookworm because its Chromium version is identical and moving it would invalidate every golden and seal measured on 2026-08-16. Engine comparisons therefore span two base images (different libc and fonts). State that wherever the two engines are compared."
  }
 }

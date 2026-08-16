@@ -6,7 +6,14 @@
 # engine is WebKitGTK driven over the W3C WebDriver classic protocol instead of
 # CDP, because WebKitGTK has no CDP endpoint.
 #
-# Engine stack (Debian bookworm arm64, probed 2026-08-14):
+# Engine stack (Debian TRIXIE arm64, moved from bookworm 2026-08-16):
+#
+# bookworm pins webkit2gtk-driver at 2.50.6, one full stable series behind
+# upstream: WebKitGTK's current stable is 2.52.5 (2026-07-09), and the 2.52
+# series opened 2026-03-18. trixie carries 2.52.5-1~deb13u1, so the base moved
+# rather than the package being pinned. Chromium is 151.0.7922.137 in BOTH
+# suites, so the Chromium image stays on bookworm and the engine comparison
+# now spans two base images -- state that caveat wherever the two are compared.
 #   webkit2gtk-driver  — /usr/bin/WebKitWebDriver (WebDriver HTTP on :9515) and
 #                        the MiniBrowser binary it launches with --automation.
 #                        WPE (the headless-native flavor) has no current arm64
@@ -34,7 +41,7 @@
 #   podman exec wb python3 /opt/bench/wddrive.py http://127.0.0.1:8000/medium.html \
 #       --host 127.0.0.1:9515 --session-file /run/bench-session-id --out-prefix /tmp/medium
 
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:trixie-slim
 
 # The trailing rm also drops /var/cache/apt/archives/partial (_apt-owned, mode
 # 0700): rootless fcvm packs the image store with an unprivileged mkfs.ext4 -d
@@ -49,7 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Fail the BUILD, not the first boot, if the engine binaries moved. MiniBrowser
 # lives under the versioned libexec dir (/usr/lib/*/webkit2gtk-4.1/MiniBrowser
-# on bookworm); resolve it once into a stable path the entry script and the
+# on bookworm and trixie alike); resolve it once into a stable path the entry script and the
 # WebDriver capabilities can name. GTK opens the display before parsing argv,
 # so even --version needs a display — a raw Xvfb (exactly how entry-webkit.sh
 # runs it; xvfb-run would drag in xauth) makes this a real "MiniBrowser can
