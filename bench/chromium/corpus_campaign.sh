@@ -42,6 +42,24 @@ URLS="https://example.com/,https://news.ycombinator.com/,https://developers.clou
 
 say() { printf '\n=== %s\n' "$*"; }
 
+# Every phase runs with debug logging: the stage attribution the analysis relies
+# on only exists in fcvm=debug output, and a caller who omitted it would produce
+# a run whose records cannot be audited afterwards. Exported once here rather
+# than repeated per command, so no phase can be left out.
+export RUST_LOG="${RUST_LOG:-fcvm=debug}"
+
+# Pin the binary, and say which one. The seal already refuses a golden recorded
+# under a different runtime bundle, so a rebuild mid-campaign fails the run
+# rather than silently mixing binaries WITHIN one. It does not bind comparisons
+# ACROSS runs, and that is not hypothetical: on 2026-08-16 a vCPU curve was
+# published whose 2 vCPU points came from fcvm 3976d0ba and whose 4 and 8 vCPU
+# points came from 3f85bd26, because the tree was rebuilt between the two
+# sweeps. Recording the hash up front makes the boundary visible in the log as
+# well as in each run's cell.
+FCVM_BIN="${FCVM_BIN:-$REPO/target/release/fcvm}"
+[ -x "$FCVM_BIN" ] || { echo "BLOCKED: no fcvm binary at $FCVM_BIN; run make build" >&2; exit 2; }
+FCVM_SHA=$(sha256sum "$FCVM_BIN" | cut -d" " -f1)
+
 # --- preflight -------------------------------------------------------------
 # The run driver enforces its own quiet gate and would void the record anyway;
 # failing here costs seconds instead of the golden's minutes.
@@ -146,6 +164,7 @@ done
 [ "$answer" = "10.0.2.2" ] || { echo "BLOCKED: wildcard DNS answered '$answer', expected 10.0.2.2" >&2; exit 3; }
 [ "$code" = "200" ] || { echo "BLOCKED: HTTPS replay returned '$code' for blog.cloudflare.com" >&2; exit 3; }
 say "replay server up: DNS -> 10.0.2.2, HTTPS 200"
+say "fcvm binary $FCVM_BIN sha256=$FCVM_SHA (recorded per run in cell.fcvm_sha256)"
 
 # --- golden ----------------------------------------------------------------
 # PHASE=run reuses the installed golden. The working-set sidecar beside the
