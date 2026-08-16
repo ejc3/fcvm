@@ -38,14 +38,26 @@ pass=$(count '(^|[^A-Z])PASS \[')
 # A hard FAIL must exclude retry lines: "TRY 1 FAIL [" also ends in " FAIL [",
 # so counting it here would double-report every retry as a hard failure.
 fail=$(grep -aE '(^|[^A-Z])FAIL \[' "$clean" | grep -acvE 'TRY [0-9]+ FAIL'; true)
-try_fail=$(count 'TRY [0-9]+ FAIL \[')
+# A retry counts however its first attempt died. nextest reports a slow-timeout
+# kill as TMT and a terminating run as TRMNTG, so a pattern matching only FAIL is
+# blind to a 900s hang that passes in 7s on retry. Five of those occurred in one
+# 6-day window, every one inside a job that reported green.
+try_fail=$(count 'TRY [0-9]+ (FAIL|TMT|TRMNTG|SIGSEGV|SIGABRT|ABORT|LEAK) \[')
 timeout=$(count '(^|[^A-Z])TIMEOUT \[')
 leak=$(count '(^|[^A-Z])LEAK \[')
 # The per-test "FLAKY [" verdict and the summary's "(N flaky)" describe the SAME
 # retries; count only the per-test verdict so a flake is not reported twice.
+# Dead in practice: with retries configured, nextest prints "TRY n <status>"
+# lines and no per-test "FLAKY [" verdict, so this reads 0 in every real log.
+# Kept only because a differently-configured run can emit it; never rely on it
+# alone, which is why try_fail above carries the weight.
 flaky=$(count '(^|[^A-Z])FLAKY \[')
 
-summary=$(grep -aE 'Summary \[.*tests run:' "$clean" | tail -1 | sed 's/^[[:space:]]*//')
+# EVERY summary, not the last one. A SnapshotEnabled job runs the suite twice
+# and emits two; in 7 of 19 multi-summary jobs the flaky summary is the FIRST,
+# and `tail -1` silently discarded it.
+summaries=$(grep -aE 'Summary \[.*tests run:' "$clean" | sed 's/^[[:space:]]*//')
+summary=$(printf '%s\n' "$summaries" | tail -1)
 
 echo "summary: ${summary:-<none found>}"
 echo "pass: $pass"
@@ -62,8 +74,14 @@ echo "flaky: $flaky"
 # gone, and this then reported CLEAN on a run the summary itself called failed —
 #   "Summary [10.0s] 1 tests run: 0 passed, 1 failed"  ->  verdict: CLEAN, exit 0
 # which is the exact defect this scanner exists to catch.
-summary_failed=$(sed -nE 's/.*tests? run:.*[^0-9]([0-9]+) failed.*/\1/p' <<<"$summary" | head -1)
-summary_flaky=$(sed -nE 's/.*\(([0-9]+) flaky\).*/\1/p' <<<"$summary" | head -1)
+# Summed across ALL summaries. `flaky` is never alone in the parens: nextest
+# writes "(1 slow, 1 flaky)", so a pattern anchored on `\(N flaky\)` matched
+# nothing in production and this gate never once fired.
+sum_field() {
+  printf '%s\n' "$summaries" | sed -nE "$1" | awk '{t+=$1} END {print t+0}'
+}
+summary_failed=$(sum_field 's/.*tests? run:.*[^0-9]([0-9]+) failed.*/\1/p')
+summary_flaky=$(sum_field 's/.*[( ]([0-9]+) flaky[,)].*/\1/p')
 summary_passed=$(sed -nE 's/.*tests? run:[^0-9]*([0-9]+) passed.*/\1/p' <<<"$summary" | head -1)
 summary_total=$(sed -nE 's/.*\] ([0-9]+) tests? run:.*/\1/p' <<<"$summary" | head -1)
 

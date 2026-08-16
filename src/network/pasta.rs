@@ -150,6 +150,65 @@ fn describe_silent_probe(code: Option<i32>, stderr: &str) -> String {
     }
 }
 
+/// Run a bounded probe command, killing its whole process GROUP on expiry.
+///
+/// `kill_on_drop` reaps only the immediate child. The probe is
+/// `nsenter -> env -> timeout -> bash`, so dropping the future kills the
+/// leader and leaves `bash` with nobody to deliver the KILL that `timeout -k`
+/// promised. Each expiry could then strand a process holding a reference to
+/// the VM's network namespace, once per retry.
+///
+/// The child leads its own process group (`process_group(0)`, so pgid == pid),
+/// which makes the whole subtree addressable with one `killpg`.
+async fn run_probe_bounded(
+    mut command: Command,
+    budget: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    command.process_group(0);
+    // Both streams MUST be piped here, exactly as `Command::output()` does it.
+    // Spawning directly does not imply it: tokio's default is INHERIT, so a
+    // caller that piped only stderr (the neighbour query does) would have its
+    // stdout go to the parent's and be captured as empty. That reads as "no
+    // neighbour entry" for every probe, which is indistinguishable from the
+    // failure this whole path is diagnosing.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawning {what}"))?;
+    let pgid = child.id().map(|id| id as i32);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let wait = async {
+        let status = child.wait().await?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Some(mut handle) = stdout {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut handle, &mut out).await;
+        }
+        if let Some(mut handle) = stderr {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut handle, &mut err).await;
+        }
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    };
+    match tokio::time::timeout(budget, wait).await {
+        Ok(result) => result.with_context(|| format!("running {what}")),
+        Err(_elapsed) => {
+            // SAFETY: pgid came from this child, which leads its own group.
+            // Killing a group we created cannot reach an unrelated process:
+            // the pid is not reused while we hold the un-reaped child.
+            if let Some(pgid) = pgid {
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+            anyhow::bail!("{what} exceeded pasta's readiness deadline")
+        }
+    }
+}
+
 /// Production [`GuestProbe`]: runs the probes inside the VM's network namespace
 /// via the holder PID.
 struct NsenterGuestProbe {
@@ -185,16 +244,19 @@ impl GuestProbe for NsenterGuestProbe {
             "env",
             "LC_ALL=C",
             "timeout",
+            // SIGKILL shortly after the TERM. `kill_on_drop` reaps only the
+            // direct child, so an abandoned attempt's `bash` is reachable only
+            // through this timeout; if TERM alone did not land, one process per
+            // retry would sit in the namespace holding a socket.
+            "-k",
+            "0.1",
             &format!("{probe_timeout:.2}"),
             "bash",
             "-c",
             &script,
         ]);
         command.stdout(Stdio::null()).stderr(Stdio::piped());
-        let output = tokio::time::timeout(budget, command.output())
-            .await
-            .context("TCP probe exceeded pasta's readiness deadline")?
-            .context("running the TCP probe via nsenter in namespace")?;
+        let output = run_probe_bounded(command, budget, "the TCP probe").await?;
 
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         // Exit 0: connected (SYN-ACK). "Connection refused": the guest's kernel
@@ -223,10 +285,7 @@ impl GuestProbe for NsenterGuestProbe {
         let mut command =
             self.command(&["ip", "neigh", "show", "to", GUEST_IP, "dev", BRIDGE_DEVICE]);
         command.stderr(Stdio::piped());
-        let output = tokio::time::timeout(budget, command.output())
-            .await
-            .context("neighbor query exceeded pasta's readiness deadline")?
-            .context("reading guest neighbour entry via nsenter in namespace")?;
+        let output = run_probe_bounded(command, budget, "the neighbour query").await?;
         if !output.status.success() {
             anyhow::bail!(
                 "failed to inspect ARP entry for guest {} on {}: {}",
@@ -241,6 +300,24 @@ impl GuestProbe for NsenterGuestProbe {
 
 /// How long the readiness loop waits between probe rounds.
 const GUEST_ANSWER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Cap on ONE probe attempt, so a single stuck attempt cannot consume the whole
+/// readiness budget.
+///
+/// Run 31906708922 failed with `neighbour: ""; probe: (silence)` after the full
+/// 5s, and the artifacts show that reading as a lie: fc-agent had finished the
+/// restore 5s earlier with `gate=open`, the namespace held a TIME-WAIT socket
+/// from `10.0.2.1 -> 10.0.2.100:80` (the probe's own connect, so the guest DID
+/// answer), the neighbour entry was REACHABLE, and the host was 95% idle with a
+/// run queue of 1. What actually happened is that the loop emitted ZERO
+/// per-round debug lines in those 5s: one attempt was handed `remaining` and
+/// never came back, so no round ever finished, `last_neighbor` was never
+/// assigned, and the empty strings got reported as guest silence.
+///
+/// An attempt that outlives this is abandoned and RETRIED. The loop must not
+/// depend on a subprocess honouring its own budget -- the probe already asks
+/// `timeout` to bound `bash`, and that still did not bound the call.
+const GUEST_PROBE_ATTEMPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Wait until the guest itself answers, or the deadline expires.
 ///
@@ -270,23 +347,69 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
     // never appeared at L2" from "the guest is at L2 but never answered".
     let mut last_neighbor = String::new();
     let mut last_detail = String::new();
+    let started = std::time::Instant::now();
+    let mut rounds: u32 = 0;
+    // Attempts abandoned for exceeding GUEST_PROBE_ATTEMPT_BUDGET. Reported in
+    // the deadline error: it is the difference between "the guest said nothing"
+    // and "this check never got an answer out of its own subprocess".
+    let mut stalled_attempts: u32 = 0;
+    // Whether the guest's TCP probe answered on the LAST completed attempt. An
+    // answered probe leaves `detail` empty, and rendering "empty" as silence is
+    // what made run 31906708922 read as a dead guest when the guest had in fact
+    // answered (its own TIME-WAIT socket was in the namespace dump). Carry the
+    // state rather than inferring it from an absence.
+    let mut last_answered = false;
+    // Whether `last_neighbor` came from a query that COMPLETED this round. A
+    // reading kept across a stalled query is useful context and must not be
+    // presented as current state: a resolved entry from an earlier round would
+    // otherwise steer the error into the "resolved to a MAC but never answered"
+    // arm while TCP had in fact answered, making one message contradict itself.
+    let mut last_neighbor_fresh = false;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+            return Err(guest_unanswered_error(
+                &last_neighbor,
+                last_neighbor_fresh,
+                &last_detail,
+                last_answered,
+                rounds,
+                stalled_attempts,
+            ));
         }
-        // A probe that outlives the whole deadline is reported as the guest
-        // never answering — with the neighbour context — not as a bare probe
-        // timeout: the informative error must not depend on where inside the
-        // loop the budget happened to run out.
-        let answer = match probe.answers_tcp(probe_port, remaining).await {
-            Ok(answer) => answer,
-            Err(error) if error.to_string().contains("readiness deadline") => {
-                return Err(guest_unanswered_error(&last_neighbor, &last_detail));
-            }
-            Err(error) => return Err(error),
-        };
+        // Counted here, not at the top of the loop: a round that finds the
+        // deadline already spent probed nothing, and a reported count that
+        // includes it overstates the work by one. The number is a diagnostic,
+        // so it has to be the number of attempts actually made.
+        rounds += 1;
+        // Each attempt is bounded separately from the deadline, so one stuck
+        // attempt costs a round instead of the whole budget.
+        let attempt = remaining.min(GUEST_PROBE_ATTEMPT_BUDGET);
+        let answer =
+            match tokio::time::timeout(attempt, probe.answers_tcp(probe_port, attempt)).await {
+                Ok(Ok(answer)) => answer,
+                // The probe ran out of ITS budget, or never returned within ours.
+                // Both mean this round failed, not that the guest is silent, so
+                // retry and carry the distinction into the deadline error. A
+                // stalled check is never again reported as an unreachable guest.
+                Ok(Err(error)) if error.to_string().contains("readiness deadline") => {
+                    stalled_attempts += 1;
+                    TcpAnswer {
+                        answered: false,
+                        detail: format!("TCP probe attempt exceeded its {attempt:?} budget"),
+                    }
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_elapsed) => {
+                    stalled_attempts += 1;
+                    TcpAnswer {
+                        answered: false,
+                        detail: format!("TCP probe attempt did not return within {attempt:?}"),
+                    }
+                }
+            };
+        last_answered = answer.answered;
         last_detail = answer.detail;
         if !answer.answered {
             debug!(
@@ -299,21 +422,56 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+            return Err(guest_unanswered_error(
+                &last_neighbor,
+                last_neighbor_fresh,
+                &last_detail,
+                last_answered,
+                rounds,
+                stalled_attempts,
+            ));
         }
-        last_neighbor = match probe.neighbor(remaining).await {
-            Ok(neighbor) => neighbor,
-            Err(error) if error.to_string().contains("readiness deadline") => {
-                return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+        let attempt = remaining.min(GUEST_PROBE_ATTEMPT_BUDGET);
+        // A stalled query keeps the previous reading for the ERROR MESSAGE only:
+        // an empty string means "no entry", and a query that never returned has
+        // not learned that. It must not count as evidence of readiness. Both
+        // halves have to hold in the SAME round, or a neighbour seen REACHABLE
+        // in round 1 could pair with round 2's TCP answer and declare a guest
+        // ready whose entry has since gone FAILED, which is precisely the
+        // stale-evidence failure this function exists to prevent.
+        let neighbor_is_fresh;
+        match tokio::time::timeout(attempt, probe.neighbor(attempt)).await {
+            Ok(Ok(neighbor)) => {
+                last_neighbor = neighbor;
+                neighbor_is_fresh = true;
+                last_neighbor_fresh = true;
             }
-            Err(error) => return Err(error),
-        };
-        let resolved = neighbor_is_resolved(&last_neighbor);
+            Ok(Err(error)) if error.to_string().contains("readiness deadline") => {
+                stalled_attempts += 1;
+                neighbor_is_fresh = false;
+                last_neighbor_fresh = false;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_elapsed) => {
+                stalled_attempts += 1;
+                neighbor_is_fresh = false;
+                last_neighbor_fresh = false;
+            }
+        }
+        let resolved = neighbor_is_fresh && neighbor_is_resolved(&last_neighbor);
 
         if answer.answered && resolved {
+            // Report HOW LONG readiness took, on success as well as failure.
+            // Without this number a deadline miss is unattributable: "slow" and
+            // "broken" look identical from one timed-out run, and the difference
+            // is whether the successful runs crowd the deadline or sit two
+            // orders of magnitude below it (they sit at ~84ms).
             info!(
                 guest_ip = GUEST_IP,
                 probe_port,
+                readiness_ms = started.elapsed().as_secs_f64() * 1000.0,
+                rounds,
+                stalled_attempts,
                 neighbor = %last_neighbor.trim(),
                 "guest answered and its MAC is resolved"
             );
@@ -322,7 +480,14 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(guest_unanswered_error(&last_neighbor, &last_detail));
+            return Err(guest_unanswered_error(
+                &last_neighbor,
+                last_neighbor_fresh,
+                &last_detail,
+                last_answered,
+                rounds,
+                stalled_attempts,
+            ));
         }
         debug!(
             guest_ip = GUEST_IP,
@@ -336,34 +501,92 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
 }
 
 /// Deadline error for [`wait_for_guest_to_answer`], naming which half was missing.
-fn guest_unanswered_error(neighbor: &str, detail: &str) -> anyhow::Error {
+/// The host's load at the instant a readiness probe gave up.
+///
+/// A readiness timeout is unattributable without this. "The box was busy" is the
+/// reflex explanation for any deadline miss, and it is worth nothing unless the
+/// number sits beside the failure. On the run this was added for, the host was
+/// 95% idle with a run queue of 1. `/proc/loadavg`'s fourth field is
+/// `runnable/total`, which separates "many tasks exist" from "many want CPU".
+fn host_load_snapshot() -> String {
+    match std::fs::read_to_string("/proc/loadavg") {
+        Ok(raw) => {
+            let fields: Vec<&str> = raw.split_whitespace().collect();
+            match fields.as_slice() {
+                [one, five, fifteen, runnable, ..] => {
+                    format!("load {one}/{five}/{fifteen}, runnable {runnable}")
+                }
+                _ => format!("load (unparsable: {})", raw.trim()),
+            }
+        }
+        Err(error) => format!("load (unavailable: {error})"),
+    }
+}
+
+fn guest_unanswered_error(
+    neighbor: &str,
+    neighbor_fresh: bool,
+    detail: &str,
+    answered: bool,
+    rounds: u32,
+    stalled_attempts: u32,
+) -> anyhow::Error {
     let neighbor = neighbor.trim();
-    let detail = if detail.is_empty() {
-        "(silence)"
-    } else {
-        detail
+    // An answered probe leaves `detail` empty, so empty means two opposite
+    // things and must never be rendered as one. Reporting "(silence)" for a
+    // guest that answered is what made run 31906708922 read as a dead guest
+    // while its own TIME-WAIT socket to the prober sat in the namespace dump.
+    let detail = match (answered, detail.is_empty()) {
+        (true, _) => "answered (SYN-ACK or RST)",
+        (false, true) => "(silence)",
+        (false, false) => detail,
     };
-    if neighbor_is_resolved(neighbor) {
+    // Only a reading from THIS round describes the current state. A stale one
+    // is labelled as such rather than silently standing in for a fresh answer.
+    let neighbor_note = if neighbor_fresh {
+        ""
+    } else if neighbor.is_empty() {
+        " (never read: every neighbour query stalled)"
+    } else {
+        " (STALE: this round's query stalled; reading is from an earlier round)"
+    };
+    if neighbor_fresh && neighbor_is_resolved(neighbor) && !answered {
         // The failure this whole path exists to catch: pasta can reach the
         // guest's MAC, so every host-side check passes, but nothing is answering
         // behind it. Report it here rather than letting a client discover it.
         anyhow::anyhow!(
             "guest {} resolved to a MAC but never answered a TCP probe within {:?}: \
              the guest is not reachable even though its neighbour entry is present; \
-             neighbour: {}; probe: {}",
+             neighbour: {}{}; probe: {}; rounds {} ({} stalled); host {}",
             GUEST_IP,
             GUEST_ANSWER_DEADLINE,
             neighbor,
-            detail
+            neighbor_note,
+            detail,
+            rounds,
+            stalled_attempts,
+            host_load_snapshot()
         )
     } else {
         anyhow::anyhow!(
-            "guest {} never appeared at L2 within {:?}: no resolved neighbour entry \
-             and no TCP answer; neighbour: {:?}; probe: {}",
+            "guest {} never appeared at L2 within {:?}: {}; neighbour: {:?}{}; \
+             probe: {}; rounds {} ({} stalled); host {}",
             GUEST_IP,
             GUEST_ANSWER_DEADLINE,
+            if answered {
+                // The guest is alive and talking; only its neighbour entry is
+                // missing. Naming that separately points at ARP or the bridge
+                // rather than at a dead guest.
+                "the guest ANSWERED TCP but its neighbour entry never resolved"
+            } else {
+                "no resolved neighbour entry and no TCP answer"
+            },
             neighbor,
-            detail
+            neighbor_note,
+            detail,
+            rounds,
+            stalled_attempts,
+            host_load_snapshot()
         )
     }
 }
@@ -2126,6 +2349,295 @@ mod tests {
         async fn neighbor(&mut self, _budget: std::time::Duration) -> Result<String> {
             Ok(self.neighbor.clone())
         }
+    }
+
+    /// A probe whose FIRST attempt never returns, and which ignores the budget
+    /// it is handed. That is what the production probe did in run 31906708922,
+    /// where an inner `timeout` failed to bound the call.
+    struct StallingGuest {
+        attempts: u32,
+        stall: std::time::Duration,
+    }
+
+    impl GuestProbe for StallingGuest {
+        async fn answers_tcp(
+            &mut self,
+            _port: u16,
+            _budget: std::time::Duration,
+        ) -> Result<TcpAnswer> {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                tokio::time::sleep(self.stall).await;
+            }
+            Ok(TcpAnswer {
+                answered: true,
+                detail: String::new(),
+            })
+        }
+
+        async fn neighbor(&mut self, _budget: std::time::Duration) -> Result<String> {
+            Ok("10.0.2.100 dev br0 lladdr 02:2c:77:3e:ae:5a REACHABLE".to_string())
+        }
+    }
+
+    /// One stuck attempt must not consume the whole readiness budget.
+    ///
+    /// Without the per-attempt bound the loop awaits the first attempt for the
+    /// entire deadline, so it completes ZERO rounds, never queries the
+    /// neighbour, and returns the deadline error, while the guest was ready the
+    /// whole time. That is the observed failure exactly: empty neighbour,
+    /// "(silence)", and a namespace that simultaneously held a TIME-WAIT socket
+    /// to the guest and a REACHABLE neighbour entry for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_probe_attempt_is_abandoned_and_retried() {
+        let mut probe = StallingGuest {
+            attempts: 0,
+            // Outlives the deadline several times over: the loop cannot pass
+            // this test by waiting the attempt out.
+            stall: GUEST_ANSWER_DEADLINE * 6,
+        };
+        let deadline = tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE;
+
+        let result = wait_for_guest_to_answer(&mut probe, PROBE_PORT, deadline).await;
+
+        assert!(
+            result.is_ok(),
+            "a single stalled attempt must be abandoned and retried, not reported \
+             as the guest never answering: {:?}",
+            result.err()
+        );
+        assert!(
+            probe.attempts >= 2,
+            "the loop must retry after abandoning the stalled attempt, but made \
+             only {} attempt(s)",
+            probe.attempts
+        );
+    }
+
+    /// A guest whose neighbour query answers once and then stalls forever,
+    /// while its TCP probe answers from the second round on.
+    struct StaleNeighborGuest {
+        rounds: u32,
+    }
+
+    impl GuestProbe for StaleNeighborGuest {
+        async fn answers_tcp(
+            &mut self,
+            _port: u16,
+            _budget: std::time::Duration,
+        ) -> Result<TcpAnswer> {
+            self.rounds += 1;
+            // Silent on round 1, answering afterwards: this is what makes the
+            // stale reading the only "resolved" evidence available.
+            Ok(TcpAnswer {
+                answered: self.rounds > 1,
+                detail: String::new(),
+            })
+        }
+
+        async fn neighbor(&mut self, budget: std::time::Duration) -> Result<String> {
+            if self.rounds <= 1 {
+                return Ok("10.0.2.100 dev br0 lladdr 02:2c:77:3e:ae:5a REACHABLE".to_string());
+            }
+            // Never returns within the attempt budget again.
+            tokio::time::sleep(budget * 4).await;
+            Ok(String::new())
+        }
+    }
+
+    /// Both halves must hold in the SAME round.
+    ///
+    /// Keeping the last neighbour reading across a stalled query is right for
+    /// the error message and wrong for the verdict: pairing round 1's REACHABLE
+    /// with round 2's TCP answer would declare ready a guest whose entry may
+    /// since have gone FAILED. That is the stale-evidence failure this function
+    /// was written to prevent, so a stalled query must not satisfy the
+    /// neighbour half.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_neighbor_query_cannot_satisfy_readiness() {
+        let mut probe = StaleNeighborGuest { rounds: 0 };
+        let deadline = tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE;
+
+        let result = wait_for_guest_to_answer(&mut probe, PROBE_PORT, deadline).await;
+
+        let error = result.expect_err(
+            "readiness must not be declared from a neighbour reading taken in an \
+             earlier round when this round's query never returned",
+        );
+        let text = error.to_string();
+
+        // The verdict was right; the DIAGNOSTIC must be too. A stale resolved
+        // entry must not steer the message into "resolved to a MAC but never
+        // answered" while TCP did answer, which would make one error contradict
+        // itself, and must never be presented as the current reading.
+        assert!(
+            text.contains("STALE") || text.contains("never read"),
+            "a neighbour reading kept across a stalled query must be labelled, not \
+             presented as this round's state: {text}"
+        );
+        assert!(
+            !text.contains("never answered a TCP probe"),
+            "TCP answered, so the error must not select the never-answered arm on \
+             the strength of a stale neighbour entry: {text}"
+        );
+    }
+
+    /// The deadline error must never call an answering guest silent.
+    ///
+    /// A probe that answered leaves `detail` empty, so "empty" carries two
+    /// opposite meanings and cannot be rendered as one. Run 31906708922 reported
+    /// `no TCP answer` and `probe: (silence)` for a guest that had demonstrably
+    /// answered: its own TIME-WAIT socket to the prober was in the namespace
+    /// dump and its neighbour entry was REACHABLE. Hours went into looking for a
+    /// dead guest that was never dead.
+    #[tokio::test(start_paused = true)]
+    async fn an_answering_guest_is_never_reported_as_silent() {
+        // Answers TCP every time; its neighbour entry never resolves.
+        let mut probe = ScriptedGuest {
+            answers: [true].into_iter().collect(),
+            last_answer: true,
+            neighbor: "10.0.2.100 dev br0 INCOMPLETE".to_string(),
+            probes: 0,
+        };
+
+        let error = wait_for_guest_to_answer(&mut probe, PROBE_PORT, paused_deadline())
+            .await
+            .expect_err("an unresolved neighbour must still fail readiness");
+        let text = error.to_string();
+
+        assert!(
+            !text.contains("no TCP answer"),
+            "the guest answered TCP, so the error must not claim otherwise: {text}"
+        );
+        assert!(
+            !text.contains("(silence)"),
+            "an answered probe leaves `detail` empty; rendering that as silence \
+             inverts the meaning: {text}"
+        );
+        assert!(
+            text.contains("ANSWERED TCP"),
+            "the error must say which half actually failed, so the reader looks at \
+             ARP and the bridge rather than at the guest: {text}"
+        );
+    }
+
+    /// A bounded probe must capture stdout, not inherit it.
+    ///
+    /// `Command::output()` forces both streams to piped; spawning directly does
+    /// not. The neighbour query pipes only stderr, so when this function
+    /// replaced `output()` its stdout went to the parent and every reading came
+    /// back empty. Four clone and port-forward tests failed in CI within 15s,
+    /// all reporting a neighbour entry that never resolved, because the reading
+    /// was being thrown away rather than missing.
+    #[tokio::test]
+    async fn a_bounded_probe_captures_stdout_even_when_the_caller_piped_only_stderr() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo neighbour-line"]);
+        // Exactly what neighbor() does, and what broke it.
+        command.stderr(Stdio::piped());
+
+        let output = run_probe_bounded(command, std::time::Duration::from_secs(5), "a test probe")
+            .await
+            .expect("the probe must run");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "neighbour-line",
+            "stdout was not captured. An inherited stdout reads as an empty result, \
+             which is indistinguishable from the guest having no neighbour entry."
+        );
+    }
+
+    /// `rounds` must equal the number of attempts actually made.
+    ///
+    /// It is reported in the deadline error as evidence of how much work the
+    /// check did. Incrementing at the top of the loop counted a round that
+    /// found the budget already spent and probed nothing, overstating it by
+    /// one. A diagnostic that is off by one is a diagnostic nobody can reason
+    /// from, which is the whole failure this PR is about.
+    #[tokio::test(start_paused = true)]
+    async fn the_reported_round_count_matches_the_probes_actually_made() {
+        let mut probe = ScriptedGuest::silent_behind_resolved_neighbor();
+
+        let error = wait_for_guest_to_answer(&mut probe, PROBE_PORT, paused_deadline())
+            .await
+            .expect_err("a silent guest must fail readiness");
+
+        let text = error.to_string();
+        let reported: usize = text
+            .split("rounds ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no `rounds N` field in the error: {text}"));
+
+        assert_eq!(
+            reported, probe.probes,
+            "the error reports {reported} rounds but the probe was called {} times. \
+             The count must describe attempts made, not loop iterations entered.\n{text}",
+            probe.probes
+        );
+    }
+
+    /// An abandoned attempt must leave no descendant behind.
+    ///
+    /// `kill_on_drop` reaps only the immediate child. The production probe is
+    /// nsenter -> env -> timeout -> bash, so killing the leader can leave bash
+    /// alive holding a reference to the VM's network namespace, once per retry.
+    /// Each attempt therefore leads its own process group and the group is
+    /// killed on expiry. This drives that with a child that IGNORES SIGTERM, so
+    /// only a group KILL can end it.
+    #[tokio::test]
+    async fn an_abandoned_probe_kills_its_whole_process_group() {
+        let marker = std::env::temp_dir().join(format!("fcvm-probe-pg-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = Command::new("bash");
+        command.args([
+            "-c",
+            &format!(
+                "trap '' TERM; sleep 300 & echo $! > {}; wait",
+                marker.display()
+            ),
+        ]);
+
+        let result = run_probe_bounded(
+            command,
+            std::time::Duration::from_millis(400),
+            "a group-kill probe",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the probe must time out to exercise the kill"
+        );
+
+        // The grandchild wrote its pid before sleeping; it must now be gone.
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .expect("the probe child must have recorded its grandchild's pid")
+            .trim()
+            .parse()
+            .expect("pid file must hold a number");
+        let _ = std::fs::remove_file(&marker);
+
+        let mut alive = true;
+        for _ in 0..50 {
+            // SAFETY: signal 0 only tests for existence.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if alive {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "grandchild {pid} survived the abandoned attempt. It ignores SIGTERM, so \
+             only a process-group kill ends it; without one, every retry strands a \
+             process holding the VM's network namespace."
+        );
     }
 
     /// Any port; the scripted guest ignores it.

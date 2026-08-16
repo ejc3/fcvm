@@ -1,0 +1,3 @@
+    Starting 1020 tests across 24 binaries (10 skipped)
+        PASS [   0.012s] (1/1020) fcvm::test_state_manager test_save_and_load
+     Summary [ 808.819s] 1020 tests run: 1020 passed (1 slow, 1 flaky), 10 skipped

@@ -213,6 +213,45 @@ The gate has its own tests, each written against the unfixed script and observed
 live oversized-thread path that fixtures cannot reach. CI state cannot tell you whether a
 finding was answered.
 
+### "LOAD RELATED" IS NOT A DIAGNOSIS. NEITHER IS "FLAKY", "TIMING", OR "CONTENTION"
+
+**These words describe the absence of an explanation, not an explanation.** They
+are what an investigation says when it has stopped. Every one of them has a
+measurement attached, and the measurement is cheap, so take it before saying the
+word:
+
+| the claim | what must be shown |
+|---|---|
+| "it was load" | `/proc/loadavg` AND per-process CPU **at the moment of failure** - captured by the failing run, not inferred afterwards |
+| "it was slow" | the operation completing at all, with its duration; "it appeared moments later" is worthless if the diagnostic itself provoked the appearance |
+| "contention" | a latency distribution that DEGRADES CONTINUOUSLY. Contention produces a spread; a broken path produces two clusters |
+| "flaky" | a failure rate, and a mechanism for the failures |
+
+Load produces a spectrum. A broken path produces a step function. That single
+test settles most of these arguments for free, and it is one `awk` away from
+data you already have.
+
+Observed 2026-08-15, three times in one investigation, all three wrong:
+
+- Claimed the published-port flake was contention. The distribution refuted it:
+  **421 requests under 0.1s, ZERO between 0.1s and 4.5s, 8 at the 5s deadline.**
+  Perfectly bimodal. The real cause was a purged neighbour entry, a binary state.
+- Claimed a box was "quiet" because I had stopped my own work. I had not stopped
+  the other tenants (three `claude` sessions and two `codex` processes were
+  running), and had never measured. Separately quoted `loadavg 6.43` as evidence
+  of CPU load when the visible processes summed to well under one core of a
+  64-core box: loadavg counts uninterruptible I/O, so it was mostly btrfs.
+- Claimed a restored clone was "merely slow to announce", from a forensics dump
+  taken AFTER the failure - a dump whose own probing can create the very entry
+  it then reports. The actual error said `neighbour: ""` and `probe: (silence)`
+  for a full 5 seconds. Nothing was slow. Something was broken, and a timeout
+  increase built on that theory would have hidden it.
+
+**A timeout increase is the most dangerous form of this.** It converts a defect
+into latency and ships. Raise a timeout only when you can show the operation
+COMPLETING at a measured duration, and say the duration in the commit message.
+"It needs more time" without a number is a guess wearing a fix's clothes.
+
 ### A FUZZ CATCH IS A LEAD, NOT A REGRESSION TEST
 
 **When the chaos fuzz (or any stochastic harness) finds a defect, the fix is not
@@ -334,6 +373,77 @@ where nobody looks. Find the cheap equivalent:
 
 If after genuinely trying you cannot make it cheap, say so **in the test file**, with what it
 would take — never only in a commit message, where the next reader will not find it.
+
+## WHAT CI CAPTURES WHEN SOMETHING FAILS
+
+The rule behind all of it: **a failure must carry the evidence needed to attribute it.**
+Every unattributable failure this repo has chased ended the same way, with the state gone by
+the time anyone looked, and the argument settled by whoever sounded most confident.
+
+Host side, captured today:
+
+| What | Where | Why it is there |
+|---|---|---|
+| `sar -q` / `sar -u`, whole day | `host-load.log` artifact | sysstat already runs on every runner and nothing read it. 10-minute samples, so it answers "was the box busy", not "at this millisecond" |
+| `pidstat -u -h 30` during the suite | `pidstat.log` artifact | `sar` is system-wide and the post-step snapshot is taken after the suite ends, so neither can say WHICH process consumed the host at the moment of a timeout |
+| `/proc/loadavg` inline in the readiness error | the error text itself | so "the box was busy" is checkable in the message, without fetching anything |
+| filtered `dmesg` | `dmesg-filtered.log` artifact | host OOM, KVM, page-fault signatures |
+| D-state watchdog | live step log | prints nothing when healthy; an ephemeral runner dies with its artifacts, so the live log is the only channel that survives |
+
+Rules learned the hard way, each from a check that could not fire:
+
+- **Never conclude "no OOM" from a job log.** Guest console lines are DEBUG and filtered out of
+  it, and host `dmesg` only reaches an artifact. Measured: `grep -c "DEBUG firecracker"` on a
+  259,570-line job log returns 0. Render resource verdicts against `/tmp/fcvm-test-logs/*`, and
+  fail closed when the artifact is missing.
+- **Prefer `/proc/vmstat`'s `oom_kill` to dmesg.** It is monotonic and cannot wrap. The guest's
+  printk ring is 128 KiB (`CONFIG_LOG_BUF_SHIFT=17`) and a chatty boot does wrap it, so a
+  dmesg-only OOM check intermittently cannot fire.
+- **Never `statvfs` a path you have not proved is local.** On a wedged FUSE mount it parks in
+  uninterruptible sleep and no timeout can cancel it, turning a diagnostic into a second hang.
+  Read `/proc/self/mountinfo` first and skip anything that is not tmpfs/ext4/btrfs/xfs.
+- **Never read `/proc/<pid>/cmdline` in a wedge scan.** It faults the target's mm and hangs on
+  exactly the processes you are trying to inspect.
+- **A collector that cannot run must say so.** Silence from a diagnostic is indistinguishable
+  from a clean result, which is the same bug as a gate printing CLEAN because `jq` was missing.
+
+## HOW TO INVESTIGATE A TIMEOUT
+
+A deadline miss says one thing only: the answer did not arrive in time. It does NOT say the
+peer was slow, and it never says the box was busy. Work the list in order; each step is a
+measurement, and any of them can end the investigation.
+
+1. **Get the load, do not assume it.** Every runner runs sysstat, so the record already
+   exists: `sar -q -f /var/log/sysstat/sa<DD> -s HH:MM:00 -e HH:MM:00` for load average and
+   run queue, `sar -u` for idle/steal. CI captures both (`Capture host load record`) and the
+   readiness error embeds `/proc/loadavg` inline. Run 31906708922 was **95.1% idle, run queue
+   1, 0% steal** at the failing sample -- every "the box was busy" sentence written about it
+   was false, and checkable in one command.
+2. **Compare against the healthy distribution, not against the deadline.** Pull the same
+   measurement from a passing run. Healthy readiness there was **84ms** against a 5s deadline.
+   Two orders of magnitude is a different state, not a slow tail, and it rules out "just raise
+   the timeout" without further argument. Log the duration on SUCCESS so this comparison is
+   always available (`readiness_ms`).
+3. **Prove the waiter actually ran.** Count its per-round log lines across the window. Zero
+   rounds in 5s means the loop never iterated, so every field in its error message is a
+   default, not an observation -- `neighbour: ""` meant "never queried", not "no entry".
+   A check that reports on work it never did is the same fail-open bug as a gate that passes
+   because `jq` was missing.
+4. **Look for evidence that contradicts the error text.** The same forensics that said the
+   guest never answered also held a TIME-WAIT socket to that guest and a REACHABLE neighbour
+   entry: the guest had answered. When the error and the artifacts disagree, the error is
+   wrong.
+5. **Bound every attempt, not just the total.** One subprocess that never returns will eat an
+   entire budget and produce a message blaming the peer. Wrap each attempt
+   (`GUEST_PROBE_ATTEMPT_BUDGET`) and count abandonments in the error. Do not trust a
+   subprocess to honour a budget you handed it -- the probe already ran `timeout(1) bash` and
+   still hung the caller.
+6. **Kill hypotheses with an experiment, cheaply.** "netns churn stalls nsenter" sounded
+   right; 16 churners moved nsenter from 9ms to 18ms max, so it was wrong and cost 60s to
+   find out. A two-arm measurement beats a paragraph of reasoning.
+
+Raising a timeout is a valid fix only after step 2 shows the healthy distribution genuinely
+crowds the deadline. Otherwise it hides the defect and buys a slower failure.
 
 ## STACKED PRs BY DEFAULT
 

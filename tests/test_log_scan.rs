@@ -34,6 +34,69 @@ fn field(out: &str, key: &str) -> i64 {
         .unwrap_or_else(|e| panic!("`{key}` is not a number ({e}):\n{out}"))
 }
 
+/// The summary's flaky count must be read from the form nextest actually emits.
+///
+/// Measured against 59 cached CI job logs: the parenthetical is never `(N flaky)`
+/// alone, it is `(1 slow, 1 flaky)`. A pattern anchored on `\(([0-9]+) flaky\)`
+/// therefore matched nothing in production and the flaky gate never once fired,
+/// while reporting `verdict: CLEAN`, exit 0, on a log whose own summary said
+/// otherwise. Job 93992054596 is exactly that log.
+#[test]
+fn the_summary_flaky_count_is_read_when_other_items_share_the_parens() {
+    let log = repo_root().join("tests/fixtures/nextest-flaky-with-slow.log");
+    let (out, code) = run_scan(&log);
+
+    assert!(
+        out.contains("verdict: FLAKY"),
+        "a summary reading `(1 slow, 1 flaky)` must be reported FLAKY. If this says \
+         CLEAN, the flaky pattern requires `flaky` to be the only item in the parens \
+         and cannot match a real nextest summary.\n{out}"
+    );
+    assert_eq!(code, 1, "a flaky run must exit non-zero.\n{out}");
+}
+
+/// Every summary in the log must be judged, not only the last one.
+///
+/// The SnapshotEnabled matrix runs the suite twice in one job, so a job log
+/// carries two summary lines. In 7 of the 19 cached multi-summary jobs the flaky
+/// summary is the FIRST one, and `tail -1` discards it.
+#[test]
+fn a_flaky_summary_is_not_discarded_by_a_later_clean_one() {
+    let log = repo_root().join("tests/fixtures/nextest-two-summaries-flaky-first.log");
+    let (out, code) = run_scan(&log);
+
+    assert!(
+        out.contains("verdict: FLAKY"),
+        "the FIRST summary reports 2 flaky and must not be dropped in favour of the \
+         last. A scanner that only reads the final summary is blind to the first \
+         suite run in every SnapshotEnabled job.\n{out}"
+    );
+    assert_eq!(code, 1, "a flaky run must exit non-zero.\n{out}");
+}
+
+/// A retry counts however its first attempt died, not only when it said FAIL.
+///
+/// nextest reports a slow-timeout kill as `TRY 1 TMT`. Five such retries occurred
+/// in the last 6 days of CI (900s hang, then a 7s pass), every one inside a job
+/// that reported green. A pattern matching only `TRY n FAIL` cannot see them.
+#[test]
+fn a_retry_after_a_timeout_kill_is_counted() {
+    let log = repo_root().join("tests/fixtures/nextest-retry-timeout.log");
+    let (out, code) = run_scan(&log);
+
+    assert_eq!(
+        field(&out, "try_fail"),
+        1,
+        "`TRY 1 TMT` is a retried failure and must be counted. A 900s hang that \
+         passes on retry is a hang bug, not contention, and this is the only place \
+         it is visible.\n{out}"
+    );
+    assert_eq!(
+        code, 1,
+        "a run containing a retried timeout must not be reported clean.\n{out}"
+    );
+}
+
 /// THE trap: nextest writes a retry as `TRY 1 FAIL`, so `grep '^ *FAIL'` matches
 /// none of them. A test that failed and then passed on retry disappears into a
 /// green total — which is precisely how a flake survives review.
