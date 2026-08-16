@@ -123,7 +123,7 @@ a { color: inherit; }
 <p class="src">Numbers are cited by run id (RB, AB, PF, CPU, HM, HK, NC, FG, CX for the latency benchmark; FB for fault counts; HC for the host-container baseline; NM for the network-mode trio; LD and MH for the concurrency/memory ladders). Smaller instrumented probe sets (attribution, ablation, the CoW census) are cited by their directory names. The full index, with result directories, is in "Provenance and gates" at the end.</p>
 
 <h2>Reproduction, 2026-08-16: the headline does not reproduce</h2>
-<p>Every figure below this section was measured on 2026-08-13/14. Regenerating the corpus benchmark two days later, on the same host, with the same 14 URLs and the same knobs, does not reproduce the 615.1&nbsp;ms headline. Nine gated runs, all publishable, zero failed requests.</p>
+<p>Every figure below this section was measured on 2026-08-13/14. Regenerating the corpus benchmark two days later, on the same host, with the same 14 URLs and the same knobs, does not reproduce the 615.1&nbsp;ms headline. Seven gated corpus runs, all publishable, zero failed requests.</p>
 <div class="tbl">
 <table>
   <tr><th>configuration</th><th class="n">resolve</th><th class="n">upgrade</th><th class="n">Page.enable</th><th class="n">navigate</th><th class="n">cdp p50</th><th class="n">noop</th></tr>
@@ -136,7 +136,7 @@ a { color: inherit; }
   <tr><td>2026-08-16 · 8 vCPU · minor</td><td class="n">204.4</td><td class="n">3.2</td><td class="n">3.9</td><td class="n">312.1</td><td class="n">654.5 ms</td><td class="n">41.0</td></tr>
 </table>
 </div>
-<p class="src">All medians, ms, cdp arm, n=202 per arm per run, warmup 28 (two full 14-URL cycles) discarded explicitly. results/reqbench-20260816-*-corpus/analysis.json and results/campaign-20260816-summary.json; host baseline results/hostcdp-509059c1700d47bb89e9854ddd54bb73/run.json.</p>
+<p class="src">All medians, ms, cdp arm, n=202 per arm per run, warmup 28 (two full 14-URL cycles) discarded explicitly. results/reqbench-20260816-*-corpus/analysis.json and results/campaign-20260816-summary.json; host baseline results/hostcdp-509059c1700d47bb89e9854ddd54bb73/hostcdp.jsonl (median of the 200 non-warmup ok reps' wall_ms; run.json carries the configuration only).</p>
 
 <p><strong>The guest is CPU-starved, not slow.</strong> <code>Page.enable</code> is one CDP round trip. It costs 15.4&nbsp;ms on 2 vCPUs and 3.4&nbsp;ms on 4, so it was waiting for a runnable core rather than for the network — TCP connect is 0.1&nbsp;ms in every run, including the sealed one. At 8 vCPUs <code>navigate</code> (312.1&nbsp;ms) is faster than the sealed run's 337.2.</p>
 
@@ -284,7 +284,7 @@ a { color: inherit; }
 </ul>
 
 <h2>Concurrency and memory amortization (64-core ladder)</h2>
-<p>The LD run climbs N simultaneous clones from one serve — N in 1, 2, 4, 8, 16, 24, 32, 48, 64 — on the benchmark host (64-core Graviton3 bare metal, 125 GiB), against the 2 MB hugepage golden, in both fill modes: <em>minor</em> (clones map pages of one shared in-memory snapshot and privatize only what they write) and <em>copy</em> (every touched page is duplicated privately). The per-clone figures here are HUGEPAGE-granularity numbers: a write to any byte of a 2 MB unit privatizes all of it, which is why they run 550–610 MiB — the same workload on 4 K pages costs 124–298 MiB per clone (the memory-frontier section below decomposes the difference). At each rung all N clones restore together, render the fixture concurrently, and system memory is recorded with all N alive (hugepage counters, per-process PSS, MemAvailable). Every rung rendered 100% of its clones.<span class="cite">LD ladder-{minor,copy}.jsonl, per-clone records + per-rung memory snapshots</span></p>
+<p>The LD run climbs N simultaneous clones from one serve — N in 1, 2, 4, 8, 16, 24, 32, 48, 64 — on the benchmark host (64-core Graviton3 bare metal, 125 GiB), against the 2 MB hugepage golden, in both fill modes: <em>minor</em> (clones map pages of one shared in-memory snapshot and privatize only what they write) and <em>copy</em> (every touched page is duplicated privately). The per-clone figures here are HUGEPAGE-granularity numbers: a write to any byte of a 2 MB unit privatizes all of it, which is why they run 550–610 MiB — the same workload on 4 K pages costs 133–146 MiB per clone at 1&nbsp;GiB, 108–203 across both guest sizes (the memory-frontier section below decomposes the difference). At each rung all N clones restore together, render the fixture concurrently, and system memory is recorded with all N alive (hugepage counters, per-process PSS, MemAvailable). Every rung rendered 100% of its clones.<span class="cite">LD ladder-{minor,copy}.jsonl, per-clone records + per-rung memory snapshots</span></p>
 <div class="tablewrap">
 <table>
   <tr><th class="n" rowspan="2">N</th><th colspan="3">latency mode · minor + 2 MB pages (LD)</th><th colspan="3">density mode · minor + 4 K pages (recells)</th></tr>

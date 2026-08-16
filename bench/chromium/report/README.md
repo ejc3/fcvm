@@ -141,7 +141,7 @@ fixed in the same pass:
 
 ## The 615.1 ms headline does not reproduce
 
-Regenerated 2026-08-16, same host, same 14 URLs, same knobs: nine gated runs,
+Regenerated 2026-08-16, same host, same 14 URLs, same knobs: seven gated corpus runs,
 all publishable, zero failures. 2 vCPUs measures **951.2 ms**, 4 measures 706.3,
 8 measures 654.5. The guest is CPU-starved rather than slow -- one `Page.enable`
 round trip costs 15.4 ms on 2 vCPUs and 3.4 ms on 4 -- and the host-container
