@@ -32,7 +32,7 @@ the tab by its icon. `description` is the gallery subtitle; omitting it on a
 redeploy drops the one already there.
 
 Publishing WITHOUT `url=` creates a second artifact. That already happened once:
-`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same 15 sections and differs
+`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same 16 sections and differs
 only in a cache-busting `<base href>`. It is stale the moment this file changes,
 and it is public.
 
