@@ -31,10 +31,15 @@ set -uo pipefail
 STATE_FILE="${BENCH_HEALTH_STATE:-/run/bench-health}"
 # Budget arithmetic, not a round number. The writer loops every 1s and its CDP
 # probe has a 3s timeout (BENCH_CDP_HEALTH_TIMEOUT), so one genuinely slow
-# iteration can stretch the gap between writes to about 4s. 6s clears that with
-# headroom while still surfacing a dead writer within two podman intervals.
-# Larger would start hiding exactly what this check exists to catch.
-MAX_AGE="${BENCH_HEALTH_MAX_AGE:-6}"
+# iteration can stretch the gap between writes to about 4s.
+#
+# Both endpoints are truncated to whole seconds below, and floor(now) -
+# floor(stamp) lies in (age-1, age+1): the computed value can be up to a second
+# LARGER than the true age as well as smaller. So a budget of 7 enforces a real
+# ceiling somewhere in 6s to 8s, and guarantees a genuine 4s gap is never
+# refused. An earlier comment here claimed truncation could only shrink the
+# figure, and quoted a 10s budget that had already been changed to 6.
+MAX_AGE="${BENCH_HEALTH_MAX_AGE:-7}"
 
 if [ ! -r "$STATE_FILE" ]; then
 	echo "unhealthy: no verdict at $STATE_FILE (is cdp_health.py --loop running?)" >&2
@@ -51,8 +56,29 @@ read -r now _ </proc/uptime || {
 	exit 1
 }
 
-# Bash has no floats; compare whole seconds. Truncation can only make the
-# computed age SMALLER by less than a second, which the 10s budget absorbs.
+# Validate BEFORE arithmetic. $(( )) evaluates its operands, so unvalidated file
+# content here is both a crash and an evaluation surface. Verified before this
+# guard existed: a stamp of "notanumber" died with "line 56: notanumber:
+# unbound variable" and an empty line with "operand expected", and the script
+# exited 1 only because `set -u` aborted on the unset `age`. That is the right
+# exit status for the wrong reason: it depends on a shell option rather than on
+# a check, and the accompanying test passed on that accident.
+case "$verdict" in
+healthy | unhealthy) ;;
+*)
+	echo "unhealthy: unrecognised verdict ${verdict:-(empty)} in $STATE_FILE" >&2
+	exit 1
+	;;
+esac
+
+case "${stamp:-}" in
+'' | *[!0-9.]* | *.*.*)
+	echo "unhealthy: unparsable stamp ${stamp:-(empty)} in $STATE_FILE" >&2
+	exit 1
+	;;
+esac
+
+# Bash has no floats; compare whole seconds. Both operands are validated above.
 age=$(( ${now%.*} - ${stamp%.*} ))
 
 if [ "$age" -lt 0 ]; then
@@ -69,7 +95,7 @@ if [ "$age" -gt "$MAX_AGE" ]; then
 fi
 
 if [ "$verdict" != healthy ]; then
-	echo "unhealthy: $verdict $detail (age ${age}s)" >&2
+	echo "unhealthy: $detail (age ${age}s)" >&2
 	exit 1
 fi
 

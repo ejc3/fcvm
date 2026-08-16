@@ -16,7 +16,8 @@
 # snapshot fires on "container is running" — a COLD browser — and every
 # restored clone's "warm" latency is really a first-paint number. Verify:
 #   podman inspect localhost/chromium-bench --format '{{json .HealthCheck}}'
-# must print the Test array containing cdp_health.
+# must print the Test array containing health_state.sh (the cheap reader;
+# the CDP round trip itself is done by the resident cdp_health.py --loop).
 #
 # Host smoke test (fast loop, no VM):
 #   podman run -d --name cb localhost/chromium-bench
@@ -95,7 +96,8 @@ EXPOSE 9222
 # fcvm's health gate is the golden-snapshot trigger. With no `--health-check`
 # URL, `Healthy` = container running AND podman's HEALTHCHECK healthy
 # (src/health.rs, "AND logic"), so THIS is what decides when the snapshot is
-# taken. cdp_health.py requires a warm marker AND a live CDP round trip that
+# taken. The resident cdp_health.py --loop requires a warm marker AND a live
+# CDP round trip that
 # finds a page target: healthy means provably able to screenshot.
 # start-period covers Chromium's cold launch + the warm render; interval is the
 # resolution of the snapshot trigger, so it is short.

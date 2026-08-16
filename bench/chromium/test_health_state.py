@@ -46,8 +46,15 @@ class HealthStateReader(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_stale_healthy_is_not_healthy(self) -> None:
-        """The one that matters. A verdict nobody is refreshing is not a verdict."""
-        result = run_reader(f"healthy {monotonic_now() - 3600} exit=0\n")
+        """The one that matters. A verdict nobody is refreshing is not a verdict.
+
+        The stamp is clamped at 0 and the budget tightened, rather than
+        subtracting an hour: on a freshly booted box `now - 3600` is NEGATIVE,
+        which the reader rejects as an unparsable stamp. That still fails
+        closed, but it exercises the wrong branch, and this test exists for the
+        staleness branch specifically.
+        """
+        result = run_reader(f"healthy {max(0, monotonic_now() - 60)} exit=0\n", max_age="1")
         self.assertEqual(
             result.returncode,
             1,
@@ -74,6 +81,41 @@ class HealthStateReader(unittest.TestCase):
         for junk in ("\n", "healthy\n", "healthy notanumber exit=0\n"):
             with self.subTest(junk=junk):
                 self.assertEqual(run_reader(junk).returncode, 1, f"accepted {junk!r}")
+
+    def test_the_writer_and_reader_agree_on_the_format(self) -> None:
+        """The contract that actually matters: publish() -> health_state.sh.
+
+        Every other case here feeds the reader a hand-written string, so the
+        writer could change its field order, its clock source, or its float
+        format and all of them would still pass while every clone reported
+        unhealthy. This runs the real writer and then the real reader against
+        the file it wrote.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "cdp_health", Path(__file__).resolve().parent / "cdp_health.py"
+        )
+        cdp_health = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cdp_health)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = os.path.join(directory, "bench-health")
+            cdp_health.STATE_FILE = state
+            cdp_health.publish("healthy", "pages=1 id=ABC")
+
+            env = dict(os.environ, BENCH_HEALTH_STATE=state)
+            result = subprocess.run(
+                ["bash", str(READER)], env=env, capture_output=True, text=True, check=False
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            "the reader rejected what the writer just wrote; the two halves have "
+            "drifted apart\n" + result.stdout + result.stderr,
+        )
+        self.assertIn("pages=1 id=ABC", result.stdout, "the detail did not survive the round trip")
 
     def test_the_budget_covers_a_slow_probe(self) -> None:
         """The writer loops at 1s but its CDP probe may take 3s, so ~4s gaps are

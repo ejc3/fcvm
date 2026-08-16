@@ -223,7 +223,13 @@ wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp
 # is published while the golden is still being prepared, and so its interpreter
 # pages are dirtied pre-snapshot and shared by every clone rather than
 # re-dirtied per clone. The HEALTHCHECK reads its verdict; see health_state.sh.
-python3 /opt/bench/cdp_health.py --loop &
+# stdout to /dev/null, stderr kept. The loop publishes its verdict to a file;
+# anything it printed per second would land in podman's container log on the
+# CLONE's CoW disk and grow forever, dirtying blocks in every clone. That works
+# directly against the per-clone memory goal this resident design serves. The
+# old per-second HEALTHCHECK escaped this because podman ring-buffers the
+# health log to 5 entries and rewrites it in place.
+python3 /opt/bench/cdp_health.py --loop >/dev/null &
 echo "chromium-bench: resident health checker started (pid $!)"
 
 echo "chromium-bench: warming renderer"

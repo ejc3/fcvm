@@ -45,16 +45,22 @@ READY_FILE = os.environ.get("BENCH_READY_FILE", "/run/bench-ready")
 TIMEOUT = float(os.environ.get("BENCH_CDP_HEALTH_TIMEOUT", "3"))
 
 
-def main() -> int:
+def main_with_reason() -> tuple[int, str]:
+    """The check, returning (exit code, REASON).
+
+    The reason is the point. As a per-second HEALTHCHECK this printed its
+    diagnostic to stderr and podman recorded it in the health log, which was
+    exactly where an operator looked when a golden never fired. With a resident
+    writer and a file-reading HEALTHCHECK, anything left on stderr is lost: the
+    health log would say only "exit=1". So the reason travels in the verdict.
+    """
     if not os.path.exists(READY_FILE):
-        print(f"unhealthy: warm marker {READY_FILE} absent", file=sys.stderr)
-        return 1
+        return 1, f"warm marker {READY_FILE} absent"
     try:
         with urllib.request.urlopen(f"http://{CDP_HOST}/json/list", timeout=TIMEOUT) as r:
             targets = json.load(r)
     except Exception as e:  # urllib raises a wide family; any of them = not healthy
-        print(f"unhealthy: CDP /json/list failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return 1
+        return 1, f"CDP /json/list failed: {type(e).__name__}: {e}"
 
     pages = [
         t
@@ -62,15 +68,22 @@ def main() -> int:
         if t.get("type") == "page" and not str(t.get("url", "")).startswith("devtools://")
     ]
     if not pages:
-        print(f"unhealthy: no page target among {len(targets)} target(s)", file=sys.stderr)
-        return 1
+        return 1, f"no page target among {len(targets)} target(s)"
 
-    # Print the target so `podman inspect` health logs record WHICH target was
-    # resolved. If this id is identical across clones, the host can skip its own
-    # /json/list lookup per request (one fewer HTTP round trip) — the benchmark
-    # checks that claim rather than assuming it.
-    print(f"healthy pages={len(pages)} id={pages[0].get('id')} ws={pages[0].get('webSocketDebuggerUrl')}")
-    return 0
+    # The resolved target id travels in the verdict for the same reason the
+    # failure reason does: it is the one place a reader can see WHICH target
+    # answered. If the id is identical across clones, the host can skip its own
+    # /json/list lookup per request; the benchmark checks that rather than
+    # assuming it.
+    return 0, f"pages={len(pages)} id={pages[0].get('id')}"
+
+
+def main() -> int:
+    """Single-shot form, still used by reqbench.sh verify (HOP A) and by hand."""
+    code, reason = main_with_reason()
+    print(("healthy " if code == 0 else "unhealthy: ") + reason,
+          file=sys.stdout if code == 0 else sys.stderr)
+    return code
 
 
 # Where the resident loop publishes its verdict, and how stale a verdict may be
@@ -85,8 +98,16 @@ def monotonic_seconds() -> float:
     NOT time.time(). fc-agent steps CLOCK_REALTIME on every restore
     (set_system_clock), which would make every clone's freshly written verdict
     look hours old to a wall-clock reader and fail the gate on every clone.
-    /proc/uptime is CLOCK_MONOTONIC and is what the bash reader uses too, so
-    both sides measure the same thing.
+
+    /proc/uptime is CLOCK_BOOTTIME (ktime_get_boottime_ts64), not
+    CLOCK_MONOTONIC. The reader uses the same file, so both sides measure the
+    same clock either way, but the freshness scheme rests on guest boottime
+    being CONTINUOUS across snapshot and restore. That holds where the
+    firecracker fork owns the VM-wide counter offset and advances it by the
+    pause duration (AGENTS.md, NV2 snapshot lifecycle). It is NOT established
+    for the cloud-hypervisor backend. If boottime jumps on restore, every
+    clone reports "verdict is Ns old" forever, which is the same total failure
+    this design moved away from, relocated from realtime to boottime.
     """
     with open("/proc/uptime", "r", encoding="ascii") as handle:
         return float(handle.read().split()[0])
@@ -113,10 +134,24 @@ def loop() -> int:
     while True:
         started = monotonic_seconds()
         try:
-            code = main()
-            publish("healthy" if code == 0 else "unhealthy", f"exit={code}")
+            code, reason = main_with_reason()
+            publish("healthy" if code == 0 else "unhealthy", reason)
         except Exception as error:  # a crash here must not look healthy
-            publish("unhealthy", f"loop error: {type(error).__name__}: {error}")
+            # Guarded. The unguarded version raised the SAME error the handler
+            # was catching (a full /run tmpfs, EROFS, a missing directory), let
+            # it escape loop(), and the process exited. Nothing supervises this
+            # loop, so the container would then be unhealthy forever with no
+            # verdict file at all, and the golden would wait out its full 300s
+            # timeout with nothing to say why.
+            try:
+                publish("unhealthy", f"loop error: {type(error).__name__}: {error}")
+            except Exception as publish_error:
+                print(
+                    f"cdp_health loop: cannot publish ({type(publish_error).__name__}: "
+                    f"{publish_error}) after {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         elapsed = monotonic_seconds() - started
         time.sleep(max(0.0, LOOP_INTERVAL - elapsed))
 

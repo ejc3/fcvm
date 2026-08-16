@@ -62,7 +62,7 @@ podman build --format docker -t localhost/chromium-bench -f Containerfile.chromi
 # `make bench-chromium` actually runs — has no build step and no healthcheck
 # check, so on that route this line is the ENTIRE verification.
 podman image inspect localhost/chromium-bench --format '{{json .HealthCheck}}' \
-  | grep -q cdp_health || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
+  | grep -q health_state || { echo 'FATAL: image has no HEALTHCHECK (OCI format drop?)'; exit 1; }
 
 # host smoke test, no VM:
 podman run -d --name cb localhost/chromium-bench
