@@ -1123,6 +1123,50 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "smaller than enclosed"):
             reqbench.bounded_cpu_residual(*observed, tracks=lambda: True)
 
+    def test_a_cpu_measurement_failure_does_not_abort_the_teardown(self):
+        """RED BEFORE THE FIX: teardown reported "NOT reaped" for a reaped VM.
+
+        bounded_cpu_residual runs AFTER the kill, the wait and t_gone, so by the
+        time it can fail the process set is already terminal. Letting it
+        propagate made teardown_fast raise SurvivedTeardown with
+
+            state  and data  NOT reaped: host CPU delta is smaller than
+            enclosed harness CPU delta: machine=30.000000ms harness=160.000000ms
+
+        which is a statement about the MEASUREMENT dressed up as a statement
+        about the PROCESSES. On GitHub-hosted runners it failed the bench suite
+        for a teardown that had worked, and it set disk_reap_skipped on a VM
+        whose disk was safe to reap.
+
+        Fail-closed belongs on PUBLICATION: the figure is withheld and the error
+        recorded, so a reader gets a KeyError rather than a plausible number.
+        """
+        from unittest import mock
+
+        p = spawn_pdeathsig_parent(["sleep", "300"])
+        wait_for_child(p.pid)
+        kids = reqbench.children_of(p.pid)
+        self.assertEqual(len(kids), 1, "parent never forked its child")
+
+        boom = RuntimeError("host CPU delta is smaller than enclosed harness CPU delta")
+        with mock.patch.object(reqbench, "bounded_cpu_residual", side_effect=boom):
+            out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
+
+        self.assertTrue(out["all_gone"], "the process set must still be reaped")
+        self.assertNotIn("disk_reap_skipped", out,
+                         "a measurement failure must not skip the disk reap")
+        self.assertIn("per_child_cpu", out,
+                      "per-child CPU is measured before the residual and must survive it")
+        self.assertIn("RuntimeError", out["cpu_residual_error"] or "",
+                      "the measurement error must be recorded, not swallowed")
+        for absent in ("machine_cpu_ms_net", "control_busy_cores",
+                       "cpu_residual_uncertainty_ms"):
+            self.assertNotIn(absent, out,
+                             f"{absent} must be ABSENT, not zeroed, when unmeasurable")
+        for pid in kids:
+            self.assertFalse(reqbench.proc_stat_fields(pid),
+                             f"child {pid} survived a teardown that reported success")
+
     def test_the_probe_reports_this_host_tracks_its_own_processes(self):
         """The probe must say yes HERE, or it would excuse every real violation.
 

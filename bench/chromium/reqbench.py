@@ -1504,10 +1504,29 @@ def measure_fast_reap(
         ctl_wall_ms = (time.monotonic() - ctl_t0) * 1000.0
         if ctl_wall_ms <= 0.0:
             raise RuntimeError("ambient control window was not positive")
-        reclaim_cpu = bounded_cpu_residual(machine1 - machine0, self_ms)
-        control_cpu = bounded_cpu_residual(ctl_machine_ms, ctl_self_ms)
+        # The process set is ALREADY terminal here: the kill, the wait and
+        # t_gone all happened above. A CPU-accounting self-check that fails at
+        # this point says the MEASUREMENT is unusable on this host; it says
+        # nothing about whether teardown worked. Letting it propagate conflated
+        # the two and made teardown_fast report "state and data NOT reaped" for
+        # a process set that was gone, on GitHub-hosted runners whose /proc/stat
+        # under-reports (machine=30ms against harness=160ms in one window while
+        # a controlled burn tracked fine).
+        #
+        # The figure is withheld rather than guessed, and the error is carried
+        # so the publication gate can refuse to publish CPU numbers that rest
+        # on it. Fail-closed on PUBLICATION, not on teardown.
+        cpu_residual_error = None
+        try:
+            reclaim_cpu = bounded_cpu_residual(machine1 - machine0, self_ms)
+            control_cpu = bounded_cpu_residual(ctl_machine_ms, ctl_self_ms)
+        except (MachineCpuCounterUnusable, RuntimeError) as err:
+            reclaim_cpu = None
+            control_cpu = None
+            cpu_residual_error = f"{type(err).__name__}: {err}"
         return {
             "all_gone": all_gone,
+            "cpu_residual_error": cpu_residual_error,
             "cpu": cpu,
             "ctl_machine_ms": ctl_machine_ms,
             "ctl_self_ms": ctl_self_ms,
@@ -1640,38 +1659,44 @@ def teardown_fast(
     out["signal_ms"] = measured["signal_ms"]
 
     window_s = t_gone - t_kill
-    ctl_rate = control_cpu["point_ms"] / ctl_wall_ms
-    ctl_rate_lo = control_cpu["lo_ms"] / ctl_wall_ms
-    ctl_rate_hi = control_cpu["hi_ms"] / ctl_wall_ms
-    excess_ms = reclaim_cpu["point_ms"] - ctl_rate * machine_window_ms
-    excess_lo_ms = reclaim_cpu["lo_ms"] - ctl_rate_hi * machine_window_ms
-    excess_hi_ms = reclaim_cpu["hi_ms"] - ctl_rate_lo * machine_window_ms
     out["reap_wall_ms"] = window_s * 1000
     out["all_gone"] = all_gone
     out["machine_cpu_ms"] = machine_cpu_ms
     out["harness_cpu_ms"] = self_ms
     out["machine_cpu_window_ms"] = machine_window_ms
-    out["machine_cpu_ms_raw"] = reclaim_cpu["raw_ms"]
-    out["machine_cpu_ms_net"] = reclaim_cpu["point_ms"]
-    out["machine_cpu_ms_net_lo"] = reclaim_cpu["lo_ms"]
-    out["machine_cpu_ms_net_hi"] = reclaim_cpu["hi_ms"]
-    out["machine_cpu_ms_subtraction_clamped"] = reclaim_cpu["clamped"]
-    out["machine_cpu_ms_excess"] = excess_ms
-    out["machine_cpu_ms_excess_lo"] = excess_lo_ms
-    out["machine_cpu_ms_excess_hi"] = excess_hi_ms
-    out["control_machine_cpu_ms"] = ctl_machine_ms
-    out["control_harness_cpu_ms"] = ctl_self_ms
-    out["control_wall_ms"] = ctl_wall_ms
-    out["control_target_ms"] = CONTROL_WINDOW_S * 1000.0
-    out["control_cpu_ms_raw"] = control_cpu["raw_ms"]
-    out["control_cpu_ms_net"] = control_cpu["point_ms"]
-    out["control_cpu_ms_net_lo"] = control_cpu["lo_ms"]
-    out["control_cpu_ms_net_hi"] = control_cpu["hi_ms"]
-    out["control_cpu_ms_subtraction_clamped"] = control_cpu["clamped"]
-    out["control_busy_cores"] = ctl_rate
-    out["control_busy_cores_lo"] = ctl_rate_lo
-    out["control_busy_cores_hi"] = ctl_rate_hi
-    out["cpu_residual_uncertainty_ms"] = reclaim_cpu["uncertainty_ms"]
+    out["cpu_residual_error"] = measured.get("cpu_residual_error")
+    # A host that cannot support the enclosure measurement still gets a full
+    # teardown and a full per-child CPU record below; only the residual-DERIVED
+    # figures are withheld, and they are ABSENT rather than zeroed, so a reader
+    # gets a KeyError instead of a plausible wrong number.
+    if reclaim_cpu is not None and control_cpu is not None:
+        ctl_rate = control_cpu["point_ms"] / ctl_wall_ms
+        ctl_rate_lo = control_cpu["lo_ms"] / ctl_wall_ms
+        ctl_rate_hi = control_cpu["hi_ms"] / ctl_wall_ms
+        excess_ms = reclaim_cpu["point_ms"] - ctl_rate * machine_window_ms
+        excess_lo_ms = reclaim_cpu["lo_ms"] - ctl_rate_hi * machine_window_ms
+        excess_hi_ms = reclaim_cpu["hi_ms"] - ctl_rate_lo * machine_window_ms
+        out["machine_cpu_ms_raw"] = reclaim_cpu["raw_ms"]
+        out["machine_cpu_ms_net"] = reclaim_cpu["point_ms"]
+        out["machine_cpu_ms_net_lo"] = reclaim_cpu["lo_ms"]
+        out["machine_cpu_ms_net_hi"] = reclaim_cpu["hi_ms"]
+        out["machine_cpu_ms_subtraction_clamped"] = reclaim_cpu["clamped"]
+        out["machine_cpu_ms_excess"] = excess_ms
+        out["machine_cpu_ms_excess_lo"] = excess_lo_ms
+        out["machine_cpu_ms_excess_hi"] = excess_hi_ms
+        out["control_machine_cpu_ms"] = ctl_machine_ms
+        out["control_harness_cpu_ms"] = ctl_self_ms
+        out["control_wall_ms"] = ctl_wall_ms
+        out["control_target_ms"] = CONTROL_WINDOW_S * 1000.0
+        out["control_cpu_ms_raw"] = control_cpu["raw_ms"]
+        out["control_cpu_ms_net"] = control_cpu["point_ms"]
+        out["control_cpu_ms_net_lo"] = control_cpu["lo_ms"]
+        out["control_cpu_ms_net_hi"] = control_cpu["hi_ms"]
+        out["control_cpu_ms_subtraction_clamped"] = control_cpu["clamped"]
+        out["control_busy_cores"] = ctl_rate
+        out["control_busy_cores_lo"] = ctl_rate_lo
+        out["control_busy_cores_hi"] = ctl_rate_hi
+        out["cpu_residual_uncertainty_ms"] = reclaim_cpu["uncertainty_ms"]
     out["machine_cpu_source"] = MACHINE_CPU_SOURCE
     out["machine_cpu_resolution_ms"] = MACHINE_CPU_RESOLUTION_MS
     out["harness_cpu_source"] = HARNESS_CPU_SOURCE
