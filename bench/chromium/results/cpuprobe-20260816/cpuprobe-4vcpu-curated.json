@@ -1,11 +1,21 @@
 {
- "_note": "cpuprobe over a gated 4-vCPU corpus campaign (reqbench-20260816-145649-corpus). Every record's summary is kept; full 20 ms series are kept for a spread across the peak distribution so the SHAPE is plottable without carrying 6 MB. Probe overhead verified: probed cdp p50 685.5 ms vs unprobed baseline 695.7 ms (-1.5%), inside the 66 ms golden-to-golden noise floor.",
- "source_run": "bench/chromium/results/reqbench-20260816-145649-corpus",
+ "_note": "cpuprobe over a gated corpus campaign, 20 ms sampling. Every render clone's summary kept; full series kept for a spread across the peak distribution. peak vCPU-only is the censoring test: at 2 vCPU p05==p95==max, i.e. the distribution collapses to the ceiling and the measurement is censored.",
  "vcpu": 4,
+ "source_run": "bench/chromium/results/reqbench-20260816-145649-corpus",
+ "cdp_blocking_p50_ms": 685.5372930003796,
+ "publishable": true,
+ "n_failed": 0,
+ "fcvm_sha256": "474f25308720c3c1",
+ "source_revision": "a7275a4e2f0a",
  "sample_interval_ms": 20,
  "n_render_clones": 248,
- "n_short_clones": 438,
- "cores_max": {
+ "peak_cores_vcpu_only": {
+  "p05": 3.759,
+  "p50": 3.974,
+  "p95": 4.162,
+  "max": 4.164
+ },
+ "peak_cores_all": {
   "p05": 3.874,
   "p50": 4.335,
   "p95": 4.851,
@@ -17,13 +27,7 @@
   "p95": 2.92,
   "max": 3.087
  },
- "vcpu_cores_max": {
-  "p05": 3.759,
-  "p50": 3.974,
-  "p95": 4.162,
-  "max": 4.164
- },
- "total_wait_ms": {
+ "runqueue_wait_ms": {
   "p05": 0.264,
   "p50": 0.652,
   "p95": 2.672,
@@ -34,12 +38,6 @@
   "p50": 0.744,
   "p95": 0.829,
   "max": 0.886
- },
- "frac_above_3_cores": {
-  "p05": 0.085,
-  "p50": 0.421,
-  "p95": 0.574,
-  "max": 0.667
  },
  "lifetime_s": {
   "p05": 0.673,
