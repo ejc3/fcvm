@@ -1572,9 +1572,33 @@ podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-# Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
-mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
-FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+# The data dir MUST live on the same filesystem as the base rootfs, or the
+# VM disk cannot be a reflink of it. FICLONE is refused across superblocks
+# (EXDEV) by the VFS before FUSE is ever consulted, so a data dir on the L1's
+# local disk silently turns an O(1) clone into a full ~10GB copy pulled
+# through fuse-pipe (src/storage/disk.rs falls back to cp). That is issue
+# #810: under the parallel suite the copy blows the `timeout 600` below and
+# the nested tests die at a near-constant 843s, passing on retry in 100-307s.
+#
+# This used to be a local dir because of "Unix socket issues on FUSE"
+# (55ef6350, 2026-01-04). Measured 2026-08-16 on a real guest: AF_UNIX bind
+# AND connect both succeed on the fuse-pipe mount, and fuse-pipe has had
+# mknod for special files including sockets since 26c75963 (2025-11-28), five
+# weeks BEFORE that workaround. The L1's own disk is ext4, which has no
+# reflink at all, so this mount is the only place CoW can happen.
+#
+# A uuid, not $$: concurrent L1s share this host directory through the map,
+# and separate PID namespaces reuse numbers (see AGENTS.md on the cross-VM
+# cache race).
+# Short on purpose. AF_UNIX sun_path is 108 bytes and the VM's sockets sit at
+# <data>/vm-disks/vm-<32 hex>/firecracker.socket, which is 63 bytes on its own.
+# A full uuid here produced a 128 byte path, bind() failed, and the L2's
+# VolumeServer died with "channel closed". That is almost certainly what was
+# misread in 55ef6350 as "FUSE doesn't support Unix sockets": the failure was
+# path length, not the filesystem.
+NESTED_DATA=/mnt/fcvm-btrfs/nd/$(cut -c1-8 /proc/sys/kernel/random/uuid)
+mkdir -p $NESTED_DATA/state $NESTED_DATA/vm-disks
+FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --no-snapshot \
     --name l{next_level} \
     --network bridged \
@@ -1611,9 +1635,33 @@ podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-# Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
-mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
-FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+# The data dir MUST live on the same filesystem as the base rootfs, or the
+# VM disk cannot be a reflink of it. FICLONE is refused across superblocks
+# (EXDEV) by the VFS before FUSE is ever consulted, so a data dir on the L1's
+# local disk silently turns an O(1) clone into a full ~10GB copy pulled
+# through fuse-pipe (src/storage/disk.rs falls back to cp). That is issue
+# #810: under the parallel suite the copy blows the `timeout 600` below and
+# the nested tests die at a near-constant 843s, passing on retry in 100-307s.
+#
+# This used to be a local dir because of "Unix socket issues on FUSE"
+# (55ef6350, 2026-01-04). Measured 2026-08-16 on a real guest: AF_UNIX bind
+# AND connect both succeed on the fuse-pipe mount, and fuse-pipe has had
+# mknod for special files including sockets since 26c75963 (2025-11-28), five
+# weeks BEFORE that workaround. The L1's own disk is ext4, which has no
+# reflink at all, so this mount is the only place CoW can happen.
+#
+# A uuid, not $$: concurrent L1s share this host directory through the map,
+# and separate PID namespaces reuse numbers (see AGENTS.md on the cross-VM
+# cache race).
+# Short on purpose. AF_UNIX sun_path is 108 bytes and the VM's sockets sit at
+# <data>/vm-disks/vm-<32 hex>/firecracker.socket, which is 63 bytes on its own.
+# A full uuid here produced a 128 byte path, bind() failed, and the L2's
+# VolumeServer died with "channel closed". That is almost certainly what was
+# misread in 55ef6350 as "FUSE doesn't support Unix sockets": the failure was
+# path length, not the filesystem.
+NESTED_DATA=/mnt/fcvm-btrfs/nd/$(cut -c1-8 /proc/sys/kernel/random/uuid)
+mkdir -p $NESTED_DATA/state $NESTED_DATA/vm-disks
+FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --no-snapshot \
     --name l{next_level} \
     --network bridged \
@@ -1649,9 +1697,33 @@ podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-# Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
-mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
-FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+# The data dir MUST live on the same filesystem as the base rootfs, or the
+# VM disk cannot be a reflink of it. FICLONE is refused across superblocks
+# (EXDEV) by the VFS before FUSE is ever consulted, so a data dir on the L1's
+# local disk silently turns an O(1) clone into a full ~10GB copy pulled
+# through fuse-pipe (src/storage/disk.rs falls back to cp). That is issue
+# #810: under the parallel suite the copy blows the `timeout 600` below and
+# the nested tests die at a near-constant 843s, passing on retry in 100-307s.
+#
+# This used to be a local dir because of "Unix socket issues on FUSE"
+# (55ef6350, 2026-01-04). Measured 2026-08-16 on a real guest: AF_UNIX bind
+# AND connect both succeed on the fuse-pipe mount, and fuse-pipe has had
+# mknod for special files including sockets since 26c75963 (2025-11-28), five
+# weeks BEFORE that workaround. The L1's own disk is ext4, which has no
+# reflink at all, so this mount is the only place CoW can happen.
+#
+# A uuid, not $$: concurrent L1s share this host directory through the map,
+# and separate PID namespaces reuse numbers (see AGENTS.md on the cross-VM
+# cache race).
+# Short on purpose. AF_UNIX sun_path is 108 bytes and the VM's sockets sit at
+# <data>/vm-disks/vm-<32 hex>/firecracker.socket, which is 63 bytes on its own.
+# A full uuid here produced a 128 byte path, bind() failed, and the L2's
+# VolumeServer died with "channel closed". That is almost certainly what was
+# misread in 55ef6350 as "FUSE doesn't support Unix sockets": the failure was
+# path length, not the filesystem.
+NESTED_DATA=/mnt/fcvm-btrfs/nd/$(cut -c1-8 /proc/sys/kernel/random/uuid)
+mkdir -p $NESTED_DATA/state $NESTED_DATA/vm-disks
+FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --no-snapshot \
     --name l{next_level} \
     --network bridged \
@@ -1756,6 +1828,21 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
     let log_content = tokio::fs::read_to_string(&log_file)
         .await
         .unwrap_or_default();
+
+    // The nested VM's disk must be a reflink of the base image, never a copy.
+    // A cross-device fallback means the data dir drifted off the filesystem
+    // that holds the base rootfs, which converts an O(1) clone into a full
+    // ~10GB copy through fuse-pipe. That is invisible in a passing run on a
+    // quiet box (it merely takes 327s instead of 30s) and fatal under the
+    // parallel suite, where it blows the inner `timeout 600` and the test dies
+    // at a near-constant 843s. Issue #810 went unattributed for seven months
+    // because the degrade only warns. Assert on it instead.
+    assert!(
+        !log_content.contains("reflink failed (cross-device)"),
+        "the nested VM disk fell back to a full copy instead of a reflink. The data dir is \
+         not on the same filesystem as the base rootfs, so FICLONE was refused with EXDEV. \
+         Check FCVM_DATA_DIR in this test's script."
+    );
 
     // Verify all level markers present
     for level in 1..=n {

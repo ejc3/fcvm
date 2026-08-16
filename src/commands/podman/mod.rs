@@ -1353,6 +1353,13 @@ async fn prepare_vm_for_lifecycle(
     }
 
     // Setup paths
+    //
+    // Checked before anything is created: the VM's Unix sockets live in this
+    // directory, and a directory a few characters too deep pushes them past
+    // sun_path. bind() then fails with ENAMETOOLONG and surfaces far away from
+    // the cause (observed as "VolumeServer failed to signal ready: channel
+    // closed"), so refuse it here where the path can still be named.
+    paths::check_socket_path_budget(&vm_id)?;
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
         .await
