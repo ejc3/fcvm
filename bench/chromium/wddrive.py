@@ -32,10 +32,6 @@ import urllib.request
 MINIBROWSER = "/usr/local/bin/MiniBrowser"
 
 
-def mono():
-    return time.clock_gettime(time.CLOCK_MONOTONIC)
-
-
 class WdError(RuntimeError):
     pass
 
@@ -155,7 +151,8 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
                    ("no such window", "no such execution context", "no such frame")):
             raise
         sentinel = False
-    wd(host, "POST", f"/session/{session}/url", {"url": url}, timeout=timeout)
+    wd(host, "POST", f"/session/{session}/url", {"url": url},
+       timeout=max(1.0, deadline - time.monotonic()))
     while True:
         state = wd(host, "POST", f"/session/{session}/execute/sync",
                    {"script": ("return [document.readyState, "
@@ -205,7 +202,6 @@ def main():
     p.add_argument("--host", default="127.0.0.1:9515")
     p.add_argument("--session-file",
                    help="read the warm session id from this file")
-    p.add_argument("--session-id", help="explicit session id (overrides file)")
     p.add_argument("--create", action="store_true",
                    help="create a NEW session (warm point only) and write its id "
                         "to --session-file")
@@ -215,7 +211,7 @@ def main():
                         "verify the session reports it (warm-point quiescence)")
     args = p.parse_args()
 
-    t0 = mono()
+    t0 = time.monotonic()
     try:
         if args.create:
             if not args.session_file:
@@ -224,24 +220,22 @@ def main():
             with open(args.session_file, "w") as target:
                 target.write(session + "\n")
         else:
-            session = args.session_id
-            if not session:
-                if not args.session_file:
-                    p.error("give --session-id or --session-file")
-                with open(args.session_file) as source:
-                    session = source.read().strip()
+            if not args.session_file:
+                p.error("give --session-file")
+            with open(args.session_file) as source:
+                session = source.read().strip()
 
-        t_connect = mono()
+        t_connect = time.monotonic()
         current_url(args.host, session)
-        connect_ms = (mono() - t_connect) * 1000
+        connect_ms = (time.monotonic() - t_connect) * 1000
 
-        t_nav = mono()
+        t_nav = time.monotonic()
         navigate(args.host, session, args.url)
-        navigate_ms = (mono() - t_nav) * 1000
+        navigate_ms = (time.monotonic() - t_nav) * 1000
 
-        t_shot = mono()
+        t_shot = time.monotonic()
         png = screenshot(args.host, session)
-        screenshot_ms = (mono() - t_shot) * 1000
+        screenshot_ms = (time.monotonic() - t_shot) * 1000
         if not png.startswith(b"\x89PNG"):
             raise WdError(f"screenshot is not a PNG ({png[:8]!r})")
         with open(f"{args.out_prefix}.png", "wb") as target:
@@ -259,12 +253,12 @@ def main():
         # b64decode raises ValueError. Each of those escaped as a traceback and
         # took the parseable one-line contract with it -- losing RENDER_FAIL
         # exactly in the failure case any harness keys on.
-        total_ms = (mono() - t0) * 1000
+        total_ms = (time.monotonic() - t0) * 1000
         print(f"RENDER_FAIL url={args.url} error={type(error).__name__}: {error} "
               f"total_ms={total_ms:.1f}")
         return 1
 
-    total_ms = (mono() - t0) * 1000
+    total_ms = (time.monotonic() - t0) * 1000
     print(
         f"RENDER_OK url={args.url} connect_ms={connect_ms:.1f} "
         f"navigate_ms={navigate_ms:.1f} screenshot_ms={screenshot_ms:.1f} "
