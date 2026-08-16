@@ -129,6 +129,20 @@ jobs:
             # matcher — which is why this was easy to miss.
             case "$f" in
               scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*) ;;
+              # Docs that TESTS READ are code, whatever their extension.
+              # tests/test_documented_make_targets.rs reads README.md and
+              # PERFORMANCE.md and fails when they name make targets that do not
+              # exist; it runs ungated under `make test-unit` in the host job. A
+              # PR editing only those files was getting zero gating jobs while
+              # the very lints that check them sat unrun -- the same hole this
+              # file fixes for bench/, one directory up.
+              README.md|PERFORMANCE.md) code=true; echo "linted doc: $f" ;;
+              # The Makefile is BOTH: ordinary code, and the subject of
+              # bench/chromium/test_reqbench.py::MakefileBenchGraph, the
+              # structural pin AGENTS.md cites for the bench dependency graph.
+              # It runs `make -pq` against this file, so a Makefile-only change
+              # is exactly the class that can break it.
+              Makefile) code=true; bench=true; echo "makefile: $f" ;;
               bench/*) bench=true; echo "bench path: $f" ;;
               docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;

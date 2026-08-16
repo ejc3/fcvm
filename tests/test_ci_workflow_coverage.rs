@@ -1221,7 +1221,12 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
     for (path, want_code, want_bench) in [
         ("bench/chromium/reqbench.py", false, true),
         ("bench/chromium/test_reqbench.py", false, true),
-        ("README.md", false, false),
+        // README.md and PERFORMANCE.md are LINTED by
+        // tests/test_documented_make_targets.rs, so they must reach the matrix.
+        ("README.md", true, false),
+        ("PERFORMANCE.md", true, false),
+        // The Makefile is both code and the subject of MakefileBenchGraph.
+        ("Makefile", true, true),
         ("AGENTS.md", false, false),
         ("docs/design.md", false, false),
         (".claude/skills/pr-workflow/SKILL.md", false, false),
@@ -1326,9 +1331,23 @@ fn renames_are_classified_by_their_source_path_too() {
         .filter_map(|s| s.get("run").and_then(Value::as_str))
         .find(|r| r.contains("gh api"))
         .expect("`changes` job no longer lists changed files");
+    // Assert on the --jq ARGUMENT, not on the whole `run:` block. The block now
+    // explains previous_filename in prose, so `run.contains("previous_filename")`
+    // stayed true even with the query reverted to `.[].filename` -- a test that
+    // could not fail for the defect it names.
+    let jq = run
+        .split("--jq")
+        .nth(1)
+        .and_then(|rest| {
+            let rest = rest.trim_start();
+            let quote = rest.chars().next()?;
+            rest[1..].split(quote).next()
+        })
+        .expect("the changed-file step no longer passes a --jq expression");
     assert!(
-        run.contains("previous_filename"),
-        "the changed-file query reads only `.filename`, so moving a source file into \
-         bench/ or docs/ hides it from the classifier and skips the matrix"
+        jq.contains("previous_filename"),
+        "the changed-file --jq expression is {jq:?}, which reads only the post-rename \
+         path, so moving a source file into bench/ or docs/ hides it from the \
+         classifier and skips the whole matrix"
     );
 }
