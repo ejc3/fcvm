@@ -18,6 +18,16 @@ pub async fn run() -> Result<()> {
     // block a thread on a full tty buffer. See fc-agent/src/console.rs.
     crate::console::init();
 
+    // Periodic guest vitals. A plain OS thread, not a tokio task: a wedged
+    // procfs read must not be able to starve the runtime that serves execs.
+    // The `[fcvm-vitals]` prefix routes these to the per-VM debug file and NOT
+    // the job log (src/firecracker/vm.rs classifies console lines), which is
+    // what lets this run for every VM without flooding a runner.
+    std::thread::spawn(|| loop {
+        eprintln!("[fcvm-vitals] {}", crate::vitals::sample_line());
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    });
+
     eprintln!("[fc-agent] run_agent starting");
 
     system::raise_resource_limits();

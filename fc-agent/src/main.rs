@@ -15,6 +15,7 @@ mod snapshot_network;
 mod system;
 mod tty;
 mod types;
+mod vitals;
 mod vsock;
 
 use std::fmt;
@@ -116,6 +117,16 @@ async fn main() {
         eprintln!("[fc-agent] ==========================================");
         eprintln!("[fc-agent] FATAL ERROR: Container failed to start");
         eprintln!("[fc-agent] Error: {:?}", e);
+        // Guest resources at the instant of failure. Without this the host sees
+        // only podman's one-liner, and issue #841 showed where that leads: two
+        // occurrences of `conmon bytes ""` with no way to tell an out-of-memory
+        // guest from a full /run tmpfs from PTY exhaustion.
+        eprintln!("[fc-agent] VITALS guest begin (container failed to start)");
+        eprint!(
+            "{}",
+            crate::vitals::snapshot_bounded(std::time::Duration::from_secs(3))
+        );
+        eprintln!("[fc-agent] VITALS guest end");
         eprintln!("[fc-agent] ==========================================");
         vsock::notify_container_exit(1);
         system::shutdown_vm(1).await;
