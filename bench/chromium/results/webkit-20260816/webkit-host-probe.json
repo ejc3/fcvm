@@ -69,6 +69,12 @@
    "fisher_exact_two_sided_p": 0.395,
    "reading": "Indistinguishable at this sample size: the upgrade did NOT fix the stall, and the apparent worsening is not significant. Pooled across both versions the stall rate is 10/21 = 48%. So this is a live defect in the CURRENT upstream stable WebKitGTK (2.52.5), not an artifact of Debian bookworm shipping an old series.",
    "completion_time_when_ok_s": 1.6
+  },
+  "pooled_across_all_arms": {
+   "stalled": 13,
+   "attempts": 31,
+   "rate": "42%",
+   "wilson95": "[26%, 59%]"
   }
  },
  "chromium_host_reference": {
@@ -91,5 +97,28 @@
    "verdict": "bookworm pinned one full stable series behind; base image moved to trixie"
   },
   "caveat": "The Chromium image stays on bookworm because its Chromium version is identical and moving it would invalidate every golden and seal measured on 2026-08-16. Engine comparisons therefore span two base images (different libc and fonts). State that wherever the two engines are compared."
+ },
+ "mechanism_investigation": {
+  "two_of_my_inferences_were_wrong": [
+   "'the session stays responsive' does NOT prove the WebProcess is alive. GET /session/<id>/url maps to Automation.getBrowsingContext, which builds its reply from page.pageLoadState().activeURL() -- pure UI-process state, no IPC to the WebProcess. A 200 proves only that the UI-process run loop is alive.",
+   "'a lighter page navigates instantly' is ambiguous. waitForNavigationToCompleteOnPage returns IMMEDIATELY when !isLoading && !hasUncommittedLoad, so 0.0-0.1 s is the signature of that early-return branch -- which also fires when the WebProcess never acknowledged the load."
+  ],
+  "sharpest_discriminator": "A stalling run burns ~8 CPU-seconds; a successful run of the SAME page returns in 1.4 s. A 5-6x work difference on identical input means a different code path was taken, which rules out every 'UI process dropped the completion' candidate -- those predict identical work in both cases.",
+  "leading_candidate_NOT_confirmed": {
+   "hypothesis": "Accelerated 2D canvas under Xvfb/llvmpipe: getImageData does a synchronous readPixels on the main thread and flushContext waits on a GL fence with NO timeout (GLFenceEGL passes EGL_FOREVER_KHR, GLFenceGL passes GL_TIMEOUT_IGNORED). A stuck fence would mean the script never returns, Document::parsing() stays true, checkCompleted() early-returns forever and the load event never fires.",
+   "test": "WEBKIT_DISABLE_COMPOSITING_MODE=1, same 10-trial protocol",
+   "result": {
+    "compositing_on": "6/10 stalled",
+    "compositing_off": "3/10 stalled",
+    "fisher_p": 0.37
+   },
+   "verdict": "NOT CONFIRMED. Stalls persist with compositing disabled and the reduction is not significant. Caveat on this negative: I did not verify that the env var actually disabled the accelerated canvas path, so the intervention itself is unproven and the negative is only as strong as the intervention."
+  },
+  "second_independent_defect": {
+   "observed": "a navigate ran 390 s with no response at all (client timeout, not a return)",
+   "expected": "session timeouts report pageLoad=300000, and WebAutomationSession defaultPageLoadTimeout is 300 s",
+   "reading": "A registered wait MUST be answered by 300 s with a WebDriver `timeout` error. It was not. So either the callback was never registered with a deadline, or its deadline was stripped -- WebAutomationSession has a single shared m_loadTimer that any resolving wait calls stop() on. This is a separate defect from the stall itself."
+  },
+  "status": "mechanism NOT established; the two facts above are established"
  }
 }
