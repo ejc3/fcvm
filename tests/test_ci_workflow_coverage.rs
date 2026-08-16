@@ -357,6 +357,79 @@ fn summary_fails_when_a_gating_job_fails() {
     }
 }
 
+/// A diagnostic that cannot run is worse than no diagnostic: it is silent in
+/// exactly the case it was written for, and its silence reads as "nothing to
+/// report". The runner-loss step shipped that way for one review round. It runs
+/// inside `summary`, whose own checkout happens AFTER the gate step that exits
+/// 1, so without a checkout of its own the script it invokes does not exist,
+/// python exits ENOENT, and the annotation never appears on any run.
+#[test]
+fn runner_loss_diagnosis_can_actually_run() {
+    let ci = parse_workflow("ci.yml");
+    let summary = workflow_job(&ci, "summary");
+    let steps = summary
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`summary` job has no steps");
+
+    let diagnose_index = steps
+        .iter()
+        .position(|s| {
+            s.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.contains("Diagnose runner loss"))
+        })
+        .expect(
+            "ci.yml's `summary` job has no `Diagnose runner loss` step, so a dead runner agent \
+             stays indistinguishable from a test failure",
+        );
+
+    let checkout_before = steps[..diagnose_index].iter().any(|s| {
+        s.get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|u| u.starts_with("actions/checkout"))
+    });
+    assert!(
+        checkout_before,
+        "`Diagnose runner loss` runs before any checkout in the `summary` job, so the classifier \
+         it invokes is not on disk. The step then fails to ENOENT and prints nothing, on every \
+         run, forever."
+    );
+
+    let run = steps[diagnose_index]
+        .get("run")
+        .and_then(Value::as_str)
+        .expect("`Diagnose runner loss` has no `run` block");
+
+    // Every script path the step names must exist in the repo. A path typo
+    // (`fcvm/scripts/...` when the checkout lands at the workspace root) is the
+    // same unrunnable-check bug wearing different clothes.
+    let repo_root = workflow_path("ci.yml")
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .expect("cannot locate repo root from workflow path")
+        .to_path_buf();
+    let mut checked = 0;
+    for token in run.split_whitespace() {
+        let candidate = token.trim_matches(|c| c == '"' || c == '\'');
+        if !candidate.ends_with(".py") {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            repo_root.join(candidate).is_file(),
+            "`Diagnose runner loss` invokes `{candidate}`, which does not exist relative to the \
+             checkout root. The step would exit ENOENT and emit no diagnosis."
+        );
+    }
+    assert!(
+        checked > 0,
+        "`Diagnose runner loss` names no .py script, so this test verified nothing. If the step \
+         changed shape, update the check rather than letting it pass vacuously."
+    );
+}
+
 /// The infrastructure classifier decides whether a failed CI run is retried or
 /// handed to a secret-bearing code fixer. Its fixture suite must execute in the
 /// ordinary pull-request gate, not remain a manual-only Make target.

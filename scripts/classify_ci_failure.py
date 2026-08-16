@@ -16,6 +16,8 @@ run into a mixed failure. Every unknown shape is non-infrastructure.
 from __future__ import annotations
 
 import argparse
+import datetime
+import email.utils
 import json
 import re
 import subprocess
@@ -75,6 +77,9 @@ def _validate_jobs(jobs: Any) -> list[dict[str, Any]]:
         conclusion = job.get("conclusion")
         if conclusion is not None and not isinstance(conclusion, str):
             raise InputError(f"job {job_id} has an invalid conclusion")
+        completed_at = job.get("completed_at")
+        if completed_at is not None and not isinstance(completed_at, str):
+            raise InputError(f"job {job_id} has an invalid completed_at")
         steps = job.get("steps")
         if not isinstance(steps, list):
             raise InputError(f"job {job_id} has no steps array")
@@ -106,6 +111,11 @@ def _validate_logs(logs: Any) -> dict[str, dict[str, Any]]:
             raise InputError(f"log evidence for job {job_id} has invalid status")
         if status == "available" and not isinstance(evidence.get("text"), str):
             raise InputError(f"available log evidence for job {job_id} needs text")
+        last_modified = evidence.get("last_modified")
+        if last_modified is not None and not isinstance(last_modified, str):
+            raise InputError(
+                f"log evidence for job {job_id} has an invalid last_modified"
+            )
         if status == "missing_blob" and (
             evidence.get("http_status") != 404
             or evidence.get("error_code") != "BlobNotFound"
@@ -170,6 +180,21 @@ def _fetch_jobs(repository: str, run_id: int, run_attempt: int) -> list[dict[str
     return _validate_jobs(jobs)
 
 
+def _last_modified_header(response: str) -> str | None:
+    """The Last-Modified value from a `gh api --include` response, if present.
+
+    Headers end at the first blank line; a log body can contain anything,
+    including a line that looks like a header, so parsing must stop there.
+    """
+    for line in response.splitlines():
+        if not line.strip():
+            return None
+        name, separator, value = line.partition(":")
+        if separator and name.strip().lower() == "last-modified":
+            return value.strip()
+    return None
+
+
 def _fetch_log(repository: str, job_id: int) -> dict[str, Any]:
     endpoint = f"repos/{repository}/actions/jobs/{job_id}/logs"
     # gh <= 2.96 has no --allow-escape-sequences option and emits captured API
@@ -185,7 +210,14 @@ def _fetch_log(repository: str, job_id: int) -> dict[str, Any]:
             ["api", "--include", "--allow-escape-sequences", endpoint]
         )
     if result.returncode == 0:
-        return {"status": "available", "text": result.stdout}
+        evidence: dict[str, Any] = {"status": "available", "text": result.stdout}
+        # `--include` already returns the response headers, so the blob's write
+        # time costs no extra request. Absent or malformed, the field is simply
+        # omitted and the stale-gap witness cannot fire.
+        last_modified = _last_modified_header(result.stdout)
+        if last_modified is not None:
+            evidence["last_modified"] = last_modified
+        return evidence
 
     response = f"{result.stdout}\n{result.stderr}"
     if "gh: HTTP 404" in response and "BlobNotFound" in response:
@@ -267,6 +299,41 @@ def _has_silent_loss_shape(job: dict[str, Any]) -> bool:
     )
 
 
+# A log blob that stopped growing this long before GitHub concluded the job is
+# a runner that died, not a job that ran. Measured on the live API the two
+# populations do not overlap: runner-concluded jobs write their blob within
+# 0-2s of completed_at (n=66), agent-death jobs show 569-1149s (n=6). 120s sits
+# 60x above the largest healthy gap and 4.7x below the smallest observed loss.
+STALE_LOG_SECONDS = 120
+
+
+def _blob_stale_seconds(
+    job: dict[str, Any], evidence: dict[str, Any]
+) -> float | None:
+    """Seconds between the log blob's last write and the job's conclusion.
+
+    Returns None whenever the answer is not knowable: a missing or unparseable
+    timestamp on either side, or a negative gap. Every such case falls through
+    to `unknown`, so an unreadable header can never manufacture an
+    infrastructure verdict.
+    """
+    completed_at = job.get("completed_at")
+    last_modified = evidence.get("last_modified")
+    if not isinstance(completed_at, str) or not isinstance(last_modified, str):
+        return None
+    try:
+        concluded = datetime.datetime.fromisoformat(
+            completed_at.replace("Z", "+00:00")
+        )
+        written = email.utils.parsedate_to_datetime(last_modified)
+    except (ValueError, TypeError):
+        return None
+    if concluded.tzinfo is None or written.tzinfo is None:
+        return None
+    gap = (concluded - written).total_seconds()
+    return gap if gap >= 0 else None
+
+
 def _classify_root_job(
     job: dict[str, Any], evidence: dict[str, Any] | None
 ) -> tuple[str, str]:
@@ -283,6 +350,17 @@ def _classify_root_job(
         return "infrastructure_explicit", "GitHub runner shutdown sentinel"
     if evidence.get("status") == "missing_blob" and _has_silent_loss_shape(job):
         return "infrastructure_silent", "null-step runner loss with missing log blob"
+    if evidence.get("status") == "available" and _has_silent_loss_shape(job):
+        # The blob survived but stopped mid-job. Same event as the missing-blob
+        # case; GitHub simply kept what the dying agent had already flushed.
+        # The null-step shape stays REQUIRED: the gap is a second witness, never
+        # the only one.
+        stale_by = _blob_stale_seconds(job, evidence)
+        if stale_by is not None and stale_by >= STALE_LOG_SECONDS:
+            return (
+                "infrastructure_silent",
+                f"null-step runner loss with log blob stale by {stale_by:.0f}s",
+            )
     return "unknown", "no exclusive runner-loss evidence"
 
 

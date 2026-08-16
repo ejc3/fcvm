@@ -962,6 +962,54 @@ jobs:
       #
       # `skipped` is deliberately not a failure: skip-check legitimately skips the
       # matrix when this tree SHA already passed on a PR branch.
+      # Runs BEFORE the gate below, which exits 1 and would skip anything after
+      # it. A dead runner agent produces a job failure indistinguishable from a
+      # test failure, so without this the operator re-reads a passing test suite
+      # hunting a bug that was never there. The classifier is narrow and
+      # fail-closed; this step is a diagnostic and must never turn a green run
+      # red, so every failure inside it degrades to silence.
+      # Summary does not check out until AFTER the gate below, and the gate
+      # exits 1, so the diagnosis needs its own checkout here. Without it the
+      # step invoked a path that does not exist, python exited ENOENT, the
+      # discarded stderr hid it, and the diagnosis silently never appeared on
+      # any run: a check that cannot fire, which is worse than no check.
+      - name: Check out for runner-loss diagnosis
+        if: contains(needs.*.result, 'failure')
+        uses: actions/checkout@v7
+      - name: Diagnose runner loss
+        if: contains(needs.*.result, 'failure')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          # Every reason this cannot render a verdict is announced. A diagnostic
+          # that stays quiet is indistinguishable from one that found nothing.
+          if [ ! -f scripts/classify_ci_failure.py ]; then
+            echo "::notice::runner-loss diagnosis skipped: classifier not present"
+            exit 0
+          fi
+          VERDICT=$(python3 scripts/classify_ci_failure.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" 2>/tmp/classify.err)
+          if [ -z "$VERDICT" ]; then
+            echo "::notice::runner-loss diagnosis unavailable: $(head -c 300 /tmp/classify.err | tr '\n' ' ')"
+            exit 0
+          fi
+          CLASSIFICATION=$(printf '%s' "$VERDICT" | jq -r '.classification' 2>/dev/null)
+          if [ -z "$CLASSIFICATION" ] || [ "$CLASSIFICATION" = null ]; then
+            echo "::notice::runner-loss diagnosis unreadable: classifier emitted no classification"
+            exit 0
+          fi
+          [ "$CLASSIFICATION" = infrastructure ] || exit 0
+          printf '%s' "$VERDICT" | jq -r '
+            .jobs[]
+            | select(.kind | startswith("infrastructure"))
+            | "::error::\(.name): the runner agent died mid-job (\(.reason)). This is NOT a test failure."
+          ' 2>/dev/null
+          exit 0
+
       - name: Fail if any gating job did not succeed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         env:
