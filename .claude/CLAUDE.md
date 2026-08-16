@@ -390,6 +390,29 @@ Host side, captured today:
 | filtered `dmesg` | `dmesg-filtered.log` artifact | host OOM, KVM, page-fault signatures |
 | D-state watchdog | live step log | prints nothing when healthy; an ephemeral runner dies with its artifacts, so the live log is the only channel that survives |
 
+Guest side, pushed by fc-agent (`fc-agent/src/vitals.rs`):
+
+| What | When | Why that field |
+|---|---|---|
+| `MemAvailable`, `Committed_AS` | every 10s, and in full at failure sites | a 1024 MiB guest can fail a fork or an mmap with nothing in dmesg |
+| `pty/nr` vs `pty/max` | same | conmon allocates a PTY per `-t` exec; this is the authoritative free count |
+| `statvfs` of `/run` | same | rootless podman's runroot is `/run/user/<uid>/containers`; ENOSPC there means conmon could not create its socket or exit file and therefore wrote NOTHING, which is issue #841's exact signature |
+| `oom_kill` from `/proc/vmstat` | same | monotonic, cannot wrap, unlike the 128 KiB printk ring |
+| cgroup `pids.current` / `pids.max` | same | the pids controller rejects forks with no message the caller sees |
+
+**It is PUSHED, never pulled, and that is not a style choice.** The obvious design is to run
+`fcvm exec --pid P --vm -- sh -c '...'` from the host at the failure site. That cannot work for
+the cases it exists for: serving an exec makes fc-agent FORK, so a guest out of pids or threads
+fails the collection for the same reason it failed the operation. It also cannot reach a VM
+whose fcvm already exited, an L2 guest, or a test nextest killed. Everything in `vitals.rs` is
+`read`/`readdir`/`statvfs` from an already-running process, so it still answers when the guest
+can no longer create one.
+
+Routing is by prefix and it is load-bearing (`src/firecracker/vm.rs` classifies console lines):
+`[fcvm-vitals]` is DEBUG, so the 10s sampler lands in the per-VM file and NOT the job log, which
+is what lets it run for every VM without flooding a runner. `[fc-agent] VITALS` is INFO, so the
+on-failure block also reaches the test's captured output.
+
 Rules learned the hard way, each from a check that could not fire:
 
 - **Never conclude "no OOM" from a job log.** Guest console lines are DEBUG and filtered out of

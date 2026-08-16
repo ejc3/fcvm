@@ -1759,6 +1759,16 @@ pub async fn run_async(
             status, exit_code
         );
 
+        // podman's own logs are unavailable here: --log-driver=none is
+        // required to prevent a conmon deadlock under burst output. That is
+        // exactly why the guest's own vitals are printed instead, and why they
+        // must be collected without forking (issue #841).
+        eprintln!("[fc-agent] VITALS guest begin (container exited {exit_code})");
+        eprint!(
+            "{}",
+            crate::vitals::snapshot_bounded(std::time::Duration::from_secs(3))
+        );
+        eprintln!("[fc-agent] VITALS guest end");
         // Note: podman logs are unavailable because we use --log-driver=none
         // (required to prevent conmon deadlock under burst output).
         // Container output was already captured through fc-agent's pipe-based

@@ -585,7 +585,14 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let response = ExecResponse::Error(format!("Failed to spawn: {}", e));
+            // A spawn failure is the case a host-side pull can never diagnose:
+            // serving that pull would need this same fork. Carry the fork-free
+            // sample in the error itself.
+            let response = ExecResponse::Error(format!(
+                "Failed to spawn: {} | guest vitals: {}",
+                e,
+                crate::vitals::sample_line()
+            ));
             write_line_to_fd(raw_fd, &serde_json::to_string(&response).unwrap());
             unsafe { libc::close(raw_fd) };
             return;
