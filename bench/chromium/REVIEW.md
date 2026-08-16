@@ -77,7 +77,7 @@ change mid-run (sha256 in `hostinfo.json`).
 
 | # | claim | status now |
 |---|---|---|
-| 1 | "fcvm marginal memory beats a warm container pool (129 vs 151 MiB)" | **SUPPORTED, but much smaller than claimed, and only for some backends.** On a matched cgroup basis: file-backed **143.5 ± 0.4** vs pool **156.5 ± 5.0** MiB/req — an 8% win, not a comfortable one. UFFD copy-mode **loses** (257.8 ± 1.1). UFFD `minor` wins clearly (132.5 ± 1.0 at 4K; **34.7 ± 0.4** with hugepages). |
+| 1 | "fcvm marginal memory beats a warm container pool (129 vs 151 MiB)" | **SUPPORTED, but much smaller than claimed, and only for some backends.** On a matched cgroup basis: file-backed **143.5 ± 0.4** vs pool **156.5 ± 5.0** MiB/req — an 8% win, not a comfortable one. UFFD copy-mode **loses** (257.8 ± 1.1). UFFD `minor` wins clearly at 4K (132.5 ± 1.0). **The hugepage cell is NOT on the matched basis and must not be quoted as a win:** 34.7 ± 0.4 counts only non-hugetlb memory, because this host's cgroup2 mounts without `memory_hugetlb_accounting` (no hugetlb controller at all) and the pool was pre-allocated before the sample, so neither basis can see the guest's 2 MiB pages. On the pool-consumption basis that can, hugepage-minor costs **553-611 MiB per concurrent clone**, i.e. it LOSES to 4K minor on memory and buys render latency instead. |
 | 2 | any egress-mode *ordering* | **STILL NOT SUPPORTED.** The confound is gone (drift term −68.8 ± 51.9 ms/h, n.s.) and within-run SE is now 8.4 ms, but run-to-run shifts reach 52 ms and the IPv6 modes swap rank. Only "the two IPv4 rootless modes are fastest" reproduces; total spread ~110 ms of ~800 ms. |
 | 3 | "16 clones sustain 5.5–6.3 req/s" | **SUPERSEDED.** Throughput, file-backed N=16, sustained phase: **7.3 rps** — 462 completions in 63.6 s, a **SINGLE** sustained window per cell, so n=1 window and no run-to-run rate interval is derivable from the data as collected (the burst cells are replicated 5x and do carry CIs). all 462 launched requests completed — 0/462 incomplete, CP 95% [0, 0.80%]. *Burst figures are NOT throughput and must not be quoted as such* (see the binding requirement below); for completeness the burst cell, with the burst as the experimental unit (5 bursts/cell), came out at 6.4 req/s measured **within** the burst window (CI 6.4–6.7) file-backed and 7.4 (7.2–7.7) hugepage-minor — i.e. the burst *understates* capacity, which is why leading with it was the original defect. |
 | 4 | "7.9 vs 5.3 req/GB" (slope without intercept) | **REPLACED.** Slopes now carry intercepts and SEs and req/GiB is quoted at concrete N. At N=8: hugepage-minor 27.7, minor-4K 7.5, file-4K 7.0, pool 5.5, copy-4K 3.9. |
@@ -95,9 +95,15 @@ change mid-run (sha256 in `hostinfo.json`).
 
 ## Newly measured in this run
 
-- **`--uffd-mode minor`, first measurement.** With 2 MiB hugepages: **34.7 ± 0.4 MiB per
-  concurrent request** (MemAvailable basis 29.1 ± 1.1) — 4.5x better than the warm container pool
-  and 7.4x better than UFFD copy-mode. At 4K: 132.5 ± 1.0.
+- **`--uffd-mode minor`, first measurement.** At 4K: **132.5 ± 1.0 MiB per concurrent request**,
+  the figure that stands. With 2 MiB hugepages the run recorded 34.7 ± 0.4 (MemAvailable basis
+  29.1 ± 1.1), and that figure **counts only non-hugetlb memory**: cgroup2 here mounts without
+  `memory_hugetlb_accounting` and carries no hugetlb controller, so `memory.current` cannot see
+  2 MiB pages, and the pool was pre-allocated before the sample, so MemAvailable cannot move for
+  them either. The "4.5x better than the warm container pool, 7.4x better than copy-mode"
+  reading that accompanied it compared a number excluding the guest's RAM against numbers
+  including it. On the pool-consumption basis, hugepage-minor is **553-611 MiB per concurrent
+  clone** — 4x WORSE than 4K minor on memory, and it is bought for render latency, not density.
 - **`minor` buys memory, not rate.** At a sustained 8 rps the 4K `minor` cell needed 165 s to
   drain 459 requests (2.8 rps achieved, p50 1224 ms, 1 request timed out — 1/459 = 0.22%
   [0.006%, 1.21%]) while file-backed held 7.3 rps with 462/462 complete. Both rates come from a

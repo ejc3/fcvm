@@ -22,10 +22,17 @@ carries no `<!doctype>`, `<html>`, `<head>` or `<body>` — the publisher wraps 
 Edit here, then republish to the SAME artifact so the URL is stable:
 
     Artifact(file_path="bench/chromium/report/shared-nothing-renders.html",
-             url="https://claude.ai/code/artifact/bc59e62a-a8b3-49f1-b759-878061c94a2e")
+             url="https://claude.ai/code/artifact/bc59e62a-a8b3-49f1-b759-878061c94a2e",
+             favicon="🔬",
+             description="Per-request-isolated Chromium in Firecracker microVMs, measured on Cloudflare's 14-URL corpus")
+
+`favicon` is REQUIRED — a publish without it is rejected, and the incantation
+above is meant to be pasted. Keep the same emoji across redeploys: readers find
+the tab by its icon. `description` is the gallery subtitle; omitting it on a
+redeploy drops the one already there.
 
 Publishing WITHOUT `url=` creates a second artifact. That already happened once:
-`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same 15 sections and differs
+`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same 14 sections and differs
 only in a cache-busting `<base href>`. It is stale the moment this file changes,
 and it is public.
 
@@ -74,11 +81,56 @@ each is a claim the evidence no longer supports:
    section prices it. Do NOT resolve that by deleting the clause: it is the last
    in-document hedge on the section with zero retrievable evidence. Demote the
    section instead.
-4. The huge-minor memory cell (34.7 MiB/clone) is not a memory measurement.
-   This host has no memory_hugetlb_accounting, so the cgroup cannot see hugetlb
-   pages at all, and the pool was pre-allocated before the sample so MemAvailable
-   cannot move either. The N=16 cell demanded 32 GiB of hugepages and published
-   34.7 MiB/clone. It is defensible only as "non-hugetlb memory".
-5. The five headline runs are not mutually seal-comparable: five bundles, five
+4. The five headline runs are not mutually seal-comparable: five bundles, five
    revisions, three snapshot tags. Only the -huge pair shares a seal, so any
    cross-run subtraction crosses a seal boundary and should say so.
+
+## Corrections applied
+
+Kept as a record of what was wrong, because a corrections file that only ever
+grows is a file nobody acts on.
+
+The 34.7 MiB/clone huge-minor cell was filed here as a correction to
+`shared-nothing-renders.html`, which never published it. It lives in
+`bench/chromium/README.md` and `bench/chromium/REVIEW.md` — the second being the
+file `bench/chromium/README.md` tells readers to "read before quoting anything
+from this directory". Filing it against the wrong document left the overclaim
+standing in the two files a reader is pointed at. Both are now corrected in
+place: 34.7 counts only non-hugetlb memory, since cgroup2 on this host mounts
+without `memory_hugetlb_accounting` and carries no hugetlb controller (verified:
+`mount | grep cgroup2` shows `rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot`),
+and the pool was pre-allocated before the sample, so MemAvailable cannot move
+for those pages either. On the pool-consumption basis, hugepage-minor is
+553-611 MiB per concurrent clone against 133-146 at 4K — it loses on memory and
+buys render latency.
+
+Eleven further defects were found by an adversarial review of this branch and
+fixed in the same pass:
+
+- "Neither mode's render or memory regresses with concurrency at 1 GiB" was
+  refuted by the table directly above it: density render goes 476, 461, 448,
+  then 767 ms at N=32. Now stated as the regression it is.
+- The Bottom line called hugepage per-clone memory "unmeasured and the next
+  experiment" while two sections measure and publish it.
+- "124-298 MiB per concurrent clone at 4 K pages": 298 appears nowhere in the
+  document; the tables give 133-146 at 1 GiB and 108-203 across both guest sizes.
+- WebKit's clean N=1 marginal (147) was compared against Chromium's 124, an
+  ablation floor probe. The matched clean cell is 146, so the engines are at
+  parity.
+- Upstream PR #5696 was cited for two different fixes. It is the dump_dirty PR
+  (verified against the firecracker repo); the vsock muxer change was never
+  filed upstream at all, and now says so.
+- "Plus five commits ... Ranked by relevance:" listed four bullets. The branch is
+  six commits ahead, five non-merge; the serial-interrupt bullet covers two of
+  them (fix plus regression test).
+- "On 4K pages copy is 14% faster than minor" inverted the base: 532.5 vs 607.9
+  makes minor 14% slower and copy 12% faster. Restated to match the body.
+- "Across all 370 LD clones" cannot be reconciled with the rung list (nine rungs,
+  199 clones per fill mode) and the record is gone, so the unverifiable total is
+  no longer asserted.
+- Kitesurf's Chromium column was called "their isolated Chromium" in one place
+  and a warm pool in three others; the headline 1.8x ratio depends on which.
+- "0 failures anywhere" is scoped to the runs in that table; a bridged attempt
+  was refused by the zero-failure gate.
+- The run-id legend omitted NM, and the publish incantation omitted the required
+  `favicon` argument, and the section count said 15 against 14.
