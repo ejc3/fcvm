@@ -262,11 +262,13 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = Hypervisor::Firecracker)]
     pub hypervisor: Hypervisor,
 
-    /// Routable IPv6 /64 prefix for routed mode VM addressing.
-    /// Each VM gets a unique address in this prefix via NDP proxy.
-    /// When set, MASQUERADE is skipped (the prefix is directly routable).
-    /// When not set, auto-detected from host interfaces.
-    /// Example: --ipv6-prefix 2803:6084:7058:46f6
+    /// Routable IPv6 prefix for routed mode VM addressing: CIDR notation for
+    /// a delegated subnet of any length up to /120 (e.g.
+    /// 2803:6086:9892:947b:1feb:1cca:2:0/112), or a bare 4-group /64
+    /// shorthand (e.g. 2803:6084:7058:46f6). Each VM gets a unique address
+    /// inside the subnet via NDP proxy. When set, MASQUERADE is skipped (the
+    /// prefix is directly routable). When not set, a /64 is auto-detected
+    /// from host interfaces.
     #[arg(long)]
     pub ipv6_prefix: Option<String>,
 
