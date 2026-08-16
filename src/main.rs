@@ -25,9 +25,16 @@ fn raise_resource_limits() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Raise resource limits early for fuse-pipe server
+fn main() -> Result<()> {
+    // Everything that mutates PROCESS-WIDE state runs here, on the one thread
+    // that exists, before the tokio runtime is built.
+    //
+    // `#[tokio::main]` is not a place to do this: it expands to "build a
+    // multi-thread runtime, then block_on the body", so by the time the body
+    // runs the worker threads are already up. `std::env::set_var` is unsafe
+    // precisely because it is a data race against any concurrent reader of the
+    // environment, and `Command::spawn` reads it. Doing it here means there is
+    // no second thread to race with.
     raise_resource_limits();
 
     // Make /usr/sbin and /sbin reachable before anything shells out. fcvm calls
@@ -36,6 +43,13 @@ async fn main() -> Result<()> {
     // break with a bare ENOENT that names no tool.
     fcvm::utils::ensure_sbin_on_path();
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     // Arm deterministic lifecycle failpoints from FCVM_FAILPOINT (test-only
     // instrumentation; no-op when unset). Once, before any command runs.
     failpoint::arm_from_env();
