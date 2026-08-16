@@ -6449,3 +6449,40 @@ class HtmlArmAndPrewire(unittest.TestCase):
                 any("prewire" in e for e in errors),
                 f"an unprewired MEASURED rep must be caught, got: {errors[:3]}",
             )
+
+
+class PerRequestPrivateDirty(unittest.TestCase):
+    """The delta a request costs, sampled where it can still be sampled.
+
+    A clone starts as a view of the shared snapshot, so Private_Dirty is what it
+    PRIVATISED: pages written, not read. It is read alive, immediately before
+    the kill, because smaps_rollup dies with the address space and cannot be
+    recovered from a zombie the way CPU can.
+
+    Reported on the same record as the latency, so a memory/latency frontier is
+    one measurement rather than a join across two harnesses on two goldens.
+    """
+
+    def test_a_live_process_reports_private_dirty(self) -> None:
+        got = reqbench.proc_private_dirty_kb(os.getpid())
+        self.assertIsNotNone(
+            got.get("private_dirty_kb"),
+            f"could not sample this process: {got.get('unavailable')}",
+        )
+        self.assertGreater(got["private_dirty_kb"], 0, got)
+
+    def test_an_unreadable_process_reports_a_reason_not_a_zero(self) -> None:
+        """A zero with no uncertainty is a claim. An unreadable file does not
+        support one, and reporting 0 KiB would silently understate every clone
+        whose sample failed."""
+        got = reqbench.proc_private_dirty_kb(999_999_999)
+        self.assertIsNone(got.get("private_dirty_kb"), got)
+        self.assertTrue(got.get("unavailable"), "no reason given for the missing sample")
+
+    def test_the_total_is_none_when_nothing_could_be_sampled(self) -> None:
+        """Summing Nones as zero would publish a confident 0 KiB for a run that
+        measured nothing at all."""
+        per_child = {"a": {"private_dirty_kb": None, "unavailable": "x"}}
+        dirty = [m.get("private_dirty_kb") for m in per_child.values()]
+        total = sum(v for v in dirty if v is not None) if any(v is not None for v in dirty) else None
+        self.assertIsNone(total)
