@@ -537,6 +537,32 @@ async fn wait_for_guest_to_answer<P: GuestProbe>(
     }
 }
 
+/// The deadline for the port-forward wait, which is NOT the remainder of the
+/// guest-answer wait.
+///
+/// The two stages prove different things in sequence: that the guest's stack
+/// answers, then that pasta's forward is wired. They used to share one
+/// `GUEST_ANSWER_DEADLINE`, so a slow first stage starved the second — and the
+/// first stage is slowest on exactly the hosts where the second one also needs
+/// time.
+///
+/// That became reachable the moment `wait_for_guest_to_answer` learned to
+/// accept on TCP evidence when every neighbour query stalled: it now returns Ok
+/// AT the deadline instead of Err, so the port-forward wait was handed zero.
+/// Observed on a CI runner at load 155:
+///
+/// ```text
+/// WARN  guest answered TCP but the neighbour table was never readable; accepting on the TCP evidence
+/// ERROR pasta port forward not ready within caller readiness budget 0ns: 127.0.0.7:27972
+/// ```
+///
+/// A working VM was torn down for a budget it was never given. Each stage gets
+/// its own, so the worst case is two budgets rather than one shared one — which
+/// is the cost of not killing a guest that answered.
+fn port_forward_deadline(now: tokio::time::Instant) -> tokio::time::Instant {
+    now + GUEST_ANSWER_DEADLINE
+}
+
 /// Deadline error for [`wait_for_guest_to_answer`], naming which half was missing.
 /// The host's load at the instant a readiness probe gave up.
 ///
@@ -1899,7 +1925,8 @@ impl NetworkManager for PastaNetwork {
                 .await;
             return Err(error);
         }
-        self.wait_for_port_forwarding_until(deadline).await
+        self.wait_for_port_forwarding_until(port_forward_deadline(tokio::time::Instant::now()))
+            .await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1910,6 +1937,35 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest-answer wait that consumed its whole budget must not starve the
+    /// port-forward wait that follows it.
+    ///
+    /// RED WITHOUT THE FIX: the two shared one deadline, so when the first
+    /// stage ran to it — which is what the accept-on-TCP-evidence branch does
+    /// by construction — the second was handed 0ns and failed immediately.
+    /// Observed in CI as `pasta port forward not ready within caller readiness
+    /// budget 0ns`, one line after the WARN saying the guest had answered.
+    #[test]
+    fn the_port_forward_wait_gets_its_own_budget() {
+        let start = tokio::time::Instant::now();
+        let guest_answer_deadline = start + GUEST_ANSWER_DEADLINE;
+        // Stage one used every microsecond it had.
+        let after_stage_one = guest_answer_deadline;
+
+        let deadline = port_forward_deadline(after_stage_one);
+        let budget = deadline.saturating_duration_since(after_stage_one);
+
+        assert_eq!(
+            budget, GUEST_ANSWER_DEADLINE,
+            "the port-forward wait inherited the exhausted guest-answer deadline, \
+             so a guest that ANSWERED is torn down for a budget it never got"
+        );
+        assert!(
+            !budget.is_zero(),
+            "zero budget: the wait fails before it can make a single attempt"
+        );
+    }
 
     /// End to end: the readiness ERROR must carry the probe's exit status.
     ///
