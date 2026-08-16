@@ -442,8 +442,14 @@ cmd_build() {
     # HEALTHCHECK with only a warning, and fcvm's health gate is what
     # triggers the golden snapshot (src/health.rs AND-logic).
     podman build --format docker -t "$IMAGE" -f "$REPO/Containerfile.chromium-bench" "$REPO"
-    podman inspect "$IMAGE" --format '{{json .HealthCheck}}' | grep -q cdp_health \
-        || { log "FATAL: image has no HEALTHCHECK (OCI format drop?)"; return 1; }
+    # The warm gate lives or dies here. fcvm treats a MISSING healthcheck as a
+    # PASS, so an image that lost it snapshots a COLD browser and every clone's
+    # "warm" latency is really a first-paint number. Assert the healthcheck
+    # exists AND is ours: health_state.sh, which reports healthy only for a
+    # FRESH verdict from the resident checker, which in turn requires the warm
+    # marker that entry.sh touches only after a full navigate + screenshot.
+    podman inspect "$IMAGE" --format '{{json .HealthCheck}}' | grep -q health_state \
+        || { log "FATAL: image has no HEALTHCHECK naming health_state.sh (OCI format drop, or the Containerfile changed without this check)"; return 1; }
 }
 
 cmd_golden() {
