@@ -141,10 +141,10 @@ fixed in the same pass:
 
 ## The 615.1 ms headline does not reproduce
 
-Regenerated 2026-08-16, same host, same 14 URLs, same knobs: seven gated corpus runs,
-all publishable, zero failures. 2 vCPUs measures **951.2 ms**, 4 measures 706.3,
-8 measures 654.5. The guest is CPU-starved rather than slow -- one `Page.enable`
-round trip costs 15.4 ms on 2 vCPUs and 3.4 ms on 4 -- and the host-container
+Regenerated 2026-08-16, same host, same 14 URLs, same knobs: ten gated corpus runs,
+all publishable, zero failures. 2 vCPUs measures **982.9 ms**, 4 measures 695.7,
+8 measures 647.2. The guest is CPU-starved rather than slow -- one `Page.enable`
+round trip costs 6.8 ms on 2 vCPUs and 3.9 ms on 4 -- and the host-container
 control moved only +9.5% because it gets all 64 cores.
 
 Ruled out with the run that did it: working-set replay, the memory backend,
