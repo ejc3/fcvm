@@ -166,9 +166,12 @@ error bars, and that campaign has not been run.
 
 **elmundo is waiting, not rendering, and the cause is unresolved.** Its
 31,046 ms median is 99% `navigate_load_event_ms`. TTFB is 4.4 ms, the screenshot
-takes 85 ms as on every other page, and `image_bytes` is byte-identical
-(108,917) across all 14 renders: the page is visually complete almost
-immediately and the browser then waits. No healthy mode -- quickest 4.0 s,
+takes 85 ms as on every other page, and the screenshot takes just two forms
+across all 14 renders -- 108,917 bytes ten times and 108,923 four times, two
+distinct SHA-256s -- with which one you get uncorrelated with render time (the
+108,923 variant appears at both the fastest render, 4,390 ms, and the slowest,
+35,070). The page is visually complete almost immediately and the browser then
+waits; waiting longer does not change what is drawn. No healthy mode -- quickest 4.0 s,
 slowest 34.7 s.
 
 It is NOT the unanswered ad chains, which is what this report used to say. Same
