@@ -164,22 +164,25 @@ are within-run and carry no run-to-run variance. Five independent bursts per
 configuration with burst-level intervals is what would give these medians real
 error bars, and that campaign has not been run.
 
-**elmundo is waiting, not rendering.** Its 31,046 ms median is 99%
-`navigate_load_event_ms` -- the wait for the load event. TTFB is 4.4 ms, the
-screenshot takes 85 ms like every other page, and `image_bytes` is byte-identical
-(108,917) across all 14 renders, fast and slow: the page is visually complete
-almost immediately and the browser then waits on subresources. There is no
-healthy mode -- the quickest render still waits 4.0 s, the slowest 34.7 s, and
-the cluster just past 30 s is a timeout being reached.
+**elmundo is waiting, not rendering, and the cause is unresolved.** Its
+31,046 ms median is 99% `navigate_load_event_ms`. TTFB is 4.4 ms, the screenshot
+takes 85 ms as on every other page, and `image_bytes` is byte-identical
+(108,917) across all 14 renders: the page is visually complete almost
+immediately and the browser then waits. No healthy mode -- quickest 4.0 s,
+slowest 34.7 s.
 
-This is the unanswered ad/consent asymmetry the report already discloses, at its
-extreme rather than a fault of the capture: the DNS override points every
-hostname at the replay server, which 404s what the frozen capture does not hold,
-and the load event waits regardless. The whole heavy-news tail shows it --
-theguardian 86% of its render in the load-event wait, rtp.pt 88% -- elmundo 99%.
-It adds 114 ms to the mix median; without it the same run measures 581.8 ms. It
-stays because the corpus is Kitesurf's published 14-URL list, and dropping a URL
-ends the comparison the corpus exists for.
+It is NOT the unanswered ad chains, which is what this report used to say. Same
+corpus, same Chromium, host container with `--host-resolver-rules="MAP *
+127.0.0.1"`: load event at 2.36 s, with 8 requests failed and 10 still in flight
+AT the load event -- they do not hold it. Not vCPU count either: `--cpus=2`
+gives 2.82 s.
+
+A page that loads in 2.4 s on the host takes 31 s in a 4-vCPU guest and neither
+obvious explanation accounts for it. Untested and guest-specific: DNS through
+the wildcard override rather than a resolver rule, the network path to the
+replay server, and Chromium being restored from a snapshot rather than freshly
+launched. Open measurement defect, not a page-weight finding. Adds 114 ms to the
+mix median (581.8 ms without it); stays because the corpus is Kitesurf's list.
 
 Records: `results/reqbench-20260816-*-corpus/analysis.json`,
 `results/campaign-20260816-summary.json`. Procedure: `../corpus_campaign.sh`.
