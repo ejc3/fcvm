@@ -46,7 +46,8 @@ pub struct RoutedNetwork {
     tap_device: String,
     port_mappings: Vec<PortMapping>,
     loopback_ip: Option<String>,
-    /// Explicit routable /64 prefix. Skips auto-detect and MASQUERADE.
+    /// Explicit routable prefix (CIDR or bare 4-group /64 shorthand).
+    /// Skips auto-detect and MASQUERADE.
     ipv6_prefix: Option<String>,
     /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost).
     forward_localhost: Vec<u16>,
@@ -90,14 +91,63 @@ impl RoutedNetwork {
         self
     }
 
-    /// Validate that a prefix string looks like a valid IPv6 /64 prefix
-    /// (4 colon-separated groups of 1-4 hex digits, e.g. "2600:1f1c:494:201").
-    fn validate_ipv6_prefix(prefix: &str) -> Result<()> {
+    /// Parse `--ipv6-prefix` into (network bits, prefix length).
+    ///
+    /// Two forms. Standard CIDR covers delegated subnets of any size
+    /// ("2803:6086:9892:947b:1feb:1cca:2:0/112", "2600:1f1c:494:201::/64"):
+    /// hosts whose fabric routes them a subnet longer than /64 (a /112 service
+    /// subnet is common on shared dev machines) could not be expressed by the
+    /// /64-only form at all. The bare 4-group form ("2600:1f1c:494:201") stays
+    /// as documented shorthand for that /64.
+    ///
+    /// The length is capped at /120 so at least 8 host bits remain for VM
+    /// addressing, and set host bits below the prefix are an error rather
+    /// than silently masked: a typo like 2600::1/64 means the caller was
+    /// confused about which part is the subnet.
+    fn parse_ipv6_prefix(prefix: &str) -> Result<(u128, u8)> {
+        if let Some((addr_part, len_part)) = prefix.split_once('/') {
+            let len: u8 = len_part.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid --ipv6-prefix '{}': '{}' is not a prefix length",
+                    prefix,
+                    len_part
+                )
+            })?;
+            if !(1..=120).contains(&len) {
+                anyhow::bail!(
+                    "invalid --ipv6-prefix '{}': length /{} out of range (1-120; \
+                     at least 8 host bits are needed for VM addresses)",
+                    prefix,
+                    len
+                );
+            }
+            let addr: std::net::Ipv6Addr = addr_part.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid --ipv6-prefix '{}': '{}' is not an IPv6 address",
+                    prefix,
+                    addr_part
+                )
+            })?;
+            let bits = u128::from(addr);
+            let host_mask = u128::MAX >> len;
+            if bits & host_mask != 0 {
+                anyhow::bail!(
+                    "invalid --ipv6-prefix '{}': host bits set below /{} \
+                     (the network part must end in zeros)",
+                    prefix,
+                    len
+                );
+            }
+            return Ok((bits, len));
+        }
+
+        // Bare 4-group shorthand for a /64 (e.g. "2600:1f1c:494:201").
         let groups: Vec<&str> = prefix.split(':').collect();
         if groups.len() != 4 {
             anyhow::bail!(
                 "invalid --ipv6-prefix '{}': expected 4 colon-separated hex groups \
-                 (e.g. 2600:1f1c:494:201)",
+                 (e.g. 2600:1f1c:494:201) or CIDR notation (e.g. \
+                 2803:6086:9892:947b:1feb:1cca:2:0/112)",
                 prefix
             );
         }
@@ -116,7 +166,10 @@ impl RoutedNetwork {
                 );
             }
         }
-        Ok(())
+        let addr: std::net::Ipv6Addr = format!("{}::", prefix)
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid --ipv6-prefix '{}'", prefix))?;
+        Ok((u128::from(addr), 64))
     }
 
     /// Get the network namespace ID (for setting Firecracker's namespace).
@@ -157,7 +210,7 @@ impl RoutedNetwork {
         }
 
         if let Some(ref prefix) = self.ipv6_prefix {
-            Self::validate_ipv6_prefix(prefix)?;
+            Self::parse_ipv6_prefix(prefix)?;
             return Ok(()); // Explicit prefix — no auto-detect or ip6tables needed
         }
 
@@ -276,8 +329,12 @@ impl RoutedNetwork {
         }
     }
 
-    /// Generate a deterministic IPv6 for the VM from the host's /64 subnet.
-    fn generate_vm_ipv6(prefix: &str, vm_id: &str) -> String {
+    /// Generate a deterministic IPv6 for the VM inside the delegated subnet.
+    ///
+    /// The vm_id hash fills the host bits below `len`. Suffixes 0 and 1 are
+    /// bumped to 2: 0 is the subnet-router anycast address and 1 is the host
+    /// side of the prefix.
+    fn generate_vm_ipv6(network: u128, len: u8, vm_id: &str) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -285,13 +342,12 @@ impl RoutedNetwork {
         vm_id.hash(&mut hasher);
         let hash = hasher.finish();
 
-        // Use lower 64 bits as the interface ID portion of the /64 prefix.
-        // Format: prefix:XXXX:XXXX:XXXX:XXXX (4 hex groups = 64 bits)
-        let w1 = ((hash >> 48) & 0xFFFF) as u16;
-        let w2 = ((hash >> 32) & 0xFFFF) as u16;
-        let w3 = ((hash >> 16) & 0xFFFF) as u16;
-        let w4 = (hash & 0xFFFF) as u16;
-        format!("{}:{:x}:{:x}:{:x}:{:x}", prefix, w1, w2, w3, w4)
+        let host_mask = u128::MAX >> len;
+        let mut suffix = (hash as u128) & host_mask;
+        if suffix <= 1 {
+            suffix = 2;
+        }
+        std::net::Ipv6Addr::from(network | suffix).to_string()
     }
 }
 
@@ -342,22 +398,27 @@ impl NetworkManager for RoutedNetwork {
             "setting up routed networking"
         );
 
-        // Resolve IPv6 /64 prefix: explicit --ipv6-prefix or auto-detect from interfaces
-        let (host_ipv6, ipv6_prefix) = if let Some(ref prefix) = self.ipv6_prefix {
-            let host_addr = format!("{}::1", prefix);
+        // Resolve the IPv6 subnet: explicit --ipv6-prefix or auto-detect a /64
+        // from host interfaces.
+        let (host_ipv6, network, prefix_len) = if let Some(ref prefix) = self.ipv6_prefix {
+            let (network, len) = Self::parse_ipv6_prefix(prefix)?;
+            let host_addr = std::net::Ipv6Addr::from(network | 1).to_string();
             info!(prefix = %prefix, "using explicit --ipv6-prefix (routable, no MASQUERADE)");
-            (host_addr, prefix.clone())
+            (host_addr, network, len)
         } else {
-            Self::detect_host_ipv6().context(
+            let (host_addr, prefix) = Self::detect_host_ipv6().context(
                 "routed mode requires a global IPv6 /64 subnet. \
                           Use --ipv6-prefix to specify one explicitly.",
-            )?
+            )?;
+            let (network, len) = Self::parse_ipv6_prefix(&prefix)
+                .context("auto-detected host prefix failed to parse")?;
+            (host_addr, network, len)
         };
 
         // Generate a unique IPv6 for this VM. Check for route collisions
         // (astronomically unlikely with 64-bit hash, but defend against it).
         let vm_ipv6 = {
-            let mut candidate = Self::generate_vm_ipv6(&ipv6_prefix, &self.vm_id);
+            let mut candidate = Self::generate_vm_ipv6(network, prefix_len, &self.vm_id);
             for attempt in 0..10 {
                 let route_check = tokio::process::Command::new("ip")
                     .args(["-6", "route", "show", &format!("{}/128", candidate)])
@@ -374,8 +435,11 @@ impl NetworkManager for RoutedNetwork {
                     "IPv6 route collision detected, trying alternative"
                 );
                 // Mix in the attempt counter for a different hash
-                candidate =
-                    Self::generate_vm_ipv6(&ipv6_prefix, &format!("{}:{}", self.vm_id, attempt));
+                candidate = Self::generate_vm_ipv6(
+                    network,
+                    prefix_len,
+                    &format!("{}:{}", self.vm_id, attempt),
+                );
             }
             candidate
         };
@@ -385,7 +449,7 @@ impl NetworkManager for RoutedNetwork {
         info!(
             host_ipv6 = %host_ipv6,
             vm_ipv6 = %vm_ipv6,
-            prefix = %ipv6_prefix,
+            prefix = %format!("{}/{}", std::net::Ipv6Addr::from(network), prefix_len),
             "IPv6 addresses for routed networking"
         );
 
@@ -1154,92 +1218,132 @@ async fn detect_default_ipv6_interface() -> Option<String> {
 mod tests {
     use super::*;
 
-    // --- validate_ipv6_prefix tests ---
+    const NET_2600: u128 = 0x2600_1f1c_0494_0201 << 64;
+    const NET_2803: u128 = 0x2803_6084_7058_46f6 << 64;
+
+    // --- parse_ipv6_prefix tests ---
 
     #[test]
-    fn test_validate_ipv6_prefix_valid() {
-        assert!(RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201").is_ok());
-        assert!(RoutedNetwork::validate_ipv6_prefix("2803:6084:7058:46f6").is_ok());
-        assert!(RoutedNetwork::validate_ipv6_prefix("0:0:0:0").is_ok());
-        assert!(RoutedNetwork::validate_ipv6_prefix("ffff:ffff:ffff:ffff").is_ok());
-        assert!(RoutedNetwork::validate_ipv6_prefix("a:b:c:d").is_ok());
+    fn bare_four_group_shorthand_is_a_slash_64() {
+        let (network, len) = RoutedNetwork::parse_ipv6_prefix("2600:1f1c:494:201").unwrap();
+        assert_eq!(len, 64);
+        assert_eq!(
+            std::net::Ipv6Addr::from(network).to_string(),
+            "2600:1f1c:494:201::"
+        );
+        assert!(RoutedNetwork::parse_ipv6_prefix("0:0:0:0").is_ok());
+        assert!(RoutedNetwork::parse_ipv6_prefix("ffff:ffff:ffff:ffff").is_ok());
+        assert!(RoutedNetwork::parse_ipv6_prefix("a:b:c:d").is_ok());
     }
 
     #[test]
-    fn test_validate_ipv6_prefix_wrong_group_count() {
-        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("expected 4 colon-separated hex groups"));
+    fn cidr_form_accepts_delegated_subnets_of_any_length() {
+        // The devserver shape that motivated this: a /112 service subnet the
+        // fabric routes to the host, exactly as /etc/fbwhoami-style config
+        // reports it (full 8 groups, zeros written out).
+        let (network, len) =
+            RoutedNetwork::parse_ipv6_prefix("2803:6086:9892:947b:1feb:1cca:0002:0000/112")
+                .unwrap();
+        assert_eq!(len, 112);
+        assert_eq!(
+            std::net::Ipv6Addr::from(network).to_string(),
+            "2803:6086:9892:947b:1feb:1cca:2:0"
+        );
 
-        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201:abcd").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("expected 4 colon-separated hex groups"));
-
-        let err = RoutedNetwork::validate_ipv6_prefix("2600").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("expected 4 colon-separated hex groups"));
-
-        let err = RoutedNetwork::validate_ipv6_prefix("").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("expected 4 colon-separated hex groups"));
+        // Compressed form of a /64.
+        let (network, len) = RoutedNetwork::parse_ipv6_prefix("2600:1f1c:494:201::/64").unwrap();
+        assert_eq!(len, 64);
+        assert_eq!(
+            std::net::Ipv6Addr::from(network).to_string(),
+            "2600:1f1c:494:201::"
+        );
     }
 
     #[test]
-    fn test_validate_ipv6_prefix_invalid_hex() {
-        // Non-hex characters
-        let err = RoutedNetwork::validate_ipv6_prefix("zzzz:1f1c:494:201").unwrap_err();
+    fn cidr_form_rejects_bad_lengths_and_set_host_bits() {
+        // Fewer than 8 host bits leaves no room for VM addresses.
+        let err = RoutedNetwork::parse_ipv6_prefix("2600::/121").unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+        let err = RoutedNetwork::parse_ipv6_prefix("2600::/0").unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+
+        // Host bits set below the length is a confused caller, not a subnet.
+        let err = RoutedNetwork::parse_ipv6_prefix("2600::1/64").unwrap_err();
+        assert!(err.to_string().contains("host bits set"));
+
+        // A 7-group non-address (the old Makefile-mangled form) must fail
+        // with a message naming the address part.
+        let err =
+            RoutedNetwork::parse_ipv6_prefix("2803:6086:9892:947b:1feb:1cca:0002/112").unwrap_err();
+        assert!(err.to_string().contains("is not an IPv6 address"));
+
+        let err = RoutedNetwork::parse_ipv6_prefix("2600::/abc").unwrap_err();
+        assert!(err.to_string().contains("is not a prefix length"));
+    }
+
+    #[test]
+    fn shorthand_rejects_wrong_group_counts_and_bad_hex() {
+        for bad in ["2600:1f1c:494", "2600:1f1c:494:201:abcd", "2600", ""] {
+            let err = RoutedNetwork::parse_ipv6_prefix(bad).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("expected 4 colon-separated hex groups"),
+                "{bad}: {err}"
+            );
+        }
+        let err = RoutedNetwork::parse_ipv6_prefix("zzzz:1f1c:494:201").unwrap_err();
         assert!(err.to_string().contains("not valid hex"));
-
-        // Empty group (consecutive colons) — splits to 4 groups but one is empty
-        let err = RoutedNetwork::validate_ipv6_prefix("2600::494:201").unwrap_err();
+        let err = RoutedNetwork::parse_ipv6_prefix("2600::494:201").unwrap_err();
         assert!(err
             .to_string()
             .contains("each group must be 1-4 hex digits"));
-
-        // Group too long (5 digits)
-        let err = RoutedNetwork::validate_ipv6_prefix("26000:1f1c:494:201").unwrap_err();
+        let err = RoutedNetwork::parse_ipv6_prefix("26000:1f1c:494:201").unwrap_err();
         assert!(err
             .to_string()
             .contains("each group must be 1-4 hex digits"));
+        let err = RoutedNetwork::parse_ipv6_prefix("2600:1f1c:494:201:1:2:3:4").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
+        let err = RoutedNetwork::parse_ipv6_prefix("2600:1f1c:494:201::1").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
     }
 
     #[test]
-    fn test_validate_ipv6_prefix_full_address_rejected() {
-        // Full IPv6 address (8 groups) should be rejected
-        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201:1:2:3:4").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("expected 4 colon-separated hex groups"));
-
-        // Compressed full address
-        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201::1").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("expected 4 colon-separated hex groups"));
+    fn vm_addresses_stay_inside_a_delegated_112() {
+        let (network, len) =
+            RoutedNetwork::parse_ipv6_prefix("2803:6086:9892:947b:1feb:1cca:2:0/112").unwrap();
+        for vm in ["vm-a", "vm-b", "vm-c", "vm-d"] {
+            let addr: std::net::Ipv6Addr = RoutedNetwork::generate_vm_ipv6(network, len, vm)
+                .parse()
+                .unwrap();
+            let bits = u128::from(addr);
+            assert_eq!(bits >> 16, network >> 16, "{vm} escaped the /112: {addr}");
+            let suffix = bits & 0xffff;
+            assert!(suffix >= 2, "{vm} landed on a reserved suffix: {addr}");
+        }
     }
 
     // --- generate_vm_ipv6 tests ---
 
     #[test]
     fn test_generate_vm_ipv6_deterministic() {
-        let a1 = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-abc");
-        let a2 = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-abc");
+        let a1 = RoutedNetwork::generate_vm_ipv6(NET_2600, 64, "vm-abc");
+        let a2 = RoutedNetwork::generate_vm_ipv6(NET_2600, 64, "vm-abc");
         assert_eq!(a1, a2, "same inputs must produce same output");
 
-        let b = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-xyz");
+        let b = RoutedNetwork::generate_vm_ipv6(NET_2600, 64, "vm-xyz");
         assert_ne!(a1, b, "different vm_ids must produce different addresses");
 
-        let c = RoutedNetwork::generate_vm_ipv6("2803:6084:7058:46f6", "vm-abc");
+        let c = RoutedNetwork::generate_vm_ipv6(NET_2803, 64, "vm-abc");
         assert_ne!(a1, c, "different prefixes must produce different addresses");
     }
 
     #[test]
     fn test_generate_vm_ipv6_format() {
-        let addr = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-test");
+        let addr = RoutedNetwork::generate_vm_ipv6(NET_2600, 64, "vm-test");
         assert!(
             addr.starts_with("2600:1f1c:494:201:"),
             "address must start with prefix: {}",
