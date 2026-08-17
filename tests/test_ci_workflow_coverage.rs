@@ -1351,3 +1351,114 @@ fn renames_are_classified_by_their_source_path_too() {
          classifier and skips the whole matrix"
     );
 }
+
+/// The `changes` job must actually EMIT every output the matrix gates on.
+///
+/// `expensive_jobs_are_gated_on_the_changes_job` checks the CONSUMER side: that
+/// each expensive job's `if:` reads `needs.changes.outputs.code`. Nothing checked
+/// the PRODUCER side, and the two are wired together by string equality across
+/// three places:
+///
+///   the detect script:  echo "code=$code" >> "$GITHUB_OUTPUT"
+///   the job's outputs:  code: ${{ steps.detect.outputs.code }}
+///   every consumer:     needs.changes.outputs.code
+///
+/// A one-character typo in the middle line -- `steps.detect.outputs.cod` -- makes
+/// `needs.changes.outputs.code` evaluate to the empty string on every PR. lint,
+/// packaging, fc-mock, host, host-root and container all skip, and `summary`
+/// goes GREEN having run only actionlint. A complete CI bypass, from one
+/// character, that the whole suite passes through: the classification tests lift
+/// the `case` block out and append their own marker, so they never execute the
+/// output writes at all, and `actionlint -shellcheck=` exits 0.
+///
+/// Found by mutation testing, not by reading. Both variants -- the typo and
+/// deleting the `echo` -- left 21/21 tests passing.
+#[test]
+fn the_changes_job_emits_every_output_the_matrix_gates_on() {
+    let ci = parse_workflow("ci.yml");
+    let jobs = ci
+        .get("jobs")
+        .and_then(Value::as_mapping)
+        .expect("ci.yml has no `jobs:` mapping");
+    let changes = jobs
+        .get(Value::from("changes"))
+        .and_then(Value::as_mapping)
+        .expect("ci.yml has no `changes` job");
+
+    // Every step's `run:` in the changes job, concatenated: this is where the
+    // GITHUB_OUTPUT writes live.
+    let scripts: String = changes
+        .get(Value::from("steps"))
+        .and_then(Value::as_sequence)
+        .expect("the `changes` job has no steps")
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|s| s.get(Value::from("run")).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let declared = changes
+        .get(Value::from("outputs"))
+        .and_then(Value::as_mapping)
+        .expect("the `changes` job declares no `outputs:`, so nothing it computes reaches the matrix");
+
+    for (name, expr) in declared {
+        let name = name.as_str().expect("output name is not a string");
+        let expr = expr.as_str().unwrap_or_default();
+        // The declared expression must reference a step output of the SAME name.
+        // A typo here is invisible at runtime: GitHub yields "" rather than an error.
+        assert!(
+            expr.contains(&format!("outputs.{name}")),
+            "`changes` declares output `{name}` as `{expr}`, which does not read \
+             `outputs.{name}`. Every consumer of `needs.changes.outputs.{name}` will see the \
+             empty string, so its gated jobs skip and `summary` goes green having run nothing."
+        );
+        // And the script must write that key from the COMPUTED variable, not
+        // merely somewhere. There are three writes of `code=` in this file: two
+        // fail-open branches emit the literal `code=true`, and the main path
+        // emits `code=$code`. An earlier version of this assertion accepted any
+        // `echo "code="`, so deleting the MAIN write still passed -- the
+        // fail-opens covered for it. That is the same disease this test exists
+        // to cure, one level up, and mutation testing is what exposed it.
+        assert!(
+            scripts.contains(&format!("echo \"{name}=${name}\"")),
+            "`changes` declares output `{name}` but no step writes `{name}=${name}` to \
+             $GITHUB_OUTPUT, so the classifier's verdict never reaches the matrix and every \
+             job gated on it skips while `summary` goes green"
+        );
+        // The fail-open branches must ALSO open this gate. A fail-open that
+        // opens only some gates is the hole this file already documents.
+        assert!(
+            scripts.contains(&format!("echo \"{name}=true\"")),
+            "no fail-open branch writes `{name}=true`, so a path the classifier cannot \
+             evaluate leaves `{name}` closed and its jobs never run"
+        );
+    }
+
+    // And the reverse: nothing may gate on an output `changes` does not declare.
+    let whole = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml is unreadable");
+    let mut consumed: Vec<String> = Vec::new();
+    let mut rest = whole.as_str();
+    while let Some(at) = rest.find("needs.changes.outputs.") {
+        rest = &rest[at + "needs.changes.outputs.".len()..];
+        let key: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !key.is_empty() && !consumed.contains(&key) {
+            consumed.push(key);
+        }
+    }
+    assert!(
+        !consumed.is_empty(),
+        "no job reads `needs.changes.outputs.*` any more, so the classifier gates nothing"
+    );
+    for key in &consumed {
+        assert!(
+            declared.contains_key(Value::from(key.as_str())),
+            "a job gates on `needs.changes.outputs.{key}`, which the `changes` job does not \
+             declare. That expression is the empty string, so the job never runs and its \
+             absence reads as success."
+        );
+    }
+}
