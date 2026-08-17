@@ -164,8 +164,9 @@ are within-run and carry no run-to-run variance. Five independent bursts per
 configuration with burst-level intervals is what would give these medians real
 error bars, and that campaign has not been run.
 
-**elmundo stalls, and it is in the headline.** Its renders are bimodal: 6 of 14
-complete in 4.4-9.0 s, the other 8 cluster at 31.0-35.1 s. Clustering that tight
+**elmundo stalls, and it is in the headline.** Its renders are bimodal: 5 of 14
+complete in 4.4-9.0 s and 8 cluster at 31.0-35.1 s, with a single render between
+the modes at 24.9 s. Clustering that tight
 just past 30 s is a timeout signature rather than page weight, and it reproduces
 at all three vCPU counts. It is a defect in the frozen capture for that origin.
 It adds 114 ms to the mix median -- without elmundo the same run measures
