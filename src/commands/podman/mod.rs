@@ -240,12 +240,25 @@ impl PodmanLifecycle {
     }
 }
 
-/// The two `podman prepare` arguments that decide where the startup snapshot is
-/// installed and whether an installed one is rebuilt.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The `podman prepare` arguments that decide where the startup snapshot is
+/// installed, whether an installed one is rebuilt, and how long the disposable
+/// VM may take to become healthy. None of these enter the snapshot's content
+/// key: they change how one build runs, not what it produces.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PrepareOptions {
     tag: Option<String>,
     force: bool,
+    ready_timeout: std::time::Duration,
+}
+
+impl Default for PrepareOptions {
+    fn default() -> Self {
+        Self {
+            tag: None,
+            force: false,
+            ready_timeout: PREPARE_HEALTH_BUDGET,
+        }
+    }
 }
 
 fn snapshot_source_disposition(
@@ -2283,6 +2296,7 @@ const PREPARE_HEALTH_BUDGET: std::time::Duration = std::time::Duration::from_sec
 async fn await_prepare_healthy<F>(
     startup_rx: tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>,
     cancel: &CancellationToken,
+    budget: std::time::Duration,
     vm_exited: F,
 ) -> Result<crate::health::StartupSnapshotAck>
 where
@@ -2296,10 +2310,11 @@ where
             let status = status.context("waiting for disposable prepare VM")?;
             bail!("disposable prepare VM exited before the container became healthy: {status}")
         }
-        _ = tokio::time::sleep(PREPARE_HEALTH_BUDGET) => {
+        _ = tokio::time::sleep(budget) => {
             bail!(
-                "disposable prepare VM did not report a healthy container within {}s",
-                PREPARE_HEALTH_BUDGET.as_secs()
+                "disposable prepare VM did not report a healthy container within {}s \
+                 (raise --ready-timeout for workloads with long warmups)",
+                budget.as_secs()
             )
         }
         startup_ack = startup_rx => {
@@ -2323,7 +2338,11 @@ async fn run_prepare_loop(
         .context("prepare lifecycle has no startup health trigger")?;
 
     let vm_exited = ctx.vm_manager.wait();
-    let startup_ack = await_prepare_healthy(startup_rx, cancel, vm_exited).await?;
+    let budget = match lifecycle {
+        PodmanLifecycle::Prepare(options) => options.ready_timeout,
+        PodmanLifecycle::Run => PREPARE_HEALTH_BUDGET,
+    };
+    let startup_ack = await_prepare_healthy(startup_rx, cancel, budget, vm_exited).await?;
 
     // Resolved before the boot, so the generation this installs is the one the pre-boot
     // cache check looked for.
@@ -2614,6 +2633,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
         force: args.force,
+        ready_timeout: std::time::Duration::from_secs(args.ready_timeout),
     });
     match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
@@ -2970,19 +2990,40 @@ mod tests {
         let error = await_prepare_healthy(
             startup_rx,
             &cancel,
+            PREPARE_HEALTH_BUDGET,
             // The disposable VM stays up; only the container never reports healthy.
             std::future::pending::<Result<std::process::ExitStatus>>(),
         )
         .await
         .expect_err("a container that never becomes healthy must not hang prepare");
 
-        assert_eq!(
-            format!("{error:#}"),
-            format!(
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
                 "disposable prepare VM did not report a healthy container within {}s",
                 PREPARE_HEALTH_BUDGET.as_secs()
-            )
+            )),
+            "{message}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepare_health_wait_honors_a_custom_budget() {
+        // --ready-timeout exists for workloads whose warmup cannot fit the
+        // default budget; the deadline and its error must follow the flag.
+        let (_startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let error = await_prepare_healthy(
+            startup_rx,
+            &cancel,
+            std::time::Duration::from_secs(3600),
+            std::future::pending::<Result<std::process::ExitStatus>>(),
+        )
+        .await
+        .expect_err("a pending container must still hit the custom deadline");
+        let message = format!("{error:#}");
+        assert!(message.contains("within 3600s"), "{message}");
+        assert!(message.contains("--ready-timeout"), "{message}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2994,6 +3035,7 @@ mod tests {
         let error = await_prepare_healthy(
             startup_rx,
             &cancel,
+            PREPARE_HEALTH_BUDGET,
             std::future::pending::<Result<std::process::ExitStatus>>(),
         )
         .await
@@ -3011,7 +3053,7 @@ mod tests {
                 256, // WEXITSTATUS 1
             ))
         };
-        let error = await_prepare_healthy(startup_rx, &cancel, exited)
+        let error = await_prepare_healthy(startup_rx, &cancel, PREPARE_HEALTH_BUDGET, exited)
             .await
             .expect_err("a dead source must end the wait");
         assert!(
@@ -3027,6 +3069,7 @@ mod tests {
         let error = await_prepare_healthy(
             startup_rx,
             &cancel,
+            PREPARE_HEALTH_BUDGET,
             std::future::pending::<Result<std::process::ExitStatus>>(),
         )
         .await
@@ -3122,7 +3165,7 @@ mod tests {
     fn tagged(tag: &str) -> PrepareOptions {
         PrepareOptions {
             tag: Some(tag.to_string()),
-            force: false,
+            ..Default::default()
         }
     }
 
@@ -3513,6 +3556,7 @@ mod tests {
             let forced = PrepareOptions {
                 tag: tag.map(str::to_string),
                 force: true,
+                ..Default::default()
             };
             let target = prepare_install_target(&forced, CONTENT_KEY).unwrap();
             assert!(

@@ -160,6 +160,13 @@ pub struct PrepareArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Seconds to wait for the disposable VM's container to become healthy
+    /// before giving up. The default fits images that start serving quickly;
+    /// workloads that import a large image or warm caches before their health
+    /// check passes need more. Not part of the snapshot's cache key.
+    #[arg(long, default_value_t = 600)]
+    pub ready_timeout: u64,
+
     #[command(flatten)]
     pub run: RunArgs,
 }
