@@ -164,13 +164,22 @@ are within-run and carry no run-to-run variance. Five independent bursts per
 configuration with burst-level intervals is what would give these medians real
 error bars, and that campaign has not been run.
 
-**elmundo stalls, and it is in the headline.** Its renders are bimodal: 5 of 14
-complete in 4.4-9.0 s and 8 cluster at 31.0-35.1 s, with a single render between
-the modes at 24.9 s. Clustering that tight
-just past 30 s is a timeout signature rather than page weight, and it reproduces
-at all three vCPU counts. It is a defect in the frozen capture for that origin.
-It adds 114 ms to the mix median -- without elmundo the same run measures
-581.8 ms. Fix the capture and the headline moves.
+**elmundo is waiting, not rendering.** Its 31,046 ms median is 99%
+`navigate_load_event_ms` -- the wait for the load event. TTFB is 4.4 ms, the
+screenshot takes 85 ms like every other page, and `image_bytes` is byte-identical
+(108,917) across all 14 renders, fast and slow: the page is visually complete
+almost immediately and the browser then waits on subresources. There is no
+healthy mode -- the quickest render still waits 4.0 s, the slowest 34.7 s, and
+the cluster just past 30 s is a timeout being reached.
+
+This is the unanswered ad/consent asymmetry the report already discloses, at its
+extreme rather than a fault of the capture: the DNS override points every
+hostname at the replay server, which 404s what the frozen capture does not hold,
+and the load event waits regardless. The whole heavy-news tail shows it --
+theguardian 86% of its render in the load-event wait, rtp.pt 88% -- elmundo 99%.
+It adds 114 ms to the mix median; without it the same run measures 581.8 ms. It
+stays because the corpus is Kitesurf's published 14-URL list, and dropping a URL
+ends the comparison the corpus exists for.
 
 Records: `results/reqbench-20260816-*-corpus/analysis.json`,
 `results/campaign-20260816-summary.json`. Procedure: `../corpus_campaign.sh`.
