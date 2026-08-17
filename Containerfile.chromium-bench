@@ -71,7 +71,8 @@ ENV VK_ICD_FILENAMES=/usr/lib/chromium/./vk_swiftshader_icd.json
 
 COPY bench/chromium/pages/ /opt/bench/pages/
 COPY bench/chromium/pageserver.py bench/chromium/render.py bench/chromium/entry.sh \
-     bench/chromium/cdp_health.py bench/chromium/health_state.sh /opt/bench/
+     bench/chromium/cdp_health.py bench/chromium/health_loop.py \
+     bench/chromium/health_state.sh /opt/bench/
 RUN chmod +x /opt/bench/entry.sh /opt/bench/render.py /opt/bench/pageserver.py \
      /opt/bench/cdp_health.py /opt/bench/health_state.sh
 
