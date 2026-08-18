@@ -928,14 +928,11 @@ fn expensive_jobs_are_gated_on_the_changes_job() {
         // every PR -- the job never runs again and its absence reads as green.
         // Mutation testing walked that straight past this assertion. Nothing
         // legitimate ever puts a constant boolean in a gate, so reject any.
-        for poison in ["false &&", "&& false", "false||", "|| true", "true ||"] {
+        // Whitespace-normalized once, so `false  &&` and `false &&` read alike.
+        let normalized = cond.split_whitespace().collect::<Vec<_>>().join(" ");
+        for poison in ["false &&", "&& false", "false ||", "|| true", "true ||"] {
             assert!(
-                !cond.replace(' ', " ").contains(poison)
-                    && !cond
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .contains(poison),
+                !normalized.contains(poison),
                 "ci.yml job `{job}`'s gate contains the constant `{poison}`: the condition \
                  mentions the changes output but can never (or always) run regardless of it"
             );
