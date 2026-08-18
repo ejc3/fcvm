@@ -95,9 +95,19 @@ WD_PID=$!
 wait_http "http://127.0.0.1:$WD_PORT/status" 300 webkit-webdriver
 
 echo "webkit-bench: creating warm session + warming renderer"
+# TWO screenshot passes, both timed in this log. The first heats
+# raster/encode/GTK init; the second PROVES the heat took (its screenshot_ms
+# should collapse, the way 1,429 ms -> 87 ms was measured post-restore). If a
+# later gated run still shows a cold first screenshot per clone, this log line
+# is the evidence that the cost does not survive the snapshot -- a finding, not
+# a config error. The quiescing --then-blank stays on the LAST pass so the
+# golden still snapshots an idle about:blank.
 python3 /opt/bench/wddrive.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
     --host "127.0.0.1:$WD_PORT" --create --session-file "$SESSION_FILE" \
-    --out-prefix /tmp/warmup --then-blank
+    --out-prefix /tmp/warmup
+python3 /opt/bench/wddrive.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
+    --host "127.0.0.1:$WD_PORT" --session-file "$SESSION_FILE" \
+    --out-prefix /tmp/warmup2 --then-blank
 
 # The host driver reads the inherited session id over the published pageserver
 # port; the health probe reads the /run copy.

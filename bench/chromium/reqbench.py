@@ -3028,6 +3028,29 @@ def spawn_clone_process(cmd: list[str], log: str, env: dict) -> subprocess.Popen
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
+def discover_wd_session(args, fcvm_pid: int) -> str:
+    """Read the golden's warm WebDriver session id out of a live clone, once.
+
+    entry-webkit.sh writes it to /run/bench-session-id in the CONTAINER before
+    the warm marker, so it precedes every golden snapshot and restores
+    identically into every clone. One `fcvm exec` (vsock, no network stack in
+    the path) on the first clone; the caller pins the result for the run.
+    Raises rather than returning empty: a run without a session id cannot
+    render anything, and a silent "" would surface 202 reps later as uniform
+    navigate failures with the real cause off-screen.
+    """
+    argv = [args.fcvm, "exec", "--pid", str(fcvm_pid), "-c",
+            "--", "cat", "/run/bench-session-id"]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    session = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not session:
+        raise RuntimeError(
+            "webkit session discovery failed: "
+            f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr[-300:]!r}"
+        )
+    return session
+
+
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
@@ -3082,30 +3105,52 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
-            ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
-            rec["ws_url_prewired"] = bool(ws_url)
-            drive_args = argparse.Namespace(
-                cdp_host=endpoint,
-                url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                format=args.format,
-                quality=args.quality,
-                timeout=max(1.0, deadline - time.monotonic()),
-                idle_wait_ms=0.0,
-                out_prefix="",
-                ws_url=ws_url,
-                connect_retries=200,
-                nav_timing=True,
-                print_target=False,
-                # This Namespace is an explicit, CLOSED field list, so every flag
-                # cdpdrive grows has to be added here too or `drive()` raises
-                # AttributeError — which is not in its except tuple, escapes it,
-                # and is swallowed by the `except Exception` below, failing every
-                # cdp rep. cdpdrive also reads it with getattr; both halves.
-                host_header="",
-                op=op,
-                render_module=os.path.join(HERE, "render.py"),
-            )
-            result = cdpdrive.drive(drive_args)
+            if getattr(args, "engine", "chromium") == "webkit":
+                # Classic WebDriver has NO session discovery: the warm session
+                # id is written by entry-webkit.sh to /run/bench-session-id
+                # BEFORE the golden snapshot, so it is snapshot state --
+                # identical across clones for exactly the reason cdpdrive's
+                # target id is. Captured ONCE via fcvm exec on the first clone
+                # and pinned for every later rep (discovery-once, same pattern
+                # as --prewire; warmups run first, so the exec cost lands on a
+                # discarded rep).
+                if not getattr(args, "wd_session_id", ""):
+                    args.wd_session_id = discover_wd_session(args, fcvm_pid)
+                rec["session_prewired"] = True
+                import wddrive
+
+                result = wddrive.drive(argparse.Namespace(
+                    cdp_host=endpoint,
+                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+                    timeout=max(1.0, deadline - time.monotonic()),
+                    session_id=args.wd_session_id,
+                    out_prefix="",
+                ))
+            else:
+                ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
+                rec["ws_url_prewired"] = bool(ws_url)
+                drive_args = argparse.Namespace(
+                    cdp_host=endpoint,
+                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+                    format=args.format,
+                    quality=args.quality,
+                    timeout=max(1.0, deadline - time.monotonic()),
+                    idle_wait_ms=0.0,
+                    out_prefix="",
+                    ws_url=ws_url,
+                    connect_retries=200,
+                    nav_timing=True,
+                    print_target=False,
+                    # This Namespace is an explicit, CLOSED field list, so every flag
+                    # cdpdrive grows has to be added here too or `drive()` raises
+                    # AttributeError — which is not in its except tuple, escapes it,
+                    # and is swallowed by the `except Exception` below, failing every
+                    # cdp rep. cdpdrive also reads it with getattr; both halves.
+                    host_header="",
+                    op=op,
+                    render_module=os.path.join(HERE, "render.py"),
+                )
+                result = cdpdrive.drive(drive_args)
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
@@ -3845,6 +3890,10 @@ def main_with_resources(resources: ExitStack) -> int:
     p.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
     p.add_argument("--quality", type=int, default=80)
     p.add_argument("--cdp-port", type=int, default=9222)
+    p.add_argument("--engine", choices=("chromium", "webkit"), default="chromium",
+                   help="render driver: chromium drives CDP via cdpdrive; webkit "
+                        "drives W3C WebDriver classic via wddrive (the port in "
+                        "--cdp-port is then the WD port, 9515)")
     p.add_argument("--image", default="")
     p.add_argument("--image-id", default="")
     p.add_argument("--snapshot-name", default="")
@@ -4044,6 +4093,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
             "uffd_mode": uffd_mode,
             "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
+            "engine": args.engine,
             "quality": args.quality,
             "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,

@@ -23,6 +23,7 @@ Timing fields mirror render.py where the protocols correspond:
 
 import argparse
 import base64
+import hashlib
 import json
 import sys
 import time
@@ -194,6 +195,87 @@ def screenshot(host, session, timeout=60.0):
 
 def current_url(host, session, timeout=10.0):
     return wd(host, "GET", f"/session/{session}/url", timeout=timeout)
+
+
+def drive(args) -> dict:
+    """One clone render, harness entry point -- cdpdrive.drive's contract.
+
+    reqbench dispatches every render through a module-level drive(args) and
+    stores the returned dict as rec["render"], so the field names here are the
+    analyzer's schema. Keys shared with cdpdrive keep its meaning (ok, url,
+    stages, image_bytes, image_sha256); WebDriver-specific facts get their own
+    keys rather than overloading CDP ones -- there is no WebSocket here, so no
+    tcp_ms/upgrade_ms, and resolve_ms is the WD status round trip that proves
+    the port is a driver rather than a socket.
+
+    The session id arrives pinned (args.session_id). Classic WebDriver has no
+    session discovery, so the id is captured ONCE per golden by the harness
+    (fcvm exec cat /run/bench-session-id on the first clone) and reused: it is
+    snapshot state, identical across clones for the same reason cdpdrive's
+    target id is.
+    """
+    t0 = time.monotonic()
+    deadline = t0 + args.timeout
+    out: dict = {"ok": False, "engine": "webkit", "wd_host": args.cdp_host,
+                 "url": args.url, "format": "png", "session_prewired": True}
+    stages: dict[str, float] = {}
+    stage = "status"
+    try:
+        session = args.session_id
+        if not session:
+            raise WdError("no session id was provided (harness discovery failed)")
+        out["session_id"] = session
+
+        # Like cdpdrive's resolve: retry the first round trip against the
+        # deadline, because the clone's forward may be seconds behind the state
+        # file. /status is the WD liveness probe; a socket that accepts but is
+        # not the driver fails here rather than mid-navigate.
+        t = time.monotonic()
+        last = None
+        while True:
+            try:
+                wd(args.cdp_host, "GET", "/status",
+                   timeout=max(0.2, min(5.0, deadline - time.monotonic())))
+                break
+            except WdError as error:
+                last = error
+                if time.monotonic() >= deadline:
+                    raise WdError(f"driver never answered /status: {last}") from error
+                time.sleep(0.05)
+        stages["resolve_ms"] = (time.monotonic() - t) * 1000
+        stages["connect_total_ms"] = (time.monotonic() - t0) * 1000
+
+        stage = "navigate"
+        t = time.monotonic()
+        navigate(args.cdp_host, session, args.url,
+                 timeout=max(1.0, deadline - time.monotonic()))
+        stages["navigate_ms"] = (time.monotonic() - t) * 1000
+
+        stage = "screenshot"
+        t = time.monotonic()
+        png = screenshot(args.cdp_host, session,
+                         timeout=max(1.0, deadline - time.monotonic()))
+        stages["screenshot_ms"] = (time.monotonic() - t) * 1000
+        if not png.startswith(b"\x89PNG"):
+            raise WdError(f"screenshot is not a PNG ({png[:8]!r})")
+        out["image_bytes"] = len(png)
+        out["image_sha256"] = hashlib.sha256(png).hexdigest()
+        if getattr(args, "out_prefix", ""):
+            with open(f"{args.out_prefix}.png", "wb") as target:
+                target.write(png)
+        stages["total_ms"] = (time.monotonic() - t0) * 1000
+        out["stages"] = stages
+        out["ok"] = True
+        return out
+    except (WdError, OSError, KeyError, TypeError, ValueError) as error:
+        # Same closed tuple as main(), same reason: TimeoutError is an OSError,
+        # session plumbing raises KeyError/TypeError, b64decode ValueError. A
+        # failure must come back as a labelled record, not a traceback.
+        stages["total_ms"] = (time.monotonic() - t0) * 1000
+        out["stages"] = stages
+        out["error"] = f"{type(error).__name__}: {error}"
+        out["failed_stage"] = stage
+        return out
 
 
 def main():

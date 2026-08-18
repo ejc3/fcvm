@@ -230,7 +230,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium analyze-chromium-request bench-clone-latency test-chromium-request \
-	bench-chromium-request-build bench-webkit-request-build test-chromium bench-chromium-request-golden bench-chromium-request-verify \
+	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
@@ -753,6 +753,22 @@ bench-webkit-request-build: build
 	@echo "==> Building WebKit request-bench container image..."
 	@podman build --format docker -t localhost/webkit-bench-req:latest \
 		-f Containerfile.webkit-bench .
+
+# The WebKit twins of the chromium request targets: same reqbench.sh, same
+# seal, same gates -- ENGINE=webkit swaps the render driver (wddrive over W3C
+# WebDriver classic on 9515), the image default, and the arm list (cdp,noop:
+# cdp-fast is CDP WebSocket prewiring and exec's guest driver is CDP-only).
+bench-webkit-request-golden: bench-webkit-request-build setup-default
+	@echo "==> Creating WebKit golden snapshot (TAG=$(if $(TAG),$(TAG),cb-req-webkit))..."
+	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) bash bench/chromium/reqbench.sh golden
+
+bench-webkit-request-verify:
+	@echo "==> Verifying WD hops on a restored WebKit clone..."
+	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) bash bench/chromium/reqbench.sh verify
+
+bench-webkit-request-run:
+	@echo "==> Running WebKit request benchmark (sealed bundle)..."
+	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) bash bench/chromium/reqbench.sh run
 
 bench-chromium-request-golden: bench-chromium-request-build setup-default
 	@echo "==> Creating golden snapshot (TAG=$(if $(TAG),$(TAG),cb-req-golden), HUGEPAGES=$(if $(HUGEPAGES),$(HUGEPAGES),0))..."
