@@ -317,6 +317,12 @@ fn self_hosted_checkouts_repair_workspace_ownership_first() {
             let guarded = steps[..idx].iter().any(|s| {
                 s.get("run").and_then(Value::as_str).is_some_and(|r| {
                     r.lines()
+                        // Strip comments first: a commented-out repair still
+                        // contains both words and chowns nothing. The sibling
+                        // gh-probe test already skips comment lines for the
+                        // same reason; a guard that a `#` disables is not a
+                        // guard.
+                        .map(|line| line.split('#').next().unwrap_or(""))
                         .any(|line| line.contains("chown") && line.contains("workspace"))
                 })
             });
@@ -458,6 +464,42 @@ fn summary_fails_when_a_gating_job_fails() {
              checked on its own, not as one arm of an `||` that a later edit can halve."
         );
     }
+
+    // The `if:` is only half the gate: the step it guards must actually FAIL.
+    // Mutating its `exit 1` to `exit 0` left every assertion above satisfied --
+    // the condition still matched, the step still ran, and Summary went green
+    // over a failed Lint. actionlint cannot object either; `exit 0` is valid
+    // shell. So the body is checked too: the failing step's script must end by
+    // exiting non-zero, not by succeeding.
+    let fail_step_run = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|s| {
+            // The GATE step alone checks both terminal states. Two diagnostic
+            // steps also fire on `failure` and deliberately end `exit 0` so
+            // they cannot preempt the gate -- matching on `failure` alone
+            // selects the first of those instead.
+            s.get(Value::from("if"))
+                .and_then(Value::as_str)
+                .is_some_and(|c| {
+                    c.contains("needs.*.result") && c.contains("failure") && c.contains("cancelled")
+                })
+        })
+        .filter_map(|s| s.get(Value::from("run")).and_then(Value::as_str))
+        .next()
+        .expect("the failure-checking step has no `run:` body");
+    let last_line = fail_step_run
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    assert_eq!(
+        last_line, "exit 1",
+        "the gate step's script ends with `{last_line}`, not `exit 1`; the condition fires, \
+         the error annotation prints, and the job then SUCCEEDS -- Summary green over a \
+         failed gating job"
+    );
 }
 
 /// A diagnostic that cannot run is worse than no diagnostic: it is silent in
@@ -881,6 +923,20 @@ fn expensive_jobs_are_gated_on_the_changes_job() {
             cond.contains("needs.changes.outputs.code == 'true'"),
             "ci.yml job `{job}` is not gated on the `changes` job, so a docs-only PR runs it"
         );
+        // A substring check tests presence, not effect: prefixing `false && `
+        // keeps the asserted text intact while the condition evaluates false on
+        // every PR -- the job never runs again and its absence reads as green.
+        // Mutation testing walked that straight past this assertion. Nothing
+        // legitimate ever puts a constant boolean in a gate, so reject any.
+        // Whitespace-normalized once, so `false  &&` and `false &&` read alike.
+        let normalized = cond.split_whitespace().collect::<Vec<_>>().join(" ");
+        for poison in ["false &&", "&& false", "false ||", "|| true", "true ||"] {
+            assert!(
+                !normalized.contains(poison),
+                "ci.yml job `{job}`'s gate contains the constant `{poison}`: the condition \
+                 mentions the changes output but can never (or always) run regardless of it"
+            );
+        }
     }
 }
 
@@ -1125,4 +1181,342 @@ fn hygiene_script_refuses_a_home_that_is_not_the_users() {
         "stderr must say why: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Run ci.yml's own `case "$f" in … esac` against a path and report how it
+/// classified it.
+///
+/// This lifts the SHIPPED globs out of the workflow rather than restating them,
+/// because the defect this guards is an ordering bug between two arms that are
+/// individually correct. A restatement would have the same ordering as whatever
+/// the test author believed, and would pass.
+fn classify_changed_path(path: &str) -> (bool, bool) {
+    let ci = parse_workflow("ci.yml");
+    let run = workflow_job(&ci, "changes")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`changes` job has no `steps:`")
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("case \"$f\" in"))
+        .expect("`changes` job no longer classifies paths with a `case` — update this test")
+        .to_string();
+
+    let start = run.find("case \"$f\" in").expect("case start");
+    let end = run[start..].find("esac").expect("unterminated case") + start + "esac".len();
+    let case_block = &run[start..end];
+
+    // The arms echo their own diagnostics ("bench path: …"), which land on
+    // stdout first, so key the result off a marker rather than off the leading
+    // two words. Reading the first two words instead makes `bench path: f`
+    // parse as code=`bench`, bench=`path:` — both false — which reports every
+    // correctly-classified bench source file as a defect.
+    let program = format!(
+        "code=false\nbench=false\nf={path:?}\n{case_block}\necho \"CLASSIFIED $code $bench\"\n"
+    );
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&program)
+        .output()
+        .expect("run the extracted classifier");
+    assert!(
+        out.status.success(),
+        "extracted classifier failed for {path}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let verdict = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("CLASSIFIED "))
+        .unwrap_or_else(|| panic!("classifier printed no verdict for {path}: {stdout}"));
+    let mut fields = verdict.split_whitespace();
+    let code = fields.next() == Some("true");
+    let bench = fields.next() == Some("true");
+    (code, bench)
+}
+
+/// A markdown file under `bench/` must route to `bench-tests`, not vanish.
+///
+/// `case` globs match `/`, so `*.md` in the docs arm swallows
+/// `bench/chromium/README.md` before the `bench/*` arm is ever considered. That
+/// PR then reports `code=false bench=false`: every gating job skips and Summary
+/// renders clean, while `bench/chromium/test_reqbench.py` carries lints that
+/// read exactly those files —
+/// `test_every_binomial_bound_matches_reqanalyze_clopper_pearson` (REVIEW.md),
+/// `test_agents_md_jpeg_figures_match_the_record_run` (AGENTS.md),
+/// `test_every_path_cited_in_a_doc_table_is_committed` (AGENTS.md, REVIEW.md)
+/// and `test_the_readme_healthcheck_verification_actually_fails` (README.md).
+///
+/// So the one class of change those lints exist to catch is the one class that
+/// runs nothing. That is the green-by-absence hole this file documents twice.
+#[test]
+fn a_bench_markdown_change_routes_to_the_bench_tests() {
+    for path in [
+        "bench/chromium/README.md",
+        "bench/chromium/AGENTS.md",
+        "bench/chromium/REVIEW.md",
+        "bench/chromium/report/README.md",
+    ] {
+        let (code, bench) = classify_changed_path(path);
+        assert!(
+            bench,
+            "`{path}` classified as code={code} bench={bench}: it matches the docs arm before \
+             `bench/*`, so a PR touching only it gets zero gating jobs while bench lints that \
+             read it exist"
+        );
+    }
+}
+
+/// The arms that surround `bench/*` must keep behaving as they did.
+///
+/// Reordering a `case` is exactly the kind of fix that trades one hole for
+/// another, so pin both directions: bench code still routes to bench, ordinary
+/// docs still skip everything, and source still runs the matrix.
+#[test]
+fn path_classification_holds_on_both_sides_of_the_bench_arm() {
+    for (path, want_code, want_bench) in [
+        ("bench/chromium/reqbench.py", false, true),
+        ("bench/chromium/test_reqbench.py", false, true),
+        // README.md and PERFORMANCE.md are LINTED by
+        // tests/test_documented_make_targets.rs, so they must reach the matrix.
+        ("README.md", true, false),
+        ("PERFORMANCE.md", true, false),
+        // The Makefile is both code and the subject of MakefileBenchGraph.
+        ("Makefile", true, true),
+        ("AGENTS.md", false, false),
+        ("docs/design.md", false, false),
+        (".claude/skills/pr-workflow/SKILL.md", false, false),
+        ("scripts/claude-assistant/index.ts", false, false),
+        ("src/main.rs", true, false),
+        ("scripts/scan-test-log.sh", true, false),
+        (".github/workflows/ci.yml", true, false),
+    ] {
+        let (code, bench) = classify_changed_path(path);
+        assert_eq!(
+            (code, bench),
+            (want_code, want_bench),
+            "`{path}` classified as code={code} bench={bench}, expected code={want_code} \
+             bench={want_bench}"
+        );
+    }
+}
+
+/// Run the `changes` step's own script with a synthetic environment.
+///
+/// `gh` is never reached on the fail-open paths (they exit before the API
+/// call), which is exactly what makes those paths testable here.
+fn run_changes_step(event: &str) -> String {
+    let ci = parse_workflow("ci.yml");
+    let run = workflow_job(&ci, "changes")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`changes` job has no `steps:`")
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("case \"$f\" in"))
+        .expect("`changes` job no longer classifies paths — update this test")
+        .to_string();
+
+    let dir = std::env::temp_dir().join(format!("fcvm-changes-{}-{event}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let out_file = dir.join("github_output");
+    std::fs::write(&out_file, "").expect("seed GITHUB_OUTPUT");
+
+    let status = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&run)
+        .env("EVENT", event)
+        .env("GITHUB_OUTPUT", &out_file)
+        .env("REPO", "o/r")
+        .env("PR", "1")
+        .output()
+        .expect("run the changes step");
+    assert!(
+        status.status.success(),
+        "changes step failed for event {event}: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let outputs = std::fs::read_to_string(&out_file).expect("read GITHUB_OUTPUT");
+    let _ = std::fs::remove_dir_all(&dir);
+    outputs
+}
+
+/// A fail-open must open BOTH gates, not just the code one.
+///
+/// Both early exits write `code=true` and never write `bench` at all, so
+/// `bench-tests` — gated on `needs.changes.outputs.bench == 'true'` — is
+/// SKIPPED on push-to-main, `workflow_dispatch`, the `Build Kernels`
+/// `workflow_run`, and on the "empty file list" path whose own comment says it
+/// fails toward running the matrix. Summary treats skipped as non-failure, so
+/// the bench lints this file routes PRs to would never run on main at all,
+/// which matters precisely because the documented stacked-PR routine
+/// force-merges with `--admin` after cancelling the PR-side run.
+///
+/// "Fail open" has to mean every gate, or it is just a differently-shaped hole.
+#[test]
+fn a_fail_open_opens_the_bench_gate_too() {
+    for event in ["push", "workflow_dispatch", "workflow_run", "schedule"] {
+        let outputs = run_changes_step(event);
+        assert!(
+            outputs.contains("code=true"),
+            "event {event}: expected code=true, got {outputs:?}"
+        );
+        assert!(
+            outputs.contains("bench=true"),
+            "event {event}: fail-open set code but left bench unset, so bench-tests \
+             is skipped and its lints never run: {outputs:?}"
+        );
+    }
+}
+
+/// A rename must be classified by where it came FROM as well as where it went.
+///
+/// `gh api ... --jq '.[].filename'` reports only the post-rename path, so
+/// `git mv src/foo.rs bench/chromium/foo.rs` yields a single `bench/` entry:
+/// `code` stays false, the whole VM matrix skips, and a tree that no longer
+/// compiles is mergeable behind a green Summary. `previous_filename` is present
+/// on exactly the renamed entries and is what closes it.
+#[test]
+fn renames_are_classified_by_their_source_path_too() {
+    let ci = parse_workflow("ci.yml");
+    let run = workflow_job(&ci, "changes")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`changes` job has no `steps:`")
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("gh api"))
+        .expect("`changes` job no longer lists changed files");
+    // Assert on the --jq ARGUMENT, not on the whole `run:` block. The block now
+    // explains previous_filename in prose, so `run.contains("previous_filename")`
+    // stayed true even with the query reverted to `.[].filename` -- a test that
+    // could not fail for the defect it names.
+    let jq = run
+        .split("--jq")
+        .nth(1)
+        .and_then(|rest| {
+            let rest = rest.trim_start();
+            let quote = rest.chars().next()?;
+            rest[1..].split(quote).next()
+        })
+        .expect("the changed-file step no longer passes a --jq expression");
+    assert!(
+        jq.contains("previous_filename"),
+        "the changed-file --jq expression is {jq:?}, which reads only the post-rename \
+         path, so moving a source file into bench/ or docs/ hides it from the \
+         classifier and skips the whole matrix"
+    );
+}
+
+/// The `changes` job must actually EMIT every output the matrix gates on.
+///
+/// `expensive_jobs_are_gated_on_the_changes_job` checks the CONSUMER side: that
+/// each expensive job's `if:` reads `needs.changes.outputs.code`. Nothing checked
+/// the PRODUCER side, and the two are wired together by string equality across
+/// three places:
+///
+///   the detect script:  echo "code=$code" >> "$GITHUB_OUTPUT"
+///   the job's outputs:  code: ${{ steps.detect.outputs.code }}
+///   every consumer:     needs.changes.outputs.code
+///
+/// A one-character typo in the middle line -- `steps.detect.outputs.cod` -- makes
+/// `needs.changes.outputs.code` evaluate to the empty string on every PR. lint,
+/// packaging, fc-mock, host, host-root and container all skip, and `summary`
+/// goes GREEN having run only actionlint. A complete CI bypass, from one
+/// character, that the whole suite passes through: the classification tests lift
+/// the `case` block out and append their own marker, so they never execute the
+/// output writes at all, and `actionlint -shellcheck=` exits 0.
+///
+/// Found by mutation testing, not by reading. Both variants -- the typo and
+/// deleting the `echo` -- left 21/21 tests passing.
+#[test]
+fn the_changes_job_emits_every_output_the_matrix_gates_on() {
+    let ci = parse_workflow("ci.yml");
+    let jobs = ci
+        .get("jobs")
+        .and_then(Value::as_mapping)
+        .expect("ci.yml has no `jobs:` mapping");
+    let changes = jobs
+        .get(Value::from("changes"))
+        .and_then(Value::as_mapping)
+        .expect("ci.yml has no `changes` job");
+
+    // Every step's `run:` in the changes job, concatenated: this is where the
+    // GITHUB_OUTPUT writes live.
+    let scripts: String = changes
+        .get(Value::from("steps"))
+        .and_then(Value::as_sequence)
+        .expect("the `changes` job has no steps")
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|s| s.get(Value::from("run")).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let declared = changes
+        .get(Value::from("outputs"))
+        .and_then(Value::as_mapping)
+        .expect(
+            "the `changes` job declares no `outputs:`, so nothing it computes reaches the matrix",
+        );
+
+    for (name, expr) in declared {
+        let name = name.as_str().expect("output name is not a string");
+        let expr = expr.as_str().unwrap_or_default();
+        // The declared expression must reference a step output of the SAME name.
+        // A typo here is invisible at runtime: GitHub yields "" rather than an error.
+        assert!(
+            expr.contains(&format!("outputs.{name}")),
+            "`changes` declares output `{name}` as `{expr}`, which does not read \
+             `outputs.{name}`. Every consumer of `needs.changes.outputs.{name}` will see the \
+             empty string, so its gated jobs skip and `summary` goes green having run nothing."
+        );
+        // And the script must write that key from the COMPUTED variable, not
+        // merely somewhere. There are three writes of `code=` in this file: two
+        // fail-open branches emit the literal `code=true`, and the main path
+        // emits `code=$code`. An earlier version of this assertion accepted any
+        // `echo "code="`, so deleting the MAIN write still passed -- the
+        // fail-opens covered for it. That is the same disease this test exists
+        // to cure, one level up, and mutation testing is what exposed it.
+        assert!(
+            scripts.contains(&format!("echo \"{name}=${name}\"")),
+            "`changes` declares output `{name}` but no step writes `{name}=${name}` to \
+             $GITHUB_OUTPUT, so the classifier's verdict never reaches the matrix and every \
+             job gated on it skips while `summary` goes green"
+        );
+        // The fail-open branches must ALSO open this gate. A fail-open that
+        // opens only some gates is the hole this file already documents.
+        assert!(
+            scripts.contains(&format!("echo \"{name}=true\"")),
+            "no fail-open branch writes `{name}=true`, so a path the classifier cannot \
+             evaluate leaves `{name}` closed and its jobs never run"
+        );
+    }
+
+    // And the reverse: nothing may gate on an output `changes` does not declare.
+    let whole = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml is unreadable");
+    let mut consumed: Vec<String> = Vec::new();
+    let mut rest = whole.as_str();
+    while let Some(at) = rest.find("needs.changes.outputs.") {
+        rest = &rest[at + "needs.changes.outputs.".len()..];
+        let key: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !key.is_empty() && !consumed.contains(&key) {
+            consumed.push(key);
+        }
+    }
+    assert!(
+        !consumed.is_empty(),
+        "no job reads `needs.changes.outputs.*` any more, so the classifier gates nothing"
+    );
+    for key in &consumed {
+        assert!(
+            declared.contains_key(Value::from(key.as_str())),
+            "a job gates on `needs.changes.outputs.{key}`, which the `changes` job does not \
+             declare. That expression is the empty string, so the job never runs and its \
+             absence reads as success."
+        );
+    }
 }

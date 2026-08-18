@@ -76,15 +76,31 @@ jobs:
           set -euo pipefail
           # Only a pull_request has a well-defined changed-file set here; every
           # other trigger runs the full matrix rather than guess.
+          # A fail-open must open EVERY gate. Writing `code=true` alone left
+          # `bench` unset, and bench-tests is gated on it, so the bench lints
+          # were skipped on push-to-main, workflow_dispatch and the Build
+          # Kernels workflow_run — i.e. never ran on main at all, which matters
+          # because the documented stacked-PR routine force-merges with --admin
+          # after cancelling the PR-side run. Summary counts skipped as
+          # non-failure, so that read as green.
           if [ "$EVENT" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "bench=true" >> "$GITHUB_OUTPUT"
             echo "event $EVENT: running the full matrix"
             exit 0
           fi
-          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
+          # `.filename` is the POST-rename path only. `git mv src/foo.rs
+          # bench/chromium/foo.rs` would report one bench/ entry, leave code
+          # false, skip the whole VM matrix, and make a non-compiling tree
+          # mergeable behind a green Summary. `previous_filename` is present on
+          # exactly the renamed entries, so classifying both paths means a
+          # rename is judged by where it came from as well as where it went.
+          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
+            --jq '.[] | .filename, (.previous_filename // empty)')
           if [ -z "$files" ]; then
-            # An empty file list is unexpected, so fail toward running the matrix.
+            # An empty file list is unexpected, so fail toward running everything.
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "bench=true" >> "$GITHUB_OUTPUT"
             echo "no changed files reported: running the full matrix"
             exit 0
           fi
@@ -98,9 +114,37 @@ jobs:
           code=false
           bench=false
           while IFS= read -r f; do
+            # `bench/*` MUST precede the docs arm. A shell `case` glob matches
+            # `/`, so `*.md` swallows bench/chromium/README.md and that PR
+            # reports code=false bench=false: zero gating jobs, clean Summary.
+            # Meanwhile bench/chromium/test_reqbench.py carries lints that read
+            # exactly those files (the Clopper-Pearson bound lint on REVIEW.md,
+            # the JPEG figure and cited-path lints on AGENTS.md, the healthcheck
+            # lint on README.md), so the one class of change those lints exist
+            # to catch would be the one class that runs nothing.
+            #
+            # The `*.md` in `paths-ignore:` at the top of this file is NOT the
+            # same pattern: GitHub's filter globs stop at a slash, so there it
+            # means root-level markdown only. Identical spelling, different
+            # matcher — which is why this was easy to miss.
             case "$f" in
-              scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*|docs/*|*.md) ;;
+              scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*) ;;
+              # Docs that TESTS READ are code, whatever their extension.
+              # tests/test_documented_make_targets.rs reads README.md and
+              # PERFORMANCE.md and fails when they name make targets that do not
+              # exist; it runs ungated under `make test-unit` in the host job. A
+              # PR editing only those files was getting zero gating jobs while
+              # the very lints that check them sat unrun -- the same hole this
+              # file fixes for bench/, one directory up.
+              README.md|PERFORMANCE.md) code=true; echo "linted doc: $f" ;;
+              # The Makefile is BOTH: ordinary code, and the subject of
+              # bench/chromium/test_reqbench.py::MakefileBenchGraph, the
+              # structural pin AGENTS.md cites for the bench dependency graph.
+              # It runs `make -pq` against this file, so a Makefile-only change
+              # is exactly the class that can break it.
+              Makefile) code=true; bench=true; echo "makefile: $f" ;;
               bench/*) bench=true; echo "bench path: $f" ;;
+              docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
           done <<< "$files"
