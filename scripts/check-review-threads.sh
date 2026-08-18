@@ -196,11 +196,18 @@ fetch_payload() {
     return 2
   fi
 
-  jq -n --argjson t "$threads" --argjson r "$reviews" --argjson c "$prcomments" \
+  # The three arrays ride file descriptors, not argv: a single argv string is
+  # capped at MAX_ARG_STRLEN (128 KiB on Linux), so --argjson with a real PR's
+  # thread bodies dies with "Argument list too long" and the gate fail-closes
+  # on exactly the large PRs it is most needed for. printf is a bash builtin,
+  # so the process substitutions never exec with the payload as an argument.
+  jq -n --slurpfile t <(printf '%s' "$threads") \
+        --slurpfile r <(printf '%s' "$reviews") \
+        --slurpfile c <(printf '%s' "$prcomments") \
         --arg a "$prauthor" --arg h "$headoid" \
      '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
-                                      reviewThreads:{nodes:$t}, reviews:{nodes:$r},
-                                      comments:{nodes:$c}}}}}'
+                                      reviewThreads:{nodes:$t[0]}, reviews:{nodes:$r[0]},
+                                      comments:{nodes:$c[0]}}}}}'
 }
 
 if [ "${1:-}" = "--from-file" ]; then
