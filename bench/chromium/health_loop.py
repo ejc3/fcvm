@@ -20,7 +20,9 @@ import os
 import sys
 import time
 
-# MUST match health_state.sh:31 -- writer and reader resolve the same path.
+# MUST equal the default in health_state.sh (its STATE_FILE fallback) --
+# writer and reader resolve the same path or every verdict is invisible.
+# Enforced end to end by test_the_default_paths_agree_without_the_env.
 DEFAULT_STATE_FILE = "/run/bench-health"
 LOOP_INTERVAL = float(os.environ.get("BENCH_HEALTH_INTERVAL", "1.0"))
 

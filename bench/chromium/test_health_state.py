@@ -19,6 +19,7 @@ import unittest
 from pathlib import Path
 
 READER = Path(__file__).resolve().parent / "health_state.sh"
+SH_DIR = Path(__file__).resolve().parent
 
 
 def monotonic_now() -> int:
@@ -38,6 +39,43 @@ def run_reader(state: str | None, max_age: str | None = None) -> subprocess.Comp
         return subprocess.run(
             ["bash", str(READER)], env=env, capture_output=True, text=True, check=False
         )
+
+
+class DefaultPathAgreement(unittest.TestCase):
+    def test_the_default_paths_agree_without_the_env(self):
+        """Writer and reader must meet at the same DEFAULT path.
+
+        Every other test here sets BENCH_HEALTH_STATE on both halves, so a
+        writer default of /run/WRONG-PATH passes the whole file -- verified by
+        mutation: 9/9 green with the default broken. Production sets the env
+        nowhere (neither entry script, neither Containerfile, not reqbench.sh),
+        so the DEFAULTS are the only contract that matters, and they were
+        enforced by nothing. A divergence reports every clone unhealthy -- or
+        worse, healthy off a stale file at the old path.
+
+        unshare gives this test a private /run without root: a user+mount
+        namespace with a tmpfs over /run, the writer publishing through its
+        default, the reader reading through its own. 23 ms, no container.
+        """
+        script = (
+            "mount -t tmpfs tmpfs /run && "
+            f"cd {SH_DIR} && "
+            "python3 -c \"import health_loop; health_loop.publish('healthy', 'pages=1 id=E2E')\" && "
+            "exec bash health_state.sh"
+        )
+        result = subprocess.run(
+            ["unshare", "-rm", "bash", "-c", script],
+            capture_output=True, text=True, timeout=60,
+            env={k: v for k, v in os.environ.items() if k != "BENCH_HEALTH_STATE"},
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            "the reader did not accept a verdict the writer just published "
+            "through both DEFAULT paths; they have diverged\n"
+            + result.stdout + result.stderr,
+        )
+        self.assertIn("id=E2E", result.stdout,
+                      "the reader passed but not on the verdict this test wrote")
 
 
 class HealthStateReader(unittest.TestCase):
@@ -87,7 +125,15 @@ class HealthStateReader(unittest.TestCase):
         # 64-bit integers, so a value that does not fit returns status 2 exactly
         # like a non-numeric one. A digits-only check passes them and the gate
         # falls open, which is the same defect wearing a disguise.
+        # 19 digits is the INT64 boundary case, and the only exploitable one:
+        # `[ -gt ]` accepts up to 9223372036854775807 (19 digits), so a length
+        # bound loosened to 19 admits budgets the comparison then chokes on.
+        # The 20- and 48-digit probes below are past the boundary and even a
+        # bound of 19 refuses them -- mutation testing showed the pair passing
+        # with the bound at 19 while a 19-digit budget waved a stale verdict
+        # through (`healthy (age 237s)`, exit 0).
         for budget in ("notanumber", "", "7s", "-1", "7.5",
+                       "9999999999999999999",
                        "99999999999999999999",
                        "999999999999999999999999999999999999999999999999"):
             with self.subTest(budget=budget):
