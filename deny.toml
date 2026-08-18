@@ -7,6 +7,11 @@ ignore = [
     # bincode is unmaintained but v1.3.3 is considered complete
     # Not a security issue - maintainers ceased development
     "RUSTSEC-2025-0141",
+    # h2 0.3 unbounded empty DATA frames (low-severity DoS); patched only in
+    # h2 >= 0.4.16, which needs the hyper 1.x line. Client-mode-only use over
+    # trusted local transports here. Tracked by issue #859; remove with the
+    # hyper 1.x / reqwest 0.12 migration. Keep in sync with .cargo/audit.toml.
+    "RUSTSEC-2026-0258",
 ]
 
 [licenses]
