@@ -37,7 +37,7 @@
 #
 # Host smoke test (fast loop, no VM):
 #   podman run -d --name wb localhost/webkit-bench
-#   podman logs -f wb          # wait for WEBKIT_BENCH_READY
+#   podman logs -f wb          # wait for BENCH_READY
 #   podman exec wb python3 /opt/bench/wddrive.py http://127.0.0.1:8000/medium.html \
 #       --host 127.0.0.1:9515 --session-file /run/bench-session-id --out-prefix /tmp/medium
 
@@ -88,7 +88,7 @@ EXPOSE 9515
 # `Healthy` = container running AND this HEALTHCHECK). wd_health.py requires the
 # warm marker AND a live WebDriver round trip on the WARM SESSION — classic
 # WebDriver's /status reports "ready" even when no browser is running, so the
-# probe is GET /session/<id>/url, which fails once the session or browser dies.
+# probe is POST execute/sync, which fails once the session or browser dies.
 # start-period covers Xvfb + MiniBrowser cold launch + the warm render.
 # The reader, not the probe. A per-second `python3 wd_health.py` spends a
 # fresh interpreter in every clone forever -- 9.1ms startup, 43.6ms per check

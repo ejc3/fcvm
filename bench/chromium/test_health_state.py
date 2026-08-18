@@ -14,6 +14,7 @@ died. That is the green-by-absence shape this repo keeps finding in gates.
 """
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,6 +77,51 @@ class DefaultPathAgreement(unittest.TestCase):
         )
         self.assertIn("id=E2E", result.stdout,
                       "the reader passed but not on the verdict this test wrote")
+
+
+class ProbeContract(unittest.TestCase):
+    def test_every_probe_branch_returns_a_reason_tuple(self) -> None:
+        """main_with_reason() promises (int, str); every branch must keep it.
+
+        health_loop.loop() unpacks the pair, so a branch that returns a bare
+        int crashes the resident checker with `TypeError: cannot unpack
+        non-iterable int object`. The loop's crash guard fails closed, so the
+        symptom is not a wrong verdict but a checker that dies and a container
+        that goes unhealthy with a traceback for a reason as mundane as "the
+        warm marker is not there yet". wd_health's absent-marker branch shipped
+        exactly that: every other branch returned the tuple and it returned 1.
+
+        Driven for real: absent marker (the shipped bug's branch), then a
+        marker with an unreadable session file (the next branch down).
+        """
+        import importlib
+        with tempfile.TemporaryDirectory() as tmp:
+            for env, why in (
+                ({"BENCH_READY_FILE": os.path.join(tmp, "absent")},
+                 "warm marker absent"),
+                ({"BENCH_READY_FILE": __file__,
+                  "BENCH_SESSION_FILE": os.path.join(tmp, "no-session")},
+                 "session file unreadable"),
+            ):
+                with self.subTest(why=why):
+                    old = {k: os.environ.get(k) for k in env}
+                    os.environ.update(env)
+                    try:
+                        import wd_health
+                        importlib.reload(wd_health)
+                        result = wd_health.main_with_reason()
+                    finally:
+                        for k, v in old.items():
+                            if v is None:
+                                os.environ.pop(k, None)
+                            else:
+                                os.environ[k] = v
+                    self.assertIsInstance(result, tuple,
+                                          f"{why}: returned {result!r}, which "
+                                          "health_loop.loop() cannot unpack")
+                    self.assertEqual(len(result), 2)
+                    self.assertIsInstance(result[0], int)
+                    self.assertIsInstance(result[1], str)
 
 
 class HealthStateReader(unittest.TestCase):
@@ -160,9 +206,22 @@ class HealthStateReader(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
 
     def test_garbage_is_not_healthy(self) -> None:
-        for junk in ("\n", "healthy\n", "healthy notanumber exit=0\n"):
+        # (input, the diagnostic its OWN guard prints). Exit code alone is not
+        # enough: with the validation deleted, `set -u` still aborts with 1 on
+        # the arithmetic error -- the right exit for the wrong reason, which is
+        # the accident the guard's comment says it exists to replace. The
+        # message pins WHICH check refused.
+        for junk, diagnostic in (
+            ("\n", "unrecognised verdict"),
+            ("healthy\n", "unparsable stamp"),
+            ("healthy notanumber exit=0\n", "unparsable stamp"),
+        ):
             with self.subTest(junk=junk):
-                self.assertEqual(run_reader(junk).returncode, 1, f"accepted {junk!r}")
+                result = run_reader(junk)
+                self.assertEqual(result.returncode, 1, f"accepted {junk!r}")
+                self.assertIn(diagnostic, result.stderr,
+                              f"refused {junk!r} but not by its own guard: "
+                              f"stderr was {result.stderr!r}")
 
     def test_the_writer_and_reader_agree_on_the_format(self) -> None:
         """The contract that actually matters: publish() -> health_state.sh.
@@ -183,10 +242,19 @@ class HealthStateReader(unittest.TestCase):
             # correct: the test reported drift that did not exist, and would
             # equally have hidden drift that did. A directory with no cache
             # cannot lie about which source ran.
+            # health_loop.py must come along: publish() lives there now, and
+            # importing it from the real tree reads bench/chromium/__pycache__
+            # -- the exact stale-bytecode hazard this copy exists to avoid.
+            shutil.copy(
+                Path(__file__).resolve().parent / "health_loop.py",
+                os.path.join(directory, "health_loop.py"),
+            )
             source = shutil.copy(
                 Path(__file__).resolve().parent / "cdp_health.py",
                 os.path.join(directory, "cdp_health_under_test.py"),
             )
+            sys.path.insert(0, directory)
+            self.addCleanup(sys.path.remove, directory)
             spec = importlib.util.spec_from_file_location("cdp_health_under_test", source)
             cdp_health = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(cdp_health)

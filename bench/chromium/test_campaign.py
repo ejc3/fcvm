@@ -52,13 +52,15 @@ class RunPackaging(unittest.TestCase):
         of packaging a run: the contamination it prevents is the contamination
         it would introduce.
         """
-        match = re.search(r"^CORPUS_STAMP\s*(\??:?=)", makefile(), re.M)
-        self.assertIsNotNone(match, "CORPUS_STAMP is gone from the Makefile")
-        self.assertEqual(
-            match.group(1), ":=",
-            "CORPUS_STAMP is recursively expanded, so $(shell date) re-runs on "
-            "every reference and one run can straddle two stamps",
-        )
+        for var in ("CORPUS_STAMP", "CORPUS_RUN_DIR"):
+            match = re.search(rf"^{var}\s*(\??:?=)", makefile(), re.M)
+            self.assertIsNotNone(match, f"{var} is gone from the Makefile")
+            self.assertEqual(
+                match.group(1), ":=",
+                f"{var} is recursively expanded; moving $(shell date) into any "
+                "recursively expanded variable re-runs it per reference, and one "
+                "run can straddle two stamps",
+            )
 
     def test_the_run_directory_is_reserved_and_not_reused(self):
         """`mkdir -p` accepts an existing directory.
@@ -109,7 +111,11 @@ class Provenance(unittest.TestCase):
         commit nobody can recover, which is the one thing writing SOURCE_REF
         exists to prevent.
         """
-        pin = re.search(r"git -C \"\$\(CURDIR\)\" branch[^\n]*", makefile())
+        # Join continuations FIRST: make folds backslash-newline into one shell
+        # command, so `|| true` on the next physical line is semantically on
+        # this one -- and a single-line regex cannot see it.
+        joined = re.sub(r"\\\n", " ", makefile())
+        pin = re.search(r"git -C \"\$\(CURDIR\)\" branch[^\n]*", joined)
         self.assertIsNotNone(pin, "the revision pin is gone")
         self.assertNotIn("branch -f", pin.group(0),
                          "the pin can move a ref an earlier record cites")

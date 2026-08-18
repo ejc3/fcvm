@@ -10,7 +10,7 @@ JSON bodies, no WebSocket). Used in three places:
     classic has no session-discovery API, so a session created after restore
     would launch a COLD browser — the id must be minted at the warm point and
     inherited by every clone.
-  * wd_health.py (in guest): GET /session/<id>/url as the liveness probe.
+  * wd_health.py (in guest): POST execute/sync as the liveness probe.
   * the host bench arms (default mode): reuse the inherited session id for
     navigate + screenshot against a restored clone.
 

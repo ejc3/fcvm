@@ -4,7 +4,7 @@
 The WebKit twin of cdp_health.py, with one protocol-forced difference: classic
 WebDriver's GET /status reports "ready" whether or not any browser is running —
 it describes the DRIVER's readiness to mint sessions, not the health of ours.
-The probe that actually covers the request path is GET /session/<id>/url on the
+The probe that actually covers the request path is POST execute/sync on the
 warm session entry-webkit.sh created: it fails once the session or MiniBrowser
 dies, and succeeds only if the exact session every clone will inherit can still
 answer.
@@ -35,8 +35,7 @@ TIMEOUT = float(os.environ.get("BENCH_WD_HEALTH_TIMEOUT", "3"))
 
 def main_with_reason() -> tuple[int, str]:
     if not os.path.exists(READY_FILE):
-        print(f"unhealthy: warm marker {READY_FILE} absent", file=sys.stderr)
-        return 1
+        return 1, f"warm marker {READY_FILE} absent"
     try:
         with open(SESSION_FILE) as source:
             session = source.read().strip()

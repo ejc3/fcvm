@@ -360,8 +360,27 @@ def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
         # excusing it. NOT memoized: this is a statement about the probe, not
         # about the host, so a later attempt may still answer the question.
         return True
-    _MACHINE_COUNTER_TRACKS = excess >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
-    return _MACHINE_COUNTER_TRACKS
+    if excess >= spent - CPU_RESIDUAL_UNCERTAINTY_MS:
+        _MACHINE_COUNTER_TRACKS = True
+        return True
+    # The median says "not tracking" -- but that verdict is only trustworthy if
+    # the pairs AGREE. Pairing cancels STEADY ambient; it amplifies FLUCTUATING
+    # ambient, because a load that starts or stops between the idle window and
+    # the burn window lands in the difference at full weight. Observed: two
+    # test suites running concurrently made this probe condemn a host that
+    # tracks perfectly (excess spread far beyond tolerance, median dragged
+    # low). When the spread of excesses exceeds the tolerance the probe cannot
+    # distinguish "counter excludes us" from "ambient was choppy", so it fails
+    # toward "tracks" -- keeping the strict violation path (RuntimeError) live
+    # rather than excusing the host -- and does NOT memoize, since choppiness
+    # is a statement about the moment, not the host. A genuinely untracked
+    # counter yields excesses that agree near zero (spread within tolerance)
+    # and is still condemned.
+    spread = excesses[-1] - excesses[0]
+    if spread > CPU_RESIDUAL_UNCERTAINTY_MS:
+        return True
+    _MACHINE_COUNTER_TRACKS = False
+    return False
 
 
 def bounded_cpu_residual(machine_ms: float, harness_ms: float, tracks=None) -> dict:
