@@ -458,6 +458,42 @@ fn summary_fails_when_a_gating_job_fails() {
              checked on its own, not as one arm of an `||` that a later edit can halve."
         );
     }
+
+    // The `if:` is only half the gate: the step it guards must actually FAIL.
+    // Mutating its `exit 1` to `exit 0` left every assertion above satisfied --
+    // the condition still matched, the step still ran, and Summary went green
+    // over a failed Lint. actionlint cannot object either; `exit 0` is valid
+    // shell. So the body is checked too: the failing step's script must end by
+    // exiting non-zero, not by succeeding.
+    let fail_step_run = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|s| {
+            // The GATE step alone checks both terminal states. Two diagnostic
+            // steps also fire on `failure` and deliberately end `exit 0` so
+            // they cannot preempt the gate -- matching on `failure` alone
+            // selects the first of those instead.
+            s.get(Value::from("if"))
+                .and_then(Value::as_str)
+                .is_some_and(|c| {
+                    c.contains("needs.*.result") && c.contains("failure") && c.contains("cancelled")
+                })
+        })
+        .filter_map(|s| s.get(Value::from("run")).and_then(Value::as_str))
+        .next()
+        .expect("the failure-checking step has no `run:` body");
+    let last_line = fail_step_run
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    assert_eq!(
+        last_line, "exit 1",
+        "the gate step's script ends with `{last_line}`, not `exit 1`; the condition fires, \
+         the error annotation prints, and the job then SUCCEEDS -- Summary green over a \
+         failed gating job"
+    );
 }
 
 /// A diagnostic that cannot run is worse than no diagnostic: it is silent in
@@ -881,6 +917,23 @@ fn expensive_jobs_are_gated_on_the_changes_job() {
             cond.contains("needs.changes.outputs.code == 'true'"),
             "ci.yml job `{job}` is not gated on the `changes` job, so a docs-only PR runs it"
         );
+        // A substring check tests presence, not effect: prefixing `false && `
+        // keeps the asserted text intact while the condition evaluates false on
+        // every PR -- the job never runs again and its absence reads as green.
+        // Mutation testing walked that straight past this assertion. Nothing
+        // legitimate ever puts a constant boolean in a gate, so reject any.
+        for poison in ["false &&", "&& false", "false||", "|| true", "true ||"] {
+            assert!(
+                !cond.replace(' ', " ").contains(poison)
+                    && !cond
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .contains(poison),
+                "ci.yml job `{job}`'s gate contains the constant `{poison}`: the condition \
+                 mentions the changes output but can never (or always) run regardless of it"
+            );
+        }
     }
 }
 
