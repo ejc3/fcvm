@@ -212,6 +212,65 @@ run_case "unresolved thread blocks" \
   1 "UNRESOLVED"
 run_case "no threads and no reviews is clear" "$(wrap '[]')" 0 "CLEAR"
 
+echo "== finding 19: a 128 KiB thread body must not kill the live-path merge =="
+# fetch_payload's final jq used --argjson, putting each array in ONE argv string;
+# Linux caps a single argv string at MAX_ARG_STRLEN (128 KiB), so any real PR whose
+# accumulated bodies pass that died with "Argument list too long", payload came back
+# empty, and the gate fail-closed FOREVER on exactly the big PRs it exists for.
+# Reached through the live path with a gh shim, since --from-file skips the merge.
+mkdir -p "$TMP/bin"
+big_body=$(printf 'x%.0s' $(seq 1 200000))
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"databaseId":1,"author":{"login":"reviewer"},"path":"a.ts","line":1,"createdAt":"2026-01-01T00:00:00Z","body":"%s"},{"databaseId":2,"author":{"login":"me"},"path":"a.ts","line":1,"createdAt":"2026-01-02T00:00:00Z","body":"NOT-A-DEFECT: fixture padding, not a finding"}]}}]}}}}}' "$big_body" > "$TMP/threads.json"
+printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]}}}}}' > "$TMP/reviews.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments.json"
+# Quoted delimiter: nothing in the shim expands at write time; GATE_TEST_DIR
+# arrives via the environment when the gate execs gh.
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
+  *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
+  *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq; apply it here
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+out=$(GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+if [ "$rc" = 0 ] && grep -qF "CLEAR" <<<"$out" && ! grep -qi "argument list too long" <<<"$out"; then
+  echo "  PASS  oversized thread body evaluates instead of dying on argv"; pass=$((pass+1))
+else
+  echo "  FAIL  oversized thread body evaluates instead of dying on argv (rc=$rc)"
+  sed 's/^/          /' <<<"$out" | head -4
+  fail=$((fail+1))
+fi
+
+echo "== finding 20: an OVERSIZED thread's paged comments ride an fd too =="
+# The pagination path rebuilt the thread with --argjson c "$all_comments" — the
+# same MAX_ARG_STRLEN hazard as finding 19, reachable only when one thread's
+# totalCount exceeds COMMENTS_PAGE_SIZE. Shrunk to 2 here so three comments,
+# one of them ~200 KiB, walk the paging loop.
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"comments":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[{"databaseId":1,"author":{"login":"reviewer"},"path":"a.ts","line":1,"createdAt":"2026-01-01T00:00:00Z","body":"%s"},{"databaseId":2,"author":{"login":"someone"},"path":"a.ts","line":1,"createdAt":"2026-01-01T01:00:00Z","body":"discussion"}]}}]}}}}}' "$big_body" > "$TMP/threads.json"
+printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"me"},"path":"a.ts","line":1,"body":"NOT-A-DEFECT: fixture padding, not a finding"}]}}}}' > "$TMP/threadpage.json"
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *"node(id"*)         cat "$GATE_TEST_DIR/threadpage.json" ;;
+  *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
+  *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
+  *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq; apply it here
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+out=$(COMMENTS_PAGE_SIZE=2 GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+if [ "$rc" = 0 ] && grep -qF "CLEAR" <<<"$out" && ! grep -qi "argument list too long" <<<"$out"; then
+  echo "  PASS  oversized paged thread evaluates instead of dying on argv"; pass=$((pass+1))
+else
+  echo "  FAIL  oversized paged thread evaluates instead of dying on argv (rc=$rc)"
+  sed 's/^/          /' <<<"$out" | head -4
+  fail=$((fail+1))
+fi
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
