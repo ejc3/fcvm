@@ -276,6 +276,18 @@ class HealthStateReader(unittest.TestCase):
             )
             sys.path.insert(0, directory)
             self.addCleanup(sys.path.remove, directory)
+            # `import health_loop` inside exec_module hits sys.modules first,
+            # so a previously imported bench/chromium copy would satisfy it and
+            # the temp copy above would never run -- the exact stale-bytecode
+            # hazard this directory exists to avoid. Evict it so the import
+            # resolves through sys.path to the copy.
+            cached_health_loop = sys.modules.pop("health_loop", None)
+            if cached_health_loop is not None:
+                self.addCleanup(
+                    sys.modules.__setitem__, "health_loop", cached_health_loop
+                )
+            else:
+                self.addCleanup(sys.modules.pop, "health_loop", None)
             spec = importlib.util.spec_from_file_location("cdp_health_under_test", source)
             cdp_health = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(cdp_health)
@@ -287,7 +299,6 @@ class HealthStateReader(unittest.TestCase):
             # sides actually use instead of a test-only back door.
             os.environ["BENCH_HEALTH_STATE"] = state
             self.addCleanup(os.environ.pop, "BENCH_HEALTH_STATE", None)
-            cdp_health.STATE_FILE = state
             cdp_health.publish("healthy", "pages=1 id=ABC")
 
             env = dict(os.environ, BENCH_HEALTH_STATE=state)

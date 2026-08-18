@@ -116,8 +116,9 @@ cp "$SESSION_FILE" "$PAGES_DIR/webdriver-session.txt"
 # Resident health checker, started BEFORE the warm marker so the interpreter's
 # pages are dirtied pre-snapshot and shared by every clone. stdout to /dev/null:
 # a per-second writer would otherwise grow podman's container log on the clone's
-# CoW disk forever.
-python3 /opt/bench/wd_health.py --loop >/dev/null 2>&1 &
+# CoW disk forever. stderr kept: the loop writes there only when it is dying,
+# and that crash is otherwise invisible (see entry.sh's cdp_health.py twin).
+python3 /opt/bench/wd_health.py --loop >/dev/null &
 echo "webkit-bench: resident health checker started"
 
 # Warm marker. wddrive.py --then-blank returns zero only after the navigate,

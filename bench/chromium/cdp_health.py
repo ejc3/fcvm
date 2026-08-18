@@ -34,7 +34,6 @@ import sys
 
 import health_loop
 from health_loop import monotonic_seconds, publish, state_file  # re-exported for callers/tests
-import time
 import urllib.request
 
 # Chromium's own DevTools port. There is no relay any more: fcvm DNATs this
@@ -87,12 +86,6 @@ def main() -> int:
     print(("healthy " if code == 0 else "unhealthy: ") + reason,
           file=sys.stdout if code == 0 else sys.stderr)
     return code
-
-
-# Where the resident loop publishes its verdict, and how stale a verdict may be
-# before the reader must refuse it.
-STATE_FILE = os.environ.get("BENCH_HEALTH_STATE", "/run/bench-health")
-LOOP_INTERVAL = float(os.environ.get("BENCH_HEALTH_INTERVAL", "1"))
 
 
 if __name__ == "__main__":
