@@ -1,0 +1,21 @@
+{
+  "runid": "073508",
+  "seed": 1786606508,
+  "cells": [
+    "file-4k",
+    "uffd-4k-copy",
+    "uffd-4k-minor",
+    "uffd-huge-minor"
+  ],
+  "pages": [
+    "medium.html"
+  ],
+  "reps": 6,
+  "warmup": 2,
+  "label": "",
+  "precheck": {
+    "loadavg_1m": 0.2626953125,
+    "firecracker_pids": [],
+    "uptime_s": 53500.39
+  }
+}

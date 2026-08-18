@@ -1,0 +1,846 @@
+{
+  "file-4k|medium.html": {
+    "cell": "file-4k",
+    "page": "medium.html",
+    "n": 6,
+    "granule": 4096,
+    "guest_bytes": 2147483648,
+    "requests": [
+      {
+        "name": "fb-073508-file-4k-medium-6",
+        "wall_ms": 3883.3649158477783,
+        "rep": 6
+      },
+      {
+        "name": "fb-073508-file-4k-medium-4",
+        "wall_ms": 3876.518726348877,
+        "rep": 4
+      },
+      {
+        "name": "fb-073508-file-4k-medium-7",
+        "wall_ms": 3841.6855335235596,
+        "rep": 7
+      },
+      {
+        "name": "fb-073508-file-4k-medium-3",
+        "wall_ms": 3904.057741165161,
+        "rep": 3
+      },
+      {
+        "name": "fb-073508-file-4k-medium-8",
+        "wall_ms": 3793.2746410369873,
+        "rep": 8
+      },
+      {
+        "name": "fb-073508-file-4k-medium-5",
+        "wall_ms": 3917.0219898223877,
+        "rep": 5
+      }
+    ],
+    "stability_uffd_offsets": {},
+    "stability_pagemap": {},
+    "stability_kvm_ipa": {},
+    "agg": {
+      "wall_ms": {
+        "mean": 3869.320591290792,
+        "min": 3793.2746410369873,
+        "max": 3917.0219898223877,
+        "median": 3879.9418210983276,
+        "n": 6
+      },
+      "uffd_faults": null,
+      "uffd_bytes": null,
+      "uffd_frac_of_guest": null,
+      "uffd_ioctl_us_p50": null,
+      "uffd_ioctl_us_mean": null,
+      "uffd_ioctl_us_total": null,
+      "uffd_interfault_us_p50": null,
+      "uffd_interfault_us_mean": null,
+      "uffd_wall_us_per_fault": null,
+      "serve_cpu_ms": null,
+      "serve_cpu_us_per_fault": null,
+      "fault_span_ms": null,
+      "pagemap_resident_4k": null,
+      "pagemap_resident_bytes": null,
+      "pagemap_frac_of_guest": null,
+      "fc_minflt_total": null,
+      "fc_majflt_total": null,
+      "fc_cpu_ms": null,
+      "kvm_guest_faults": null,
+      "kvm_unique_4k": null,
+      "kvm_unique_granule": null,
+      "kvm_frac_of_guest": null
+    }
+  },
+  "uffd-4k-copy|medium.html": {
+    "cell": "uffd-4k-copy",
+    "page": "medium.html",
+    "n": 6,
+    "granule": 4096,
+    "guest_bytes": 2147483648,
+    "requests": [
+      {
+        "name": "fb-073508-uffd-4k-copy-medium-3",
+        "wall_ms": 3840.222120285034,
+        "rep": 3,
+        "uffd_trace_file": "691056-vm-2.faults",
+        "uffd_faults": 13281,
+        "uffd_bytes": 54398976,
+        "uffd_frac_of_guest": 0.025331497192382812,
+        "uffd_ioctl_us_p50": 2.315,
+        "uffd_ioctl_us_p90": 2.638,
+        "uffd_ioctl_us_p99": 9.219,
+        "uffd_ioctl_us_mean": 2.626991265717943,
+        "uffd_ioctl_us_total": 34889.071,
+        "uffd_interfault_us_p50": 8.55,
+        "uffd_interfault_us_mean": 275.6739079819277,
+        "locality": {
+          "unique_granules": 13281,
+          "runs": 4611,
+          "run_len_mean": 2.8802862719583606,
+          "run_len_median": 1,
+          "run_len_p90": 4,
+          "run_len_max": 513,
+          "frac_in_runs_ge2": 0.7720804156313531,
+          "frac_in_runs_ge4": 0.5912958361569159,
+          "frac_in_runs_ge16": 0.37022814547097355,
+          "frac_in_runs_ge64": 0.2651155786461863,
+          "frac_in_runs_ge512": 0.23138317897748664,
+          "order_frac_next_is_plus1": 0.03102409638554217,
+          "order_frac_next_within_16": 0.2760542168674699
+        },
+        "fault_span_ms": 3695.838569,
+        "uffd_wall_us_per_fault": 278.28014223326556,
+        "serve_cpu_ms": 340.0,
+        "serve_cpu_us_per_fault": 25.60048189142384
+      },
+      {
+        "name": "fb-073508-uffd-4k-copy-medium-6",
+        "wall_ms": 3810.009717941284,
+        "rep": 6,
+        "trace_ambiguous": [
+          "691056-vm-3.faults",
+          "691056-vm-4.faults"
+        ],
+        "serve_cpu_ms": 350.0
+      },
+      {
+        "name": "fb-073508-uffd-4k-copy-medium-8",
+        "wall_ms": 3789.074420928955,
+        "rep": 8,
+        "uffd_trace_file": "691056-vm-4.faults",
+        "uffd_faults": 11725,
+        "uffd_bytes": 48025600,
+        "uffd_frac_of_guest": 0.022363662719726562,
+        "uffd_ioctl_us_p50": 2.299,
+        "uffd_ioctl_us_p90": 2.636,
+        "uffd_ioctl_us_p99": 8.466,
+        "uffd_ioctl_us_mean": 2.5505154797441367,
+        "uffd_ioctl_us_total": 29904.794,
+        "uffd_interfault_us_p50": 8.681,
+        "uffd_interfault_us_mean": 308.6051764756056,
+        "locality": {
+          "unique_granules": 11725,
+          "runs": 4684,
+          "run_len_mean": 2.503202391118702,
+          "run_len_median": 1.0,
+          "run_len_p90": 4,
+          "run_len_max": 512,
+          "frac_in_runs_ge2": 0.7362899786780384,
+          "frac_in_runs_ge4": 0.5330490405117271,
+          "frac_in_runs_ge16": 0.279317697228145,
+          "frac_in_runs_ge64": 0.14140724946695096,
+          "frac_in_runs_ge512": 0.08733475479744136,
+          "order_frac_next_is_plus1": 0.04136813374274991,
+          "order_frac_next_within_16": 0.1790344592289321
+        },
+        "fault_span_ms": 3647.991883,
+        "uffd_wall_us_per_fault": 311.12937168443494,
+        "serve_cpu_ms": 330.0,
+        "serve_cpu_us_per_fault": 28.14498933901919
+      },
+      {
+        "name": "fb-073508-uffd-4k-copy-medium-4",
+        "wall_ms": 3824.62215423584,
+        "rep": 4,
+        "trace_ambiguous": [
+          "691056-vm-5.faults",
+          "691056-vm-6.faults"
+        ],
+        "serve_cpu_ms": 340.0
+      },
+      {
+        "name": "fb-073508-uffd-4k-copy-medium-5",
+        "wall_ms": 3788.562297821045,
+        "rep": 5,
+        "uffd_trace_file": "691056-vm-6.faults",
+        "uffd_faults": 13901,
+        "uffd_bytes": 56938496,
+        "uffd_frac_of_guest": 0.026514053344726562,
+        "uffd_ioctl_us_p50": 2.262,
+        "uffd_ioctl_us_p90": 2.583,
+        "uffd_ioctl_us_p99": 9.066,
+        "uffd_ioctl_us_mean": 2.5531438745413997,
+        "uffd_ioctl_us_total": 35491.253,
+        "uffd_interfault_us_p50": 7.11,
+        "uffd_interfault_us_mean": 259.53937309352517,
+        "locality": {
+          "unique_granules": 13901,
+          "runs": 5154,
+          "run_len_mean": 2.697128443927047,
+          "run_len_median": 1.0,
+          "run_len_p90": 4,
+          "run_len_max": 1024,
+          "frac_in_runs_ge2": 0.7541903460182721,
+          "frac_in_runs_ge4": 0.565714696784404,
+          "frac_in_runs_ge16": 0.3388964822674628,
+          "frac_in_runs_ge64": 0.21854542838644703,
+          "frac_in_runs_ge512": 0.18423135026257104,
+          "order_frac_next_is_plus1": 0.03575539568345324,
+          "order_frac_next_within_16": 0.21633093525179856
+        },
+        "fault_span_ms": 3643.088539,
+        "uffd_wall_us_per_fault": 262.0738464139271,
+        "serve_cpu_ms": 360.0,
+        "serve_cpu_us_per_fault": 25.897417451981873
+      },
+      {
+        "name": "fb-073508-uffd-4k-copy-medium-7",
+        "wall_ms": 3815.8257007598877,
+        "rep": 7,
+        "uffd_trace_file": "691056-vm-7.faults",
+        "uffd_faults": 11265,
+        "uffd_bytes": 46141440,
+        "uffd_frac_of_guest": 0.021486282348632812,
+        "uffd_ioctl_us_p50": 2.251,
+        "uffd_ioctl_us_p90": 2.562,
+        "uffd_ioctl_us_p99": 8.028,
+        "uffd_ioctl_us_mean": 2.4994,
+        "uffd_ioctl_us_total": 28155.741,
+        "uffd_interfault_us_p50": 6.38,
+        "uffd_interfault_us_mean": 323.8182633167614,
+        "locality": {
+          "unique_granules": 11265,
+          "runs": 4455,
+          "run_len_mean": 2.5286195286195285,
+          "run_len_median": 1,
+          "run_len_p90": 4,
+          "run_len_max": 512,
+          "frac_in_runs_ge2": 0.7407900577008433,
+          "frac_in_runs_ge4": 0.5369729249889037,
+          "frac_in_runs_ge16": 0.2768752774079006,
+          "frac_in_runs_ge64": 0.16688859298712827,
+          "frac_in_runs_ge512": 0.09090102086107413,
+          "order_frac_next_is_plus1": 0.019176136363636364,
+          "order_frac_next_within_16": 0.13041548295454544
+        },
+        "fault_span_ms": 3675.644659,
+        "uffd_wall_us_per_fault": 326.2889177984909,
+        "serve_cpu_ms": 340.0,
+        "serve_cpu_us_per_fault": 30.181979582778517
+      }
+    ],
+    "stability_uffd_offsets": {
+      "n_runs": 4,
+      "set_sizes": [
+        13281,
+        11725,
+        13901,
+        11265
+      ],
+      "jaccard_mean": 0.6857003395674774,
+      "jaccard_min": 0.6177835971908107,
+      "jaccard_max": 0.7504187604690117,
+      "core_size": 8765,
+      "union_size": 17762,
+      "core_frac_of_mean_set": 0.6987961412740173,
+      "loo_coverage_mean": 0.900818235172169,
+      "loo_coverage_min": 0.8266311776131213,
+      "loo_waste_mean": 0.31466115658222354
+    },
+    "stability_pagemap": {},
+    "stability_kvm_ipa": {},
+    "agg": {
+      "wall_ms": {
+        "mean": 3811.386068662008,
+        "min": 3788.562297821045,
+        "max": 3840.222120285034,
+        "median": 3812.917709350586,
+        "n": 6
+      },
+      "uffd_faults": {
+        "mean": 12543.0,
+        "min": 11265,
+        "max": 13901,
+        "median": 12503.0,
+        "n": 4
+      },
+      "uffd_bytes": {
+        "mean": 51376128.0,
+        "min": 46141440,
+        "max": 56938496,
+        "median": 51212288.0,
+        "n": 4
+      },
+      "uffd_frac_of_guest": {
+        "mean": 0.023923873901367188,
+        "min": 0.021486282348632812,
+        "max": 0.026514053344726562,
+        "median": 0.023847579956054688,
+        "n": 4
+      },
+      "uffd_ioctl_us_p50": {
+        "mean": 2.2817499999999997,
+        "min": 2.251,
+        "max": 2.315,
+        "median": 2.2805,
+        "n": 4
+      },
+      "uffd_ioctl_us_mean": {
+        "mean": 2.55751265500087,
+        "min": 2.4994,
+        "max": 2.626991265717943,
+        "median": 2.551829677142768,
+        "n": 4
+      },
+      "uffd_ioctl_us_total": {
+        "mean": 32110.21475,
+        "min": 28155.741,
+        "max": 35491.253,
+        "median": 32396.932500000003,
+        "n": 4
+      },
+      "uffd_interfault_us_p50": {
+        "mean": 7.68025,
+        "min": 6.38,
+        "max": 8.681,
+        "median": 7.83,
+        "n": 4
+      },
+      "uffd_interfault_us_mean": {
+        "mean": 291.90918021695495,
+        "min": 259.53937309352517,
+        "max": 323.8182633167614,
+        "median": 292.1395422287667,
+        "n": 4
+      },
+      "uffd_wall_us_per_fault": {
+        "mean": 294.44306953252965,
+        "min": 262.0738464139271,
+        "max": 326.2889177984909,
+        "median": 294.7047569588502,
+        "n": 4
+      },
+      "serve_cpu_ms": {
+        "mean": 343.3333333333333,
+        "min": 330.0,
+        "max": 360.0,
+        "median": 340.0,
+        "n": 6
+      },
+      "serve_cpu_us_per_fault": {
+        "mean": 27.456217066300855,
+        "min": 25.60048189142384,
+        "max": 30.181979582778517,
+        "median": 27.02120339550053,
+        "n": 4
+      },
+      "fault_span_ms": {
+        "mean": 3665.6409125,
+        "min": 3643.088539,
+        "max": 3695.838569,
+        "median": 3661.818271,
+        "n": 4
+      },
+      "pagemap_resident_4k": null,
+      "pagemap_resident_bytes": null,
+      "pagemap_frac_of_guest": null,
+      "fc_minflt_total": null,
+      "fc_majflt_total": null,
+      "fc_cpu_ms": null,
+      "kvm_guest_faults": null,
+      "kvm_unique_4k": null,
+      "kvm_unique_granule": null,
+      "kvm_frac_of_guest": null
+    }
+  },
+  "uffd-4k-minor|medium.html": {
+    "cell": "uffd-4k-minor",
+    "page": "medium.html",
+    "n": 6,
+    "granule": 4096,
+    "guest_bytes": 2147483648,
+    "requests": [
+      {
+        "name": "fb-073508-uffd-4k-minor-medium-5",
+        "wall_ms": 3881.429433822632,
+        "rep": 5,
+        "uffd_trace_file": "691138-vm-2.faults",
+        "uffd_faults": 5628,
+        "uffd_bytes": 23052288,
+        "uffd_frac_of_guest": 0.01073455810546875,
+        "uffd_ioctl_us_p50": 1.541,
+        "uffd_ioctl_us_p90": 1.732,
+        "uffd_ioctl_us_p99": 2.681,
+        "uffd_ioctl_us_mean": 1.5894726368159204,
+        "uffd_ioctl_us_total": 8945.552,
+        "uffd_interfault_us_p50": 12.161,
+        "uffd_interfault_us_mean": 666.1957730584681,
+        "locality": {
+          "unique_granules": 5628,
+          "runs": 2005,
+          "run_len_mean": 2.8069825436408977,
+          "run_len_median": 1,
+          "run_len_p90": 4,
+          "run_len_max": 512,
+          "frac_in_runs_ge2": 0.7745202558635395,
+          "frac_in_runs_ge4": 0.5796019900497512,
+          "frac_in_runs_ge16": 0.3384861407249467,
+          "frac_in_runs_ge64": 0.21961620469083157,
+          "frac_in_runs_ge512": 0.09097370291400142,
+          "order_frac_next_is_plus1": 0.021325750844144304,
+          "order_frac_next_within_16": 0.27279189621467925
+        },
+        "fault_span_ms": 3757.629167,
+        "uffd_wall_us_per_fault": 667.6668740227434,
+        "serve_cpu_ms": 140.0,
+        "serve_cpu_us_per_fault": 24.875621890547265
+      },
+      {
+        "name": "fb-073508-uffd-4k-minor-medium-6",
+        "wall_ms": 3896.1198329925537,
+        "rep": 6,
+        "uffd_trace_file": "691138-vm-3.faults",
+        "uffd_faults": 4321,
+        "uffd_bytes": 17698816,
+        "uffd_frac_of_guest": 0.008241653442382812,
+        "uffd_ioctl_us_p50": 1.527,
+        "uffd_ioctl_us_p90": 1.739,
+        "uffd_ioctl_us_p99": 2.659,
+        "uffd_ioctl_us_mean": 1.5909803286276325,
+        "uffd_ioctl_us_total": 6874.626,
+        "uffd_interfault_us_p50": 12.02,
+        "uffd_interfault_us_mean": 869.1441349537038,
+        "locality": {
+          "unique_granules": 4321,
+          "runs": 1925,
+          "run_len_mean": 2.244675324675325,
+          "run_len_median": 1,
+          "run_len_p90": 3,
+          "run_len_max": 512,
+          "frac_in_runs_ge2": 0.7007637121036797,
+          "frac_in_runs_ge4": 0.4654015274242074,
+          "frac_in_runs_ge16": 0.2534135616755381,
+          "frac_in_runs_ge64": 0.13515389956028698,
+          "frac_in_runs_ge512": 0.11849109002545707,
+          "order_frac_next_is_plus1": 0.031018518518518518,
+          "order_frac_next_within_16": 0.20023148148148148
+        },
+        "fault_span_ms": 3761.577289,
+        "uffd_wall_us_per_fault": 870.5339710715112,
+        "serve_cpu_ms": 130.0,
+        "serve_cpu_us_per_fault": 30.08562832677621
+      },
+      {
+        "name": "fb-073508-uffd-4k-minor-medium-3",
+        "wall_ms": 3833.3795070648193,
+        "rep": 3,
+        "uffd_trace_file": "691138-vm-4.faults",
+        "uffd_faults": 5556,
+        "uffd_bytes": 22757376,
+        "uffd_frac_of_guest": 0.01059722900390625,
+        "uffd_ioctl_us_p50": 1.566,
+        "uffd_ioctl_us_p90": 1.786,
+        "uffd_ioctl_us_p99": 2.658,
+        "uffd_ioctl_us_mean": 1.6413833693304536,
+        "uffd_ioctl_us_total": 9119.526,
+        "uffd_interfault_us_p50": 12.389,
+        "uffd_interfault_us_mean": 664.4177753375337,
+        "locality": {
+          "unique_granules": 5556,
+          "runs": 2244,
+          "run_len_mean": 2.4759358288770055,
+          "run_len_median": 1.0,
+          "run_len_p90": 4,
+          "run_len_max": 512,
+          "frac_in_runs_ge2": 0.7374010079193665,
+          "frac_in_runs_ge4": 0.5248380129589633,
+          "frac_in_runs_ge16": 0.2791576673866091,
+          "frac_in_runs_ge64": 0.11951043916486681,
+          "frac_in_runs_ge512": 0.09215262778977681,
+          "order_frac_next_is_plus1": 0.049864986498649864,
+          "order_frac_next_within_16": 0.26714671467146717
+        },
+        "fault_span_ms": 3699.960268,
+        "uffd_wall_us_per_fault": 665.939573074154,
+        "serve_cpu_ms": 150.0,
+        "serve_cpu_us_per_fault": 26.997840172786177
+      },
+      {
+        "name": "fb-073508-uffd-4k-minor-medium-7",
+        "wall_ms": 3830.7135105133057,
+        "rep": 7,
+        "trace_ambiguous": [
+          "691138-vm-5.faults",
+          "691138-vm-6.faults"
+        ],
+        "serve_cpu_ms": 150.0
+      },
+      {
+        "name": "fb-073508-uffd-4k-minor-medium-4",
+        "wall_ms": 3885.5538368225098,
+        "rep": 4,
+        "uffd_trace_file": "691138-vm-6.faults",
+        "uffd_faults": 4573,
+        "uffd_bytes": 18731008,
+        "uffd_frac_of_guest": 0.008722305297851562,
+        "uffd_ioctl_us_p50": 1.532,
+        "uffd_ioctl_us_p90": 1.754,
+        "uffd_ioctl_us_p99": 2.559,
+        "uffd_ioctl_us_mean": 1.5936024491581018,
+        "uffd_ioctl_us_total": 7287.544,
+        "uffd_interfault_us_p50": 11.345,
+        "uffd_interfault_us_mean": 819.7827335958004,
+        "locality": {
+          "unique_granules": 4573,
+          "runs": 2086,
+          "run_len_mean": 2.192233940556088,
+          "run_len_median": 1.0,
+          "run_len_p90": 3,
+          "run_len_max": 512,
+          "frac_in_runs_ge2": 0.6877323420074349,
+          "frac_in_runs_ge4": 0.4537502733435382,
+          "frac_in_runs_ge16": 0.25388147824185436,
+          "frac_in_runs_ge64": 0.1277061010277717,
+          "frac_in_runs_ge512": 0.11196151322982725,
+          "order_frac_next_is_plus1": 0.030402449693788275,
+          "order_frac_next_within_16": 0.2106299212598425
+        },
+        "fault_span_ms": 3755.334202,
+        "uffd_wall_us_per_fault": 821.1970701946207,
+        "serve_cpu_ms": 140.0,
+        "serve_cpu_us_per_fault": 30.614476273780888
+      },
+      {
+        "name": "fb-073508-uffd-4k-minor-medium-8",
+        "wall_ms": 3918.2257652282715,
+        "rep": 8,
+        "uffd_trace_file": "691138-vm-7.faults",
+        "uffd_faults": 5161,
+        "uffd_bytes": 21139456,
+        "uffd_frac_of_guest": 0.009843826293945312,
+        "uffd_ioctl_us_p50": 1.523,
+        "uffd_ioctl_us_p90": 1.738,
+        "uffd_ioctl_us_p99": 2.565,
+        "uffd_ioctl_us_mean": 1.5858015888393722,
+        "uffd_ioctl_us_total": 8184.322,
+        "uffd_interfault_us_p50": 12.14,
+        "uffd_interfault_us_mean": 731.4742449612404,
+        "locality": {
+          "unique_granules": 5161,
+          "runs": 2138,
+          "run_len_mean": 2.413938260056127,
+          "run_len_median": 1.0,
+          "run_len_p90": 3,
+          "run_len_max": 512,
+          "frac_in_runs_ge2": 0.7211780662662275,
+          "frac_in_runs_ge4": 0.49719046696376673,
+          "frac_in_runs_ge16": 0.3222243751211006,
+          "frac_in_runs_ge64": 0.21681844603758962,
+          "frac_in_runs_ge512": 0.09920558031389265,
+          "order_frac_next_is_plus1": 0.023643410852713178,
+          "order_frac_next_within_16": 0.28255813953488373
+        },
+        "fault_span_ms": 3782.591426,
+        "uffd_wall_us_per_fault": 732.9183154427436,
+        "serve_cpu_ms": 140.0,
+        "serve_cpu_us_per_fault": 27.126525867080023
+      }
+    ],
+    "stability_uffd_offsets": {
+      "n_runs": 5,
+      "set_sizes": [
+        5628,
+        4321,
+        5556,
+        4573,
+        5161
+      ],
+      "jaccard_mean": 0.6543882168247959,
+      "jaccard_min": 0.5421012849584278,
+      "jaccard_max": 0.8184420363933755,
+      "core_size": 3253,
+      "union_size": 7751,
+      "core_frac_of_mean_set": 0.644439161614961,
+      "loo_coverage_mean": 0.9238838892392611,
+      "loo_coverage_min": 0.7899786780383795,
+      "loo_waste_mean": 0.36650584735948977
+    },
+    "stability_pagemap": {},
+    "stability_kvm_ipa": {},
+    "agg": {
+      "wall_ms": {
+        "mean": 3874.236981074015,
+        "min": 3830.7135105133057,
+        "max": 3918.2257652282715,
+        "median": 3883.491635322571,
+        "n": 6
+      },
+      "uffd_faults": {
+        "mean": 5047.8,
+        "min": 4321,
+        "max": 5628,
+        "median": 5161,
+        "n": 5
+      },
+      "uffd_bytes": {
+        "mean": 20675788.8,
+        "min": 17698816,
+        "max": 23052288,
+        "median": 21139456,
+        "n": 5
+      },
+      "uffd_frac_of_guest": {
+        "mean": 0.009627914428710938,
+        "min": 0.008241653442382812,
+        "max": 0.01073455810546875,
+        "median": 0.009843826293945312,
+        "n": 5
+      },
+      "uffd_ioctl_us_p50": {
+        "mean": 1.5378,
+        "min": 1.523,
+        "max": 1.566,
+        "median": 1.532,
+        "n": 5
+      },
+      "uffd_ioctl_us_mean": {
+        "mean": 1.6002480745542962,
+        "min": 1.5858015888393722,
+        "max": 1.6413833693304536,
+        "median": 1.5909803286276325,
+        "n": 5
+      },
+      "uffd_ioctl_us_total": {
+        "mean": 8082.314,
+        "min": 6874.626,
+        "max": 9119.526,
+        "median": 8184.322,
+        "n": 5
+      },
+      "uffd_interfault_us_p50": {
+        "mean": 12.011,
+        "min": 11.345,
+        "max": 12.389,
+        "median": 12.14,
+        "n": 5
+      },
+      "uffd_interfault_us_mean": {
+        "mean": 750.2029323813492,
+        "min": 664.4177753375337,
+        "max": 869.1441349537038,
+        "median": 731.4742449612404,
+        "n": 5
+      },
+      "uffd_wall_us_per_fault": {
+        "mean": 751.6511607611546,
+        "min": 665.939573074154,
+        "max": 870.5339710715112,
+        "median": 732.9183154427436,
+        "n": 5
+      },
+      "serve_cpu_ms": {
+        "mean": 141.66666666666666,
+        "min": 130.0,
+        "max": 150.0,
+        "median": 140.0,
+        "n": 6
+      },
+      "serve_cpu_us_per_fault": {
+        "mean": 27.94001850619411,
+        "min": 24.875621890547265,
+        "max": 30.614476273780888,
+        "median": 27.126525867080023,
+        "n": 5
+      },
+      "fault_span_ms": {
+        "mean": 3751.4184704,
+        "min": 3699.960268,
+        "max": 3782.591426,
+        "median": 3757.629167,
+        "n": 5
+      },
+      "pagemap_resident_4k": null,
+      "pagemap_resident_bytes": null,
+      "pagemap_frac_of_guest": null,
+      "fc_minflt_total": null,
+      "fc_majflt_total": null,
+      "fc_cpu_ms": null,
+      "kvm_guest_faults": null,
+      "kvm_unique_4k": null,
+      "kvm_unique_granule": null,
+      "kvm_frac_of_guest": null
+    }
+  },
+  "uffd-huge-minor|medium.html": {
+    "cell": "uffd-huge-minor",
+    "page": "medium.html",
+    "n": 6,
+    "granule": 2097152,
+    "guest_bytes": 2147483648,
+    "requests": [
+      {
+        "name": "fb-073508-uffd-huge-minor-medium-3",
+        "wall_ms": 3738.09552192688,
+        "rep": 3,
+        "uffd_trace_file": "691220-vm-2.faults",
+        "uffd_faults": 0,
+        "uffd_bytes": 0,
+        "uffd_frac_of_guest": 0.0,
+        "locality": {},
+        "fault_span_ms": 0.0,
+        "serve_cpu_ms": 0.0
+      },
+      {
+        "name": "fb-073508-uffd-huge-minor-medium-5",
+        "wall_ms": 3667.7701473236084,
+        "rep": 5,
+        "trace_ambiguous": [
+          "691220-vm-3.faults",
+          "691220-vm-4.faults"
+        ],
+        "serve_cpu_ms": 10.0
+      },
+      {
+        "name": "fb-073508-uffd-huge-minor-medium-6",
+        "wall_ms": 3693.3441162109375,
+        "rep": 6,
+        "uffd_trace_file": "691220-vm-4.faults",
+        "uffd_faults": 0,
+        "uffd_bytes": 0,
+        "uffd_frac_of_guest": 0.0,
+        "locality": {},
+        "fault_span_ms": 0.0,
+        "serve_cpu_ms": 0.0
+      },
+      {
+        "name": "fb-073508-uffd-huge-minor-medium-7",
+        "wall_ms": 3666.3482189178467,
+        "rep": 7,
+        "uffd_trace_file": "691220-vm-5.faults",
+        "uffd_faults": 0,
+        "uffd_bytes": 0,
+        "uffd_frac_of_guest": 0.0,
+        "locality": {},
+        "fault_span_ms": 0.0,
+        "serve_cpu_ms": 0.0
+      },
+      {
+        "name": "fb-073508-uffd-huge-minor-medium-4",
+        "wall_ms": 3641.7300701141357,
+        "rep": 4,
+        "uffd_trace_file": "691220-vm-6.faults",
+        "uffd_faults": 0,
+        "uffd_bytes": 0,
+        "uffd_frac_of_guest": 0.0,
+        "locality": {},
+        "fault_span_ms": 0.0,
+        "serve_cpu_ms": 10.0
+      },
+      {
+        "name": "fb-073508-uffd-huge-minor-medium-8",
+        "wall_ms": 3684.6299171447754,
+        "rep": 8,
+        "uffd_trace_file": "691220-vm-7.faults",
+        "uffd_faults": 0,
+        "uffd_bytes": 0,
+        "uffd_frac_of_guest": 0.0,
+        "locality": {},
+        "fault_span_ms": 0.0,
+        "serve_cpu_ms": 0.0
+      }
+    ],
+    "stability_uffd_offsets": {
+      "n_runs": 5,
+      "set_sizes": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "jaccard_mean": 1.0,
+      "jaccard_min": 1.0,
+      "jaccard_max": 1.0,
+      "core_size": 0,
+      "union_size": 0,
+      "core_frac_of_mean_set": null,
+      "loo_coverage_mean": 0.0,
+      "loo_coverage_min": 0.0,
+      "loo_waste_mean": 0.0
+    },
+    "stability_pagemap": {},
+    "stability_kvm_ipa": {},
+    "agg": {
+      "wall_ms": {
+        "mean": 3681.9863319396973,
+        "min": 3641.7300701141357,
+        "max": 3738.09552192688,
+        "median": 3676.200032234192,
+        "n": 6
+      },
+      "uffd_faults": {
+        "mean": 0.0,
+        "min": 0,
+        "max": 0,
+        "median": 0,
+        "n": 5
+      },
+      "uffd_bytes": {
+        "mean": 0.0,
+        "min": 0,
+        "max": 0,
+        "median": 0,
+        "n": 5
+      },
+      "uffd_frac_of_guest": {
+        "mean": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "median": 0.0,
+        "n": 5
+      },
+      "uffd_ioctl_us_p50": null,
+      "uffd_ioctl_us_mean": null,
+      "uffd_ioctl_us_total": null,
+      "uffd_interfault_us_p50": null,
+      "uffd_interfault_us_mean": null,
+      "uffd_wall_us_per_fault": null,
+      "serve_cpu_ms": {
+        "mean": 3.3333333333333335,
+        "min": 0.0,
+        "max": 10.0,
+        "median": 0.0,
+        "n": 6
+      },
+      "serve_cpu_us_per_fault": null,
+      "fault_span_ms": {
+        "mean": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "median": 0.0,
+        "n": 5
+      },
+      "pagemap_resident_4k": null,
+      "pagemap_resident_bytes": null,
+      "pagemap_frac_of_guest": null,
+      "fc_minflt_total": null,
+      "fc_majflt_total": null,
+      "fc_cpu_ms": null,
+      "kvm_guest_faults": null,
+      "kvm_unique_4k": null,
+      "kvm_unique_granule": null,
+      "kvm_frac_of_guest": null
+    }
+  }
+}

@@ -13,6 +13,10 @@ results/**
 !results/**/analysis.json
 !results/**/run.json
 !results/**/hostcdp.jsonl
+!results/**/summary.json
+!results/**/meta.json
+!results/**/charts/
+!results/**/charts/*.svg
 !results/**/summary.md
 !results/campaign-*-summary.json
 !results/**/cpuprobe-*-curated.json
