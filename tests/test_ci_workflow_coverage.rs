@@ -1400,7 +1400,9 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
     let declared = changes
         .get(Value::from("outputs"))
         .and_then(Value::as_mapping)
-        .expect("the `changes` job declares no `outputs:`, so nothing it computes reaches the matrix");
+        .expect(
+            "the `changes` job declares no `outputs:`, so nothing it computes reaches the matrix",
+        );
 
     for (name, expr) in declared {
         let name = name.as_str().expect("output name is not a string");
