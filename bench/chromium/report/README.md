@@ -32,7 +32,7 @@ the tab by its icon. `description` is the gallery subtitle; omitting it on a
 redeploy drops the one already there.
 
 Publishing WITHOUT `url=` creates a second artifact. That already happened once:
-`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same 16 sections and differs
+`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same sections and differs
 only in a cache-busting `<base href>`. It is stale the moment this file changes,
 and it is public.
 
@@ -73,8 +73,9 @@ each is a claim the evidence no longer supports:
    priced", "Concurrency and memory amortization", "The memory frontier",
    "Ablating the floor", "A second engine: WebKit", and the Kitesurf memory/CPU
    rows. The three network-mode run ids it cites (f0023333, b87bb625, 62962574)
-   appear nowhere, and all 23 surviving analysis.json files record
-   network_mode "rootless", so no non-rootless record exists to re-derive.
+   appear nowhere, and every surviving analysis.json (23 at audit time; the 14
+   curated ones are committed under results/) records network_mode "rootless",
+   so no non-rootless record exists to re-derive.
 2. Provenance says the probe sets are "kept alongside the run index". They are
    not kept. That sentence is false as published.
 3. "Open measurements" still lists network-mode A/B/C as open while a full
@@ -139,8 +140,11 @@ fixed in the same pass:
 
 ## Corpus latency by guest vCPU count
 
-Ten gated corpus runs, all publishable, zero failures. Same host, same 14 URLs,
-same knobs, one fcvm binary (`aa5340ac`):
+The curve below is the clean trio: three gated runs on one fcvm binary
+(`aa5340ac`), same host, same 14 URLs, same knobs. The campaign's ten gated
+2026-08-16 runs as a whole span four binaries (`3976d0ba`, `f1fb5376`,
+`3f85bd26`, `aa5340ac`; the summary's `_note` records which run used which),
+which is why the trio was re-run on one binary before drawing a curve:
 
 | guest vCPUs | cdp p50 | CI | Page.enable |
 |---|---|---|---|
@@ -155,10 +159,19 @@ runnable core, not for the network -- TCP connect is 0.1 ms throughout.
 What the curve supports. vCPU count is baked into the golden, so the three
 points are three goldens, and this file's rule is that absolutes are per-golden.
 The spread is measured, not assumed: the 2 vCPU configuration was measured three
-times across three goldens at 916.9, 951.2 and 982.9 ms, so golden-to-golden
-plus run-to-run variation is at least 66 ms here. The 2->4 step (287 ms) is four
+times at 916.9, 951.2 and 982.9 ms — the first two on one golden and one binary
+(`cb-req-corpus`, `3976d0ba`), the third on a second golden with `aa5340ac` —
+so golden-to-golden plus binary-to-binary plus run-to-run variation together
+amount to at least 66 ms here. The 2->4 step (287 ms) is four
 times that and holds; the 4->8 step (48 ms) is smaller than it and does NOT.
-Eight vCPUs is not shown to be faster than four, only not slower. Each point is
+Eight vCPUs is not shown to be faster than four, only not slower.
+
+One more gated record exists that no figure uses:
+`results/reqbench-20260816-134130-corpus` is a 2 vCPU rerun (927.8 ms median,
+202 measured) taken between the mixed-binary sweep and the clean trio; the
+clean trio superseded it, and it stays committed because the tracking rule
+keeps every gated record.
+ Each point is
 one gated run: 202 samples, one experimental unit, so the harness's intervals
 are within-run and carry no run-to-run variance. Five independent bursts per
 configuration with burst-level intervals is what would give these medians real
