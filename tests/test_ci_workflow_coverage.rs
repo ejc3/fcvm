@@ -317,6 +317,12 @@ fn self_hosted_checkouts_repair_workspace_ownership_first() {
             let guarded = steps[..idx].iter().any(|s| {
                 s.get("run").and_then(Value::as_str).is_some_and(|r| {
                     r.lines()
+                        // Strip comments first: a commented-out repair still
+                        // contains both words and chowns nothing. The sibling
+                        // gh-probe test already skips comment lines for the
+                        // same reason; a guard that a `#` disables is not a
+                        // guard.
+                        .map(|line| line.split('#').next().unwrap_or(""))
                         .any(|line| line.contains("chown") && line.contains("workspace"))
                 })
             });
