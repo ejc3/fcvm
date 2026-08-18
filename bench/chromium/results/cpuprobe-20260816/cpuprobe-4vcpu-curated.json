@@ -1,5 +1,5 @@
 {
- "_note": "Curated by lifetime_s >= 0.6: 248 of 686 raw probe records kept (render clones; sub-0.6 s records are serve/teardown helper processes and probe attach fragments, not renders). The peak/spread analysis is robust to the cut: recomputed over the full population, 2 vCPU still collapses and the 8 vCPU spread grows.",
+ "_note": "Curated by lifetime_s >= 0.6: 248 of 686 raw probe records kept (render clones; sub-0.6 s records are serve/teardown helper processes and probe attach fragments, not renders). The robustness-to-the-cut check (recomputing over the full population) was run at curation time against the raw probe records in the source_run's uncommitted samples/ directory; those raw records were not retained (unretained), so only the curated statistics in this file are reproducible from the repository.",
  "vcpu": 4,
  "source_run": "bench/chromium/results/reqbench-20260816-145649-corpus",
  "cdp_blocking_p50_ms": 685.5372930003796,
