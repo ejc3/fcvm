@@ -1,0 +1,145 @@
+{
+ "_note": "WebKitGTK engine probe, HOST-side (podman --network host, no VM), same fixture pageserver the guest uses. Not a corpus number and not VM-isolated: under the publication rule this is optimisation evidence, not a headline. The ENGINE arm is NOT wired into reqbench.sh/py -- WebDriver classic and CDP are different protocols -- so no gated in-guest WebKit number exists on any committed path.",
+ "image": "localhost/webkit-bench-req",
+ "driver": "wddrive.py (W3C WebDriver classic, port 9515)",
+ "fixture": "medium.html",
+ "screenshot_format": "png (WebKitGTK is PNG-only; Chromium arm used JPEG q80)",
+ "warm_renders": {
+  "n": 54,
+  "total_ms": {
+   "p50": 122.0,
+   "p95": 129.44
+  },
+  "connect_ms": {
+   "p50": 26.0
+  },
+  "navigate_ms": {
+   "p50": 45.9
+  },
+  "screenshot_ms": {
+   "p50": 50.4
+  }
+ },
+ "first_render_penalty": {
+  "observed_ms": {
+   "first_medium_screenshot": 997.4,
+   "steady_state_screenshot": 50.4
+  },
+  "finding": "A one-time, process-global initialisation costs ~950 ms and is triggered by the first render of a page that needs it. Once paid, EVERY page is fast (~46 ms). Verified on three fresh containers, including one where medium.html was rendered FIRST: 999.6 ms, then warmup.html 47.2, minimal.html 30.4, medium.html 47.5.",
+  "consequence": "entry-webkit.sh warms with warmup.html, which does NOT trigger it, so the golden snapshot freezes the browser with the init UNPAID and every clone pays it on its first real render. That is the mechanism behind the report's 'full first render ~1.9 s' for WebKit clones.",
+  "caveat": "warmup.html is self-contained BY DESIGN so the warm point shares zero byte-resources with measured fixtures, and Chromium's entry.sh warms with the same page. Any fix must trigger the init without sharing bytes with what is measured."
+ },
+ "heavy_html_hang": {
+  "corrected": "An earlier version of this record called the stall DETERMINISTIC on the strength of 2 observations that both stalled. That was wrong. It is INTERMITTENT.",
+  "measurement": {
+   "clean_fresh_container_attempts": 11,
+   "stalled": 4,
+   "completed": 7,
+   "stall_rate": "36%",
+   "completion_time_when_ok_s": 1.4,
+   "longest_observed_stall_s": 390,
+   "note": "390 s was curl's own timeout, not a return; the navigate had not completed."
+  },
+  "during_the_stall": {
+   "webkit_web_process_instantaneous_cpu": "0.3% of one core",
+   "cpu_consumed_total": "~8 CPU-seconds, all in the first ~6 s",
+   "session_responsive": "yes - GET /session/<id>/url returns the correct URL throughout",
+   "reading": "Not slow computation and not a crash. The page's work completes, the browser goes idle and stays responsive, and the navigate command simply never reports completion."
+  },
+  "chromium_same_page": {
+   "total_ms": 1387.6,
+   "navigate_load_event_ms": 1312.8,
+   "stalls_observed": 0
+  },
+  "page": "3302 bytes: a synchronous script building a 1200x6 table with a forced layout every 100 rows, then canvas gradients/arcs/text and a pixel readback, all before the load event",
+  "bearing_on_the_report": "The report attributes a '120-second navigate-stall class Chromium does not show' to CONCURRENCY (N>=8; 'success 19/32 at N=32' = 41% failure). This measures a 36% stall rate at N=1. Those rates are close enough to be the same underlying intermittent bug rather than a load effect. It does not PROVE the concurrency attribution wrong -- which page those runs rendered is not recorded -- but a stall that occurs 36% of the time at N=1 is not explained by concurrency.",
+  "upgrade_did_not_fix_it": {
+   "2.50.6": {
+    "stalled": 4,
+    "attempts": 11,
+    "rate": "36%",
+    "wilson95": "[15%, 65%]"
+   },
+   "2.52.5": {
+    "stalled": 6,
+    "attempts": 10,
+    "rate": "60%",
+    "wilson95": "[31%, 83%]"
+   },
+   "fisher_exact_two_sided_p": 0.395,
+   "reading": "Indistinguishable at this sample size: the upgrade did NOT fix the stall, and the apparent worsening is not significant. Pooled across both versions the stall rate is 10/21 = 48%. So this is a live defect in the CURRENT upstream stable WebKitGTK (2.52.5), not an artifact of Debian bookworm shipping an old series.",
+   "completion_time_when_ok_s": 1.6
+  },
+  "pooled_across_all_arms": {
+   "stalled": 13,
+   "attempts": 31,
+   "rate": "42%",
+   "wilson95": "[26%, 59%]"
+  }
+ },
+ "chromium_host_reference": {
+  "p50_ms": 145.6,
+  "n": 200,
+  "source": "results/hostcdp-509059c1700d47bb89e9854ddd54bb73/hostcdp.jsonl",
+  "format": "jpeg q80"
+ },
+ "version_audit": {
+  "chromium": {
+   "installed": "151.0.7922.137",
+   "bookworm_candidate": "151.0.7922.137-1~deb12u1",
+   "trixie_candidate": "151.0.7922.137-1~deb13u1",
+   "verdict": "already the latest packaged build; identical in both suites, so no upgrade available or needed"
+  },
+  "webkitgtk": {
+   "was": "2.50.6-1~deb12u2 (Debian bookworm)",
+   "now": "2.52.5-1~deb13u1 (Debian trixie)",
+   "upstream_stable": "2.52.5, released 2026-07-09; the 2.52 series opened 2026-03-18",
+   "verdict": "bookworm pinned one full stable series behind; base image moved to trixie"
+  },
+  "caveat": "The Chromium image stays on bookworm because its Chromium version is identical and moving it would invalidate every golden and seal measured on 2026-08-16. Engine comparisons therefore span two base images (different libc and fonts). State that wherever the two engines are compared."
+ },
+ "mechanism_investigation": {
+  "two_of_my_inferences_were_wrong": [
+   "'the session stays responsive' does NOT prove the WebProcess is alive. GET /session/<id>/url maps to Automation.getBrowsingContext, which builds its reply from page.pageLoadState().activeURL() -- pure UI-process state, no IPC to the WebProcess. A 200 proves only that the UI-process run loop is alive.",
+   "'a lighter page navigates instantly' is ambiguous. waitForNavigationToCompleteOnPage returns IMMEDIATELY when !isLoading && !hasUncommittedLoad, so 0.0-0.1 s is the signature of that early-return branch -- which also fires when the WebProcess never acknowledged the load."
+  ],
+  "sharpest_discriminator": "A stalling run burns ~8 CPU-seconds; a successful run of the SAME page returns in 1.4 s. A 5-6x work difference on identical input means a different code path was taken, which rules out every 'UI process dropped the completion' candidate -- those predict identical work in both cases.",
+  "leading_candidate_NOT_confirmed": {
+   "hypothesis": "Accelerated 2D canvas under Xvfb/llvmpipe: getImageData does a synchronous readPixels on the main thread and flushContext waits on a GL fence with NO timeout (GLFenceEGL passes EGL_FOREVER_KHR, GLFenceGL passes GL_TIMEOUT_IGNORED). A stuck fence would mean the script never returns, Document::parsing() stays true, checkCompleted() early-returns forever and the load event never fires.",
+   "test": "WEBKIT_DISABLE_COMPOSITING_MODE=1, same 10-trial protocol",
+   "result": {
+    "compositing_on": "6/10 stalled",
+    "compositing_off": "3/10 stalled",
+    "fisher_p": 0.37
+   },
+   "verdict": "NOT CONFIRMED. Stalls persist with compositing disabled and the reduction is not significant. Caveat on this negative: I did not verify that the env var actually disabled the accelerated canvas path, so the intervention itself is unproven and the negative is only as strong as the intervention."
+  },
+  "second_independent_defect": {
+   "observed": "a navigate ran 390 s with no response at all (client timeout, not a return)",
+   "expected": "session timeouts report pageLoad=300000, and WebAutomationSession defaultPageLoadTimeout is 300 s",
+   "reading": "A registered wait MUST be answered by 300 s with a WebDriver `timeout` error. It was not. So either the callback was never registered with a deadline, or its deadline was stripped -- WebAutomationSession has a single shared m_loadTimer that any resolving wait calls stop() on. This is a separate defect from the stall itself."
+  },
+  "status": "mechanism NOT established; the two facts above are established"
+ },
+ "leading_hypothesis_and_workaround": {
+  "observed_during_confirmed_stall": "Probed with the navigate still outstanding at t=25s: document.readyState='complete'; the page's own marker read 'done layout_ms=1145.0 canvas_ms=160.0 checksum=65030'; 1200 table rows present; GET /status, /url and /title all answered 200 in under 3 ms. The page finished in ~1.3 s and JavaScript still executes. Only the COMMAND never completes.",
+  "hypothesis": "WebKit drops the navigation-completion notification. Consistent with everything observed, but the mechanism is not established (see mechanism_investigation.status) and the gate patch in upstream/ is not built or tested, so this stays a hypothesis rather than a root cause.",
+  "why_nothing_rescues_it": "Source/WebDriver/Session.cpp Session::go arms NO timer: it sends navigateBrowsingContext and waits for the backend indefinitely. The only deadline is the browser-side WebAutomationSession::m_loadTimer (defaultPageLoadTimeout = 300_s, WebAutomationSession.cpp:92). One observed navigate ran 390 s with no response, so that deadline did not fire either. There is a SINGLE shared m_loadTimer for four separate pending-callback maps and every resolving wait calls stop() on it (lines 962, 968, 993, 1002), so a second wait can strip the first one's deadline.",
+  "workaround": "pageLoadStrategy 'none' plus polling document.readyState over execute/sync. WebAutomationSession::waitForNavigationToCompleteOnPage returns immediately on its first branch when the strategy is None, so the broken completion path is never entered; readiness comes from a different command path that is demonstrably alive during the stall. It also makes navigate_ms mean navigate-to-readyState-complete, i.e. the same quantity as Chromium's navigate-to-load-event, instead of 'whenever WebKit felt like replying'.",
+  "validation": {
+   "baseline_failed": "13/31 (42%)",
+   "with_workaround_failed": "1/24 (4%)",
+   "fisher_exact_two_sided_p": 0.0015,
+   "note": "The single failure was a container that never became healthy because my test loop reused host ports before release; a second batch with port hygiene was 12/12.",
+   "timings_now_deterministic": {
+    "navigate_ms": "~1570",
+    "screenshot_ms": "~95",
+    "total_ms": "1678-1729, a 51 ms spread"
+   }
+  },
+  "still_upstream_bugs": [
+   "the lost navigation-completion notification itself",
+   "the 300 s pageLoad deadline failing to fire, which makes the hang unrecoverable by any client"
+  ]
+ }
+}

@@ -52,13 +52,15 @@ class RunPackaging(unittest.TestCase):
         of packaging a run: the contamination it prevents is the contamination
         it would introduce.
         """
-        match = re.search(r"^CORPUS_STAMP\s*(\??:?=)", makefile(), re.M)
-        self.assertIsNotNone(match, "CORPUS_STAMP is gone from the Makefile")
-        self.assertEqual(
-            match.group(1), ":=",
-            "CORPUS_STAMP is recursively expanded, so $(shell date) re-runs on "
-            "every reference and one run can straddle two stamps",
-        )
+        for var in ("CORPUS_STAMP", "CORPUS_RUN_DIR"):
+            match = re.search(rf"^{var}\s*(\??:?=)", makefile(), re.M)
+            self.assertIsNotNone(match, f"{var} is gone from the Makefile")
+            self.assertEqual(
+                match.group(1), ":=",
+                f"{var} is recursively expanded; moving $(shell date) into any "
+                "recursively expanded variable re-runs it per reference, and one "
+                "run can straddle two stamps",
+            )
 
     def test_the_run_directory_is_reserved_and_not_reused(self):
         """`mkdir -p` accepts an existing directory.
@@ -68,10 +70,29 @@ class RunPackaging(unittest.TestCase):
         The reservation must FAIL on collision.
         """
         body = makefile()
-        self.assertRegex(
-            body, r'@mkdir "\$\(CORPUS_RUN_DIR\)" \|\|',
-            "the run directory is not reserved with a failing plain mkdir",
-        )
+        # Behavioural, not structural: run the reservation recipe against a
+        # pre-created directory and require make itself to fail. The structural
+        # version regexed for `@mkdir ... ||` and never looked past the `||`,
+        # so `exit 1` -> `exit 0` survived it -- the recipe still PRINTED
+        # "REFUSING" and then proceeded into the existing directory, which is
+        # the exact contamination the reservation exists to prevent.
+        block = re.search(
+            r'(@mkdir "\$\(CORPUS_RUN_DIR\)" \|\| \{ \\\n.*?\})', body, re.S)
+        self.assertIsNotNone(block, "the reservation block is gone")
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = os.path.join(tmp, "corpus-x")
+            os.mkdir(run_dir)  # the collision
+            recipe = block.group(1).replace("$(CORPUS_RUN_DIR)", run_dir)
+            mk = os.path.join(tmp, "mk")
+            with open(mk, "w") as handle:
+                handle.write("reserve:\n\t" + recipe + "\n")
+            result = subprocess.run(["make", "-f", mk, "reserve"],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "the reservation printed its refusal and PROCEEDED into an "
+                "existing campaign directory\n" + result.stdout + result.stderr)
+            self.assertIn("REFUSING", result.stdout + result.stderr)
         self.assertNotRegex(
             body, r'@mkdir -p "\$\(CORPUS_RUN_DIR\)"\s*$',
             "mkdir -p on the run directory silently reuses an existing campaign",
@@ -90,7 +111,11 @@ class Provenance(unittest.TestCase):
         commit nobody can recover, which is the one thing writing SOURCE_REF
         exists to prevent.
         """
-        pin = re.search(r"git -C \"\$\(CURDIR\)\" branch[^\n]*", makefile())
+        # Join continuations FIRST: make folds backslash-newline into one shell
+        # command, so `|| true` on the next physical line is semantically on
+        # this one -- and a single-line regex cannot see it.
+        joined = re.sub(r"\\\n", " ", makefile())
+        pin = re.search(r"git -C \"\$\(CURDIR\)\" branch[^\n]*", joined)
         self.assertIsNotNone(pin, "the revision pin is gone")
         self.assertNotIn("branch -f", pin.group(0),
                          "the pin can move a ref an earlier record cites")
@@ -115,6 +140,14 @@ class Teardown(unittest.TestCase):
         )
         self.assertIn("exit 1", block,
                       "teardown cannot fail when it leaves the host broken")
+        # And the recipe line carrying that exit must not be prefixed `-`:
+        # make then ignores the failure and the target exits 0 over a box with
+        # no DNS, which is the same fail-open with one more character.
+        retry = re.search(r"^\t(@?-?)for i in", block, re.M)
+        self.assertIsNotNone(retry, "the dnsmasq retry loop is gone")
+        self.assertNotIn("-", retry.group(1),
+                         "the dnsmasq retry recipe is `-` prefixed, so make "
+                         "ignores its exit 1 and teardown reports clean anyway")
 
 
 class LogFilter(unittest.TestCase):

@@ -31,7 +31,9 @@ have half-done in the snapshot.
 import json
 import os
 import sys
-import time
+
+import health_loop
+from health_loop import monotonic_seconds, publish, state_file  # re-exported for callers/tests
 import urllib.request
 
 # Chromium's own DevTools port. There is no relay any more: fcvm DNATs this
@@ -86,77 +88,7 @@ def main() -> int:
     return code
 
 
-# Where the resident loop publishes its verdict, and how stale a verdict may be
-# before the reader must refuse it.
-STATE_FILE = os.environ.get("BENCH_HEALTH_STATE", "/run/bench-health")
-LOOP_INTERVAL = float(os.environ.get("BENCH_HEALTH_INTERVAL", "1"))
-
-
-def monotonic_seconds() -> float:
-    """Seconds from /proc/uptime, so a clock step cannot age a verdict.
-
-    NOT time.time(). fc-agent steps CLOCK_REALTIME on every restore
-    (set_system_clock), which would make every clone's freshly written verdict
-    look hours old to a wall-clock reader and fail the gate on every clone.
-
-    /proc/uptime is CLOCK_BOOTTIME (ktime_get_boottime_ts64), not
-    CLOCK_MONOTONIC. The reader uses the same file, so both sides measure the
-    same clock either way, but the freshness scheme rests on guest boottime
-    being CONTINUOUS across snapshot and restore. That holds where the
-    firecracker fork owns the VM-wide counter offset and advances it by the
-    pause duration (AGENTS.md, NV2 snapshot lifecycle). It is NOT established
-    for the cloud-hypervisor backend. If boottime jumps on restore, every
-    clone reports "verdict is Ns old" forever, which is the same total failure
-    this design moved away from, relocated from realtime to boottime.
-    """
-    with open("/proc/uptime", "r", encoding="ascii") as handle:
-        return float(handle.read().split()[0])
-
-
-def publish(verdict: str, detail: str) -> None:
-    """Write the verdict atomically, so a reader never sees a half-written line."""
-    tmp = f"{STATE_FILE}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(f"{verdict} {monotonic_seconds():.3f} {detail}\n")
-    os.replace(tmp, STATE_FILE)
-
-
-def loop() -> int:
-    """Run the check forever, publishing each verdict.
-
-    Why resident: as a HEALTHCHECK command this cost a fresh CPython per second
-    in EVERY clone, forever. Measured in this image: 9.1ms of interpreter
-    startup, 43.6ms for the whole check even when it fails fast. Paid once at
-    the golden instead, the interpreter's pages are dirtied before the snapshot
-    and are therefore SHARED by every clone rather than privately re-dirtied.
-    Each iteration then writes one small file on tmpfs.
-    """
-    while True:
-        started = monotonic_seconds()
-        try:
-            code, reason = main_with_reason()
-            publish("healthy" if code == 0 else "unhealthy", reason)
-        except Exception as error:  # a crash here must not look healthy
-            # Guarded. The unguarded version raised the SAME error the handler
-            # was catching (a full /run tmpfs, EROFS, a missing directory), let
-            # it escape loop(), and the process exited. Nothing supervises this
-            # loop, so the container would then be unhealthy forever with no
-            # verdict file at all, and the golden would wait out its full 300s
-            # timeout with nothing to say why.
-            try:
-                publish("unhealthy", f"loop error: {type(error).__name__}: {error}")
-            except Exception as publish_error:
-                print(
-                    f"cdp_health loop: cannot publish ({type(publish_error).__name__}: "
-                    f"{publish_error}) after {type(error).__name__}: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        elapsed = monotonic_seconds() - started
-        time.sleep(max(0.0, LOOP_INTERVAL - elapsed))
-
-
 if __name__ == "__main__":
     if "--loop" in sys.argv:
-        sys.exit(loop())
+        sys.exit(health_loop.loop(main_with_reason, "cdp_health"))
     sys.exit(main())

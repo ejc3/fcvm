@@ -23,10 +23,22 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$HERE/../.." && pwd)}"
-TAG="${TAG:-cb-req-corpus}"
+ENGINE="${ENGINE:-chromium}"
+case "$ENGINE" in chromium|webkit) ;; *) echo "unknown ENGINE '$ENGINE'" >&2; exit 2 ;; esac
+# Engine-scoped default tag: a webkit golden under the chromium tag would be
+# refused by the seal anyway (different image digest), but the failure would
+# come minutes in rather than at naming time.
+if [ "$ENGINE" = webkit ]; then TAG="${TAG:-cb-req-corpus-webkit}"; else TAG="${TAG:-cb-req-corpus}"; fi
+# cdp-fast is CDP WebSocket prewiring; WebKit's driver has no WebSocket, so its
+# default drops that arm rather than recording 202 guaranteed failures.
+if [ "${ENGINE:-chromium}" = webkit ]; then
+    ARMS="${ARMS:-cdp,noop}"
+else
+    ARMS="${ARMS:-cdp,cdp-fast,noop}"
+fi
 REPS="${REPS:-202}"
 WARMUP="${WARMUP:-28}"          # two full 14-URL cycles; the harness fails closed below this
-ARMS="${ARMS:-cdp,cdp-fast,noop}"
+
 UFFD_MODE="${UFFD_MODE:-minor}"
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 BACKEND="${BACKEND:-uffd}"
@@ -223,11 +235,11 @@ say "fcvm binary $FCVM_BIN sha256=$FCVM_SHA (recorded per run in cell.fcvm_sha25
 PHASE="${PHASE:-all}"
 if [ "$PHASE" = all ]; then
     say "golden $TAG (GUEST_DNS=10.0.2.2 baked into resolv.conf at boot)"
-    GUEST_DNS=10.0.2.2 TAG="$TAG" \
-        make -C "$REPO" bench-chromium-request-golden 2>&1 | tee "$LOGDIR/golden.log"
+    GUEST_DNS=10.0.2.2 TAG="$TAG" ENGINE="$ENGINE" \
+        make -C "$REPO" "bench-$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)-request-golden" 2>&1 | tee "$LOGDIR/golden.log"
 
-    say "verify: CDP hops on a restored clone"
-    TAG="$TAG" make -C "$REPO" bench-chromium-request-verify 2>&1 | tee "$LOGDIR/verify.log"
+    say "verify: $([ "$ENGINE" = webkit ] && echo WebDriver || echo CDP) hops on a restored clone"
+    TAG="$TAG" ENGINE="$ENGINE" make -C "$REPO" "bench-$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)-request-verify" 2>&1 | tee "$LOGDIR/verify.log"
 else
     snap="${DATA_ROOT:-/mnt/fcvm-btrfs}/snapshots/$TAG"
     [ -f "$snap/config.json" ] || { echo "BLOCKED: PHASE=$PHASE but no golden at $snap" >&2; exit 2; }
@@ -264,8 +276,8 @@ say "box quiet (1-min load $load1)"
 say "measured run: $REPS reps/arm, warmup $WARMUP, arms $ARMS, $BACKEND/$UFFD_MODE prefetch=$UFFD_PREFETCH"
 TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
     UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
-    RESULTS="$RESULTS" \
-    make -C "$REPO" bench-chromium-request-run 2>&1 | tee "$LOGDIR/run.log"
+    RESULTS="$RESULTS" ENGINE="$ENGINE" \
+    make -C "$REPO" "bench-$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)-request-run" 2>&1 | tee "$LOGDIR/run.log"
 
 say "records: $RESULTS"
 say "logs:    $LOGDIR"

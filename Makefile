@@ -230,7 +230,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium analyze-chromium-request bench-clone-latency test-chromium-request \
-	bench-chromium-request-build bench-chromium-request-golden bench-chromium-request-verify \
+	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
@@ -294,6 +294,7 @@ help:
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
 	@echo "  bench-chromium-request-build   Build the request-bench container image"
+	@echo "  bench-webkit-request-build     Build the WebKit request-bench container image"
 	@echo "  bench-chromium-request-golden  Create golden snapshot (TAG=, HUGEPAGES=1, NETMODE=)"
 	@echo "  bench-chromium-request-verify  Prove CDP hops on a restored clone (TAG=)"
 	@echo "  bench-chromium-request-run     Measured run (TAG=, BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, WARMUP=, ARMS=, RESULTS=)"
@@ -303,6 +304,7 @@ help:
 	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
+	@echo "  test-chromium          Run ALL bench unit tests (what CI runs)"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
 	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
 	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
@@ -743,6 +745,32 @@ bench-chromium-request-build: build
 	@echo "==> Building Chromium request-bench container image..."
 	@bash bench/chromium/reqbench.sh build
 
+# The WebKit arm's image. Separate from the Chromium one on purpose: they are
+# different engines behind the same BENCH_READY contract, and rebuilding the
+# Chromium image changes its digest, which invalidates goldens already recorded
+# against it.
+bench-webkit-request-build: build
+	@echo "==> Building WebKit request-bench container image..."
+	@ENGINE=webkit bash bench/chromium/reqbench.sh build
+
+# The WebKit twins of the chromium request targets: same reqbench.sh, same
+# seal, same gates -- ENGINE=webkit swaps the render driver (wddrive over W3C
+# WebDriver classic on 9515), the image default, and the arm list (cdp,noop:
+# cdp-fast is CDP WebSocket prewiring and exec's guest driver is CDP-only).
+bench-webkit-request-golden: bench-webkit-request-build setup-default
+	@echo "==> Creating WebKit golden snapshot (TAG=$(if $(TAG),$(TAG),cb-req-webkit))..."
+	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) bash bench/chromium/reqbench.sh golden
+
+bench-webkit-request-verify:
+	@echo "==> Verifying WD hops on a restored WebKit clone..."
+	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) bash bench/chromium/reqbench.sh verify
+
+bench-webkit-request-run:
+	@echo "==> Running WebKit request benchmark ($(BACKEND), $(REPS) measured attempts per arm)..."
+	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) \
+		BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
+		bash bench/chromium/reqbench.sh run
+
 bench-chromium-request-golden: bench-chromium-request-build setup-default
 	@echo "==> Creating golden snapshot (TAG=$(if $(TAG),$(TAG),cb-req-golden), HUGEPAGES=$(if $(HUGEPAGES),$(HUGEPAGES),0))..."
 	@bash bench/chromium/reqbench.sh golden
@@ -946,6 +974,14 @@ analyze-chromium-request:
 	@test -f "$(RESULTS)/reqbench.jsonl" || { echo "ERROR: no $(RESULTS)/reqbench.jsonl" >&2; exit 2; }
 	@python3 bench/chromium/reqanalyze.py --json-out "$(RESULTS)/analysis.json" \
 		"$(RESULTS)/reqbench.jsonl"
+
+# What CI runs (ci.yml globs test_*.py). The per-harness targets below are
+# narrower dev conveniences; run THIS before pushing, because a new test file is
+# invisible to every one of them until somebody remembers to add a target, and
+# the failure mode of forgetting is a green local run.
+test-chromium:
+	@python3 -m unittest discover -s bench/chromium -p 'test_*.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
 
 test-chromium-request:
 	@python3 -m unittest discover -s bench/chromium -p 'test_reqbench.py' \

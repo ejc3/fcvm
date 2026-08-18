@@ -1,0 +1,11 @@
+# cargo-audit configuration. Keep in sync with deny.toml [advisories].
+[advisories]
+ignore = [
+    # h2 0.3 queues empty DATA frames without limit (low-severity DoS). The
+    # patch exists only in h2 >= 0.4.16, which requires the hyper 1.x line;
+    # fcvm/fc-mock sit on hyper 0.14 + hyperlocal and fc-agent on reqwest
+    # 0.11. h2 here runs only in client mode over trusted local transports
+    # (Unix socket to firecracker, guest-local HTTP), so the condition is not
+    # reachable from an untrusted peer. Remove with the migration: issue #859.
+    "RUSTSEC-2026-0258",
+]

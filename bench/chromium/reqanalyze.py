@@ -522,6 +522,12 @@ def _validate_schedule(dataset):
     expected = set(expected_order)
     observed = {}
     observed_order = []
+    # Per-run constants, hoisted out of the record loop. The meta owns the
+    # engine: the harness stamps it once per run, so a record's own stamp is
+    # asserted against it below rather than allowed to pick the schema that
+    # judges it.
+    meta_engine = meta.get("engine") or "chromium"
+    expected_quality = meta["quality"] if meta["format"] == "jpeg" else 0
     for record in dataset["records"]:
         rsource = record.get("_source") or {}
         rlabel = f"{rsource.get('path')}:{rsource.get('line')}"
@@ -707,10 +713,26 @@ def _validate_schedule(dataset):
                         expected_url = urls[record.get("rep", 0) % len(urls)]
                     else:
                         expected_url = meta.get("url")
+                    # The two engines emit different render schemas and each
+                    # is held to its own: a webkit record judged by the
+                    # chromium schema fails structurally (~13 errors per
+                    # healthy render: wd_host is not cdp_host, WebDriver has
+                    # no idle policy, no prewire, no tcp/upgrade/enable
+                    # stages), which gated every webkit run into failure.
+                    engine = meta_engine
+                    # cdpdrive stamps no engine field, so a missing stamp means
+                    # chromium, never "whatever the meta says": a webkit run
+                    # whose renders carry no stamp must fail, not inherit.
+                    if (render.get("engine") or "chromium") != meta_engine:
+                        errors.append(
+                            f"{rlabel} render engine {render.get('engine')!r} "
+                            f"mismatches metadata {meta.get('engine')!r}"
+                        )
+                    host_key = "wd_host" if engine == "webkit" else "cdp_host"
                     expected_fields = {
                         "url": expected_url,
                         "format": meta.get("format"),
-                        "cdp_host": record.get("endpoint"),
+                        host_key: record.get("endpoint"),
                     }
                     for field, expected_value in expected_fields.items():
                         if render.get(field) != expected_value:
@@ -718,25 +740,48 @@ def _validate_schedule(dataset):
                                 f"{rlabel} CDP render {field}={render.get(field)!r} "
                                 f"does not match {expected_value!r}"
                             )
-                    if render.get("idle_timeout") != 0:
+                    if engine != "webkit" and render.get("idle_timeout") != 0:
                         errors.append(
                             f"{rlabel} CDP render did not complete its declared idle policy"
                         )
-                    prewired_expected = meta.get("ws_url_prewired")
-                    discovery_warmup = (
-                        is_warmup
-                        and prewired_expected is True
-                        and render.get("target_prewired") is False
-                    )
-                    # --prewire pins the URL on the first successful warmup rep,
-                    # which itself necessarily runs unprewired; measured reps are
-                    # held strictly to the metadata.
-                    if not discovery_warmup and (
-                        render.get("target_prewired") is not prewired_expected
-                    ):
-                        errors.append(f"{rlabel} CDP target prewire mode mismatches metadata")
+                    if engine == "webkit":
+                        # Classic WebDriver has no target discovery: the warm
+                        # session id is snapshot state, so every rep must run
+                        # prewired.
+                        if render.get("session_prewired") is not True:
+                            errors.append(
+                                f"{rlabel} webkit render ran without its "
+                                "prewired session"
+                            )
+                    else:
+                        prewired_expected = meta.get("ws_url_prewired")
+                        discovery_warmup = (
+                            is_warmup
+                            and prewired_expected is True
+                            and render.get("target_prewired") is False
+                        )
+                        # --prewire pins the URL on the first successful warmup rep,
+                        # which itself necessarily runs unprewired; measured reps are
+                        # held strictly to the metadata.
+                        if not discovery_warmup and (
+                            render.get("target_prewired") is not prewired_expected
+                        ):
+                            errors.append(f"{rlabel} CDP target prewire mode mismatches metadata")
                     stages = render.get("stages")
-                    if arm == "html":
+                    if engine == "webkit":
+                        # WebDriver classic is plain HTTP: no WebSocket
+                        # (tcp/upgrade/enable), no idle policy, no separate
+                        # decode, and no navigation-timing extraction. The html
+                        # arm is refused upfront for this engine.
+                        if arm == "html":
+                            errors.append(
+                                f"{rlabel} html arm is not valid for webkit records"
+                            )
+                        required_stages = (
+                            "resolve_ms", "connect_total_ms", "navigate_ms",
+                            "screenshot_ms", "total_ms",
+                        )
+                    elif arm == "html":
                         # The html op swaps the terminal screenshot+decode stages
                         # for a single DOM-extraction stage.
                         required_stages = (
@@ -790,7 +835,9 @@ def _validate_schedule(dataset):
                         )
                     ):
                         errors.append(f"{rlabel} CDP render has invalid image_sha256")
-                    for dimension in (() if arm == "html" else ("width", "height")):
+                    for dimension in (
+                        () if (arm == "html" or engine == "webkit") else ("width", "height")
+                    ):
                         value = render.get(dimension)
                         if (
                             not isinstance(value, int)
@@ -798,22 +845,27 @@ def _validate_schedule(dataset):
                             or value <= 0
                         ):
                             errors.append(f"{rlabel} CDP render has invalid {dimension}")
-                    expected_quality = meta["quality"] if meta["format"] == "jpeg" else 0
-                    if arm != "html" and render.get("quality") != expected_quality:
+                    if (
+                        arm != "html"
+                        and engine != "webkit"
+                        and render.get("quality") != expected_quality
+                    ):
                         errors.append(f"{rlabel} CDP render quality mismatches metadata")
-                    nav = render.get("nav")
                     nav_fields = (
                         "dns_ms", "connect_ms", "tls_ms", "ttfb_ms",
                         "resp_ms", "load_ms",
                     )
-                    if not isinstance(nav, dict):
-                        errors.append(f"{rlabel} CDP render has no navigation timing")
-                    else:
-                        for field in nav_fields:
-                            if not finite_nonnegative(nav.get(field)):
-                                errors.append(
-                                    f"{rlabel} CDP render has invalid nav.{field}"
-                                )
+                    # WebDriver classic exposes no navigation timing.
+                    if engine != "webkit":
+                        nav = render.get("nav")
+                        if not isinstance(nav, dict):
+                            errors.append(f"{rlabel} CDP render has no navigation timing")
+                        else:
+                            for field in nav_fields:
+                                if not finite_nonnegative(nav.get(field)):
+                                    errors.append(
+                                        f"{rlabel} CDP render has invalid nav.{field}"
+                                    )
                 if arm == "cdp-fast" and isinstance(teardown, dict):
                     if teardown.get("accounting_version") != "post-terminal-ambient-v2":
                         errors.append(f"{rlabel} fast teardown has stale accounting semantics")

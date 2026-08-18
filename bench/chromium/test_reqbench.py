@@ -19,6 +19,7 @@ import io
 import json
 import os
 import random
+import re
 import signal
 import shlex
 import shutil
@@ -1237,6 +1238,65 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 "this process; on a busy host that turns the enclosure check "
                 "into a no-op",
             )
+
+    def test_choppy_ambient_does_not_condemn_the_host(self):
+        """Fluctuating load must read as "cannot tell", not as "not tracking".
+
+        Pairing cancels STEADY ambient but amplifies FLUCTUATING ambient: a
+        load that starts or stops between the idle and burn windows lands in
+        the difference at full weight. Observed live -- two test suites running
+        concurrently made the probe condemn this host (median excess dragged
+        below tolerance), failing the positive-control test above once per
+        ~six runs.
+
+        The stub alternates ambient between 0 and 8 cores per WINDOW, the
+        worst case: every idle window quiet, every burn window loud, then the
+        reverse -- excesses scatter far beyond tolerance. A probe that trusts
+        its median here condemns the host; one that notices the pairs disagree
+        must fail toward "tracks" (keeping the strict violation path live) and
+        must NOT memoize, because choppiness describes the moment, not the
+        host.
+
+        RED WITHOUT THE FIX: the median-only version returns False.
+        """
+        from unittest import mock
+
+        # Four calls bracket each pair: idle start, idle end, burn start, burn
+        # end. The deltas between consecutive calls are therefore
+        # [idle-window, gap, burn-window, gap] per pair. Ambient of 8 cores
+        # lands in pair 0's IDLE window (excess strongly negative), pair 1's
+        # BURN window (strongly positive), nowhere in pair 2 (zero), and so on
+        # -- the pairs DISAGREE, which is what distinguishes chop from a
+        # counter that genuinely excludes this process (whose excesses agree
+        # near zero; that case is the frozen/ambient tests above and must
+        # still be condemned). The first stub of this test alternated ambient
+        # IDENTICALLY in every pair, so all five excesses were equal, the
+        # spread was zero, and the probe rightly condemned it -- a stub of
+        # consistent chop is a stub of a broken counter.
+        w = 8.0 * 320.0  # 8 cores for one ~320 ms window, in ms of CPU
+        deltas = iter([0.0,  # first read
+                       w, 0.0, 0.0, 0.0,    # pair 0: loud idle  -> excess -w
+                       0.0, 0.0, w, 0.0,    # pair 1: loud burn  -> excess +w
+                       0.0, 0.0, 0.0, 0.0,  # pair 2: quiet      -> excess 0
+                       w, 0.0, 0.0, 0.0,    # pair 3: loud idle  -> excess -w
+                       0.0, 0.0, w, 0.0])   # pair 4: loud burn  -> excess +w
+        state = {"clock": 0.0}
+
+        def choppy():
+            state["clock"] += next(deltas, 0.0)
+            return state["clock"]
+
+        with mock.patch.object(reqbench, "machine_cpu_ms", side_effect=choppy):
+            self.assertTrue(
+                reqbench.machine_counter_tracks_this_process(),
+                "a choppy ambient made the probe condemn the host; 'the pairs "
+                "disagree' must read as 'cannot tell', not as 'not tracking'",
+            )
+        self.assertIsNone(
+            reqbench._MACHINE_COUNTER_TRACKS,
+            "a cannot-tell verdict was memoized; the next campaign inherits a "
+            "guess about a moment, not a fact about the host",
+        )
 
     def test_reclaim_sampler_does_not_burn_a_core(self):
         """The RECLAIM window must not spin either — the control window is only half.
@@ -5547,6 +5607,26 @@ class TimedWsUpgradeDiagnostics(unittest.TestCase):
         self.assertIsInstance(diagnostics["socket_so_error"], int)
 
 
+class HarnessIdentity(unittest.TestCase):
+    """harness_sha256 must cover every staged script that defines a sample.
+
+    The staged runtime bundle (reqbench.sh's `for source in ...` list) is what
+    actually runs; a script in the bundle but not in the hash means two runs
+    with different driver code can carry the same harness identity. That was
+    real: wddrive.py defined every webkit sample while harness_sha256 omitted
+    it.
+    """
+
+    def test_harness_hash_covers_every_staged_request_script(self):
+        sh = open(os.path.join(HERE, "reqbench.sh")).read()
+        m = re.search(r"for source in ([^;]+); do", sh)
+        self.assertIsNotNone(m, "staged source list not found in reqbench.sh")
+        staged = set(m.group(1).split())
+        # reqanalyze.py is staged (the analysis step runs from the bundle) but
+        # defines no request sample.
+        self.assertEqual(set(reqbench.HARNESS_SOURCES), staged - {"reqanalyze.py"})
+
+
 class MakefileBenchGraph(unittest.TestCase):
     """The Chromium bench make targets must encode their real dependencies.
 
@@ -5649,6 +5729,24 @@ class MakefileBenchGraph(unittest.TestCase):
                "bench-chromium-request-all", "bench-chromium-hostcdp",
                "bench-chromium-fault"):
             self.assertIn(t, self.phony, f"{t} missing from .PHONY")
+
+    def test_webkit_run_forwards_the_measurement_knobs(self):
+        # Without the forwarding, `make bench-webkit-request-run REPS=202`
+        # silently ran reqbench.sh's default rep count and wrote to a
+        # RUNID-derived directory while analyze-chromium-request read the
+        # empty $(RESULTS).
+        recipe = "\n".join(self.recipes.get("bench-webkit-request-run", []))
+        for knob in ("BACKEND", "REPS", "WARMUP", "RESULTS"):
+            self.assertIn(f'{knob}="$({knob})"', recipe,
+                          f"bench-webkit-request-run does not forward {knob}")
+
+    def test_webkit_build_routes_through_the_healthcheck_assert(self):
+        # A raw `podman build` here skips cmd_build's HEALTHCHECK assertion,
+        # so an image that lost its healthcheck (OCI format drop) snapshots a
+        # cold browser and the golden gate cannot notice.
+        recipe = "\n".join(self.recipes.get("bench-webkit-request-build", []))
+        self.assertIn("reqbench.sh build", recipe)
+        self.assertNotIn("podman build", recipe)
 
     def test_fault_target_provisions_its_hugepage_pool(self):
         # faultbench selects uffd-huge-minor whenever the huge golden exists,

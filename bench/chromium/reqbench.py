@@ -360,8 +360,27 @@ def machine_counter_tracks_this_process(burn_ms: float = None) -> bool:
         # excusing it. NOT memoized: this is a statement about the probe, not
         # about the host, so a later attempt may still answer the question.
         return True
-    _MACHINE_COUNTER_TRACKS = excess >= spent - CPU_RESIDUAL_UNCERTAINTY_MS
-    return _MACHINE_COUNTER_TRACKS
+    if excess >= spent - CPU_RESIDUAL_UNCERTAINTY_MS:
+        _MACHINE_COUNTER_TRACKS = True
+        return True
+    # The median says "not tracking" -- but that verdict is only trustworthy if
+    # the pairs AGREE. Pairing cancels STEADY ambient; it amplifies FLUCTUATING
+    # ambient, because a load that starts or stops between the idle window and
+    # the burn window lands in the difference at full weight. Observed: two
+    # test suites running concurrently made this probe condemn a host that
+    # tracks perfectly (excess spread far beyond tolerance, median dragged
+    # low). When the spread of excesses exceeds the tolerance the probe cannot
+    # distinguish "counter excludes us" from "ambient was choppy", so it fails
+    # toward "tracks" -- keeping the strict violation path (RuntimeError) live
+    # rather than excusing the host -- and does NOT memoize, since choppiness
+    # is a statement about the moment, not the host. A genuinely untracked
+    # counter yields excesses that agree near zero (spread within tolerance)
+    # and is still condemned.
+    spread = excesses[-1] - excesses[0]
+    if spread > CPU_RESIDUAL_UNCERTAINTY_MS:
+        return True
+    _MACHINE_COUNTER_TRACKS = False
+    return False
 
 
 def bounded_cpu_residual(machine_ms: float, harness_ms: float, tracks=None) -> dict:
@@ -1133,11 +1152,19 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+# Every script that defines one request sample, for either engine. Must stay
+# equal to reqbench.sh's staged runtime sources minus the binaries and the
+# analyzer (which reads samples but defines none); asserted by
+# harness_hash_covers_every_staged_request_script in test_reqbench.py.
+HARNESS_SOURCES = ("reqbench.py", "cdpdrive.py", "render.py", "wddrive.py",
+                   "reqbench.sh")
+
+
 def harness_sha256() -> str:
     """Content identity for every script that defines one request sample."""
     h = hashlib.sha256()
     h.update(b"fcvm-chromium-request-harness-v1\0")
-    for name in ("reqbench.py", "cdpdrive.py", "render.py", "reqbench.sh"):
+    for name in HARNESS_SOURCES:
         encoded = name.encode()
         h.update(len(encoded).to_bytes(4, "big"))
         h.update(encoded)
@@ -1362,6 +1389,26 @@ class SurvivedTeardown(RuntimeError):
         super().__init__(message)
         self.teardown = teardown or {}
         self.record: dict = {}
+
+
+class SessionDiscoveryFailed(RuntimeError):
+    """The golden holds no usable WebDriver session id; no rep can ever render.
+
+    Escalates out of the per-rep handler (after that rep's teardown) instead of
+    being recorded and retried: every retry re-spawns a clone, re-execs, and
+    fails the same way, so a swallowed discovery failure burns the entire
+    schedule and surfaces 202 reps later as uniform navigate failures with the
+    real cause off-screen."""
+
+
+def rep_error_escalates(error: BaseException) -> bool:
+    """Whether a per-rep exception must abort the schedule after teardown.
+
+    Non-Exception BaseExceptions (KeyboardInterrupt, HarnessInterrupted) always
+    do; SessionDiscoveryFailed does because retrying it is structurally
+    pointless (the missing session id is snapshot state, identical for every
+    clone)."""
+    return not isinstance(error, Exception) or isinstance(error, SessionDiscoveryFailed)
 
 
 class HarnessInterrupted(BaseException):
@@ -3009,6 +3056,40 @@ def spawn_clone_process(cmd: list[str], log: str, env: dict) -> subprocess.Popen
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
+def discover_wd_session(args, fcvm_pid: int, deadline: float) -> str:
+    """Read the golden's warm WebDriver session id out of a live clone, once.
+
+    entry-webkit.sh writes it to /run/bench-session-id in the CONTAINER before
+    the warm marker, so it precedes every golden snapshot and restores
+    identically into every clone. One `fcvm exec` (vsock, no network stack in
+    the path) on the first clone; the caller pins the result for the run.
+    Raises rather than returning empty: a run without a session id cannot
+    render anything, and a silent "" would surface 202 reps later as uniform
+    navigate failures with the real cause off-screen.
+    """
+    argv = [args.fcvm, "exec", "--pid", str(fcvm_pid), "-c",
+            "--", "cat", "/run/bench-session-id"]
+    # Bounded by the CLONE's remaining deadline, and every failure mode is
+    # SessionDiscoveryFailed: a timeout or an unlaunchable fcvm left as its
+    # own type is an ordinary Exception the per-rep handler records and
+    # RETRIES, so each later webkit rep would repeat the whole discovery wait
+    # against a value that is snapshot state and will not change.
+    timeout = max(1.0, min(60.0, deadline - time.monotonic()))
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as error:
+        raise SessionDiscoveryFailed(
+            f"webkit session discovery failed: {type(error).__name__}: {error}"
+        ) from error
+    session = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not session:
+        raise SessionDiscoveryFailed(
+            "webkit session discovery failed: "
+            f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr[-300:]!r}"
+        )
+    return session
+
+
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
@@ -3063,30 +3144,52 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
-            ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
-            rec["ws_url_prewired"] = bool(ws_url)
-            drive_args = argparse.Namespace(
-                cdp_host=endpoint,
-                url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                format=args.format,
-                quality=args.quality,
-                timeout=max(1.0, deadline - time.monotonic()),
-                idle_wait_ms=0.0,
-                out_prefix="",
-                ws_url=ws_url,
-                connect_retries=200,
-                nav_timing=True,
-                print_target=False,
-                # This Namespace is an explicit, CLOSED field list, so every flag
-                # cdpdrive grows has to be added here too or `drive()` raises
-                # AttributeError — which is not in its except tuple, escapes it,
-                # and is swallowed by the `except Exception` below, failing every
-                # cdp rep. cdpdrive also reads it with getattr; both halves.
-                host_header="",
-                op=op,
-                render_module=os.path.join(HERE, "render.py"),
-            )
-            result = cdpdrive.drive(drive_args)
+            if getattr(args, "engine", "chromium") == "webkit":
+                # Classic WebDriver has NO session discovery: the warm session
+                # id is written by entry-webkit.sh to /run/bench-session-id
+                # BEFORE the golden snapshot, so it is snapshot state --
+                # identical across clones for exactly the reason cdpdrive's
+                # target id is. Captured ONCE via fcvm exec on the first clone
+                # and pinned for every later rep (discovery-once, same pattern
+                # as --prewire; warmups run first, so the exec cost lands on a
+                # discarded rep).
+                if not getattr(args, "wd_session_id", ""):
+                    args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
+                rec["session_prewired"] = True
+                import wddrive
+
+                result = wddrive.drive(argparse.Namespace(
+                    cdp_host=endpoint,
+                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+                    timeout=max(1.0, deadline - time.monotonic()),
+                    session_id=args.wd_session_id,
+                    out_prefix="",
+                ))
+            else:
+                ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
+                rec["ws_url_prewired"] = bool(ws_url)
+                drive_args = argparse.Namespace(
+                    cdp_host=endpoint,
+                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+                    format=args.format,
+                    quality=args.quality,
+                    timeout=max(1.0, deadline - time.monotonic()),
+                    idle_wait_ms=0.0,
+                    out_prefix="",
+                    ws_url=ws_url,
+                    connect_retries=200,
+                    nav_timing=True,
+                    print_target=False,
+                    # This Namespace is an explicit, CLOSED field list, so every flag
+                    # cdpdrive grows has to be added here too or `drive()` raises
+                    # AttributeError — which is not in its except tuple, escapes it,
+                    # and is swallowed by the `except Exception` below, failing every
+                    # cdp rep. cdpdrive also reads it with getattr; both halves.
+                    host_header="",
+                    op=op,
+                    render_module=os.path.join(HERE, "render.py"),
+                )
+                result = cdpdrive.drive(drive_args)
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
@@ -3139,7 +3242,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["ok"] = False
             rec["request_error"] = f"{type(e).__name__}: {e}"
             rec["error"] = rec["request_error"]
-            if not isinstance(e, Exception):
+            if rep_error_escalates(e):
                 interrupted = e
             rec.setdefault("blocking_ms", (time.monotonic() - t_spawn) * 1000)
             if state_path is None and fcvm_start_time is not None:
@@ -3338,7 +3441,7 @@ def run_noop_request(args, rep: int) -> dict:
             rec["ok"] = False
             rec["request_error"] = f"{type(e).__name__}: {e}"
             rec["error"] = rec["request_error"]
-            if not isinstance(e, Exception):
+            if rep_error_escalates(e):
                 interrupted = e
             if state_path is None and fcvm_start_time is not None:
                 state_path, state = scan_state(
@@ -3538,7 +3641,7 @@ def run_exec_request(args, rep: int) -> dict:
             rec["log"] = log
             teardown_error.record = rec
             raise teardown_error from request_error
-        if not isinstance(request_error, Exception):
+        if rep_error_escalates(request_error):
             raise
         rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
         rec["log"] = log
@@ -3778,6 +3881,19 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
 CDP_CLASS_ARMS = frozenset({"cdp", "cdp-fast", "html"})
 
 
+def allowed_arms_for_engine(engine: str) -> frozenset:
+    """The arms an engine can actually execute; refused upfront, not per-rep.
+
+    webkit excludes exec (its in-guest driver is render.py, which
+    Containerfile.webkit-bench does not ship, so every exec rep burns a full
+    clone lifecycle on a guaranteed in-guest failure) and html (wddrive has no
+    DOM-extraction op; the request would silently return screenshot records the
+    analyzer then rejects for missing extract_ms/html_bytes/html_sha256)."""
+    if engine == "webkit":
+        return frozenset({"cdp", "cdp-fast", "noop"})
+    return frozenset({"exec", "cdp", "cdp-fast", "html", "noop"})
+
+
 def publication_arms_ok(arms) -> bool:
     """Whether an arm set can back a publication run.
 
@@ -3826,6 +3942,10 @@ def main_with_resources(resources: ExitStack) -> int:
     p.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
     p.add_argument("--quality", type=int, default=80)
     p.add_argument("--cdp-port", type=int, default=9222)
+    p.add_argument("--engine", choices=("chromium", "webkit"), default="chromium",
+                   help="render driver: chromium drives CDP via cdpdrive; webkit "
+                        "drives W3C WebDriver classic via wddrive (the port in "
+                        "--cdp-port is then the WD port, 9515)")
     p.add_argument("--image", default="")
     p.add_argument("--image-id", default="")
     p.add_argument("--snapshot-name", default="")
@@ -3945,12 +4065,26 @@ def main_with_resources(resources: ExitStack) -> int:
             )
     os.makedirs(args.out_dir, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    allowed_arms = {"exec", "cdp", "cdp-fast", "html", "noop"}
+    allowed_arms = allowed_arms_for_engine(args.engine)
     if not arms or len(set(arms)) != len(arms) or any(a not in allowed_arms for a in arms):
         p.error(
             "--arms must be a non-empty, duplicate-free subset of "
-            "exec,cdp,cdp-fast,html,noop"
+            + ",".join(sorted(allowed_arms))
+            + f" for --engine {args.engine}"
         )
+    if args.engine == "webkit":
+        # WebDriver's screenshot is always PNG (wddrive stamps format=png), so
+        # the jpeg default in --format would put a declaration in meta the
+        # renders can never satisfy.
+        args.format = "png"
+        if args.ws_url:
+            p.error("--ws-url is CDP WebSocket prewiring; --engine webkit "
+                    "drives WebDriver classic and cannot use it")
+        # --prewire likewise names CDP prewiring. Leaving it set would stamp
+        # ws_url_prewired=true in meta for a WebSocket that never exists; the
+        # webkit analogue (the inherited WebDriver session) is recorded per
+        # rep as session_prewired.
+        args.prewire = False
     # exec is ALLOWED but no longer REQUIRED: it is retired from measurement
     # (no published claim rests on it), and run reqbench-20260814-022254-uffd
     # measured that 95% of noop reps following an exec rep land in a +17 ms
@@ -4025,6 +4159,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
             "uffd_mode": uffd_mode,
             "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
+            "engine": args.engine,
             "quality": args.quality,
             "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,

@@ -30,7 +30,27 @@ fi
 # rootless needs no sudo. SUDO is kept as a hook only so the same script can be
 # pointed at a root-only mode later without rewriting every call site.
 SUDO="${SUDO:-}"
-IMAGE="${IMAGE:-localhost/chromium-bench-req}"
+# ENGINE picks the render driver and, with it, the image and port defaults.
+# webkit: W3C WebDriver classic on 9515 via wddrive.py; the session id is baked
+# into the golden (entry-webkit.sh), captured once per run over fcvm exec.
+ENGINE="${ENGINE:-chromium}"
+case "$ENGINE" in
+chromium)
+    IMAGE="${IMAGE:-localhost/chromium-bench-req}"
+    CONTAINERFILE="Containerfile.chromium-bench"
+    ;;
+webkit)
+    IMAGE="${IMAGE:-localhost/webkit-bench-req}"
+    CONTAINERFILE="Containerfile.webkit-bench"
+    CDP_PORT="${CDP_PORT:-9515}"
+    # cdp-fast is CDP WebSocket prewiring; exec's guest driver is CDP-only.
+    ARMS="${ARMS:-cdp,noop}"
+    ;;
+*)
+    echo "unknown ENGINE '$ENGINE' (chromium|webkit)" >&2
+    exit 2
+    ;;
+esac
 # 9222 is Chromium's own CDP port. It binds guest loopback ONLY (it ignores
 # --remote-debugging-address; measured evidence in entry.sh), but fcvm DNATs each
 # eligible published TCP port to guest 127.0.0.1 when setup succeeds, so
@@ -103,17 +123,17 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${REQBENCH_STAGED:-0}" != 1 ]; then
     source_revision_before=$(git -C "$REPO" rev-parse HEAD)
     mkdir -p "$RESULTS/runtime"
     stage_dir=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
-    for source in reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py; do
+    for source in reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py wddrive.py; do
         cp --reflink=auto "$HERE/$source" "$stage_dir/$source"
     done
     cp --reflink=auto "$FC_AGENT" "$stage_dir/fc-agent"
     cp --reflink=auto "$FCVM" "$stage_dir/fcvm"
     chmod 0555 "$stage_dir/fcvm" "$stage_dir/fc-agent" "$stage_dir/reqbench.sh" \
         "$stage_dir/reqbench.py" "$stage_dir/reqanalyze.py" \
-        "$stage_dir/cdpdrive.py" "$stage_dir/render.py"
+        "$stage_dir/cdpdrive.py" "$stage_dir/render.py" "$stage_dir/wddrive.py"
     (
         cd "$stage_dir"
-        sha256sum fcvm fc-agent reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py \
+        sha256sum fcvm fc-agent reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py wddrive.py \
             > MANIFEST.sha256
     )
     bundle_hash=$(sha256sum "$stage_dir/MANIFEST.sha256" | cut -d' ' -f1)
@@ -147,6 +167,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${REQBENCH_STAGED:-0}" != 1 ]; then
         FC_AGENT="$bundle_dir/fc-agent" \
         SUDO="$SUDO" \
         IMAGE="$IMAGE" \
+        ENGINE="$ENGINE" \
         CDP_PORT="$CDP_PORT" \
         NETMODE="$NETMODE" \
         CPU="$CPU" \
@@ -441,7 +462,7 @@ cmd_build() {
     # --format docker is LOAD-BEARING: podman's default OCI format DROPS
     # HEALTHCHECK with only a warning, and fcvm's health gate is what
     # triggers the golden snapshot (src/health.rs AND-logic).
-    podman build --format docker -t "$IMAGE" -f "$REPO/Containerfile.chromium-bench" "$REPO"
+    podman build --format docker -t "$IMAGE" -f "$REPO/$CONTAINERFILE" "$REPO"
     # The warm gate lives or dies here. fcvm treats a MISSING healthcheck as a
     # PASS, so an image that lost it snapshots a COLD browser and every clone's
     # "warm" latency is really a first-paint number. Assert the healthcheck
@@ -668,6 +689,16 @@ target_id() {
         --timeout "$TARGET_ID_TIMEOUT" 2>/dev/null || true
 }
 
+# The webkit twin of target_id(): read the baked session id out of a clone.
+# `|| true` for the same reason: under `set -euo pipefail` an exec/cat failure
+# inside $() would abort cmd_verify BEFORE its own "HOP C FAILED (no baked
+# session id)" / "TARGET ID UNREADABLE" diagnostics and the ordered teardown
+# that follows them, the exact failures those branches exist to name.
+wd_session_id() {
+    $SUDO "$FCVM" exec --pid "$1" -c -- cat /run/bench-session-id 2>/dev/null \
+        | tr -d '[:space:]' || true
+}
+
 cmd_verify() {
     # Every hop feeds this counter and the function RETURNS it. Each hop used to
     # be `... || echo "HOP X FAILED"`, which makes the compound command SUCCEED —
@@ -714,9 +745,21 @@ cmd_verify() {
     log "verify: clone pid=$cpid host-side ip=$ip"
 
     echo "--- HOP A: healthcheck path, 127.0.0.1:$CDP_PORT INSIDE the container ---"
-    $SUDO "$FCVM" exec --pid "$cpid" -c -- python3 /opt/bench/cdp_health.py \
-        || { echo "HOP A FAILED (in-container CDP round trip)"; fail=1; }
+    local health_probe=cdp_health.py
+    [ "$ENGINE" = webkit ] && health_probe=wd_health.py
+    $SUDO "$FCVM" exec --pid "$cpid" -c -- python3 "/opt/bench/$health_probe" \
+        || { echo "HOP A FAILED (in-container $ENGINE health round trip)"; fail=1; }
 
+    if [ "$ENGINE" = webkit ]; then
+        echo "--- HOP B: GET /status from the HOST against $ip:$CDP_PORT ---"
+        python3 - "$ip:$CDP_PORT" <<'PYWD' || { echo "HOP B FAILED (host -> clone WD HTTP)"; fail=1; }
+import json, sys, urllib.request
+host = sys.argv[1]
+with urllib.request.urlopen(f"http://{host}/status", timeout=10) as r:
+    v = json.load(r)["value"]
+print("  OK ready=", v.get("ready"), "|", v.get("message", ""))
+PYWD
+    else
     echo "--- HOP B: GET /json/version from the HOST against $ip:$CDP_PORT ---"
     python3 - "$ip:$CDP_PORT" <<'PY' || { echo "HOP B FAILED (host -> clone CDP HTTP)"; fail=1; }
 import json, sys, urllib.request
@@ -735,9 +778,32 @@ except Exception as e:
     print(f"  note: non-IP Host header REJECTED ({e}) — expected; connect by IP")
 PY
 
+    fi
+
+    if [ "$ENGINE" = webkit ]; then
+        echo "--- HOP C: WD render (navigate + screenshot) from the HOST ---"
+        local wd_session
+        wd_session=$(wd_session_id "$cpid")
+        if [ -z "$wd_session" ]; then
+            echo "HOP C FAILED (no baked session id in the clone)"; fail=1
+        else
+            REQBENCH_HERE="$HERE" python3 - "$ip:$CDP_PORT" "$URL" "$wd_session" "$RESULTS/verify" <<'PYWD3' \
+                || { echo "HOP C FAILED (host WD render)"; fail=1; }
+import argparse, json, sys
+import os; sys.path.insert(0, os.environ["REQBENCH_HERE"])
+import wddrive
+host, url, session, prefix = sys.argv[1:5]
+r = wddrive.drive(argparse.Namespace(cdp_host=host, url=url, timeout=120.0,
+                                     session_id=session, out_prefix=prefix))
+print(json.dumps({k: r[k] for k in ("ok", "image_bytes", "stages") if k in r}))
+sys.exit(0 if r.get("ok") else 1)
+PYWD3
+        fi
+    else
     echo "--- HOP C: WebSocket upgrade + one CDP command from the HOST ---"
     python3 "$HERE/cdpdrive.py" "$ip:$CDP_PORT" "$URL" --format jpeg --nav-timing \
         --out-prefix "$RESULTS/verify" || { echo "HOP C FAILED (host WS + CDP)"; fail=1; }
+    fi
 
     # --- target id stability, ACROSS CLONES, asserted.
     # This block used to print one clone's id and compare it with nothing, under
@@ -745,10 +811,20 @@ PY
     # serve is already up, so a second clone is cheap.
     echo "--- target id stability ACROSS CLONES (-> can /json/list be skipped?) ---"
     local id1 id2 cname2="cb-req-verify2-$RUNID" cpid2 ip2 clone2_bg vmid2
+    if [ "$ENGINE" = webkit ]; then
+        # The id is a baked, immutable file; HOP C already read it from this
+        # clone, so reuse that instead of another exec round trip.
+        id1="$wd_session"
+    else
     id1=$(target_id "$ip:$CDP_PORT")
+    fi
     start_clone "$spid" "$cname2" "$RESULTS/logs/verify-clone2.log" || return 1
     cpid2="$CLONE_PID"; ip2="$CLONE_IP"; clone2_bg="$CLONE_BG"; vmid2="$CLONE_VM_ID"
+    if [ "$ENGINE" = webkit ]; then
+        id2=$(wd_session_id "$cpid2")
+    else
     id2=$(target_id "$ip2:$CDP_PORT")
+    fi
     echo "  clone1 ($ip) id=${id1:-<none>}"
     echo "  clone2 ($ip2) id=${id2:-<none>}"
     if [ -z "$id1" ] || [ -z "$id2" ]; then
@@ -999,6 +1075,7 @@ cmd_run() {
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
         --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" \
+        --engine "$ENGINE" \
         "${prewire_args[@]}" &
     local driver_bg=$!
     track "$driver_bg"
