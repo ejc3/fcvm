@@ -37,9 +37,11 @@ ENGINE="${ENGINE:-chromium}"
 case "$ENGINE" in
 chromium)
     IMAGE="${IMAGE:-localhost/chromium-bench-req}"
+    CONTAINERFILE="Containerfile.chromium-bench"
     ;;
 webkit)
     IMAGE="${IMAGE:-localhost/webkit-bench-req}"
+    CONTAINERFILE="Containerfile.webkit-bench"
     CDP_PORT="${CDP_PORT:-9515}"
     # cdp-fast is CDP WebSocket prewiring; exec's guest driver is CDP-only.
     ARMS="${ARMS:-cdp,noop}"
@@ -460,7 +462,7 @@ cmd_build() {
     # --format docker is LOAD-BEARING: podman's default OCI format DROPS
     # HEALTHCHECK with only a warning, and fcvm's health gate is what
     # triggers the golden snapshot (src/health.rs AND-logic).
-    podman build --format docker -t "$IMAGE" -f "$REPO/Containerfile.chromium-bench" "$REPO"
+    podman build --format docker -t "$IMAGE" -f "$REPO/$CONTAINERFILE" "$REPO"
     # The warm gate lives or dies here. fcvm treats a MISSING healthcheck as a
     # PASS, so an image that lost it snapshots a COLD browser and every clone's
     # "warm" latency is really a first-paint number. Assert the healthcheck
@@ -687,6 +689,16 @@ target_id() {
         --timeout "$TARGET_ID_TIMEOUT" 2>/dev/null || true
 }
 
+# The webkit twin of target_id(): read the baked session id out of a clone.
+# `|| true` for the same reason: under `set -euo pipefail` an exec/cat failure
+# inside $() would abort cmd_verify BEFORE its own "HOP C FAILED (no baked
+# session id)" / "TARGET ID UNREADABLE" diagnostics and the ordered teardown
+# that follows them, the exact failures those branches exist to name.
+wd_session_id() {
+    $SUDO "$FCVM" exec --pid "$1" -c -- cat /run/bench-session-id 2>/dev/null \
+        | tr -d '[:space:]' || true
+}
+
 cmd_verify() {
     # Every hop feeds this counter and the function RETURNS it. Each hop used to
     # be `... || echo "HOP X FAILED"`, which makes the compound command SUCCEED —
@@ -771,7 +783,7 @@ PY
     if [ "$ENGINE" = webkit ]; then
         echo "--- HOP C: WD render (navigate + screenshot) from the HOST ---"
         local wd_session
-        wd_session=$($SUDO "$FCVM" exec --pid "$cpid" -c -- cat /run/bench-session-id | tr -d '[:space:]')
+        wd_session=$(wd_session_id "$cpid")
         if [ -z "$wd_session" ]; then
             echo "HOP C FAILED (no baked session id in the clone)"; fail=1
         else
@@ -800,14 +812,14 @@ PYWD3
     echo "--- target id stability ACROSS CLONES (-> can /json/list be skipped?) ---"
     local id1 id2 cname2="cb-req-verify2-$RUNID" cpid2 ip2 clone2_bg vmid2
     if [ "$ENGINE" = webkit ]; then
-        id1=$($SUDO "$FCVM" exec --pid "$cpid" -c -- cat /run/bench-session-id | tr -d '[:space:]')
+        id1=$(wd_session_id "$cpid")
     else
     id1=$(target_id "$ip:$CDP_PORT")
     fi
     start_clone "$spid" "$cname2" "$RESULTS/logs/verify-clone2.log" || return 1
     cpid2="$CLONE_PID"; ip2="$CLONE_IP"; clone2_bg="$CLONE_BG"; vmid2="$CLONE_VM_ID"
     if [ "$ENGINE" = webkit ]; then
-        id2=$($SUDO "$FCVM" exec --pid "$cpid2" -c -- cat /run/bench-session-id | tr -d '[:space:]')
+        id2=$(wd_session_id "$cpid2")
     else
     id2=$(target_id "$ip2:$CDP_PORT")
     fi

@@ -751,8 +751,7 @@ bench-chromium-request-build: build
 # against it.
 bench-webkit-request-build: build
 	@echo "==> Building WebKit request-bench container image..."
-	@podman build --format docker -t localhost/webkit-bench-req:latest \
-		-f Containerfile.webkit-bench .
+	@ENGINE=webkit bash bench/chromium/reqbench.sh build
 
 # The WebKit twins of the chromium request targets: same reqbench.sh, same
 # seal, same gates -- ENGINE=webkit swaps the render driver (wddrive over W3C
@@ -767,8 +766,10 @@ bench-webkit-request-verify:
 	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) bash bench/chromium/reqbench.sh verify
 
 bench-webkit-request-run:
-	@echo "==> Running WebKit request benchmark (sealed bundle)..."
-	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) bash bench/chromium/reqbench.sh run
+	@echo "==> Running WebKit request benchmark ($(BACKEND), $(REPS) measured attempts per arm)..."
+	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) \
+		BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
+		bash bench/chromium/reqbench.sh run
 
 bench-chromium-request-golden: bench-chromium-request-build setup-default
 	@echo "==> Creating golden snapshot (TAG=$(if $(TAG),$(TAG),cb-req-golden), HUGEPAGES=$(if $(HUGEPAGES),$(HUGEPAGES),0))..."
