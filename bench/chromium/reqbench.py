@@ -1152,11 +1152,19 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+# Every script that defines one request sample, for either engine. Must stay
+# equal to reqbench.sh's staged runtime sources minus the binaries and the
+# analyzer (which reads samples but defines none); asserted by
+# harness_hash_covers_every_staged_request_script in test_reqbench.py.
+HARNESS_SOURCES = ("reqbench.py", "cdpdrive.py", "render.py", "wddrive.py",
+                   "reqbench.sh")
+
+
 def harness_sha256() -> str:
     """Content identity for every script that defines one request sample."""
     h = hashlib.sha256()
     h.update(b"fcvm-chromium-request-harness-v1\0")
-    for name in ("reqbench.py", "cdpdrive.py", "render.py", "reqbench.sh"):
+    for name in HARNESS_SOURCES:
         encoded = name.encode()
         h.update(len(encoded).to_bytes(4, "big"))
         h.update(encoded)
@@ -4058,6 +4066,14 @@ def main_with_resources(resources: ExitStack) -> int:
         # the jpeg default in --format would put a declaration in meta the
         # renders can never satisfy.
         args.format = "png"
+        if args.ws_url:
+            p.error("--ws-url is CDP WebSocket prewiring; --engine webkit "
+                    "drives WebDriver classic and cannot use it")
+        # --prewire likewise names CDP prewiring. Leaving it set would stamp
+        # ws_url_prewired=true in meta for a WebSocket that never exists; the
+        # webkit analogue (the inherited WebDriver session) is recorded per
+        # rep as session_prewired.
+        args.prewire = False
     # exec is ALLOWED but no longer REQUIRED: it is retired from measurement
     # (no published claim rests on it), and run reqbench-20260814-022254-uffd
     # measured that 95% of noop reps following an exec rep land in a +17 ms

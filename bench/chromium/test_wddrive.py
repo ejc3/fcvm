@@ -54,7 +54,8 @@ class FakeDriver(http.server.BaseHTTPRequestHandler):
 
 
 class NavigateReadiness(unittest.TestCase):
-    def drive(self, results, landed="http://page/x"):
+    def drive(self, results, landed="http://page/x", url="http://page/x",
+              timeout=10.0):
         """Serve one navigate() against a scripted sequence of script results."""
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeDriver)
         # results[0] answers the sentinel plant; the rest answer the poll.
@@ -66,8 +67,7 @@ class NavigateReadiness(unittest.TestCase):
         self.addCleanup(server.shutdown)
         host = f"127.0.0.1:{server.server_port}"
         try:
-            wddrive.navigate(host, "sess", "http://page/x", timeout=10.0,
-                             poll_s=0.001)
+            wddrive.navigate(host, "sess", url, timeout=timeout, poll_s=0.001)
         finally:
             self.remaining = len(server.plan["results"])
             self.navigated = server.plan["navigated"]
@@ -107,6 +107,38 @@ class NavigateReadiness(unittest.TestCase):
         with self.assertRaises(wddrive.WdError) as caught:
             self.drive([1, ["complete", True]], landed="about:blank")
         self.assertIn("landed off-origin", str(caught.exception))
+
+    def test_a_fragment_only_navigation_is_ready_without_a_document_swap(self):
+        """A fragment navigation keeps the SAME document, so the sentinel
+        survives and `swapped` can never come true. Requiring the swap polls a
+        finished page until the deadline and reports TimeoutError for a URL
+        that loaded. The plant's own round trip returns document.URL, which is
+        what identifies the case.
+        """
+        self.drive(["http://page/x", ["complete", False]],
+                   url="http://page/x#section", timeout=2.0)
+        self.assertTrue(self.navigated)
+
+    def test_a_same_url_reload_still_requires_the_document_swap(self):
+        """Repeating the same fragmentless URL is a RELOAD: the document is
+        replaced and readiness must wait for the swap. This is the exact
+        measured false-ready in navigate()'s docstring (navigate_ms=3.4 with
+        985 ms of layout pending), so the same-document shortcut must not
+        cover it -- only a requested fragment qualifies.
+        """
+        self.drive(["http://page/x", ["complete", False], ["complete", True]],
+                   url="http://page/x")
+        self.assertEqual(self.remaining, 0,
+                         "reload returned before the document swapped")
+
+    def test_origin_comparison_ignores_host_case_and_default_port(self):
+        """The driver serializes the active document's URL, which can differ
+        from the requested string in host case and an explicit default port
+        while naming the same origin.
+        """
+        self.drive([1, ["complete", True]],
+                   url="http://PAGE:80/x", landed="http://page/x")
+        self.assertTrue(self.navigated)
 
     def test_a_same_origin_redirect_is_a_render_not_a_failure(self):
         """The landed-URL guard compares origins, not full URLs.

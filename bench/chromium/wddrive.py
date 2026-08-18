@@ -135,11 +135,23 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
     # was still doing 985 ms of layout, which then landed in screenshot_ms.
     # A real document swap wipes the global, so its ABSENCE is the proof that
     # this readyState belongs to the new document and not the old one.
+    requested = urlsplit(url)
+    same_document = False
     try:
-        wd(host, "POST", f"/session/{session}/execute/sync",
-           {"script": "window.__fcvmNavSentinel = 1; return 1", "args": []},
+        planted = wd(host, "POST", f"/session/{session}/execute/sync",
+           {"script": "window.__fcvmNavSentinel = 1; return document.URL", "args": []},
            timeout=max(1.0, deadline - time.monotonic()))
         sentinel = True
+        # A navigation that differs from the CURRENT document only by fragment
+        # is a same-document navigation: nothing is loaded, the sentinel is
+        # never wiped, and requiring the swap would poll a finished page until
+        # the deadline. The requested fragment must be non-empty: repeating the
+        # SAME fragmentless URL is a reload, which replaces the document and is
+        # exactly the measured false-ready the sentinel exists to catch.
+        # document.URL rides the plant's round trip, so this costs nothing.
+        current = urlsplit(planted) if isinstance(planted, str) else urlsplit("")
+        same_document = bool(requested.fragment) and (
+            requested._replace(fragment="") == current._replace(fragment=""))
     except WdError as error:
         # ONLY the fresh-session case may skip the sentinel: with no previous
         # document there is nothing for a stale "complete" to come from. Any
@@ -155,7 +167,6 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
         sentinel = False
     wd(host, "POST", f"/session/{session}/url", {"url": url},
        timeout=max(1.0, deadline - time.monotonic()))
-    requested = urlsplit(url)
     while True:
         state = wd(host, "POST", f"/session/{session}/execute/sync",
                    {"script": ("return [document.readyState, "
@@ -163,7 +174,7 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
                     "args": []},
                    timeout=max(1.0, deadline - time.monotonic()))
         ready, swapped = (state[0], state[1]) if isinstance(state, list) else (state, True)
-        if ready == "complete" and (swapped or not sentinel):
+        if ready == "complete" and (swapped or not sentinel or same_document):
             # readyState "complete" is NOT proof the requested page loaded.
             # WebKit's network-error page is a fresh document (sentinel wiped)
             # that reaches complete, so without this check a dead pageserver
@@ -183,7 +194,11 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
             # the requested origin (about:, applewebdata:, blank), which is
             # what this check exists to catch.
             got = urlsplit(landed if isinstance(landed, str) else "")
-            if (got.scheme, got.netloc) != (requested.scheme, requested.netloc):
+            try:
+                off_origin = _origin(got) != _origin(requested)
+            except ValueError:  # malformed port in what the driver returned
+                off_origin = True
+            if off_origin:
                 raise WdError(
                     f"navigation landed off-origin: requested {url!r} but "
                     f"document.URL is {landed!r}; this is a failed load (error "
@@ -201,6 +216,19 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
 def screenshot(host, session, timeout=60.0):
     b64 = wd(host, "GET", f"/session/{session}/screenshot", timeout=timeout)
     return base64.b64decode(b64)
+
+
+def _origin(split):
+    """Canonical (scheme, host, port) for origin comparison.
+
+    The driver serializes the ACTIVE document's URL, which can differ from the
+    requested string in case and in an explicit default port while naming the
+    same origin. A malformed port raises ValueError in .port; the caller treats
+    that as off-origin.
+    """
+    scheme = split.scheme.lower()
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    return (scheme, (split.hostname or "").lower(), split.port or default_port)
 
 
 def current_url(host, session, timeout=10.0):

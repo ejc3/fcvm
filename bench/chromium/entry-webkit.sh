@@ -13,10 +13,9 @@
 #
 # THE SESSION IS PART OF THE SNAPSHOT. Classic WebDriver has no session
 # discovery: a session created after restore would launch a cold browser, so
-# the warm session id minted here is what every clone inherits. It is persisted
-# twice: /run/bench-session-id for the in-guest health probe, and
-# pages/webdriver-session.txt so the HOST driver can fetch it over the
-# published pageserver port without an exec round trip.
+# the warm session id minted here is what every clone inherits, persisted at
+# /run/bench-session-id. The in-guest health probe reads it there and the host
+# harness captures it once per run over fcvm exec (discover_wd_session).
 set -eu
 
 PAGES_DIR="${BENCH_PAGES_DIR:-/opt/bench/pages}"
@@ -109,9 +108,6 @@ python3 /opt/bench/wddrive.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
     --host "127.0.0.1:$WD_PORT" --session-file "$SESSION_FILE" \
     --out-prefix /tmp/warmup2 --then-blank
 
-# The host driver reads the inherited session id over the published pageserver
-# port; the health probe reads the /run copy.
-cp "$SESSION_FILE" "$PAGES_DIR/webdriver-session.txt"
 
 # Resident health checker, started BEFORE the warm marker so the interpreter's
 # pages are dirtied pre-snapshot and shared by every clone. stdout to /dev/null:

@@ -238,7 +238,7 @@ if [ "$PHASE" = all ]; then
     GUEST_DNS=10.0.2.2 TAG="$TAG" ENGINE="$ENGINE" \
         make -C "$REPO" "bench-$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)-request-golden" 2>&1 | tee "$LOGDIR/golden.log"
 
-    say "verify: CDP hops on a restored clone"
+    say "verify: $([ "$ENGINE" = webkit ] && echo WebDriver || echo CDP) hops on a restored clone"
     TAG="$TAG" ENGINE="$ENGINE" make -C "$REPO" "bench-$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)-request-verify" 2>&1 | tee "$LOGDIR/verify.log"
 else
     snap="${DATA_ROOT:-/mnt/fcvm-btrfs}/snapshots/$TAG"

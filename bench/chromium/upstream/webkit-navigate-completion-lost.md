@@ -1,6 +1,6 @@
 # WebKitGTK: navigate never completes, and its 300 s timeout never fires
 
-## ROOT CAUSE (traced in Source/, confirmed by a prediction)
+## LEADING HYPOTHESIS (traced in Source/, supported by a prediction; the patch is not built or tested)
 
 `WebPageProxy::didFinishLoadForFrame` (WebPageProxy.cpp:7996) gates the
 automation notification on the navigation still being registered:
@@ -20,7 +20,7 @@ if (!isMainFrame || !navigationID || navigation) {          // <-- gate
 
 The sibling path does NOT gate it. `didFinishDocumentLoadForFrame`
 (WebPageProxy.cpp:7832) notifies automation unconditionally, before it even
-looks the navigation up. That asymmetry is the defect.
+looks the navigation up. That asymmetry is the candidate defect.
 
 Two IPC messages from the WebProcess race:
 
@@ -34,7 +34,7 @@ If the former is processed first the `API::Navigation` is already retired,
 callback is left in `m_pendingNormalNavigationInBrowsingContextCallbacksPerPage`
 forever.
 
-**Confirming prediction.** WebDriver's `normal` strategy resolves via the GATED
+**Supporting prediction.** WebDriver's `normal` strategy resolves via the GATED
 `navigationOccurredForFrame`; `eager` resolves via the UNGATED
 `documentLoadedForFrame`. So `eager` should never stall. Measured on 2.52.5,
 same page, same protocol, fresh container per trial:
@@ -46,7 +46,10 @@ same page, same protocol, fresh container per trial:
 
 Proposed patch: `webkit-didFinishLoadForFrame-automation.patch` in this
 directory moves the automation notification out of the gate, matching
-`didFinishDocumentLoadForFrame`. NOT YET BUILT OR TESTED against a WebKit build.
+`didFinishDocumentLoadForFrame`. NOT YET BUILT OR TESTED against a WebKit build;
+the eager/normal split is consistent with the gate being the cause but does not
+isolate it (eager also changes when the wait resolves), so the asymmetry stays
+a hypothesis until the patched `normal` path is measured to recover.
 
 
 Two defects, filed together because the second is what makes the first fatal.

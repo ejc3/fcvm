@@ -121,8 +121,9 @@
   },
   "status": "mechanism NOT established; the two facts above are established"
  },
- "ROOT_CAUSE_AND_FIX": {
-  "diagnosis": "NOT a hang, not slow layout, not a GL fence. WebKit loses the navigation-completion notification. Probed during a CONFIRMED stall with the navigate still outstanding at t=25s: document.readyState='complete'; the page's own marker read 'done layout_ms=1145.0 canvas_ms=160.0 checksum=65030'; 1200 table rows present; GET /status, /url and /title all answered 200 in under 3 ms. The page finished in ~1.3 s and JavaScript still executes. Only the COMMAND never completes.",
+ "leading_hypothesis_and_workaround": {
+  "observed_during_confirmed_stall": "Probed with the navigate still outstanding at t=25s: document.readyState='complete'; the page's own marker read 'done layout_ms=1145.0 canvas_ms=160.0 checksum=65030'; 1200 table rows present; GET /status, /url and /title all answered 200 in under 3 ms. The page finished in ~1.3 s and JavaScript still executes. Only the COMMAND never completes.",
+  "hypothesis": "WebKit drops the navigation-completion notification. Consistent with everything observed, but the mechanism is not established (see mechanism_investigation.status) and the gate patch in upstream/ is not built or tested, so this stays a hypothesis rather than a root cause.",
   "why_nothing_rescues_it": "Source/WebDriver/Session.cpp Session::go arms NO timer: it sends navigateBrowsingContext and waits for the backend indefinitely. The only deadline is the browser-side WebAutomationSession::m_loadTimer (defaultPageLoadTimeout = 300_s, WebAutomationSession.cpp:92). One observed navigate ran 390 s with no response, so that deadline did not fire either. There is a SINGLE shared m_loadTimer for four separate pending-callback maps and every resolving wait calls stop() on it (lines 962, 968, 993, 1002), so a second wait can strip the first one's deadline.",
   "workaround": "pageLoadStrategy 'none' plus polling document.readyState over execute/sync. WebAutomationSession::waitForNavigationToCompleteOnPage returns immediately on its first branch when the strategy is None, so the broken completion path is never entered; readiness comes from a different command path that is demonstrably alive during the stall. It also makes navigate_ms mean navigate-to-readyState-complete, i.e. the same quantity as Chromium's navigate-to-load-event, instead of 'whenever WebKit felt like replying'.",
   "validation": {
@@ -135,11 +136,6 @@
     "screenshot_ms": "~95",
     "total_ms": "1678-1729, a 51 ms spread"
    }
-  },
-  "engine_comparison_on_this_page": {
-   "webkit_total_ms": 1700,
-   "chromium_total_ms": 1387.6,
-   "reading": "WebKit ~22% slower on this page once it is reliable, versus unusable 42% of the time before."
   },
   "still_upstream_bugs": [
    "the lost navigation-completion notification itself",

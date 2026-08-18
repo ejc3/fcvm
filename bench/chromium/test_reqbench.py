@@ -19,6 +19,7 @@ import io
 import json
 import os
 import random
+import re
 import signal
 import shlex
 import shutil
@@ -5606,6 +5607,26 @@ class TimedWsUpgradeDiagnostics(unittest.TestCase):
         self.assertIsInstance(diagnostics["socket_so_error"], int)
 
 
+class HarnessIdentity(unittest.TestCase):
+    """harness_sha256 must cover every staged script that defines a sample.
+
+    The staged runtime bundle (reqbench.sh's `for source in ...` list) is what
+    actually runs; a script in the bundle but not in the hash means two runs
+    with different driver code can carry the same harness identity. That was
+    real: wddrive.py defined every webkit sample while harness_sha256 omitted
+    it.
+    """
+
+    def test_harness_hash_covers_every_staged_request_script(self):
+        sh = open(os.path.join(HERE, "reqbench.sh")).read()
+        m = re.search(r"for source in ([^;]+); do", sh)
+        self.assertIsNotNone(m, "staged source list not found in reqbench.sh")
+        staged = set(m.group(1).split())
+        # reqanalyze.py is staged (the analysis step runs from the bundle) but
+        # defines no request sample.
+        self.assertEqual(set(reqbench.HARNESS_SOURCES), staged - {"reqanalyze.py"})
+
+
 class MakefileBenchGraph(unittest.TestCase):
     """The Chromium bench make targets must encode their real dependencies.
 
@@ -5708,6 +5729,24 @@ class MakefileBenchGraph(unittest.TestCase):
                "bench-chromium-request-all", "bench-chromium-hostcdp",
                "bench-chromium-fault"):
             self.assertIn(t, self.phony, f"{t} missing from .PHONY")
+
+    def test_webkit_run_forwards_the_measurement_knobs(self):
+        # Without the forwarding, `make bench-webkit-request-run REPS=202`
+        # silently ran reqbench.sh's default rep count and wrote to a
+        # RUNID-derived directory while analyze-chromium-request read the
+        # empty $(RESULTS).
+        recipe = "\n".join(self.recipes.get("bench-webkit-request-run", []))
+        for knob in ("BACKEND", "REPS", "WARMUP", "RESULTS"):
+            self.assertIn(f'{knob}="$({knob})"', recipe,
+                          f"bench-webkit-request-run does not forward {knob}")
+
+    def test_webkit_build_routes_through_the_healthcheck_assert(self):
+        # A raw `podman build` here skips cmd_build's HEALTHCHECK assertion,
+        # so an image that lost its healthcheck (OCI format drop) snapshots a
+        # cold browser and the golden gate cannot notice.
+        recipe = "\n".join(self.recipes.get("bench-webkit-request-build", []))
+        self.assertIn("reqbench.sh build", recipe)
+        self.assertNotIn("podman build", recipe)
 
     def test_fault_target_provisions_its_hugepage_pool(self):
         # faultbench selects uffd-huge-minor whenever the huge golden exists,
