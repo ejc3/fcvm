@@ -29,8 +29,12 @@ pub const CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum fragmentation accepted from an on-disk performance hint.
 ///
-/// The hint is untrusted cache state. Planning must have a fixed CPU/allocation ceiling and
-/// degrade to ordinary demand paging instead of allocating proportional to a corrupt bitmap.
+/// The hint is untrusted cache state. Planning must have a fixed CPU/allocation ceiling, so a
+/// hint with more runs than this keeps only its LARGEST runs (a fixed-size selection, never an
+/// allocation proportional to a corrupt bitmap) and leaves the rest to demand paging. Large
+/// honest workloads sit past this cap routinely: a warmed 128 GiB guest's restore set
+/// fragments into millions of runs, and discarding the whole plan (which is what this cap
+/// used to do) silently turned prefetch off exactly where it had the most to do.
 pub const MAX_PREFETCH_RUNS: usize = 65_536;
 pub const MAX_PREFETCH_SEGMENTS: usize = 65_536;
 
@@ -87,14 +91,56 @@ pub fn plan(set: &PageSet, regions: &[Region], page_size: usize, mem_len: u64) -
         return segments;
     }
 
-    for (run_index, run) in set.runs().enumerate() {
-        if run_index >= MAX_PREFETCH_RUNS {
-            return Vec::new();
-        }
+    // Keep the largest runs when the hint fragments past the planning cap. The heap never
+    // grows past the cap, so allocation stays fixed no matter what the bitmap holds; length
+    // ties break toward lower offsets deterministically. The kept runs are re-sorted by
+    // offset because the merge below relies on encounter order.
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, std::cmp::Reverse<u64>)>> =
+        std::collections::BinaryHeap::new();
+    let mut dropped_runs: u64 = 0;
+    let mut dropped_bytes: u64 = 0;
+    for run in set.runs() {
         let run_end = run.offset.saturating_add(run.len).min(mem_len);
         if run_end <= run.offset {
             continue;
         }
+        let candidate = (run_end - run.offset, std::cmp::Reverse(run.offset));
+        if heap.len() == MAX_PREFETCH_RUNS {
+            // Full: most candidates lose to the smallest kept run, and a
+            // peek rejects them in O(1) instead of paying a push+pop.
+            match heap.peek() {
+                Some(&std::cmp::Reverse(smallest)) if candidate > smallest => {
+                    if let Some(std::cmp::Reverse((len, _))) = heap.pop() {
+                        dropped_runs += 1;
+                        dropped_bytes += len;
+                    }
+                    heap.push(std::cmp::Reverse(candidate));
+                }
+                _ => {
+                    dropped_runs += 1;
+                    dropped_bytes += candidate.0;
+                }
+            }
+        } else {
+            heap.push(std::cmp::Reverse(candidate));
+        }
+    }
+    let mut runs: Vec<(u64, u64)> = heap
+        .into_iter()
+        .map(|std::cmp::Reverse((len, std::cmp::Reverse(offset)))| (offset, offset + len))
+        .collect();
+    runs.sort_unstable_by_key(|&(offset, _)| offset);
+    if dropped_runs > 0 {
+        debug!(
+            dropped_runs,
+            dropped_mib = dropped_bytes >> 20,
+            kept_runs = runs.len(),
+            "working-set hint fragments past the planning cap; prefetching its largest runs \
+             and leaving the rest to demand paging"
+        );
+    }
+
+    'runs: for &(run_offset, run_end) in &runs {
         for region in regions {
             let Ok(region_size) = u64::try_from(region.size) else {
                 continue;
@@ -102,7 +148,7 @@ pub fn plan(set: &PageSet, regions: &[Region], page_size: usize, mem_len: u64) -
             let Some(region_end) = region.file_offset.checked_add(region_size) else {
                 continue;
             };
-            let start = run.offset.max(region.file_offset);
+            let start = run_offset.max(region.file_offset);
             let end = run_end.min(region_end).min(mem_len);
             if end <= start {
                 continue;
@@ -183,7 +229,15 @@ pub fn plan(set: &PageSet, regions: &[Region], page_size: usize, mem_len: u64) -
             });
             if !merged {
                 if segments.len() >= MAX_PREFETCH_SEGMENTS {
-                    return Vec::new();
+                    // Same ceiling, same degradation: keep what is planned so
+                    // far and leave the rest to demand paging, never discard
+                    // the whole plan.
+                    debug!(
+                        segments = segments.len(),
+                        "prefetch plan reached the segment cap; the remaining \
+                         runs fall back to demand paging"
+                    );
+                    break 'runs;
                 }
                 segments.push(segment);
             }
@@ -527,8 +581,14 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_more_runs_than_the_prefetch_budget() {
-        let run_count = MAX_PREFETCH_RUNS + 1;
+    fn plan_keeps_the_budget_of_runs_from_an_oversized_hint() {
+        // A warmed large guest's restore set fragments into more runs than the
+        // planning budget as a matter of course. The budget bounds the plan;
+        // it must not discard it: an earlier version returned an EMPTY plan
+        // here, which silently turned prefetch off for exactly the workloads
+        // with the most pages to prefetch (observed live: a 128 GiB guest's
+        // 31M-page hint replayed zero pages, reported as segments=0).
+        let run_count = MAX_PREFETCH_RUNS + 10;
         let mem_len = u64::try_from(run_count * 2).unwrap() * G;
         let mut set = PageSet::empty(mem_len);
         for run in 0..run_count {
@@ -539,10 +599,47 @@ mod tests {
             file_offset: 0,
             size: usize::try_from(mem_len).unwrap(),
         }];
-        assert!(
-            plan(&set, &regions, PAGE, mem_len).is_empty(),
-            "a fragmented hint beyond the fixed planning budget must degrade to demand paging"
+        let segments = plan(&set, &regions, PAGE, mem_len);
+        assert_eq!(
+            segments.len(),
+            MAX_PREFETCH_RUNS,
+            "an oversized hint must fill the planning budget, not abandon it"
         );
+    }
+
+    #[test]
+    fn plan_prefers_the_largest_runs_of_an_oversized_hint() {
+        // When the budget forces a choice, bytes win: every multi-granule run
+        // must survive selection ahead of single-granule ones.
+        let filler_count = MAX_PREFETCH_RUNS + 20;
+        let big_run_granules: u64 = 8;
+        let filler_len = u64::try_from(filler_count * 2).unwrap() * G;
+        let big_base = filler_len + 16 * G;
+        let mem_len = big_base + 4 * (big_run_granules + 4) * G;
+        let mut set = PageSet::empty(mem_len);
+        for run in 0..filler_count {
+            set.insert_range(u64::try_from(run * 2).unwrap() * G, G);
+        }
+        let mut big_offsets = Vec::new();
+        for big in 0..4u64 {
+            let offset = big_base + big * (big_run_granules + 4) * G;
+            set.insert_range(offset, big_run_granules * G);
+            big_offsets.push(offset);
+        }
+        let regions = [Region {
+            base_host_virt_addr: 0x4000_0000,
+            file_offset: 0,
+            size: usize::try_from(mem_len).unwrap(),
+        }];
+        let segments = plan(&set, &regions, PAGE, mem_len);
+        assert_eq!(segments.len(), MAX_PREFETCH_RUNS);
+        for offset in big_offsets {
+            assert!(
+                segments.iter().any(|segment| segment.file_offset == offset
+                    && segment.len == usize::try_from(big_run_granules).unwrap() * PAGE),
+                "a large run must not lose its budget slot to single-page filler"
+            );
+        }
     }
 
     // =========================================================================
