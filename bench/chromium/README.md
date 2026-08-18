@@ -182,7 +182,18 @@ with intercepts and req/GiB at concrete N, and uncertainty on every figure.
 
 Headlines: artifact **730 ms** (95% CI 708-741) end to end against a host-native warm floor of
 **218 ms** (202-229); `--uffd-mode minor` with hugepages at **34.7 +/- 0.4 MiB per concurrent
-request**; routed's 1 s first-egress stall gone (3.0 ms on every mode). Two previously published
+request of NON-HUGETLB memory** (this host's cgroup2 mounts without `memory_hugetlb_accounting`
+and exposes no hugetlb controller, so neither the cgroup nor MemAvailable can see the guest's
+2 MiB pages at all; the pool was pre-allocated before the sample, so MemAvailable cannot move
+either). It is not the per-clone memory cost. Measured on the pool-consumption basis that CAN
+see those pages, hugepage-minor costs **553-611 MiB per concurrent clone** against **133-146**
+at 4K -- the price of a 2 MiB copy-on-write granule. Do not quote 34.7 as a memory win.
+The memory cells were measured on a quiet box: the density phases' continuous
+load record (results/20260808-corrected/corrected.json, load.by_phase dens1-dens16, 20-30
+samples/min) reads median 0.56-0.64, p90 2.21, max 6.32 on 64 cores, about 1% median
+utilization, and the latency-vs-load regression over all 426 requests is flat
+(-27.9 +/- 25.7 ms per load unit, not significant).
+Routed's 1 s first-egress stall gone (3.0 ms on every mode). Two previously published
 Chromium figures are **refuted** by this run: JPEG q80 is -8.3% per request (not -21%), and
 site-isolation-off saves 3.6% on PSS (not 23% - that number was an RSS artifact).
 

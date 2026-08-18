@@ -1,5 +1,5 @@
 {
- "_note": "cpuprobe over a gated corpus campaign, 20 ms sampling. Every render clone's summary kept; full series kept for a spread across the peak distribution. peak vCPU-only is the censoring test: at 2 vCPU p05==p95==max, i.e. the distribution collapses to the ceiling and the measurement is censored.",
+ "_note": "Curated by lifetime_s >= 0.6: 425 of 687 raw probe records kept (render clones; sub-0.6 s records are serve/teardown helper processes and probe attach fragments, not renders). The robustness-to-the-cut check (recomputing over the full population) was run at curation time against the raw probe records in the source_run's uncommitted samples/ directory; those raw records were not retained (unretained), so only the curated statistics in this file are reproducible from the repository.",
  "vcpu": 2,
  "source_run": "bench/chromium/results/reqbench-20260816-152156-corpus",
  "cdp_blocking_p50_ms": 966.2088214990945,
