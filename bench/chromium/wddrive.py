@@ -29,6 +29,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 MINIBROWSER = "/usr/local/bin/MiniBrowser"
 
@@ -173,11 +174,20 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
             # compare the document we actually landed on.
             landed = wd(host, "GET", f"/session/{session}/url",
                         timeout=max(1.0, deadline - time.monotonic()))
-            if landed != url:
+            # Compare ORIGINS, not full URLs. The corpus preflight admits
+            # redirecting URLs (30x from the corpus server), and replayed
+            # real-site JS rewrites document.URL via history.replaceState, so
+            # full-URL equality fails legitimate renders that the Chromium arm
+            # passes. A dead origin or an internal error page still lands off
+            # the requested origin (about:, applewebdata:, blank), which is
+            # what this check exists to catch.
+            requested = urlsplit(url)
+            got = urlsplit(landed if isinstance(landed, str) else "")
+            if (got.scheme, got.netloc) != (requested.scheme, requested.netloc):
                 raise WdError(
-                    f"navigation landed elsewhere: requested {url!r} but "
+                    f"navigation landed off-origin: requested {url!r} but "
                     f"document.URL is {landed!r}; this is a failed load (error "
-                    "page, redirect, or a dead origin), not a render")
+                    "page or a dead origin), not a render")
             return
         state = ready
         if time.monotonic() >= deadline:
@@ -274,7 +284,7 @@ def drive(args) -> dict:
         stages["total_ms"] = (time.monotonic() - t0) * 1000
         out["stages"] = stages
         out["error"] = f"{type(error).__name__}: {error}"
-        out["failed_stage"] = stage
+        out["stage"] = stage  # seam key: cdpdrive writes "stage", reqbench reads "stage"
         return out
 
 

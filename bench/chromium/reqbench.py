@@ -1383,6 +1383,26 @@ class SurvivedTeardown(RuntimeError):
         self.record: dict = {}
 
 
+class SessionDiscoveryFailed(RuntimeError):
+    """The golden holds no usable WebDriver session id; no rep can ever render.
+
+    Escalates out of the per-rep handler (after that rep's teardown) instead of
+    being recorded and retried: every retry re-spawns a clone, re-execs, and
+    fails the same way, so a swallowed discovery failure burns the entire
+    schedule and surfaces 202 reps later as uniform navigate failures with the
+    real cause off-screen."""
+
+
+def rep_error_escalates(error: BaseException) -> bool:
+    """Whether a per-rep exception must abort the schedule after teardown.
+
+    Non-Exception BaseExceptions (KeyboardInterrupt, HarnessInterrupted) always
+    do; SessionDiscoveryFailed does because retrying it is structurally
+    pointless (the missing session id is snapshot state, identical for every
+    clone)."""
+    return not isinstance(error, Exception) or isinstance(error, SessionDiscoveryFailed)
+
+
 class HarnessInterrupted(BaseException):
     """A host signal that must unwind only after the active clone is reaped."""
 
@@ -3044,7 +3064,7 @@ def discover_wd_session(args, fcvm_pid: int) -> str:
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     session = (proc.stdout or "").strip()
     if proc.returncode != 0 or not session:
-        raise RuntimeError(
+        raise SessionDiscoveryFailed(
             "webkit session discovery failed: "
             f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr[-300:]!r}"
         )
@@ -3203,7 +3223,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["ok"] = False
             rec["request_error"] = f"{type(e).__name__}: {e}"
             rec["error"] = rec["request_error"]
-            if not isinstance(e, Exception):
+            if rep_error_escalates(e):
                 interrupted = e
             rec.setdefault("blocking_ms", (time.monotonic() - t_spawn) * 1000)
             if state_path is None and fcvm_start_time is not None:
@@ -3842,6 +3862,19 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
 CDP_CLASS_ARMS = frozenset({"cdp", "cdp-fast", "html"})
 
 
+def allowed_arms_for_engine(engine: str) -> frozenset:
+    """The arms an engine can actually execute; refused upfront, not per-rep.
+
+    webkit excludes exec (its in-guest driver is render.py, which
+    Containerfile.webkit-bench does not ship, so every exec rep burns a full
+    clone lifecycle on a guaranteed in-guest failure) and html (wddrive has no
+    DOM-extraction op; the request would silently return screenshot records the
+    analyzer then rejects for missing extract_ms/html_bytes/html_sha256)."""
+    if engine == "webkit":
+        return frozenset({"cdp", "cdp-fast", "noop"})
+    return frozenset({"exec", "cdp", "cdp-fast", "html", "noop"})
+
+
 def publication_arms_ok(arms) -> bool:
     """Whether an arm set can back a publication run.
 
@@ -4013,11 +4046,12 @@ def main_with_resources(resources: ExitStack) -> int:
             )
     os.makedirs(args.out_dir, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    allowed_arms = {"exec", "cdp", "cdp-fast", "html", "noop"}
+    allowed_arms = allowed_arms_for_engine(getattr(args, "engine", "chromium"))
     if not arms or len(set(arms)) != len(arms) or any(a not in allowed_arms for a in arms):
         p.error(
             "--arms must be a non-empty, duplicate-free subset of "
-            "exec,cdp,cdp-fast,html,noop"
+            + ",".join(sorted(allowed_arms))
+            + f" for --engine {getattr(args, 'engine', 'chromium')}"
         )
     # exec is ALLOWED but no longer REQUIRED: it is retired from measurement
     # (no published claim rests on it), and run reqbench-20260814-022254-uffd
@@ -4092,7 +4126,10 @@ def main_with_resources(resources: ExitStack) -> int:
             "kind": "meta", "run_id": run_id, "seed": args.seed,
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
             "uffd_mode": uffd_mode,
-            "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
+            "warmup": args.warmup, "url": args.url, "urls": args.urls,
+            # webkit's WebDriver screenshot is always PNG; recording args.format
+            # here made the analyzer hold png renders to a jpeg declaration.
+            "format": "png" if args.engine == "webkit" else args.format,
             "engine": args.engine,
             "quality": args.quality,
             "source_revision": current_source_revision,

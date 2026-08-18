@@ -89,7 +89,12 @@ class DriveContract(unittest.TestCase):
             session_id="s", out_prefix=""))
         self.assertFalse(result["ok"])
         self.assertIn("error", result)
-        self.assertEqual(result["failed_stage"], "status")
+        # The seam contract key is "stage" (cdpdrive.py writes out["stage"];
+        # reqbench.py lifts result.get("stage") into rec["failure_stage"]).
+        # This test once pinned wddrive's deviant "failed_stage", so the suite
+        # passed while the harness recorded failure_stage="" for every
+        # webkit failure.
+        self.assertEqual(result["stage"], "status")
         self.assertIn("total_ms", result["stages"])
 
     def test_a_missing_session_id_fails_before_any_network(self):
@@ -111,9 +116,24 @@ class SessionDiscovery(unittest.TestCase):
         with mock.patch.object(subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr="")
-            with self.assertRaises(RuntimeError) as caught:
+            with self.assertRaises(reqbench.SessionDiscoveryFailed) as caught:
                 reqbench.discover_wd_session(args, 1234)
         self.assertIn("session discovery failed", str(caught.exception))
+
+    def test_discovery_failure_escalates_out_of_the_rep_handler(self):
+        """The raise alone is not the abort: the per-rep handler catches
+        BaseException and, before this predicate existed, recorded the failure
+        and let the schedule continue -- every later rep re-spawned a clone,
+        re-ran discovery, and failed the same way, exactly the 202-doomed-reps
+        outcome the discovery docstring promises to prevent. The handler must
+        escalate SessionDiscoveryFailed (after that rep's teardown) the same
+        way it escalates a host interrupt, and must NOT escalate an ordinary
+        per-rep failure."""
+        self.assertTrue(reqbench.rep_error_escalates(
+            reqbench.SessionDiscoveryFailed("no session")))
+        self.assertTrue(reqbench.rep_error_escalates(KeyboardInterrupt()))
+        self.assertFalse(reqbench.rep_error_escalates(RuntimeError("one bad rep")))
+        self.assertFalse(reqbench.rep_error_escalates(OSError("transient")))
 
     def test_discovery_strips_and_returns_the_id(self):
         args = argparse.Namespace(fcvm="/bin/true")
@@ -159,3 +179,113 @@ class EngineDispatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebkitAnalyzerSchema(unittest.TestCase):
+    """The publication gate judges each engine's renders by that engine's schema.
+
+    Before the analyzer learned the webkit schema, a healthy webkit render
+    failed ~13 structural checks written for cdpdrive records (cdp_host,
+    idle policy, prewire, the six WebSocket/idle/decode stages, width/height,
+    quality, navigation timing), so an ENGINE=webkit run could never gate
+    clean even with every render healthy.
+    """
+
+    CHROMIUM_ONLY_COMPLAINTS = (
+        "does not match",           # cdp_host / format held to the wrong keys
+        "idle policy",
+        "prewire",
+        "invalid tcp_ms",
+        "invalid upgrade_ms",
+        "invalid enable_ms",
+        "invalid idle_ms",
+        "invalid decode_ms",
+        "invalid nav_timing_ms",
+        "invalid width",
+        "invalid height",
+        "quality mismatches",
+        "no navigation timing",
+    )
+
+    @staticmethod
+    def healthy_webkit_dataset():
+        import random
+
+        meta = {
+            "kind": "meta", "run_id": "wk", "engine": "webkit",
+            "format": "png", "quality": 85, "url": "http://c/p",
+            "urls": None, "arms": ["cdp", "noop"], "reps": 1, "warmup": 1,
+            "seed": 7, "started": 1.0, "ws_url_prewired": None,
+            "loadavg": [0.5, 0.5, 0.5], "quiet_loadavg1_limit": 2.0,
+            "quiet_vm_processes": 0, "quiet_guard_loadavg1": 0.5,
+            "quiet_guard_passed": True,
+            "_source": {"path": "t.jsonl", "line": 1},
+        }
+        # Records must realise the seeded schedule exactly, in order.
+        rng = random.Random(meta["seed"])
+        schedule = []
+        for rep in range(meta["warmup"] + meta["reps"]):
+            order = list(meta["arms"])
+            rng.shuffle(order)
+            schedule.extend((arm, rep, rep < meta["warmup"]) for arm in order)
+        records = []
+        for line, (arm, rep, is_warmup) in enumerate(schedule, start=2):
+            record = {
+                "kind": "request", "arm": arm, "rep": rep, "warmup": is_warmup,
+                "ok": True, "blocking_ms": 12.0, "wall_ms": 20.0,
+                "record_id": f"wk:{arm}:{rep}:{int(is_warmup)}", "run_id": "wk",
+                "url": meta["url"],
+                "_source": {"path": "t.jsonl", "line": line},
+            }
+            if arm == "cdp":
+                record.update({
+                    "endpoint": "127.0.0.1:9515",
+                    "state_to_port_ms": 1.0, "spawn_to_port_ms": 2.0,
+                    "render": {
+                        "ok": True, "engine": "webkit",
+                        "wd_host": "127.0.0.1:9515", "url": meta["url"],
+                        "format": "png", "session_prewired": True,
+                        "session_id": "s", "image_bytes": 10,
+                        "image_sha256": "a" * 64,
+                        "stages": {
+                            "resolve_ms": 1.0, "connect_total_ms": 2.0,
+                            "navigate_ms": 3.0, "screenshot_ms": 4.0,
+                            "total_ms": 10.0,
+                        },
+                    },
+                })
+            records.append(record)
+        return {
+            "backend": "uffd", "cell": None, "cell_id": None, "run_id": "wk",
+            "records": records, "metas": [meta], "sources": ["t.jsonl"],
+            "source_artifacts": [], "metadata_errors": [],
+        }
+
+    def test_a_healthy_webkit_render_raises_no_chromium_schema_errors(self):
+        import reqanalyze
+
+        dataset = self.healthy_webkit_dataset()
+        reqanalyze._validate_schedule(dataset)
+        schema_noise = [
+            error for error in dataset["metadata_errors"]
+            if any(complaint in error for complaint in self.CHROMIUM_ONLY_COMPLAINTS)
+        ]
+        self.assertEqual(
+            schema_noise, [],
+            "a healthy webkit render must not fail chromium-schema checks",
+        )
+
+    def test_a_webkit_render_missing_its_own_stages_still_fails(self):
+        import reqanalyze
+
+        dataset = self.healthy_webkit_dataset()
+        measured_cdp = next(
+            record for record in dataset["records"]
+            if record["arm"] == "cdp" and not record["warmup"]
+        )
+        del measured_cdp["render"]["stages"]["screenshot_ms"]
+        reqanalyze._validate_schedule(dataset)
+        self.assertTrue(
+            any("invalid screenshot_ms" in error for error in dataset["metadata_errors"]),
+            f"webkit schema must still gate its own stages: {dataset['metadata_errors']}",
+        )

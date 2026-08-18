@@ -106,7 +106,18 @@ class NavigateReadiness(unittest.TestCase):
         """
         with self.assertRaises(wddrive.WdError) as caught:
             self.drive([1, ["complete", True]], landed="about:blank")
-        self.assertIn("landed elsewhere", str(caught.exception))
+        self.assertIn("landed off-origin", str(caught.exception))
+
+    def test_a_same_origin_redirect_is_a_render_not_a_failure(self):
+        """The landed-URL guard compares origins, not full URLs.
+
+        The corpus preflight admits redirecting URLs and replayed real-site JS
+        rewrites document.URL via history.replaceState, so a same-origin
+        path/query difference is a legitimate render. Full-URL equality here
+        failed loads the Chromium arm passes.
+        """
+        self.drive([1, ["complete", True]], landed="http://page/x?session=abc")
+        self.assertTrue(self.navigated)
 
     def test_a_fresh_session_navigates_without_a_previous_document(self):
         """No previous document means no stale "complete" to guard against.
