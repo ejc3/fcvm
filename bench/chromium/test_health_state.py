@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 READER = Path(__file__).resolve().parent / "health_state.sh"
@@ -280,14 +281,10 @@ class HealthStateReader(unittest.TestCase):
             # so a previously imported bench/chromium copy would satisfy it and
             # the temp copy above would never run -- the exact stale-bytecode
             # hazard this directory exists to avoid. Evict it so the import
-            # resolves through sys.path to the copy.
-            cached_health_loop = sys.modules.pop("health_loop", None)
-            if cached_health_loop is not None:
-                self.addCleanup(
-                    sys.modules.__setitem__, "health_loop", cached_health_loop
-                )
-            else:
-                self.addCleanup(sys.modules.pop, "health_loop", None)
+            # resolves through sys.path to the copy; patch.dict restores the
+            # whole mapping on cleanup.
+            self.enterContext(mock.patch.dict(sys.modules))
+            sys.modules.pop("health_loop", None)
             spec = importlib.util.spec_from_file_location("cdp_health_under_test", source)
             cdp_health = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(cdp_health)

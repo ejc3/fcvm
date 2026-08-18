@@ -3422,7 +3422,7 @@ def run_noop_request(args, rep: int) -> dict:
             rec["ok"] = False
             rec["request_error"] = f"{type(e).__name__}: {e}"
             rec["error"] = rec["request_error"]
-            if not isinstance(e, Exception):
+            if rep_error_escalates(e):
                 interrupted = e
             if state_path is None and fcvm_start_time is not None:
                 state_path, state = scan_state(
@@ -3622,7 +3622,7 @@ def run_exec_request(args, rep: int) -> dict:
             rec["log"] = log
             teardown_error.record = rec
             raise teardown_error from request_error
-        if not isinstance(request_error, Exception):
+        if rep_error_escalates(request_error):
             raise
         rec["blocking_ms"] = rec["wall_ms"] = (time.monotonic() - t0) * 1000
         rec["log"] = log
@@ -4046,13 +4046,18 @@ def main_with_resources(resources: ExitStack) -> int:
             )
     os.makedirs(args.out_dir, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    allowed_arms = allowed_arms_for_engine(getattr(args, "engine", "chromium"))
+    allowed_arms = allowed_arms_for_engine(args.engine)
     if not arms or len(set(arms)) != len(arms) or any(a not in allowed_arms for a in arms):
         p.error(
             "--arms must be a non-empty, duplicate-free subset of "
             + ",".join(sorted(allowed_arms))
-            + f" for --engine {getattr(args, 'engine', 'chromium')}"
+            + f" for --engine {args.engine}"
         )
+    if args.engine == "webkit":
+        # WebDriver's screenshot is always PNG (wddrive stamps format=png), so
+        # the jpeg default in --format would put a declaration in meta the
+        # renders can never satisfy.
+        args.format = "png"
     # exec is ALLOWED but no longer REQUIRED: it is retired from measurement
     # (no published claim rests on it), and run reqbench-20260814-022254-uffd
     # measured that 95% of noop reps following an exec rep land in a +17 ms
@@ -4126,10 +4131,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "kind": "meta", "run_id": run_id, "seed": args.seed,
             "backend": "file" if args.snapshot_tag else "uffd", "arms": arms, "reps": args.reps,
             "uffd_mode": uffd_mode,
-            "warmup": args.warmup, "url": args.url, "urls": args.urls,
-            # webkit's WebDriver screenshot is always PNG; recording args.format
-            # here made the analyzer hold png renders to a jpeg declaration.
-            "format": "png" if args.engine == "webkit" else args.format,
+            "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
             "engine": args.engine,
             "quality": args.quality,
             "source_revision": current_source_revision,

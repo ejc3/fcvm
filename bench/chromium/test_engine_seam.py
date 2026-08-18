@@ -16,10 +16,14 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
 
+import random
+
+import reqanalyze
 import reqbench
 import wddrive
 
@@ -177,10 +181,6 @@ class EngineDispatch(unittest.TestCase):
                       "the chromium path was lost while adding webkit")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class WebkitAnalyzerSchema(unittest.TestCase):
     """The publication gate judges each engine's renders by that engine's schema.
 
@@ -208,20 +208,41 @@ class WebkitAnalyzerSchema(unittest.TestCase):
     )
 
     @staticmethod
-    def healthy_webkit_dataset():
-        import random
+    def webkit_run_lines():
+        """One healthy ENGINE=webkit run as (meta, records) JSONL lines.
 
+        The records realise the seeded schedule exactly, in order, so the only
+        errors a test can observe are the schema checks under test.
+        """
         meta = {
             "kind": "meta", "run_id": "wk", "engine": "webkit",
+            "backend": "uffd", "uffd_mode": "copy",
             "format": "png", "quality": 85, "url": "http://c/p",
             "urls": None, "arms": ["cdp", "noop"], "reps": 1, "warmup": 1,
-            "seed": 7, "started": 1.0, "ws_url_prewired": None,
+            "seed": 7, "started": 1.0,
+            "image": "localhost/webkit-bench-req",
+            "image_id": "sha256:" + "d" * 64, "snapshot": "snapshot-wk",
+            "snapshot_generation_id": "22222222-2222-4222-8222-222222222222",
+            "snapshot_config_sha256": "7" * 64,
+            "snapshot_created_at": "2026-08-09T00:00:00Z",
+            "snapshot_vm_id": "vm-" + "f" * 32,
+            "fcvm_sha256": "a" * 64, "harness_sha256": "c" * 64,
+            "runtime_bundle_sha256": "8" * 64,
+            "source_revision": "b" * 40,
+            "cdp_port": 9515, "network_mode": "rootless", "cpu": 2,
+            "port_mappings": [{
+                "host_ip": None, "host_port": 9515, "guest_port": 9515,
+                "proto": "tcp",
+            }],
+            "memory_mib": 1024,
+            "rust_log": "fcvm=debug", "ws_url_prewired": False,
+            "allow_busy": False,
+            "host_boot_id": "00000000-0000-0000-0000-000000000001",
+            "host_kernel_release": "6.18.0-fixture", "host_machine": "aarch64",
             "loadavg": [0.5, 0.5, 0.5], "quiet_loadavg1_limit": 2.0,
             "quiet_vm_processes": 0, "quiet_guard_loadavg1": 0.5,
             "quiet_guard_passed": True,
-            "_source": {"path": "t.jsonl", "line": 1},
         }
-        # Records must realise the seeded schedule exactly, in order.
         rng = random.Random(meta["seed"])
         schedule = []
         for rep in range(meta["warmup"] + meta["reps"]):
@@ -229,13 +250,12 @@ class WebkitAnalyzerSchema(unittest.TestCase):
             rng.shuffle(order)
             schedule.extend((arm, rep, rep < meta["warmup"]) for arm in order)
         records = []
-        for line, (arm, rep, is_warmup) in enumerate(schedule, start=2):
+        for arm, rep, is_warmup in schedule:
             record = {
                 "kind": "request", "arm": arm, "rep": rep, "warmup": is_warmup,
                 "ok": True, "blocking_ms": 12.0, "wall_ms": 20.0,
                 "record_id": f"wk:{arm}:{rep}:{int(is_warmup)}", "run_id": "wk",
                 "url": meta["url"],
-                "_source": {"path": "t.jsonl", "line": line},
             }
             if arm == "cdp":
                 record.update({
@@ -255,17 +275,25 @@ class WebkitAnalyzerSchema(unittest.TestCase):
                     },
                 })
             records.append(record)
-        return {
-            "backend": "uffd", "cell": None, "cell_id": None, "run_id": "wk",
-            "records": records, "metas": [meta], "sources": ["t.jsonl"],
-            "source_artifacts": [], "metadata_errors": [],
-        }
+        return meta, records
+
+    def load_dataset(self, mutate=None):
+        """Round-trip the fixture run through reqanalyze.load(), as real
+        datasets arrive: the loader builds the envelope, stamps provenance,
+        and runs the schedule validation whose errors the tests read."""
+        meta, records = self.webkit_run_lines()
+        if mutate is not None:
+            mutate(records)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "wk.jsonl")
+            with open(path, "w") as f:
+                for line in [meta, *records]:
+                    f.write(json.dumps(line) + "\n")
+            (dataset,) = reqanalyze.load([path])
+        return dataset
 
     def test_a_healthy_webkit_render_raises_no_chromium_schema_errors(self):
-        import reqanalyze
-
-        dataset = self.healthy_webkit_dataset()
-        reqanalyze._validate_schedule(dataset)
+        dataset = self.load_dataset()
         schema_noise = [
             error for error in dataset["metadata_errors"]
             if any(complaint in error for complaint in self.CHROMIUM_ONLY_COMPLAINTS)
@@ -276,16 +304,19 @@ class WebkitAnalyzerSchema(unittest.TestCase):
         )
 
     def test_a_webkit_render_missing_its_own_stages_still_fails(self):
-        import reqanalyze
+        def drop_screenshot_stage(records):
+            measured_cdp = next(
+                record for record in records
+                if record["arm"] == "cdp" and not record["warmup"]
+            )
+            del measured_cdp["render"]["stages"]["screenshot_ms"]
 
-        dataset = self.healthy_webkit_dataset()
-        measured_cdp = next(
-            record for record in dataset["records"]
-            if record["arm"] == "cdp" and not record["warmup"]
-        )
-        del measured_cdp["render"]["stages"]["screenshot_ms"]
-        reqanalyze._validate_schedule(dataset)
+        dataset = self.load_dataset(mutate=drop_screenshot_stage)
         self.assertTrue(
             any("invalid screenshot_ms" in error for error in dataset["metadata_errors"]),
             f"webkit schema must still gate its own stages: {dataset['metadata_errors']}",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

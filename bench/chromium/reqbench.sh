@@ -812,7 +812,9 @@ PYWD3
     echo "--- target id stability ACROSS CLONES (-> can /json/list be skipped?) ---"
     local id1 id2 cname2="cb-req-verify2-$RUNID" cpid2 ip2 clone2_bg vmid2
     if [ "$ENGINE" = webkit ]; then
-        id1=$(wd_session_id "$cpid")
+        # The id is a baked, immutable file; HOP C already read it from this
+        # clone, so reuse that instead of another exec round trip.
+        id1="$wd_session"
     else
     id1=$(target_id "$ip:$CDP_PORT")
     fi

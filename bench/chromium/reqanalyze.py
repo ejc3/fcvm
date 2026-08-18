@@ -522,6 +522,12 @@ def _validate_schedule(dataset):
     expected = set(expected_order)
     observed = {}
     observed_order = []
+    # Per-run constants, hoisted out of the record loop. The meta owns the
+    # engine: the harness stamps it once per run, so a record's own stamp is
+    # asserted against it below rather than allowed to pick the schema that
+    # judges it.
+    meta_engine = meta.get("engine") or "chromium"
+    expected_quality = meta["quality"] if meta["format"] == "jpeg" else 0
     for record in dataset["records"]:
         rsource = record.get("_source") or {}
         rlabel = f"{rsource.get('path')}:{rsource.get('line')}"
@@ -713,24 +719,18 @@ def _validate_schedule(dataset):
                     # healthy render: wd_host is not cdp_host, WebDriver has
                     # no idle policy, no prewire, no tcp/upgrade/enable
                     # stages), which gated every webkit run into failure.
-                    engine = render.get("engine") or meta.get("engine") or "chromium"
-                    if engine != (meta.get("engine") or "chromium"):
+                    engine = meta_engine
+                    if (render.get("engine") or meta_engine) != meta_engine:
                         errors.append(
-                            f"{rlabel} render engine {engine!r} mismatches "
-                            f"metadata {meta.get('engine')!r}"
+                            f"{rlabel} render engine {render.get('engine')!r} "
+                            f"mismatches metadata {meta.get('engine')!r}"
                         )
-                    if engine == "webkit":
-                        expected_fields = {
-                            "url": expected_url,
-                            "format": meta.get("format"),
-                            "wd_host": record.get("endpoint"),
-                        }
-                    else:
-                        expected_fields = {
-                            "url": expected_url,
-                            "format": meta.get("format"),
-                            "cdp_host": record.get("endpoint"),
-                        }
+                    host_key = "wd_host" if engine == "webkit" else "cdp_host"
+                    expected_fields = {
+                        "url": expected_url,
+                        "format": meta.get("format"),
+                        host_key: record.get("endpoint"),
+                    }
                     for field, expected_value in expected_fields.items():
                         if render.get(field) != expected_value:
                             errors.append(
@@ -842,28 +842,27 @@ def _validate_schedule(dataset):
                             or value <= 0
                         ):
                             errors.append(f"{rlabel} CDP render has invalid {dimension}")
-                    expected_quality = meta["quality"] if meta["format"] == "jpeg" else 0
                     if (
                         arm != "html"
                         and engine != "webkit"
                         and render.get("quality") != expected_quality
                     ):
                         errors.append(f"{rlabel} CDP render quality mismatches metadata")
-                    nav = render.get("nav") if engine != "webkit" else None
                     nav_fields = (
                         "dns_ms", "connect_ms", "tls_ms", "ttfb_ms",
                         "resp_ms", "load_ms",
                     )
-                    if engine == "webkit":
-                        pass  # WebDriver classic exposes no navigation timing.
-                    elif not isinstance(nav, dict):
-                        errors.append(f"{rlabel} CDP render has no navigation timing")
-                    else:
-                        for field in nav_fields:
-                            if not finite_nonnegative(nav.get(field)):
-                                errors.append(
-                                    f"{rlabel} CDP render has invalid nav.{field}"
-                                )
+                    # WebDriver classic exposes no navigation timing.
+                    if engine != "webkit":
+                        nav = render.get("nav")
+                        if not isinstance(nav, dict):
+                            errors.append(f"{rlabel} CDP render has no navigation timing")
+                        else:
+                            for field in nav_fields:
+                                if not finite_nonnegative(nav.get(field)):
+                                    errors.append(
+                                        f"{rlabel} CDP render has invalid nav.{field}"
+                                    )
                 if arm == "cdp-fast" and isinstance(teardown, dict):
                     if teardown.get("accounting_version") != "post-terminal-ambient-v2":
                         errors.append(f"{rlabel} fast teardown has stale accounting semantics")

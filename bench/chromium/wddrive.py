@@ -155,6 +155,7 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
         sentinel = False
     wd(host, "POST", f"/session/{session}/url", {"url": url},
        timeout=max(1.0, deadline - time.monotonic()))
+    requested = urlsplit(url)
     while True:
         state = wd(host, "POST", f"/session/{session}/execute/sync",
                    {"script": ("return [document.readyState, "
@@ -181,7 +182,6 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
             # passes. A dead origin or an internal error page still lands off
             # the requested origin (about:, applewebdata:, blank), which is
             # what this check exists to catch.
-            requested = urlsplit(url)
             got = urlsplit(landed if isinstance(landed, str) else "")
             if (got.scheme, got.netloc) != (requested.scheme, requested.netloc):
                 raise WdError(
