@@ -244,6 +244,33 @@ else
   fail=$((fail+1))
 fi
 
+echo "== finding 20: an OVERSIZED thread's paged comments ride an fd too =="
+# The pagination path rebuilt the thread with --argjson c "$all_comments" — the
+# same MAX_ARG_STRLEN hazard as finding 19, reachable only when one thread's
+# totalCount exceeds COMMENTS_PAGE_SIZE. Shrunk to 2 here so three comments,
+# one of them ~200 KiB, walk the paging loop.
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"comments":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[{"databaseId":1,"author":{"login":"reviewer"},"path":"a.ts","line":1,"createdAt":"2026-01-01T00:00:00Z","body":"%s"},{"databaseId":2,"author":{"login":"someone"},"path":"a.ts","line":1,"createdAt":"2026-01-01T01:00:00Z","body":"discussion"}]}}]}}}}}' "$big_body" > "$TMP/threads.json"
+printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"me"},"path":"a.ts","line":1,"body":"NOT-A-DEFECT: fixture padding, not a finding"}]}}}}' > "$TMP/threadpage.json"
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *"node(id"*)         cat "$GATE_TEST_DIR/threadpage.json" ;;
+  *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
+  *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
+  *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq; apply it here
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+out=$(COMMENTS_PAGE_SIZE=2 GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+if [ "$rc" = 0 ] && grep -qF "CLEAR" <<<"$out" && ! grep -qi "argument list too long" <<<"$out"; then
+  echo "  PASS  oversized paged thread evaluates instead of dying on argv"; pass=$((pass+1))
+else
+  echo "  FAIL  oversized paged thread evaluates instead of dying on argv (rc=$rc)"
+  sed 's/^/          /' <<<"$out" | head -4
+  fail=$((fail+1))
+fi
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

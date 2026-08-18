@@ -178,8 +178,11 @@ fetch_payload() {
         ccursor=null
       fi
     done
-    threads=$(jq --arg id "$tid" --argjson c "$all_comments" \
-      'map(if .id == $id then .comments.nodes = $c else . end)' <<<"$threads")
+    # Same MAX_ARG_STRLEN hazard as the final merge below: a fully paged
+    # thread's comments are exactly the payload that grows past one argv
+    # string, so they ride an fd too.
+    threads=$(jq --arg id "$tid" --slurpfile c <(printf '%s' "$all_comments") \
+      'map(if .id == $id then .comments.nodes = $c[0] else . end)' <<<"$threads")
   done
 
   # Re-read the head AFTER all paging. A push landing mid-evaluation would otherwise leave
