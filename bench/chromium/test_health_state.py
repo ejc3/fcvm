@@ -43,40 +43,61 @@ def run_reader(state: str | None, max_age: str | None = None) -> subprocess.Comp
 
 
 class DefaultPathAgreement(unittest.TestCase):
-    def test_the_default_paths_agree_without_the_env(self):
-        """Writer and reader must meet at the same DEFAULT path.
+    def test_the_default_paths_agree_without_the_env(self) -> None:
+        """Writer and reader must resolve the same DEFAULT state-file path.
 
         Every other test here sets BENCH_HEALTH_STATE on both halves, so a
         writer default of /run/WRONG-PATH passes the whole file -- verified by
         mutation: 9/9 green with the default broken. Production sets the env
         nowhere (neither entry script, neither Containerfile, not reqbench.sh),
-        so the DEFAULTS are the only contract that matters, and they were
-        enforced by nothing. A divergence reports every clone unhealthy -- or
-        worse, healthy off a stale file at the old path.
+        so the DEFAULTS are the only contract in use, and nothing enforced
+        them. A divergence reports every clone unhealthy -- or worse, healthy
+        off a stale file at the old path.
 
-        unshare gives this test a private /run without root: a user+mount
-        namespace with a tmpfs over /run, the writer publishing through its
-        default, the reader reading through its own. 23 ms, no container.
+        Both sides are asked, not read: the writer's answer is the real
+        health_loop.state_file() with the env absent; the reader's is the real
+        STATE_FILE assignment lifted from health_state.sh and EXECUTED under
+        bash with the env absent -- the shipped bytes, not a paraphrase of
+        them. A first version of this test proved the same thing end to end
+        under `unshare -rm` with a private tmpfs /run; GitHub-hosted runners
+        refuse unprivileged user namespaces (`unshare: write failed
+        /proc/self/uid_map: Operation not permitted`), and AGENTS.md is
+        explicit that a test must run where CI runs it. The write-then-read
+        mechanics this drops are covered by the format round-trip test below.
         """
-        script = (
-            "mount -t tmpfs tmpfs /run && "
-            f"cd {SH_DIR} && "
-            "python3 -c \"import health_loop; health_loop.publish('healthy', 'pages=1 id=E2E')\" && "
-            "exec bash health_state.sh"
+        import importlib
+
+        env = {k: v for k, v in os.environ.items() if k != "BENCH_HEALTH_STATE"}
+
+        old = os.environ.pop("BENCH_HEALTH_STATE", None)
+        try:
+            import health_loop
+            importlib.reload(health_loop)
+            writer_default = health_loop.state_file()
+        finally:
+            if old is not None:
+                os.environ["BENCH_HEALTH_STATE"] = old
+
+        reader_line = next(
+            (line for line in READER.read_text().splitlines()
+             if line.startswith("STATE_FILE=")),
+            None,
         )
-        result = subprocess.run(
-            ["unshare", "-rm", "bash", "-c", script],
-            capture_output=True, text=True, timeout=60,
-            env={k: v for k, v in os.environ.items() if k != "BENCH_HEALTH_STATE"},
+        self.assertIsNotNone(reader_line, "health_state.sh no longer assigns STATE_FILE")
+        resolved = subprocess.run(
+            ["bash", "-c", reader_line + '\nprintf "%s" "$STATE_FILE"'],
+            capture_output=True, text=True, timeout=30, env=env,
         )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        reader_default = resolved.stdout
+
         self.assertEqual(
-            result.returncode, 0,
-            "the reader did not accept a verdict the writer just published "
-            "through both DEFAULT paths; they have diverged\n"
-            + result.stdout + result.stderr,
+            writer_default, reader_default,
+            "writer and reader resolve DIFFERENT default paths; every verdict "
+            "the loop publishes is invisible to the gate",
         )
-        self.assertIn("id=E2E", result.stdout,
-                      "the reader passed but not on the verdict this test wrote")
+        self.assertTrue(writer_default.startswith("/"),
+                        f"the shared default {writer_default!r} is not absolute")
 
 
 class ProbeContract(unittest.TestCase):
