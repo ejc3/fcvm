@@ -720,7 +720,10 @@ def _validate_schedule(dataset):
                     # no idle policy, no prewire, no tcp/upgrade/enable
                     # stages), which gated every webkit run into failure.
                     engine = meta_engine
-                    if (render.get("engine") or meta_engine) != meta_engine:
+                    # cdpdrive stamps no engine field, so a missing stamp means
+                    # chromium, never "whatever the meta says": a webkit run
+                    # whose renders carry no stamp must fail, not inherit.
+                    if (render.get("engine") or "chromium") != meta_engine:
                         errors.append(
                             f"{rlabel} render engine {render.get('engine')!r} "
                             f"mismatches metadata {meta.get('engine')!r}"

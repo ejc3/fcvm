@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -121,7 +122,7 @@ class SessionDiscovery(unittest.TestCase):
             run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr="")
             with self.assertRaises(reqbench.SessionDiscoveryFailed) as caught:
-                reqbench.discover_wd_session(args, 1234)
+                reqbench.discover_wd_session(args, 1234, time.monotonic() + 5.0)
         self.assertIn("session discovery failed", str(caught.exception))
 
     def test_discovery_failure_escalates_out_of_the_rep_handler(self):
@@ -144,7 +145,7 @@ class SessionDiscovery(unittest.TestCase):
         with mock.patch.object(subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="  abc-123\n", stderr="")
-            self.assertEqual(reqbench.discover_wd_session(args, 1), "abc-123")
+            self.assertEqual(reqbench.discover_wd_session(args, 1, time.monotonic() + 5.0), "abc-123")
 
 
 class EngineDispatch(unittest.TestCase):
@@ -179,6 +180,34 @@ class EngineDispatch(unittest.TestCase):
         self.assertIn("discover_wd_session", src)
         self.assertIn("cdpdrive.drive", src,
                       "the chromium path was lost while adding webkit")
+
+
+class DiscoveryFailureClassification(unittest.TestCase):
+    """Every discovery failure mode is SessionDiscoveryFailed, so it escalates.
+
+    A subprocess.TimeoutExpired or OSError left as itself is an ordinary
+    Exception the per-rep handler records and retries; the session id is
+    snapshot state, so each retry repeats the full wait for the same answer.
+    """
+
+    def discover(self):
+        args = argparse.Namespace(fcvm="/bin/true", wd_session_id="")
+        return reqbench.discover_wd_session(args, 1234, time.monotonic() + 5.0)
+
+    def test_a_discovery_timeout_escalates(self):
+        with mock.patch.object(
+            reqbench.subprocess, "run",
+            side_effect=reqbench.subprocess.TimeoutExpired(cmd="x", timeout=1),
+        ):
+            with self.assertRaises(reqbench.SessionDiscoveryFailed):
+                self.discover()
+
+    def test_an_unlaunchable_fcvm_escalates(self):
+        with mock.patch.object(
+            reqbench.subprocess, "run", side_effect=OSError("no such file"),
+        ):
+            with self.assertRaises(reqbench.SessionDiscoveryFailed):
+                self.discover()
 
 
 class WebkitAnalyzerSchema(unittest.TestCase):
@@ -301,6 +330,22 @@ class WebkitAnalyzerSchema(unittest.TestCase):
         self.assertEqual(
             schema_noise, [],
             "a healthy webkit render must not fail chromium-schema checks",
+        )
+
+    def test_a_webkit_render_with_no_engine_stamp_fails(self):
+        """A missing render engine stamp means chromium (cdpdrive writes no
+        stamp), so on a webkit run it must be flagged as a mismatch, not
+        inherited from the meta.
+        """
+        def drop_engine_stamp(records):
+            for record in records:
+                if record["arm"] == "cdp":
+                    del record["render"]["engine"]
+
+        dataset = self.load_dataset(mutate=drop_engine_stamp)
+        self.assertTrue(
+            any("mismatches metadata" in error for error in dataset["metadata_errors"]),
+            f"unstamped renders must not pass a webkit run: {dataset['metadata_errors']}",
         )
 
     def test_a_webkit_render_missing_its_own_stages_still_fails(self):

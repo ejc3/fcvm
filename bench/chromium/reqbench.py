@@ -3056,7 +3056,7 @@ def spawn_clone_process(cmd: list[str], log: str, env: dict) -> subprocess.Popen
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def discover_wd_session(args, fcvm_pid: int) -> str:
+def discover_wd_session(args, fcvm_pid: int, deadline: float) -> str:
     """Read the golden's warm WebDriver session id out of a live clone, once.
 
     entry-webkit.sh writes it to /run/bench-session-id in the CONTAINER before
@@ -3069,7 +3069,18 @@ def discover_wd_session(args, fcvm_pid: int) -> str:
     """
     argv = [args.fcvm, "exec", "--pid", str(fcvm_pid), "-c",
             "--", "cat", "/run/bench-session-id"]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    # Bounded by the CLONE's remaining deadline, and every failure mode is
+    # SessionDiscoveryFailed: a timeout or an unlaunchable fcvm left as its
+    # own type is an ordinary Exception the per-rep handler records and
+    # RETRIES, so each later webkit rep would repeat the whole discovery wait
+    # against a value that is snapshot state and will not change.
+    timeout = max(1.0, min(60.0, deadline - time.monotonic()))
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as error:
+        raise SessionDiscoveryFailed(
+            f"webkit session discovery failed: {type(error).__name__}: {error}"
+        ) from error
     session = (proc.stdout or "").strip()
     if proc.returncode != 0 or not session:
         raise SessionDiscoveryFailed(
@@ -3143,7 +3154,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
                 # as --prewire; warmups run first, so the exec cost lands on a
                 # discarded rep).
                 if not getattr(args, "wd_session_id", ""):
-                    args.wd_session_id = discover_wd_session(args, fcvm_pid)
+                    args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
                 rec["session_prewired"] = True
                 import wddrive
 
