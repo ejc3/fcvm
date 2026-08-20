@@ -19,19 +19,39 @@ CDP_PORT="${CDP_PORT:-9222}"
 RUNID="${RUNID:-$(tr -d - </proc/sys/kernel/random/uuid)}"
 RESULTS="${RESULTS:-$HERE/results/hostcdp-$RUNID}"
 CNAME="hostcdp-$$"
+LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 
 mkdir -p "$RESULTS"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
 # Same quiet-box refusal as the VM harness: a contaminated baseline poisons
-# every ratio computed against it.
-la=$(cut -d' ' -f1 /proc/loadavg)
-fc=$(pgrep -c firecracker || true)
-# Same 1.0 gate as faultbench; the earlier printf-rounding form refused at 0.70.
-if [ "${ALLOW_BUSY:-0}" != 1 ] && { [ "${fc:-0}" -gt 0 ] || awk -v l="$la" 'BEGIN{exit !(l >= 1.0)}'; }; then
-    log "REFUSING: load=$la firecracker=$fc. ALLOW_BUSY=1 overrides and taints the run."
-    exit 3
-fi
+# every ratio computed against it. SETTLE_WAIT_SECS > 0 bounds a wait for the
+# box to go quiet before refusing (same knob as reqbench.sh guard_quiet; the
+# Makefile runs this right after `build`, whose load a 1-minute average still
+# carries). Default 0 keeps the fail-fast refusal.
+SETTLE_WAIT_SECS="${SETTLE_WAIT_SECS:-0}"
+[[ "$SETTLE_WAIT_SECS" =~ ^[0-9]+$ ]] \
+    || { log "SETTLE_WAIT_SECS must be a whole number of seconds (got '$SETTLE_WAIT_SECS')"; exit 2; }
+quiet_sample() {
+    la=$(cut -d' ' -f1 "$LOADAVG_FILE")
+    fc=$(pgrep -c firecracker || true)
+    [ "${ALLOW_BUSY:-0}" != 1 ] || return 0
+    [ "${fc:-0}" -eq 0 ] || return 1
+    # Same 1.0 gate as faultbench; the earlier printf-rounding form refused at 0.70.
+    if awk -v l="$la" 'BEGIN{exit !(l >= 1.0)}'; then return 1; fi
+    return 0
+}
+deadline=$((SECONDS + SETTLE_WAIT_SECS))
+until quiet_sample; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        log "REFUSING: load=$la firecracker=$fc. ALLOW_BUSY=1 overrides and taints the run."
+        exit 3
+    fi
+    nap=$((deadline - SECONDS))
+    [ "$nap" -le 5 ] || nap=5
+    log "settling: load=$la firecracker=$fc; re-sampling in ${nap}s ($((deadline - SECONDS))s left in the ${SETTLE_WAIT_SECS}s window)"
+    sleep "$nap"
+done
 
 cleanup() { podman rm -f "$CNAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT

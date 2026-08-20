@@ -7,6 +7,7 @@ survives: a corrupt number reads exactly like a real one.
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -245,6 +246,86 @@ class ServeIdentity(unittest.TestCase):
         }))
         self.assertEqual(faultbench.serve_pid_for("t", "copy"), 4444)
         self.assertIsNone(faultbench.serve_pid_for("t", "minor"))
+
+
+class _FakeSubprocess:
+    """faultbench's view of the subprocess module, with Popen recorded.
+
+    run() stays real (main shells out for the host IPv4 address); Popen is
+    what starts hostserver.py, and a test must never leak a real one.
+    """
+
+    def __init__(self, record):
+        self.record = record
+        self.run = subprocess.run
+        self.STDOUT = subprocess.STDOUT
+        self.PIPE = subprocess.PIPE
+        self.DEVNULL = subprocess.DEVNULL
+
+    def Popen(self, *args, **kwargs):
+        self.record.append(args[0] if args else kwargs.get("args"))
+
+        class Dummy:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        return Dummy()
+
+
+class QuietGate(unittest.TestCase):
+    """The start-load check and its SETTLE_WAIT_SECS knob."""
+
+    def patch(self, obj, name, value):
+        real = getattr(obj, name)
+        setattr(obj, name, value)
+        self.addCleanup(setattr, obj, name, real)
+
+    def test_the_start_load_check_settles_within_the_settle_window(self):
+        """`make bench-chromium-fault` runs build and setup right before this
+        gate, so a fail-fast cold chain refuses on its own prerequisite wake
+        and a retry repeats the prerequisites. SETTLE_WAIT_SECS bounds a wait
+        for the load to fall, same knob as reqbench.sh and hostcdp.sh."""
+        samples = iter([(9.9, 0.0, 0.0), (9.5, 0.0, 0.0), (0.2, 0.0, 0.0)])
+        self.patch(os, "getloadavg", lambda: next(samples))
+        self.patch(faultbench, "firecracker_pids", lambda: set())
+        naps = []
+        self.patch(faultbench.time, "sleep", naps.append)
+        os.environ["SETTLE_WAIT_SECS"] = "30"
+        self.addCleanup(os.environ.pop, "SETTLE_WAIT_SECS", None)
+        info = faultbench.host_precheck()
+        self.assertEqual(info["loadavg_1m"], 0.2)
+        self.assertEqual(len(naps), 2, "one nap per busy re-sample")
+
+    def test_a_busy_refusal_spawns_nothing_and_keeps_the_out_dir_fresh(self):
+        """A refused run must be retryable with the same --out.
+
+        A hostserver started before host_precheck sits outside the teardown
+        try/finally, so a refusal leaks it; require_fresh_out_dir and the
+        mkdirs running earlier still means the retry is refused for the
+        directory the refused run itself dirtied.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "run"
+            spawned = []
+            self.patch(faultbench, "subprocess", _FakeSubprocess(spawned))
+            self.patch(os, "getloadavg", lambda: (9.9, 0.0, 0.0))
+            self.patch(faultbench, "firecracker_pids", lambda: set())
+            self.patch(sys, "argv", ["faultbench.py", "--out", str(out)])
+            with self.assertRaises(SystemExit) as caught:
+                faultbench.main()
+            self.assertIn("load average", str(caught.exception))
+            self.assertEqual(spawned, [], "a refused run spawned a child")
+            # Raises SystemExit("not empty") if the refusal dirtied it.
+            faultbench.require_fresh_out_dir(out)
 
 
 if __name__ == "__main__":

@@ -630,6 +630,25 @@ def build_schedule(cells, pages, reps, warmup, seed):
     return warm + measured
 
 
+SETTLE_POLL_S = 5.0
+
+
+def settle_wait_secs():
+    """The bounded quiet-gate settle window, shared knob with reqbench/hostcdp."""
+    raw = os.environ.get("SETTLE_WAIT_SECS", "0")
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(
+            f"[faultbench] SETTLE_WAIT_SECS must be a number of seconds, got {raw!r}"
+        )
+    if value < 0:
+        raise SystemExit(
+            f"[faultbench] SETTLE_WAIT_SECS must not be negative, got {raw!r}"
+        )
+    return value
+
+
 def host_precheck(expected_firecrackers=0):
     """Refuse to start on a host that is already busy or already running VMs.
 
@@ -637,23 +656,35 @@ def host_precheck(expected_firecrackers=0):
     background load moves every latency number. Both are invisible after the fact,
     which is why this runs before the first request rather than being reported with
     the results.
+
+    SETTLE_WAIT_SECS > 0 bounds a wait for the load to fall below MAX_START_LOAD
+    before refusing: the make one-shot chain reaches this gate seconds after its
+    own prerequisite builds, whose work a 1-minute average still carries. A
+    foreign firecracker still refuses immediately; it does not go away by waiting.
     """
-    load1 = os.getloadavg()[0]
-    foreign = firecracker_pids()
-    info = {"loadavg_1m": load1, "firecracker_pids": sorted(foreign),
-            "uptime_s": float(Path("/proc/uptime").read_text().split()[0])}
-    if len(foreign) > expected_firecrackers:
-        raise SystemExit(
-            f"[faultbench] {len(foreign)} firecracker processes already running "
-            f"({sorted(foreign)}); they would compete for CPU and pollute the host-wide "
-            f"ftrace dump. Stop them first."
-        )
-    if load1 > MAX_START_LOAD:
-        raise SystemExit(
-            f"[faultbench] 1-minute load average is {load1:.2f}, above {MAX_START_LOAD}; "
-            f"every latency number would be measuring the other workload too"
-        )
-    return info
+    deadline = time.monotonic() + settle_wait_secs()
+    while True:
+        load1 = os.getloadavg()[0]
+        foreign = firecracker_pids()
+        info = {"loadavg_1m": load1, "firecracker_pids": sorted(foreign),
+                "uptime_s": float(Path("/proc/uptime").read_text().split()[0])}
+        if len(foreign) > expected_firecrackers:
+            raise SystemExit(
+                f"[faultbench] {len(foreign)} firecracker processes already running "
+                f"({sorted(foreign)}); they would compete for CPU and pollute the host-wide "
+                f"ftrace dump. Stop them first."
+            )
+        if load1 <= MAX_START_LOAD:
+            return info
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SystemExit(
+                f"[faultbench] 1-minute load average is {load1:.2f}, above {MAX_START_LOAD}; "
+                f"every latency number would be measuring the other workload too"
+            )
+        print(f"[faultbench] settling: load1={load1:.2f} above {MAX_START_LOAD}; "
+              f"re-sampling ({remaining:.0f}s left in the settle window)", flush=True)
+        time.sleep(min(SETTLE_POLL_S, remaining))
 
 
 class LoadSampler(threading.Thread):
@@ -729,6 +760,34 @@ def main():
                          "record so a run can be replayed in the same order")
     args = ap.parse_args()
 
+    # Every refusal must run BEFORE the output directory is dirtied and
+    # before hostserver.py is spawned: the server starts outside the teardown
+    # try/finally, so a refusal after it leaks the server, and directories
+    # made before a refusal make require_fresh_out_dir refuse the retry.
+    precheck = host_precheck()
+    print(f"[faultbench] host at start: load1={precheck['loadavg_1m']:.2f} "
+          f"firecrackers={len(precheck['firecracker_pids'])}", flush=True)
+
+    # golden snapshot tags, resolved the same way bench.sh does (content-addressed)
+    tags = {}
+    for d in SNAP_DIR.glob("cb-golden-*"):
+        if d.is_dir():
+            key = d.name.split("-")[2]
+            tags[key] = d.name
+
+    pages = [p.strip() for p in args.pages.split(",") if p.strip()] or [args.page]
+    # The seed is recorded, so a suspicious run can be replayed in the same order.
+    seed = args.seed if args.seed is not None else int(time.time())
+    cells = [c.strip() for c in args.cells.split(",") if c.strip()]
+    unknown = [c for c in cells if c not in CELLS]
+    if unknown:
+        raise SystemExit(f"[faultbench] unknown cells {unknown}; known: {sorted(CELLS)}")
+    for c in [c for c in cells if not tags.get(CELLS[c][2])]:
+        print(f"[faultbench] SKIP {c}: no golden snapshot for {CELLS[c][2]}", flush=True)
+    cells = [c for c in cells if tags.get(CELLS[c][2])]
+    if not cells:
+        raise SystemExit("[faultbench] no cell has a golden snapshot; nothing to measure")
+
     out = Path(args.out)
     require_fresh_out_dir(out)
     (out / "requests").mkdir(parents=True, exist_ok=True)
@@ -744,31 +803,8 @@ def main():
         stdout=open(out / "logs" / "hostserver.log", "w"), stderr=subprocess.STDOUT)
     time.sleep(1.0)
 
-    # golden snapshot tags, resolved the same way bench.sh does (content-addressed)
-    tags = {}
-    for d in SNAP_DIR.glob("cb-golden-*"):
-        if d.is_dir():
-            key = d.name.split("-")[2]
-            tags[key] = d.name
-
     runid = time.strftime("%H%M%S")
     results = []
-    pages = [p.strip() for p in args.pages.split(",") if p.strip()] or [args.page]
-    # The seed is recorded, so a suspicious run can be replayed in the same order.
-    seed = args.seed if args.seed is not None else int(time.time())
-    cells = [c.strip() for c in args.cells.split(",") if c.strip()]
-    unknown = [c for c in cells if c not in CELLS]
-    if unknown:
-        raise SystemExit(f"[faultbench] unknown cells {unknown}; known: {sorted(CELLS)}")
-    for c in [c for c in cells if not tags.get(CELLS[c][2])]:
-        print(f"[faultbench] SKIP {c}: no golden snapshot for {CELLS[c][2]}", flush=True)
-    cells = [c for c in cells if tags.get(CELLS[c][2])]
-    if not cells:
-        raise SystemExit("[faultbench] no cell has a golden snapshot; nothing to measure")
-
-    precheck = host_precheck()
-    print(f"[faultbench] host at start: load1={precheck['loadavg_1m']:.2f} "
-          f"firecrackers={len(precheck['firecracker_pids'])}", flush=True)
     (out / "run.json").write_text(json.dumps({
         "runid": runid, "seed": seed, "cells": cells, "pages": pages,
         "reps": args.reps, "warmup": args.warmup, "label": args.label,
