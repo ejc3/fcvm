@@ -33,7 +33,12 @@ SETTLE_WAIT_SECS="${SETTLE_WAIT_SECS:-0}"
 [[ "$SETTLE_WAIT_SECS" =~ ^[0-9]+$ ]] \
     || { log "SETTLE_WAIT_SECS must be a whole number of seconds (got '$SETTLE_WAIT_SECS')"; exit 2; }
 quiet_sample() {
-    la=$(cut -d' ' -f1 "$LOADAVG_FILE")
+    la=$(cut -d' ' -f1 "$LOADAVG_FILE" || true)
+    # This function runs as an `until` condition, where set -e is suppressed
+    # and awk reads an empty string as 0, so a missing, unreadable, or empty
+    # LOADAVG_FILE would otherwise pass the gate without a load reading.
+    [[ "$la" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+        || { log "REFUSING: no numeric 1-minute load readable from $LOADAVG_FILE (got '$la')"; exit 2; }
     fc=$(pgrep -c firecracker || true)
     [ "${ALLOW_BUSY:-0}" != 1 ] || return 0
     [ "${fc:-0}" -eq 0 ] || return 1

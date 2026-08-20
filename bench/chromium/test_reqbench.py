@@ -4670,6 +4670,49 @@ class HostCdpQuietGate(unittest.TestCase):
             self.assertNotIn("REFUSING", result.stderr)
             self.assertNotEqual(result.returncode, 3, result.stderr)
 
+    def test_an_unreadable_loadavg_file_fails_closed(self):
+        """RED BEFORE THE FIX: with LOADAVG_FILE missing or empty, `cut`
+        fails inside the `until quiet_sample` condition where set -e is
+        suppressed, `la` comes back empty, awk reads the empty string as 0,
+        and the gate passes without ever evaluating host load. A mistyped
+        override then starts the container (stub exit 7 here) instead of
+        refusing. The script must exit 2 before reaching podman."""
+        for fixture in ("missing", "empty"):
+            with self.subTest(fixture=fixture), \
+                    tempfile.TemporaryDirectory() as d:
+                binx = os.path.join(d, "bin")
+                os.makedirs(binx)
+                loadavg = os.path.join(d, "loadavg")
+                if fixture == "empty":
+                    open(loadavg, "w").close()
+                stubs = {
+                    "pgrep": "#!/bin/bash\necho 0\nexit 1\n",
+                    # Reaching podman means the gate passed; exit 7 is
+                    # distinguishable from the validation refusal exit 2.
+                    "podman": "#!/bin/bash\nexit 7\n",
+                }
+                for name, body in stubs.items():
+                    path = os.path.join(binx, name)
+                    with open(path, "w") as f:
+                        f.write(body)
+                    os.chmod(path, 0o755)
+                env = dict(os.environ)
+                env.update(
+                    PATH=binx + os.pathsep + env["PATH"],
+                    LOADAVG_FILE=loadavg,
+                    ALLOW_BUSY="0",
+                    RESULTS=os.path.join(d, "results"),
+                )
+                result = subprocess.run(
+                    ["bash", self.SH], env=env,
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(
+                    result.returncode, 2,
+                    f"gate did not fail closed: rc={result.returncode} "
+                    f"stderr={result.stderr[-800:]}")
+                self.assertIn(loadavg, result.stderr)
+
 
 class SustainedRateUncertainty(unittest.TestCase):
     """The throughput HEADLINE must carry uncertainty, like everything else here.

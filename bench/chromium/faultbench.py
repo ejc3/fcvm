@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -641,6 +642,13 @@ def settle_wait_secs():
     except ValueError:
         raise SystemExit(
             f"[faultbench] SETTLE_WAIT_SECS must be a number of seconds, got {raw!r}"
+        )
+    # float() accepts 'nan' and 'inf', and nan also slips the negative check
+    # (nan compares false to everything); either would make the bounded
+    # window unbounded, so require a finite value.
+    if not math.isfinite(value):
+        raise SystemExit(
+            f"[faultbench] SETTLE_WAIT_SECS must be a finite number of seconds, got {raw!r}"
         )
     if value < 0:
         raise SystemExit(

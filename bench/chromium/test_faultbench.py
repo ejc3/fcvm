@@ -305,6 +305,19 @@ class QuietGate(unittest.TestCase):
         self.assertEqual(info["loadavg_1m"], 0.2)
         self.assertEqual(len(naps), 2, "one nap per busy re-sample")
 
+    def test_a_non_finite_settle_window_is_rejected(self):
+        """SETTLE_WAIT_SECS promises a BOUNDED settle window. float() accepts
+        'nan' and 'inf', and neither trips the negative check (nan compares
+        false to everything), so on a busy host the deadline never expires:
+        `remaining <= 0` never holds and host_precheck resamples forever."""
+        for raw in ("nan", "inf", "Infinity"):
+            with self.subTest(raw=raw):
+                os.environ["SETTLE_WAIT_SECS"] = raw
+                self.addCleanup(os.environ.pop, "SETTLE_WAIT_SECS", None)
+                with self.assertRaises(SystemExit) as caught:
+                    faultbench.settle_wait_secs()
+                self.assertIn("finite", str(caught.exception))
+
     def test_a_busy_refusal_spawns_nothing_and_keeps_the_out_dir_fresh(self):
         """A refused run must be retryable with the same --out.
 
