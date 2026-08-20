@@ -182,11 +182,14 @@ fn rebuild_proxy_url(parsed: &Url, host: String, port: u16) -> String {
 
 /// Build runtime boot arguments for the kernel command line.
 ///
-/// Per-instance network values (`ip=`, `ipv6=`, and the mode's DNS choice in
-/// `network_config`) are excluded from the snapshot key by design. Every other
-/// token is emitted from `launch_config`, the same hashed FirecrackerConfig
-/// the snapshot key is computed from, so the hashed value and the value the
-/// guest boots with cannot diverge (#821).
+/// Per-instance network values (`ip=` and `ipv6=` addresses) are excluded
+/// from the snapshot key by design. The mode's DNS choice in `network_config`
+/// is either a constant (pasta's forwarder), the --dns override (hashed via
+/// dns_server), or bridged mode's first host resolver (hashed via host_dns
+/// and threaded into BridgedNetwork from the same resolution, #863). Every
+/// other token is emitted from `launch_config`, the same hashed
+/// FirecrackerConfig the snapshot key is computed from, so the hashed value
+/// and the value the guest boots with cannot diverge (#821).
 pub(crate) fn build_runtime_boot_args(
     network_config: &crate::network::NetworkConfig,
     launch_config: &crate::firecracker::FirecrackerConfig,
@@ -227,9 +230,10 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // Pass DNS servers to guest for resolv.conf configuration: the mode's
-    // DNS choice (pasta forwarder, bridged host DNS, or the --dns override
-    // recorded in network_config), else the hashed host fallback resolved at
-    // config construction (#821).
+    // DNS choice recorded in network_config (pasta forwarder, the bridged
+    // first-hashed-host_dns entry threaded at network construction, or the
+    // --dns override), else the hashed host fallback resolved at config
+    // construction (#821).
     {
         let dns_servers = if let Some(ref dns) = network_config.dns_server {
             vec![dns.clone()]
@@ -878,6 +882,10 @@ pub(super) struct VmSetupParams<'a> {
     pub image_disk_path: Option<&'a std::path::Path>,
     pub fc_config: Option<crate::firecracker::FirecrackerConfig>,
     pub runtime_config: &'a crate::commands::common::RuntimeConfig,
+    /// The launch's single GuestBootInputs resolution. When fc_config is None
+    /// (snapshots disabled) the fallback launch config is built from this
+    /// same copy instead of reading the host again mid-launch.
+    pub boot_inputs: GuestBootInputs,
 }
 
 /// Helper function that runs VM setup and returns VmManager on success.
@@ -1018,6 +1026,34 @@ impl GuestBootInputs {
             no_writeback_cache: std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok(),
         }
     }
+
+    /// Drop the inputs this launch cannot observe, so the key hashes exactly
+    /// what the guest boots with (#863). Applied by both config constructors:
+    ///
+    /// * Bridged mode forwards a single resolver to the guest
+    ///   (network_config.dns_server carries the first host entry), so only
+    ///   the first entry can reach it; keying the rest would cold-boot a
+    ///   guest whose cmdline is identical when a secondary nameserver moves.
+    /// * The four FUSE knobs are read only inside fc-agent's FUSE mount path
+    ///   (fc-agent/src/fuse/mod.rs), and mount_fuse_volumes runs only when
+    ///   the boot plan carries volumes (fc-agent/src/agent.rs), so a
+    ///   volume-free run boots identically under any of their values.
+    pub(crate) fn for_launch(
+        mut self,
+        network_mode: crate::firecracker::FcNetworkMode,
+        has_fuse_volumes: bool,
+    ) -> Self {
+        if matches!(network_mode, crate::firecracker::FcNetworkMode::Bridged) {
+            self.host_dns.truncate(1);
+        }
+        if !has_fuse_volumes {
+            self.fuse_readers = None;
+            self.fuse_trace_rate = None;
+            self.fuse_max_write = None;
+            self.no_writeback_cache = false;
+        }
+        self
+    }
 }
 
 /// The first `search` line of a resolv.conf, split into domains.
@@ -1047,6 +1083,7 @@ pub(crate) fn build_launch_config(
 ) -> crate::firecracker::FirecrackerConfig {
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
     let network_mode: FcNetworkMode = args.network.into();
+    let boot_inputs = boot_inputs.for_launch(network_mode, !args.map.is_empty());
     // Collect extra disk specifications
     let mut extra_disks: Vec<String> = Vec::new();
     extra_disks.extend(args.disk.iter().cloned());
@@ -1363,6 +1400,7 @@ async fn run_vm_setup_inner(
         image_disk_path,
         fc_config,
         runtime_config,
+        boot_inputs,
     } = params;
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
@@ -1501,7 +1539,7 @@ async fn run_vm_setup_inner(
                 initrd_path,
                 &cmd_args,
                 runtime_config,
-                GuestBootInputs::resolve(args.dns.as_deref(), runtime_config),
+                boot_inputs,
             )
         });
 
@@ -1618,7 +1656,8 @@ mod tests {
             (
                 "fcvm_dns",
                 "--dns override hashed via FirecrackerConfig.dns_server; the \
-                 no-override host fallback hashed via FirecrackerConfig.host_dns",
+                 no-override host fallback (and bridged mode's threaded first \
+                 resolver) hashed via FirecrackerConfig.host_dns",
             ),
             ("fcvm_dns_search", "hashed via FirecrackerConfig.dns_search"),
             (

@@ -317,6 +317,7 @@ pub(super) fn build_firecracker_config(
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
 
     let network_mode: FcNetworkMode = args.network.into();
+    let boot_inputs = boot_inputs.for_launch(network_mode, !args.map.is_empty());
 
     let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
 

@@ -1688,8 +1688,13 @@ async fn cmd_snapshot_run_inner(
     // Setup networking based on mode - reuse guest_ip from snapshot if available
     let network: Box<dyn NetworkManager> = match network_mode {
         FcNetworkMode::Bridged => {
+            // The clone reports the resolver the snapshot captured, not the
+            // restore host's current one: the guest's resolv.conf is already
+            // baked into the restored memory, and the reboot plan deliberately
+            // re-bakes the captured value (see run_args_from_snapshot_metadata).
             let mut net =
-                BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+                BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                    .with_dns_server(saved_network.dns_server.clone());
             // If snapshot has saved network config with guest_ip, use it
             if let Some(ref guest_ip) = saved_network.guest_ip {
                 net = net.with_guest_ip(guest_ip.clone());
