@@ -20,7 +20,9 @@ use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
 };
 use crate::storage::{validate_snapshot_name, SnapshotGeneration, SnapshotManager};
-use crate::uffd::{Prefetch, UffdBacking, UffdServer};
+use crate::uffd::{
+    record_window_from_env, Prefetch, UffdBacking, UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,
+};
 use crate::volume::{SpawnedVolumes, VolumeConfig};
 
 use super::common::{
@@ -911,6 +913,13 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         None => Prefetch::On,
     };
 
+    // How long after its handshake each clone's faults keep being recorded into that set
+    // (--uffd-prefetch-record-window / FCVM_UFFD_PREFETCH_RECORD_WINDOW).
+    let record_window = args
+        .uffd_prefetch_record_window
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_PREFETCH_RECORD_WINDOW);
+
     // The server names its own socket after this process's (pid, start_time), so no two
     // live servers can collide on it. Clones rebuild the same name from the serve state
     // file (see `cmd_snapshot_run`).
@@ -924,6 +933,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         &paths::data_dir(),
         backing,
         prefetch,
+        record_window,
     )
     .await
     .context("creating UFFD server")?;
@@ -1909,6 +1919,7 @@ async fn cmd_snapshot_run_inner(
             };
             let backing = setup_try!(UffdBacking::from_env(hugepages));
             let prefetch = setup_try!(Prefetch::from_env());
+            let record_window = setup_try!(record_window_from_env());
             info!(
                 reason = %reason,
                 mode = backing.name(),
@@ -1940,6 +1951,7 @@ async fn cmd_snapshot_run_inner(
                 &data_dir,
                 backing,
                 prefetch,
+                record_window,
             )
             .await
             .context("creating implicit UFFD server"));

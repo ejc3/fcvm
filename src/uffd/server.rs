@@ -479,6 +479,9 @@ pub enum Prefetch {
 struct CloneWorkingSet {
     store: Option<Arc<WorkingSetStore>>,
     persistence: Option<WorkingSetPersistence>,
+    /// Per-clone recording window, anchored at the UFFD handshake. Only consulted when
+    /// `store` is present, so the zero this derives under `Default` never gates anything.
+    record_window: Duration,
 }
 
 impl Prefetch {
@@ -500,6 +503,41 @@ impl Prefetch {
     }
 }
 
+/// Env var overriding [`DEFAULT_PREFETCH_RECORD_WINDOW`], in whole seconds.
+pub const PREFETCH_RECORD_WINDOW_ENV: &str = "FCVM_UFFD_PREFETCH_RECORD_WINDOW";
+
+/// How long after its UFFD handshake a clone's demand faults are recorded into the
+/// snapshot's working-set hint. Faults past the window are served normally but no longer
+/// recorded, so the sidecar converges to the union of restore windows instead of the
+/// lifetime footprint of the longest-lived clone (issue #858: one clone that ran for hours
+/// grew a 128 GiB guest's hint from 6.5 GiB to 122 GiB).
+///
+/// 300 s is a safety bound pending empirical tuning, not a measured optimum: the slowest
+/// restore-to-guest-ACK observed in issue #858 is 28.5 s on a 128 GiB guest, so this sits
+/// more than 10x past it and cannot truncate an honest restore working set. The 128 GiB
+/// workload measurement that would justify a tighter default is tracked in the issue.
+pub const DEFAULT_PREFETCH_RECORD_WINDOW: Duration = Duration::from_secs(300);
+
+/// Parse a [`PREFETCH_RECORD_WINDOW_ENV`] / `--uffd-prefetch-record-window` value.
+///
+/// `0` records nothing (replay of an already-recorded hint is unaffected).
+pub fn parse_record_window(raw: &str) -> Result<Duration> {
+    let secs: u64 = raw.trim().parse().with_context(|| {
+        format!("{PREFETCH_RECORD_WINDOW_ENV}={raw:?} is not a whole number of seconds")
+    })?;
+    Ok(Duration::from_secs(secs))
+}
+
+/// Resolve the recording window from the environment, defaulting to
+/// [`DEFAULT_PREFETCH_RECORD_WINDOW`]. Used by the implicit server inside
+/// `snapshot run`, which has no serve CLI to carry the flag.
+pub fn record_window_from_env() -> Result<Duration> {
+    match std::env::var(PREFETCH_RECORD_WINDOW_ENV) {
+        Ok(value) => parse_record_window(&value),
+        Err(_) => Ok(DEFAULT_PREFETCH_RECORD_WINDOW),
+    }
+}
+
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
 pub struct UffdServer {
     snapshot_id: String,
@@ -510,6 +548,7 @@ pub struct UffdServer {
     mem_size: usize,
     working_set: Option<Arc<WorkingSetStore>>,
     working_set_persistence: Option<WorkingSetPersistence>,
+    record_window: Duration,
 }
 
 impl UffdServer {
@@ -540,6 +579,7 @@ impl UffdServer {
         dir: &Path,
         backing: UffdBacking,
         prefetch: Prefetch,
+        record_window: Duration,
     ) -> Result<Self> {
         // Before anything else: prove we can fail closed on this kernel.
         require_peer_pidfd_support()?;
@@ -667,6 +707,7 @@ impl UffdServer {
             mem_size,
             working_set,
             working_set_persistence,
+            record_window,
         })
     }
 
@@ -785,6 +826,7 @@ impl UffdServer {
                             let working_set = CloneWorkingSet {
                                 store: self.working_set.clone(),
                                 persistence: self.working_set_persistence.clone(),
+                                record_window: self.record_window,
                             };
                             let mem_size = self.mem_size;
                             let admitted_slot = Arc::clone(&admitted);
@@ -1258,6 +1300,11 @@ struct VmState {
     fault_count: u64,
     pending_continues: std::collections::BTreeMap<usize, PendingContinue>,
     recorded: Option<PageSet>,
+    /// When this clone's recording window closes. `None` means unbounded (a window too
+    /// large for the clock to represent). Faults are always SERVED regardless; the deadline
+    /// only stops them being recorded, so the persisted hint stays a restore working set
+    /// instead of growing into a long-lived clone's lifetime footprint (issue #858).
+    record_until: Option<std::time::Instant>,
     started: std::time::Instant,
     /// `Some` only under `FCVM_UFFD_FAULT_TRACE`; see [`FaultTrace`].
     trace: Option<FaultTrace>,
@@ -1282,6 +1329,15 @@ impl VmState {
         if let (Some((offset, t0)), Some(t)) = (trace, self.trace.as_mut()) {
             let t1 = t.now_ns();
             t.record(offset, t0, t1);
+        }
+    }
+
+    /// The recorder for a demand fault observed at `now`, or `None` once the recording
+    /// window has closed.
+    fn fault_recorder(&mut self, now: std::time::Instant) -> Option<&mut PageSet> {
+        match self.record_until {
+            Some(deadline) if now >= deadline => None,
+            _ => self.recorded.as_mut(),
         }
     }
 }
@@ -1351,6 +1407,7 @@ async fn handle_vm_page_faults(
     let CloneWorkingSet {
         store: working_set,
         persistence: working_set_persistence,
+        record_window,
     } = working_set;
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
     let page_mask = !(page_size - 1);
@@ -1389,6 +1446,10 @@ async fn handle_vm_page_faults(
         fault_count: 0,
         pending_continues: std::collections::BTreeMap::new(),
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
+        // Anchored here, right after the handshake: the window is measured from the
+        // moment this clone could first fault, not from server startup. A window the
+        // clock cannot represent (checked_add overflow) means unbounded recording.
+        record_until: started.checked_add(record_window),
         started,
         trace: FaultTrace::from_env(&vm_id, started),
     };
@@ -1719,7 +1780,8 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
 
                     // Record demand, never replay: the set converges on what the guest
                     // actually requested rather than recursively recording its prediction.
-                    if let Some(recorder) = state.recorded.as_mut() {
+                    // Recording stops at the clone's window deadline; serving does not.
+                    if let Some(recorder) = state.fault_recorder(std::time::Instant::now()) {
                         recorder.insert_range(offset_in_file as u64, page_size as u64);
                     }
 
@@ -2510,6 +2572,7 @@ mod tests {
             fault_count: 0,
             pending_continues: std::collections::BTreeMap::new(),
             recorded: None,
+            record_until: None,
             started: origin,
             trace: Some(FaultTrace {
                 path: path.clone(),
@@ -2674,6 +2737,121 @@ mod tests {
         assert_eq!(Prefetch::parse("off").unwrap(), Prefetch::Off);
         assert!(Prefetch::parse("true").is_err());
         assert!(Prefetch::parse("").is_err());
+    }
+
+    #[test]
+    fn record_window_parses_whole_seconds_only() {
+        assert_eq!(parse_record_window("0").unwrap(), Duration::from_secs(0));
+        assert_eq!(
+            parse_record_window(" 300 ").unwrap(),
+            Duration::from_secs(300)
+        );
+        assert!(parse_record_window("5s").is_err());
+        assert!(parse_record_window("-1").is_err());
+        assert!(parse_record_window("").is_err());
+    }
+
+    /// Issue #858: a clone that outlives its recording window must keep being SERVED but
+    /// stop being RECORDED, or the persisted hint grows into the clone's lifetime
+    /// footprint (measured: hours of uptime took a 128 GiB guest's hint from 6.5 GiB to
+    /// 122 GiB). With the window forced to zero, a resolved fault must record nothing.
+    #[test]
+    fn a_fault_past_the_recording_window_is_not_recorded() {
+        let mem_len = 64 * 4096u64;
+        let started = std::time::Instant::now();
+
+        let mut past_window = VmState {
+            fault_count: 0,
+            pending_continues: std::collections::BTreeMap::new(),
+            recorded: Some(PageSet::empty(mem_len)),
+            record_until: Some(started), // zero-length window: closed before any fault
+            started,
+            trace: None,
+        };
+        let fault_time = started + Duration::from_secs(1);
+        if let Some(recorder) = past_window.fault_recorder(fault_time) {
+            recorder.insert_range(0, 4096);
+        }
+        assert!(
+            past_window.recorded.as_ref().unwrap().is_empty(),
+            "a fault resolved past the recording window must not be recorded"
+        );
+
+        // Positive control: the same fault inside the window IS recorded, so the gate
+        // above cannot pass by never recording anything.
+        let mut in_window = VmState {
+            fault_count: 0,
+            pending_continues: std::collections::BTreeMap::new(),
+            recorded: Some(PageSet::empty(mem_len)),
+            record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
+            started,
+            trace: None,
+        };
+        if let Some(recorder) = in_window.fault_recorder(fault_time) {
+            recorder.insert_range(0, 4096);
+        }
+        assert_eq!(
+            in_window.recorded.as_ref().unwrap().len(),
+            1,
+            "a fault inside the window must still be recorded"
+        );
+    }
+
+    /// Issue #858, store level: a clone whose faults all land past its recording window
+    /// must contribute zero learned pages to the snapshot's working set, while a clone
+    /// faulting inside the window still teaches the store.
+    #[test]
+    fn observations_past_the_window_contribute_no_learned_pages() {
+        let fixture = tempfile::tempdir().unwrap();
+        let memory_path = fixture.path().join("memory.bin");
+        let config_path = fixture.path().join("config.json");
+        let generation_lock_path = fixture.path().join("snapshot.lock");
+        let mem_len = 64 * 4096u64;
+        std::fs::write(&memory_path, vec![0u8; mem_len as usize]).unwrap();
+        std::fs::write(&config_path, b"generation-1").unwrap();
+        let store = Arc::new(
+            WorkingSetStore::open(&memory_path, mem_len, &config_path, &generation_lock_path)
+                .unwrap(),
+        );
+
+        let started = std::time::Instant::now();
+        let fault_time = started + Duration::from_secs(1);
+        let clone_state = |window: Duration| VmState {
+            fault_count: 0,
+            pending_continues: std::collections::BTreeMap::new(),
+            recorded: Some(store.recorder()),
+            record_until: started.checked_add(window),
+            started,
+            trace: None,
+        };
+
+        // Every fault of this clone lands after its (zero-length) window.
+        let mut late = clone_state(Duration::ZERO);
+        for offset in [0u64, 4096, 8192] {
+            if let Some(recorder) = late.fault_recorder(fault_time) {
+                recorder.insert_range(offset, 4096);
+            }
+        }
+        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+        persist_observed_working_set("vm-late", Some(persistence.clone()), late.recorded.take());
+        assert!(
+            store.to_prefetch().is_empty(),
+            "faults past the window must not become learned pages in the store"
+        );
+
+        // The same faults inside the window are learned, proving the merge path works.
+        let mut timely = clone_state(DEFAULT_PREFETCH_RECORD_WINDOW);
+        for offset in [0u64, 4096, 8192] {
+            if let Some(recorder) = timely.fault_recorder(fault_time) {
+                recorder.insert_range(offset, 4096);
+            }
+        }
+        persist_observed_working_set("vm-timely", Some(persistence), timely.recorded.take());
+        assert_eq!(
+            store.to_prefetch().len(),
+            3,
+            "faults inside the window must still be learned"
+        );
     }
 
     /// The implicit-restore socket must fit in `sun_path` under the LONGEST path fcvm

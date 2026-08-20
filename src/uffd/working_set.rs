@@ -524,6 +524,18 @@ impl WorkingSetStore {
                     key = ?key,
                     "loaded recorded restore working set"
                 );
+                if hint_covers_most_of_the_image(set.bytes(), mem_len) {
+                    warn!(
+                        target: "uffd",
+                        path = %path.display(),
+                        hint_mib = set.bytes() / (1024 * 1024),
+                        guest_mib = mem_len / (1024 * 1024),
+                        "recorded working set covers more than half the guest, which looks \
+                         like a lifetime footprint rather than a restore working set (issue \
+                         #858); replay will populate all of it. Delete the sidecar to \
+                         re-record."
+                    );
+                }
                 set
             }
             None => PageSet::empty(mem_len),
@@ -724,6 +736,17 @@ impl WorkingSetStore {
             }
         }
     }
+}
+
+/// Whether a recorded hint is so large relative to the guest that it looks like a
+/// lifetime footprint rather than a restore working set.
+///
+/// Honest restore working sets measured 5 to 11 percent of guest memory (6.5 and 14 GiB
+/// of a 128 GiB guest, issue #858); the two poisoned sidecars observed there covered 66
+/// and 95 percent. Half the guest separates the two populations with margin on both
+/// sides.
+pub fn hint_covers_most_of_the_image(hint_bytes: u64, mem_len: u64) -> bool {
+    hint_bytes.saturating_mul(2) > mem_len
 }
 
 /// Read and validate a recorded set. `None` means "nothing usable here" — always a normal
@@ -1365,6 +1388,30 @@ mod tests {
             .expect("the retry must acquire the released sidecar");
         assert!(outcome.persisted);
         assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 2);
+    }
+
+    /// Issue #858's poisoned-sidecar tell: a hint covering most of the guest cannot be a
+    /// restore working set. The thresholds pin the measured populations: honest sets were
+    /// 6.5 and 14 GiB of a 128 GiB guest, poisoned ones 84 and 122 GiB.
+    #[test]
+    fn a_hint_covering_most_of_the_guest_is_flagged_as_suspect() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let guest = 128 * GIB;
+
+        // Honest restore working sets must not be flagged.
+        assert!(!hint_covers_most_of_the_image(13 * GIB / 2, guest));
+        assert!(!hint_covers_most_of_the_image(14 * GIB, guest));
+
+        // The two poisoned sidecars from the issue must be.
+        assert!(hint_covers_most_of_the_image(84 * GIB, guest));
+        assert!(hint_covers_most_of_the_image(122 * GIB, guest));
+
+        // Exactly half is the boundary: not suspect at half, suspect one granule past it.
+        assert!(!hint_covers_most_of_the_image(64 * GIB, guest));
+        assert!(hint_covers_most_of_the_image(64 * GIB + GRANULE, guest));
+
+        // An empty hint on an empty image is not suspect.
+        assert!(!hint_covers_most_of_the_image(0, 0));
     }
 
     #[test]
