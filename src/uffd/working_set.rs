@@ -532,8 +532,11 @@ impl WorkingSetStore {
                         guest_mib = mem_len / (1024 * 1024),
                         "recorded working set covers more than half the guest, which looks \
                          like a lifetime footprint rather than a restore working set (issue \
-                         #858); replay will populate all of it. Delete the sidecar to \
-                         re-record."
+                         #858); replay will populate all of it. To re-record: stop the serve \
+                         process, delete the sidecar, then restart the serve. Deleting it \
+                         while a serve is running does not repair that server; the loaded \
+                         hint stays in its in-memory union and the persistence worker can \
+                         write the sidecar again."
                     );
                 }
                 set
@@ -1412,6 +1415,73 @@ mod tests {
 
         // An empty hint on an empty image is not suspect.
         assert!(!hint_covers_most_of_the_image(0, 0));
+    }
+
+    /// The suspect-hint warning must order the repair as stop, delete, restart. Deleting
+    /// the sidecar while the serve is still running does not repair that server: the
+    /// suspect set stays in `WorkingSetStore::known`, later clones still replay it, and
+    /// the persistence worker can rewrite the sidecar, racing the deletion.
+    #[test]
+    fn suspect_hint_warning_orders_stop_before_delete_before_restart() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // Persist a hint covering more than half the image (33 of 64 granules).
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("suspect-warning", mem_len);
+        {
+            let store = open_store(&image, mem_len);
+            let mut set = store.recorder();
+            set.insert_range(0, 33 * GRANULE);
+            store.merge_and_persist(&set).unwrap();
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = open_store(&image, mem_len);
+        });
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("covers more than half the guest"),
+            "the suspect warning must fire for this hint; captured: {log}"
+        );
+        let stop = log
+            .find("stop the serve")
+            .unwrap_or_else(|| panic!("guidance must start with stopping the serve: {log}"));
+        let delete = log
+            .find("delete the sidecar")
+            .unwrap_or_else(|| panic!("guidance must include deleting the sidecar: {log}"));
+        let restart = log
+            .find("restart the serve")
+            .unwrap_or_else(|| panic!("guidance must end with restarting the serve: {log}"));
+        assert!(
+            stop < delete && delete < restart,
+            "repair steps must read stop, then delete, then restart: {log}"
+        );
     }
 
     #[test]

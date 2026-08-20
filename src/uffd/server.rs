@@ -538,6 +538,21 @@ pub fn record_window_from_env() -> Result<Duration> {
     }
 }
 
+/// How a UFFD server serves pages: the materialisation mode plus the working-set
+/// recording and replay knobs. `snapshot serve` resolves one from its CLI flags; the
+/// implicit server inside `snapshot run` resolves one from the environment.
+#[derive(Clone, Copy, Debug)]
+pub struct ServeShape {
+    /// Private per-clone `UFFDIO_COPY` (default) or one shared memfd resolved with
+    /// `UFFDIO_CONTINUE`.
+    pub backing: UffdBacking,
+    /// Whether clones replay the snapshot's recorded working set.
+    pub prefetch: Prefetch,
+    /// How long after its UFFD handshake each clone's demand faults keep being
+    /// recorded into that set. See [`DEFAULT_PREFETCH_RECORD_WINDOW`].
+    pub record_window: Duration,
+}
+
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
 pub struct UffdServer {
     snapshot_id: String,
@@ -577,10 +592,14 @@ impl UffdServer {
         generation_config_path: &Path,
         generation_lock_path: &Path,
         dir: &Path,
-        backing: UffdBacking,
-        prefetch: Prefetch,
-        record_window: Duration,
+        shape: ServeShape,
     ) -> Result<Self> {
+        let ServeShape {
+            backing,
+            prefetch,
+            record_window,
+        } = shape;
+
         // Before anything else: prove we can fail closed on this kernel.
         require_peer_pidfd_support()?;
 

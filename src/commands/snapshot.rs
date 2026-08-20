@@ -21,7 +21,8 @@ use crate::state::{
 };
 use crate::storage::{validate_snapshot_name, SnapshotGeneration, SnapshotManager};
 use crate::uffd::{
-    record_window_from_env, Prefetch, UffdBacking, UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,
+    record_window_from_env, Prefetch, ServeShape, UffdBacking, UffdServer,
+    DEFAULT_PREFETCH_RECORD_WINDOW,
 };
 use crate::volume::{SpawnedVolumes, VolumeConfig};
 
@@ -931,9 +932,11 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             .join("config.json"),
         &super::common::snapshot_sibling(&paths::snapshot_dir().join(&args.snapshot_name), "lock"),
         &paths::data_dir(),
-        backing,
-        prefetch,
-        record_window,
+        ServeShape {
+            backing,
+            prefetch,
+            record_window,
+        },
     )
     .await
     .context("creating UFFD server")?;
@@ -1949,9 +1952,11 @@ async fn cmd_snapshot_run_inner(
                     "lock",
                 ),
                 &data_dir,
-                backing,
-                prefetch,
-                record_window,
+                ServeShape {
+                    backing,
+                    prefetch,
+                    record_window,
+                },
             )
             .await
             .context("creating implicit UFFD server"));
