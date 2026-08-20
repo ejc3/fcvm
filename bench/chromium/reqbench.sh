@@ -458,10 +458,14 @@ assert_vm_artifacts_absent() {
 }
 
 # The build-to-golden handshake file for $IMAGE. cmd_build records the image
-# ID it published here; cmd_golden refuses a tag that resolves elsewhere.
+# ID it published here; cmd_golden consumes it (reads and removes it in one
+# rename) so a later golden with no preceding build cannot inherit a stale
+# record. The filename keys on a hash of the full image name: character
+# substitution is not injective (localhost/a_b:c and localhost/a:b_c would
+# share one file and clobber each other's records).
 built_image_id_file() {
     printf '%s/reqbench-locks/built-image-%s.id\n' \
-        "$DATA_ROOT" "$(printf '%s' "$IMAGE" | tr '/:' '__')"
+        "$DATA_ROOT" "$(printf '%s' "$IMAGE" | sha256sum | cut -c1-32)"
 }
 
 cmd_build() {
@@ -576,7 +580,15 @@ cmd_golden() {
     local built_id_file built_image_id=""
     built_id_file=$(built_image_id_file)
     if [ -e "$built_id_file" ]; then
-        built_image_id=$(tr -d '[:space:]' <"$built_id_file")
+        # Claim the record atomically: the rename makes this golden the only
+        # consumer, and removal afterwards keeps a later golden that had no
+        # build of its own from attesting this build's ID as its provenance.
+        local built_id_claim
+        built_id_claim="$built_id_file.consumed.$$"
+        mv "$built_id_file" "$built_id_claim" \
+            || { log "golden: cannot claim the built-image record $built_id_file"; return 1; }
+        built_image_id=$(tr -d '[:space:]' <"$built_id_claim")
+        rm -f "$built_id_claim"
         [[ "$built_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
             || { log "golden: recorded built-image ID in $built_id_file is invalid: '$built_image_id'"; return 1; }
         if [ "$image_id" != "$built_image_id" ]; then

@@ -4025,9 +4025,12 @@ exit 1
             self.assertIn("golden: PREPARE FAILED", result.stderr)
 
     def _built_id_path(self, data_root, image="localhost/chromium-bench-req"):
-        mangled = image.replace("/", "_").replace(":", "_")
+        # Same encoding as built_image_id_file: a hash of the full image name,
+        # because character substitution collides (localhost/a_b:c and
+        # localhost/a:b_c share one substituted name).
+        key = hashlib.sha256(image.encode()).hexdigest()[:32]
         return os.path.join(
-            data_root, "reqbench-locks", f"built-image-{mangled}.id",
+            data_root, "reqbench-locks", f"built-image-{key}.id",
         )
 
     def _golden_image_identity_fixture(self, d, snapshot_cache_key,
@@ -4287,6 +4290,49 @@ exit 1
             )) as source:
                 provenance = json.load(source)
             self.assertEqual(provenance["built_image_id"], recorded)
+
+    def test_golden_consumes_the_build_record(self):
+        """The record is one build-to-golden handshake, not a standing fact.
+
+        Left in place, a later golden with no build of its own would inherit
+        it: either attesting a stale built_image_id in provenance or rejecting
+        a legitimately retagged pre-existing image.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            recorded = "sha256:" + "b" * 64
+            result, _argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, built_image_id=recorded,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            self.assertFalse(
+                os.path.exists(self._built_id_path(d)),
+                "the build record must be consumed by the golden that read it",
+            )
+
+    def test_build_record_paths_do_not_collide_across_image_names(self):
+        """Substitution encodings collide (localhost/a_b:c vs localhost/a:b_c);
+        the record key must be injective, and the shell and the test helper
+        must agree on it byte for byte.
+        """
+        colliders = ("localhost/a_b:c", "localhost/a:b_c")
+        with tempfile.TemporaryDirectory() as d:
+            paths = [self._built_id_path(d, image) for image in colliders]
+            self.assertNotEqual(
+                paths[0], paths[1],
+                "two distinct image names share one build-record file",
+            )
+            for image in colliders:
+                shell = subprocess.run(
+                    ["bash", "-c",
+                     'export REQBENCH_STAGED=1 IMAGE="$1" DATA_ROOT="$2"; '
+                     'source "$3" >/dev/null 2>&1; built_image_id_file',
+                     "-", image, d, os.path.join(HERE, "reqbench.sh")],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(
+                    shell.stdout.strip(), self._built_id_path(d, image),
+                    f"shell and test helper disagree on the record path for {image}",
+                )
 
     def test_build_refuses_a_render_py_that_diverged_from_the_sealed_bundle(self):
         """The exec arm runs the image's render.py, the cdp arm the bundle's.
