@@ -749,7 +749,9 @@ impl WorkingSetStore {
 /// and 95 percent. Half the guest separates the two populations with margin on both
 /// sides.
 pub fn hint_covers_most_of_the_image(hint_bytes: u64, mem_len: u64) -> bool {
-    hint_bytes.saturating_mul(2) > mem_len
+    // Division, not saturating_mul(2): doubling saturates at u64::MAX and
+    // would call a more-than-half hint safe at the boundary.
+    hint_bytes > mem_len / 2
 }
 
 /// Read and validate a recorded set. `None` means "nothing usable here" — always a normal
@@ -1404,6 +1406,10 @@ mod tests {
         // Honest restore working sets must not be flagged.
         assert!(!hint_covers_most_of_the_image(13 * GIB / 2, guest));
         assert!(!hint_covers_most_of_the_image(14 * GIB, guest));
+        // Saturation boundary: doubling u64::MAX / 2 + 1 saturates to u64::MAX,
+        // which is not strictly greater than a u64::MAX-byte image, so the
+        // multiply form called a more-than-half hint safe.
+        assert!(hint_covers_most_of_the_image(u64::MAX / 2 + 1, u64::MAX));
 
         // The two poisoned sidecars from the issue must be.
         assert!(hint_covers_most_of_the_image(84 * GIB, guest));
