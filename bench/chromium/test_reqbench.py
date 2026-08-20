@@ -4229,15 +4229,20 @@ exit 1
         with tempfile.TemporaryDirectory() as d:
             env, binx = self._env(d, DATA_ROOT=d, REQBENCH_STAGED="1")
             image_id = "b" * 64
+            # No `image inspect` branch: the ID must come from the build's
+            # own --iidfile, so a regression back to inspecting the mutable
+            # tag after the build fails here instead of passing silently.
             self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
 case "$1" in
-  build) exit 0 ;;
-  inspect) echo '{{"Test":["CMD-SHELL","/opt/bench/health_state.sh"]}}'; exit 0 ;;
-  image)
-      [ "$2" = inspect ] || exit 1
-      echo {image_id}
+  build)
+      prev=""
+      for a in "$@"; do
+          [ "$prev" = --iidfile ] && printf 'sha256:{image_id}' > "$a"
+          prev="$a"
+      done
       exit 0
       ;;
+  inspect) echo '{{"Test":["CMD-SHELL","/opt/bench/health_state.sh"]}}'; exit 0 ;;
 esac
 exit 1
 ''')
@@ -4331,6 +4336,117 @@ exit 0
             self.assertFalse(
                 os.path.exists(built_marker),
                 "the image build ran against diverged render bytes",
+            )
+
+    def test_build_records_the_id_of_the_image_it_built_not_the_tags(self):
+        """RED BEFORE THE FIX: cmd_build inspected $IMAGE only after podman
+        build returned, so a retag in that window recorded the replacement's
+        ID and the build-to-golden handshake then blessed the replacement.
+        --iidfile captures the built image's ID as part of the build
+        operation itself. The stub plays the retag: the build writes BUILT to
+        its --iidfile while any later inspect of the tag answers SWAPPED."""
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, DATA_ROOT=d, REQBENCH_STAGED="1")
+            built = "a" * 64
+            swapped = "f" * 64
+            self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+case "$1" in
+  build)
+      prev=""
+      for a in "$@"; do
+          [ "$prev" = --iidfile ] && printf 'sha256:{built}' > "$a"
+          prev="$a"
+      done
+      exit 0
+      ;;
+  inspect) echo '{{"Test":["CMD-SHELL","/opt/bench/health_state.sh"]}}'; exit 0 ;;
+  image)
+      [ "$2" = inspect ] || exit 1
+      echo {swapped}
+      exit 0
+      ;;
+esac
+exit 1
+''')
+            result = subprocess.run(
+                [self.SH, "build"], env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            recorded = self._read_if_exists(
+                self._built_id_path(d), "<missing>").strip()
+            self.assertEqual(
+                recorded, "sha256:" + built,
+                "the handshake recorded an ID read from the mutable tag "
+                "after the build returned",
+            )
+
+    def test_build_bakes_the_sealed_bytes_when_the_repo_mutates_mid_build(self):
+        """RED BEFORE THE FIX: the cmp pre-check read the repository, then
+        podman read the SAME mutable repository as its build context, so an
+        edit landing between the check and podman's COPY still baked diverged
+        bytes while the cdp arm ran the sealed copy. The build must read from
+        an immutable staged context whose sealed sources come from the
+        runtime bundle. The stub plays the mid-build editor: it appends to
+        the repository's render.py first, then records the render bytes the
+        build context actually holds."""
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, DATA_ROOT=d)
+            srcrepo = os.path.join(d, "srcrepo")
+            bench_dir = os.path.join(srcrepo, "bench", "chromium")
+            os.makedirs(os.path.join(bench_dir, "pages"))
+            with open(os.path.join(bench_dir, "pages", "medium.html"), "w") as f:
+                f.write("<html></html>\n")
+            for name in ("render.py", "cdpdrive.py", "wddrive.py"):
+                shutil.copyfile(
+                    os.path.join(HERE, name), os.path.join(bench_dir, name),
+                )
+            with open(os.path.join(
+                    srcrepo, "Containerfile.chromium-bench"), "w") as f:
+                f.write("FROM scratch\nCOPY bench/chromium/render.py /opt/\n")
+            subprocess.run(
+                ["git", "init", "-q", srcrepo],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", srcrepo, "add", "-A"],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", srcrepo, "-c", "user.name=t",
+                 "-c", "user.email=t@example.com", "commit", "-qm", "seed"],
+                check=True, capture_output=True, text=True,
+            )
+            baked = os.path.join(d, "baked-render.py")
+            self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+if [ "$1" = build ]; then
+    # The mid-build edit: it lands after every pre-check has passed, exactly
+    # when the real podman would be reading COPY sources from the context.
+    echo "# edit landed while podman was reading the context" \
+        >> {srcrepo}/bench/chromium/render.py
+    prev=""; ctx=""; iid=""
+    for a in "$@"; do
+        [ "$prev" = --iidfile ] && iid="$a"
+        prev="$a"; ctx="$a"
+    done
+    [ -z "$iid" ] || printf 'sha256:%s' "$(printf 'c%.0s' {{1..64}})" > "$iid"
+    cp "$ctx/bench/chromium/render.py" {baked}
+    exit 0
+fi
+[ "$1" = inspect ] && {{ echo '{{"Test":["CMD-SHELL","/opt/bench/health_state.sh"]}}'; exit 0; }}
+[ "$1 $2" = "image inspect" ] && {{ echo {"b" * 64}; exit 0; }}
+exit 1
+''')
+            result = subprocess.run(
+                [self.SH, "build"], env=dict(env, REQBENCH_SOURCE_REPO=srcrepo),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            with open(os.path.join(HERE, "render.py")) as f:
+                sealed = f.read()
+            self.assertEqual(
+                self._read_if_exists(baked, "<no context recorded>"), sealed,
+                "the image baked repository bytes, not the sealed bundle's",
             )
 
     def _run_stub(self, d, backend, analyzer_rc=0, sudo_env_reset=False):

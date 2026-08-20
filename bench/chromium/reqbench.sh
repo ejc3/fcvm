@@ -466,40 +466,72 @@ built_image_id_file() {
 
 cmd_build() {
     log "building $IMAGE"
-    # The bundle sealed this invocation's request code at process start, but
-    # the image build COPYs from the live repository. An edit in between puts
-    # different render bytes in the exec arm (image copy) than in the CDP arm
-    # (bundle copy) while every seal check passes: the staging guard compares
-    # git HEAD only, which cannot see an uncommitted edit.
+    local sealed_source ctx built_id id_file id_tmp iid_tmp
+    # Fail-fast pre-check. The bundle sealed this invocation's request code at
+    # process start, but the repository is what feeds the image, and the
+    # staging guard compares git HEAD only, which cannot see an uncommitted
+    # edit. Diverged bytes here mean the exec arm (image copy) and the CDP
+    # arm (bundle copy) would run different render code under a passing seal.
     if [ -n "${REQBENCH_RUNTIME_BUNDLE:-}" ]; then
-        local sealed_source
         for sealed_source in render.py cdpdrive.py wddrive.py; do
             cmp -s "$REPO/bench/chromium/$sealed_source" \
                 "$REQBENCH_RUNTIME_BUNDLE/$sealed_source" \
                 || { log "FATAL: $sealed_source in $REPO/bench/chromium diverged from the sealed runtime bundle; the image would bake different bytes than this run executes"; return 1; }
         done
     fi
+    # Podman reads COPY sources when the build executes, not when the check
+    # above ran, so an edit landing in between would still bake into the
+    # image. Build from an immutable staged context instead: the
+    # Containerfiles COPY only bench/chromium top-level files and
+    # bench/chromium/pages/, and the sealed sources come from the runtime
+    # bundle, not the repository. A Containerfile that grows a COPY source
+    # outside this set fails the build loudly; extend the staging here.
+    ctx=$(mktemp -d "$RESULTS/logs/build-context.XXXXXX") \
+        || { log "FATAL: cannot create a staged build context under $RESULTS/logs"; return 1; }
+    mkdir -p "$ctx/bench/chromium"
+    find "$REPO/bench/chromium" -maxdepth 1 -type f \
+        -exec cp --reflink=auto -t "$ctx/bench/chromium" {} + \
+        || { log "FATAL: cannot stage bench/chromium sources into $ctx"; return 1; }
+    cp -a --reflink=auto "$REPO/bench/chromium/pages" "$ctx/bench/chromium/pages" \
+        || { log "FATAL: cannot stage bench/chromium/pages into $ctx"; return 1; }
+    cp --reflink=auto "$REPO/$CONTAINERFILE" "$ctx/$CONTAINERFILE" \
+        || { log "FATAL: cannot stage $CONTAINERFILE into $ctx"; return 1; }
+    if [ -n "${REQBENCH_RUNTIME_BUNDLE:-}" ]; then
+        for sealed_source in render.py cdpdrive.py wddrive.py; do
+            cp --reflink=auto "$REQBENCH_RUNTIME_BUNDLE/$sealed_source" \
+                "$ctx/bench/chromium/$sealed_source" \
+                || { log "FATAL: cannot stage sealed $sealed_source into $ctx"; return 1; }
+        done
+    fi
     # --format docker is LOAD-BEARING: podman's default OCI format DROPS
     # HEALTHCHECK with only a warning, and fcvm's health gate is what
     # triggers the golden snapshot (src/health.rs AND-logic).
-    podman build --format docker -t "$IMAGE" -f "$REPO/$CONTAINERFILE" "$REPO"
+    # --iidfile is equally load-bearing: podman records the ID of the image
+    # THIS build produced as part of the build operation itself. Inspecting
+    # the tag afterwards reads whatever the tag points at by then, which a
+    # concurrent retag in that window can change.
+    iid_tmp=$(mktemp "$RESULTS/logs/build-iid.XXXXXX") \
+        || { log "FATAL: cannot stage the image-ID capture under $RESULTS/logs"; return 1; }
+    podman build --format docker --iidfile "$iid_tmp" -t "$IMAGE" \
+        -f "$ctx/$CONTAINERFILE" "$ctx"
+    built_id=$(tr -d '[:space:]' <"$iid_tmp")
+    rm -f "$iid_tmp"
+    rm -rf -- "$ctx"
+    built_id="sha256:${built_id#sha256:}"
+    [[ "$built_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
+        || { log "FATAL: podman recorded no valid image ID for $IMAGE (got '$built_id')"; return 1; }
     # The warm gate lives or dies here. fcvm treats a MISSING healthcheck as a
     # PASS, so an image that lost it snapshots a COLD browser and every clone's
     # "warm" latency is really a first-paint number. Assert the healthcheck
-    # exists AND is ours: health_state.sh, which reports healthy only for a
-    # FRESH verdict from the resident checker, which in turn requires the warm
-    # marker that entry.sh touches only after a full navigate + screenshot.
-    podman inspect "$IMAGE" --format '{{json .HealthCheck}}' | grep -q health_state \
+    # exists AND is ours, on the built ID rather than the retaggable tag:
+    # health_state.sh reports healthy only for a FRESH verdict from the
+    # resident checker, which in turn requires the warm marker that entry.sh
+    # touches only after a full navigate + screenshot.
+    podman inspect "$built_id" --format '{{json .HealthCheck}}' | grep -q health_state \
         || { log "FATAL: image has no HEALTHCHECK naming health_state.sh (OCI format drop, or the Containerfile changed without this check)"; return 1; }
     # Record the ID this build published so cmd_golden, which runs as a
     # separate process with the TAG lock released in between, can refuse a
     # tag another worktree repointed in that window.
-    local built_id id_file id_tmp
-    built_id=$(podman image inspect --format '{{.Id}}' "$IMAGE") \
-        || { log "FATAL: cannot read the image ID podman published for $IMAGE"; return 1; }
-    built_id="sha256:${built_id#sha256:}"
-    [[ "$built_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
-        || { log "FATAL: podman reported invalid image ID '$built_id' for $IMAGE"; return 1; }
     mkdir -p "$DATA_ROOT/reqbench-locks"
     id_file=$(built_image_id_file)
     id_tmp=$(mktemp "$id_file.XXXXXX") \
