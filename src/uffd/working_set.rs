@@ -524,6 +524,21 @@ impl WorkingSetStore {
                     key = ?key,
                     "loaded recorded restore working set"
                 );
+                if hint_covers_most_of_the_image(set.bytes(), mem_len) {
+                    warn!(
+                        target: "uffd",
+                        path = %path.display(),
+                        hint_mib = set.bytes() / (1024 * 1024),
+                        guest_mib = mem_len / (1024 * 1024),
+                        "recorded working set covers more than half the guest, which looks \
+                         like a lifetime footprint rather than a restore working set (issue \
+                         #858); replay will populate all of it. To re-record: stop the serve \
+                         process, delete the sidecar, then restart the serve. Deleting it \
+                         while a serve is running does not repair that server; the loaded \
+                         hint stays in its in-memory union and the persistence worker can \
+                         write the sidecar again."
+                    );
+                }
                 set
             }
             None => PageSet::empty(mem_len),
@@ -724,6 +739,19 @@ impl WorkingSetStore {
             }
         }
     }
+}
+
+/// Whether a recorded hint is so large relative to the guest that it looks like a
+/// lifetime footprint rather than a restore working set.
+///
+/// Honest restore working sets measured 5 to 11 percent of guest memory (6.5 and 14 GiB
+/// of a 128 GiB guest, issue #858); the two poisoned sidecars observed there covered 66
+/// and 95 percent. Half the guest separates the two populations with margin on both
+/// sides.
+pub fn hint_covers_most_of_the_image(hint_bytes: u64, mem_len: u64) -> bool {
+    // Division, not saturating_mul(2): doubling saturates at u64::MAX and
+    // would call a more-than-half hint safe at the boundary.
+    hint_bytes > mem_len / 2
 }
 
 /// Read and validate a recorded set. `None` means "nothing usable here" — always a normal
@@ -1365,6 +1393,101 @@ mod tests {
             .expect("the retry must acquire the released sidecar");
         assert!(outcome.persisted);
         assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 2);
+    }
+
+    /// Issue #858's poisoned-sidecar tell: a hint covering most of the guest cannot be a
+    /// restore working set. The thresholds pin the measured populations: honest sets were
+    /// 6.5 and 14 GiB of a 128 GiB guest, poisoned ones 84 and 122 GiB.
+    #[test]
+    fn a_hint_covering_most_of_the_guest_is_flagged_as_suspect() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let guest = 128 * GIB;
+
+        // Honest restore working sets must not be flagged.
+        assert!(!hint_covers_most_of_the_image(13 * GIB / 2, guest));
+        assert!(!hint_covers_most_of_the_image(14 * GIB, guest));
+        // Saturation boundary: doubling u64::MAX / 2 + 1 saturates to u64::MAX,
+        // which is not strictly greater than a u64::MAX-byte image, so the
+        // multiply form called a more-than-half hint safe.
+        assert!(hint_covers_most_of_the_image(u64::MAX / 2 + 1, u64::MAX));
+
+        // The two poisoned sidecars from the issue must be.
+        assert!(hint_covers_most_of_the_image(84 * GIB, guest));
+        assert!(hint_covers_most_of_the_image(122 * GIB, guest));
+
+        // Exactly half is the boundary: not suspect at half, suspect one granule past it.
+        assert!(!hint_covers_most_of_the_image(64 * GIB, guest));
+        assert!(hint_covers_most_of_the_image(64 * GIB + GRANULE, guest));
+
+        // An empty hint on an empty image is not suspect.
+        assert!(!hint_covers_most_of_the_image(0, 0));
+    }
+
+    /// The suspect-hint warning must order the repair as stop, delete, restart. Deleting
+    /// the sidecar while the serve is still running does not repair that server: the
+    /// suspect set stays in `WorkingSetStore::known`, later clones still replay it, and
+    /// the persistence worker can rewrite the sidecar, racing the deletion.
+    #[test]
+    fn suspect_hint_warning_orders_stop_before_delete_before_restart() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // Persist a hint covering more than half the image (33 of 64 granules).
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("suspect-warning", mem_len);
+        {
+            let store = open_store(&image, mem_len);
+            let mut set = store.recorder();
+            set.insert_range(0, 33 * GRANULE);
+            store.merge_and_persist(&set).unwrap();
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = open_store(&image, mem_len);
+        });
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("covers more than half the guest"),
+            "the suspect warning must fire for this hint; captured: {log}"
+        );
+        let stop = log
+            .find("stop the serve")
+            .unwrap_or_else(|| panic!("guidance must start with stopping the serve: {log}"));
+        let delete = log
+            .find("delete the sidecar")
+            .unwrap_or_else(|| panic!("guidance must include deleting the sidecar: {log}"));
+        let restart = log
+            .find("restart the serve")
+            .unwrap_or_else(|| panic!("guidance must end with restarting the serve: {log}"));
+        assert!(
+            stop < delete && delete < restart,
+            "repair steps must read stop, then delete, then restart: {log}"
+        );
     }
 
     #[test]

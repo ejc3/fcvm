@@ -452,6 +452,14 @@ pub struct SnapshotServeArgs {
     /// - `off`: no recording, no replay — every clone faults every page in.
     #[arg(long, value_name = "on|off", env = "FCVM_UFFD_PREFETCH")]
     pub uffd_prefetch: Option<String>,
+
+    /// Seconds after a clone's UFFD handshake during which its demand faults are recorded
+    /// into the snapshot's working set. Past the window the clone is served exactly as
+    /// before but no longer recorded, so a long-lived clone cannot grow the hint into its
+    /// lifetime footprint. 0 records nothing; replay of an existing hint is unaffected.
+    /// Default: 300 (a safety bound pending empirical tuning, see issue #858).
+    #[arg(long, value_name = "secs", env = "FCVM_UFFD_PREFETCH_RECORD_WINDOW")]
+    pub uffd_prefetch_record_window: Option<u64>,
 }
 
 #[derive(Args, Debug)]
