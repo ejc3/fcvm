@@ -155,6 +155,48 @@ pub struct FirecrackerConfig {
     /// attached disk) is skip-serialized so those keys are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_disk_identity: Option<String>,
+    /// Host-derived DNS fallback (the host's resolv.conf servers), used when
+    /// --dns is absent. fc-agent writes these into the guest's resolv.conf at
+    /// boot, so they are baked into any snapshot; without this field a host
+    /// resolver change cache-hits a snapshot answering with the old servers
+    /// (#821). Empty when --dns overrides it (the fallback is never emitted
+    /// then, and hashing it would fragment keys between hosts whose guests
+    /// boot identically). Empty (the default) is skip-serialized so existing
+    /// keys are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_dns: Vec<String>,
+    /// Host-derived DNS search domains (resolv.conf `search` line), forwarded
+    /// as `fcvm_dns_search=` and written into the guest's resolv.conf at boot.
+    /// Baked into snapshots, so part of the cache key (#821). Empty (the
+    /// default) is skip-serialized so existing keys are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_search: Vec<String>,
+    /// FUSE reader thread count (RuntimeConfig.fuse_readers or
+    /// FCVM_FUSE_READERS), forwarded as `fuse_readers=`. Changes fc-agent's
+    /// FUSE thread and memory shape captured in the snapshot, so part of the
+    /// cache key (#821). None (the default) is skip-serialized so existing
+    /// keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_readers: Option<String>,
+    /// FUSE per-operation trace rate (FCVM_FUSE_TRACE_RATE), forwarded as
+    /// `fuse_trace_rate=`. Guest-visible boot behavior baked into snapshots,
+    /// so part of the cache key (#821). None (the default) is skip-serialized
+    /// so existing keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_trace_rate: Option<String>,
+    /// FUSE max_write cap (FCVM_FUSE_MAX_WRITE), forwarded as
+    /// `fuse_max_write=`. Guest-visible boot behavior baked into snapshots,
+    /// so part of the cache key (#821). None (the default) is skip-serialized
+    /// so existing keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_max_write: Option<String>,
+    /// Whether the guest disables the FUSE writeback cache
+    /// (FCVM_NO_WRITEBACK_CACHE), forwarded as `no_writeback_cache=1`.
+    /// Guest-visible boot behavior baked into snapshots, so part of the cache
+    /// key (#821). false (the default) is skip-serialized so existing keys
+    /// are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_writeback_cache: bool,
 }
 
 impl Default for FirecrackerConfig {
@@ -190,6 +232,12 @@ impl Default for FirecrackerConfig {
             agent_strace: false,
             extra_boot_args: None,
             image_disk_identity: None,
+            host_dns: Vec::new(),
+            dns_search: Vec::new(),
+            fuse_readers: None,
+            fuse_trace_rate: None,
+            fuse_max_write: None,
+            no_writeback_cache: false,
         }
     }
 }
@@ -618,6 +666,60 @@ mod tests {
         config3.image_disk_identity = Some("2007:73678848:1765581300.000000000".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
         assert_ne!(config2.snapshot_key(), config3.snapshot_key());
+    }
+
+    /// The host-derived DNS fallback is written into the guest's resolv.conf
+    /// at boot, so hosts whose resolv.conf differs must not share a snapshot,
+    /// and a host resolver change must be a cache miss (#821).
+    #[test]
+    fn test_snapshot_key_changes_with_host_dns() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.host_dns = vec!["1.1.1.1".to_string()];
+        let mut config3 = test_config();
+        config3.host_dns = vec!["8.8.8.8".to_string()];
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+        assert_ne!(config2.snapshot_key(), config3.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_dns_search() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.dns_search = vec!["corp.example".to_string()];
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_fuse_readers() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.fuse_readers = Some("64".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_fuse_trace_rate() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.fuse_trace_rate = Some("100".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_fuse_max_write() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.fuse_max_write = Some("32768".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_no_writeback_cache() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.no_writeback_cache = true;
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]

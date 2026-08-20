@@ -309,6 +309,7 @@ pub(super) fn build_firecracker_config(
     firecracker_bin: Option<&Path>,
     image_disk_identity: Option<String>,
     extra_boot_args: Option<String>,
+    boot_inputs: super::vm_config::GuestBootInputs,
 ) -> crate::firecracker::FirecrackerConfig {
     // image_identifier is the digest for localhost images (content-addressed cache key).
     // args.image is the original name (what the guest uses to find the image).
@@ -377,6 +378,12 @@ pub(super) fn build_firecracker_config(
         agent_strace: args.strace_agent,
         extra_boot_args,
         image_disk_identity,
+        host_dns: boot_inputs.host_dns,
+        dns_search: boot_inputs.dns_search,
+        fuse_readers: boot_inputs.fuse_readers,
+        fuse_trace_rate: boot_inputs.fuse_trace_rate,
+        fuse_max_write: boot_inputs.fuse_max_write,
+        no_writeback_cache: boot_inputs.no_writeback_cache,
     }
 }
 

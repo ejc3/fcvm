@@ -37,7 +37,7 @@ pub use snapshot::{
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
-    setup_nfs_exports,
+    setup_nfs_exports, GuestBootInputs,
 };
 use vm_config::{run_vm_setup, VmSetupParams};
 
@@ -1205,6 +1205,7 @@ async fn prepare_vm_for_lifecycle(
             runtime_config.firecracker_bin.as_deref(),
             image_disk_identity.clone(),
             vm_config::effective_extra_boot_args(&runtime_config),
+            GuestBootInputs::resolve(args.dns.as_deref(), &runtime_config),
         );
         let key = config.snapshot_key();
 
@@ -2751,6 +2752,7 @@ mod tests {
                 None,
                 None,
                 extra,
+                GuestBootInputs::default(),
             )
             .snapshot_key()
         };
@@ -2776,6 +2778,112 @@ mod tests {
             key(&base, None),
             key(&base, Some("arm64.nv2".to_string())),
             "extra boot args must change the key"
+        );
+    }
+
+    /// #821 helper: snapshot key of a config built through the real
+    /// constructor from the given guest boot inputs. The host-derived DNS
+    /// values and the FUSE knobs are guest-visible boot inputs, baked into
+    /// the guest at boot and therefore into any snapshot taken from it, so
+    /// two runs differing only in one of them must never share a snapshot.
+    /// Before FirecrackerConfig carried these fields the keys came out equal
+    /// and a cache hit silently served a guest built with the other value.
+    fn boot_inputs_key(inputs: GuestBootInputs) -> String {
+        use std::path::Path;
+        build_firecracker_config(
+            &test_args(),
+            "sha256:test",
+            Path::new("/kernel"),
+            Path::new("/rootfs"),
+            Path::new("/initrd"),
+            None,
+            ImageMode::Overlay,
+            None,
+            None,
+            None,
+            inputs,
+        )
+        .snapshot_key()
+    }
+
+    #[test]
+    fn host_dns_fallback_changes_snapshot_key() {
+        let dns = |servers: &[&str]| GuestBootInputs {
+            host_dns: servers.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(dns(&["1.1.1.1"])),
+            "host DNS fallback must change the key"
+        );
+        assert_ne!(
+            boot_inputs_key(dns(&["1.1.1.1"])),
+            boot_inputs_key(dns(&["8.8.8.8"])),
+            "hosts with different resolv.conf servers must not share a snapshot"
+        );
+    }
+
+    #[test]
+    fn dns_search_changes_snapshot_key() {
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(GuestBootInputs {
+                dns_search: vec!["corp.example".to_string()],
+                ..Default::default()
+            }),
+            "DNS search domains must change the key"
+        );
+    }
+
+    #[test]
+    fn fuse_readers_changes_snapshot_key() {
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs {
+                fuse_readers: Some("8".to_string()),
+                ..Default::default()
+            }),
+            boot_inputs_key(GuestBootInputs {
+                fuse_readers: Some("64".to_string()),
+                ..Default::default()
+            }),
+            "fuse_readers must change the key"
+        );
+    }
+
+    #[test]
+    fn fuse_trace_rate_changes_snapshot_key() {
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(GuestBootInputs {
+                fuse_trace_rate: Some("100".to_string()),
+                ..Default::default()
+            }),
+            "fuse_trace_rate must change the key"
+        );
+    }
+
+    #[test]
+    fn fuse_max_write_changes_snapshot_key() {
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(GuestBootInputs {
+                fuse_max_write: Some("32768".to_string()),
+                ..Default::default()
+            }),
+            "fuse_max_write must change the key"
+        );
+    }
+
+    #[test]
+    fn no_writeback_cache_changes_snapshot_key() {
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(GuestBootInputs {
+                no_writeback_cache: true,
+                ..Default::default()
+            }),
+            "no_writeback_cache must change the key"
         );
     }
 

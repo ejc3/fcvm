@@ -3100,9 +3100,9 @@ async fn build_clone_reboot_plan(
         &initrd_path,
         &None,
         runtime_config,
+        super::podman::GuestBootInputs::resolve(synth_args.dns.as_deref(), runtime_config),
     );
-    let boot_args =
-        super::podman::build_runtime_boot_args(&synth_args, network_config, runtime_config);
+    let boot_args = super::podman::build_runtime_boot_args(network_config, &launch_config);
 
     let volume_mappings = synth_args
         .map
