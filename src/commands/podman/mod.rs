@@ -37,7 +37,7 @@ pub use snapshot::{
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
-    setup_nfs_exports,
+    setup_nfs_exports, GuestBootInputs,
 };
 use vm_config::{run_vm_setup, VmSetupParams};
 
@@ -1188,6 +1188,11 @@ async fn prepare_vm_for_lifecycle(
             .unwrap_or(false),
         std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock"),
     );
+    // Resolved ONCE for the whole launch. The same values feed the snapshot
+    // key (via fc_config or the fallback launch config) and the bridged
+    // network's guest DNS below, so the hashed value and the guest-visible
+    // value cannot diverge on a mid-launch resolv.conf change (#863).
+    let boot_inputs = GuestBootInputs::resolve(args.dns.as_deref(), &runtime_config);
     let (fc_config, snapshot_key, prepare_target): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
@@ -1205,6 +1210,7 @@ async fn prepare_vm_for_lifecycle(
             runtime_config.firecracker_bin.as_deref(),
             image_disk_identity.clone(),
             vm_config::effective_extra_boot_args(&runtime_config),
+            boot_inputs.clone(),
         );
         let key = config.snapshot_key();
 
@@ -1453,11 +1459,24 @@ async fn prepare_vm_for_lifecycle(
 
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let mut network: Box<dyn NetworkManager> = match args.network {
-        NetworkMode::Bridged => Box::new(BridgedNetwork::new(
-            vm_id.clone(),
-            tap_device.clone(),
-            port_mappings.clone(),
-        )),
+        NetworkMode::Bridged => {
+            // The guest's resolver is the first hashed host_dns entry,
+            // threaded from the same resolution the snapshot key saw instead
+            // of re-read inside setup() (#863). Fail closed like the old
+            // in-setup read did: a bridged guest NATs straight out and needs
+            // a real resolver, and --dns is the override.
+            if args.dns.is_none() && boot_inputs.host_dns.is_empty() {
+                bail!(
+                    "no usable host DNS server for bridged mode (VMs cannot use a \
+                     loopback stub resolver; on systemd-resolved hosts mount \
+                     /run/systemd/resolve). Pass --dns to override."
+                );
+            }
+            Box::new(
+                BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                    .with_dns_server(boot_inputs.host_dns.first().cloned()),
+            )
+        }
         NetworkMode::Routed => {
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
@@ -1754,6 +1773,7 @@ async fn prepare_vm_for_lifecycle(
             image_disk_path: image_disk_path.as_deref(),
             fc_config,
             runtime_config: &runtime_config,
+            boot_inputs,
         },
         network.as_mut(),
         &state_manager,
@@ -2751,6 +2771,7 @@ mod tests {
                 None,
                 None,
                 extra,
+                GuestBootInputs::default(),
             )
             .snapshot_key()
         };
@@ -2776,6 +2797,197 @@ mod tests {
             key(&base, None),
             key(&base, Some("arm64.nv2".to_string())),
             "extra boot args must change the key"
+        );
+    }
+
+    /// #821 helper: snapshot key of a config built through the real
+    /// constructor from the given guest boot inputs. The host-derived DNS
+    /// values and the FUSE knobs are guest-visible boot inputs, baked into
+    /// the guest at boot and therefore into any snapshot taken from it, so
+    /// two runs differing only in one of them must never share a snapshot.
+    /// Before FirecrackerConfig carried these fields the keys came out equal
+    /// and a cache hit silently served a guest built with the other value.
+    fn key_for(args: &RunArgs, inputs: GuestBootInputs) -> String {
+        use std::path::Path;
+        build_firecracker_config(
+            args,
+            "sha256:test",
+            Path::new("/kernel"),
+            Path::new("/rootfs"),
+            Path::new("/initrd"),
+            None,
+            ImageMode::Overlay,
+            None,
+            None,
+            None,
+            inputs,
+        )
+        .snapshot_key()
+    }
+
+    fn boot_inputs_key(inputs: GuestBootInputs) -> String {
+        key_for(&test_args(), inputs)
+    }
+
+    /// #863: bridged mode forwards exactly one resolver to the guest
+    /// (network_config.dns_server is the first host entry), so the key must
+    /// hash exactly that. Keying the whole host list cold-boots a guest whose
+    /// cmdline is identical whenever a secondary nameserver changes. Rootless
+    /// mode emits the whole list, so every entry must keep keying there.
+    #[test]
+    fn bridged_mode_keys_only_the_emitted_dns() {
+        let dns = |servers: &[&str]| GuestBootInputs {
+            host_dns: servers.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let bridged = |servers: &[&str]| {
+            let mut args = test_args();
+            args.network = NetworkMode::Bridged;
+            key_for(&args, dns(servers))
+        };
+        assert_eq!(
+            bridged(&["1.1.1.1", "8.8.8.8"]),
+            bridged(&["1.1.1.1", "9.9.9.9"]),
+            "a secondary nameserver never reaches a bridged guest and must not change its key"
+        );
+        assert_ne!(
+            bridged(&["1.1.1.1", "8.8.8.8"]),
+            bridged(&["8.8.8.8", "8.8.8.8"]),
+            "the first resolver IS emitted to a bridged guest and must change the key"
+        );
+        assert_ne!(
+            boot_inputs_key(dns(&["1.1.1.1", "8.8.8.8"])),
+            boot_inputs_key(dns(&["1.1.1.1", "9.9.9.9"])),
+            "rootless mode emits the whole list, so a secondary change must still key"
+        );
+    }
+
+    /// #863: with no --map, fc-agent never calls mount_fuse_volumes
+    /// (fc-agent/src/agent.rs gates it on plan.volumes, and the four knobs are
+    /// read only inside fc-agent/src/fuse/mod.rs's mount path), so the knobs
+    /// cannot affect a volume-free guest and must not fragment its key.
+    #[test]
+    fn fuse_knobs_do_not_fragment_volume_free_keys() {
+        let knobs = || GuestBootInputs {
+            fuse_readers: Some("8".to_string()),
+            fuse_trace_rate: Some("100".to_string()),
+            fuse_max_write: Some("32768".to_string()),
+            no_writeback_cache: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(knobs()),
+            "FUSE knobs are dormant without volumes and must not change the key"
+        );
+        assert_ne!(
+            key_for(&fuse_volume_args(), GuestBootInputs::default()),
+            key_for(&fuse_volume_args(), knobs()),
+            "with a volume mapped the knobs shape the guest's FUSE mounts and must key"
+        );
+    }
+
+    /// Args with a FUSE volume mapped: the four FUSE knobs only reach the
+    /// guest's mount path when the run maps volumes.
+    fn fuse_volume_args() -> RunArgs {
+        let mut args = test_args();
+        args.map = vec!["/tmp/data:/data".to_string()];
+        args
+    }
+
+    #[test]
+    fn host_dns_fallback_changes_snapshot_key() {
+        let dns = |servers: &[&str]| GuestBootInputs {
+            host_dns: servers.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(dns(&["1.1.1.1"])),
+            "host DNS fallback must change the key"
+        );
+        assert_ne!(
+            boot_inputs_key(dns(&["1.1.1.1"])),
+            boot_inputs_key(dns(&["8.8.8.8"])),
+            "hosts with different resolv.conf servers must not share a snapshot"
+        );
+    }
+
+    #[test]
+    fn dns_search_changes_snapshot_key() {
+        assert_ne!(
+            boot_inputs_key(GuestBootInputs::default()),
+            boot_inputs_key(GuestBootInputs {
+                dns_search: vec!["corp.example".to_string()],
+                ..Default::default()
+            }),
+            "DNS search domains must change the key"
+        );
+    }
+
+    #[test]
+    fn fuse_readers_changes_snapshot_key() {
+        assert_ne!(
+            key_for(
+                &fuse_volume_args(),
+                GuestBootInputs {
+                    fuse_readers: Some("8".to_string()),
+                    ..Default::default()
+                }
+            ),
+            key_for(
+                &fuse_volume_args(),
+                GuestBootInputs {
+                    fuse_readers: Some("64".to_string()),
+                    ..Default::default()
+                }
+            ),
+            "fuse_readers must change the key of a run with volumes"
+        );
+    }
+
+    #[test]
+    fn fuse_trace_rate_changes_snapshot_key() {
+        assert_ne!(
+            key_for(&fuse_volume_args(), GuestBootInputs::default()),
+            key_for(
+                &fuse_volume_args(),
+                GuestBootInputs {
+                    fuse_trace_rate: Some("100".to_string()),
+                    ..Default::default()
+                }
+            ),
+            "fuse_trace_rate must change the key of a run with volumes"
+        );
+    }
+
+    #[test]
+    fn fuse_max_write_changes_snapshot_key() {
+        assert_ne!(
+            key_for(&fuse_volume_args(), GuestBootInputs::default()),
+            key_for(
+                &fuse_volume_args(),
+                GuestBootInputs {
+                    fuse_max_write: Some("32768".to_string()),
+                    ..Default::default()
+                }
+            ),
+            "fuse_max_write must change the key of a run with volumes"
+        );
+    }
+
+    #[test]
+    fn no_writeback_cache_changes_snapshot_key() {
+        assert_ne!(
+            key_for(&fuse_volume_args(), GuestBootInputs::default()),
+            key_for(
+                &fuse_volume_args(),
+                GuestBootInputs {
+                    no_writeback_cache: true,
+                    ..Default::default()
+                }
+            ),
+            "no_writeback_cache must change the key of a run with volumes"
         );
     }
 

@@ -182,12 +182,17 @@ fn rebuild_proxy_url(parsed: &Url, host: String, port: u16) -> String {
 
 /// Build runtime boot arguments for the kernel command line.
 ///
-/// These are per-instance values NOT included in the snapshot cache key:
-/// network IP config, IPv6, DNS, strace, profile boot args, FUSE tuning.
+/// Per-instance network values (`ip=` and `ipv6=` addresses) are excluded
+/// from the snapshot key by design. The mode's DNS choice in `network_config`
+/// is either a constant (pasta's forwarder), the --dns override (hashed via
+/// dns_server), or bridged mode's first host resolver (hashed via host_dns
+/// and threaded into BridgedNetwork from the same resolution, #863). Every
+/// other token is emitted from `launch_config`, the same hashed
+/// FirecrackerConfig the snapshot key is computed from, so the hashed value
+/// and the value the guest boots with cannot diverge (#821).
 pub(crate) fn build_runtime_boot_args(
-    args: &RunArgs,
     network_config: &crate::network::NetworkConfig,
-    runtime_config: &crate::commands::common::RuntimeConfig,
+    launch_config: &crate::firecracker::FirecrackerConfig,
 ) -> String {
     let mut boot_args = String::new();
 
@@ -224,15 +229,16 @@ pub(crate) fn build_runtime_boot_args(
         boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
     }
 
-    // Pass DNS servers to guest for resolv.conf configuration
-    // Both rootless and bridged: use host DNS servers directly (reachable via
-    // pasta's L4 translation or bridge/NAT respectively)
+    // Pass DNS servers to guest for resolv.conf configuration: the mode's
+    // DNS choice recorded in network_config (pasta forwarder, the bridged
+    // first-hashed-host_dns entry threaded at network construction, or the
+    // --dns override), else the hashed host fallback resolved at config
+    // construction (#821).
     {
         let dns_servers = if let Some(ref dns) = network_config.dns_server {
-            // Use the network-mode-specific DNS (pasta forwarder or host DNS)
             vec![dns.clone()]
         } else {
-            crate::network::get_host_dns_servers().unwrap_or_default()
+            launch_config.host_dns.clone()
         };
 
         if !dns_servers.is_empty() {
@@ -244,26 +250,19 @@ pub(crate) fn build_runtime_boot_args(
         }
 
         // Pass search domains for short hostname resolution
-        if let Ok(content) = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
-            .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
-        {
-            let search: Vec<&str> = content
-                .lines()
-                .filter_map(|l| l.trim().strip_prefix("search "))
-                .next()
-                .map(|s| s.split_whitespace().collect())
-                .unwrap_or_default();
-            if !search.is_empty() {
-                if !boot_args.is_empty() {
-                    boot_args.push(' ');
-                }
-                boot_args.push_str(&format!("fcvm_dns_search={}", search.join("|")));
+        if !launch_config.dns_search.is_empty() {
+            if !boot_args.is_empty() {
+                boot_args.push(' ');
             }
+            boot_args.push_str(&format!(
+                "fcvm_dns_search={}",
+                launch_config.dns_search.join("|")
+            ));
         }
     }
 
     // Enable fc-agent strace debugging if requested
-    if args.strace_agent {
+    if launch_config.agent_strace {
         if !boot_args.is_empty() {
             boot_args.push(' ');
         }
@@ -272,8 +271,7 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // Additional boot args from RuntimeConfig (kernel profile) or FCVM_BOOT_ARGS env var
-    let extra_boot_args = effective_extra_boot_args(runtime_config);
-    if let Some(ref extra) = extra_boot_args {
+    if let Some(ref extra) = launch_config.extra_boot_args {
         if !boot_args.is_empty() {
             boot_args.push(' ');
         }
@@ -281,11 +279,7 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // Pass FUSE reader count to fc-agent via kernel command line (from RuntimeConfig or env)
-    let fuse_readers = runtime_config
-        .fuse_readers
-        .map(|r| r.to_string())
-        .or_else(|| std::env::var("FCVM_FUSE_READERS").ok());
-    if let Some(readers) = fuse_readers {
+    if let Some(ref readers) = launch_config.fuse_readers {
         if !boot_args.is_empty() {
             boot_args.push(' ');
         }
@@ -293,7 +287,7 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // Pass FUSE trace rate to fc-agent via kernel command line.
-    if let Ok(rate) = std::env::var("FCVM_FUSE_TRACE_RATE") {
+    if let Some(ref rate) = launch_config.fuse_trace_rate {
         if !boot_args.is_empty() {
             boot_args.push(' ');
         }
@@ -304,8 +298,8 @@ pub(crate) fn build_runtime_boot_args(
     // deterministic-interleaving instrumentation — see the failpoint crate).
     // Validated up front: guest specs are sleep-only and whitespace-free, and a
     // bad spec must fail the run before a VM boots, not silently un-arm a test.
-    if let Ok(spec) = std::env::var("FCVM_GUEST_FAILPOINT") {
-        if let Err(e) = failpoint::validate_guest_spec(&spec) {
+    if let Some(ref spec) = launch_config.guest_failpoint {
+        if let Err(e) = failpoint::validate_guest_spec(spec) {
             panic!("invalid FCVM_GUEST_FAILPOINT: {e}");
         }
         if !boot_args.is_empty() {
@@ -315,7 +309,7 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // Pass FUSE max_write to fc-agent via kernel command line.
-    if let Ok(max_write) = std::env::var("FCVM_FUSE_MAX_WRITE") {
+    if let Some(ref max_write) = launch_config.fuse_max_write {
         if !boot_args.is_empty() {
             boot_args.push(' ');
         }
@@ -323,7 +317,7 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // Pass FUSE writeback cache disable flag to fc-agent via kernel command line.
-    if std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok() {
+    if launch_config.no_writeback_cache {
         if !boot_args.is_empty() {
             boot_args.push(' ');
         }
@@ -888,6 +882,10 @@ pub(super) struct VmSetupParams<'a> {
     pub image_disk_path: Option<&'a std::path::Path>,
     pub fc_config: Option<crate::firecracker::FirecrackerConfig>,
     pub runtime_config: &'a crate::commands::common::RuntimeConfig,
+    /// The launch's single GuestBootInputs resolution. When fc_config is None
+    /// (snapshots disabled) the fallback launch config is built from this
+    /// same copy instead of reading the host again mid-launch.
+    pub boot_inputs: GuestBootInputs,
 }
 
 /// Helper function that runs VM setup and returns VmManager on success.
@@ -968,9 +966,9 @@ pub(super) async fn run_vm_setup(
 /// The extra kernel boot args a launch will actually append.
 ///
 /// Resolves the kernel profile's `boot_args`, falling back to FCVM_BOOT_ARGS.
-/// One derivation, used both by the snapshot-key config (hashed) and by the
-/// runtime cmdline assembly (applied), so the hashed value and the applied
-/// value cannot drift.
+/// Resolved once at FirecrackerConfig construction (hashed);
+/// build_runtime_boot_args emits the config's value, so the hashed value and
+/// the applied value cannot drift.
 pub(crate) fn effective_extra_boot_args(
     runtime_config: &crate::commands::common::RuntimeConfig,
 ) -> Option<String> {
@@ -978,6 +976,94 @@ pub(crate) fn effective_extra_boot_args(
         .boot_args
         .clone()
         .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok())
+}
+
+/// Guest-visible boot inputs read from the host, resolved once per
+/// FirecrackerConfig construction. Each is forwarded to fc-agent on the
+/// kernel cmdline and baked into the booted guest, so each is stored on the
+/// config (and therefore in the snapshot key) and emitted from there by
+/// build_runtime_boot_args (#821). A second read at emission time would be a
+/// window for the guest to boot with a value the key never saw.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GuestBootInputs {
+    pub host_dns: Vec<String>,
+    pub dns_search: Vec<String>,
+    pub fuse_readers: Option<String>,
+    pub fuse_trace_rate: Option<String>,
+    pub fuse_max_write: Option<String>,
+    pub no_writeback_cache: bool,
+}
+
+impl GuestBootInputs {
+    /// Read the host state and env knobs that shape the guest at boot.
+    ///
+    /// `dns_override` is --dns: when set it wins outright (hashed via
+    /// FirecrackerConfig.dns_server), the host fallback is never emitted, and
+    /// hashing the host list anyway would only fragment cache keys between
+    /// hosts whose guests boot identically.
+    pub(crate) fn resolve(
+        dns_override: Option<&str>,
+        runtime_config: &crate::commands::common::RuntimeConfig,
+    ) -> Self {
+        let host_dns = if dns_override.is_some() {
+            Vec::new()
+        } else {
+            crate::network::get_host_dns_servers().unwrap_or_default()
+        };
+        let dns_search = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+            .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
+            .map(|content| parse_search_domains(&content))
+            .unwrap_or_default();
+        Self {
+            host_dns,
+            dns_search,
+            fuse_readers: runtime_config
+                .fuse_readers
+                .map(|r| r.to_string())
+                .or_else(|| std::env::var("FCVM_FUSE_READERS").ok()),
+            fuse_trace_rate: std::env::var("FCVM_FUSE_TRACE_RATE").ok(),
+            fuse_max_write: std::env::var("FCVM_FUSE_MAX_WRITE").ok(),
+            no_writeback_cache: std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok(),
+        }
+    }
+
+    /// Drop the inputs this launch cannot observe, so the key hashes exactly
+    /// what the guest boots with (#863). Applied by both config constructors:
+    ///
+    /// * Bridged mode forwards a single resolver to the guest
+    ///   (network_config.dns_server carries the first host entry), so only
+    ///   the first entry can reach it; keying the rest would cold-boot a
+    ///   guest whose cmdline is identical when a secondary nameserver moves.
+    /// * The four FUSE knobs are read only inside fc-agent's FUSE mount path
+    ///   (fc-agent/src/fuse/mod.rs), and mount_fuse_volumes runs only when
+    ///   the boot plan carries volumes (fc-agent/src/agent.rs), so a
+    ///   volume-free run boots identically under any of their values.
+    pub(crate) fn for_launch(
+        mut self,
+        network_mode: crate::firecracker::FcNetworkMode,
+        has_fuse_volumes: bool,
+    ) -> Self {
+        if matches!(network_mode, crate::firecracker::FcNetworkMode::Bridged) {
+            self.host_dns.truncate(1);
+        }
+        if !has_fuse_volumes {
+            self.fuse_readers = None;
+            self.fuse_trace_rate = None;
+            self.fuse_max_write = None;
+            self.no_writeback_cache = false;
+        }
+        self
+    }
+}
+
+/// The first `search` line of a resolv.conf, split into domains.
+fn parse_search_domains(resolv: &str) -> Vec<String> {
+    resolv
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("search "))
+        .next()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// Build the FirecrackerConfig used to cold-boot a VM from a disk.
@@ -993,9 +1079,11 @@ pub(crate) fn build_launch_config(
     initrd_path: &std::path::Path,
     cmd_args: &Option<Vec<String>>,
     runtime_config: &crate::commands::common::RuntimeConfig,
+    boot_inputs: GuestBootInputs,
 ) -> crate::firecracker::FirecrackerConfig {
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
     let network_mode: FcNetworkMode = args.network.into();
+    let boot_inputs = boot_inputs.for_launch(network_mode, !args.map.is_empty());
     // Collect extra disk specifications
     let mut extra_disks: Vec<String> = Vec::new();
     extra_disks.extend(args.disk.iter().cloned());
@@ -1056,6 +1144,12 @@ pub(crate) fn build_launch_config(
         // Launch-only config: never hashed into a snapshot key, so the image
         // disk's build identity is not resolved here.
         image_disk_identity: None,
+        host_dns: boot_inputs.host_dns,
+        dns_search: boot_inputs.dns_search,
+        fuse_readers: boot_inputs.fuse_readers,
+        fuse_trace_rate: boot_inputs.fuse_trace_rate,
+        fuse_max_write: boot_inputs.fuse_max_write,
+        no_writeback_cache: boot_inputs.no_writeback_cache,
     }
 }
 
@@ -1306,6 +1400,7 @@ async fn run_vm_setup_inner(
         image_disk_path,
         fc_config,
         runtime_config,
+        boot_inputs,
     } = params;
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
@@ -1444,10 +1539,11 @@ async fn run_vm_setup_inner(
                 initrd_path,
                 &cmd_args,
                 runtime_config,
+                boot_inputs,
             )
         });
 
-    let mut runtime_boot_args = build_runtime_boot_args(args, network_config, runtime_config);
+    let mut runtime_boot_args = build_runtime_boot_args(network_config, &launch_config);
     if bootplan_over_vsock {
         // fc-agent reads this kernel arg to select the vsock boot-plan transport.
         runtime_boot_args.push_str(" fcvm_bootplan=vsock");
@@ -1542,11 +1638,10 @@ mod tests {
     /// Fail-closed inventory of the runtime kernel-cmdline tokens. Everything
     /// build_runtime_boot_args emits is guest-visible, so each token must be
     /// either derived from a hashed FirecrackerConfig field or consciously
-    /// listed here as per-instance (excluded from the snapshot key by design)
-    /// or as tracked unhashed state (#821). A new push_str token fails this
-    /// test until its author hashes it into the key or adds it below with a
-    /// disposition — the fail-open alternative is a --dns-style silent
-    /// cache-hit bug.
+    /// listed here as per-instance (excluded from the snapshot key by
+    /// design). A new push_str token fails this test until its author hashes
+    /// it into the key or adds it below with a disposition; the fail-open
+    /// alternative is a --dns-style silent cache-hit bug.
     #[test]
     fn runtime_boot_arg_tokens_are_hashed_or_allowlisted() {
         const EXPECTED: &[(&str, &str)] = &[
@@ -1561,23 +1656,18 @@ mod tests {
             (
                 "fcvm_dns",
                 "--dns override hashed via FirecrackerConfig.dns_server; the \
-                 no-override host fallback is tracked in #821",
+                 no-override host fallback (and bridged mode's threaded first \
+                 resolver) hashed via FirecrackerConfig.host_dns",
             ),
-            (
-                "fcvm_dns_search",
-                "host-derived at launch; unhashed, tracked in #821",
-            ),
+            ("fcvm_dns_search", "hashed via FirecrackerConfig.dns_search"),
             (
                 "fc_agent_strace",
                 "hashed via FirecrackerConfig.agent_strace",
             ),
-            (
-                "fuse_readers",
-                "guest-visible knob; unhashed, tracked in #821",
-            ),
+            ("fuse_readers", "hashed via FirecrackerConfig.fuse_readers"),
             (
                 "fuse_trace_rate",
-                "guest-visible knob; unhashed, tracked in #821",
+                "hashed via FirecrackerConfig.fuse_trace_rate",
             ),
             (
                 "fcvm_failpoint",
@@ -1585,11 +1675,11 @@ mod tests {
             ),
             (
                 "fuse_max_write",
-                "guest-visible knob; unhashed, tracked in #821",
+                "hashed via FirecrackerConfig.fuse_max_write",
             ),
             (
                 "no_writeback_cache",
-                "guest-visible knob; unhashed, tracked in #821",
+                "hashed via FirecrackerConfig.no_writeback_cache",
             ),
         ];
         let src = include_str!("vm_config.rs");
@@ -1637,6 +1727,92 @@ mod tests {
              FirecrackerConfig (see the guest_failpoint field for the pattern) \
              or add it to EXPECTED with a disposition"
         );
+    }
+
+    /// #821: the kernel cmdline must be emitted from the hashed config, not
+    /// re-read from the host at launch. A second read is a window for the
+    /// guest to boot with a value the snapshot key never saw.
+    #[test]
+    fn runtime_boot_args_emit_the_hashed_config_values() {
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: vec!["192.0.2.1".to_string(), "192.0.2.2".to_string()],
+            dns_search: vec!["corp.example".to_string(), "internal".to_string()],
+            fuse_readers: Some("64".to_string()),
+            fuse_trace_rate: Some("100".to_string()),
+            fuse_max_write: Some("32768".to_string()),
+            no_writeback_cache: true,
+            ..Default::default()
+        };
+        let network_config = crate::network::NetworkConfig::default();
+
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        for token in [
+            "fcvm_dns=192.0.2.1|192.0.2.2",
+            "fcvm_dns_search=corp.example|internal",
+            "fuse_readers=64",
+            "fuse_trace_rate=100",
+            "fuse_max_write=32768",
+            "no_writeback_cache=1",
+        ] {
+            assert!(
+                boot_args.contains(token),
+                "expected {token:?} in boot args {boot_args:?}"
+            );
+        }
+    }
+
+    /// The mode's DNS choice (pasta forwarder, bridged host DNS, or the --dns
+    /// override recorded in network_config) wins over the hashed host
+    /// fallback, which only applies when the mode provides no DNS.
+    #[test]
+    fn runtime_boot_args_prefer_mode_dns_over_host_fallback() {
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: vec!["192.0.2.1".to_string()],
+            ..Default::default()
+        };
+        let network_config = crate::network::NetworkConfig {
+            dns_server: Some("10.0.2.3".to_string()),
+            ..Default::default()
+        };
+
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        assert!(
+            boot_args.contains("fcvm_dns=10.0.2.3"),
+            "boot args: {boot_args:?}"
+        );
+        assert!(
+            !boot_args.contains("192.0.2.1"),
+            "host fallback must not be emitted when the mode provides DNS: {boot_args:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_runtime_config_fuse_readers_and_drops_fallback_on_dns_override() {
+        let runtime_config = crate::commands::common::RuntimeConfig {
+            firecracker_bin: None,
+            firecracker_args: None,
+            boot_args: None,
+            fuse_readers: Some(8),
+        };
+        let inputs = GuestBootInputs::resolve(Some("10.0.2.2"), &runtime_config);
+        assert_eq!(inputs.fuse_readers.as_deref(), Some("8"));
+        assert!(
+            inputs.host_dns.is_empty(),
+            "--dns wins outright, so the host fallback must not fragment the key"
+        );
+    }
+
+    #[test]
+    fn parse_search_domains_takes_first_search_line() {
+        assert_eq!(
+            parse_search_domains("nameserver 192.0.2.1\nsearch corp.example internal\n"),
+            vec!["corp.example", "internal"]
+        );
+        assert_eq!(
+            parse_search_domains("search a.example\nsearch b.example\n"),
+            vec!["a.example"]
+        );
+        assert!(parse_search_domains("nameserver 192.0.2.1\n").is_empty());
     }
 
     #[test]

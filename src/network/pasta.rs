@@ -3350,9 +3350,12 @@ mod tests {
 
     /// The batch really does run under `bash -c` and really does abort at the
     /// first failure — verified against the host's actual `ip` binary, in the
-    /// current namespace, using read-only `link show` commands.
+    /// current namespace, using read-only `link show` commands. The script
+    /// resolves `ip` through PATH, so this holds PATH_IP_LOCK against the
+    /// bridged fake-`ip` test when plain `cargo test` shares one process.
     #[test]
     fn ip_batch_script_runs_and_aborts_on_first_failure() {
+        let _path_lock = crate::network::PATH_IP_LOCK.blocking_lock();
         let ok = IpBatchScript::new(
             vec![
                 ("show loopback".to_string(), "link show lo".to_string()),

@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use super::{
-    get_host_dns_servers, namespace, portmap, types::generate_mac, veth, NetworkConfig,
-    NetworkManager, PortMapping,
+    namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
 };
 use crate::state::truncate_id;
 
@@ -122,6 +121,11 @@ pub struct BridgedNetwork {
     guest_ip_override: Option<String>,
     /// VM ID to use for subnet calculation (for cache restore with fresh networking)
     network_vm_id: Option<String>,
+    /// The resolver the guest is told to use, threaded in by the caller.
+    /// Fresh boots pass the launch config's first hashed host_dns entry so
+    /// the snapshot key and the guest-visible value cannot diverge; clone
+    /// restores pass the resolver captured in the snapshot metadata (#863).
+    dns_server: Option<String>,
 
     // Network state (populated during setup)
     namespace_id: Option<String>,
@@ -144,6 +148,7 @@ impl BridgedNetwork {
             port_mappings,
             guest_ip_override: None,
             network_vm_id: None,
+            dns_server: None,
             namespace_id: None,
             host_veth: None,
             guest_veth: None,
@@ -154,6 +159,15 @@ impl BridgedNetwork {
             is_clone: false,
             veth_inner_ip: None,
         }
+    }
+
+    /// Set the resolver setup() reports as the guest's DNS server. setup()
+    /// deliberately has no fallback read of the host's resolv.conf: the
+    /// caller resolved this value once, alongside whatever hashed or recorded
+    /// it, and a second read here could disagree with that copy.
+    pub fn with_dns_server(mut self, dns_server: Option<String>) -> Self {
+        self.dns_server = dns_server;
+        self
     }
 
     /// Set guest IP to use (for clones - use same IP as original VM)
@@ -478,9 +492,9 @@ impl NetworkManager for BridgedNetwork {
             return Err(e).context("ensuring global NAT for 10.0.0.0/8");
         }
 
-        // Step 7: Get DNS server for VM
-        let dns_servers = get_host_dns_servers().context("getting DNS servers")?;
-        let dns_server = dns_servers.first().cloned();
+        // Step 7: The guest's DNS server, threaded in by the caller (see the
+        // dns_server field). Not re-read from the host here.
+        let dns_server = self.dns_server.clone();
 
         // Step 8: Setup port mappings if any
         if !self.port_mappings.is_empty() {
@@ -649,10 +663,12 @@ mod tests {
     /// RED before the fix: kernel_routes_peer_via_veth returned `true` on any
     /// spawn error or nonzero exit, so a candidate nobody could verify was
     /// taken as verified — the same silent acceptance #820 is about. The fake
-    /// `ip` here exits 1; nextest runs each test in its own process, so
-    /// prepending to PATH cannot leak into a sibling test.
+    /// `ip` here exits 1; nextest runs each test in its own process, but
+    /// plain `cargo test` does not, so the PATH mutation additionally holds
+    /// PATH_IP_LOCK against siblings that spawn the real `ip` by name.
     #[tokio::test]
     async fn an_unavailable_route_verdict_is_an_error_not_an_acceptance() {
+        let _path_lock = crate::network::PATH_IP_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("fcvm-fakeip-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("ip");
@@ -679,6 +695,27 @@ mod tests {
         assert!(
             format!("{err:#}").contains("ip route get"),
             "the error must name the probe that failed: {err:#}"
+        );
+    }
+
+    /// #863: the bridged guest's resolver is threaded in from the launch
+    /// config, the same value the snapshot key hashed. setup() must not read
+    /// the host's resolv.conf itself: a mid-launch change would save the
+    /// snapshot under one resolver's key while the guest boots with another.
+    #[test]
+    fn setup_does_not_reread_host_dns() {
+        let src = include_str!("bridged.rs");
+        let start = src
+            .find("async fn setup")
+            .expect("setup present in bridged.rs");
+        let end = src[start..]
+            .find("async fn cleanup")
+            .expect("cleanup still follows setup")
+            + start;
+        assert!(
+            !src[start..end].contains("get_host_dns_servers"),
+            "BridgedNetwork::setup reads host DNS itself; thread the launch config's \
+             hashed value via with_dns_server instead"
         );
     }
 

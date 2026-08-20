@@ -107,6 +107,16 @@ pub trait NetworkManager: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// Serializes tests whose behavior depends on resolving `ip` through the
+/// process-global PATH. Plain `cargo test` runs every test in one process, so
+/// a test that points PATH at a fake `ip` races any sibling that spawns the
+/// real one by name (nextest's process-per-test isolation never sees this).
+/// Both kinds of test hold this lock: the PATH mutator and the by-name
+/// spawner. tokio's Mutex because the mutator holds it across an await, and
+/// it does not poison when a holder's assertion panics.
+#[cfg(test)]
+pub(crate) static PATH_IP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Get host DNS servers for VMs
 ///
 /// Returns DNS servers that VMs can use. Checks /run/systemd/resolve/resolv.conf
