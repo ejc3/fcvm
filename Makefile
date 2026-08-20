@@ -427,34 +427,72 @@ clean-test-data: build
 	mkdir -p /tmp/fcvm-test-logs
 	@echo "==> Cleaned test data (preserved cached assets)"
 
-# Record which sibling FUSE trees this build compiles against. fuse-pipe
-# builds fuse-backend-rs from the sibling path dependency (fuse-pipe/Cargo.toml
-# points at ../../fuse-backend-rs), so that code is whatever the directory
-# holds, not what any lockfile pins; the container legs mount sibling
-# checkouts of both trees at the same relative location (/workspace).
+# Record which FUSE dependency code this build compiles against. Two
+# dependencies, two mechanisms:
+#   fuse-backend-rs is a sibling path dependency (fuse-pipe/Cargo.toml points
+#   at ../../fuse-backend-rs), so the compiled code is whatever that directory
+#   holds, not what any lockfile pins. Reported as git describe of the
+#   checkout, or MISSING when there is no checkout. When the tree is dirty
+#   the line appends +<first 12 hex of sha256 over `git diff HEAD`>, because
+#   every possible local edit against one commit otherwise prints the same
+#   -dirty value. Untracked files are excluded from the digest: describe
+#   --dirty does not flag them, and an untracked file cannot reach the build
+#   unless a tracked file references it, which dirties the tree.
+#   fuser is a git dependency (fuse-pipe/Cargo.toml declares the URL,
+#   Cargo.lock pins the revision). Cargo compiles the locked revision from
+#   its git cache, never the sibling /workspace/fuser mount, so the line
+#   reports the lock's resolved source, which carries the exact commit
+#   after '#'.
 # Issue #807: two local fuse-backend-rs checkouts drifted 19 commits apart
-# and no build log recorded which one a given binary used. One line per
-# dependency, MISSING when there is no checkout to describe. Pinned by
+# and no build log recorded which one a given binary used. Pinned by
 # tests/test_dep_provenance.rs.
 .PHONY: dep-provenance
 dep-provenance:
-	@for dep in fuse-backend-rs fuser; do \
-		echo "$$dep: $$(git -C "$(MAKEFILE_DIR)../$$dep" describe --always --dirty 2>/dev/null || echo MISSING)"; \
-	done
+	@dir="$(MAKEFILE_DIR)../fuse-backend-rs"; \
+	if desc=$$(git -C "$$dir" describe --always --dirty 2>/dev/null); then \
+		case "$$desc" in \
+			*-dirty) desc="$$desc+$$(git -C "$$dir" diff --no-ext-diff HEAD | sha256sum | cut -c1-12)" ;; \
+		esac; \
+	else \
+		desc=MISSING; \
+	fi; \
+	echo "fuse-backend-rs: $$desc"
+	@src=$$(awk -F'"' '/^name = "fuser"$$/ {f=1; next} f && /^\[\[package\]\]/ {exit} f && /^source = / {print $$2; exit}' "$(MAKEFILE_DIR)Cargo.lock" 2>/dev/null); \
+	echo "fuser: $${src:-MISSING}"
 
+# The provenance the dep-provenance prerequisite prints only describes the
+# sources cargo read if nothing changed the sibling tree mid-build. Both
+# build targets therefore snapshot the provenance before their cargo
+# commands, re-derive it after, and fail on any difference instead of
+# logging a line about a tree cargo never saw.
 build: cargo-target-link dep-provenance
 	@echo "==> Building..."
-	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm
-	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-agent --target $(MUSL_TARGET)
-	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
+	@set -e; \
+	before="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm; \
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-agent --target $(MUSL_TARGET); \
+	mkdir -p target/release; \
+	cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent; \
+	after="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	if [ "$$before" != "$$after" ]; then \
+		printf 'ERROR: dependency provenance changed during the build\nbefore:\n%s\nafter:\n%s\n' "$$before" "$$after" >&2; \
+		exit 1; \
+	fi
 	@# Sync embedded config to user config dir (config is embedded at compile time)
 	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
 # Host-native tools used by the kernel-builder AMI/workflow. Unlike `build`,
 # this does not require a musl Rust target for the guest agent.
-build-host-tools: cargo-target-link
+build-host-tools: cargo-target-link dep-provenance
 	@echo "==> Building host-native fcvm and fc-agent..."
-	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm -p fc-agent
+	@set -e; \
+	before="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm -p fc-agent; \
+	after="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	if [ "$$before" != "$$after" ]; then \
+		printf 'ERROR: dependency provenance changed during the build\nbefore:\n%s\nafter:\n%s\n' "$$before" "$$after" >&2; \
+		exit 1; \
+	fi
 
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."
