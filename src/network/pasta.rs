@@ -1897,26 +1897,45 @@ impl NetworkManager for PastaNetwork {
 
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up pasta resources");
+        let mut errors = Vec::new();
 
         // `kill()` is start_kill + wait, so this stays correct whether or not
         // `start_kill_processes` already signalled pasta (re-signalling a not-yet-reaped
         // process is a no-op); when it did, the wait below has nothing left to wait for.
+        // `kill()` returning Ok also means the child was reaped, so propagating its
+        // error is the process-gone confirmation: a surviving pasta keeps the tap
+        // device and the forwarded loopback ports bound, and callers such as
+        // `cleanup_vm_verified` treat cleanup's Ok as proof those resources are gone.
         if let Some(mut process) = self.pasta_process.take() {
             if let Err(e) = process.kill().await {
-                warn!("failed to kill pasta: {}", e);
+                warn!(vm_id = %self.vm_id, error = %e, "failed to kill pasta");
+                errors.push(format!("killing pasta: {}", e));
             }
         }
 
         if let Some(ref pid_file) = self.pid_file {
             if pid_file.exists() {
                 if let Err(e) = tokio::fs::remove_file(pid_file).await {
-                    warn!("failed to remove pasta PID file: {}", e);
+                    warn!(vm_id = %self.vm_id, error = %e, "failed to remove pasta PID file");
+                    errors.push(format!(
+                        "removing pasta PID file {}: {}",
+                        pid_file.display(),
+                        e
+                    ));
                 }
             }
         }
 
-        info!(vm_id = %self.vm_id, "pasta cleanup complete");
-        Ok(())
+        if errors.is_empty() {
+            info!(vm_id = %self.vm_id, "pasta cleanup complete");
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "pasta cleanup had {} error(s): {}",
+                errors.len(),
+                errors.join("; ")
+            )
+        }
     }
 
     fn tap_device(&self) -> &str {
@@ -1992,6 +2011,51 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed cleanup step must surface as an Err. Callers treat cleanup's
+    /// Ok as proof the host resources are gone: `cleanup_vm_verified`
+    /// (src/commands/common.rs) records the result so prepare can refuse to
+    /// publish a snapshot while pasta still holds the tap device and the
+    /// forwarded loopback ports, or while its PID file remains.
+    ///
+    /// A directory at the PID-file path makes `remove_file` fail with EISDIR
+    /// for every uid, so this needs neither root nor permission games.
+    #[tokio::test]
+    async fn cleanup_fails_closed_when_the_pid_file_cannot_be_removed() {
+        let dir = tempfile::tempdir().expect("creating tempdir");
+        let mut network = PastaNetwork::new("cleanup-pidfile-test".into(), "tap0".into(), vec![]);
+        network.pid_file = Some(dir.path().to_path_buf());
+
+        let error = network
+            .cleanup()
+            .await
+            .expect_err("cleanup must report the PID-file removal failure, not Ok");
+        assert!(
+            format!("{error:#}").contains("removing pasta PID file"),
+            "error must attribute the failed step: {error:#}"
+        );
+    }
+
+    /// An already-reaped pasta is not a cleanup failure. `kill()` returning Ok
+    /// is the process-gone confirmation (tokio's `start_kill` on a reaped
+    /// child returns Ok since 1.44), so cleanup must not fabricate an error
+    /// for a process that no longer exists. This pins the boundary of the
+    /// fail-closed contract: Err means "could not confirm gone", never
+    /// "was already gone".
+    #[tokio::test]
+    async fn cleanup_reports_success_for_an_already_reaped_pasta() {
+        let mut network = PastaNetwork::new("cleanup-reaped-test".into(), "tap0".into(), vec![]);
+        let mut child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawning true");
+        child.wait().await.expect("waiting for true");
+        network.pasta_process = Some(child);
+
+        network
+            .cleanup()
+            .await
+            .expect("a reaped pasta means the process is gone, which is cleanup success");
+    }
 
     /// A guest-answer wait that consumed its whole budget must not starve the
     /// port-forward wait that follows it.
