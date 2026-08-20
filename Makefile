@@ -427,7 +427,22 @@ clean-test-data: build
 	mkdir -p /tmp/fcvm-test-logs
 	@echo "==> Cleaned test data (preserved cached assets)"
 
-build: cargo-target-link
+# Record which sibling FUSE trees this build compiles against. fuse-pipe
+# builds fuse-backend-rs from the sibling path dependency (fuse-pipe/Cargo.toml
+# points at ../../fuse-backend-rs), so that code is whatever the directory
+# holds, not what any lockfile pins; the container legs mount sibling
+# checkouts of both trees at the same relative location (/workspace).
+# Issue #807: two local fuse-backend-rs checkouts drifted 19 commits apart
+# and no build log recorded which one a given binary used. One line per
+# dependency, MISSING when there is no checkout to describe. Pinned by
+# tests/test_dep_provenance.rs.
+.PHONY: dep-provenance
+dep-provenance:
+	@for dep in fuse-backend-rs fuser; do \
+		echo "$$dep: $$(git -C "$(MAKEFILE_DIR)../$$dep" describe --always --dirty 2>/dev/null || echo MISSING)"; \
+	done
+
+build: cargo-target-link dep-provenance
 	@echo "==> Building..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-agent --target $(MUSL_TARGET)
