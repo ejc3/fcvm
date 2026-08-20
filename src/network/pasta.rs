@@ -1186,8 +1186,18 @@ impl PastaNetwork {
             }
         };
 
-        if pid_file.exists() {
-            tokio::fs::remove_file(&pid_file).await?;
+        // Same rule as cleanup(): no exists() pre-check, because
+        // `Path::exists()` maps metadata errors to false and would silently
+        // keep a stale file that the readiness wait then mistakes for pasta
+        // being ready. Only NotFound means there was nothing to remove.
+        match tokio::fs::remove_file(&pid_file).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("removing stale pasta PID file {}", pid_file.display())
+                })
+            }
         }
 
         let host_ipv6 = Self::detect_host_ipv6();
@@ -1416,13 +1426,33 @@ impl PastaNetwork {
             }));
         }
 
-        self.wait_for_pid_file(&mut child, &pid_file, &mut pid_file_watch)
-            .await?;
+        self.adopt_and_await_pasta(child, pid_file, &mut pid_file_watch)
+            .await
+    }
 
+    /// Take ownership of the spawned pasta and its PID path, then wait for
+    /// readiness.
+    ///
+    /// Both fields are recorded even when the wait fails: pasta can write its
+    /// PID file and exit before the wait returns, and cleanup() can only reap
+    /// the child and remove the file if `self` owns them on every error path.
+    /// The retry loop in `post_start` reaps `self.pasta_process` between
+    /// attempts for the same reason.
+    async fn adopt_and_await_pasta<E>(
+        &mut self,
+        mut child: Child,
+        pid_file: PathBuf,
+        pid_file_events: &mut E,
+    ) -> Result<()>
+    where
+        E: crate::utils::DirEventSource,
+    {
+        self.pid_file = Some(pid_file.clone());
+        let readiness = self
+            .wait_for_pid_file(&mut child, &pid_file, pid_file_events)
+            .await;
         self.pasta_process = Some(child);
-        self.pid_file = Some(pid_file);
-
-        Ok(())
+        readiness
     }
 
     /// Start an attempt-local stderr capture.
@@ -1910,18 +1940,32 @@ impl NetworkManager for PastaNetwork {
             if let Err(e) = process.kill().await {
                 warn!(vm_id = %self.vm_id, error = %e, "failed to kill pasta");
                 errors.push(format!("killing pasta: {}", e));
+                // `kill_on_drop` is off for pasta, so dropping the handle here
+                // would leave a possibly-live process that nothing can signal
+                // again. Put it back so the caller's next cleanup() can retry.
+                self.pasta_process = Some(process);
             }
         }
 
-        if let Some(ref pid_file) = self.pid_file {
-            if pid_file.exists() {
-                if let Err(e) = tokio::fs::remove_file(pid_file).await {
-                    warn!(vm_id = %self.vm_id, error = %e, "failed to remove pasta PID file");
-                    errors.push(format!(
-                        "removing pasta PID file {}: {}",
-                        pid_file.display(),
-                        e
-                    ));
+        // The PID file goes only after the kill is confirmed: while pasta may
+        // still be alive, the file is the on-disk record of that process. No
+        // exists() pre-check either: `Path::exists()` maps metadata errors
+        // (EACCES, ENOTDIR, ...) to false, which would skip the removal and
+        // report success without knowing whether the file remains. NotFound is
+        // the one removal error that already proves the goal state.
+        if errors.is_empty() {
+            if let Some(ref pid_file) = self.pid_file {
+                match tokio::fs::remove_file(pid_file).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        warn!(vm_id = %self.vm_id, error = %e, "failed to remove pasta PID file");
+                        errors.push(format!(
+                            "removing pasta PID file {}: {}",
+                            pid_file.display(),
+                            e
+                        ));
+                    }
                 }
             }
         }
@@ -2033,6 +2077,133 @@ mod tests {
         assert!(
             format!("{error:#}").contains("removing pasta PID file"),
             "error must attribute the failed step: {error:#}"
+        );
+    }
+
+    /// `Path::exists()` maps metadata errors (EACCES, ENOTDIR, ...) to false,
+    /// so an exists() pre-check skips the removal for a PID path it could not
+    /// even stat, and cleanup reports Ok without knowing whether the file
+    /// remains. A regular file as the parent component makes both the stat and
+    /// the removal fail with ENOTDIR for every uid, so this needs neither root
+    /// nor permission games.
+    #[tokio::test]
+    async fn cleanup_fails_closed_when_the_pid_path_cannot_be_checked() {
+        let dir = tempfile::tempdir().expect("creating tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"").expect("creating blocker file");
+        let mut network = PastaNetwork::new("cleanup-enotdir-test".into(), "tap0".into(), vec![]);
+        network.pid_file = Some(blocker.join("pasta.pid"));
+
+        let error = network
+            .cleanup()
+            .await
+            .expect_err("cleanup must report the PID-file removal failure, not Ok");
+        assert!(
+            format!("{error:#}").contains("removing pasta PID file"),
+            "error must attribute the failed step: {error:#}"
+        );
+    }
+
+    /// An absent PID file is cleanup success, not an error: NotFound is the
+    /// one removal outcome that already proves the goal state. This pins the
+    /// boundary of the direct-removal path so it does not fail VMs whose PID
+    /// file was never written or was already collected.
+    #[tokio::test]
+    async fn cleanup_treats_a_missing_pid_file_as_already_clean() {
+        let dir = tempfile::tempdir().expect("creating tempdir");
+        let mut network = PastaNetwork::new("cleanup-absent-test".into(), "tap0".into(), vec![]);
+        network.pid_file = Some(dir.path().join("never-written.pid"));
+
+        network
+            .cleanup()
+            .await
+            .expect("NotFound means the PID file is already gone");
+    }
+
+    /// A failed kill must leave the handle in place. `kill_on_drop` is off for
+    /// pasta, so dropping the Child would leave a possibly-live pasta that
+    /// nothing can signal again, and a later cleanup() call could not retry.
+    /// The PID file must also survive the failed attempt: it is the on-disk
+    /// record that pasta may still hold the tap device and forwarded ports,
+    /// and it may only be removed once the process is confirmed gone.
+    ///
+    /// Failure vehicle: reap the child with waitpid(2) behind tokio's back.
+    /// The Child still believes the process exists, so kill() sends SIGKILL to
+    /// a freed PID and gets ESRCH. Reuse of that PID inside this test would
+    /// require a full pid-space wraparound between the waitpid and the kill,
+    /// so the signal cannot land on a live process.
+    #[tokio::test]
+    async fn a_failed_kill_keeps_the_handle_and_the_pid_file() {
+        let dir = tempfile::tempdir().expect("creating tempdir");
+        let pid_file = dir.path().join("pasta.pid");
+        std::fs::write(&pid_file, b"123\n").expect("writing PID file");
+
+        let child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawning true");
+        let pid = child.id().expect("child PID") as libc::pid_t;
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(reaped, pid, "waitpid must reap the child");
+
+        let mut network = PastaNetwork::new("cleanup-kill-fail-test".into(), "tap0".into(), vec![]);
+        network.pasta_process = Some(child);
+        network.pid_file = Some(pid_file.clone());
+
+        let error = network
+            .cleanup()
+            .await
+            .expect_err("an unconfirmed kill must fail cleanup");
+        assert!(
+            format!("{error:#}").contains("killing pasta"),
+            "error must attribute the failed step: {error:#}"
+        );
+        assert!(
+            network.pasta_process.is_some(),
+            "the handle must survive a failed kill so the next cleanup can retry"
+        );
+        assert!(
+            pid_file.exists(),
+            "the PID file outlives an unconfirmed kill"
+        );
+    }
+
+    /// A readiness wait that fails still leaves real state behind: pasta can
+    /// write its PID file and exit before the wait returns, and the child
+    /// needs reaping either way. Both must be owned by `self` on the error
+    /// path, or cleanup() skips them and reports Ok while the PID file
+    /// remains on disk.
+    #[tokio::test]
+    async fn a_failed_readiness_wait_still_owns_the_child_and_pid_path() {
+        let dir = tempfile::tempdir().expect("creating tempdir");
+        let pid_file = dir.path().join("pasta.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("spawn exiting child");
+        // Reap up front so the wait's child-exit arm fires deterministically
+        // instead of racing the PID-file deadline.
+        child.wait().await.expect("reap exited child");
+
+        let mut no_watch = None::<crate::utils::DirWatch>;
+        let mut net = PastaNetwork::new("adopt-test".to_string(), "tap0".to_string(), vec![]);
+        let error = net
+            .adopt_and_await_pasta(child, pid_file.clone(), &mut no_watch)
+            .await
+            .expect_err("an exited pasta cannot become ready");
+        assert!(
+            format!("{error:#}").contains("exited before becoming ready"),
+            "{error:#}"
+        );
+        assert_eq!(
+            net.pid_file.as_deref(),
+            Some(pid_file.as_path()),
+            "the PID path must be recorded even when readiness fails, or cleanup cannot remove it"
+        );
+        assert!(
+            net.pasta_process.is_some(),
+            "the child must be stored even when readiness fails, or cleanup cannot reap it"
         );
     }
 
