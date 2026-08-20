@@ -457,8 +457,28 @@ assert_vm_artifacts_absent() {
     return "$left"
 }
 
+# The build-to-golden handshake file for $IMAGE. cmd_build records the image
+# ID it published here; cmd_golden refuses a tag that resolves elsewhere.
+built_image_id_file() {
+    printf '%s/reqbench-locks/built-image-%s.id\n' \
+        "$DATA_ROOT" "$(printf '%s' "$IMAGE" | tr '/:' '__')"
+}
+
 cmd_build() {
     log "building $IMAGE"
+    # The bundle sealed this invocation's request code at process start, but
+    # the image build COPYs from the live repository. An edit in between puts
+    # different render bytes in the exec arm (image copy) than in the CDP arm
+    # (bundle copy) while every seal check passes: the staging guard compares
+    # git HEAD only, which cannot see an uncommitted edit.
+    if [ -n "${REQBENCH_RUNTIME_BUNDLE:-}" ]; then
+        local sealed_source
+        for sealed_source in render.py cdpdrive.py wddrive.py; do
+            cmp -s "$REPO/bench/chromium/$sealed_source" \
+                "$REQBENCH_RUNTIME_BUNDLE/$sealed_source" \
+                || { log "FATAL: $sealed_source in $REPO/bench/chromium diverged from the sealed runtime bundle; the image would bake different bytes than this run executes"; return 1; }
+        done
+    fi
     # --format docker is LOAD-BEARING: podman's default OCI format DROPS
     # HEALTHCHECK with only a warning, and fcvm's health gate is what
     # triggers the golden snapshot (src/health.rs AND-logic).
@@ -471,6 +491,22 @@ cmd_build() {
     # marker that entry.sh touches only after a full navigate + screenshot.
     podman inspect "$IMAGE" --format '{{json .HealthCheck}}' | grep -q health_state \
         || { log "FATAL: image has no HEALTHCHECK naming health_state.sh (OCI format drop, or the Containerfile changed without this check)"; return 1; }
+    # Record the ID this build published so cmd_golden, which runs as a
+    # separate process with the TAG lock released in between, can refuse a
+    # tag another worktree repointed in that window.
+    local built_id id_file id_tmp
+    built_id=$(podman image inspect --format '{{.Id}}' "$IMAGE") \
+        || { log "FATAL: cannot read the image ID podman published for $IMAGE"; return 1; }
+    built_id="sha256:${built_id#sha256:}"
+    [[ "$built_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
+        || { log "FATAL: podman reported invalid image ID '$built_id' for $IMAGE"; return 1; }
+    mkdir -p "$DATA_ROOT/reqbench-locks"
+    id_file=$(built_image_id_file)
+    id_tmp=$(mktemp "$id_file.XXXXXX") \
+        || { log "FATAL: cannot stage the built-image record next to $id_file"; return 1; }
+    printf '%s\n' "$built_id" >"$id_tmp"
+    mv -f "$id_tmp" "$id_file"
+    log "build: published $IMAGE as $built_id"
 }
 
 cmd_golden() {
@@ -499,6 +535,22 @@ cmd_golden() {
         image_cache_key="${image_digest#sha256:}"
     else
         image_cache_key="${image_id#sha256:}"
+    fi
+    # The checks below only prove this process's own observation is
+    # self-consistent. When cmd_build recorded which ID it published, require
+    # the tag to still resolve there: build and golden run as separate
+    # processes with the TAG lock released between them, and a tag swap in
+    # that window would snapshot the replacement.
+    local built_id_file built_image_id=""
+    built_id_file=$(built_image_id_file)
+    if [ -e "$built_id_file" ]; then
+        built_image_id=$(tr -d '[:space:]' <"$built_id_file")
+        [[ "$built_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { log "golden: recorded built-image ID in $built_id_file is invalid: '$built_image_id'"; return 1; }
+        if [ "$image_id" != "$built_image_id" ]; then
+            log "golden: $IMAGE resolved to $image_id but the build phase recorded $built_image_id; the tag was repointed between build and golden"
+            return 1
+        fi
     fi
     # --publish carries host -> guest; fc-agent DNATs the published port to
     # guest loopback (fc-agent/src/network.rs::publish_to_loopback), the hop
@@ -539,14 +591,15 @@ cmd_golden() {
     $SUDO python3 - "$DATA_ROOT/snapshots/$TAG/config.json" \
         "$DATA_ROOT/snapshots/$TAG/reqbench-provenance.json" \
         "$DATA_ROOT/snapshots/$TAG.lock" "$IMAGE" "$image_id" "$image_digest" \
-        "$image_cache_key" "$prepared_generation" "$prepared_digest" \
+        "$image_cache_key" "$built_image_id" \
+        "$prepared_generation" "$prepared_digest" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
         "${REQBENCH_SOURCE_REVISION:-}" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
-    image_cache_key, prepared_generation, prepared_digest,
+    image_cache_key, built_image_id, prepared_generation, prepared_digest,
     fcvm_sha256, runtime_bundle_sha256, source_revision,
 ) = sys.argv[1:]
 lock = open(lock_path, "a+")
@@ -600,6 +653,9 @@ record = {
     "image_id": image_id,
     "image_digest": image_digest,
     "image_cache_key": image_cache_key,
+    # The ID cmd_build recorded, when a build preceded this golden; null for
+    # a golden taken against a pre-existing image with no build record.
+    "built_image_id": built_image_id or None,
     "creator_fcvm_sha256": fcvm_sha256,
     "creator_runtime_bundle_sha256": runtime_bundle_sha256,
     "source_revision": source_revision,

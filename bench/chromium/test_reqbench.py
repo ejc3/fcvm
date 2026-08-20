@@ -4024,8 +4024,19 @@ exit 1
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertIn("golden: PREPARE FAILED", result.stderr)
 
-    def _golden_image_identity_fixture(self, d, snapshot_cache_key):
+    def _built_id_path(self, data_root, image="localhost/chromium-bench-req"):
+        mangled = image.replace("/", "_").replace(":", "_")
+        return os.path.join(
+            data_root, "reqbench-locks", f"built-image-{mangled}.id",
+        )
+
+    def _golden_image_identity_fixture(self, d, snapshot_cache_key,
+                                       built_image_id=None):
         env, binx = self._env(d, DATA_ROOT=d)
+        if built_image_id is not None:
+            os.makedirs(os.path.join(d, "reqbench-locks"), exist_ok=True)
+            with open(self._built_id_path(d), "w") as f:
+                f.write(built_image_id + "\n")
         argv = os.path.join(d, "fcvm-argv.log")
         digest = "a" * 64
         image_id = "b" * 64
@@ -4205,6 +4216,122 @@ exit 1
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertIn("the image tag changed during golden creation", result.stderr)
             self.assertIn(digest, result.stderr)
+
+    def test_build_records_the_image_id_it_published(self):
+        """golden can only bind to the build's image if the build says which one.
+
+        `make bench-chromium-request-golden` runs build and golden as separate
+        reqbench.sh processes with the TAG lock released between them; a tag
+        swap in that window makes golden snapshot the replacement while every
+        check inside cmd_golden still passes, because those checks only prove
+        cmd_golden's own observation is self-consistent.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, DATA_ROOT=d, REQBENCH_STAGED="1")
+            image_id = "b" * 64
+            self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+case "$1" in
+  build) exit 0 ;;
+  inspect) echo '{{"Test":["CMD-SHELL","/opt/bench/health_state.sh"]}}'; exit 0 ;;
+  image)
+      [ "$2" = inspect ] || exit 1
+      echo {image_id}
+      exit 0
+      ;;
+esac
+exit 1
+''')
+            result = subprocess.run(
+                [self.SH, "build"], env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            recorded = self._read_if_exists(self._built_id_path(d), "<missing>")
+            self.assertEqual(recorded.strip(), "sha256:" + image_id)
+
+    def test_golden_refuses_an_image_that_is_not_the_one_build_produced(self):
+        """A build record that names a different image ID must stop the golden.
+
+        cmd_golden's in-process checks close the inspect-to-prepare and
+        prepare-to-provenance windows, but nothing binds golden's inspect to
+        the image cmd_build published in its separate process.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            recorded = "sha256:" + "e" * 64
+            result, argv, _digest, image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, built_image_id=recorded,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(recorded, result.stderr)
+            self.assertIn("sha256:" + image_id, result.stderr)
+            self.assertNotIn(
+                "podman prepare", argv,
+                "golden snapshotted an image the build did not produce",
+            )
+
+    def test_golden_records_a_matching_build_id_in_provenance(self):
+        """A matching record must pass and land in reqbench-provenance.json."""
+        with tempfile.TemporaryDirectory() as d:
+            recorded = "sha256:" + "b" * 64
+            result, _argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, built_image_id=recorded,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            with open(os.path.join(
+                d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
+            )) as source:
+                provenance = json.load(source)
+            self.assertEqual(provenance["built_image_id"], recorded)
+
+    def test_build_refuses_a_render_py_that_diverged_from_the_sealed_bundle(self):
+        """The exec arm runs the image's render.py, the cdp arm the bundle's.
+
+        cmd_build COPYs render.py from the live repository while the bundle
+        sealed its own copy at process start, and the staging guard only
+        compares git HEAD, which cannot see an uncommitted edit. Diverged
+        bytes must be refused before the image build runs.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, binx = self._env(d, DATA_ROOT=d)
+            srcrepo = os.path.join(d, "srcrepo")
+            bench_dir = os.path.join(srcrepo, "bench", "chromium")
+            os.makedirs(bench_dir)
+            for name in ("cdpdrive.py", "wddrive.py"):
+                shutil.copyfile(
+                    os.path.join(HERE, name), os.path.join(bench_dir, name),
+                )
+            with open(os.path.join(HERE, "render.py")) as f:
+                render = f.read()
+            with open(os.path.join(bench_dir, "render.py"), "w") as f:
+                f.write(render + "\n# uncommitted edit made after staging\n")
+            subprocess.run(
+                ["git", "init", "-q", srcrepo],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", srcrepo, "add", "-A"],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", srcrepo, "-c", "user.name=t",
+                 "-c", "user.email=t@example.com", "commit", "-qm", "seed"],
+                check=True, capture_output=True, text=True,
+            )
+            built_marker = os.path.join(d, "podman-build-ran")
+            self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+[ "$1" = build ] && touch {built_marker}
+exit 0
+''')
+            result = subprocess.run(
+                [self.SH, "build"], env=dict(env, REQBENCH_SOURCE_REPO=srcrepo),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("render.py", result.stderr)
+            self.assertFalse(
+                os.path.exists(built_marker),
+                "the image build ran against diverged render bytes",
+            )
 
     def _run_stub(self, d, backend, analyzer_rc=0, sudo_env_reset=False):
         env, binx = self._env(d, BACKEND=backend, REPS="1", WARMUP="0")
