@@ -68,8 +68,8 @@ PY
       shift 3; view="$1"; shift; shift   # exec --pid P <view> -- argv...
       line="$view $*"; printf '%s\n' "${line//$'\n'/ }" >> "$STUB_EXEC_LOG"   # one line per exec
       case "$view $*" in
-        "--vm cat /etc/resolv.conf") printf '%b' "$STUB_RESOLV_VM" ;;
-        "-c cat /etc/resolv.conf") printf '%b' "$STUB_RESOLV_CONTAINER" ;;
+        "--vm cat /etc/resolv.conf") printf '%b' "$STUB_RESOLV_VM"; exit "${STUB_RESOLV_RC:-0}" ;;
+        "-c cat /etc/resolv.conf") printf '%b' "$STUB_RESOLV_CONTAINER"; exit "${STUB_RESOLV_RC:-0}" ;;
         "-c python3 /opt/bench/"*) exit 0 ;;
         "-c python3 -c "*gethostbyname*) echo "$STUB_ANSWER" ;;
         "-c python3 -c "*urllib*) echo "$STUB_URL_STATUS" ;;
@@ -113,7 +113,7 @@ class VerifyDnsHop(unittest.TestCase):
     def _fixture(self, d, dns_server="10.0.2.2", config=True, hosts=HOSTS,
                  urls=URLS, answer="10.0.2.2", resolv_vm="nameserver 10.0.2.2\n",
                  resolv_container="nameserver 10.0.2.2\n", url_status="200",
-                 drop_config=False):
+                 drop_config=False, resolv_rc=0):
         data = os.path.join(d, "data")
         state_dir = os.path.join(data, "state")
         snap = os.path.join(data, "snapshots", TAG)
@@ -156,6 +156,7 @@ class VerifyDnsHop(unittest.TestCase):
             STUB_RESOLV_CONTAINER=resolv_container,
             STUB_URL_STATUS=url_status,
             STUB_DROP_CONFIG="1" if drop_config else "0",
+            STUB_RESOLV_RC=str(resolv_rc),
         )
         return env, state_dir
 
@@ -279,6 +280,76 @@ class VerifyDnsHop(unittest.TestCase):
             self.assertIsNone(evidence["dns_server"])
             self.assertEqual(evidence["hosts"], {})
             self.assertEqual(evidence["urls"], {})
+
+    def test_a_failed_resolver_read_fails_even_with_plausible_output(self):
+        """`fcvm exec` that prints the wanted line and exits non-zero is
+        an exec that did not complete (a torn-down clone, a container that
+        is not the one Chromium runs in); its stdout proves nothing. The
+        hop kept the stdout and discarded the exit status.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 (verify passed) and
+        evidence passed=true.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _ = self._fixture(d, resolv_rc=3)
+            result = self._verify(env)
+            self.assertNotEqual(result.returncode, 0,
+                                "verify passed on a resolver read that exited 3\n"
+                                + result.stdout)
+            self.assertIn("HOP D FAILED", result.stderr)
+            self.assertIn("exited 3", result.stderr)
+            self.assertIs(self._evidence(env)["passed"], False)
+
+    def test_urls_alone_are_still_verified(self):
+        """VERIFY_DNS_URLS without VERIFY_DNS_HOSTS ran zero checks and
+        recorded passed=true; the URL fetches are assertions in their own
+        right and need the baked resolver just the same.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 (a 404 through the
+        resolver under test passed) and evidence urls == {}.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _ = self._fixture(d, hosts="", url_status="404")
+            result = self._verify(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("HOP D FAILED", result.stderr)
+            evidence = self._evidence(env)
+            self.assertIs(evidence["passed"], False)
+            self.assertEqual(evidence["urls"]["https://example.com/"],
+                             {"status": 404, "ok": False})
+        with tempfile.TemporaryDirectory() as d:
+            env, _ = self._fixture(d, hosts="")
+            result = self._verify(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-2500:]}")
+            evidence = self._evidence(env)
+            self.assertIs(evidence["passed"], True)
+            self.assertEqual(evidence["hosts"], {})
+            for url in URLS.split(","):
+                self.assertEqual(evidence["urls"][url], {"status": 200, "ok": True})
+        with tempfile.TemporaryDirectory() as d:
+            # URLs alone, with no baked resolver to fetch through: refuse.
+            env, _ = self._fixture(d, hosts="", dns_server=None)
+            result = self._verify(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("baked resolver", result.stderr)
+
+    def test_a_second_nameserver_fails(self):
+        """glibc walks the nameserver list: a resolv.conf that names the
+        baked resolver AND a public one renders the live site the moment
+        the replay server misses a query. One matching line was enough.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 (verify passed with
+        8.8.8.8 as a fallback resolver).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _ = self._fixture(
+                d, resolv_container="nameserver 10.0.2.2\\nnameserver 8.8.8.8\\n")
+            result = self._verify(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("HOP D FAILED", result.stderr)
+            self.assertIn("8.8.8.8", result.stderr)
+            self.assertIs(self._evidence(env)["passed"], False)
 
     def test_an_unreadable_config_blocks_hop_d(self):
         """Fail closed: a hop that could not read the snapshot has no basis

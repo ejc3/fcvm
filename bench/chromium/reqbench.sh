@@ -822,11 +822,12 @@ wd_session_id() {
 # checks the clone against it from inside the container, where Chromium runs.
 #
 # VERIFY_DNS_HOSTS  comma-separated hostnames; each must resolve to
-#                   VERIFY_DNS_ANSWER inside the container. Unset: only the
-#                   recorded resolver is written, no assertion is made, so the
-#                   default golden (no GUEST_DNS) verifies as before.
+#                   VERIFY_DNS_ANSWER inside the container.
 # VERIFY_DNS_URLS   comma-separated URLs; each in-container GET must return a
 #                   2xx or 3xx status through the resolver under test.
+# With both unset only the recorded resolver is written and no assertion is
+# made, so the default golden (no GUEST_DNS) verifies as before. Either one
+# set requires a baked resolver and checks both resolv.conf views.
 # Evidence lands in $RESULTS/verify-dns.json either way.
 VERIFY_DNS_HOSTS="${VERIFY_DNS_HOSTS:-}"
 VERIFY_DNS_ANSWER="${VERIFY_DNS_ANSWER:-10.0.2.2}"
@@ -853,14 +854,12 @@ verify_guest_dns() {
         "$cfg" 2>>"$errlog") \
         || { echo "HOP D BLOCKED: cannot read metadata.network_config.dns_server from $cfg (jq missing, or config.json unreadable)" >&2; return 1; }
     local -a hosts=() urls=()
-    if [ -n "$VERIFY_DNS_HOSTS" ]; then
-        IFS=',' read -ra hosts <<<"$VERIFY_DNS_HOSTS"
-        IFS=',' read -ra urls <<<"$VERIFY_DNS_URLS"
-    fi
+    [ -z "$VERIFY_DNS_HOSTS" ] || IFS=',' read -ra hosts <<<"$VERIFY_DNS_HOSTS"
+    [ -z "$VERIFY_DNS_URLS" ] || IFS=',' read -ra urls <<<"$VERIFY_DNS_URLS"
     echo "--- HOP D: baked resolver INSIDE the restored clone (dns_server=${dns_server:-null}, ${#hosts[@]} host(s), ${#urls[@]} url(s)) ---"
     local failed=0 resolv_vm="" resolv_container="" hosts_json='{}' urls_json='{}'
-    if [ -z "$VERIFY_DNS_HOSTS" ]; then
-        echo "  VERIFY_DNS_HOSTS unset: recording the snapshot's resolver, asserting nothing"
+    if [ -z "$VERIFY_DNS_HOSTS" ] && [ -z "$VERIFY_DNS_URLS" ]; then
+        echo "  VERIFY_DNS_HOSTS and VERIFY_DNS_URLS unset: recording the snapshot's resolver, asserting nothing"
     elif [ -z "$dns_server" ]; then
         failed=1
         echo "HOP D FAILED: corpus verify requires a baked resolver, but metadata.network_config.dns_server is null (golden made without GUEST_DNS?)" >&2
@@ -868,19 +867,32 @@ verify_guest_dns() {
         local want="nameserver $dns_server" view
         # Both views: fc-agent writes the VM's resolv.conf from the boot plan
         # and podman derives the container's from it. Chromium reads the
-        # second, so the first being right is not enough.
+        # second, so the first being right is not enough. The exec status is
+        # kept: output from an exec that did not complete proves nothing.
+        local rc_vm=0 rc_container=0
         resolv_vm=$($SUDO "$FCVM" exec --pid "$cpid" --vm -- cat /etc/resolv.conf 2>>"$errlog") \
-            || resolv_vm="${resolv_vm:-}"
+            || rc_vm=$?
         resolv_container=$($SUDO "$FCVM" exec --pid "$cpid" -c -- cat /etc/resolv.conf 2>>"$errlog") \
-            || resolv_container="${resolv_container:-}"
+            || rc_container=$?
         for view in vm container; do
-            local text="$resolv_vm"
-            [ "$view" = vm ] || text="$resolv_container"
-            if grep -qx -- "$want" <<<"$text"; then
-                echo "  $view /etc/resolv.conf names $dns_server"
-            else
+            local text="$resolv_vm" rc="$rc_vm" others=""
+            [ "$view" = vm ] || { text="$resolv_container"; rc="$rc_container"; }
+            if [ "$rc" -ne 0 ]; then
+                failed=1
+                echo "HOP D FAILED: reading $view /etc/resolv.conf exited $rc (got: $(tr '\n' '|' <<<"$text"))" >&2
+            elif ! grep -qx -- "$want" <<<"$text"; then
                 failed=1
                 echo "HOP D FAILED: $view /etc/resolv.conf has no '$want' line (got: $(tr '\n' '|' <<<"$text"))" >&2
+            else
+                # glibc walks the whole nameserver list, so a second entry
+                # answers the moment the replay server misses a query.
+                others=$(grep -E '^[[:space:]]*nameserver[[:space:]]' <<<"$text" | grep -vx -- "$want" || true)
+                if [ -n "$others" ]; then
+                    failed=1
+                    echo "HOP D FAILED: $view /etc/resolv.conf also names a fallback resolver ($(tr '\n' '|' <<<"$others")), which would answer whenever $dns_server does not" >&2
+                else
+                    echo "  $view /etc/resolv.conf names $dns_server and nothing else"
+                fi
             fi
         done
         local host answer ok
