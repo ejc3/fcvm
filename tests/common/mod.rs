@@ -779,16 +779,16 @@ fn spawn_log_consumer_opts<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                         }
                         continue;
                     }
-                    // Any other read error is the stream itself failing; there
-                    // is nothing further to read, and the marker records it.
+                    // Any other read error is the stream itself failing, and
+                    // whatever the child wrote after it is lost. That is NOT
+                    // end-of-stream: the failure record below is what
+                    // `wait_for_log_eof` turns into an error, and the clean
+                    // marker is deliberately not written.
                     Err(e) => {
                         if let Some(ref log) = logger {
-                            log.log_raw(&format!(
-                                "[fcvm-test] {} consumer stopped on a read error: {}",
-                                name, e
-                            ));
+                            log.log_raw(&format!("{}{}", log_failure_prefix(is_stderr), e));
                         }
-                        break;
+                        return;
                     }
                 };
                 let prefix = if is_stderr {
@@ -842,6 +842,16 @@ fn log_eof_marker(is_stderr: bool) -> &'static str {
     }
 }
 
+/// The record a consumer writes instead of the marker when its stream FAILS.
+/// The read error follows the prefix on the same line.
+fn log_failure_prefix(is_stderr: bool) -> &'static str {
+    if is_stderr {
+        "[fcvm-test] child stderr capture failed: "
+    } else {
+        "[fcvm-test] child stdout capture failed: "
+    }
+}
+
 /// Wait until BOTH of a spawned fcvm's log consumers have drained their streams
 /// into `log_path`, then return. Call this after the child has exited and before
 /// asserting on the log's contents.
@@ -862,6 +872,20 @@ pub async fn wait_for_log_eof(log_path: &std::path::Path, timeout: Duration) -> 
         // the harness's own records with a timestamp, so nothing but the marker
         // itself can produce this line. A substring test would be satisfied by
         // an argv or a child line that merely quotes the marker's text.
+        // A failed stream never reaches end-of-stream; report it rather than
+        // wait out the timeout, and never certify the file as complete.
+        for is_stderr in [false, true] {
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.starts_with(log_failure_prefix(is_stderr)))
+            {
+                anyhow::bail!(
+                    "log {} is incomplete: {}",
+                    log_path.display(),
+                    line.trim_start_matches("[fcvm-test] ")
+                );
+            }
+        }
         let reached = |marker: &str| text.lines().any(|line| line == marker);
         if reached(log_eof_marker(false)) && reached(log_eof_marker(true)) {
             return Ok(());

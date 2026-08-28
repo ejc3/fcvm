@@ -61,6 +61,62 @@ async fn log_capture_continues_past_an_unreadable_line() {
     );
 }
 
+/// A reader that serves one line and then fails with a non-UTF-8 error.
+struct TornPipe {
+    served: bool,
+}
+
+impl tokio::io::AsyncRead for TornPipe {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        if !me.served {
+            me.served = true;
+            buf.put_slice(b"only line before the tear\n");
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Ready(Err(std::io::Error::other("pipe torn")))
+        }
+    }
+}
+
+#[tokio::test]
+async fn wait_for_log_eof_reports_a_failed_capture_instead_of_certifying_it() {
+    let logger = common::TestLogger::new("log-capture-torn");
+    let path = logger.path().clone();
+    let stderr: &'static [u8] = b"";
+    common::spawn_log_consumer_to_file(
+        Some(TornPipe { served: false }),
+        "torn",
+        Some(logger.clone()),
+        false,
+    );
+    common::spawn_log_consumer_to_file(Some(stderr), "torn", Some(logger), true);
+
+    // A read error is not end-of-stream: whatever the child wrote after it
+    // was never captured. Certifying that file complete lets an absence
+    // check pass against a truncated log, so the waiter must fail instead.
+    let result = common::wait_for_log_eof(&path, Duration::from_secs(5)).await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let err = match result {
+        Ok(()) => panic!(
+            "wait_for_log_eof certified a capture whose stream failed mid-way as complete:\n{text}"
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("pipe torn"),
+        "the waiter's error must carry the read error, not a timeout:\n{err}\n{text}"
+    );
+    assert!(
+        text.contains("only line before the tear"),
+        "the lines before the failure must still be in the file:\n{text}"
+    );
+}
+
 #[tokio::test]
 async fn wait_for_log_eof_ignores_a_child_line_that_quotes_the_marker() {
     let logger = common::TestLogger::new("log-capture-quoted-marker");
