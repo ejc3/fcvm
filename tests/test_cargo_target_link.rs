@@ -2745,6 +2745,129 @@ fn cargo_target_link_falls_back_when_the_existing_worktree_dir_is_unwritable() {
     assert_target_usable(checkout.path(), "existing but unwritable worktree dir");
 }
 
+/// "Is a directory" is not "is writable" (codex on #867). Every path that leaves
+/// target/ as a plain local directory used to end on a `-d` test, so a target/
+/// nothing could write was reported as a successful fallback and cargo failed
+/// several steps later with its own error. The script now runs one probe,
+/// `require_writable_local_target`, at each of those exits. Two of the three are
+/// driven here through the fixture every uid can use: target/ pointing at
+/// /proc/self, a directory root itself cannot create in. The third (retaining an
+/// unmanaged REAL directory) cannot be staged for uid 0 without a mount or
+/// `chattr +i`, neither of which the container lane permits (overlayfs refuses
+/// the flag), so it is pinned structurally in
+/// `every_local_target_exit_probes_writability_first`.
+#[test]
+fn cargo_target_link_refuses_an_unwritable_local_target_when_btrfs_is_unusable() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    std::os::unix::fs::symlink("/proc/self", checkout.path().join("target"))
+        .expect("procfs-backed local target/");
+    let unwritable_tmp = tempfile::tempdir().expect("btrfs stand-in");
+    let btrfs_root: PathBuf = if nix_geteuid_is_root() {
+        PathBuf::from("/proc")
+    } else {
+        std::fs::set_permissions(
+            unwritable_tmp.path(),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("chmod 0555");
+        unwritable_tmp.path().to_path_buf()
+    };
+
+    let (ok, out) = run_link(checkout.path(), &btrfs_root);
+    let _ = std::fs::set_permissions(
+        unwritable_tmp.path(),
+        std::fs::Permissions::from_mode(0o755),
+    );
+
+    assert!(
+        !ok,
+        "the recipe reported success with a target/ nothing can write (btrfs unusable, \
+         local target/ kept on a `-d` test alone):\n{out}"
+    );
+    assert!(
+        out.contains("nothing can write"),
+        "the failure must say the local target/ is unwritable, not something else:\n{out}"
+    );
+}
+
+#[test]
+fn cargo_target_link_refuses_an_unwritable_local_target_on_managed_fallback() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    // The managed worktree dir cannot be written, so the script falls back to
+    // the local target/ ... which is just as unwritable, and is not a managed
+    // link, so the fallback keeps it.
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+    std::os::unix::fs::symlink("/proc/self", checkout.path().join("target"))
+        .expect("procfs-backed local target/");
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(
+        !ok,
+        "the managed-dir fallback reported success with a local target/ nothing can \
+         write:\n{out}"
+    );
+    assert!(
+        out.contains("nothing can write"),
+        "the failure must say the local target/ is unwritable, not something else:\n{out}"
+    );
+}
+
+/// Every exit that leaves target/ as a plain local directory probes it first.
+///
+/// Behavioural coverage above reaches two of the three exits; this pins all of
+/// them by shape, so a fourth exit (or a probe dropped from one) fails here.
+#[test]
+fn every_local_target_exit_probes_writability_first() {
+    let script =
+        std::fs::read_to_string(repo_root().join("scripts/cargo-target-link.sh")).expect("script");
+    let lines: Vec<&str> = script.lines().collect();
+    fn is_code(l: &str) -> bool {
+        !l.trim().is_empty() && !l.trim().starts_with('#')
+    }
+    let mut exits = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() != "exit 0" {
+            continue;
+        }
+        exits += 1;
+        let preceding: Vec<&str> = lines[..i]
+            .iter()
+            .rev()
+            .filter(|l| is_code(l))
+            .take(3)
+            .copied()
+            .collect();
+        assert!(
+            preceding
+                .iter()
+                .any(|l| l.contains("require_writable_local_target")),
+            "line {}: `exit 0` without a writability probe among the three preceding \
+             statements {:?}; a target/ that passes `-d` but cannot be written is a cargo \
+             error several steps later",
+            i + 1,
+            preceding
+        );
+    }
+    assert!(
+        exits >= 2,
+        "expected the managed-dir fallback and the unmanaged-target retention to each \
+         `exit 0`; found {exits}. If the script's shape changed, move this pin with it."
+    );
+    let last = lines
+        .iter()
+        .rev()
+        .find(|l| is_code(l))
+        .map(|l| l.trim())
+        .unwrap_or("");
+    assert_eq!(
+        last, "require_writable_local_target",
+        "the script's fall-through end (the else-branch and self-heal paths) must be \
+         the probe itself"
+    );
+}
+
 /// Helper: this checkout's managed worktree dir, exactly as the script names it.
 fn managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
     let p = std::fs::canonicalize(checkout).expect("canonical checkout path");

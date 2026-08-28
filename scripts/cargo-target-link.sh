@@ -101,6 +101,28 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # #867). Replacing it is safe here because this script holds the checkout lock
 # (no Cargo runs in this checkout meanwhile) and, whenever target/ resolved,
 # the exclusive lease on its generation taken below.
+# Every exit that leaves target/ as a plain local directory ends here. "Is a
+# directory" is not "is writable": procfs, a read-only mount, and (for a
+# non-root user) a 0555 directory all pass `-d`, and an unwritable target/
+# turns into an opaque cargo error several steps later, which is precisely
+# how the original outage read. So create it if absent, then prove a file
+# can be made in it.
+require_writable_local_target() {
+	[ -e target ] || mkdir -p target
+	if [ ! -d target ]; then
+		echo "ERROR: target exists but is not a usable directory:" >&2
+		ls -ld target >&2
+		exit 1
+	fi
+	local probe
+	if ! probe="$(mktemp -p target .cargo-target-link-probe.XXXXXXXX 2>/dev/null)"; then
+		echo "ERROR: target/ is a directory nothing can write; cargo cannot use it:" >&2
+		ls -ld target >&2
+		exit 1
+	fi
+	rm -f -- "$probe"
+}
+
 fallback_to_local() {
 	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
 	if [ -L target ]; then
@@ -108,12 +130,7 @@ fallback_to_local() {
 			"$BTRFS_ROOT"/cargo-target/*) rm -f -- target ;;
 		esac
 	fi
-	[ -e target ] || mkdir -p target
-	if [ ! -d target ]; then
-		echo "ERROR: target exists but is not a usable directory:" >&2
-		ls -ld target >&2
-		exit 1
-	fi
+	require_writable_local_target
 	exit 0
 }
 
@@ -244,6 +261,7 @@ if [ -e target ] && ! [ -L target ]; then
 		echo "ERROR: unmanaged local target/ cannot be atomically rotated; refusing unsafe clean" >&2
 		exit 1
 	fi
+	require_writable_local_target
 	echo "==> WARNING: retaining unmanaged local target/; it cannot be atomically rotated" >&2
 	exit 0
 fi
@@ -359,11 +377,6 @@ if [ -L target ] && ! [ -d target ]; then
 	fi
 fi
 
-# Fail closed: leaving target/ unusable turns into an opaque cargo error several
-# steps later, which is precisely how the original outage read.
-[ -e target ] || mkdir -p target
-if [ ! -d target ]; then
-	echo "ERROR: target exists but is not a usable directory:" >&2
-	ls -ld target >&2
-	exit 1
-fi
+# Fail closed, for every path that reaches here (the managed link just
+# published, the unusable-volume branch, a healed or dropped dangling link).
+require_writable_local_target
