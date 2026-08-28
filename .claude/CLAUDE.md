@@ -171,6 +171,11 @@ Enforcement: `scripts/check-review-threads.sh <pr>` fails while any review threa
 unresolved, and while any finding — inline OR in a PR-level review body — carries no
 disposition. One vocabulary for both:
 
+A head that no reviewer has anything to say about is still reviewed: the gate counts a
+bot's no-findings verdict (Codex's "Didn't find any major issues" comment, CodeRabbit's
+"Full review finished.") as coverage of the head when it is dated after the head commit
+and posted by someone other than the author; such verdicts need no disposition.
+
 | `RED-VERIFIED: <test>` | a defect claim, closed by a test watched failing without the fix |
 | `NOT-A-DEFECT: <reason>` | naming, docs, style |
 | `DISAGREE: <reason>` | a defect claim you are rejecting, with reasoning |
