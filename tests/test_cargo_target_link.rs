@@ -280,19 +280,12 @@ fn cargo_target_link_heals_when_btrfs_is_gone_entirely() {
     );
     assert_target_usable(work.path(), "btrfs root absent");
 
-    // And it must be a REAL local directory, not the stale link with its target
-    // recreated. `$BTRFS_ROOT` absent means the volume is unmounted; recreating
-    // the path underneath a mountpoint writes build artifacts to the small root
-    // filesystem while still looking like btrfs — the exact failure this whole
-    // indirection exists to avoid.
-    assert!(
-        std::fs::symlink_metadata(work.path().join("target"))
-            .expect("target must exist")
-            .file_type()
-            .is_dir(),
-        "target is still a symlink after the btrfs volume disappeared; artifacts would be \
-         written under the unmounted mountpoint {gone:?} — i.e. onto the root filesystem"
-    );
+    // And it must be the script's own fallback link, not the stale link with
+    // its target recreated. `$BTRFS_ROOT` absent means the volume is unmounted;
+    // recreating the path underneath a mountpoint writes build artifacts to the
+    // small root filesystem while still looking like btrfs, the exact failure
+    // this whole indirection exists to avoid.
+    assert_local_fallback_link(work.path(), &gone, "btrfs root absent");
 }
 
 /// A different textual spelling can still resolve to the same directory inode. Opening that
@@ -2733,16 +2726,11 @@ fn cargo_target_link_falls_back_when_the_existing_worktree_dir_is_unwritable() {
     let (ok, out) = run_link(checkout.path(), btrfs.path());
 
     assert!(ok, "the recipe failed outright:\n{out}");
-    let target = checkout.path().join("target");
-    assert!(
-        !target.is_symlink(),
-        "target/ was pointed at the unwritable managed directory {}; a probe that only \
-         `mkdir -p`s an existing directory cannot see that it is unwritable\n{out}",
-        std::fs::read_link(&target)
-            .map(|l| l.display().to_string())
-            .unwrap_or_default()
+    assert_local_fallback_link(
+        checkout.path(),
+        btrfs.path(),
+        "existing but unwritable worktree dir",
     );
-    assert_target_usable(checkout.path(), "existing but unwritable worktree dir");
 }
 
 /// "Is a directory" is not "is writable" (codex on #867). Every path that leaves
@@ -2856,17 +2844,9 @@ fn cargo_target_link_drops_a_managed_link_it_cannot_lease() {
         ok,
         "the recipe failed instead of falling back to a local target/:\n{out}"
     );
-    let target = checkout.path().join("target");
-    assert!(
-        !target.is_symlink(),
-        "target/ still points into the managed tree ({}) on a path that took no lease \
-         on it\n{out}",
-        std::fs::read_link(&target)
-            .map(|l| l.display().to_string())
-            .unwrap_or_default()
-    );
-    assert_target_usable(
+    assert_local_fallback_link(
         checkout.path(),
+        btrfs.path(),
         "managed link dropped on an unusable volume",
     );
     let mtime = std::fs::metadata(&generation)
@@ -2909,13 +2889,11 @@ fn cargo_target_link_falls_back_when_the_managed_dir_cannot_be_opened() {
         "the recipe died instead of falling back when the managed dir cannot be \
          opened:\n{out}"
     );
-    let target = checkout.path().join("target");
-    assert!(
-        target.is_dir() && !target.is_symlink(),
-        "target/ should be a local directory after the fallback, not {:?}\n{out}",
-        std::fs::symlink_metadata(&target).map(|m| m.file_type())
+    assert_local_fallback_link(
+        checkout.path(),
+        btrfs.path(),
+        "managed dir that cannot be opened",
     );
-    assert_target_usable(checkout.path(), "managed dir that cannot be opened");
 }
 
 /// `run_link`, but as uid 65534 when the tests are root: root can open and
@@ -3259,6 +3237,39 @@ fn managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
         .join(format!("{base}-{}", &digest[..8]))
 }
 
+/// Helper: this checkout's fallback payload, exactly as the script names it.
+fn local_fallback_dir(checkout: &Path) -> PathBuf {
+    std::fs::canonicalize(checkout)
+        .expect("canonical checkout path")
+        .join(".cargo-target-local")
+}
+
+/// The script's own fallback: `target` is a link to the checkout-local payload,
+/// never a real `target/` dentry, so a later run can replace it once the volume
+/// is back. Returns the payload path.
+fn assert_local_fallback_link(checkout: &Path, btrfs_root: &Path, ctx: &str) -> PathBuf {
+    let target = checkout.join("target");
+    let link = std::fs::read_link(&target).unwrap_or_else(|error| {
+        panic!(
+            "{ctx}: target/ is not a symlink ({error}); a real target/ dentry is retained as \
+             unmanaged by every later run, so the checkout would never return to the btrfs \
+             cache. symlink_metadata={:?}",
+            std::fs::symlink_metadata(&target).map(|m| m.file_type())
+        )
+    });
+    assert!(
+        !link.starts_with(btrfs_root),
+        "{ctx}: target/ -> {link:?} points into the btrfs root {btrfs_root:?}"
+    );
+    assert_eq!(
+        link,
+        local_fallback_dir(checkout),
+        "{ctx}: target/ does not point at the checkout-local fallback payload"
+    );
+    assert_target_usable(checkout, ctx);
+    link
+}
+
 /// Make this checkout's managed worktree dir "exist but refuse writes" without
 /// any privilege: point it at procfs, where creating an entry is refused for
 /// root and non-root alike. `mkdir -p` on it succeeds (it exists), a lease fd
@@ -3291,8 +3302,8 @@ fn unwritable_managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBu
 /// leaves the symlink in place. The link still resolves, so the dangling-link
 /// repair is skipped and the final `-d target` check passes: exit 0 with a
 /// target Cargo cannot create files in. The fallback has to repoint an existing
-/// managed link at a real local directory -- under the generation lease it
-/// already holds for exactly this kind of replacement.
+/// managed link at the local fallback -- under the generation lease it already
+/// holds for exactly this kind of replacement.
 #[test]
 fn cargo_target_link_replaces_a_managed_link_to_an_unwritable_dir() {
     let checkout = tempfile::tempdir().expect("checkout tempdir");
@@ -3303,16 +3314,11 @@ fn cargo_target_link_replaces_a_managed_link_to_an_unwritable_dir() {
     let (ok, out) = run_link(checkout.path(), btrfs.path());
 
     assert!(ok, "the recipe failed outright:\n{out}");
-    let target = checkout.path().join("target");
-    assert!(
-        !target.is_symlink(),
-        "target/ still links to the unwritable managed directory {}; the fallback \
-         warned and walked away\n{out}",
-        std::fs::read_link(&target)
-            .map(|l| l.display().to_string())
-            .unwrap_or_default()
+    assert_local_fallback_link(
+        checkout.path(),
+        btrfs.path(),
+        "managed link to an unwritable dir",
     );
-    assert_target_usable(checkout.path(), "managed link to an unwritable dir");
 }
 
 /// The write probe must happen INSIDE the generation lease, never before it.
@@ -3382,5 +3388,156 @@ fn cargo_target_link_does_not_touch_a_generation_it_has_not_leased() {
         before, after,
         "the generation directory was modified (mtime {before} -> {after}) while the \
          pruner held its lease: the write probe ran outside the lock"
+    );
+}
+
+/// A fallback the script created must not outlive the outage that caused it.
+///
+/// Codex on #867 (P2): with the volume unavailable and no target/ present, the
+/// fallback created a REAL target/ directory. The next run with the volume back
+/// took the pre-protocol branch, which retains any real target/ as unmanaged, so
+/// the checkout never returned to the btrfs cache and every later build landed
+/// on the root filesystem until the disk guard quarantined the runner. The
+/// fallback now lives behind a link to a checkout-local payload, which the
+/// recovered run replaces under the same lease as any other published link.
+/// Nothing enumerates that payload, so nothing reclaims it: it stays in place
+/// and its path is printed so a human can remove it.
+#[test]
+fn cargo_target_link_returns_to_btrfs_after_a_volume_outage() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    assert!(!btrfs.exists(), "precondition: the volume is not mounted");
+
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 1 (volume absent) failed:\n{out}");
+    assert_target_usable(checkout.path(), "run 1, volume absent");
+    let target = checkout.path().join("target");
+    let payload = std::fs::canonicalize(&target).expect("resolve the fallback payload");
+    std::fs::write(
+        target.join("built-during-outage"),
+        b"built while the volume was down",
+    )
+    .expect("write through target/ during the outage");
+
+    std::fs::create_dir_all(&btrfs).expect("the volume is mounted again");
+
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 2 (volume back) failed:\n{out}");
+    let link = std::fs::read_link(&target).unwrap_or_else(|error| {
+        panic!(
+            "run 2: target/ is not a symlink ({error}); the fallback the script created \
+             during the outage was retained as an unmanaged real target/, so this checkout \
+             never returns to the btrfs cache and every later build stays on the root \
+             filesystem:\n{out}"
+        )
+    });
+    assert!(
+        link.starts_with(btrfs.join("cargo-target")),
+        "run 2: target/ -> {link:?} is not under the recovered volume:\n{out}"
+    );
+    assert_target_usable(checkout.path(), "run 2, volume back");
+    assert_eq!(
+        std::fs::read(payload.join("built-during-outage")).unwrap_or_else(|error| panic!(
+            "the outage payload {payload:?} was destroyed: {error}"
+        )),
+        b"built while the volume was down",
+        "the outage payload was modified"
+    );
+    assert!(
+        !target.join("built-during-outage").exists(),
+        "the outage payload is still published through target/"
+    );
+    assert!(
+        out.contains(payload.to_str().expect("utf-8 payload path")),
+        "run 2 must print the orphaned payload path {payload:?} so a human can remove it:\n{out}"
+    );
+}
+
+/// A real target/ the script did not create is retained, volume or no volume.
+/// Its dentry may carry a mount that exists only in another mount namespace,
+/// and renaming or removing it could move or detach that mount; only the
+/// script's own fallback lives behind a replaceable link.
+#[test]
+fn cargo_target_link_retains_a_real_target_it_did_not_create() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let target = checkout.path().join("target");
+    std::fs::create_dir(&target).expect("pre-existing real target/");
+    let artifact = target.join("pre-protocol-artifact");
+    std::fs::write(&artifact, b"not the script's to move").expect("write artifact");
+
+    for (volume_present, ctx) in [(false, "volume absent"), (true, "volume back")] {
+        if volume_present {
+            std::fs::create_dir_all(&btrfs).expect("mount the volume");
+        }
+        let (ok, out) = run_link(checkout.path(), &btrfs);
+        assert!(ok, "{ctx}: the recipe failed:\n{out}");
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .expect("target/ must exist")
+                .file_type()
+                .is_dir(),
+            "{ctx}: a real target/ the script did not create was replaced by {:?}:\n{out}",
+            std::fs::read_link(&target)
+        );
+        if volume_present {
+            assert!(
+                out.contains("retaining unmanaged local target/"),
+                "{ctx}: retention must be stated:\n{out}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&artifact).expect("read the retained artifact"),
+            b"not the script's to move",
+            "{ctx}: the retained payload changed"
+        );
+        assert!(
+            !local_fallback_dir(checkout.path()).exists(),
+            "{ctx}: a fallback payload was created beside a retained real target/:\n{out}"
+        );
+        assert_target_usable(checkout.path(), ctx);
+    }
+}
+
+/// `--rotate` keeps refusing while the volume is down: the fallback link, and a
+/// fallback payload with no link over it, would both report a clean while the
+/// payload survives.
+#[test]
+fn cargo_target_link_rotate_refuses_the_local_fallback_while_the_volume_is_down() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "fallback failed:\n{out}");
+    let payload = assert_local_fallback_link(checkout.path(), &btrfs, "volume absent");
+    let target = checkout.path().join("target");
+    std::fs::write(target.join("artifact"), b"survives").expect("write through target/");
+
+    let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+    assert!(
+        !ok && out.contains("refusing unsafe clean"),
+        "--rotate reported a clean it cannot perform on the fallback link:\n{out}"
+    );
+    assert_eq!(
+        std::fs::read_link(&target).expect("readlink"),
+        payload,
+        "a refused rotation must leave the fallback link in place"
+    );
+
+    std::fs::remove_file(&target).expect("unlink the fallback link");
+    let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+    assert!(
+        !ok && out.contains("refusing unsafe clean"),
+        "--rotate republished a surviving fallback payload as a clean target/:\n{out}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&target).is_err(),
+        "a refused rotation must not publish anything"
+    );
+    assert_eq!(
+        std::fs::read(payload.join("artifact")).expect("read the surviving payload"),
+        b"survives"
     );
 }

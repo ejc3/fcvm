@@ -6,7 +6,7 @@
 # runs first and its postcondition is the whole contract: after it returns 0,
 # `target` IS a usable directory.
 #
-# Two properties this has to hold, both learned the hard way:
+# Three properties this has to hold, the first two learned the hard way:
 #
 # 1. PER WORKTREE. Cargo names a test binary from a hash over package
 #    name/version/features that does NOT include the checkout path, so every
@@ -25,6 +25,13 @@
 #    Not a directory (os error 20)" that took out Host-arm64 on every open PR on
 #    2026-08-08. `~/.cargo` in the Makefile's check-disk target already
 #    self-heals for exactly this reason; target/ did not.
+#
+# 3. A FALLBACK MUST BE REVERSIBLE. A real target/ the script did not create is
+#    retained for good (its dentry may carry a mount visible only in another
+#    mount namespace), so a fallback shaped as a real target/ would keep every
+#    later build on the root filesystem after the volume returned. The fallback
+#    is a symlink to a checkout-local payload, replaced like any other published
+#    link once the volume is usable again.
 #
 # Everything below runs under an exclusive flock on the checkout directory,
 # because more than one `make` can run in one checkout (several CI entry points
@@ -79,23 +86,46 @@ p="$(pwd -P)"
 name="$(printf '%s' "$(basename "$p")" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 hash="$(printf '%s' "$p" | sha256sum | cut -c1-8)"
 WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
+# The fallback payload, published through target/ as a symlink and never as a
+# real target/ dentry.
+LOCAL_TARGET="$p/.cargo-target-local"
 
-# Every exit that leaves target/ as a plain local directory proves a file can
-# be created in it first. `-d` passes on procfs, a read-only mount, and a 0555
+publish_target_link() {
+	local destination="$1" staging
+	staging="$(mktemp -d -- "$p/.fcvm-target-link.XXXXXXXX")"
+	ln -s -- "$destination" "$staging/target"
+	# The checkout lock excludes every cooperating resolver. Replacing only
+	# this symlink is atomic and never renames a physical target dentry (which
+	# could move a mount that exists solely in another namespace).
+	mv -Tf -- "$staging/target" target
+	rmdir -- "$staging"
+}
+
+# Every exit that leaves target/ on the root filesystem proves a file can be
+# created in it first. `-d` passes on procfs, a read-only mount, and a 0555
 # directory. `-w` is no better for root, which passes access(W_OK) on a
 # directory it still cannot create entries in. Creating an entry is the
-# operation cargo needs, and the only test of it.
+# operation cargo needs, and the only test of it. When nothing is published,
+# the fallback is a link to $LOCAL_TARGET; a real target/ dentry is never
+# created here, because every later run would retain it as unmanaged.
 require_writable_local_target() {
-	# A managed link was already dropped by the caller under its lease; an
-	# unmanaged dangling one is dropped here, or `mkdir -p` fails with EEXIST.
-	if [ -L target ] && ! [ -e target ]; then
-		echo "==> WARNING: dropping dangling target/ → $(readlink target); a local directory takes its place" >&2
+	# A managed link was already dropped by the caller under its lease. An
+	# unmanaged dangling link is dropped here; a dangling fallback link keeps
+	# its name and gets its payload back.
+	if [ -L target ] && ! [ -e target ] && [ "$(readlink target)" != "$LOCAL_TARGET" ]; then
+		echo "==> WARNING: dropping dangling target/ → $(readlink target); the local fallback takes its place" >&2
 		rm -f -- target
 	fi
-	if ! [ -e target ] && ! mkdir -p target; then
-		echo "ERROR: cannot create a local target/ directory:" >&2
-		ls -ld target >&2 2>/dev/null || true
-		exit 1
+	if ! [ -e target ]; then
+		if ! mkdir -p -- "$LOCAL_TARGET"; then
+			echo "ERROR: cannot create the local fallback $LOCAL_TARGET:" >&2
+			ls -ld -- "$LOCAL_TARGET" "$p" >&2 2>/dev/null || true
+			exit 1
+		fi
+		if ! [ -L target ]; then
+			publish_target_link "$LOCAL_TARGET"
+			echo "==> Symlinked target/ → $LOCAL_TARGET (local fallback)" >&2
+		fi
 	fi
 	if [ ! -d target ]; then
 		echo "ERROR: target exists but is not a usable directory:" >&2
@@ -113,33 +143,39 @@ require_writable_local_target() {
 
 # Drops the checkout's managed target/ link; the generation stays for the
 # pruner. A resolving link is dropped only under an exclusive lease on the
-# generation it publishes: a cargo wrapper may hold that lease shared for the
+# directory it publishes: a cargo wrapper may hold that lease shared for the
 # life of its build, and removing the pathname under it splits the build across
-# two trees. A generation that cannot be opened cannot be leased, so the drop
-# is refused. The lease fd stays open until exit. A dangling link publishes
-# nothing and is dropped without one.
+# two trees. A directory that cannot be opened cannot be leased, so the drop is
+# refused. The lease fd stays open until exit. A dangling link publishes
+# nothing and is dropped without one. The script's own fallback link is leased
+# the same way and kept, since it already publishes the directory the fallback
+# uses.
 drop_managed_link() {
 	[ -L target ] || return 0
-	case "$(readlink target)" in
-		"$BTRFS_ROOT"/cargo-target/*)
-			if [[ -z ${old_target_lease_fd:-} ]] && [ -d target ]; then
-				if ! exec {old_target_lease_fd}<target; then
-					echo "ERROR: cannot open the published generation $(readlink target) to lease it; a running build may still hold it, refusing to replace target/" >&2
-					exit 1
-				fi
-				flock -x "$old_target_lease_fd"
-			fi
-			echo "==> WARNING: dropping target/ → $(readlink target); its volume cannot be used" >&2
-			rm -f -- target ;;
+	local linked
+	linked="$(readlink target)"
+	case "$linked" in
+		"$BTRFS_ROOT"/cargo-target/* | "$LOCAL_TARGET") ;;
+		*) return 0 ;;
 	esac
+	if [[ -z ${old_target_lease_fd:-} ]] && [ -d target ]; then
+		if ! exec {old_target_lease_fd}<target; then
+			echo "ERROR: cannot open the published directory $linked to lease it; a running build may still hold it, refusing to replace target/" >&2
+			exit 1
+		fi
+		flock -x "$old_target_lease_fd"
+	fi
+	[ "$linked" != "$LOCAL_TARGET" ] || return 0
+	echo "==> WARNING: dropping target/ → $linked; its volume cannot be used" >&2
+	rm -f -- target
 }
 
 fallback_to_local() {
 	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
 	drop_managed_link
-	# `--rotate` promises a clean target/; a retained local link or directory
-	# would report one while its payload survives.
-	if ((FORCE_ROTATE)) && { [ -L target ] || [ -d target ]; }; then
+	# `--rotate` promises a clean target/; a retained link or directory, or a
+	# republished fallback payload, would report one while its payload survives.
+	if ((FORCE_ROTATE)) && { [ -L target ] || [ -d target ] || [ -e "$LOCAL_TARGET" ]; }; then
 		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
 		exit 1
 	fi
@@ -240,17 +276,6 @@ finally:
     os.close(directory_fd)
 ' "/proc/$$/fd/$fresh_lease_fd"
 	flock -s "$fresh_lease_fd"
-}
-
-publish_target_link() {
-	local destination="$1" staging
-	staging="$(mktemp -d -- "$p/.fcvm-target-link.XXXXXXXX")"
-	ln -s -- "$destination" "$staging/target"
-	# The checkout lock excludes every cooperating resolver. Replacing only
-	# this symlink is atomic and never renames a physical target dentry (which
-	# could move a mount that exists solely in another namespace).
-	mv -Tf -- "$staging/target" target
-	rmdir -- "$staging"
 }
 
 mkdir -p -- "$(dirname "$WT_TARGET")"
@@ -358,6 +383,10 @@ case "$retired_rc" in
 esac
 
 if ! [ -L target ] || [ "$(readlink target)" != "$candidate" ]; then
+	if [ "${linked:-}" = "$LOCAL_TARGET" ]; then
+		# Nothing enumerates this path, so nothing reclaims it.
+		echo "==> WARNING: $BTRFS_ROOT is usable again; the fallback payload $LOCAL_TARGET is no longer published and is not reclaimed, remove it by hand" >&2
+	fi
 	publish_target_link "$candidate"
 	echo "==> Symlinked target/ → $candidate"
 fi
@@ -372,7 +401,7 @@ if [[ -n ${candidate_lease_fd:-} && $candidate_lease_fd != "$final_lease_fd" ]];
 	exec {candidate_lease_fd}<&-
 fi
 else
-	if ((FORCE_ROTATE)) && [ -d target ]; then
+	if ((FORCE_ROTATE)) && { [ -d target ] || [ -e "$LOCAL_TARGET" ]; }; then
 		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
 		exit 1
 	fi
@@ -385,8 +414,9 @@ else
 fi
 
 # Self-heal a dangling link. `[ -d target ]` follows the symlink, so this is
-# false exactly when it does not resolve.
-if [ -L target ] && ! [ -d target ]; then
+# false exactly when it does not resolve. A dangling fallback link is left for
+# require_writable_local_target, which recreates its payload.
+if [ -L target ] && ! [ -d target ] && [ "$(readlink target)" != "$LOCAL_TARGET" ]; then
 	TGT="$(readlink target)"
 	if ! [ -d "$BTRFS_ROOT" ]; then
 		# The VOLUME is gone, not just our directory on it. Recreating the path
