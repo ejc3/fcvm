@@ -4,9 +4,11 @@
 The campaign reads $RESULTS/corpus-dns.log and $RESULTS/corpus-access.log after
 a run to show which resolver the guest used and which hosts it fetched. Each
 line has to carry the fields that reader keys on, and it has to be on disk
-before the run's next step reads it, so every test below reads the log while
-the server that wrote it is still running: a line held in a stdio buffer would
-not be there.
+once the handler that answered has finished, so every test below reads the log
+before it is closed: a line held in a stdio buffer would not be there. The
+access line follows the response, so the HTTP tests wait for the handler
+through the shipped shutdown sequence (stop_listeners, which joins it) rather
+than read the moment the client has the body.
 
 Watched red 2026-08-28 against corpus_serve.py at 4d172153; the failure text is
 quoted on each test.
@@ -19,11 +21,16 @@ import http.client
 import io
 import json
 import os
+import re
+import signal
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +69,7 @@ class DnsLog(unittest.TestCase):
             target=corpus_serve.serve_dns, args=(sock, answer_ip, log), daemon=True,
         )
         thread.start()
+        self._dns = (sock, thread)
 
         def stop():
             # close() does not wake a recvfrom already blocked in the kernel
@@ -82,6 +90,18 @@ class DnsLog(unittest.TestCase):
         self.addCleanup(stop)
         return port
 
+    def _rows(self, log_path: str) -> list:
+        """The log once the responder has ended.
+
+        The line follows the answer, so a client holding the reply can still
+        be ahead of the line; reading the file at that moment found zero rows
+        once in 25 runs of this module (2026-08-28). The shipped stop_dns
+        ends the responder and joins it; the log stays open, so a line that
+        is there was flushed by the responder, not by close().
+        """
+        corpus_serve.stop_dns(*self._dns)
+        return read_jsonl(log_path)
+
     def _ask(self, port: int, name: str, qtype: int):
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(client.close)
@@ -98,7 +118,7 @@ class DnsLog(unittest.TestCase):
             reply, me = self._ask(port, "blog.cloudflare.com", QTYPE_A)
             self.assertEqual(socket.inet_ntoa(reply[-4:]), "10.0.2.2",
                              "the responder no longer answers A queries")
-            rows = read_jsonl(log_path)
+            rows = self._rows(log_path)
             self.assertEqual(len(rows), 1, rows)
             row = rows[0]
             self.assertEqual(sorted(row), ["answer", "peer", "qname", "qtype", "ts"])
@@ -113,7 +133,7 @@ class DnsLog(unittest.TestCase):
             log_path = os.path.join(d, "corpus-dns.log")
             port = self._responder(log_path)
             self._ask(port, "fonts.gstatic.com", QTYPE_AAAA)
-            (row,) = read_jsonl(log_path)
+            (row,) = self._rows(log_path)
             self.assertEqual(row["qname"], "fonts.gstatic.com")
             self.assertEqual(row["qtype"], QTYPE_AAAA)
             self.assertEqual(row["answer"], "")
@@ -124,7 +144,7 @@ class DnsLog(unittest.TestCase):
             port = self._responder(log_path)
             for name in ("a.test", "b.test", "c.test"):
                 self._ask(port, name, QTYPE_A)
-            self.assertEqual([r["qname"] for r in read_jsonl(log_path)],
+            self.assertEqual([r["qname"] for r in self._rows(log_path)],
                              ["a.test", "b.test", "c.test"])
 
     def test_without_a_log_the_responder_still_answers_and_writes_nothing(self):
@@ -221,11 +241,12 @@ class AccessLog(unittest.TestCase):
             }}, handle)
         return os.path.join(d, "corpus")
 
-    def _replay(self, d: str, log=None, peers=None, start=True):
+    def _replay(self, d: str, log=None, peers=None, start=True, handler=None):
         """The shipped server class over a one-file corpus on an ephemeral port.
 
         Returns (server, thread). With start=False the thread is None and the
-        caller runs serve_forever itself, as serve_http does.
+        caller runs serve_forever itself, as serve_http does. `handler` is the
+        handler class to serve with (default corpus_serve.Handler).
         """
         from pathlib import Path
 
@@ -233,7 +254,7 @@ class AccessLog(unittest.TestCase):
 
         # A subclass, so the handler's class-level tables and log stay private
         # to this test instead of mutating corpus_serve.Handler for the suite.
-        class H(corpus_serve.Handler):
+        class H(handler or corpus_serve.Handler):
             pass
 
         H.exact, H.noquery, H.redirects = exact, noquery, redirects
@@ -252,7 +273,19 @@ class AccessLog(unittest.TestCase):
         log = corpus_serve.JsonlLog(log_path) if log_path else None
         if log is not None:
             self.addCleanup(log.close)
-        return self._replay(d, log)[0].server_port
+        return self._replay(d, log)[0]
+
+    def _rows(self, server, log_path: str) -> list:
+        """The log once every handler `server` dequeued has finished.
+
+        The access line is written after the response, so a client holding
+        the whole body can still be ahead of the line; reading the file at
+        that moment found zero rows once in 454 (2026-08-28). The shipped
+        shutdown sequence waits for the handlers; the log stays open, so a
+        line that is there was flushed by the handler, not by close().
+        """
+        corpus_serve.stop_listeners([server])
+        return read_jsonl(log_path)
 
     def _get(self, port: int, path: str, host: str = "example.test"):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -265,10 +298,10 @@ class AccessLog(unittest.TestCase):
     def test_a_hit_is_logged_with_host_path_status_and_body_bytes(self):
         with tempfile.TemporaryDirectory() as d:
             log_path = os.path.join(d, "corpus-access.log")
-            port = self._server(d, log_path)
-            status, body, me = self._get(port, "/a.txt")
+            server = self._server(d, log_path)
+            status, body, me = self._get(server.server_port, "/a.txt")
             self.assertEqual((status, body), (200, self.BODY))
-            (row,) = read_jsonl(log_path)
+            (row,) = self._rows(server, log_path)
             self.assertEqual(sorted(row), ["bytes", "duration_ms", "host", "method",
                                            "path", "peer", "status", "ts"])
             self.assertEqual(row["method"], "GET")
@@ -283,10 +316,10 @@ class AccessLog(unittest.TestCase):
     def test_a_miss_is_logged_as_a_404_with_zero_bytes(self):
         with tempfile.TemporaryDirectory() as d:
             log_path = os.path.join(d, "corpus-access.log")
-            port = self._server(d, log_path)
-            status, _, _ = self._get(port, "/absent.js?v=1", host="cdn.test")
+            server = self._server(d, log_path)
+            status, _, _ = self._get(server.server_port, "/absent.js?v=1", host="cdn.test")
             self.assertEqual(status, 404)
-            (row,) = read_jsonl(log_path)
+            (row,) = self._rows(server, log_path)
             self.assertEqual(row["host"], "cdn.test")
             self.assertEqual(row["path"], "/absent.js?v=1")
             self.assertEqual(row["status"], 404)
@@ -297,17 +330,18 @@ class AccessLog(unittest.TestCase):
         the TLS listener); the log records the header as sent."""
         with tempfile.TemporaryDirectory() as d:
             log_path = os.path.join(d, "corpus-access.log")
-            port = self._server(d, log_path)
-            status, body, _ = self._get(port, "/a.txt", host="example.test:443")
+            server = self._server(d, log_path)
+            status, body, _ = self._get(server.server_port, "/a.txt", host="example.test:443")
             self.assertEqual((status, body), (200, self.BODY))
-            (row,) = read_jsonl(log_path)
+            (row,) = self._rows(server, log_path)
             self.assertEqual(row["host"], "example.test:443")
 
     def test_without_a_log_serving_is_unchanged_and_nothing_is_written(self):
         with tempfile.TemporaryDirectory() as d:
-            port = self._server(d, None)
-            status, body, _ = self._get(port, "/a.txt")
+            server = self._server(d, None)
+            status, body, _ = self._get(server.server_port, "/a.txt")
             self.assertEqual((status, body), (200, self.BODY))
+            corpus_serve.stop_listeners([server])
             self.assertEqual(sorted(os.listdir(d)), ["corpus"])
 
 
@@ -366,7 +400,8 @@ class AccessLog(unittest.TestCase):
                              "serve_forever kept running after a failed access-log write")
             self.assertIsInstance(server.log_failure, OSError)
             self.assertEqual(server.log_failure.errno, errno.ENOSPC)
-            self.assertEqual(len(read_jsonl(log_path)), 1,
+            self.assertEqual(server.failed_log, "access")
+            self.assertEqual(len(self._rows(server, log_path)), 1,
                              "the line that failed to write is in the log")
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
             self.addCleanup(conn.close)
@@ -416,6 +451,161 @@ class AccessLog(unittest.TestCase):
                           "the failure was not recorded on the other listener")
             self.assertIn("FAILED", err.getvalue())
             self.assertIn("No space left on device", err.getvalue())
+
+    def test_a_signal_stop_waits_for_the_handlers_in_flight_before_closing_the_log(self):
+        """The access line follows the response, so a client can hold the
+        whole body while the line is still unwritten. The campaign sends
+        SIGTERM the moment the after-run verify returns and hashes the log
+        once the process is gone, so a process that exited on the signal
+        without waiting for that handler left a truncated log that was
+        hashed as clean. The stop must end accepting, wait for every handler
+        already dequeued, then close the logs, and serve_http returns 0.
+
+        The handler holds its thread after answering until the test releases
+        it, so the stop lands with the response read and the line to come,
+        and a stop that returns before the release did not wait.
+
+        Red: `AttributeError: module 'corpus_serve' has no attribute
+        'install_signal_handlers'`; with a handler that ended the loops and
+        closed the log without the wait: `False is not true : serve_http
+        returned while a handler was still running`.
+        """
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class Held(corpus_serve.Handler):
+            def do_GET(self):
+                self._serve()
+                release.wait(timeout=10)
+
+        with tempfile.TemporaryDirectory() as d:
+            log_path = os.path.join(d, "corpus-access.log")
+            log = corpus_serve.JsonlLog(log_path)
+            peers = []
+            plain, _ = self._replay(d, log, peers, start=False, handler=Held)
+            tls, _ = self._replay(d, log, peers, start=False, handler=Held)
+            returned = []
+            loop = threading.Thread(
+                target=lambda: returned.append(corpus_serve.serve_http(plain, tls, logs=[log])),
+                daemon=True)
+            loop.start()
+            self.addCleanup(lambda: (plain.shutdown(), tls.shutdown())
+                            if loop.is_alive() else None)
+            # The real handler, installed and then put back: unittest runs
+            # this on the main thread, where signal.signal is allowed.
+            saved = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+            for sig, previous in saved.items():
+                self.addCleanup(signal.signal, sig, previous)
+            on_signal = corpus_serve.install_signal_handlers(tls)
+            for sig in saved:
+                self.assertIs(signal.getsignal(sig), on_signal, f"{sig!r} is not handled")
+            status, body, _ = self._get(plain.server_port, "/a.txt")
+            self.assertEqual((status, body), (200, self.BODY))
+            on_signal(signal.SIGTERM, None)
+            # serve_forever polls its shutdown flag every 0.5 s, so ending
+            # both loops takes up to 1 s; a stop that waits then blocks on
+            # the held handler and cannot return before the release.
+            loop.join(timeout=2)
+            self.assertTrue(loop.is_alive(), "serve_http returned while a handler was still running")
+            release.set()
+            loop.join(timeout=5)
+            self.assertFalse(loop.is_alive(), "serve_http did not return once the handler had finished")
+            self.assertEqual(returned, [0])
+            rows = read_jsonl(log_path)
+            self.assertEqual(len(rows), 1,
+                             "the access line of the request in flight at the stop is not in the log")
+            self.assertEqual((rows[0]["status"], rows[0]["bytes"]), (200, len(self.BODY)))
+            with self.assertRaises(ValueError, msg="the log is still open after the stop"):
+                log.write({"late": True})
+            conn = http.client.HTTPConnection("127.0.0.1", plain.server_port, timeout=1)
+            self.addCleanup(conn.close)
+            with self.assertRaises(OSError, msg="a request was answered after the stop"):
+                conn.request("GET", "/a.txt", headers={"Host": "example.test"})
+                conn.getresponse()
+
+    def test_sigterm_to_the_process_leaves_the_last_access_line_on_disk(self):
+        """main() end to end, the way stop_corpus_serve ends it: a real
+        SIGTERM to the process while the handler of an already answered
+        request is still running. The process must exit 0 with that
+        request's line in the log.
+
+        The wrapper makes the shipped handler hold its thread after
+        answering until a flag file appears, and announces the HTTP port
+        serve_http was given, which main() does not print when asked for
+        port 0.
+
+        Red: `0 != 1 : the access line of the request in flight at SIGTERM
+        is not in the log (exit -15 before the handler finished)`, the
+        signal's default action; with a handler that ended the loops and
+        closed the log without the wait, the same with exit 0.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = self._corpus(d)
+            log_path = os.path.join(d, "corpus-access.log")
+            flag = os.path.join(d, "release")
+            wrapper = textwrap.dedent(f"""
+                import os, sys, time
+                sys.path.insert(0, {HERE!r})
+                import corpus_serve
+
+                def held(self):
+                    corpus_serve.Handler._serve(self)
+                    deadline = time.monotonic() + 10
+                    while not os.path.exists({flag!r}) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+
+                corpus_serve.Handler.do_GET = held
+                serve_http = corpus_serve.serve_http
+
+                def announce(plain, tls, *args, **kwargs):
+                    print("PORT", plain.server_port, flush=True)
+                    return serve_http(plain, tls, *args, **kwargs)
+
+                corpus_serve.serve_http = announce
+                sys.exit(corpus_serve.main())
+            """)
+            proc = subprocess.Popen(
+                [sys.executable, "-c", wrapper, "--root", root, "--port", "0",
+                 "--tls-port", "0", "--dns-addr", "127.0.0.1", "--dns-port", "0",
+                 "--access-log", log_path, "--dns-log", os.path.join(d, "corpus-dns.log")],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            watchdog = threading.Timer(30, proc.kill)
+            watchdog.start()
+            self.addCleanup(watchdog.cancel)
+            self.addCleanup(proc.stdout.close)
+            self.addCleanup(proc.kill)
+            port = None
+            head = []
+            for line in proc.stdout:
+                head.append(line)
+                found = re.match(r"PORT (\d+)$", line.strip())
+                if found:
+                    port = int(found.group(1))
+                    break
+            self.assertIsNotNone(port, "corpus_serve did not start:\n" + "".join(head))
+            status, body, _ = self._get(port, "/a.txt")
+            self.assertEqual((status, body), (200, self.BODY))
+            proc.send_signal(signal.SIGTERM)
+            # serve_forever polls its shutdown flag every 0.5 s, so ending
+            # both loops takes up to 1 s; a process that waits then blocks
+            # on the held handler and cannot exit before the flag appears.
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            early_exit = proc.returncode
+            open(flag, "w").close()
+            rest = proc.stdout.read()
+            proc.wait(timeout=10)
+            output = "".join(head) + rest
+            rows = read_jsonl(log_path)
+            self.assertEqual(len(rows), 1, "the access line of the request in flight at SIGTERM "
+                             f"is not in the log (exit {early_exit} before the handler finished):\n{output}")
+            self.assertEqual((rows[0]["status"], rows[0]["bytes"]), (200, len(self.BODY)))
+            self.assertIsNone(early_exit,
+                              f"corpus_serve exited {early_exit} while a handler was still running")
+            self.assertEqual(proc.returncode, 0,
+                             f"corpus_serve exited {proc.returncode} on SIGTERM:\n{output}")
 
 
 class Flags(unittest.TestCase):

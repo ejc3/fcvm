@@ -13,26 +13,33 @@ Resolution order for a request URL u:
   2. match ignoring the query string (analytics beacons carry per-view ids)
   3. 404, counted in /––misses (read by the checker for the report)
 
-Two optional logs, one JSON object per line, flushed per line so the campaign
-can read them after a run while this process is still serving:
+Two optional logs, one JSON object per line, flushed per line so a log left
+behind by a killed process is complete up to its last answered request:
   --dns-log PATH     {ts, peer, qname, qtype, answer} per DNS query; answer is
                      the address for A queries and "" for everything else
   --access-log PATH  {ts, peer, method, host, path, status, bytes, duration_ms}
                      per HTTP and HTTPS request; host is the Host header as sent
 
-Either log is evidence the campaign hashes, so a line that cannot be written
-stops the server: the DNS responder closes its socket, and an access line
-that fails ends both HTTP listeners and main() exits 1 with the reason.
+Either log is evidence the campaign hashes once this process has exited, so
+the log has to be complete when it exits. SIGTERM and SIGINT run the shutdown
+sequence (stop_listeners): every listener stops accepting, the DNS responder
+ends, every handler already dequeued finishes and writes its line, the logs
+are closed, and main() returns 0. A line that cannot be written stops the
+server through the same sequence: the DNS responder closes its socket, an
+access line that fails ends both HTTP listeners, and main() returns 1 with
+the reason.
 """
 
 import argparse
 import http.server
 import json
+import signal
 import socket
 import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -127,7 +134,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # the server would keep answering, unlogged, for the rest
                     # of the run. Stop every listener instead; the re-raise
                     # puts the traceback in corpus_serve.log via handle_error.
-                    self.server.fail_closed(exc)
+                    self.server.fail_closed(exc, "access")
                     raise
 
     def send_response(self, code, message=None):
@@ -239,49 +246,137 @@ class ReplayServer(http.server.ThreadingHTTPServer):
     """One replay listener; `peers` is the list of listeners sharing the log.
 
     A handler whose access line could not be written calls fail_closed(): the
-    error is recorded as log_failure on every peer and every peer's
-    serve_forever() returns, so serve_http() exits 1 with the reason instead
-    of serving on with a truncated log. Both listeners stop because the guest
-    fetches through both, and a log with only one side's lines is as short as
-    one with neither. Nothing clears the failure.
+    error is recorded as log_failure on every peer, with the log's name as
+    failed_log, and every peer is asked to stop, so serve_http() runs the
+    shutdown sequence and exits 1 with the reason instead of serving on with
+    a truncated log. Both listeners stop because the guest fetches through
+    both, and a log with only one side's lines is as short as one with
+    neither. Nothing clears the failure.
     """
+
+    # A handler thread outlives shutdown(): a request dequeued before the
+    # serve loop returned is still being answered and logged. As
+    # ThreadingHTTPServer ships them the handler threads are daemon threads,
+    # which server_close() does not join and the interpreter kills at exit,
+    # so an exit right after shutdown() dropped the last access line while
+    # the client already held the response. Non-daemon threads are the ones
+    # server_close() joins (block_on_close), which is what lets
+    # stop_listeners close the log only once every line is on disk.
+    daemon_threads = False
+    block_on_close = True
 
     def __init__(self, address, handler, peers=None):
         super().__init__(address, handler)
         self.log_failure = None
+        self.failed_log = None
         self.peers = peers if peers is not None else []
         self.peers.append(self)
 
-    def fail_closed(self, exc: BaseException) -> None:
+    def fail_closed(self, exc: BaseException, log_name: str) -> None:
         with _FAIL_CLOSED:
             if any(peer.log_failure is not None for peer in self.peers):
                 return
             for peer in self.peers:
                 peer.log_failure = exc
-        # shutdown() blocks until a serve_forever loop has returned, so it
-        # runs off the handler thread; peers are stopped in list order, and
-        # main() blocks in the last one's serve_forever.
-        threading.Thread(target=self._stop_peers, name="fail-closed", daemon=True).start()
+                peer.failed_log = log_name
+        self.request_stop()
+
+    def request_stop(self) -> None:
+        """Ask every peer to stop accepting; returns at once.
+
+        shutdown() blocks until the serve loop has returned, so it cannot run
+        on that loop's own thread: a handler thread here, or the main thread
+        inside serve_forever, which is where a signal handler runs. A helper
+        thread stops the peers in list order; main() blocks in the last
+        one's serve_forever, and serve_http continues from there.
+        """
+        threading.Thread(target=self._stop_peers, name="stop", daemon=True).start()
 
     def _stop_peers(self) -> None:
         for peer in self.peers:
             peer.shutdown()
 
 
-def serve_http(plain: ReplayServer, tls: ReplayServer, err=None) -> int:
-    """Serve both listeners until a failed access-log write stops them.
+def stop_listeners(peers, logs=()) -> None:
+    """The shutdown sequence, in this order: no listener accepts another
+    connection, every handler already dequeued runs to its end, then the
+    logs are closed.
 
-    serve_forever() returns only through ReplayServer.fail_closed (nothing
-    else calls shutdown), so a return is a failure: the reason goes to `err`
-    (stderr by default) and the status is 1. The process exits with it, the
-    guest's fetches and lookups start failing, and the campaign records the
-    run as unclean on the after-run bracket and the :53 owner samples.
+    The access line is written after the response, so a client can hold the
+    whole body while the line is still to come. The campaign sends SIGTERM
+    as soon as its after-run verify returns and hashes both logs once this
+    process is gone; without the wait, the last handler's line was lost and
+    a truncated log was hashed as clean. Every handler answers one HTTP/1.0
+    request and exits, so the wait is bounded by the slowest response in
+    flight; a handler that never answered owes no line, and the campaign's
+    stop_corpus_serve escalates to SIGKILL after 5 s.
+    """
+    for peer in peers:
+        peer.shutdown()
+    for peer in peers:
+        peer.server_close()  # joins the handler threads (block_on_close)
+    for log in logs:
+        log.close()
+
+
+def stop_dns(sock: socket.socket, thread: threading.Thread) -> None:
+    """End serve_dns and wait for it: no query is answered after this
+    returns, and every answered one has its line written before the DNS log
+    is closed.
+
+    close() alone does not wake a recvfrom blocked in the kernel (the call
+    keeps the socket alive until a datagram arrives). shutdown(SHUT_RD) does,
+    with an empty datagram; on an unconnected UDP socket it raises ENOTCONN
+    and wakes the reader all the same. The responder then finds the socket
+    closed and returns. A socket serve_dns already closed on a failed write
+    is tolerated.
+    """
+    try:
+        sock.shutdown(socket.SHUT_RD)
+    except OSError:
+        pass
+    sock.close()
+    thread.join()
+
+
+def install_signal_handlers(server: ReplayServer):
+    """SIGTERM and SIGINT stop the replay with its logs complete.
+
+    The handler runs on the main thread, inside serve_forever, so it only
+    asks the peers to stop; serve_http runs the shutdown sequence once the
+    loops have returned. Returns the handler.
+    """
+    def on_signal(signum, _frame):
+        print(f"stopping on {signal.Signals(signum).name}", flush=True)
+        server.request_stop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, on_signal)
+    return on_signal
+
+
+def serve_http(plain: ReplayServer, tls: ReplayServer, err=None, logs=(), dns=None) -> int:
+    """Serve both listeners until a signal or a failed log write stops them.
+
+    serve_forever() returns only through ReplayServer.request_stop (the
+    signal handler, or fail_closed; nothing else calls shutdown). The shutdown
+    sequence then runs: the DNS responder `dns` (its socket and thread) is
+    ended and joined, and stop_listeners waits for the handlers in flight
+    and closes `logs`. Returns 0 after a signal. After a failed log write the
+    reason goes to `err` (stderr by default) and the status is 1; the process
+    exits with it, the guest's fetches and lookups start failing, and the
+    campaign records the run as unclean on the after-run bracket and the :53
+    owner samples.
     """
     threading.Thread(target=plain.serve_forever, daemon=True).start()
     tls.serve_forever()
-    plain.shutdown()
+    if dns is not None:
+        stop_dns(*dns)
+    stop_listeners((tls, plain), logs)
     failure = tls.log_failure or plain.log_failure
-    print(f"FAILED: an access log line could not be written, replay stopped: {failure!r}",
+    if failure is None:
+        return 0
+    print(f"FAILED: the {tls.failed_log} log could not be written, replay stopped: {failure!r}",
           file=err or sys.stderr, flush=True)
     return 1
 
@@ -411,23 +506,29 @@ def main():
 
     dns_log = JsonlLog(args.dns_log) if args.dns_log else None
     dns_sock = bind_dns(args.dns_addr, args.dns_port)
-    threading.Thread(target=serve_dns, args=(dns_sock, args.answer_ip, dns_log),
-                     daemon=True).start()
-    print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> {args.answer_ip}", flush=True)
 
     # Both listeners exist before either serves: a failure on one must find
     # the other in `peers`, and neither answers a request before that.
     peers = []
     plain = ReplayServer(("127.0.0.1", args.port), Handler, peers)
-    tmp = Path("/tmp/corpus-replay-cert")
-    tmp.mkdir(exist_ok=True)
-    crt, key = selfsigned(tmp)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(str(crt), str(key))
     tls = ReplayServer(("127.0.0.1", args.tls_port), Handler, peers)
+    # The key pair lives only until it is loaded: a fixed path under /tmp was
+    # shared by every server on the box, whatever user each ran as.
+    with tempfile.TemporaryDirectory(prefix="corpus-replay-cert-") as tmp:
+        crt, key = selfsigned(Path(tmp))
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(crt), str(key))
     tls.socket = ctx.wrap_socket(tls.socket, server_side=True)
+
+    dns_thread = threading.Thread(target=serve_dns, args=(dns_sock, args.answer_ip, dns_log),
+                                  daemon=True)
+    dns_thread.start()
+    print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> {args.answer_ip}", flush=True)
+    install_signal_handlers(plain)
     print(f"replaying on http://127.0.0.1:{args.port} and https://127.0.0.1:{args.tls_port}", flush=True)
-    return serve_http(plain, tls)
+    return serve_http(plain, tls,
+                      logs=[log for log in (Handler.access_log, dns_log) if log is not None],
+                      dns=(dns_sock, dns_thread))
 
 
 if __name__ == "__main__":

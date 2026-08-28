@@ -370,7 +370,11 @@ stop_corpus_serve() {
     # bind, and the next run picks up the leaked pid and records
     # DNSMASQ_WAS_ACTIVE=no. Called before the evidence is written (so the
     # replay-log hashes name files nothing appends to afterwards) and again
-    # from the exit trap, which finds it already gone.
+    # from the exit trap, which finds it already gone. On SIGTERM the server
+    # stops accepting, waits for the handlers still answering (their access
+    # lines follow their responses), closes both logs and exits, so once the
+    # poll below sees it gone the logs are complete; the SIGKILL fallback
+    # is for a handler that never finishes, which owes no line.
     if [ -n "$SERVE_PID" ] && sudo kill -0 "$SERVE_PID" 2>/dev/null; then
         say "stopping corpus_serve ($SERVE_PID)"
         sudo kill "$SERVE_PID" 2>/dev/null || true
