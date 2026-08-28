@@ -4789,6 +4789,130 @@ done
                 "2.0001=busy:3", "3=busy:3",
             ])
 
+    def _settle_env(self, d, **extra):
+        """A busy loadavg fixture plus an empty ps fixture, for guard tests."""
+        fixture = os.path.join(d, "ps.txt")
+        loadavg = os.path.join(d, "loadavg")
+        open(fixture, "w").close()
+        with open(loadavg, "w") as f:
+            f.write("9.99 0 0 1/1 1\n")
+        env, binx = self._env(
+            d, ALLOW_BUSY="0", PS_FIXTURE=fixture, LOADAVG_FILE=loadavg,
+            **extra,
+        )
+        self._write(os.path.join(binx, "ps"), '#!/bin/bash\ncat "$PS_FIXTURE"\n')
+        return env
+
+    def test_quiet_guard_settles_within_the_opt_in_window(self):
+        """SETTLE_WAIT_SECS turns one busy sample into a bounded re-sample loop.
+
+        The one-shot chain (cmd_all) reaches the run gate seconds after its own
+        build, golden and verify phases, so the 1-minute load average it reads
+        still carries that prerequisite work. Without the window a cold
+        `make bench-chromium-request-all` refuses because of its own wake, and
+        a retry repeats the phony prerequisites.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = self._settle_env(d, SETTLE_WAIT_SECS="30")
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+( sleep 2; printf '0.10 0 0 1/1 1\n' > "$LOADAVG_FILE" ) &
+helper=$!
+if guard_quiet; then
+    echo settled
+else
+    echo "refused:$?"
+fi
+wait "$helper"
+'''
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(), "settled", result.stderr[-800:],
+            )
+
+    def test_quiet_guard_reads_a_leading_zero_window_as_decimal(self):
+        """`08` is a whole number to the validator and invalid octal to bash.
+
+        `$((SECONDS + 08))` fails with "value too great for base" and `010`
+        would silently mean eight. The deadline must be computed from the
+        value parsed in base 10 (CodeRabbit on #865).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = self._settle_env(d, SETTLE_WAIT_SECS="08")
+            script = f"""
+source {self.SH!r}
+trap - EXIT INT TERM
+( sleep 2; printf '0.10 0 0 1/1 1\n' > "$LOADAVG_FILE" ) &
+helper=$!
+if guard_quiet; then
+    echo settled
+else
+    echo "refused:$?"
+fi
+wait "$helper"
+"""
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(), "settled", result.stderr[-800:],
+            )
+            self.assertNotIn("value too great for base", result.stderr)
+            self.assertIn("8s window", result.stderr)
+
+    def test_quiet_guard_still_refuses_when_the_settle_window_elapses(self):
+        """A box that never goes quiet is refused, with the wait named."""
+        with tempfile.TemporaryDirectory() as d:
+            env = self._settle_env(d, SETTLE_WAIT_SECS="1")
+            script = f'''
+source {self.SH!r}
+trap - EXIT INT TERM
+if guard_quiet; then
+    echo quiet
+else
+    echo "refused:$?"
+fi
+'''
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "refused:3")
+            self.assertIn("still busy after 1s settle wait", result.stderr)
+
+    def test_all_gives_its_own_chain_a_settle_default(self):
+        """cmd_all runs the gate right after its own prerequisite phases."""
+        for preset, expected in ((None, "120"), ("7", "7")):
+            with self.subTest(preset=preset), tempfile.TemporaryDirectory() as d:
+                extra = {"REQBENCH_STAGED": "1", "DATA_ROOT": d}
+                if preset is not None:
+                    extra["SETTLE_WAIT_SECS"] = preset
+                env, binx = self._env(d, **extra)
+                capture = os.path.join(d, "settle.txt")
+                # cmd_build's podman invocation is the first child the chain
+                # runs; failing there keeps the test to the dispatch line.
+                self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+echo "settle=${{SETTLE_WAIT_SECS:-<unset>}}" >> {capture}
+exit 1
+''')
+                result = subprocess.run(
+                    [self.SH, "all"], env=env,
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(
+                    f"settle={expected}",
+                    self._read_if_exists(capture, "<no podman invocation>"),
+                )
+
     def test_target_id_waits_for_readiness_and_skips_devtools_pages(self):
         """RED BEFORE THE FIX: `target_id` was a SINGLE-SHOT urlopen with
         `2>/dev/null || true`, and `start_clone` returns as soon as the state file
@@ -4812,6 +4936,145 @@ done
                                    capture_output=True, text=True, timeout=120)
             self.assertEqual(r.stdout.strip(), "ABC123",
                              f"stdout={r.stdout!r} stderr={r.stderr[-800:]}")
+
+
+class HostCdpQuietGate(unittest.TestCase):
+    """hostcdp.sh shares reqbench's SETTLE_WAIT_SECS quiet-gate knob.
+
+    The Makefile runs the host baseline right after `build`, so its tighter
+    1.0 gate is even easier for the chain to trip on its own wake.
+    """
+
+    SH = os.path.join(HERE, "hostcdp.sh")
+
+    def test_the_gate_reads_a_leading_zero_window_as_decimal(self):
+        # Same octal trap as reqbench's guard_quiet (CodeRabbit on #865):
+        # "08" must be an eight-second window, not a bash arithmetic error.
+        with tempfile.TemporaryDirectory() as d:
+            binx = os.path.join(d, "bin")
+            os.makedirs(binx)
+            loadavg = os.path.join(d, "loadavg")
+            with open(loadavg, "w") as f:
+                f.write("9.99 0 0 1/1 1\n")
+            stubs = {
+                "pgrep": "#!/bin/bash\necho 0\nexit 1\n",
+                "podman": "#!/bin/bash\nexit 7\n",
+            }
+            for name, body in stubs.items():
+                path = os.path.join(binx, name)
+                with open(path, "w") as f:
+                    f.write(body)
+                os.chmod(path, 0o755)
+            env = dict(os.environ)
+            env.update(
+                PATH=binx + os.pathsep + env["PATH"],
+                LOADAVG_FILE=loadavg,
+                SETTLE_WAIT_SECS="08",
+                ALLOW_BUSY="0",
+                RESULTS=os.path.join(d, "results"),
+            )
+            helper = subprocess.Popen(
+                ["bash", "-c",
+                 f'sleep 2; printf "0.10 0 0 1/1 1\\n" > {loadavg}'],
+            )
+            try:
+                result = subprocess.run(
+                    ["bash", self.SH], env=env,
+                    capture_output=True, text=True, timeout=60,
+                )
+            finally:
+                helper.wait(timeout=10)
+            self.assertNotIn("value too great for base", result.stderr)
+            self.assertIn("8s window", result.stderr)
+            self.assertNotIn("REFUSING", result.stderr)
+            self.assertNotEqual(result.returncode, 3, result.stderr)
+
+    def test_the_gate_settles_with_the_same_knob(self):
+        with tempfile.TemporaryDirectory() as d:
+            binx = os.path.join(d, "bin")
+            os.makedirs(binx)
+            loadavg = os.path.join(d, "loadavg")
+            with open(loadavg, "w") as f:
+                f.write("9.99 0 0 1/1 1\n")
+            stubs = {
+                # No firecrackers; the load fixture is the only busy signal.
+                "pgrep": "#!/bin/bash\necho 0\nexit 1\n",
+                # Failing the container start right after the gate keeps the
+                # test to the gate itself; exit 7 is distinguishable from the
+                # gate's refusal exit 3.
+                "podman": "#!/bin/bash\nexit 7\n",
+            }
+            for name, body in stubs.items():
+                path = os.path.join(binx, name)
+                with open(path, "w") as f:
+                    f.write(body)
+                os.chmod(path, 0o755)
+            env = dict(os.environ)
+            env.update(
+                PATH=binx + os.pathsep + env["PATH"],
+                LOADAVG_FILE=loadavg,
+                SETTLE_WAIT_SECS="30",
+                ALLOW_BUSY="0",
+                RESULTS=os.path.join(d, "results"),
+            )
+            helper = subprocess.Popen(
+                ["bash", "-c",
+                 f'sleep 2; printf "0.10 0 0 1/1 1\\n" > {loadavg}'],
+            )
+            try:
+                result = subprocess.run(
+                    ["bash", self.SH], env=env,
+                    capture_output=True, text=True, timeout=60,
+                )
+            finally:
+                helper.wait(timeout=10)
+            self.assertIn("settling", result.stderr)
+            self.assertIn("9.99", result.stderr)
+            self.assertNotIn("REFUSING", result.stderr)
+            self.assertNotEqual(result.returncode, 3, result.stderr)
+
+    def test_an_unreadable_loadavg_file_fails_closed(self):
+        """RED BEFORE THE FIX: with LOADAVG_FILE missing or empty, `cut`
+        fails inside the `until quiet_sample` condition where set -e is
+        suppressed, `la` comes back empty, awk reads the empty string as 0,
+        and the gate passes without ever evaluating host load. A mistyped
+        override then starts the container (stub exit 7 here) instead of
+        refusing. The script must exit 2 before reaching podman."""
+        for fixture in ("missing", "empty"):
+            with self.subTest(fixture=fixture), \
+                    tempfile.TemporaryDirectory() as d:
+                binx = os.path.join(d, "bin")
+                os.makedirs(binx)
+                loadavg = os.path.join(d, "loadavg")
+                if fixture == "empty":
+                    open(loadavg, "w").close()
+                stubs = {
+                    "pgrep": "#!/bin/bash\necho 0\nexit 1\n",
+                    # Reaching podman means the gate passed; exit 7 is
+                    # distinguishable from the validation refusal exit 2.
+                    "podman": "#!/bin/bash\nexit 7\n",
+                }
+                for name, body in stubs.items():
+                    path = os.path.join(binx, name)
+                    with open(path, "w") as f:
+                        f.write(body)
+                    os.chmod(path, 0o755)
+                env = dict(os.environ)
+                env.update(
+                    PATH=binx + os.pathsep + env["PATH"],
+                    LOADAVG_FILE=loadavg,
+                    ALLOW_BUSY="0",
+                    RESULTS=os.path.join(d, "results"),
+                )
+                result = subprocess.run(
+                    ["bash", self.SH], env=env,
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(
+                    result.returncode, 2,
+                    f"gate did not fail closed: rc={result.returncode} "
+                    f"stderr={result.stderr[-800:]}")
+                self.assertIn(loadavg, result.stderr)
 
 
 class SustainedRateUncertainty(unittest.TestCase):

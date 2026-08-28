@@ -388,7 +388,7 @@ vm_process_count() {
     printf '%s\n' "$count"
 }
 
-guard_quiet() {
+guard_quiet_sample() {
     # Match comm, not argv. Repository paths in a tmux/Codex command line used to
     # make `pgrep -f` count the benchmark operator as an fcvm process. Prefixes
     # are required because content-addressed Firecracker names and Linux's
@@ -425,6 +425,39 @@ guard_quiet() {
     fi
     QUIET_GUARD_LOADAVG1="$la"
     QUIET_GUARD_VM_PROCESSES="$fc"
+}
+
+guard_quiet() {
+    # SETTLE_WAIT_SECS > 0 turns a busy first sample into a bounded re-sample
+    # loop. The one-shot chain (cmd_all) reaches this gate seconds after its
+    # own build, golden and verify phases, so the 1-minute load average still
+    # carries that prerequisite work; without the window a cold invocation
+    # refuses on its own wake and a retry repeats the phony prerequisites.
+    # Default 0 keeps the standalone fail-fast refusal.
+    local settle="${SETTLE_WAIT_SECS:-0}"
+    [[ "$settle" =~ ^[0-9]+$ ]] || {
+        log "REFUSING: SETTLE_WAIT_SECS must be a whole number of seconds (got '$settle')"
+        return 3
+    }
+    # Base 10: "08" passes the validator and is invalid octal to bash
+    # arithmetic, and "010" would silently mean eight.
+    settle=$((10#$settle))
+    local rc=0
+    guard_quiet_sample || rc=$?
+    [ "$rc" -ne 0 ] || return 0
+    [ "$settle" -gt 0 ] || return "$rc"
+    local deadline=$((SECONDS + settle)) nap
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        nap=$((deadline - SECONDS))
+        [ "$nap" -le 5 ] || nap=5
+        log "settling: box is busy; re-sampling in ${nap}s ($((deadline - SECONDS))s left in the ${settle}s window)"
+        sleep "$nap"
+        rc=0
+        guard_quiet_sample || rc=$?
+        [ "$rc" -ne 0 ] || return 0
+    done
+    log "REFUSING: box still busy after ${settle}s settle wait"
+    return "$rc"
 }
 
 state_pid_by_name() {
@@ -1255,7 +1288,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         golden) cmd_golden ;;
         verify) cmd_verify ;;
         run)    cmd_run ;;
-        all)    cmd_build; cmd_golden; cmd_verify; cmd_run ;;
+        all)
+            # The chain's own build/golden/verify phases are the load the run
+            # gate reads a minute later; default the settle window so a cold
+            # one-shot does not refuse on its own wake. An explicit
+            # SETTLE_WAIT_SECS wins.
+            export SETTLE_WAIT_SECS="${SETTLE_WAIT_SECS:-120}"
+            cmd_build; cmd_golden; cmd_verify; cmd_run ;;
         *) echo "usage: $0 {build|golden|verify|run|all}" >&2; exit 2 ;;
     esac
 fi
