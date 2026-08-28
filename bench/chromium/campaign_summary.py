@@ -432,17 +432,45 @@ def load_cell(run_dir):
     }, sources.entries
 
 
+def run_identity(run_dir):
+    """The keys that name one run directory, so a second name for a run
+    already listed can be recognised: its canonical path, and the directory
+    identity the filesystem reports. A symlink alias shares the canonical
+    path; a bind mount shares only (st_dev, st_ino). A path that cannot be
+    stat'ed carries the first key alone and is refused by load_cell with its
+    own message."""
+    keys = [("path", os.path.realpath(run_dir))]
+    try:
+        stat = os.stat(run_dir)
+    except OSError:
+        return keys
+    keys.append(("dir", (stat.st_dev, stat.st_ino)))
+    return keys
+
+
 def build_index(run_dirs):
     """Every cell or a list of refusals; never a partial index."""
     cells = []
     generated_from = []
     errors = []
-    seen = set()
+    seen = {}
     for run_dir in run_dirs:
-        if run_dir in seen:
-            errors.append(f"{run_dir}: listed more than once")
+        keys = run_identity(run_dir)
+        first = next((seen[key] for key in keys if key in seen), None)
+        if first is not None:
+            # Refused, not deduped: one run reached under two names is an
+            # argument list the caller did not mean, and an index that
+            # silently dropped the second would be one experiment counted
+            # twice or a cell nobody notices is missing.
+            if first == run_dir:
+                errors.append(f"{run_dir}: listed more than once")
+            else:
+                errors.append(
+                    f"{run_dir}: is the run directory {first} under a second name"
+                )
             continue
-        seen.add(run_dir)
+        for key in keys:
+            seen[key] = run_dir
         try:
             cell, sources = load_cell(run_dir)
         except RunError as error:

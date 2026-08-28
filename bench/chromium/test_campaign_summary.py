@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -780,6 +781,60 @@ class CampaignSummary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _paths, text = self._refused(d, analysis_overrides={"withdrawn": True})
             self.assertIn("withdrawn", text)
+
+    def test_one_run_listed_under_two_names_refuses(self):
+        """`seen` held the argument strings, so `results/run` and a symlink
+        to it were loaded as two cells and one experiment was counted twice
+        in the campaign. A second name for a run already listed is refused,
+        naming both paths, rather than quietly deduped: the caller passed an
+        argument list they did not mean, and an index that hid it would be
+        quoted by someone who never saw the argument list.
+
+        RED BEFORE THE FIX: rc 0 and 2 cells, both from one run directory.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            alias = os.path.join(d, "alias")
+            os.symlink(run_dir, alias)
+            out = os.path.join(d, "index.json")
+            rc, text = self._summarize(out, [run_dir, alias])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out),
+                             "an index was written over a double-counted run")
+            self.assertIn(alias, text)
+            self.assertIn(run_dir, text)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            out = os.path.join(d, "index.json")
+            rc, text = self._summarize(out, [run_dir, run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("more than once", text)
+            self.assertFalse(os.path.exists(out))
+
+    def test_one_run_reached_by_two_paths_refuses_on_its_inode(self):
+        """A bind mount, unlike a symlink, gives the same directory two
+        canonical paths, so the path key alone would let it through. The
+        directory identity the filesystem reports (st_dev, st_ino) is the
+        second key. Bind-mounting needs root, so the shape is reproduced by
+        holding os.path.realpath to the identity function, which is what a
+        bind mount does to these two paths.
+
+        RED BEFORE THE FIX: rc 0 and 2 cells, both from one run directory.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            alias = os.path.join(d, "alias")
+            os.symlink(run_dir, alias)
+            out = os.path.join(d, "index.json")
+            with unittest.mock.patch("os.path.realpath", side_effect=lambda p: p):
+                rc, text = self._summarize(out, [run_dir, alias])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn(alias, text)
+            self.assertIn(run_dir, text)
 
     def test_the_index_cannot_alias_an_input(self):
         with tempfile.TemporaryDirectory() as d:
