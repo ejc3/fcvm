@@ -16,12 +16,12 @@
 #   That is what a root-created lock did to every later unprivileged run
 #   (`flock: cannot open lock file ...: Permission denied`). flock(2) does not
 #   care about the open mode.
-# - Created atomically, as root: a hard link fails if the name already exists,
-#   so concurrent creators agree on one inode, and in a sticky directory a
-#   root-owned entry can be unlinked only by root or the directory's owner.
-#   Nothing here chmods or chowns a path: `install -m` sets the mode on the
-#   file it creates, and a planted symlink at that name is replaced, not
-#   followed.
+# - Created atomically: a hard link fails if the name already exists, so
+#   concurrent creators agree on one inode. The invoking user creates it when
+#   the directory is writable, root (sudo) only on a fresh box whose data root
+#   is still root-owned. Nothing here chmods or chowns a path: `install -m`
+#   sets the mode on the file it creates, and a planted symlink at that name
+#   is replaced, not followed.
 # - The entry is checked before AND after opening. A symlink, a non-regular
 #   file, or a file owned by anyone but root, the invoking user, or the
 #   directory's owner is refused: its owner could repoint or recreate it under
@@ -42,7 +42,7 @@ refuse() {
 	exit 1
 }
 
-# $1 = lock path. Runs as root.
+# $1 = lock path. Runs as whoever can write the directory.
 create_if_absent() {
 	local tmp
 	tmp="$(mktemp -u "$1.XXXXXX")"
@@ -52,8 +52,14 @@ create_if_absent() {
 }
 
 if ! [ -e "$lock" ] && ! [ -L "$lock" ]; then
-	sudo mkdir -p "$(dirname "$lock")"
-	sudo bash -c "$(declare -f create_if_absent); create_if_absent \"\$1\"" _ "$lock"
+	dir="$(dirname "$lock")"
+	if [ -d "$dir" ] && [ -w "$dir" ]; then
+		create_if_absent "$lock"
+	else
+		# A fresh box: the data root is root-owned until setup hands it over.
+		sudo mkdir -p "$dir"
+		sudo bash -c "$(declare -f create_if_absent); create_if_absent \"\$1\"" _ "$lock"
+	fi
 fi
 
 # The entry as it is on disk: stat without -L reports a symlink as itself.

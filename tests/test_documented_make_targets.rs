@@ -817,25 +817,21 @@ fn hugepage_lock_is_taken_through_the_helper_at_every_site() {
     }
 }
 
-/// A stand-in for the lock's caller that is never root.
+/// Run `program` as an unprivileged stand-in when the tests are root.
 ///
 /// The read-only open matters only for an unprivileged opener: for root,
 /// "protected_regular would refuse O_CREAT" and "the owner is untrusted" are
 /// the same condition (a file owned by neither root nor the directory's
-/// owner). So under sudo the helper is driven as `nobody`, from a copy the
-/// tests place where `nobody` can read it.
-fn as_unprivileged(dir: &std::path::Path, program: &str) -> std::process::Command {
+/// owner). Under the privileged runner the helper is therefore driven as uid
+/// 65534 through `setpriv`, from a copy placed where that uid can read it. No
+/// sudo anywhere: `make test-fast` shims it to fail, and root needs none.
+fn as_unprivileged(program: &str) -> std::process::Command {
     if unsafe { libc::geteuid() } == 0 {
-        let mut c = std::process::Command::new("sudo");
-        c.args([
-            "-u",
-            "nobody",
-            "--preserve-env=HUGEPAGE_POOL_LOCK,HUGEPAGE_POOL_LOCK_WAIT",
-        ]);
+        let mut c = std::process::Command::new("setpriv");
+        c.args(["--reuid=65534", "--regid=65534", "--clear-groups"]);
         c.arg(program);
         c
     } else {
-        let _ = dir;
         std::process::Command::new(program)
     }
 }
@@ -850,46 +846,57 @@ fn helper_copy(dir: &std::path::Path) -> String {
     dst.to_string_lossy().into_owned()
 }
 
-/// The helper takes a root-owned lock in a user-owned sticky directory, the
-/// production shape, as an unprivileged caller.
+/// The helper opens the lock read-only, never with O_CREAT.
 ///
-/// The fixture first proves the failure it guards against: `flock <path>`
-/// (O_CREAT) is refused there by protected_regular. A box with the sysctl off
-/// fails here instead of passing vacuously.
+/// Two fixtures, one per lane, each proving the failure it guards against
+/// before showing the helper succeed:
+/// - as root (the privileged lanes): the production shape, a root-owned lock
+///   in a user-owned 1777 directory, opened by uid 65534, where `flock <path>`
+///   (O_CREAT) is refused by protected_regular;
+/// - as a user (the unprivileged lanes, where no other uid's file can be
+///   staged): a 0444 lock of one's own, which a `<>` open refuses.
+///
+/// A box with the sysctl off fails the root branch instead of passing it.
 #[test]
 fn hugepage_lock_helper_opens_the_lock_without_o_creat() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777))
-        .expect("chmod 1777");
-    let root = unsafe { libc::geteuid() } == 0;
-    if root {
-        // The stand-in is nobody, so the directory's owner must be nobody
-        // for the shape to hold (file owner outside {opener, dir owner}).
-        std::os::unix::fs::chown(dir.path(), Some(65534), Some(65534)).expect("chown dir");
-    }
     let lock = dir.path().join("hugepage-pool.lock");
-    let created = std::process::Command::new("sudo")
-        .args(["install", "-m", "644", "/dev/null"])
-        .arg(&lock)
-        .status()
-        .expect("sudo install");
-    assert!(created.success(), "stage a root-owned lock");
+    let root = unsafe { libc::geteuid() } == 0;
     let helper = helper_copy(dir.path());
+    if root {
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777))
+            .expect("chmod 1777");
+        std::os::unix::fs::chown(dir.path(), Some(65534), Some(65534)).expect("chown dir");
+        std::fs::write(&lock, b"").expect("root-owned lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).expect("0644");
+        let refused = as_unprivileged("flock")
+            .args(["-x", "-n"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .expect("flock by path as uid 65534");
+        assert!(
+            !refused.success(),
+            "fixture does not reproduce: `flock <path>` (O_CREAT) on a root-owned lock in \
+             a user-owned sticky directory succeeded for uid 65534, so fs.protected_regular \
+             is off on this box"
+        );
+    } else {
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).expect("0444");
+        let refused = std::process::Command::new("bash")
+            .args(["-c", "exec 9<>\"$1\"", "_"])
+            .arg(&lock)
+            .status()
+            .expect("run <> open");
+        assert!(
+            !refused.success(),
+            "fixture does not reproduce: a `<>` open of a 0444 lock succeeded"
+        );
+    }
 
-    let refused = as_unprivileged(dir.path(), "flock")
-        .args(["-x", "-n"])
-        .arg(&lock)
-        .arg("true")
-        .status()
-        .expect("flock by path");
-    assert!(
-        !refused.success(),
-        "fixture does not reproduce: `flock <path>` (O_CREAT) on a root-owned lock in a \
-         user-owned sticky directory succeeded, so fs.protected_regular is off on this box"
-    );
-
-    let out = as_unprivileged(dir.path(), &helper)
+    let out = as_unprivileged(&helper)
         .env("HUGEPAGE_POOL_LOCK", &lock)
         .env("HUGEPAGE_POOL_LOCK_WAIT", "2")
         .args(["sh", "-c", "echo took-it"])
@@ -902,8 +909,12 @@ fn hugepage_lock_helper_opens_the_lock_without_o_creat() {
     );
     assert!(
         out.status.success() && text.contains("took-it"),
-        "the helper failed to take a root-owned lock it only needs to open read-only:\n{text}"
+        "the helper failed to take a lock it only needs to open read-only:\n{text}"
     );
+    if root {
+        // Hand the directory back so the tempdir can be removed.
+        let _ = std::os::unix::fs::chown(dir.path(), Some(0), Some(0));
+    }
 }
 
 /// A symlink at the lock path is refused, not followed (codex, CodeRabbit on
@@ -944,17 +955,17 @@ fn hugepage_lock_helper_refuses_a_planted_symlink() {
 
 /// A lock owned by anyone but root, the invoking user, or the directory's
 /// owner is refused: that owner can unlink and recreate it under a holder.
+///
+/// Privileged lanes only: staging a file owned by another uid takes root, and
+/// `make test-fast` shims sudo to fail.
+#[cfg(feature = "privileged-tests")]
 #[test]
 fn hugepage_lock_helper_refuses_a_lock_another_user_can_recreate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let lock = dir.path().join("hugepage-pool.lock");
     std::fs::write(&lock, b"").expect("lock");
-    let chowned = std::process::Command::new("sudo")
-        .args(["chown", "65534:65534"])
-        .arg(&lock)
-        .status()
-        .expect("sudo chown");
-    assert!(chowned.success(), "stage a lock owned by another uid");
+    std::os::unix::fs::chown(&lock, Some(65534), Some(65534))
+        .expect("stage a lock owned by another uid (this test runs as root)");
     let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/hugepage-pool-lock.sh");
     let out = std::process::Command::new(helper)
         .env("HUGEPAGE_POOL_LOCK", &lock)
