@@ -2814,6 +2814,75 @@ fn cargo_target_link_refuses_an_unwritable_local_target_on_managed_fallback() {
     );
 }
 
+/// A managed link is DROPPED, never probed through, when its generation cannot
+/// be leased (codex on #867).
+///
+/// The unusable-volume path (the volume exists but `$WT_TARGET` cannot be
+/// created) never opens a generation lease, yet `target/` can still resolve
+/// into the managed tree: a rotated `.generation-*` directory outlives the
+/// canonical path the pruner removed. Probing writability THROUGH that link
+/// creates and removes a file inside a generation this run holds no lease on,
+/// which is the census/rewalk race the lease protocol exists to prevent; and if
+/// that generation is itself unwritable the script fails instead of falling
+/// back. So the link goes and a local `target/` takes its place; the generation
+/// is left untouched for the pruner. Staged for every uid: a dangling symlink
+/// at `$WT_TARGET` defeats `mkdir -p` for root too.
+#[test]
+fn cargo_target_link_drops_a_managed_link_it_cannot_lease() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(wt.parent().unwrap()).expect("cargo-target parent");
+    let generation = wt.with_file_name(format!(
+        "{}.generation-stale000",
+        wt.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&generation).expect("retained generation");
+    // `set_file_time` opens a FILE; a directory's mtime is pinned with touch.
+    let pinned = std::process::Command::new("touch")
+        .args(["-d", "@1600000000"])
+        .arg(&generation)
+        .status()
+        .expect("run touch");
+    assert!(pinned.success(), "pin the generation's mtime");
+    std::os::unix::fs::symlink(btrfs.path().join("cargo-target/absent"), &wt)
+        .expect("dangling $WT_TARGET, so mkdir -p fails for every uid");
+    std::os::unix::fs::symlink(&generation, checkout.path().join("target"))
+        .expect("target/ -> retained generation");
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(
+        ok,
+        "the recipe failed instead of falling back to a local target/:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        !target.is_symlink(),
+        "target/ still points into the managed tree ({}) on a path that took no lease \
+         on it\n{out}",
+        std::fs::read_link(&target)
+            .map(|l| l.display().to_string())
+            .unwrap_or_default()
+    );
+    assert_target_usable(
+        checkout.path(),
+        "managed link dropped on an unusable volume",
+    );
+    let mtime = std::fs::metadata(&generation)
+        .expect("generation still exists")
+        .modified()
+        .expect("mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    assert_eq!(
+        mtime, 1_600_000_000,
+        "the retained generation was written through (a probe file was created and \
+         removed in it) without a lease\n{out}"
+    );
+}
+
 /// Every exit that leaves target/ as a plain local directory probes it first.
 ///
 /// Behavioural coverage above reaches two of the three exits; this pins all of

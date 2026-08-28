@@ -123,13 +123,23 @@ require_writable_local_target() {
 	rm -f -- "$probe"
 }
 
+# A managed target/ link is dropped, never probed through, on any path that
+# holds no lease on the generation it points at: creating and removing a file
+# inside an unleased generation is the census/rewalk race the pruner's lease
+# protocol exists to prevent. Only the checkout's link goes; the generation is
+# left for the pruner.
+drop_managed_link() {
+	[ -L target ] || return 0
+	case "$(readlink target)" in
+		"$BTRFS_ROOT"/cargo-target/*)
+			echo "==> WARNING: dropping target/ → $(readlink target); no lease can be taken on it" >&2
+			rm -f -- target ;;
+	esac
+}
+
 fallback_to_local() {
 	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
-	if [ -L target ]; then
-		case "$(readlink target)" in
-			"$BTRFS_ROOT"/cargo-target/*) rm -f -- target ;;
-		esac
-	fi
+	drop_managed_link
 	require_writable_local_target
 	exit 0
 }
@@ -355,6 +365,9 @@ else
 	if ! [ -d "$BTRFS_ROOT" ]; then
 		echo "==> NOTE: $BTRFS_ROOT is not a directory; build artifacts stay on the root filesystem"
 	fi
+	# This branch never leases a generation, and target/ may still resolve into
+	# one (a rotated generation outliving the canonical path the pruner removed).
+	drop_managed_link
 fi
 
 # Self-heal a dangling link. `[ -d target ]` follows the symlink, so this is
