@@ -80,8 +80,27 @@ name="$(printf '%s' "$(basename "$p")" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 hash="$(printf '%s' "$p" | sha256sum | cut -c1-8)"
 WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 
+# "Is a directory" is not "is usable". On a GitHub-hosted runner /mnt/fcvm-btrfs
+# does not exist, and podman CREATES it as an empty root-owned directory to
+# satisfy CONTAINER_RUN_BASE's bind mount -- so inside the container the volume
+# passes `-d` and fails `mkdir` (Permission denied), while the checkout's own
+# target/ is a bind mount this script should simply keep. Testing `-d` alone
+# took the managed branch and died before reaching its own "retaining unmanaged
+# local target/" exit; every Weekly container-bench from 2026-08-10 on read
+#     mkdir: cannot create directory '/mnt/fcvm-btrfs/cargo-target': Permission denied
+# `-w` would not do either: root passes access(W_OK) on directories it still
+# cannot create in (procfs, a read-only mount). Try the mkdir, and let its
+# outcome decide -- loudly, because artifacts on the root filesystem are the
+# thing this indirection exists to avoid and a reader should see it happen.
+btrfs_usable=0
 if [ -d "$BTRFS_ROOT" ]; then
-	mkdir -p "$WT_TARGET" || { echo "ERROR: cannot create $WT_TARGET" >&2; exit 1; }
+	if mkdir -p "$WT_TARGET" 2>/dev/null; then
+		btrfs_usable=1
+	else
+		echo "==> WARNING: $BTRFS_ROOT exists but $WT_TARGET cannot be created; build artifacts stay on the root filesystem" >&2
+	fi
+fi
+if ((btrfs_usable)); then
 
 retire_target() {
 	local fd="$1"
@@ -270,7 +289,9 @@ else
 		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
 		exit 1
 	fi
-	echo "==> NOTE: $BTRFS_ROOT is not a directory; build artifacts stay on the root filesystem"
+	if ! [ -d "$BTRFS_ROOT" ]; then
+		echo "==> NOTE: $BTRFS_ROOT is not a directory; build artifacts stay on the root filesystem"
+	fi
 fi
 
 # Self-heal a dangling link. `[ -d target ]` follows the symlink, so this is

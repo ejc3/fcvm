@@ -2643,3 +2643,69 @@ fn persistent_runner_entrypoints_route_cargo_through_the_lease() {
         );
     }
 }
+
+/// The volume EXISTS but cannot be written: keep the local `target/`.
+///
+/// GitHub-hosted runners have no `/mnt/fcvm-btrfs`, and podman CREATES it as an
+/// empty root-owned directory to satisfy `CONTAINER_RUN_BASE`'s bind mount. Inside
+/// the container the volume is therefore a directory (`[ -d ]` true) that the
+/// build user cannot write, while the checkout's own `target/` is a bind mount --
+/// a real directory the recipe should simply keep. The script tested `-d`, took
+/// the btrfs branch, and died on `mkdir` before reaching its own
+/// "retaining unmanaged local target/" exit:
+///
+/// ```text
+/// mkdir: cannot create directory '/mnt/fcvm-btrfs/cargo-target': Permission denied
+/// ERROR: cannot create /mnt/fcvm-btrfs/cargo-target/fcvm-1602bce1
+/// make: *** [Makefile:337: cargo-target-link] Error 1
+/// ```
+///
+/// Every Weekly `container-bench` since 2026-08-10 (the script landed 08-09; the
+/// last green Weekly was 08-03). Unwritable is produced two ways because this
+/// file also runs under sudo, where mode bits cannot stop root: as a normal user
+/// a 0o555 tempdir, as root a procfs path that no uid can `mkdir` under.
+#[test]
+fn cargo_target_link_keeps_a_bind_mounted_target_when_btrfs_is_unwritable() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    // The bind-mounted target/: a real directory that already exists.
+    std::fs::create_dir(checkout.path().join("target")).expect("pre-existing target/");
+
+    let unwritable_tmp = tempfile::tempdir().expect("btrfs stand-in");
+    let btrfs_root: PathBuf = if nix_geteuid_is_root() {
+        PathBuf::from("/proc")
+    } else {
+        std::fs::set_permissions(
+            unwritable_tmp.path(),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("chmod 0555");
+        unwritable_tmp.path().to_path_buf()
+    };
+
+    let (ok, out) = run_link(checkout.path(), &btrfs_root);
+
+    // Restore so the tempdir can be removed whatever the outcome.
+    let _ = std::fs::set_permissions(
+        unwritable_tmp.path(),
+        std::fs::Permissions::from_mode(0o755),
+    );
+
+    assert!(
+        ok,
+        "the recipe failed instead of keeping the existing target/ when the btrfs \
+         volume is present but unwritable:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_dir() && !target.is_symlink(),
+        "target/ should have been kept as the real (bind-mounted) directory it was; \
+         it is now {:?}\n{out}",
+        std::fs::symlink_metadata(&target).map(|m| m.file_type())
+    );
+    assert_target_usable(checkout.path(), "unwritable btrfs volume");
+}
+
+fn nix_geteuid_is_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
