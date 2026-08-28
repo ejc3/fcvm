@@ -6,19 +6,28 @@
 # The lock is $HUGEPAGE_POOL_LOCK (default /mnt/fcvm-btrfs/hugepage-pool.lock),
 # the same file bench/chromium/reqbench.sh holds for a phase lifetime, so a
 # bench phase already in flight and a `make setup-hugepages` from another
-# checkout serialize on one inode. Two rules make one file usable by root and
-# by unprivileged callers in the same sticky, user-owned data root:
+# checkout serialize on one inode. The data root is a sticky, world-writable
+# directory owned by the box's user, and the lock has to be usable there by
+# root and by unprivileged callers. Three rules:
 #
-# - It is opened READ-ONLY, never with O_CREAT. fs.protected_regular refuses an
+# - Opened READ-ONLY, never with O_CREAT. fs.protected_regular refuses an
 #   O_CREAT open of a file owned by someone else in a sticky world-writable
-#   directory, root included, and util-linux `flock <path>` and bash `<>` both
-#   use O_CREAT. That is what a root-created lock did to every later
-#   unprivileged run (`flock: cannot open lock file ...: Permission denied`).
-#   flock(2) does not care about the open mode.
-# - It is created atomically when absent: a hard link fails if the name already
-#   exists, so concurrent creators agree on one inode. Nothing here chmods or
-#   chowns a path: `install -m` sets the mode on the file it creates, and a
-#   planted symlink at that name is replaced, not followed.
+#   directory, and util-linux `flock <path>` and bash `<>` both use O_CREAT.
+#   That is what a root-created lock did to every later unprivileged run
+#   (`flock: cannot open lock file ...: Permission denied`). flock(2) does not
+#   care about the open mode.
+# - Created atomically, as root: a hard link fails if the name already exists,
+#   so concurrent creators agree on one inode, and in a sticky directory a
+#   root-owned entry can be unlinked only by root or the directory's owner.
+#   Nothing here chmods or chowns a path: `install -m` sets the mode on the
+#   file it creates, and a planted symlink at that name is replaced, not
+#   followed.
+# - The entry is checked before AND after opening. A symlink, a non-regular
+#   file, or a file owned by anyone but root, the invoking user, or the
+#   directory's owner is refused: its owner could repoint or recreate it under
+#   a holder, and a later caller would lock a different inode and write the
+#   pool concurrently. After the open, the descriptor's inode must be the
+#   path's own (lstat) inode, which closes the window between check and open.
 #
 # The command runs as a CHILD while this script keeps fd 9: `exec` would hand
 # the descriptor to the command, and sudo closes inherited descriptors, which
@@ -28,28 +37,42 @@ lock="${HUGEPAGE_POOL_LOCK:-/mnt/fcvm-btrfs/hugepage-pool.lock}"
 wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
 [ $# -gt 0 ] || { echo "usage: $0 <command...>" >&2; exit 2; }
 
-# $1 = lock path. Runs as whoever can write the directory.
+refuse() {
+	echo "hugepage-pool-lock: $*" >&2
+	exit 1
+}
+
+# $1 = lock path. Runs as root.
 create_if_absent() {
 	local tmp
 	tmp="$(mktemp -u "$1.XXXXXX")"
 	install -m 644 /dev/null "$tmp"
-	ln "$tmp" "$1" 2>/dev/null || [ -e "$1" ]
+	ln "$tmp" "$1" 2>/dev/null || true
 	rm -f "$tmp"
 }
 
-if [ ! -e "$lock" ]; then
-	dir="$(dirname "$lock")"
-	if [ -d "$dir" ] && [ -w "$dir" ]; then
-		create_if_absent "$lock"
-	else
-		sudo mkdir -p "$dir"
-		sudo bash -c "$(declare -f create_if_absent); create_if_absent \"\$1\"" _ "$lock"
-	fi
+if ! [ -e "$lock" ] && ! [ -L "$lock" ]; then
+	sudo mkdir -p "$(dirname "$lock")"
+	sudo bash -c "$(declare -f create_if_absent); create_if_absent \"\$1\"" _ "$lock"
 fi
 
+# The entry as it is on disk: stat without -L reports a symlink as itself.
+if [ -L "$lock" ]; then
+	refuse "$lock is a symlink (owner uid $(stat -c %u "$lock")); a path another user can repoint is not a lock"
+fi
+[ -f "$lock" ] || refuse "$lock is not a regular file"
+owner="$(stat -c %u "$lock")"
+dir_owner="$(stat -c %u "$(dirname "$lock")")"
+case "$owner" in
+0 | "$(id -u)" | "$dir_owner") ;;
+*) refuse "$lock is owned by uid $owner, who can recreate it under a holder; refusing" ;;
+esac
+
 exec 9<"$lock"
+if [ "$(stat -c %d:%i "$lock")" != "$(stat -Lc %d:%i "/proc/$$/fd/9")" ]; then
+	refuse "$lock was replaced between check and open; refusing"
+fi
 if ! flock -x -w "$wait_s" 9; then
-	echo "hugepage-pool-lock: $lock busy for ${wait_s}s; refusing to race the owner" >&2
-	exit 1
+	refuse "$lock busy for ${wait_s}s; refusing to race the owner"
 fi
 "$@"

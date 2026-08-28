@@ -6273,6 +6273,22 @@ class SnapshotLockHeldAcrossRun(unittest.TestCase):
             {"BACKEND": "uffd", "UFFD_MODE": "minor"})
         self.assertIn("POOL-HELD", r.stdout + r.stderr)
 
+    def test_pool_lock_refuses_a_planted_symlink(self):
+        # A symlink at the lock path, planted by another writer of the sticky
+        # data root, would be followed by the read-only open; its owner can
+        # repoint it under a holder so a later caller locks a different inode
+        # and writes the pool concurrently (codex + CodeRabbit on #868). Fail
+        # closed, pool untouched.
+        r, pool = self._bash(
+            'touch "$DATA_ROOT/elsewhere"; '
+            'ln -s "$DATA_ROOT/elsewhere" "$DATA_ROOT/hugepage-pool.lock"; '
+            'HUGEPAGE_POOL_LOCK_WAIT=1 ensure_hugepage_pool')
+        self.assertNotEqual(r.returncode, 0,
+                            "a symlinked lock path must be refused")
+        self.assertEqual(open(pool).read().strip(), "100",
+                         "pool must be untouched behind a refused lock")
+        self.assertIn("symlink", r.stdout + r.stderr)
+
     def test_pool_grow_respects_exclusive_holder(self):
         # While another process holds the pool lock exclusive, a grow must
         # not proceed concurrently: bounded wait, then fail closed.
