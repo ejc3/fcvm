@@ -6060,13 +6060,19 @@ class MakefileBenchGraph(unittest.TestCase):
         # And the grow must hold the cross-harness pool lock (codex P1,
         # PR #815): the pool is host-global and reqbench/faultbench/bench.sh
         # all write it.
-        self.assertIn("hugepage-pool.lock", recipe,
-                      "fault recipe must serialize on the shared pool lock")
-        # The lock file must be creatable by unprivileged callers even when
-        # the data root is root-owned (fresh boxes): the recipe pre-creates
-        # it with sudo before flock (CodeRabbit round 2, PR #815).
-        self.assertRegex(recipe, r"sudo[^\n]*touch[^\n]*hugepage-pool\.lock",
-                         "fault recipe must sudo-pre-create the pool lock")
+        self.assertIn("hugepage-pool.lock.d", recipe,
+                      "fault recipe must serialize on the shared pool lock DIRECTORY")
+        # The lock is a directory (PR #868): creatable with sudo when the data
+        # root is root-owned (fresh boxes, CodeRabbit round 2 on PR #815), and
+        # openable by any user afterwards because a 0755 directory needs no
+        # O_CREAT and no ownership to open read-only. A lock FILE created by
+        # root under the invoker's sticky data root is refused by
+        # fs.protected_regular on the next unprivileged open, and chowning it
+        # to each invoker races between two users.
+        self.assertRegex(recipe, r"sudo[^\n]*mkdir -p -m 755[^\n]*hugepage-pool\.lock\.d",
+                         "fault recipe must sudo-mkdir the pool lock directory")
+        self.assertNotRegex(recipe, r"(touch|chown|chmod)[^\n]*hugepage-pool\.lock",
+                            "fault recipe must not create, chown, or chmod a lock FILE")
 
     def test_run_help_documents_tag(self):
         # Following the documented huge flow without TAG= on the run line
@@ -6263,7 +6269,7 @@ class SnapshotLockHeldAcrossRun(unittest.TestCase):
     def test_pool_lease_held_shared_through_phase(self):
         r, _ = self._bash(
             'mkdir -p "$RESULTS/logs"; '
-            'probe() { flock -x -n "$DATA_ROOT/hugepage-pool.lock" true '
+            'probe() { flock -x -n "$DATA_ROOT/hugepage-pool.lock.d" true '
             '  && echo POOL-FREE || echo POOL-HELD; }; '
             'export -f probe; '
             'REQBENCH_DRIVER_HOOK="probe" cmd_run',
@@ -6274,8 +6280,8 @@ class SnapshotLockHeldAcrossRun(unittest.TestCase):
         # While another process holds the pool lock exclusive, a grow must
         # not proceed concurrently: bounded wait, then fail closed.
         r, pool = self._bash(
-            'touch "$DATA_ROOT/hugepage-pool.lock"; '
-            'exec 9<>"$DATA_ROOT/hugepage-pool.lock"; flock -x 9; '
+            'mkdir -p -m 755 "$DATA_ROOT/hugepage-pool.lock.d"; '
+            'exec 9<"$DATA_ROOT/hugepage-pool.lock.d"; flock -x 9; '
             'HUGEPAGE_POOL_LOCK_WAIT=1 ensure_hugepage_pool')
         self.assertNotEqual(r.returncode, 0,
                             "grow must not race a concurrent pool owner")

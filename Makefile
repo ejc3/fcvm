@@ -639,22 +639,24 @@ setup-pjdfstest:
 
 # Hugepage pool for privileged tests (512 pages = 1GB, enough for 512MB test VMs)
 HUGEPAGE_POOL_TESTS := 512
-# The pool lock is chowned to the invoker: a root-owned 666 file in a sticky
-# world-writable directory is exactly what fs.protected_regular refuses to
-# open for anyone else, so the unprivileged flock that follows fails with
-# EACCES on every run after the first. Same treatment check-disk gives
-# ~/.cargo. (Keep this comment HERE: a `#` line inside the continued recipe
-# below is shell text and eats the trailing backslash -- that is how #868's
-# first revision produced `syntax error: unexpected end of file`.)
+# The pool lock is a DIRECTORY, shared with bench-chromium-fault and
+# bench/chromium/reqbench.sh. A lock FILE created here by root under the
+# invoker's sticky data root is refused by fs.protected_regular on the next
+# unprivileged O_CREAT open (util-linux `flock <path>` and bash `<>` both use
+# it), and chowning it to each invoker races between two users. `mkdir -p` is
+# idempotent for any creator, and a 0755 directory opens read-only for any
+# user with no O_CREAT and no ownership, so nothing privileged ever changes
+# its metadata. (Keep this comment HERE: a `#` line inside the continued
+# recipe below is shell text and eats the trailing backslash -- that is how
+# #868's first revision produced `syntax error: unexpected end of file`.)
 setup-hugepages:
 	@current=$$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0); \
 	if [ "$$current" -ge "$(HUGEPAGE_POOL_TESTS)" ]; then \
 		echo "==> Hugepages already allocated: $$current (need $(HUGEPAGE_POOL_TESTS))"; \
 	else \
 		echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TESTS) pages = $$(( $(HUGEPAGE_POOL_TESTS) * 2 ))MB)..."; \
-		sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true; \
-		sudo sh -c "touch /mnt/fcvm-btrfs/hugepage-pool.lock && chmod 666 /mnt/fcvm-btrfs/hugepage-pool.lock && chown $$(id -u):$$(id -g) /mnt/fcvm-btrfs/hugepage-pool.lock"; \
-		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock \
+		sudo mkdir -p -m 755 /mnt/fcvm-btrfs/hugepage-pool.lock.d; \
+		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock.d \
 			sudo sh -c 'echo $(HUGEPAGE_POOL_TESTS) > /proc/sys/vm/nr_hugepages'; \
 	fi
 
@@ -1014,8 +1016,8 @@ FAULT_POOL ?= 4096
 bench-chromium-fault: build setup-default
 	@test -n "$(FAULT_OUT)" || (echo "ERROR: FAULT_OUT required (results directory)"; exit 1)
 	@if ls -d /mnt/fcvm-btrfs/snapshots/cb-golden-huge* >/dev/null 2>&1; then \
-		sudo sh -c "touch /mnt/fcvm-btrfs/hugepage-pool.lock && chmod 666 /mnt/fcvm-btrfs/hugepage-pool.lock && chown $$(id -u):$$(id -g) /mnt/fcvm-btrfs/hugepage-pool.lock"; \
-		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock sh -c ' \
+		sudo mkdir -p -m 755 /mnt/fcvm-btrfs/hugepage-pool.lock.d; \
+		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock.d sh -c ' \
 			current=$$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0); \
 			if [ "$$current" -lt "$(FAULT_POOL)" ]; then \
 				echo "==> Growing hugepage pool $$current -> $(FAULT_POOL) for the huge cells..."; \

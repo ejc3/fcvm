@@ -1023,11 +1023,16 @@ ensure_hugepage_pool() {
     # EXCLUSIVE and atomically downgrades. Bounded waits fail closed rather
     # than hanging behind a stuck owner.
     local wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
-    local pool_lock="$DATA_ROOT/hugepage-pool.lock"
-    mkdir -p "$DATA_ROOT" 2>/dev/null || true
-    touch "$pool_lock" 2>/dev/null || true
+    # A DIRECTORY, not a file (PR #868): mkdir -p is idempotent for any
+    # creator, and a 0755 directory opens read-only for any user with no
+    # O_CREAT and no ownership, so who created it never matters. A lock FILE
+    # created by root (make setup-hugepages) under a sticky user-owned data
+    # root is refused by fs.protected_regular on the next unprivileged
+    # O_CREAT open, which is what `<>` and util-linux `flock <path>` do.
+    local pool_lock="$DATA_ROOT/hugepage-pool.lock.d"
+    mkdir -p -m 755 "$pool_lock" 2>/dev/null || true
     if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
-        exec {REQBENCH_POOL_LOCK_FD}<>"$pool_lock" || true
+        exec {REQBENCH_POOL_LOCK_FD}<"$pool_lock" || true
     fi
     if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
         log "hugepages: pool lock unavailable at $pool_lock"
