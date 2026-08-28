@@ -639,12 +639,12 @@ cmd_golden() {
         "$prepared_generation" "$prepared_digest" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
-        "${REQBENCH_SOURCE_REVISION:-}" <<'PY'
+        "${REQBENCH_SOURCE_REVISION:-}" "$GUEST_DNS" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
     image_cache_key, built_image_id, prepared_generation, prepared_digest,
-    fcvm_sha256, runtime_bundle_sha256, source_revision,
+    fcvm_sha256, runtime_bundle_sha256, source_revision, guest_dns,
 ) = sys.argv[1:]
 lock = open(lock_path, "a+")
 fcntl.flock(lock, fcntl.LOCK_SH)
@@ -687,7 +687,20 @@ if config_sha256 != prepared_digest:
         f"snapshot config digest {config_sha256!r} does not match prepare's "
         f"({prepared_digest!r}); the generation changed in place"
     )
+# --dns is a request; metadata.network_config.dns_server is what fc-agent
+# wrote to the guest's resolv.conf. A golden whose snapshot records another
+# resolver would carry provenance claiming a replay wiring it does not have.
+# Only checked when GUEST_DNS was given: without it fcvm fills dns_server
+# from the host resolver, so the recorded null means "not requested".
+baked_dns = (metadata.get("network_config") or {}).get("dns_server")
+if guest_dns and baked_dns != guest_dns:
+    raise SystemExit(
+        f"GUEST_DNS={guest_dns!r} was requested but the snapshot's "
+        f"metadata.network_config.dns_server is {baked_dns!r}; the guest did not "
+        "bake the resolver this golden claims"
+    )
 record = {
+    "guest_dns": guest_dns or None,
     "snapshot_generation_id": generation_id,
     "snapshot_config_sha256": config_sha256,
     "snapshot_created_at": config.get("created_at"),
@@ -799,6 +812,123 @@ wd_session_id() {
         | tr -d '[:space:]' || true
 }
 
+# HOP D: the baked resolver, asked of the restored clone itself.
+#
+# The corpus campaign bakes GUEST_DNS into the golden so every corpus hostname
+# resolves to the pasta gateway and lands on the host replay server. HOPs A-C
+# reach the clone by IP and prove nothing about that: a clone whose resolv.conf
+# came back pointing at a real resolver renders the live site and records a
+# plausible number. This hop reads the resolver the snapshot recorded, then
+# checks the clone against it from inside the container, where Chromium runs.
+#
+# VERIFY_DNS_HOSTS  comma-separated hostnames; each must resolve to
+#                   VERIFY_DNS_ANSWER inside the container. Unset: only the
+#                   recorded resolver is written, no assertion is made, so the
+#                   default golden (no GUEST_DNS) verifies as before.
+# VERIFY_DNS_URLS   comma-separated URLs; each in-container GET must return a
+#                   2xx or 3xx status through the resolver under test.
+# Evidence lands in $RESULTS/verify-dns.json either way.
+VERIFY_DNS_HOSTS="${VERIFY_DNS_HOSTS:-}"
+VERIFY_DNS_ANSWER="${VERIFY_DNS_ANSWER:-10.0.2.2}"
+VERIFY_DNS_URLS="${VERIFY_DNS_URLS:-}"
+# In-container GET with an unverified TLS context: the replay server's
+# certificate is self-signed and the resolver is the thing under test. The
+# error processor is replaced so every status comes back as a number instead
+# of an exception; redirects are therefore not followed, and a 3xx counts as
+# the request having reached the replay server. Both bench images ship python3.
+VERIFY_DNS_URL_PROBE='import ssl,sys,urllib.request as u
+c=ssl._create_unverified_context()
+H=type("H",(u.HTTPErrorProcessor,),{"http_response":lambda s,q,r:r,"https_response":lambda s,q,r:r})
+print(u.build_opener(u.HTTPSHandler(context=c),H).open(u.Request(sys.argv[1]),timeout=30).status)'
+
+verify_guest_dns() {
+    local cpid="$1" cfg="$DATA_ROOT/snapshots/$TAG/config.json"
+    local out="$RESULTS/verify-dns.json" errlog="$RESULTS/logs/verify-dns.log"
+    local dns_server
+    # jq's exit status is the readability test: a missing binary, a missing or
+    # unreadable file and invalid JSON all land here. BLOCKED rather than
+    # FAILED, and no evidence file: nothing was evaluated, so nothing can be
+    # reported, passing or failing.
+    dns_server=$($SUDO jq -r '.metadata.network_config.dns_server | if type == "string" then . else "" end' \
+        "$cfg" 2>>"$errlog") \
+        || { echo "HOP D BLOCKED: cannot read metadata.network_config.dns_server from $cfg (jq missing, or config.json unreadable)" >&2; return 1; }
+    local -a hosts=() urls=()
+    if [ -n "$VERIFY_DNS_HOSTS" ]; then
+        IFS=',' read -ra hosts <<<"$VERIFY_DNS_HOSTS"
+        IFS=',' read -ra urls <<<"$VERIFY_DNS_URLS"
+    fi
+    echo "--- HOP D: baked resolver INSIDE the restored clone (dns_server=${dns_server:-null}, ${#hosts[@]} host(s), ${#urls[@]} url(s)) ---"
+    local failed=0 resolv_vm="" resolv_container="" hosts_json='{}' urls_json='{}'
+    if [ -z "$VERIFY_DNS_HOSTS" ]; then
+        echo "  VERIFY_DNS_HOSTS unset: recording the snapshot's resolver, asserting nothing"
+    elif [ -z "$dns_server" ]; then
+        failed=1
+        echo "HOP D FAILED: corpus verify requires a baked resolver, but metadata.network_config.dns_server is null (golden made without GUEST_DNS?)" >&2
+    else
+        local want="nameserver $dns_server" view
+        # Both views: fc-agent writes the VM's resolv.conf from the boot plan
+        # and podman derives the container's from it. Chromium reads the
+        # second, so the first being right is not enough.
+        resolv_vm=$($SUDO "$FCVM" exec --pid "$cpid" --vm -- cat /etc/resolv.conf 2>>"$errlog") \
+            || resolv_vm="${resolv_vm:-}"
+        resolv_container=$($SUDO "$FCVM" exec --pid "$cpid" -c -- cat /etc/resolv.conf 2>>"$errlog") \
+            || resolv_container="${resolv_container:-}"
+        for view in vm container; do
+            local text="$resolv_vm"
+            [ "$view" = vm ] || text="$resolv_container"
+            if grep -qx -- "$want" <<<"$text"; then
+                echo "  $view /etc/resolv.conf names $dns_server"
+            else
+                failed=1
+                echo "HOP D FAILED: $view /etc/resolv.conf has no '$want' line (got: $(tr '\n' '|' <<<"$text"))" >&2
+            fi
+        done
+        local host answer ok
+        for host in "${hosts[@]}"; do
+            [ -n "$host" ] || continue
+            answer=$($SUDO "$FCVM" exec --pid "$cpid" -c -- python3 -c \
+                'import socket,sys;print(socket.gethostbyname(sys.argv[1]))' "$host" 2>>"$errlog") \
+                || answer="${answer:-}<exec rc=$?>"
+            if [ "$answer" = "$VERIFY_DNS_ANSWER" ]; then
+                ok=true
+            else
+                ok=false; failed=1
+                echo "HOP D FAILED: $host resolved to '$answer' inside the clone, want $VERIFY_DNS_ANSWER" >&2
+            fi
+            echo "  $host -> $answer ($ok)"
+            hosts_json=$(jq -c --arg h "$host" --arg a "$answer" --argjson ok "$ok" \
+                '.[$h] = {answer: $a, ok: $ok}' <<<"$hosts_json")
+        done
+        local url status
+        for url in "${urls[@]}"; do
+            [ -n "$url" ] || continue
+            status=$($SUDO "$FCVM" exec --pid "$cpid" -c -- python3 -c "$VERIFY_DNS_URL_PROBE" "$url" 2>>"$errlog") \
+                || status="${status:-}<exec rc=$?>"
+            if [[ "$status" =~ ^[0-9]+$ ]] && [ "$status" -ge 200 ] && [ "$status" -le 399 ]; then
+                ok=true
+            else
+                ok=false; failed=1
+                echo "HOP D FAILED: GET $url inside the clone returned '$status', want 200-399" >&2
+            fi
+            echo "  GET $url -> $status ($ok)"
+            urls_json=$(jq -c --arg u "$url" --arg s "$status" --argjson ok "$ok" \
+                '.[$u] = {status: (if ($s | test("^[0-9]+$")) then ($s | tonumber) else null end), ok: $ok}' \
+                <<<"$urls_json")
+        done
+    fi
+    local passed=true
+    [ "$failed" -eq 0 ] || passed=false
+    jq -n --arg dns "$dns_server" --arg rv "$resolv_vm" --arg rc "$resolv_container" \
+        --argjson hosts "$hosts_json" --argjson urls "$urls_json" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson passed "$passed" \
+        '{dns_server: (if $dns == "" then null else $dns end), resolv_conf_vm: $rv,
+          resolv_conf_container: $rc, hosts: $hosts, urls: $urls, timestamp: $ts, passed: $passed}' \
+        >"$out.tmp" && mv "$out.tmp" "$out" \
+        || { echo "HOP D BLOCKED: cannot write $out" >&2; return 1; }
+    [ "$failed" -eq 0 ] || return 1
+    echo "  OK evidence in $out"
+}
+
 cmd_verify() {
     # Every hop feeds this counter and the function RETURNS it. Each hop used to
     # be `... || echo "HOP X FAILED"`, which makes the compound command SUCCEED —
@@ -849,6 +979,8 @@ cmd_verify() {
     [ "$ENGINE" = webkit ] && health_probe=wd_health.py
     $SUDO "$FCVM" exec --pid "$cpid" -c -- python3 "/opt/bench/$health_probe" \
         || { echo "HOP A FAILED (in-container $ENGINE health round trip)"; fail=1; }
+
+    verify_guest_dns "$cpid" || fail=1
 
     if [ "$ENGINE" = webkit ]; then
         echo "--- HOP B: GET /status from the HOST against $ip:$CDP_PORT ---"
