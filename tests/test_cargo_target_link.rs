@@ -2728,61 +2728,9 @@ fn cargo_target_link_falls_back_when_the_existing_worktree_dir_is_unwritable() {
     // published and hides exactly the defect under test.
     let checkout = tempfile::tempdir().expect("checkout tempdir");
     let btrfs = tempfile::tempdir().expect("btrfs stand-in");
-
-    // The script's own naming: sanitized basename + sha256(pwd -P)[..8].
-    let p = std::fs::canonicalize(checkout.path()).expect("canonical checkout path");
-    let base: String = p
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "._-".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let digest = {
-        use sha2::Digest;
-        hex::encode(sha2::Sha256::digest(p.to_string_lossy().as_bytes()))
-    };
-    let wt_target = btrfs
-        .path()
-        .join("cargo-target")
-        .join(format!("{base}-{}", &digest[..8]));
-    std::fs::create_dir_all(&wt_target).expect("pre-create the worktree dir");
-
-    let root = nix_geteuid_is_root();
-    if root {
-        let ok = Command::new("mount")
-            .args([
-                "--bind",
-                btrfs.path().to_str().unwrap(),
-                btrfs.path().to_str().unwrap(),
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            && Command::new("mount")
-                .args(["-o", "remount,ro,bind", btrfs.path().to_str().unwrap()])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-        assert!(ok, "could not remount the btrfs stand-in read-only as root");
-    } else {
-        std::fs::set_permissions(&wt_target, std::fs::Permissions::from_mode(0o555))
-            .expect("chmod 0555 on the worktree dir");
-    }
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
 
     let (ok, out) = run_link(checkout.path(), btrfs.path());
-
-    if root {
-        let _ = Command::new("umount").arg(btrfs.path()).status();
-    } else {
-        let _ = std::fs::set_permissions(&wt_target, std::fs::Permissions::from_mode(0o755));
-    }
 
     assert!(ok, "the recipe failed outright:\n{out}");
     let target = checkout.path().join("target");
@@ -2822,6 +2770,31 @@ fn managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
         .join(format!("{base}-{}", &digest[..8]))
 }
 
+/// Make this checkout's managed worktree dir "exist but refuse writes" without
+/// any privilege: point it at procfs, where creating an entry is refused for
+/// root and non-root alike. `mkdir -p` on it succeeds (it exists), a lease fd
+/// opens, and the write probe inside the lease fails -- exactly the
+/// ownership-change / read-only-remount state, staged with a symlink.
+///
+/// Replaces an earlier fixture that chmod'ed as a user and bind-remounted
+/// read-only as root: as UID 0 WITHOUT CAP_SYS_ADMIN (an unprivileged
+/// container) the mount was refused and the test failed before reaching the
+/// script (Codex on #867).
+fn unwritable_managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
+    let wt = managed_worktree_dir(checkout, btrfs_root);
+    std::fs::create_dir_all(wt.parent().unwrap()).expect("cargo-target parent");
+    std::os::unix::fs::symlink("/proc/self", &wt).expect("procfs-backed worktree dir");
+    assert!(
+        wt.is_dir(),
+        "the procfs stand-in does not resolve to a directory"
+    );
+    assert!(
+        std::fs::File::create(wt.join(".fcvm-fixture-probe")).is_err(),
+        "the procfs stand-in accepted a write; the fixture proves nothing"
+    );
+    wt
+}
+
 /// A managed symlink whose directory has become unwritable must be REPLACED.
 ///
 /// Codex on #867 (P2): with `target` already pointing at the managed directory,
@@ -2835,35 +2808,10 @@ fn managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
 fn cargo_target_link_replaces_a_managed_link_to_an_unwritable_dir() {
     let checkout = tempfile::tempdir().expect("checkout tempdir");
     let btrfs = tempfile::tempdir().expect("btrfs stand-in");
-    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
-    std::fs::create_dir_all(&wt).expect("managed dir");
+    let wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
     std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("managed link");
 
-    let root = nix_geteuid_is_root();
-    if root {
-        let b = btrfs.path().to_str().unwrap();
-        let ok = Command::new("mount")
-            .args(["--bind", b, b])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            && Command::new("mount")
-                .args(["-o", "remount,ro,bind", b])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-        assert!(ok, "could not remount the btrfs stand-in read-only as root");
-    } else {
-        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).expect("chmod 0555");
-    }
-
     let (ok, out) = run_link(checkout.path(), btrfs.path());
-
-    if root {
-        let _ = Command::new("umount").arg(btrfs.path()).status();
-    } else {
-        let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
-    }
 
     assert!(ok, "the recipe failed outright:\n{out}");
     let target = checkout.path().join("target");
