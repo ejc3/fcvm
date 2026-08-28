@@ -18,9 +18,20 @@ the cell's guest_dns names a baked resolver or its guest_env is non-empty,
 optional otherwise; when present it must name the run's snapshot generation,
 config, tag, engine, backend and UFFD mode, record uffd_prefetch "off" (null
 on the file backend, which has no serve), say passed=true with the sealed
-bundle intact, list no violations, cover every URL the cell measured and
-carry a load event for each). The index names every file it was generated
-from with its sha256, and carries one cell per run: engine, cpu, memory_mib,
+bundle intact, list no violations, cover every URL the cell measured, carry
+a load event for each and have rendered each reps times). A diag's
+passed=true means only that nothing it was asked to check went wrong, so its
+limits must have been armed for this run: on Chromium limits.expect_ips must
+be exactly the address set the run's records name (the answers the verify
+brackets recorded inside the restored clone, the BENCH_RESOLVE_ALL_TO address
+of a resolver-rule golden, and the IP-literal hosts of the measured URLs; a
+run whose records name no address cannot hold a diag to anything and is
+refused), on WebKit it must be null (that render carries no trace and
+reqbench refuses the expectation), and limits.max_load_ms must be a positive
+integer no larger than the run's own stall_gate.max_ms. The corpus campaign
+arms both at 15000 ms and refuses a DIAG_MAX_LOAD_MS above STALL_MAX_MS
+before building anything. The index names every file it was generated from
+with its sha256, and carries one cell per run: engine, cpu, memory_mib,
 guest_dns, guest_env, the seal identity, publishable, stall_gate_passed,
 dns_verdict, load_max_1min (the maximum 1-min load the campaign's sampler saw
 during the measured run, when the evidence records it), the headline median
@@ -48,12 +59,14 @@ so the hash names the bytes that were parsed.
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
 # One :53 owner sample, as corpus_campaign.sh's dns_owner_sample prints it.
@@ -231,6 +244,43 @@ def check_owner_log(run_dir, evidence, owner_bytes):
         )
 
 
+def canonical_ip(value):
+    """The address as a string, or None when value is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def bracket_answers(run_dir, name, verify):
+    """The addresses one passing verify bracket's resolver answered.
+
+    HOP D writes passed=true only when every host it asked resolved to the
+    expected answer, so a passing bracket whose host is not ok, or whose
+    answer is not an address, is a record the index cannot read an answer
+    from and is refused.
+    """
+    hosts = verify.get("hosts")
+    if not isinstance(hosts, dict):
+        raise RunError(f"{run_dir}: {name} names no hosts")
+    answers = set()
+    for host, entry in hosts.items():
+        if not isinstance(entry, dict) or entry.get("ok") is not True:
+            raise RunError(
+                f"{run_dir}: {name} records passed=true but host {host} is not ok"
+            )
+        answer = canonical_ip(entry.get("answer"))
+        if answer is None:
+            raise RunError(
+                f"{run_dir}: {name} records answer {entry.get('answer')!r} for "
+                f"{host}, which is not an address"
+            )
+        answers.add(answer)
+    return answers
+
+
 def check_verify_bracket(run_dir, name, verify, resolver):
     """Hold one HOP D bracket to what the campaign asserted when it ran it:
     the clone resolved through `resolver` (None takes the bracket's own, so
@@ -298,7 +348,11 @@ def check_verify_bracket(run_dir, name, verify, resolver):
 
 
 def check_evidence(run_dir, evidence, sources, guest_dns):
-    """Hold a clean verdict to the files it cites; raise RunError otherwise."""
+    """Hold a clean verdict to the files it cites; raise RunError otherwise.
+
+    Returns the set of addresses the verify brackets' resolver answered,
+    the run's own record of where its pages came from.
+    """
     if not isinstance(evidence, dict):
         # Valid JSON that is not an object ([] for one) has no verdict to
         # read; refusing it here keeps every .get() below on a dict.
@@ -367,6 +421,7 @@ def check_evidence(run_dir, evidence, sources, guest_dns):
         )
     cited = {os.path.basename(p) for p in verify_files}
     resolver = guest_dns if isinstance(guest_dns, str) and guest_dns else None
+    answers = set()
     for stage in VERIFY_STAGES:
         name = f"verify-dns-{stage}.json"
         if name not in cited:
@@ -383,7 +438,9 @@ def check_evidence(run_dir, evidence, sources, guest_dns):
                 f"{run_dir}: {name} sha256 {digest} does not match the {want} "
                 "dns-evidence.json recorded at the verdict"
             )
-        resolver = check_verify_bracket(run_dir, name, parse_json(data, path), resolver)
+        verify = parse_json(data, path)
+        resolver = check_verify_bracket(run_dir, name, verify, resolver)
+        answers |= bracket_answers(run_dir, name, verify)
     # The replay server's own logs, pinned by hash at the verdict.
     for field, name in REPLAY_LOGS.items():
         want = evidence.get(field)
@@ -398,6 +455,38 @@ def check_evidence(run_dir, evidence, sources, guest_dns):
                 f"{run_dir}: {name} sha256 {digest} does not match the "
                 f"{want} dns-evidence.json recorded at the verdict"
             )
+    return answers
+
+
+def recorded_addresses(run_dir, measured_urls, guest_env, answers):
+    """The addresses the run's own records say its pages came from.
+
+    Three records name one: the resolver answers the verify brackets saw
+    inside the restored clone (a corpus run), the BENCH_RESOLVE_ALL_TO
+    address a resolver-rule golden baked into Chromium's host resolver
+    rules, and the IP-literal hosts of the measured URLs (the medium.html
+    fixture on the host loopback). The set is what the diag must have been
+    held to; it is derived here rather than assumed to be the replay's
+    10.0.2.2 so a golden made against another address is checked against
+    that address.
+    """
+    addresses = set(answers or ())
+    for entry in guest_env:
+        key, _, value = entry.partition("=")
+        if key != "BENCH_RESOLVE_ALL_TO":
+            continue
+        address = canonical_ip(value)
+        if address is None:
+            raise RunError(
+                f"{run_dir}: analysis.json cell guest_env names {entry!r}, "
+                "whose value is not an address"
+            )
+        addresses.add(address)
+    for url in measured_urls:
+        address = canonical_ip(urlsplit(url).hostname)
+        if address is not None:
+            addresses.add(address)
+    return addresses
 
 
 # What binds a diag to the run it sits beside: diag summary key -> analysis
@@ -414,8 +503,13 @@ DIAG_IDENTITY = (
 )
 
 
-def summarize_diag(run_dir, diag, cell, measured_urls):
-    """The diag's verdict, violation count and slowest load per URL; RunError otherwise."""
+def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
+    """The diag's verdict, violation count and slowest load per URL; RunError otherwise.
+
+    addresses is the set recorded_addresses derived for the cell, and
+    stall_max_ms the run's armed stall gate: the two things the diag's
+    limits are held to.
+    """
     if not isinstance(diag, dict):
         raise RunError(f"{run_dir}: diag/summary.json is not a JSON object")
     for diag_key, cell_key in DIAG_IDENTITY:
@@ -488,7 +582,88 @@ def summarize_diag(run_dir, diag, cell, measured_urls):
             f"{run_dir}: diag/summary.json records passed={passed} with "
             f"{len(violations)} violation(s) {kinds}; a run whose diag failed is not indexed"
         )
+    check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms)
     return {"diag_passed": True, "violations_count": 0, "max_load_ms": max_load}
+
+
+def check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms):
+    """Refuse a passing diag whose limits were not armed for this run.
+
+    reqbench.sh diag writes passed=true when nothing it was asked to check
+    went wrong, and records what it was asked under limits: expect_ips (the
+    DIAG_EXPECT_IPS list, null when unset, always null on WebKit whose
+    render carries no trace) and max_load_ms (DIAG_MAX_LOAD_MS, null when
+    unset). A diag run without them allowed every remote address and held
+    no load event to a limit, and a later standalone diag over the same
+    RESULTS replaces the campaign's summary with exactly that shape. So the
+    address set must be the one the run's records name, the load limit a
+    positive integer no larger than the run's own stall gate, and every
+    measured URL rendered reps times.
+    """
+    limits = diag.get("limits")
+    if (
+        not isinstance(limits, dict)
+        or "expect_ips" not in limits
+        or "max_load_ms" not in limits
+    ):
+        raise RunError(
+            f"{run_dir}: diag/summary.json records no limits (expect_ips, max_load_ms); "
+            "a diag whose limits are unknown is not this run's evidence"
+        )
+    expect_ips = limits["expect_ips"]
+    if diag["engine"] == "webkit":
+        if expect_ips is not None:
+            raise RunError(
+                f"{run_dir}: diag/summary.json records limits.expect_ips={expect_ips!r} "
+                "on webkit, whose render carries no trace to hold to an address; "
+                "reqbench refuses that expectation, so the diag did not write this"
+            )
+    else:
+        if (
+            not isinstance(expect_ips, list)
+            or not expect_ips
+            or any(canonical_ip(ip) is None for ip in expect_ips)
+        ):
+            raise RunError(
+                f"{run_dir}: diag/summary.json records limits.expect_ips={expect_ips!r}; "
+                "a diag run without DIAG_EXPECT_IPS allowed every remote address"
+            )
+        held = {canonical_ip(ip) for ip in expect_ips}
+        if not addresses:
+            raise RunError(
+                f"{run_dir}: the run's records name no address its pages came from "
+                "(no verify bracket answer, no BENCH_RESOLVE_ALL_TO, no IP-literal url "
+                f"host), so diag/summary.json limits.expect_ips={sorted(held)} cannot "
+                "be held to the run"
+            )
+        if held != addresses:
+            raise RunError(
+                f"{run_dir}: diag/summary.json limits.expect_ips={sorted(held)} is not "
+                f"the address set the run's records name {sorted(addresses)}; that diag "
+                "held its renders to other addresses"
+            )
+    max_load_ms = limits["max_load_ms"]
+    if not positive_int(max_load_ms):
+        raise RunError(
+            f"{run_dir}: diag/summary.json records limits.max_load_ms={max_load_ms!r}; "
+            "a diag run without DIAG_MAX_LOAD_MS held no load event to a limit"
+        )
+    if max_load_ms > stall_max_ms:
+        raise RunError(
+            f"{run_dir}: diag/summary.json limits.max_load_ms={max_load_ms} is above "
+            f"the run's stall_gate max_ms={stall_max_ms}; the diag was allowed more "
+            "than the measured run"
+        )
+    reps = diag.get("reps")
+    if not positive_int(reps):
+        raise RunError(f"{run_dir}: diag/summary.json records reps={reps!r}")
+    for url in measured_urls:
+        data = diag["urls"][url]
+        if data.get("reps") != reps or data.get("renders_ok") != reps:
+            raise RunError(
+                f"{run_dir}: diag/summary.json records renders_ok={data.get('renders_ok')!r} "
+                f"of reps={data.get('reps')!r} for {url}, not {reps} of {reps}"
+            )
 
 
 def load_cell(run_dir):
@@ -562,10 +737,11 @@ def load_cell(run_dir):
 
     dns_verdict = None
     load_max_1min = None
+    answers = set()
     evidence_path = os.path.join(run_dir, "dns-evidence.json")
     if os.path.isfile(evidence_path):
         evidence = sources.read_json(evidence_path)
-        check_evidence(run_dir, evidence, sources, cell["guest_dns"])
+        answers = check_evidence(run_dir, evidence, sources, cell["guest_dns"])
         dns_verdict = evidence["verdict"]
         # Reported, not gated: the run driver refused a busy box at the
         # start, and evidence from before the sampler carried the load
@@ -593,7 +769,10 @@ def load_cell(run_dir):
     diag_path = os.path.join(run_dir, "diag", "summary.json")
     if os.path.isfile(diag_path):
         measured = [part.strip() for part in str(cell.get("url") or "").split(",") if part.strip()]
-        diag = summarize_diag(run_dir, sources.read_json(diag_path), cell, measured)
+        addresses = recorded_addresses(run_dir, measured, guest_env, answers)
+        diag = summarize_diag(
+            run_dir, sources.read_json(diag_path), cell, measured, addresses, max_ms
+        )
     elif cell["guest_dns"] is not None or guest_env:
         # The campaign diagnoses the golden before measuring on it; a run
         # whose golden was shaped for the corpus (a baked resolver, or a

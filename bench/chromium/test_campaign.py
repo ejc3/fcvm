@@ -1643,6 +1643,52 @@ class DiagPhase(unittest.TestCase):
                     self.assertIn("DIAG_ONLY", result.stdout,
                                   "the stop does not say why the campaign ended")
 
+    KNOBS = re.compile(
+        r'^(STALL_MAX_MS="\$\{STALL_MAX_MS:-\d+\}"\n.*?^DIAG_ONLY="\$\{DIAG_ONLY:-0\}"\n)',
+        re.S | re.M)
+
+    def test_the_campaign_refuses_a_diag_ceiling_above_the_run_s_stall_gate(self):
+        """campaign_summary holds the diag's max_load_ms to the run's stall
+        gate, so a campaign started with DIAG_MAX_LOAD_MS above STALL_MAX_MS
+        would spend its golden on a run the index refuses. The knob block
+        refuses that before anything is built, and a limit that is not a
+        positive integer of milliseconds with it. The block is lifted out of
+        the shipped script and run against each environment; the diag make
+        line's own DIAG_EXPECT_IPS and DIAG_MAX_LOAD_MS are pinned by
+        test_run_diag_hands_the_corpus_and_the_replay_answer_to_the_diag_target.
+
+        Watched red 2026-08-28 at 51527021: DIAG_MAX_LOAD_MS=20000 over
+        STALL_MAX_MS=15000 ran through (`AssertionError: 0 != 2`).
+        """
+        block = self.KNOBS.search(campaign())
+        self.assertIsNotNone(block, "the STALL_MAX_MS .. DIAG_ONLY knob block is gone")
+        cases = (
+            ("defaults", {}, 0),
+            ("equal", {"STALL_MAX_MS": "15000", "DIAG_MAX_LOAD_MS": "15000"}, 0),
+            ("diag stricter", {"STALL_MAX_MS": "20000", "DIAG_MAX_LOAD_MS": "15000"}, 0),
+            ("empty falls back to the default", {"DIAG_MAX_LOAD_MS": ""}, 0),
+            ("diag above the gate", {"STALL_MAX_MS": "15000", "DIAG_MAX_LOAD_MS": "20000"}, 2),
+            ("diag one over the default gate", {"DIAG_MAX_LOAD_MS": "15001"}, 2),
+            ("diag not a number", {"DIAG_MAX_LOAD_MS": "abc"}, 2),
+            ("gate zero", {"STALL_MAX_MS": "0"}, 2),
+            ("gate negative", {"STALL_MAX_MS": "-15000"}, 2),
+        )
+        for label, knobs, want in cases:
+            with self.subTest(case=label):
+                env = dict(os.environ)
+                for key in ("STALL_MAX_MS", "DIAG_MAX_LOAD_MS", "DIAG_ONLY"):
+                    env.pop(key, None)
+                env.update(knobs)
+                result = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + block.group(1) + "echo KNOBS_OK\n"],
+                    env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, want, result.stdout + result.stderr)
+                if want == 0:
+                    self.assertIn("KNOBS_OK", result.stdout)
+                else:
+                    self.assertIn("BLOCKED", result.stderr)
+                    self.assertNotIn("KNOBS_OK", result.stdout)
+
     def test_the_diag_follows_the_golden_verify_in_both_phases_and_precedes_the_settle(self):
         """Ordering in the main flow, which cannot run without a VM."""
         body = campaign()

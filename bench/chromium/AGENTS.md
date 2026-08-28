@@ -89,7 +89,9 @@ touched, and the webkit diag refuses `DIAG_EXPECT_IPS=` because its render
 has no trace to hold it to. The corpus campaign (`make bench-chromium-corpus`)
 runs it after the verify that follows the golden, with every corpus URL,
 `DIAG_EXPECT_IPS=10.0.2.2` on Chromium and `DIAG_MAX_LOAD_MS` defaulting to
-15000, and refuses to measure when it fails; `DIAG_ONLY=1` stops the
+15000 (the campaign refuses a `DIAG_MAX_LOAD_MS` above `STALL_MAX_MS` before
+building anything, since the index refuses the diag that would produce),
+and refuses to measure when it fails; `DIAG_ONLY=1` stops the
 campaign after golden, verify and diag, for a throwaway golden round, and
 `DIAG_REPS=` passes through to the diag. The campaign hands the diag
 `UFFD_PREFETCH=off` whatever the measured run's setting, so the diag's
@@ -97,8 +99,18 @@ renders (every corpus URL, three clones each) do not warm the sidecar the run
 replays and a fresh golden still measures as one. campaign_summary.py
 refuses a corpus run without its `diag/summary.json`, a summary that names
 another snapshot generation, config, tag, engine, backend or UFFD mode than
-the run's analysis cell, and one whose `uffd_prefetch` is not `"off"` (`null`
-on the file backend), including a summary from before the field existed.
+the run's analysis cell, one whose `uffd_prefetch` is not `"off"` (`null`
+on the file backend), including a summary from before the field existed,
+and one whose `limits` were not armed for the run: `passed` is true when
+nothing the diag was asked to check went wrong, and a standalone diag over
+the same `RESULTS` with the knobs unset replaces the campaign's summary with
+one that allowed every remote address and held no load event to a limit. So
+on Chromium `limits.expect_ips` must be exactly the address set the run's
+records name (the verify brackets' resolver answers, `BENCH_RESOLVE_ALL_TO`,
+and any IP-literal URL host; a run whose records name no address cannot hold
+a diag to anything and is refused), on WebKit it must be `null`,
+`limits.max_load_ms` must be a positive integer no larger than the run's
+`stall_gate.max_ms`, and every measured URL must have rendered `reps` times.
 
 `verify`, `diag` and `run` deliberately have NO build dependency: reqbench.sh
 seals fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and

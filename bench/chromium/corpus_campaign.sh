@@ -52,6 +52,17 @@ STALL_MAX_MS="${STALL_MAX_MS:-15000}"
 # same 15 s, for the same reason. DIAG_REPS reaches the diag target through
 # the environment when set.
 DIAG_MAX_LOAD_MS="${DIAG_MAX_LOAD_MS:-15000}"
+# campaign_summary holds the diag's limit to the run's stall gate and
+# refuses a diag that was allowed more than the measured run, so a campaign
+# that would leave an un-indexable diag stops here, before the golden. Both
+# are positive integers of milliseconds; reqanalyze and reqbench check their
+# own copies later, but a bad value must not cost a golden first.
+for knob in STALL_MAX_MS DIAG_MAX_LOAD_MS; do
+    [[ "${!knob}" =~ ^[1-9][0-9]*$ ]] \
+        || { echo "BLOCKED: $knob must be a positive integer of milliseconds (got '${!knob}')" >&2; exit 2; }
+done
+[ "$DIAG_MAX_LOAD_MS" -le "$STALL_MAX_MS" ] \
+    || { echo "BLOCKED: DIAG_MAX_LOAD_MS=$DIAG_MAX_LOAD_MS exceeds STALL_MAX_MS=$STALL_MAX_MS; campaign_summary refuses a diag allowed more than the run's stall gate" >&2; exit 2; }
 # DIAG_ONLY=1 ends the campaign after golden, verify and diag: no measured
 # run, no analysis. For the throwaway golden round.
 DIAG_ONLY="${DIAG_ONLY:-0}"

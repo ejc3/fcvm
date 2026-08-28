@@ -181,7 +181,8 @@ def diag_summary(urls=("https://example.com/",), passed=True, violations=(),
 def write_verify(path, passed=True, **overrides):
     """One HOP D evidence file in reqbench.sh's shape; overrides rewrite
     fields on top of a bracket that resolved every corpus host and URL
-    through the replay resolver with the proxy variables ignored."""
+    through the replay resolver with the proxy variables ignored (hosts,
+    for a bracket whose resolver answered elsewhere)."""
     record = {
         "dns_server": "10.0.2.2",
         "resolv_conf_vm": "nameserver 10.0.2.2\n",
@@ -756,6 +757,201 @@ class CampaignSummary(unittest.TestCase):
                 self.assertEqual(rc, 0, text)
                 with open(out) as handle:
                     self.assertIs(json.load(handle)["cells"][0]["diag"]["diag_passed"], True)
+
+    def test_a_diag_whose_limits_were_not_armed_is_refused(self):
+        """passed=true from a diag run without DIAG_EXPECT_IPS or
+        DIAG_MAX_LOAD_MS says only that nothing it was asked to check went
+        wrong: every remote address was allowed, no load event was held to
+        a limit. A standalone diag over the same RESULTS replaces the
+        campaign's summary with one shaped like that, so the index holds
+        the summary's limits to the run: expect_ips is the address set the
+        run's records name, max_load_ms is a positive integer at or under
+        the run's own stall gate, and every measured URL rendered reps
+        times.
+
+        Watched red 2026-08-28 at 51527021: every case was indexed
+        (`AssertionError: 0 == 0`).
+        """
+        def with_limits(**limits):
+            summary = diag_summary()
+            summary["limits"].update(limits)
+            return summary
+
+        no_limits = diag_summary()
+        del no_limits["limits"]
+        unshaped = diag_summary()
+        unshaped["limits"] = "armed"
+        half = diag_summary()
+        del half["limits"]["max_load_ms"]
+        no_reps = diag_summary()
+        no_reps["reps"] = 0
+        short = diag_summary()
+        short["urls"]["https://example.com/"]["renders_ok"] = 2
+        cases = (
+            ("no limits at all", no_limits, "limits"),
+            ("limits not an object", unshaped, "limits"),
+            ("limits without max_load_ms", half, "limits"),
+            ("expect_ips null", with_limits(expect_ips=None), "expect_ips"),
+            ("expect_ips empty", with_limits(expect_ips=[]), "expect_ips"),
+            ("expect_ips not a list", with_limits(expect_ips="10.0.2.2"), "expect_ips"),
+            ("expect_ips not an address", with_limits(expect_ips=["replay"]), "expect_ips"),
+            ("expect_ips another address",
+             with_limits(expect_ips=["93.184.216.34"]), "expect_ips"),
+            ("expect_ips a superset",
+             with_limits(expect_ips=["10.0.2.2", "93.184.216.34"]), "expect_ips"),
+            ("max_load_ms null", with_limits(max_load_ms=None), "max_load_ms"),
+            ("max_load_ms zero", with_limits(max_load_ms=0), "max_load_ms"),
+            ("max_load_ms negative", with_limits(max_load_ms=-15000), "max_load_ms"),
+            ("max_load_ms a float", with_limits(max_load_ms=15000.0), "max_load_ms"),
+            ("max_load_ms a string", with_limits(max_load_ms="15000"), "max_load_ms"),
+            ("max_load_ms a bool", with_limits(max_load_ms=True), "max_load_ms"),
+            ("max_load_ms above the run's stall gate",
+             with_limits(max_load_ms=15001), "stall_gate"),
+            ("reps zero", no_reps, "reps"),
+            ("a measured url rendered short of reps", short, "renders_ok"),
+        )
+        for label, diag, keyword in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, diag=diag)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{label}: indexed")
+                self.assertFalse(os.path.exists(out))
+                self.assertIn(keyword, text, label)
+
+    def test_a_diag_limit_at_or_under_the_run_s_stall_gate_is_accepted(self):
+        """The positive control for the limit rule: the campaign hands the
+        diag the same 15 s it arms the run's stall gate with, and a
+        stricter diag limit, or a looser run gate, is still a diag held at
+        least as tightly as the run."""
+        for label, diag_limit, stall in (
+            ("equal", 15000, 15000),
+            ("stricter than the gate", 5000, 15000),
+            ("under a looser gate", 15000, 20000),
+            ("under a fractional gate", 15000, 15000.5),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                summary = diag_summary()
+                summary["limits"]["max_load_ms"] = diag_limit
+                write_run(run_dir, diag=summary, stall_max_ms=stall)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertEqual(rc, 0, text)
+                with open(out) as handle:
+                    self.assertIs(json.load(handle)["cells"][0]["diag"]["diag_passed"], True)
+
+    def test_the_diag_s_expected_addresses_are_the_ones_the_run_s_records_name(self):
+        """The address set the diag must have been held to comes from the
+        run's own records, not from a constant: the resolver answers the
+        verify brackets recorded inside the restored clone, the
+        BENCH_RESOLVE_ALL_TO address a resolver-rule golden baked, and the
+        IP-literal hosts of the measured URLs. A run whose records name no
+        address gives the index nothing to hold expect_ips to, and its diag
+        is refused rather than trusted; a passing bracket whose host was not
+        ok, or whose answer is not an address, is refused as a record the
+        index cannot read an answer from.
+
+        Watched red 2026-08-28 at 51527021: every refused case was indexed
+        (`AssertionError: 0 == 0`).
+        """
+        def diag_for(ips, **kwargs):
+            summary = diag_summary(**kwargs)
+            summary["limits"]["expect_ips"] = ips
+            return summary
+
+        def brackets(host):
+            return {"hosts": {"example.com": host}}
+
+        rule = ("BENCH_RESOLVE_ALL_TO=10.0.2.7",)
+        fixture_url = "http://127.0.0.1:8000/medium.html"
+        fixture = {"url": fixture_url}
+        accepted = (
+            ("brackets that answered 10.0.2.9",
+             dict(verify_overrides=brackets({"answer": "10.0.2.9", "ok": True}),
+                  diag=diag_for(["10.0.2.9"]))),
+            ("a resolver rule naming 10.0.2.7",
+             dict(dns_verdict=None, guest_dns=None, guest_env=rule,
+                  diag=diag_for(["10.0.2.7"]))),
+            ("a fixture url on the host loopback",
+             dict(dns_verdict=None, guest_dns=None, cell_overrides=fixture,
+                  diag=diag_for(["127.0.0.1"], urls=(fixture_url,)))),
+        )
+        for label, kwargs in accepted:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, **kwargs)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertEqual(rc, 0, f"{label}: {text}")
+        refused = (
+            ("the replay answer where the brackets answered 10.0.2.9",
+             dict(verify_overrides=brackets({"answer": "10.0.2.9", "ok": True}),
+                  diag=diag_for(["10.0.2.2"])), "10.0.2.9"),
+            ("the replay answer where the rule names 10.0.2.7",
+             dict(dns_verdict=None, guest_dns=None, guest_env=rule,
+                  diag=diag_for(["10.0.2.2"])), "10.0.2.7"),
+            ("the replay answer for a fixture url on the host loopback",
+             dict(dns_verdict=None, guest_dns=None, cell_overrides=fixture,
+                  diag=diag_for(["10.0.2.2"], urls=(fixture_url,))), "127.0.0.1"),
+            ("a live cell whose records name no address",
+             dict(dns_verdict=None, guest_dns=None, diag=diag_for(["93.184.216.34"])),
+             "no address"),
+            ("brackets that checked no host",
+             dict(verify_overrides={"hosts": {}}, diag=diag_for(["10.0.2.2"])),
+             "no address"),
+            ("a bracket host that was not ok under passed=true",
+             dict(verify_overrides=brackets({"answer": "10.0.2.2", "ok": False}),
+                  diag=diag_for(["10.0.2.2"])), "ok"),
+            ("a bracket answer that is not an address",
+             dict(verify_overrides=brackets({"answer": "<exec rc=1>", "ok": True}),
+                  diag=diag_for(["10.0.2.2"])), "answer"),
+        )
+        for label, kwargs, keyword in refused:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, **kwargs)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{label}: indexed")
+                self.assertFalse(os.path.exists(out))
+                self.assertIn(keyword, text, label)
+
+    def test_a_webkit_diag_carries_no_ip_expectation_and_still_needs_its_load_limit(self):
+        """reqbench refuses DIAG_EXPECT_IPS on webkit (its render carries no
+        trace to hold it to), so a webkit summary records expect_ips null
+        and the verify brackets hold the resolver; one carrying an address
+        list was not written by the diag. max_load_ms is held as on
+        Chromium.
+
+        Watched red 2026-08-28 at 51527021: the address list and the null
+        limit were both indexed (`AssertionError: 0 == 0`).
+        """
+        def webkit(**limits):
+            summary = diag_summary(engine="webkit")
+            summary["limits"].update(expect_ips=None)
+            summary["limits"].update(limits)
+            return summary
+
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, engine="webkit", diag=webkit())
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+        for label, diag, keyword in (
+            ("an address list on webkit", webkit(expect_ips=["10.0.2.2"]), "expect_ips"),
+            ("no load limit on webkit", webkit(max_load_ms=None), "max_load_ms"),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, engine="webkit", diag=diag)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{label}: indexed")
+                self.assertFalse(os.path.exists(out))
+                self.assertIn(keyword, text, label)
 
     def test_a_resolver_rule_cell_needs_its_diag(self):
         """A golden with GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> resolves through
