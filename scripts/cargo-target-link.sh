@@ -80,36 +80,14 @@ name="$(printf '%s' "$(basename "$p")" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 hash="$(printf '%s' "$p" | sha256sum | cut -c1-8)"
 WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 
-# "Is a directory" is not "is usable". On a GitHub-hosted runner /mnt/fcvm-btrfs
-# does not exist, and podman CREATES it as an empty root-owned directory to
-# satisfy CONTAINER_RUN_BASE's bind mount -- so inside the container the volume
-# passes `-d` and fails `mkdir` (Permission denied), while the checkout's own
-# target/ is a bind mount this script should simply keep. Testing `-d` alone
-# took the managed branch and died before reaching its own "retaining unmanaged
-# local target/" exit; every Weekly container-bench from 2026-08-10 on read
-#     mkdir: cannot create directory '/mnt/fcvm-btrfs/cargo-target': Permission denied
-# `-w` would not do either: root passes access(W_OK) on directories it still
-# cannot create in (procfs, a read-only mount). Try the mkdir, and let its
-# outcome decide -- loudly, because artifacts on the root filesystem are the
-# thing this indirection exists to avoid and a reader should see it happen.
-# Give up on the managed volume and leave a REAL local target/ behind.
-#
-# Loud, because artifacts on the root filesystem are the thing this indirection
-# exists to avoid and a reader should see it happen. If target/ is a managed
-# symlink it is REPLACED, not left: a link that still resolves would pass every
-# later `-d target` check while Cargo cannot create a file there (raised on
-# #867). Replacing it is safe here because this script holds the checkout lock
-# (no Cargo runs in this checkout meanwhile) and, whenever target/ resolved,
-# the exclusive lease on its generation taken below.
-# Every exit that leaves target/ as a plain local directory ends here. "Is a
-# directory" is not "is writable": procfs, a read-only mount, and (for a
-# non-root user) a 0555 directory all pass `-d`, and an unwritable target/
-# turns into an opaque cargo error several steps later, which is precisely
-# how the original outage read. So create it if absent, then prove a file
-# can be made in it.
+# Every exit that leaves target/ as a plain local directory proves a file can
+# be created in it first. `-d` passes on procfs, a read-only mount, and a 0555
+# directory. `-w` is no better for root, which passes access(W_OK) on a
+# directory it still cannot create entries in. Creating an entry is the
+# operation cargo needs, and the only test of it.
 require_writable_local_target() {
-	# A dangling UNMANAGED link (a managed one was dropped by the caller) would
-	# make `mkdir -p` fail with EEXIST, under `set -e` and before any diagnostic.
+	# A managed link was already dropped by the caller under its lease; an
+	# unmanaged dangling one is dropped here, or `mkdir -p` fails with EEXIST.
 	if [ -L target ] && ! [ -e target ]; then
 		echo "==> WARNING: dropping dangling target/ → $(readlink target); a local directory takes its place" >&2
 		rm -f -- target
@@ -133,22 +111,17 @@ require_writable_local_target() {
 	rm -f -- "$probe"
 }
 
-# A managed target/ link is dropped, never probed through, on any path that
-# holds no lease on the generation it points at: creating and removing a file
-# inside an unleased generation is the census/rewalk race the pruner's lease
-# protocol exists to prevent. Only the checkout's link goes; the generation is
-# left for the pruner.
+# Drops the checkout's managed target/ link; the generation stays for the
+# pruner. A resolving link is dropped only under an exclusive lease on the
+# generation it publishes: a cargo wrapper may hold that lease shared for the
+# life of its build, and removing the pathname under it splits the build across
+# two trees. A generation that cannot be opened cannot be leased, so the drop
+# is refused. The lease fd stays open until exit. A dangling link publishes
+# nothing and is dropped without one.
 drop_managed_link() {
 	[ -L target ] || return 0
 	case "$(readlink target)" in
 		"$BTRFS_ROOT"/cargo-target/*)
-			# The link publishes a generation a Cargo wrapper may still hold
-			# SHARED while it resolves later target/... paths. Removing the
-			# pathname under that build splits its outputs across two trees,
-			# so the generation is leased EXCLUSIVELY first (this blocks until
-			# the wrapper is done), and a generation that cannot be opened is
-			# a refusal, as for the published-generation open above. The fd
-			# stays open until exit. A dangling link publishes nothing.
 			if [[ -z ${old_target_lease_fd:-} ]] && [ -d target ]; then
 				if ! exec {old_target_lease_fd}<target; then
 					echo "ERROR: cannot open the published generation $(readlink target) to lease it; a running build may still hold it, refusing to replace target/" >&2
@@ -164,9 +137,8 @@ drop_managed_link() {
 fallback_to_local() {
 	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
 	drop_managed_link
-	# `--rotate` promises a logically clean target/. Retaining an unmanaged
-	# link or directory here would report a clean while its payload survives;
-	# the unusable-volume branch refuses the same way.
+	# `--rotate` promises a clean target/; a retained local link or directory
+	# would report one while its payload survives.
 	if ((FORCE_ROTATE)) && { [ -L target ] || [ -d target ]; }; then
 		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
 		exit 1
@@ -175,14 +147,8 @@ fallback_to_local() {
 	exit 0
 }
 
-# "Is a directory" is not "is usable": on a GitHub-hosted runner podman creates
-# a missing /mnt/fcvm-btrfs as an empty root-owned directory to satisfy the
-# bind mount, so the volume passes `-d` and the mkdir below fails. Whether an
-# EXISTING directory can be written is settled later, under its lease -- see
-# the write probe in the lease block. Probing here, before the generation is
-# leased, is the race the pruner's census/rewalk cannot tolerate (raised on
-# #867): an entry that appears after the census or vanishes during the rewalk
-# aborts the hourly preflight.
+# `mkdir -p` returns 0 on an existing directory without proving it can be
+# written; that is settled under the generation's lease, at the reuse probe.
 old_target_lease_fd=""
 btrfs_usable=0
 if [ -d "$BTRFS_ROOT" ]; then
@@ -311,15 +277,11 @@ fi
 candidate="$WT_TARGET"
 if [ -L target ] && [ -d target ]; then
 	linked="$(readlink target)"
-	# A Cargo wrapper that already crossed the checkout→target lock handoff no
-	# longer holds the checkout lease. Pin and exclusively lease its resolved
-	# generation before publishing any different symlink target.
-	# Fail closed if the published generation cannot be opened: without its
-	# lease there is no way to know whether a Cargo wrapper still holds it
-	# shared, and a generation that lost only READ permission (0333) is one
-	# Cargo can still create entries in. Replacing target/ under such a build
-	# would split it across two trees. Only the operator can fix this (chmod
-	# the generation, or remove the link by hand once nothing runs).
+	# target/ is replaced only under an exclusive lease on the generation it
+	# publishes: a cargo wrapper past the checkout→target lock handoff holds
+	# only that lease, shared, and the flock below blocks until it is done. A
+	# generation that cannot be opened cannot be leased, so replacing it is
+	# refused; a 0333 generation still accepts cargo's writes.
 	if ! exec {old_target_lease_fd}<target; then
 		echo "ERROR: cannot open the published generation $linked to lease it; a running build may still hold it, refusing to replace target/" >&2
 		exit 1
@@ -352,9 +314,9 @@ fi
 retired_rc=0
 target_is_retired "$candidate_state_fd" || retired_rc=$?
 if ((FORCE_ROTATE)) && [ "$retired_rc" != 0 ]; then
-	# Retiring writes the marker into the candidate, so one that cannot be
-	# written cannot take it; the fallback refuses under --rotate. An already
-	# retired candidate needs no marker and rotates below.
+	# Retiring writes a marker into the candidate, so an unwritable one falls
+	# back, and the fallback refuses under --rotate. An already retired
+	# candidate needs no marker.
 	if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
 		fallback_to_local "$candidate cannot be written"
 	fi
@@ -370,18 +332,11 @@ case "$retired_rc" in
 		echo "==> Rotating retired target/ → $candidate"
 		;;
 	3)
-		# The candidate is REUSED, so it must be writable. The probe runs here,
-		# after the retirement check, under the exclusive lease: `mkdir -p`
-		# above is idempotent and says nothing about an EXISTING directory that
-		# has since gone read-only (ownership change, ro remount), and creating
-		# an entry is the operation Cargo needs, the one root cannot fake past
-		# EROFS. Under the lease, because the pruner holds LOCK_EX on a
-		# generation across its census and rewalk; an entry created or removed
-		# outside that lock is exactly the "target entry disappeared during
-		# reclaim" abort. A RETIRED candidate is never probed: new_generation
-		# needs only its parent writable, and a retired generation that went
-		# read-only used to fall back to a local target/ that every later run
-		# then retained.
+		# A generation is probed for writability only when it is reused, and
+		# only under its exclusive lease: the pruner holds LOCK_EX across its
+		# census and rewalk, and an entry created or removed outside the lease
+		# aborts it. A retired candidate is never probed; new_generation needs
+		# only the parent writable.
 		if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
 			fallback_to_local "$candidate cannot be written"
 		fi
@@ -391,10 +346,8 @@ case "$retired_rc" in
 		final_lease_fd="$candidate_state_fd"
 		;;
 	*)
-		# The retirement marker could not be read at all. On a directory that
-		# cannot even be written (a read-only or foreign filesystem) that is
-		# just an unusable managed target, and the fallback applies; on a
-		# writable one it is a protocol error and stays fatal.
+		# An unreadable marker on an unwritable directory is an unusable
+		# volume; on a writable one it is a protocol error.
 		if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
 			fallback_to_local "$candidate cannot be written"
 		fi
@@ -426,8 +379,8 @@ else
 	if ! [ -d "$BTRFS_ROOT" ]; then
 		echo "==> NOTE: $BTRFS_ROOT is not a directory; build artifacts stay on the root filesystem"
 	fi
-	# This branch never leases a generation, and target/ may still resolve into
-	# one (a rotated generation outliving the canonical path the pruner removed).
+	# target/ may still resolve into a generation that outlived its canonical
+	# path; drop_managed_link leases it before dropping the link.
 	drop_managed_link
 fi
 
@@ -451,6 +404,5 @@ if [ -L target ] && ! [ -d target ]; then
 	fi
 fi
 
-# Fail closed, for every path that reaches here (the managed link just
-# published, the unusable-volume branch, a healed or dropped dangling link).
+# Fail closed on every path that reaches here.
 require_writable_local_target
