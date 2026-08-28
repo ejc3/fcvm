@@ -7278,6 +7278,8 @@ class AnalyzerResolverGate(unittest.TestCase):
         self.assertEqual(out["cell"]["engine"], "chromium")
 
     def test_localhost_without_guest_dns_is_publishable(self):
+        """Positive control, like the fixture-URL case above: red only against
+        the over-strict gate."""
         with tempfile.TemporaryDirectory() as d:
             rc, out = self._analyze(
                 d,
@@ -7312,8 +7314,11 @@ class AnalyzerResolverGate(unittest.TestCase):
             )
         self.assertIs(out["publishable"], False)
         self.assertEqual(rc, 5)
+        # The CELL must reject it. The render-engine mismatch check already
+        # mentions "engine", so a looser assertion passed on the unfixed tree.
+        self.assertIsNone(out["cell"])
         errors = out["gate"]["backend_metadata"]["errors"]
-        self.assertTrue(any("engine" in error for error in errors), errors)
+        self.assertTrue(any("no valid engine" in error for error in errors), errors)
 
     def test_a_url_set_that_contradicts_url_is_a_metadata_error(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7534,7 +7539,11 @@ class AnalyzerStallGate(unittest.TestCase):
             src = os.path.join(d, "r.jsonl")
             AnalyzerAvailability._write_clean_backend(src, "file", 200, 384.0)
             from contextlib import redirect_stderr
+            stderr = io.StringIO()
             with self.assertRaises(SystemExit) as raised:
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
                     reqanalyze.main_with(["--stall-max-ms", "0", src])
             self.assertEqual(raised.exception.code, 2)
+            # An unknown flag also exits 2, which let this pass before the
+            # flag existed; the refusal has to be the range check.
+            self.assertIn("positive", stderr.getvalue())
