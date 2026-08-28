@@ -54,15 +54,31 @@ class DnsLog(unittest.TestCase):
 
     def _responder(self, log_path=None, answer_ip="10.0.2.2"):
         sock = corpus_serve.bind_dns("127.0.0.1", 0)
-        self.addCleanup(sock.close)
+        port = sock.getsockname()[1]
         log = corpus_serve.JsonlLog(log_path) if log_path else None
-        if log is not None:
-            self.addCleanup(log.close)
         thread = threading.Thread(
             target=corpus_serve.serve_dns, args=(sock, answer_ip, log), daemon=True,
         )
         thread.start()
-        return sock.getsockname()[1]
+
+        def stop():
+            # close() does not wake a recvfrom already blocked in the kernel
+            # (see test_closing_the_socket_ends_the_responder_thread); one
+            # datagram after the close releases it, and the thread is then
+            # joined so no test leaves a blocked responder behind.
+            sock.close()
+            wake = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                wake.sendto(dns_query("wake.test", QTYPE_A), ("127.0.0.1", port))
+            finally:
+                wake.close()
+            thread.join(timeout=5)
+            if log is not None:
+                log.close()
+            self.assertFalse(thread.is_alive(), "serve_dns outlived its test")
+
+        self.addCleanup(stop)
+        return port
 
     def _ask(self, port: int, name: str, qtype: int):
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -115,6 +131,45 @@ class DnsLog(unittest.TestCase):
             reply, _ = self._ask(port, "blog.cloudflare.com", QTYPE_A)
             self.assertEqual(socket.inet_ntoa(reply[-4:]), "10.0.2.2")
             self.assertEqual(os.listdir(d), [])
+
+    def test_a_log_that_cannot_be_written_ends_the_responder(self):
+        """A query answered but not logged is a hole in the evidence the
+        campaign hashes. The broad handler swallowed the write error and the
+        resolver kept answering, unlogged, for the rest of the run. It now
+        closes its socket and ends: the guest stops resolving, the :53 owner
+        sampler sees no owner, and the run is refused on both counts.
+
+        Red: the second query was answered (thread alive, socket open).
+        """
+        class BrokenLog:
+            def write(self, _row):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                pass
+
+        sock = corpus_serve.bind_dns("127.0.0.1", 0)
+        port = sock.getsockname()[1]
+        seen = []
+        saved_hook = threading.excepthook
+        threading.excepthook = lambda args: seen.append(args.exc_value)
+        self.addCleanup(setattr, threading, "excepthook", saved_hook)
+        thread = threading.Thread(target=corpus_serve.serve_dns,
+                                  args=(sock, "10.0.2.2", BrokenLog()), daemon=True)
+        thread.start()
+        reply, _ = self._ask(port, "blog.cloudflare.com", QTYPE_A)
+        self.assertEqual(socket.inet_ntoa(reply[-4:]), "10.0.2.2",
+                         "the query before the failed write must still be answered")
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "serve_dns kept serving after a failed log write")
+        self.assertEqual(sock.fileno(), -1, "the responder left its socket open")
+        self.assertTrue(seen and isinstance(seen[0], OSError), seen)
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(client.close)
+        client.settimeout(1)
+        client.sendto(dns_query("second.test", QTYPE_A), ("127.0.0.1", port))
+        with self.assertRaises(OSError):
+            client.recvfrom(512)
 
     def test_closing_the_socket_ends_the_responder_thread(self):
         """A closed socket must end serve_dns, not spin it on EBADF forever.

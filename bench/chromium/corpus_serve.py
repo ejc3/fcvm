@@ -251,7 +251,11 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
 
     With `log`, one line per answered query: {ts, peer, qname, qtype, answer}.
     Returns when the socket is closed under it; every other error on a query
-    is dropped so one malformed packet cannot stop the replay.
+    is dropped so one malformed packet cannot stop the replay. A log line that
+    cannot be written is the one exception: an answered, unlogged query is a
+    hole in the evidence the campaign hashes, so the responder closes its
+    socket and raises. The guest then stops resolving and the campaign's :53
+    owner sampler finds no owner, and the run is refused on both counts.
     """
     while True:
         try:
@@ -283,7 +287,10 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
                 resp = txid + flags + struct.pack(">HHHH", 1, 0, 0, 0) + question
                 answered = ""
             sock.sendto(resp, peer)
-            if log is not None:
+        except Exception:  # noqa: BLE001 - a malformed query must not kill the server
+            continue
+        if log is not None:
+            try:
                 log.write({
                     "ts": time.time(),
                     "peer": f"{peer[0]}:{peer[1]}",
@@ -291,8 +298,9 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
                     "qtype": qtype,
                     "answer": answered,
                 })
-        except Exception:  # noqa: BLE001 - a malformed query must not kill the server
-            continue
+            except OSError:
+                sock.close()
+                raise
 
 
 def build_parser() -> argparse.ArgumentParser:
