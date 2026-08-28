@@ -66,7 +66,7 @@ fetch_payload() {
           pullRequest(number: $pr) {
             author { login }
             headRefOid
-            commits(last: 1) { nodes { commit { committedDate } } }
+            commits(last: 1) { nodes { commit { committedDate checkSuites(first: 10) { nodes { createdAt } } } } }
             reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
               pageInfo { hasNextPage endCursor }
               nodes { author { login } state body submittedAt commit { oid } }
@@ -81,6 +81,7 @@ fetch_payload() {
     prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$rresp")
     headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$rresp")
     headdate=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.committedDate // ""' <<<"$rresp")
+    headsuites=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes // []' <<<"$rresp")
     [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
     rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
   done
@@ -209,9 +210,9 @@ fetch_payload() {
   jq -n --slurpfile t <(printf '%s' "$threads") \
         --slurpfile r <(printf '%s' "$reviews") \
         --slurpfile c <(printf '%s' "$prcomments") \
-        --arg a "$prauthor" --arg h "$headoid" --arg d "$headdate" \
+        --arg a "$prauthor" --arg h "$headoid" --arg d "$headdate" --argjson cs "${headsuites:-[]}" \
      '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
-                                      commits:{nodes:[{commit:{committedDate:$d}}]},
+                                      commits:{nodes:[{commit:{committedDate:$d, checkSuites:{nodes:$cs}}}]},
                                       reviewThreads:{nodes:$t[0]}, reviews:{nodes:$r[0]},
                                       comments:{nodes:$c[0]}}}}}'
 }
@@ -312,19 +313,28 @@ TRIGGER_RE='\A[[:space:]]*@[A-Za-z0-9_-]+([[:space:]]+[A-Za-z-]+)?[[:space:]]*\z
 # A reviewer with nothing to say posts no review object: Codex answers "Didn't find any
 # major issues" as a plain comment, and CodeRabbit's review that produces no comments
 # replies "Full review finished." (or "Review finished."). Those are verdicts, not
-# findings: they need no disposition, and (dated after the head commit, from someone other
-# than the author) they are the only coverage a clean head will ever get.
-VERDICT_RE='Codex Review: Didn.t find any major issues|(^|\n)(Full r|R)eview finished\.'
+# findings: they need no disposition, and (dated after the head ARRIVED, from someone
+# other than the author) they are the only coverage a clean head will ever get. The
+# verdict must be the WHOLE comment: after dropping HTML comments, blank lines and the
+# "> Note:" trailer, exactly the acknowledgement lines and nothing else. A body carrying
+# the phrase beside review text is a finding and stays claimable.
+VERDICT_JQ='def is_verdict:
+  ((. // "") | gsub("<!--(.|\n)*?-->"; "") | split("\n")
+    | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0 and (startswith(">") | not)))) as $l
+  | ($l == ["✅ Action performed", "Full review finished."])
+    or ($l == ["✅ Action performed", "Review finished."])
+    or (($l | length) == 1 and ($l[0] | test("^Codex Review: Didn.t find any major issues[^\n]{0,40}$")));'
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
-bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg vre "$VERDICT_RE" \
-   '($ignore | split(",")) as $skip
+bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" \
+   "$VERDICT_JQ"'($ignore | split(",")) as $skip
   | (.[0] | map({author, state, body, at: .submittedAt,
                  claimable: ((.state // "COMMENTED") != "APPROVED")}))
   + (.[1] | map({author, state: "COMMENT", body, at: .createdAt,
+                 verdict: (.body | is_verdict),
                  claimable: ((.author.login | IN($skip[]) | not)
                              and ((.body // "") | test($trig) | not)
-                             and ((.body // "") | test($vre) | not))}))' \
+                             and ((.body | is_verdict) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 
@@ -477,19 +487,21 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
   anyreview=$(jq -r --arg me "$prauthor" '[ .[] | select(.author.login != $me) ] | length' \
               <<<"$reviews") || {
     echo "verdict: BLOCKED — could not count reviews." >&2; exit 2; }
-  # A verdict with no findings leaves no review object (see VERDICT_RE). One from someone
-  # other than the author, dated AFTER the head commit, was issued for this head; dated
-  # before it, it was issued for an older one. Without the commit date nothing can be
-  # dated after it, and the head stays uncovered: fail closed.
-  headdate=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.committedDate // ""' <<<"$payload" 2>/dev/null)
-  verdicts=$(jq -r --arg me "$prauthor" --arg re "$VERDICT_RE" --arg hd "$headdate" \
+  # A verdict with no findings leaves no review object (see VERDICT_JQ). One from someone
+  # other than the author, dated AFTER the head ARRIVED at GitHub, was issued for this
+  # head; dated before that, it was issued for an older one. Arrival is the creation of
+  # the head's earliest check suite, not committedDate: a commit made locally before an
+  # older head's verdict and pushed afterwards would otherwise read as covered. Without a
+  # check suite nothing can be dated after arrival, and the head stays uncovered.
+  arrived=$(jq -r '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[]?.createdAt // empty] | min // ""' <<<"$payload" 2>/dev/null)
+  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" \
              '[ .[] | select(.state == "COMMENT") | select(.author.login != $me)
-                | select((.body // "") | test($re))
+                | select(.verdict == true)
                 | select($hd != "" and (.at // "") > $hd) ] | length' <<<"$bodies") || {
     echo "verdict: BLOCKED — could not evaluate no-findings verdicts." >&2; exit 2; }
   if [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ] && [ "${verdicts:-0}" -gt 0 ]; then
     echo
-    echo "  HEAD COVERED  ${headoid:0:9} — no review object, but $verdicts no-findings verdict(s) dated after its commit"
+    echo "  HEAD COVERED  ${headoid:0:9} — no review object, but $verdicts no-findings verdict(s) dated after it arrived ($arrived)"
   elif [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ]; then
     echo
     echo "  UNREVIEWED HEAD  ${headoid:0:9} — reviews exist, none of them cover this commit"
