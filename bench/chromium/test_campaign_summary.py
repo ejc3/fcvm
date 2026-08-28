@@ -137,6 +137,33 @@ SEAL = {
     "snapshot_generation_id": "33333333-3333-4333-8333-333333333333",
     "snapshot_config_sha256": "5" * 64,
 }
+# write_run's diag default: a passing summary for a resolver run, none for a
+# fixture run. Distinct from None, which omits the file on purpose.
+DIAG_DEFAULT = object()
+
+
+def diag_summary(urls=("https://example.com/",), passed=True, violations=(),
+                 max_load_ms=812.5, engine="chromium"):
+    """diag/summary.json in the shape reqbench.sh diag writes."""
+    return {
+        "engine": engine,
+        "tag": "cb-req-corpus",
+        "backend": "uffd",
+        "uffd_mode": "minor",
+        "uffd_prefetch": "on",
+        "reps": 3,
+        "urls": {
+            url: {"reps": 3, "renders_ok": 3, "max_load_ms": max_load_ms,
+                  "max_pending_at_load": 2, "remote_ips": {"10.0.2.2": 42},
+                  "errors": {}}
+            for url in urls
+        },
+        "violations": list(violations),
+        "teardown_failures": 0,
+        "passed": passed,
+        "limits": {"expect_ips": ["10.0.2.2"], "max_load_ms": 15000},
+        "timestamp": "2026-08-28T00:00:00Z",
+    }
 
 
 def write_verify(path, passed=True, **overrides):
@@ -165,7 +192,7 @@ def write_run(
     publishable=True,
     stall_passed=True,
     dns_verdict="clean",
-    diag=None,
+    diag=DIAG_DEFAULT,
     guest_dns="10.0.2.2",
     engine="chromium",
     stall_max_ms=15000,
@@ -182,7 +209,9 @@ def write_run(
     """A minimal run directory shaped like reqanalyze + the campaign evidence.
 
     dns_verdict=None omits dns-evidence.json and everything it names; diag=None
-    omits diag/summary.json. stall_max_ms=None is what reqanalyze writes when
+    omits diag/summary.json, and the default writes a passing one for a
+    resolver run (guest_dns set) and none for a fixture run. stall_max_ms=None
+    is what reqanalyze writes when
     it ran without --stall-max-ms (passed true, evaluated 0). The evidence
     names three passing verify brackets with their real sha256, an owner log
     with `samples` lines and the two replay logs with their real sha256, the
@@ -214,6 +243,8 @@ def write_run(
             cell.pop(field, None)
         else:
             cell[field] = value
+    if diag is DIAG_DEFAULT:
+        diag = diag_summary() if guest_dns is not None else None
     analysis = {
         "publishable": publishable,
         "gate": {"passed": publishable, "reasons": [] if publishable else ["x"]},
@@ -331,7 +362,7 @@ class CampaignSummary(unittest.TestCase):
     def test_one_clean_run_is_indexed(self):
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "reqbench-20260828-000000-corpus")
-            paths = write_run(run_dir, diag={"dns_owner": "corpus_serve", "stalls": 0})
+            paths = write_run(run_dir)
             out_dir = os.path.join(d, "index")
             os.makedirs(out_dir)
             out = os.path.join(out_dir, "campaign-20260828-summary.json")
@@ -363,7 +394,10 @@ class CampaignSummary(unittest.TestCase):
         self.assertEqual(cell["headline"]["cdp"]["blocking_ms_ci"], [567.6, 702.9])
         self.assertEqual(cell["headline"]["cdp"]["n"], 202)
         self.assertEqual(cell["headline"]["noop"]["blocking_ms"], 41.1)
-        self.assertEqual(cell["diag"], {"dns_owner": "corpus_serve", "stalls": 0})
+        self.assertEqual(cell["diag"], {
+            "diag_passed": True, "violations_count": 0,
+            "max_load_ms": {"https://example.com/": 812.5},
+        })
 
     def test_an_unclean_dns_verdict_refuses_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as d:
@@ -516,6 +550,91 @@ class CampaignSummary(unittest.TestCase):
             self.assertNotEqual(rc, 0, text)
             self.assertFalse(os.path.exists(out))
             self.assertIn("dns-evidence.json", text)
+
+    def test_diag_fields_flow_into_the_cell(self):
+        """The cell carries the diag's verdict, its violation count and the
+        slowest load event per URL, and the index names the summary among
+        the files it was generated from.
+
+        Watched red 2026-08-28 at 55d6fb7d: the cell's diag was the whole
+        summary object (`AssertionError: {'engine': 'chromium', ...} != {'diag_passed': True, ...}`).
+        """
+        urls = ("https://example.com/", "https://news.ycombinator.com/")
+        summary = diag_summary(urls=urls)
+        summary["urls"]["https://news.ycombinator.com/"]["max_load_ms"] = 2210.0
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir, diag=summary)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                index = json.load(handle)
+        cell = index["cells"][0]
+        self.assertEqual(cell["diag"], {
+            "diag_passed": True,
+            "violations_count": 0,
+            "max_load_ms": {"https://example.com/": 812.5,
+                            "https://news.ycombinator.com/": 2210.0},
+        })
+        self.assertIn(paths["diag"], {entry["path"] for entry in index["generated_from"]})
+
+    def test_a_corpus_cell_without_its_diag_is_refused(self):
+        """A run whose guest resolved through the baked resolver had the
+        diag run before it; a run directory without the summary is a run
+        nobody diagnosed, and it is not indexed.
+
+        Watched red 2026-08-28 at 55d6fb7d: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=None)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("diag/summary.json", text)
+
+    def test_a_failed_diag_refuses(self):
+        """Watched red 2026-08-28 at 55d6fb7d: AssertionError: 0 == 0 (a
+        summary saying passed=false with a remote_ip violation was indexed)."""
+        violation = {"url": "https://example.com/", "rep": 2, "kind": "remote_ip",
+                     "detail": "93.184.216.34 served 3 request(s), first https://example.com/"}
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=diag_summary(passed=False, violations=[violation]))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("diag", text)
+            self.assertIn("remote_ip", text)
+
+    def test_a_diag_that_skipped_a_measured_url_is_refused(self):
+        """A diag over other pages says nothing about the pages this run
+        measured; every URL in the cell must appear in the summary."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=diag_summary(urls=("https://other.example/",)))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("https://example.com/", text)
+
+    def test_a_fixture_run_keeps_its_previous_shape(self):
+        """No resolver, no diag: the medium.html runs index as before."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, dns_verdict=None, guest_dns=None, diag=None)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                cell = json.load(handle)["cells"][0]
+        self.assertIsNone(cell["diag"])
+        self.assertIsNone(cell["dns_verdict"])
 
     def _refused(self, d, **run_kwargs):
         run_dir = os.path.join(d, "run")

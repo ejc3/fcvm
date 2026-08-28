@@ -714,11 +714,13 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | `bench-chromium-request-golden` | `bench-chromium-request-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=`, `GUEST_ENV=` (own `TAG=`) |
 | `bench-chromium-request-verify` | none (sealed bundle) | `TAG=` |
 | `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=` |
+| `bench-chromium-request-diag` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `DIAG_URLS=`, `DIAG_REPS=`, `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`, `RESULTS=` |
+| `bench-webkit-request-diag` | none (sealed bundle) | the diag knobs above; `ENGINE=webkit`, default `TAG=cb-req-webkit` |
 | `bench-chromium-request-all` | `build` + `setup-default` | all of the above, one seal |
 | `bench-chromium-hostcdp` | `bench-chromium-request-build` | host-container CDP baseline, no VM; `BENCH_RESOLVE_ALL_TO=` |
 | `bench-chromium-fault` | `build` + `setup-default` | `FAULT_OUT=` (required), `FAULT_ARGS=` |
 
-- **verify/run must never gain a `build` dependency.** reqbench.sh seals
+- **verify/diag/run must never gain a `build` dependency.** reqbench.sh seals
   fcvm + fc-agent + its five sources into a hash-bound runtime bundle; the
   run refuses a golden recorded under a different bundle hash. A rebuild (or
   any edit to a sealed file) between golden and run invalidates the chain —
@@ -737,6 +739,14 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 - BACKEND=file is refused against a hugepage TAG (fcvm restores those via an
   implicit UFFD server; the record would be mislabeled), and the pool is
   ensured MEM-derived (4 x MEM/2 pages) at golden, verify, AND run time.
+- The diag phase renders each URL on its own clone with cdpdrive's
+  `--net-trace` and refuses on any remote IP outside `DIAG_EXPECT_IPS=`, any
+  name that did not resolve, any load event over `DIAG_MAX_LOAD_MS=`, any
+  failed render, or an unclean clone teardown; `$RESULTS/diag/summary.json`
+  holds the verdict. `make bench-chromium-corpus` runs it after the golden's
+  verify with the corpus URLs, `DIAG_EXPECT_IPS=10.0.2.2` and
+  `DIAG_MAX_LOAD_MS=15000` (overridable), and does not measure when it fails;
+  `DIAG_ONLY=1` stops the campaign after golden, verify and diag.
 - Structural pin: `MakefileBenchGraph` in bench/chromium/test_reqbench.py
   (`make test-chromium-request`) — it fails if the dependency graph or the
   no-rebuild property of the measured phases regresses.

@@ -5006,6 +5006,410 @@ exit 1
             self.assertEqual(r.stdout.strip(), "ABC123",
                              f"stdout={r.stdout!r} stderr={r.stderr[-800:]}")
 
+    # --- diag: what holds a page's load event inside a restored clone -----
+
+    # Stands in for fcvm. `snapshot serve` and every `snapshot run` clone
+    # publish a state file the way the real ones do and log their own
+    # teardown to $STUB_TEARDOWN_LOG when SIGTERM reaches them, so a test can
+    # prove each clone was stopped rather than infer it from an empty state
+    # directory alone.
+    DIAG_FCVM_STUB = r'''#!/bin/bash
+echo "$*" >> "$STUB_ARGV"
+case "$1 $2" in
+  "snapshot serve")
+      echo "Serve PID: $$"; echo "Waiting for VMs"
+      sleep 30 & sl=$!
+      trap 'echo "torn down serve" >> "$STUB_TEARDOWN_LOG"; kill $sl 2>/dev/null; exit 0' TERM
+      wait $sl; exit 0 ;;
+  "snapshot run")
+      name=""; prev=""
+      for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
+      vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
+      state="$STATE_DIR/$vm_id.json"
+      read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
+      printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \
+          "$vm_id" "$name" "$$" "${f[19]}" > "$state"
+      sleep 30 & sl=$!
+      trap 'echo "torn down $name" >> "$STUB_TEARDOWN_LOG"; kill $sl 2>/dev/null; rm -f "$state"; exit 0' TERM
+      wait $sl; rm -f "$state"; exit 0 ;;
+  "ls --json")
+      pid=""; [ "${3:-}" = --pid ] && pid="$4"
+      "$STUB_PYTHON" - "$STATE_DIR" "$pid" <<'PY'
+import glob, json, os, sys
+rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vm-*.json"))]
+if sys.argv[2]:
+    rows = [r for r in rows if str(r["pid"]) == sys.argv[2]]
+print(json.dumps(rows))
+PY
+      ;;
+  "exec --pid")
+      shift 3; view="$1"; shift; shift
+      case "$view $*" in
+        "-c cat /run/bench-session-id") echo SESSION-1 ;;
+        *) exit 0 ;;
+      esac ;;
+  *) exit 0 ;;
+esac
+'''
+
+    # Stands in for the host python3. A cdpdrive.py invocation writes the
+    # trace the diag asked for and prints the record cdpdrive prints, both
+    # shaped from STUB_* variables; the webkit render (`python3 - wddrive`)
+    # writes its record to the path it was given. Everything else, the
+    # `-c` one-liners that parse `fcvm ls --json` and the `-` heredoc that
+    # writes summary.json, runs the real interpreter.
+    DIAG_PYTHON_STUB = r'''#!/bin/bash
+case "$1 ${2:-}" in
+  *cdpdrive.py*)
+      printf '%s\n' "$*" >> "$STUB_DRIVER_ARGV"
+      exec __PYTHON__ - "$@" <<'PY'
+import json, os, sys
+argv = sys.argv[2:]
+host, url = argv[0], argv[1]
+trace = None
+for i, a in enumerate(argv):
+    if a == "--net-trace":
+        trace = argv[i + 1]
+ip = os.environ.get("STUB_REMOTE_IP", "10.0.2.2")
+load = float(os.environ.get("STUB_LOAD_MS", "812.5"))
+error = os.environ.get("STUB_ERROR_TEXT", "")
+rc = int(os.environ.get("STUB_DRIVER_RC", "0"))
+rows = [
+    {"request_id": "r1", "url": url, "remote_ip": ip, "status": 200, "failed": False,
+     "pending_at_load": False, "error_text": ""},
+    {"request_id": "r2", "url": url + "asset.js", "remote_ip": ip, "status": 200,
+     "failed": False, "pending_at_load": True, "error_text": ""},
+    {"request_id": "r3", "url": url + "beacon", "remote_ip": ip, "status": 200,
+     "failed": False, "pending_at_load": True, "error_text": ""},
+]
+if error:
+    rows.append({"request_id": "r4", "url": "https://cdn.example/x.js", "remote_ip": "",
+                 "status": None, "failed": True, "pending_at_load": True,
+                 "error_text": error})
+summary = {"n_requests": len(rows), "n_failed": sum(r["failed"] for r in rows),
+           "n_pending_at_load": sum(r["pending_at_load"] for r in rows),
+           "remote_ips": {ip: sum(1 for r in rows if r["remote_ip"] == ip)},
+           "errors": {error: 1} if error else {}, "load_event_ms": load}
+if trace and os.environ.get("STUB_NO_TRACE", "0") != "1":
+    with open(trace, "w") as f:
+        json.dump({"requests": rows, "summary": summary}, f)
+record = {"ok": rc == 0, "cdp_host": host, "url": url, "format": "jpeg",
+          "stages": {"resolve_ms": 1.0}}
+if rc == 0:
+    record["stages"].update({"navigate_command_ms": 40.0, "navigate_load_event_ms": load,
+                             "navigate_ms": load + 40.0, "total_ms": load + 200.0})
+    record["net_trace"] = summary
+else:
+    record["error"] = "RuntimeError: navigation failed: net::ERR_CONNECTION_REFUSED"
+    record["stage"] = "navigate-command-response"
+print(json.dumps(record))
+sys.exit(rc)
+PY
+      ;;
+  "- wddrive")
+      cat >/dev/null
+      printf '%s\n' "$*" >> "$STUB_DRIVER_ARGV"
+      shift
+      __PYTHON__ - "$@" <<'PY'
+import json, os, sys
+_driver, host, url, session, record_path = sys.argv[1:6]
+load = float(os.environ.get("STUB_LOAD_MS", "812.5"))
+record = {"ok": True, "engine": "webkit", "wd_host": host, "url": url,
+          "session_id": session,
+          "stages": {"resolve_ms": 1.0, "navigate_ms": load, "total_ms": load + 100.0}}
+with open(record_path, "w") as f:
+    json.dump(record, f)
+PY
+      exit $? ;;
+esac
+exec __PYTHON__ "$@"
+'''
+
+    DIAG_URLS = "https://example.com/,https://blog.cloudflare.com/"
+
+    def _diag_fixture(self, d, engine="chromium", urls=DIAG_URLS, reps="2",
+                      expect_ips="10.0.2.2", max_load_ms="", backend="uffd",
+                      **stub_env):
+        data = os.path.join(d, "data")
+        state_dir = os.path.join(data, "state")
+        snap = os.path.join(data, "snapshots", "tag-under-test")
+        os.makedirs(state_dir)
+        os.makedirs(snap)
+        with open(os.path.join(snap, "config.json"), "w") as handle:
+            json.dump({"generation_id": "12345678-1234-4234-8234-123456789abc",
+                       "metadata": {"hugepages": False, "memory_mib": 1024}}, handle)
+        binx = os.path.join(d, "bin")
+        os.makedirs(binx)
+        self._write(os.path.join(binx, "python3"),
+                    self.DIAG_PYTHON_STUB.replace("__PYTHON__", sys.executable))
+        fcvm = os.path.join(d, "fcvm")
+        self._write(fcvm, self.DIAG_FCVM_STUB)
+        self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
+        env = dict(os.environ)
+        # The developer's shell must not decide what the diag renders.
+        for key in ("DIAG_URLS", "DIAG_REPS", "DIAG_EXPECT_IPS", "DIAG_MAX_LOAD_MS",
+                    "BACKEND", "UFFD_MODE", "UFFD_PREFETCH", "ENGINE", "URL"):
+            env.pop(key, None)
+        env.update(
+            PATH=binx + os.pathsep + env["PATH"],
+            TAG="tag-under-test",
+            STATE_DIR=state_dir,
+            RESULTS=os.path.join(d, "results"),
+            RUNID=self.RUN_ID,
+            FCVM=fcvm,
+            FC_AGENT=os.path.join(d, "fc-agent"),
+            ENGINE=engine,
+            BACKEND=backend,
+            UFFD_MODE="minor",
+            UFFD_PREFETCH="on",
+            DIAG_REPS=reps,
+            DIAG_EXPECT_IPS=expect_ips,
+            DIAG_MAX_LOAD_MS=max_load_ms,
+            STUB_PYTHON=sys.executable,
+            STUB_ARGV=os.path.join(d, "argv.log"),
+            STUB_DRIVER_ARGV=os.path.join(d, "driver-argv.log"),
+            STUB_TEARDOWN_LOG=os.path.join(d, "teardown.log"),
+        )
+        if urls is not None:
+            env["DIAG_URLS"] = urls
+        env.update(stub_env)
+        return env, state_dir
+
+    def _diag(self, env):
+        return subprocess.run(
+            ["bash", "-c", f'source "{self.SH}" && cmd_diag'],
+            env=env, capture_output=True, text=True, timeout=180)
+
+    def _diag_summary(self, env):
+        path = os.path.join(env["RESULTS"], "diag", "summary.json")
+        self.assertTrue(os.path.exists(path), f"no {path} was written")
+        with open(path) as handle:
+            return json.load(handle)
+
+    def _diag_teardowns(self, env):
+        return self._read_if_exists(env["STUB_TEARDOWN_LOG"]).splitlines()
+
+    def test_diag_renders_each_url_on_its_own_clone_and_summarises_the_traces(self):
+        """One clone per (URL, rep), one traced render each, torn down each
+        time, summarised per URL with the remote IPs the trace saw.
+
+        Watched red 2026-08-28 at 55d6fb7d: `bash: line 1: cmd_diag:
+        command not found`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], True)
+            self.assertEqual(summary["violations"], [])
+            self.assertEqual(summary["engine"], "chromium")
+            self.assertEqual(summary["tag"], "tag-under-test")
+            self.assertEqual(summary["limits"],
+                             {"expect_ips": ["10.0.2.2"], "max_load_ms": None})
+            self.assertEqual(set(summary["urls"]), set(self.DIAG_URLS.split(",")))
+            for data in summary["urls"].values():
+                self.assertEqual(data["reps"], 2)
+                self.assertEqual(data["renders_ok"], 2)
+                self.assertEqual(data["max_load_ms"], 812.5)
+                self.assertEqual(data["max_pending_at_load"], 2)
+                self.assertEqual(data["remote_ips"], {"10.0.2.2": 6})
+                self.assertEqual(data["errors"], {})
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            stems = ["example.com-1", "example.com-2",
+                     "blog.cloudflare.com-1", "blog.cloudflare.com-2"]
+            for stem in stems:
+                with open(os.path.join(diag_dir, stem + ".json")) as handle:
+                    self.assertIs(json.load(handle)["ok"], True, stem)
+                self.assertTrue(os.path.exists(os.path.join(diag_dir, stem + ".trace.json")),
+                                f"{stem}: no trace was written")
+            argv = self._read_if_exists(env["STUB_ARGV"])
+            self.assertIn("snapshot serve tag-under-test --uffd-mode minor --uffd-prefetch on",
+                          argv, "the serve did not carry the run's backend knobs")
+            self.assertEqual(argv.count("snapshot run --pid "), 4, argv)
+            driver = self._read_if_exists(env["STUB_DRIVER_ARGV"]).splitlines()
+            self.assertEqual(len(driver), 4, driver)
+            for line, stem in zip(driver, stems):
+                self.assertIn(" --timeout 120 ", line)
+                self.assertIn(f" --net-trace {diag_dir}/{stem}.trace.json", line)
+            self.assertEqual(sorted(self._diag_teardowns(env)),
+                             sorted([f"torn down cb-req-diag-{n}-{self.RUN_ID}"
+                                     for n in range(1, 5)] + ["torn down serve"]))
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_diag_defaults_to_the_run_url_three_times_and_needs_no_expected_ips(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, urls=None, reps="", expect_ips="")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            summary = self._diag_summary(env)
+            self.assertEqual(list(summary["urls"]), ["http://127.0.0.1:8000/medium.html"])
+            self.assertEqual(summary["urls"]["http://127.0.0.1:8000/medium.html"]["reps"], 3)
+            self.assertEqual(summary["limits"]["expect_ips"], None)
+            self.assertEqual(len(self._read_if_exists(env["STUB_DRIVER_ARGV"]).splitlines()), 3)
+            self.assertTrue(os.path.exists(os.path.join(
+                env["RESULTS"], "diag", "127.0.0.1-8000-medium.html-3.trace.json")))
+
+    def test_a_remote_ip_outside_the_expected_set_is_a_violation(self):
+        """The trace shows a request that reached the live internet: the
+        clone rendered a real site, not the replay."""
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d, STUB_REMOTE_IP="93.184.216.34")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0,
+                                "diag passed a render that talked to 93.184.216.34\n"
+                                + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            kinds = {v["kind"] for v in summary["violations"]}
+            self.assertEqual(kinds, {"remote_ip"}, summary["violations"])
+            self.assertEqual(len(summary["violations"]), 4)
+            first = summary["violations"][0]
+            self.assertEqual(first["url"], "https://example.com/")
+            self.assertEqual(first["rep"], 1)
+            self.assertIn("93.184.216.34", first["detail"])
+            for data in summary["urls"].values():
+                self.assertEqual(data["remote_ips"], {"93.184.216.34": 6})
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_a_name_that_did_not_resolve_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, STUB_ERROR_TEXT="net::ERR_NAME_NOT_RESOLVED")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]},
+                             {"name_not_resolved"}, summary["violations"])
+            self.assertIn("cdn.example", summary["violations"][0]["detail"])
+            for data in summary["urls"].values():
+                self.assertEqual(data["errors"], {"net::ERR_NAME_NOT_RESOLVED": 2})
+                self.assertEqual(data["max_pending_at_load"], 3)
+
+    def test_a_load_event_over_the_limit_is_a_stall_and_no_limit_is_no_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, max_load_ms="15000", STUB_LOAD_MS="31000")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0,
+                                "a 31 s load event passed a 15 s limit\n" + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"stall"})
+            self.assertIn("31000", summary["violations"][0]["detail"])
+            self.assertIn("15000", summary["violations"][0]["detail"])
+            self.assertEqual(summary["limits"]["max_load_ms"], 15000)
+            for data in summary["urls"].values():
+                self.assertEqual(data["max_load_ms"], 31000.0)
+                self.assertEqual(data["renders_ok"], 2)
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, STUB_LOAD_MS="31000")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"an unset DIAG_MAX_LOAD_MS gated: {result.stderr[-2000:]}")
+            self.assertIs(self._diag_summary(env)["passed"], True)
+
+    def test_a_failed_render_is_a_violation_and_its_clone_is_still_torn_down(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d, STUB_DRIVER_RC="1")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"render_failed"})
+            self.assertEqual(len(summary["violations"]), 4)
+            self.assertIn("ERR_CONNECTION_REFUSED", summary["violations"][0]["detail"])
+            for data in summary["urls"].values():
+                self.assertEqual(data["renders_ok"], 0)
+                self.assertIsNone(data["max_load_ms"])
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            with open(os.path.join(diag_dir, "example.com-1.json")) as handle:
+                self.assertIs(json.load(handle)["ok"], False)
+            # Every clone, and the serve, were stopped through the stub's
+            # SIGTERM handler; nothing waited for the exit trap.
+            self.assertEqual(sorted(self._diag_teardowns(env)),
+                             sorted([f"torn down cb-req-diag-{n}-{self.RUN_ID}"
+                                     for n in range(1, 5)] + ["torn down serve"]))
+            self.assertEqual(os.listdir(state_dir), [],
+                             "a failed render skipped the clone teardown")
+
+    def test_a_missing_trace_is_a_failed_render(self):
+        """cdpdrive exits 1 with net_trace_error when it could not write the
+        trace; a record that says ok while the trace is absent is a render
+        the diag could not observe."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_NO_TRACE="1")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"render_failed"})
+            self.assertIn("trace", summary["violations"][0]["detail"])
+
+    def test_diag_on_webkit_reads_navigate_ms_and_needs_no_trace(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d, engine="webkit", reps="1",
+                                                STUB_LOAD_MS="640.25")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], True)
+            self.assertEqual(summary["engine"], "webkit")
+            for data in summary["urls"].values():
+                self.assertEqual(data["renders_ok"], 1)
+                self.assertEqual(data["max_load_ms"], 640.25)
+                self.assertIsNone(data["max_pending_at_load"])
+                self.assertEqual(data["remote_ips"], {})
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            self.assertEqual(
+                sorted(name for name in os.listdir(diag_dir) if name.endswith(".trace.json")),
+                [], "a webkit diag wrote traces it has no way to fill")
+            with open(os.path.join(diag_dir, "example.com-1.json")) as handle:
+                record = json.load(handle)
+            self.assertEqual(record["session_id"], "SESSION-1")
+            driver = self._read_if_exists(env["STUB_DRIVER_ARGV"]).splitlines()
+            self.assertEqual(len(driver), 2)
+            self.assertTrue(all(line.startswith("- wddrive 127.0.0.1:9515 ") for line in driver),
+                            driver)
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_diag_on_the_file_backend_restores_without_a_serve(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d, backend="file", reps="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            argv = self._read_if_exists(env["STUB_ARGV"])
+            self.assertNotIn("snapshot serve", argv)
+            self.assertEqual(argv.count("snapshot run --snapshot tag-under-test "), 2, argv)
+            self.assertIs(self._diag_summary(env)["passed"], True)
+            self.assertEqual(self._diag_summary(env)["backend"], "file")
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_diag_refuses_a_rep_count_or_limit_that_is_not_a_positive_integer(self):
+        for knob, value in (("DIAG_REPS", "0"), ("DIAG_REPS", "two"),
+                            ("DIAG_MAX_LOAD_MS", "15s")):
+            with self.subTest(knob=knob, value=value), tempfile.TemporaryDirectory() as d:
+                env, _state_dir = self._diag_fixture(d)
+                env[knob] = value
+                result = self._diag(env)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(knob, result.stderr)
+                self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]),
+                                 "the serve started before the knobs were checked")
+
+    def test_diag_refuses_two_urls_that_would_share_a_record_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, urls="https://example.com/a/b,https://example.com/a-b")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("example.com-a-b", result.stderr)
+            self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]))
+
 
 class HostCdpQuietGate(unittest.TestCase):
     """hostcdp.sh shares reqbench's SETTLE_WAIT_SECS quiet-gate knob.
@@ -6336,7 +6740,8 @@ class MakefileBenchGraph(unittest.TestCase):
         # build, so these targets must not rebuild anything — TRANSITIVELY:
         # a direct-only check passes `run: bench-chromium-request-build`,
         # which rebuilds through its own deps (codex P2, 2026-08-14).
-        for t in ("bench-chromium-request-run", "bench-chromium-request-verify"):
+        for t in ("bench-chromium-request-run", "bench-chromium-request-verify",
+                  "bench-chromium-request-diag", "bench-webkit-request-diag"):
             c = self.closure(t)
             for forbidden in ("build", "setup-default", "cargo-target-link"):
                 self.assertNotIn(forbidden, c,
@@ -6348,7 +6753,8 @@ class MakefileBenchGraph(unittest.TestCase):
         for t in ("bench-chromium-request-build", "bench-chromium-request-golden",
                "bench-chromium-request-verify", "bench-chromium-request-run",
                "bench-chromium-request-all", "bench-chromium-hostcdp",
-               "bench-chromium-fault"):
+               "bench-chromium-fault", "bench-chromium-request-diag",
+               "bench-webkit-request-diag"):
             self.assertIn(t, self.phony, f"{t} missing from .PHONY")
 
     def test_webkit_run_forwards_the_measurement_knobs(self):
@@ -6411,6 +6817,35 @@ class MakefileBenchGraph(unittest.TestCase):
                       if "bench-chromium-request-run" in ln]
         self.assertTrue(help_lines, "run target missing from help")
         self.assertIn("TAG=", help_lines[0])
+
+    def test_diag_targets_are_sealed_phases_that_forward_their_knobs(self):
+        """The diag runs on the golden the run uses, under the same seal:
+        no build dependency, its knobs forwarded the way run forwards
+        BACKEND and RESULTS (a Makefile default is not exported to the
+        recipe on its own), a help line naming TAG= and DIAG_URLS=.
+
+        Watched red 2026-08-28 at 55d6fb7d: `bench-chromium-request-diag
+        not found in make database`.
+        """
+        for t in ("bench-chromium-request-diag", "bench-webkit-request-diag"):
+            self.assertEqual(self.prereqs(t), set(), f"{t} has prerequisites")
+            c = self.closure(t)
+            for forbidden in ("build", "setup-default", "cargo-target-link"):
+                self.assertNotIn(forbidden, c, f"{t} transitively reaches {forbidden}")
+            self.assertIn(t, self.phony, f"{t} missing from .PHONY")
+            recipe = "\n".join(self.recipes.get(t, []))
+            self.assertIn("reqbench.sh diag", recipe)
+            for knob in ("BACKEND", "DIAG_URLS", "DIAG_REPS", "DIAG_EXPECT_IPS",
+                         "DIAG_MAX_LOAD_MS", "RESULTS"):
+                self.assertIn(f'{knob}="$({knob})"', recipe,
+                              f"{t} does not forward {knob}")
+            help_lines = [ln for ln in self.recipes.get("help", []) if t in ln]
+            self.assertTrue(help_lines, f"{t} missing from help")
+            for knob in ("TAG=", "DIAG_URLS=", "DIAG_EXPECT_IPS=", "DIAG_MAX_LOAD_MS="):
+                self.assertIn(knob, help_lines[0], f"{t} help line lacks {knob}")
+        webkit = "\n".join(self.recipes.get("bench-webkit-request-diag", []))
+        self.assertIn("ENGINE=webkit", webkit)
+        self.assertIn("cb-req-webkit", webkit, "the webkit diag does not default to the webkit tag")
 
     def test_full_chain_and_companion_benches(self):
         p = self.prereqs("bench-chromium-request-all")
@@ -8262,6 +8697,19 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(rc, 0)
         with open(os.path.join(run_dir, "dns-evidence.json"), "w") as handle:
             json.dump(self._evidence(run_dir, "clean"), handle)
+        # The diag summary reqbench.sh diag leaves beside a corpus run; the
+        # index refuses a resolver run without one.
+        os.makedirs(os.path.join(run_dir, "diag"))
+        with open(os.path.join(run_dir, "diag", "summary.json"), "w") as handle:
+            json.dump({
+                "engine": "chromium", "tag": "cb-req-corpus", "backend": "file",
+                "uffd_mode": None, "uffd_prefetch": None, "reps": 3,
+                "urls": {url: {"reps": 3, "renders_ok": 3, "max_load_ms": 812.5,
+                               "max_pending_at_load": 2, "remote_ips": {"10.0.2.2": 9},
+                               "errors": {}} for url in self.CORPUS},
+                "violations": [], "teardown_failures": 0, "passed": True,
+                "limits": {"expect_ips": ["10.0.2.2"], "max_load_ms": 15000},
+            }, handle)
         return run_dir
 
     @staticmethod
@@ -8304,12 +8752,17 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(cell["dns_verdict"], "clean")
         self.assertEqual(cell["headline"]["cdp"]["blocking_ms"], 384.0)
         self.assertEqual(cell["headline"]["cdp"]["n"], 200)
+        self.assertEqual(cell["diag"], {
+            "diag_passed": True, "violations_count": 0,
+            "max_load_ms": {url: 812.5 for url in self.CORPUS},
+        })
         self.assertEqual(
             {os.path.basename(entry["path"]) for entry in index["generated_from"]},
             {
                 "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
                 "verify-dns-before-run.json", "verify-dns-after-run.json",
                 "dns-owner.log", "corpus-dns.log", "corpus-access.log",
+                "summary.json",
             },
         )
 

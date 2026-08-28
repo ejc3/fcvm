@@ -445,6 +445,7 @@ class DnsBrackets(unittest.TestCase):
 env > "$MAKE_ENV_DUMP"
 echo "$*" > "$MAKE_ARGV"
 [ -z "${MAKE_VERIFY_JSON:-}" ] || printf '%s\\n' "$MAKE_VERIFY_JSON" > "$RESULTS/verify-dns.json"
+[ -z "${MAKE_DIAG_JSON:-}" ] || { mkdir -p "$RESULTS/diag"; printf '%s\\n' "$MAKE_DIAG_JSON" > "$RESULTS/diag/summary.json"; }
 exit "${MAKE_RC:-0}"
 """
     # Decoy :53 listeners with OTHER pids, as on the bench host itself:
@@ -742,7 +743,9 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             results = os.path.join(tmp, "results")
             os.makedirs(results)
             stale = ["dns-evidence.json", "verify-dns-after-run.json",
-                     "verify-dns.json", "dns-owner.log", "corpus-serve.status"]
+                     "verify-dns.json", "dns-owner.log", "corpus-serve.status",
+                     "diag/summary.json"]
+            os.makedirs(os.path.join(results, "diag"))
             for name in stale:
                 with open(os.path.join(results, name), "w") as handle:
                     handle.write('{"verdict": "clean", "passed": true}\n')
@@ -1427,6 +1430,168 @@ while True:
         self.assertIn("--access-log", inner)
         self.assertIn('"$RESULTS/corpus-dns.log"', args)
         self.assertIn('"$RESULTS/corpus-access.log"', args)
+
+
+class DiagPhase(unittest.TestCase):
+    """The diag runs on the golden's clones after its verify and before anything
+    is measured: one traced render per corpus URL and rep, inside a restored
+    clone, holding every remote IP to the replay's, every name to resolved,
+    every load event under DIAG_MAX_LOAD_MS. A failed diag ends the campaign
+    before the measured run; DIAG_ONLY=1 ends it after the diag whatever the
+    result, for the throwaway golden round.
+
+    Borrows DnsBrackets' fakes and helper lifting, as HugepageGuardsRound2
+    borrows _bash in test_reqbench.py.
+    """
+
+    HELPERS = DnsBrackets.HELPERS
+    URL_LINE = DnsBrackets.URL_LINE
+    FAKE_MAKE = DnsBrackets.FAKE_MAKE
+    FAKE_SS = DnsBrackets.FAKE_SS
+    FAKE_SYSTEMCTL = DnsBrackets.FAKE_SYSTEMCTL
+    FAKE_SUDO = DnsBrackets.FAKE_SUDO
+    _fakes = DnsBrackets._fakes
+    _set_load = staticmethod(DnsBrackets._set_load)
+    _make_env = DnsBrackets._make_env
+    _run = DnsBrackets._run
+    _helpers = DnsBrackets._helpers
+    _urls = DnsBrackets._urls
+
+    DIAG_BLOCK = re.compile(
+        r'(run_diag \|\| campaign_fail[^\n]*\n'
+        r'if \[ "\$DIAG_ONLY" = 1 \]; then\n.*?\nfi\n)', re.S)
+
+    def _diag_summary(self, urls, passed=True):
+        return json.dumps({
+            "engine": "chromium", "tag": "cb-req-corpus", "passed": passed,
+            "urls": {u: {"reps": 3, "renders_ok": 3, "max_load_ms": 812.5}
+                     for u in urls.split(",")},
+            "violations": [] if passed else [
+                {"url": urls.split(",")[0], "rep": 1, "kind": "remote_ip",
+                 "detail": "93.184.216.34 served 1 request(s)"}],
+            "limits": {"expect_ips": ["10.0.2.2"], "max_load_ms": 15000},
+        })
+
+    def _knob_defaults(self):
+        body = campaign()
+        limit = re.search(r'^DIAG_MAX_LOAD_MS="\$\{DIAG_MAX_LOAD_MS:-(\d+)\}"$', body, re.M)
+        self.assertIsNotNone(limit, "the campaign sets no DIAG_MAX_LOAD_MS default")
+        self.assertEqual(limit.group(1), "15000")
+        only = re.search(r'^DIAG_ONLY="\$\{DIAG_ONLY:-0\}"$', body, re.M)
+        self.assertIsNotNone(only, "the campaign has no DIAG_ONLY knob")
+        return limit.group(0) + "\n" + only.group(0) + "\n"
+
+    def _prelude(self, urls):
+        return ('set -euo pipefail\nsay() { echo "=== $*"; }\n'
+                f'URLS="{urls}"\nBACKEND=uffd\nUFFD_MODE=minor\nUFFD_PREFETCH=on\n'
+                'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=no\nSAMPLER_ALIVE_AT_STOP=""\n'
+                'DNS_SAMPLE_INTERVAL=10\n'
+                + self._knob_defaults() + self._helpers() + "\n")
+
+    def test_run_diag_hands_the_corpus_and_the_replay_answer_to_the_diag_target(self):
+        """Every corpus URL, the replay's answer as the only expected remote
+        IP, the 15 s limit, this run's RESULTS and the run's backend knobs,
+        to the engine's diag target; the summary it leaves must say passed.
+
+        Watched red 2026-08-28 at 55d6fb7d: `bash: line N: run_diag: command
+        not found` (the helpers block has no run_diag) after the knob
+        defaults were found missing.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS"):
+                env.pop(key, None)
+            env["MAKE_DIAG_JSON"] = self._diag_summary(urls)
+            result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("DIAGNOSED", result.stdout)
+            seen = self._make_env(env)
+            self.assertEqual(seen.get("DIAG_URLS"), urls, "diag was not told the corpus")
+            self.assertEqual(seen.get("DIAG_EXPECT_IPS"), "10.0.2.2")
+            self.assertEqual(seen.get("DIAG_MAX_LOAD_MS"), "15000")
+            self.assertEqual(seen.get("RESULTS"), results,
+                             "the diag's records land outside the run directory")
+            self.assertEqual(seen.get("TAG"), "cb-req-corpus")
+            self.assertEqual(seen.get("ENGINE"), "chromium")
+            for knob, want in (("BACKEND", "uffd"), ("UFFD_MODE", "minor"),
+                               ("UFFD_PREFETCH", "on")):
+                self.assertEqual(seen.get(knob), want,
+                                 f"the diag does not run on the measured run's {knob}")
+            with open(env["MAKE_ARGV"]) as handle:
+                self.assertIn("bench-chromium-request-diag", handle.read())
+
+    def test_a_failed_or_missing_diag_refuses_to_measure(self):
+        urls = self._urls()
+        cases = {
+            "make failed": {"MAKE_RC": "1", "MAKE_DIAG_JSON": self._diag_summary(urls)},
+            "summary says failed": {"MAKE_DIAG_JSON": self._diag_summary(urls, passed=False)},
+            "no summary": {},
+        }
+        for label, extra in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS"):
+                    env.pop(key, None)
+                env.update(extra)
+                result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+                self.assertNotEqual(result.returncode, 0, f"{label}: accepted\n{result.stdout}")
+                self.assertNotIn("DIAGNOSED", result.stdout)
+                self.assertIn("diag", result.stderr, label)
+
+    def test_diag_only_stops_after_the_diag_and_a_failed_diag_stops_before_measuring(self):
+        """The block between the golden's verify and the settle wait, run
+        with the fake make: DIAG_ONLY=1 exits 0 without reaching what
+        follows; a failed diag exits non-zero without reaching it; the
+        default reaches it.
+        """
+        urls = self._urls()
+        block = self.DIAG_BLOCK.search(campaign())
+        self.assertIsNotNone(block, "the diag call and the DIAG_ONLY stop are gone")
+        cases = (
+            ("DIAG_ONLY=1", {"DIAG_ONLY": "1"}, True, 0, False),
+            ("default", {}, True, 0, True),
+            ("diag failed", {"DIAG_ONLY": "1", "MAKE_RC": "1"}, False, 1, False),
+        )
+        for label, extra, diag_ok, want_rc, measured in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS"):
+                    env.pop(key, None)
+                env["MAKE_DIAG_JSON"] = self._diag_summary(urls, passed=diag_ok)
+                env.update(extra)
+                script = self._prelude(urls) + block.group(1) + "echo MEASURED\n"
+                result = self._run(script, env)
+                self.assertEqual(result.returncode, want_rc,
+                                 f"{label}: {result.stdout}{result.stderr}")
+                self.assertEqual("MEASURED" in result.stdout, measured,
+                                 f"{label}: {result.stdout}{result.stderr}")
+                if label == "DIAG_ONLY=1":
+                    self.assertIn("DIAG_ONLY", result.stdout,
+                                  "the stop does not say why the campaign ended")
+
+    def test_the_diag_follows_the_golden_verify_in_both_phases_and_precedes_the_settle(self):
+        """Ordering in the main flow, which cannot run without a VM."""
+        body = campaign()
+        phases = re.search(r'if \[ "\$PHASE" = all \]; then\n(.*?)\nelse\n(.*?)\nfi\n',
+                           body, re.S)
+        self.assertIsNotNone(phases, "the PHASE branch is gone")
+        for branch in (phases.group(1), phases.group(2)):
+            self.assertIn("run_verify pre", branch)
+            self.assertNotIn("run_diag", branch,
+                             "the diag is called inside one phase branch; it runs once, "
+                             "after whichever golden the phase settled on")
+        self.assertEqual(body.count("run_diag ||"), 1)
+        diag = body.index("run_diag ||")
+        self.assertLess(phases.end(), diag, "the diag runs before the golden's verify")
+        stop = body.index('if [ "$DIAG_ONLY" = 1 ]; then', diag)
+        settle = body.index("settle_deadline=")
+        self.assertLess(stop, settle, "the DIAG_ONLY stop comes after the settle wait")
+        self.assertLess(diag, body.index("run_verify before-run"))
+        self.assertLess(diag, body.index("engine_target run)"))
+        self.assertIn("campaign_fail", body[diag:body.index("\n", diag)],
+                      "a failed diag does not end the campaign")
+
 
 if __name__ == "__main__":
     unittest.main()

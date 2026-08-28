@@ -13,13 +13,16 @@ agree with the sha256 it recorded, each verify bracket must record the run's
 resolver with the URL probes run under no proxy and every host and URL
 answered through it, and every sample in dns-owner.log must name its
 serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive and a load the
-evidence accounts for) and diag/summary.json (optional). The index names
-every file it was generated from with its sha256, and carries one
-cell per run: engine, cpu, memory_mib, guest_dns, the seal identity,
+evidence accounts for) and diag/summary.json (reqbench.sh diag; required
+under the same condition as dns-evidence.json, optional otherwise; when
+present it must say passed=true, list no violations, and cover every URL the
+cell measured). The index names every file it was generated from with its
+sha256, and carries one cell per run: engine, cpu, memory_mib, guest_dns,
+the seal identity,
 publishable, stall_gate_passed, dns_verdict, load_max_1min (the maximum 1-min
 load the campaign's sampler saw during the measured run, when the evidence
-records it), the headline median blocking_ms per arm with its CI, and the
-diag summary when there is one.
+records it), the headline median blocking_ms per arm with its CI, and for the
+diag its verdict, violation count and slowest load event per URL.
 
 The publication rule (REVIEW.md) is to quote only from sealed runs that passed
 their gates and were never withdrawn, and publishable=true alone proves none
@@ -32,12 +35,12 @@ named WITHDRAWN in its directory whose first line is the reason, or by
 refusal quotes the reason.
 
 The index is written only when every run is sealed, publishable and not
-withdrawn, every stall gate passed and every DNS verdict is clean. Otherwise
-nothing is written, an index already at --out is removed, and the exit status
-is 5, the same code reqanalyze uses for a refused run: an index that quietly
-carried an unpublishable cell would be quoted by someone who only opened the
-index. Inputs are only ever read, and each is read once so the hash names the
-bytes that were parsed.
+withdrawn, every stall gate passed, every DNS verdict is clean and every diag
+passed. Otherwise nothing is written, an index already at --out is removed,
+and the exit status is 5, the same code reqanalyze uses for a refused run: an
+index that quietly carried an unpublishable cell would be quoted by someone
+who only opened the index. Inputs are only ever read, and each is read once
+so the hash names the bytes that were parsed.
 """
 
 import argparse
@@ -394,6 +397,42 @@ def check_evidence(run_dir, evidence, sources, guest_dns):
             )
 
 
+def summarize_diag(run_dir, diag, measured_urls):
+    """The diag's verdict, violation count and slowest load per URL; RunError otherwise."""
+    if not isinstance(diag, dict):
+        raise RunError(f"{run_dir}: diag/summary.json is not a JSON object")
+    passed = diag.get("passed")
+    if not isinstance(passed, bool):
+        raise RunError(f"{run_dir}: diag/summary.json records no boolean passed")
+    violations = diag.get("violations")
+    if not isinstance(violations, list):
+        raise RunError(f"{run_dir}: diag/summary.json has no violations list")
+    urls = diag.get("urls")
+    if not isinstance(urls, dict) or not urls:
+        raise RunError(f"{run_dir}: diag/summary.json diagnosed no urls")
+    max_load = {}
+    for url, data in urls.items():
+        value = data.get("max_load_ms") if isinstance(data, dict) else None
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        ):
+            raise RunError(f"{run_dir}: diag/summary.json max_load_ms for {url} is {value!r}")
+        max_load[url] = value
+    # A diag over other pages says nothing about the pages this run measured.
+    missing = [url for url in measured_urls if url not in urls]
+    if missing:
+        raise RunError(
+            f"{run_dir}: diag/summary.json did not diagnose {missing}, which the run measured"
+        )
+    if passed is not True or violations:
+        kinds = sorted({v.get("kind") for v in violations if isinstance(v, dict)})
+        raise RunError(
+            f"{run_dir}: diag/summary.json records passed={passed} with "
+            f"{len(violations)} violation(s) {kinds}; a run whose diag failed is not indexed"
+        )
+    return {"diag_passed": True, "violations_count": 0, "max_load_ms": max_load}
+
+
 def load_cell(run_dir):
     """Read one run directory into an index cell. Returns (cell, source entries)."""
     sources = Sources()
@@ -486,7 +525,15 @@ def load_cell(run_dir):
     diag = None
     diag_path = os.path.join(run_dir, "diag", "summary.json")
     if os.path.isfile(diag_path):
-        diag = sources.read_json(diag_path)
+        measured = [part.strip() for part in str(cell.get("url") or "").split(",") if part.strip()]
+        diag = summarize_diag(run_dir, sources.read_json(diag_path), measured)
+    elif cell["guest_dns"] is not None:
+        # The campaign diagnoses the golden before measuring on it; a
+        # resolver run without the summary is a run nobody diagnosed.
+        raise RunError(
+            f"{run_dir}: guest_dns is {cell['guest_dns']!r} but there is no "
+            "diag/summary.json; a corpus run without its diag is not indexed"
+        )
 
     arms = analysis.get("arms")
     if not isinstance(arms, dict) or not arms:

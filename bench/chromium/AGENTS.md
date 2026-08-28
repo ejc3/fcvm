@@ -26,13 +26,15 @@ and is how goldens died on half-set-up boxes (2026-08-13, twice in one day):
 cd ~/src/fcvm
 make bench-chromium-request-golden       # deps: fcvm build -> image build -> setup-default -> golden
 make bench-chromium-request-verify       # prove all three hops on a RESTORED clone before measuring
+make bench-chromium-request-diag DIAG_EXPECT_IPS=127.0.0.1 DIAG_MAX_LOAD_MS=15000   # what holds the load event, per clone
 make bench-chromium-request-run BACKEND=uffd REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-uffd-200
 make bench-chromium-request-run BACKEND=file REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-file-200
 ```
 
 Knobs pass as make command-line variables (make exports them to the recipe
 environment): `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `UFFD_MODE=`,
-`UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=`. Hugepage goldens
+`UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=`, and for the diag
+`DIAG_URLS=`, `DIAG_REPS=`, `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`. Hugepage goldens
 are part of the snapshot identity — give them their own tag
 (`make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`;
 the same `TAG=` must then be passed to `-verify` and `-run`, or they select
@@ -51,9 +53,32 @@ The host control takes the same variable directly:
 `make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
 `resolve_all_to` in its `run.json` (null when unset).
 
-`verify` and `run` deliberately have NO build dependency: reqbench.sh seals
-fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and the
-run refuses a golden whose provenance records a different bundle hash.
+`bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
+answers what holds a page's load event inside a restored clone, on the
+golden the run uses and with the run's serve setup (`BACKEND=`, `UFFD_MODE=`,
+`UFFD_PREFETCH=`, `TAG=`), without a measured arm. One clone per URL in
+`DIAG_URLS=` (comma-separated; default the run's URL) times `DIAG_REPS=`
+(default 3): clone, one render, teardown. On Chromium the render is
+cdpdrive.py with `--net-trace`, which the measured arms never send; WebKit
+renders through wddrive without a trace. Each render's record and trace land
+under `$RESULTS/diag/`, and `summary.json` there carries, per URL, the render
+count, the slowest load event, the most requests still open at the load
+event, every remote IP with its request count and every failure text, plus a
+violations list and `passed`. The phase exits non-zero, and `passed` is false,
+on any remote IP outside `DIAG_EXPECT_IPS=` (comma-separated, when set), any
+`net::ERR_NAME_NOT_RESOLVED` in a trace, any load event over
+`DIAG_MAX_LOAD_MS=` (when set), any failed render, and any clone whose
+teardown was not clean. The corpus campaign (`make bench-chromium-corpus`)
+runs it after the verify that follows the golden, with every corpus URL,
+`DIAG_EXPECT_IPS=10.0.2.2` and `DIAG_MAX_LOAD_MS` defaulting to 15000, and
+refuses to measure when it fails; `DIAG_ONLY=1` stops the campaign after
+golden, verify and diag, for a throwaway golden round, and `DIAG_REPS=`
+passes through to the diag. campaign_summary.py refuses a corpus run without
+its `diag/summary.json`.
+
+`verify`, `diag` and `run` deliberately have NO build dependency: reqbench.sh
+seals fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and
+the run refuses a golden whose provenance records a different bundle hash.
 Rebuilding — or editing any sealed file — between golden and run therefore
 invalidates the chain; regolden instead of fighting the seal. The structural
 pin for all of this is `MakefileBenchGraph` in `test_reqbench.py`

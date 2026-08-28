@@ -8,6 +8,7 @@
 #   ./reqbench.sh golden      # podman prepare: cold build, snapshot at the image health gate
 #   ./reqbench.sh verify      # prove all three hops on a RESTORED CLONE (do this first)
 #   ./reqbench.sh run         # the three-arm A/B
+#   ./reqbench.sh diag        # what holds each page's load event: one traced render per clone
 #
 # The two changes under test:
 #   PART 1  the request path is Chromium's own CDP endpoint, driven from the host
@@ -796,9 +797,10 @@ PY
 # three hops separately so a failure names the hop instead of looking like
 # "networking is broken".
 
-# Start one clone against the running serve. Sets CLONE_PID and CLONE_IP.
-# Factored out so verify can start TWO of them: a single clone's target id
-# cannot answer a question about stability ACROSS clones.
+# Start one clone against the running serve, or (empty serve pid) from the
+# snapshot files. Sets CLONE_PID and CLONE_IP. Factored out so verify can
+# start TWO of them: a single clone's target id cannot answer a question
+# about stability ACROSS clones.
 #
 # Results come back in GLOBALS, not on stdout, on purpose: `x=$(start_clone …)`
 # runs the function in a subshell, so its `track` calls would update a copy of
@@ -811,7 +813,12 @@ CLONE_VM_ID=""
 start_clone() {
     local spid="$1" cname="$2" cl="$3"
     CLONE_PID=""; CLONE_IP=""; CLONE_BG=""; CLONE_VM_ID=""
-    $SUDO env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run --pid "$spid" --name "$cname" \
+    # An empty serve pid is BACKEND=file: restore MAP_PRIVATE from the
+    # snapshot files under $TAG (reqbench.py's clone_backend_args does the
+    # same) instead of from a UFFD serve.
+    local -a source_args=(--pid "$spid")
+    [ -n "$spid" ] || source_args=(--snapshot "$TAG")
+    $SUDO env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run "${source_args[@]}" --name "$cname" \
         --no-dirty-tracking --no-swap >"$cl" 2>&1 &
     CLONE_BG=$!
     track "$CLONE_BG"
@@ -829,6 +836,42 @@ start_clone() {
 import json,sys
 n=json.load(sys.stdin)[0]["config"]["network"]
 print(n.get("loopback_ip") or n.get("host_ip") or n.get("guest_ip") or "")')
+}
+
+# The UFFD serve a phase restores its clones from. Results in globals, for
+# the reason start_clone gives. $1 = phase label for log lines, $2 = log
+# file; anything after is passed to `snapshot serve` (--uffd-mode,
+# --uffd-prefetch).
+SERVE_PID=""
+SERVE_BG=""
+start_serve() {
+    local phase="$1" sf="$2"
+    shift 2
+    SERVE_PID=""; SERVE_BG=""
+    $SUDO "$FCVM" snapshot serve "$TAG" "$@" >"$sf" 2>&1 &
+    SERVE_BG=$!
+    track "$SERVE_BG"
+    local t0=$SECONDS
+    until grep -q "Waiting for VMs" "$sf" 2>/dev/null; do
+        [ $((SECONDS-t0)) -lt 60 ] || { log "$phase: serve never came up"; cat "$sf" >&2; return 1; }
+        sleep 0.5
+    done
+    SERVE_PID=$(grep -oP 'Serve PID: \K[0-9]+' "$sf" | head -1)
+    [ -n "$SERVE_PID" ] || { log "$phase: could not read Serve PID from $sf"; return 1; }
+    track "$SERVE_PID"
+}
+
+# Stops what start_serve started; a no-op when nothing was. Returns 1 when
+# either process needed SIGKILL or survived it.
+stop_serve() {
+    local phase="$1" rc=0
+    [ -n "$SERVE_BG" ] || return 0
+    if [ -n "$SERVE_PID" ]; then
+        stop_tracked "$SERVE_PID" || { log "$phase: UFFD serve required SIGKILL"; rc=1; }
+    fi
+    stop_tracked "$SERVE_BG" || { log "$phase: UFFD serve required SIGKILL"; rc=1; }
+    SERVE_PID=""; SERVE_BG=""
+    return $rc
 }
 
 # Print the page target id for a clone, or nothing.
@@ -1049,17 +1092,8 @@ cmd_verify() {
         ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
     fi
     log "verify: starting serve for $TAG"
-    local sf="$RESULTS/logs/verify-serve.log"
-    $SUDO "$FCVM" snapshot serve "$TAG" >"$sf" 2>&1 &
-    local serve_bg=$!
-    track "$serve_bg"
-    local t0=$SECONDS
-    until grep -q "Waiting for VMs" "$sf" 2>/dev/null; do
-        [ $((SECONDS-t0)) -lt 60 ] || { log "verify: serve never came up"; cat "$sf" >&2; return 1; }
-        sleep 0.5
-    done
-    local spid; spid=$(grep -oP 'Serve PID: \K[0-9]+' "$sf" | head -1)
-    track "$spid"
+    start_serve verify "$RESULTS/logs/verify-serve.log" || return 1
+    local spid="$SERVE_PID"
     log "verify: serve pid $spid"
 
     local cname="cb-req-verify-$RUNID" cl="$RESULTS/logs/verify-clone.log"
@@ -1176,10 +1210,7 @@ PYWD3
         || { log "verify: clone 1 required SIGKILL"; fail=1; }
     assert_vm_artifacts_absent "$vmid2" || fail=1
     assert_vm_artifacts_absent "$vmid1" || fail=1
-    stop_tracked "$spid" \
-        || { log "verify: serve required SIGKILL"; fail=1; }
-    stop_tracked "$serve_bg" \
-        || { log "verify: serve required SIGKILL"; fail=1; }
+    stop_serve verify || fail=1
     # Return AFTER the cleanup above, never before it.
     [ "$fail" -eq 0 ] || { log "verify: FAILED ($fail check(s)) — do NOT run the A/B"; return 1; }
     log "verify: done; both clone state/disk trees are absent"
@@ -1222,6 +1253,14 @@ GUEST_ENV="${GUEST_ENV:-}"
 # gate unarmed, which campaign_summary refuses to index; the corpus campaign
 # sets it.
 STALL_MAX_MS="${STALL_MAX_MS:-}"
+# The diag phase (cmd_diag, below). DIAG_URLS: comma-separated, default the
+# run's URL. DIAG_REPS: clones per URL. DIAG_EXPECT_IPS: comma-separated;
+# when set, every remote IP a traced render talked to must be one of them.
+# DIAG_MAX_LOAD_MS: when set, a load event over it is a stall.
+DIAG_URLS="${DIAG_URLS:-}"
+DIAG_REPS="${DIAG_REPS:-3}"
+DIAG_EXPECT_IPS="${DIAG_EXPECT_IPS:-}"
+DIAG_MAX_LOAD_MS="${DIAG_MAX_LOAD_MS:-}"
 # Overridable for unit tests only; production is the real kernel knob.
 HUGEPAGE_POOL_FILE="${HUGEPAGE_POOL_FILE:-/proc/sys/vm/nr_hugepages}"
 
@@ -1399,7 +1438,7 @@ cmd_run() {
         log "FATAL: no measurements were taken because the quiet-host guard refused the run"
         return "$guard_rc"
     fi
-    local rc=0 spid="" serve_bg=""
+    local rc=0
     local backend_args=()
     # --prewire only for PREWIRE=1: ${PREWIRE:+--prewire} treats the ordinary
     # false-like PREWIRE=0 as ON, silently changing the measured operation.
@@ -1413,21 +1452,10 @@ cmd_run() {
     case "$BACKEND" in
         uffd)
             log "run: BACKEND=uffd — starting serve for $TAG (mode=$UFFD_MODE prefetch=$UFFD_PREFETCH)"
-            local sf="$RESULTS/logs/serve.log"
-            $SUDO "$FCVM" snapshot serve "$TAG" --uffd-mode "$UFFD_MODE" \
-                --uffd-prefetch "$UFFD_PREFETCH" >"$sf" 2>&1 &
-            serve_bg=$!
-            track "$serve_bg"
-            local t0=$SECONDS
-            until grep -q "Waiting for VMs" "$sf" 2>/dev/null; do
-                [ $((SECONDS-t0)) -lt 60 ] || { log "run: serve never came up"; cat "$sf" >&2; return 1; }
-                sleep 0.5
-            done
-            spid=$(grep -oP 'Serve PID: \K[0-9]+' "$sf" | head -1)
-            [ -n "$spid" ] || { log "run: could not read Serve PID from $sf"; return 1; }
-            track "$spid"
-            log "run: serve pid $spid -> reqbench.py"
-            backend_args=(--serve-pid "$spid")
+            start_serve run "$RESULTS/logs/serve.log" \
+                --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" || return 1
+            log "run: serve pid $SERVE_PID -> reqbench.py"
+            backend_args=(--serve-pid "$SERVE_PID")
             ;;
         file)
             # No serve at all: clones restore MAP_PRIVATE from the snapshot files.
@@ -1466,12 +1494,7 @@ cmd_run() {
     fi
     untrack "$driver_bg"
     ACTIVE_DRIVER_BG=""
-    if [ -n "$spid" ]; then
-        stop_tracked "$spid" \
-            || { log "run: UFFD serve required SIGKILL"; rc=1; }
-        stop_tracked "$serve_bg" \
-            || { log "run: UFFD serve required SIGKILL"; rc=1; }
-    fi
+    stop_serve run || rc=1
     verify_runtime_bundle || rc=1
     # A completed driver is not automatically a publishable run: request-level
     # failures and an under-sized backend arm are recorded in JSONL rather than
@@ -1492,6 +1515,344 @@ apply_publication_gates() {
         "${stall_args[@]}" "$RESULTS/reqbench.jsonl"
 }
 
+# ---------------------------------------------------------------------------
+# DIAG. What holds a page's load event inside a restored clone, on the golden
+# the run uses and with the run's serve setup, without a measured arm. One
+# clone per (URL, rep): clone, one render, teardown. On Chromium the render
+# carries cdpdrive's --net-trace (Network.* rows for the navigation), which
+# the measured arms never send, so this is its own phase rather than a knob on
+# the run. Everything lands in $RESULTS/diag/: <stem>-<rep>.json (the render
+# record), <stem>-<rep>.trace.json (Chromium only) and summary.json, where
+# <stem> is the URL's host for a root URL and host plus path otherwise (see
+# diag_stem).
+#
+# The phase exits non-zero, and summary.json says passed=false, on any remote
+# IP outside DIAG_EXPECT_IPS, any net::ERR_NAME_NOT_RESOLVED in a trace, any
+# load event over DIAG_MAX_LOAD_MS, any failed render, and any clone or serve
+# whose teardown was not clean.
+
+# The record stem for a URL: scheme and trailing slashes dropped, every run of
+# characters outside [A-Za-z0-9._-] folded to one '-'. A root URL's stem is
+# its host; the corpus has five todomvc.com pages, so the path is part of it.
+diag_stem() {
+    printf '%s\n' "$1" | sed -E 's#^[a-z]+://##; s#/+$##; s#[^A-Za-z0-9._-]+#-#g'
+}
+
+# A record for a render that never reached the driver, so summary.json never
+# has to guess what a missing record means. $1 = record path, $2 = url,
+# $3 = error text, $4 = stage.
+diag_failed_record() {
+    local record="$1"
+    jq -n --arg url "$2" --arg err "$3" --arg stage "$4" \
+        '{ok: false, url: $url, error: $err, stage: $stage}' >"$record.tmp" \
+        && mv -f "$record.tmp" "$record"
+}
+
+# One render against a clone. $1 = url, $2 = record path, $3 = trace path,
+# $4 = clone pid, $5 = clone host-side ip. The record is written whatever the
+# driver did: its own when it printed a JSON object, one naming the exit
+# status otherwise. Returns the driver's status.
+diag_render() {
+    local url="$1" record="$2" trace="$3" cpid="$4" ip="$5"
+    local tmp="$record.tmp" status=0
+    if [ "$ENGINE" = webkit ]; then
+        local wd_session
+        wd_session=$(wd_session_id "$cpid")
+        if [ -z "$wd_session" ]; then
+            diag_failed_record "$record" "$url" "no baked session id in the clone" session
+            return 1
+        fi
+        # argv[1] names the driver so a process listing (and the test stub on
+        # PATH) can tell this render from the summary writer, which is also a
+        # `python3 -` heredoc. wddrive.drive is the same call the measured
+        # webkit arm makes; the record is its return value.
+        REQBENCH_HERE="$HERE" python3 - wddrive "$ip:$CDP_PORT" "$url" "$wd_session" "$tmp" \
+            2>>"$RESULTS/logs/diag-render.log" <<'PYWD' || status=$?
+import argparse, json, os, sys
+sys.path.insert(0, os.environ["REQBENCH_HERE"])
+import wddrive
+_driver, host, url, session, record_path = sys.argv[1:6]
+record = wddrive.drive(argparse.Namespace(cdp_host=host, url=url, timeout=120.0,
+                                          session_id=session, out_prefix=""))
+with open(record_path, "w") as target:
+    json.dump(record, target, separators=(",", ":"))
+    target.write("\n")
+sys.exit(0 if record.get("ok") else 1)
+PYWD
+    else
+        python3 "$HERE/cdpdrive.py" "$ip:$CDP_PORT" "$url" --format jpeg --timeout 120 \
+            --net-trace "$trace" >"$tmp" 2>>"$RESULTS/logs/diag-render.log" || status=$?
+    fi
+    if jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
+        mv -f "$tmp" "$record"
+    else
+        rm -f "$tmp"
+        diag_failed_record "$record" "$url" "driver exited $status without a record" driver
+    fi
+    return "$status"
+}
+
+# Reads every record and trace the loop left in $RESULTS/diag, writes
+# summary.json whole (tmp + rename) and returns 1 when it says passed=false.
+# $1 = clone/serve teardowns that were not clean, then url/stem pairs.
+diag_write_summary() {
+    local teardown_failures="$1"
+    shift
+    # The UFFD knobs describe nothing on the file backend; recorded as null.
+    local mode="$UFFD_MODE" prefetch="$UFFD_PREFETCH"
+    [ "$BACKEND" = uffd ] || { mode=""; prefetch=""; }
+    python3 - "$RESULTS/diag" "$ENGINE" "$TAG" "$BACKEND" "$mode" "$prefetch" \
+        "$DIAG_REPS" "$DIAG_EXPECT_IPS" "$DIAG_MAX_LOAD_MS" "$teardown_failures" "$@" <<'PY'
+import json, os, sys, tempfile, time
+from collections import Counter
+
+(diag_dir, engine, tag, backend, uffd_mode, uffd_prefetch, reps_raw,
+ expect_raw, max_load_raw, teardown_raw) = sys.argv[1:11]
+pairs = sys.argv[11:]
+reps = int(reps_raw)
+expect_ips = [ip for ip in expect_raw.split(",") if ip] or None
+max_load_ms = int(max_load_raw) if max_load_raw else None
+teardown_failures = int(teardown_raw)
+# Chromium's load event is timed from the navigate command's response;
+# WebDriver's navigate returns after the classic load event, so its round
+# trip is the same question.
+load_key = "navigate_ms" if engine == "webkit" else "navigate_load_event_ms"
+
+
+def read_json(path):
+    """(value, None), or (None, why) when there is nothing to read."""
+    try:
+        with open(path) as source:
+            return json.load(source), None
+    except FileNotFoundError:
+        return None, "is missing"
+    except (OSError, ValueError) as error:
+        return None, f"cannot be read ({type(error).__name__}: {error})"
+
+
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def by_count(item):
+    return (-item[1], item[0])
+
+
+urls = {}
+violations = []
+for i in range(0, len(pairs), 2):
+    url, stem = pairs[i], pairs[i + 1]
+    remote_ips = Counter()
+    errors = Counter()
+    renders_ok = 0
+    max_load = None
+    max_pending = None
+    for rep in range(1, reps + 1):
+        def violation(kind, detail, rep=rep):
+            violations.append({"url": url, "rep": rep, "kind": kind, "detail": detail})
+
+        base = os.path.join(diag_dir, f"{stem}-{rep}")
+        record, why = read_json(base + ".json")
+        if not isinstance(record, dict):
+            violation("render_failed", f"record {base}.json {why or 'is not a JSON object'}")
+            record = {}
+        elif record.get("ok") is True:
+            renders_ok += 1
+        else:
+            violation("render_failed",
+                      f"{record.get('error') or 'ok is not true'} "
+                      f"(stage {record.get('stage') or 'unknown'})")
+        stages = record.get("stages")
+        load = stages.get(load_key) if isinstance(stages, dict) else None
+        if number(load):
+            max_load = load if max_load is None else max(max_load, load)
+            if max_load_ms is not None and load > max_load_ms:
+                violation("stall", f"{load_key}={load:.0f} ms exceeds DIAG_MAX_LOAD_MS={max_load_ms}")
+        if engine == "webkit":
+            continue
+        trace, why = read_json(base + ".trace.json")
+        rows = trace.get("requests") if isinstance(trace, dict) else None
+        if not isinstance(rows, list):
+            violation("render_failed",
+                      f"trace {base}.trace.json {why or 'has no requests list'}")
+            continue
+        pending = 0
+        foreign = {}
+        unresolved = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ip = row.get("remote_ip") or ""
+            if ip:
+                remote_ips[ip] += 1
+                if expect_ips is not None and ip not in expect_ips:
+                    foreign.setdefault(ip, []).append(row.get("url", ""))
+            if row.get("failed"):
+                text = row.get("error_text") or "<no errorText>"
+                errors[text] += 1
+                if "ERR_NAME_NOT_RESOLVED" in text:
+                    unresolved.append(row.get("url", ""))
+            if row.get("pending_at_load"):
+                pending += 1
+        max_pending = pending if max_pending is None else max(max_pending, pending)
+        for ip, hit in sorted(foreign.items()):
+            violation("remote_ip", f"{ip} served {len(hit)} request(s), first {hit[0]}")
+        if unresolved:
+            violation("name_not_resolved",
+                      f"{len(unresolved)} request(s) failed to resolve, first {unresolved[0]}")
+    urls[url] = {
+        "reps": reps,
+        "renders_ok": renders_ok,
+        "max_load_ms": max_load,
+        "max_pending_at_load": max_pending,
+        "remote_ips": dict(sorted(remote_ips.items(), key=by_count)),
+        "errors": dict(sorted(errors.items(), key=by_count)),
+    }
+
+passed = not violations and teardown_failures == 0
+summary = {
+    "engine": engine,
+    "tag": tag,
+    "backend": backend,
+    "uffd_mode": uffd_mode or None,
+    "uffd_prefetch": uffd_prefetch or None,
+    "reps": reps,
+    "urls": urls,
+    "violations": violations,
+    "teardown_failures": teardown_failures,
+    "passed": passed,
+    "limits": {"expect_ips": expect_ips, "max_load_ms": max_load_ms},
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+}
+fd, temporary = tempfile.mkstemp(prefix=".summary.", dir=diag_dir)
+try:
+    with os.fdopen(fd, "w") as target:
+        json.dump(summary, target, indent=2, sort_keys=True)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, os.path.join(diag_dir, "summary.json"))
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+for url, data in urls.items():
+    print(f"  {url}: {data['renders_ok']}/{reps} ok, max load {data['max_load_ms']} ms, "
+          f"max pending at load {data['max_pending_at_load']}, "
+          f"remote ips {data['remote_ips']}, errors {data['errors']}")
+for entry in violations:
+    print(f"  VIOLATION {entry['kind']} {entry['url']} rep {entry['rep']}: {entry['detail']}")
+if teardown_failures:
+    print(f"  {teardown_failures} teardown(s) were not clean")
+sys.exit(0 if passed else 1)
+PY
+}
+
+cmd_diag() {
+    # The run's own preamble: backend and pool sanity under the generation
+    # lock, for the reasons cmd_run gives. No quiet-host guard, nothing here
+    # is measured.
+    acquire_generation_lock || return 1
+    local huge_state
+    huge_state=$(hugepage_snapshot_state)
+    if [ "$BACKEND" = file ] && [ "$huge_state" != normal ]; then
+        log "diag: BACKEND=file refused: snapshot '$TAG' hugepage state is '$huge_state' (a hugepage snapshot restores via an implicit UFFD server and the record would be mislabeled); use BACKEND=uffd or a non-hugepage TAG"
+        return 2
+    fi
+    if [ "$huge_state" = huge ]; then
+        ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
+    fi
+    [[ "$DIAG_REPS" =~ ^[1-9][0-9]*$ ]] \
+        || { log "diag: DIAG_REPS must be a positive integer (got '$DIAG_REPS')"; return 2; }
+    if [ -n "$DIAG_MAX_LOAD_MS" ] && [[ ! "$DIAG_MAX_LOAD_MS" =~ ^[1-9][0-9]*$ ]]; then
+        log "diag: DIAG_MAX_LOAD_MS must be a positive integer of milliseconds (got '$DIAG_MAX_LOAD_MS')"
+        return 2
+    fi
+    case "$BACKEND" in
+        uffd|file) ;;
+        *) log "diag: unknown BACKEND=$BACKEND (want uffd|file)"; return 2 ;;
+    esac
+    # Name every record before starting anything: two URLs that fold to one
+    # stem would overwrite each other's records and the summary would read
+    # one page's trace as the other's.
+    local -a urls=() pairs=()
+    local -A stems=()
+    local url stem
+    IFS=',' read -ra urls <<<"${DIAG_URLS:-$URL}"
+    for url in "${urls[@]}"; do
+        [ -n "$url" ] || { log "diag: DIAG_URLS has an empty entry"; return 2; }
+        stem=$(diag_stem "$url")
+        [ -n "$stem" ] || { log "diag: cannot name a record for '$url'"; return 2; }
+        if [ -n "${stems[$stem]:-}" ]; then
+            log "diag: '$url' and '${stems[$stem]}' would share the record name $stem"
+            return 2
+        fi
+        stems[$stem]="$url"
+        pairs+=("$url" "$stem")
+    done
+    mkdir -p "$RESULTS/diag" "$RESULTS/logs"
+    local rc=0 teardown_failures=0
+    if [ "$BACKEND" = uffd ]; then
+        log "diag: BACKEND=uffd, starting serve for $TAG (mode=$UFFD_MODE prefetch=$UFFD_PREFETCH)"
+        start_serve diag "$RESULTS/logs/diag-serve.log" \
+            --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" || return 1
+    else
+        log "diag: BACKEND=file, no UFFD serve, restoring from $TAG directly"
+    fi
+    log "diag: ${#urls[@]} url(s) x $DIAG_REPS clone(s), engine=$ENGINE, expect_ips=${DIAG_EXPECT_IPS:-<any>}, max_load_ms=${DIAG_MAX_LOAD_MS:-<none>}"
+    local i rep n=0 base record trace cname
+    for ((i = 0; i < ${#pairs[@]}; i += 2)); do
+        url="${pairs[i]}"
+        stem="${pairs[i + 1]}"
+        for ((rep = 1; rep <= DIAG_REPS; rep++)); do
+            n=$((n + 1))
+            base="$RESULTS/diag/$stem-$rep"
+            record="$base.json"
+            trace="$base.trace.json"
+            cname="cb-req-diag-$n-$RUNID"
+            rm -f "$record" "$record.tmp" "$trace"
+            if start_clone "$SERVE_PID" "$cname" "$RESULTS/logs/diag-clone-$stem-$rep.log"; then
+                if [ -n "$CLONE_IP" ]; then
+                    if diag_render "$url" "$record" "$trace" "$CLONE_PID" "$CLONE_IP"; then
+                        log "diag: $url rep $rep rendered ($record)"
+                    else
+                        log "diag: $url rep $rep render FAILED ($record)"
+                    fi
+                else
+                    diag_failed_record "$record" "$url" "clone has no host-side IP" clone
+                fi
+            else
+                diag_failed_record "$record" "$url" "clone never registered" clone
+            fi
+            # This clone's teardown, whatever the render did: the summary
+            # below counts a teardown that needed SIGKILL, survived it, or
+            # left state or disk behind as a failure of the phase.
+            if [ -n "$CLONE_PID" ]; then
+                stop_tracked "$CLONE_PID" \
+                    || { log "diag: clone $cname required SIGKILL"; teardown_failures=$((teardown_failures + 1)); }
+            fi
+            if [ -n "$CLONE_BG" ]; then
+                stop_tracked "$CLONE_BG" \
+                    || { log "diag: clone $cname required SIGKILL"; teardown_failures=$((teardown_failures + 1)); }
+            fi
+            if [ -n "$CLONE_VM_ID" ]; then
+                assert_vm_artifacts_absent "$CLONE_VM_ID" || teardown_failures=$((teardown_failures + 1))
+            fi
+        done
+    done
+    stop_serve diag || teardown_failures=$((teardown_failures + 1))
+    verify_runtime_bundle || rc=1
+    if diag_write_summary "$teardown_failures" "${pairs[@]}"; then
+        log "diag: passed ($RESULTS/diag/summary.json)"
+    else
+        rc=1
+        log "diag: FAILED, see $RESULTS/diag/summary.json"
+    fi
+    return $rc
+}
+
 # Only dispatch when EXECUTED. Sourcing the file makes its helpers unit-testable
 # (see ReqbenchShell in test_reqbench.py) instead of reachable only through a
 # whole phase.
@@ -1502,6 +1863,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         golden) cmd_golden ;;
         verify) cmd_verify ;;
         run)    cmd_run ;;
+        diag)   cmd_diag ;;
         all)
             # The chain's own build/golden/verify phases are the load the run
             # gate reads a minute later; default the settle window so a cold
@@ -1509,6 +1871,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             # SETTLE_WAIT_SECS wins.
             export SETTLE_WAIT_SECS="${SETTLE_WAIT_SECS:-120}"
             cmd_build; cmd_golden; cmd_verify; cmd_run ;;
-        *) echo "usage: $0 {build|golden|verify|run|all}" >&2; exit 2 ;;
+        *) echo "usage: $0 {build|golden|verify|run|diag|all}" >&2; exit 2 ;;
     esac
 fi
