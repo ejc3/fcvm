@@ -7446,6 +7446,32 @@ class AnalyzerPerUrl(unittest.TestCase):
             out["per_url"]["http://127.0.0.1:8000/medium.html"]["cdp"]["n"], 200,
         )
 
+    def test_a_record_url_that_contradicts_its_render_is_a_schedule_error(self):
+        """per_url buckets by the record's own url stamp. The schedule check
+        validated only render.url, so a record could sit in one URL's
+        bucket while its render proves it rendered another, and the run
+        stayed publishable."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self.write(src)
+
+            def cross(record):
+                self.assertEqual(record["url"], self.URLS[0])
+                record["url"] = self.URLS[1]  # render.url stays URLS[0]
+
+            AnalyzerAvailability._mutate_record(src, "cdp", cross)
+            rc = _run_analyzer_fast(["--json-out", dst, src])
+            with open(dst) as source:
+                out = json.load(source)
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(
+            any("url" in error and self.URLS[1] in error for error in errors),
+            errors,
+        )
+
 
 class AnalyzerStallGate(unittest.TestCase):
     """A load event that takes tens of seconds is a stall, not a slow page.

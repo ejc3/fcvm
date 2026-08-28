@@ -871,6 +871,13 @@ def _validate_schedule(dataset):
                                 f"{rlabel} CDP render {field}={render.get(field)!r} "
                                 f"does not match {expected_value!r}"
                             )
+                    # per_url buckets by the record's own url stamp, so the
+                    # stamp is held to the schedule as strictly as render.url.
+                    if "url" in record and record.get("url") != expected_url:
+                        errors.append(
+                            f"{rlabel} record url {record.get('url')!r} does not "
+                            f"match the scheduled {expected_url!r}"
+                        )
                     if engine != "webkit" and render.get("idle_timeout") != 0:
                         errors.append(
                             f"{rlabel} CDP render did not complete its declared idle policy"
