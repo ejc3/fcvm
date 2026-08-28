@@ -439,6 +439,9 @@ guard_quiet() {
         log "REFUSING: SETTLE_WAIT_SECS must be a whole number of seconds (got '$settle')"
         return 3
     }
+    # Base 10: "08" passes the validator and is invalid octal to bash
+    # arithmetic, and "010" would silently mean eight.
+    settle=$((10#$settle))
     local rc=0
     guard_quiet_sample || rc=$?
     [ "$rc" -ne 0 ] || return 0

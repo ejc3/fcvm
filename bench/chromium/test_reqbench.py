@@ -4546,6 +4546,38 @@ wait "$helper"
                 result.stdout.strip(), "settled", result.stderr[-800:],
             )
 
+    def test_quiet_guard_reads_a_leading_zero_window_as_decimal(self):
+        """`08` is a whole number to the validator and invalid octal to bash.
+
+        `$((SECONDS + 08))` fails with "value too great for base" and `010`
+        would silently mean eight. The deadline must be computed from the
+        value parsed in base 10 (CodeRabbit on #865).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = self._settle_env(d, SETTLE_WAIT_SECS="08")
+            script = f"""
+source {self.SH!r}
+trap - EXIT INT TERM
+( sleep 2; printf '0.10 0 0 1/1 1\n' > "$LOADAVG_FILE" ) &
+helper=$!
+if guard_quiet; then
+    echo settled
+else
+    echo "refused:$?"
+fi
+wait "$helper"
+"""
+            result = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(), "settled", result.stderr[-800:],
+            )
+            self.assertNotIn("value too great for base", result.stderr)
+            self.assertIn("8s window", result.stderr)
+
     def test_quiet_guard_still_refuses_when_the_settle_window_elapses(self):
         """A box that never goes quiet is refused, with the wait named."""
         with tempfile.TemporaryDirectory() as d:
@@ -4625,6 +4657,48 @@ class HostCdpQuietGate(unittest.TestCase):
     """
 
     SH = os.path.join(HERE, "hostcdp.sh")
+
+    def test_the_gate_reads_a_leading_zero_window_as_decimal(self):
+        # Same octal trap as reqbench's guard_quiet (CodeRabbit on #865):
+        # "08" must be an eight-second window, not a bash arithmetic error.
+        with tempfile.TemporaryDirectory() as d:
+            binx = os.path.join(d, "bin")
+            os.makedirs(binx)
+            loadavg = os.path.join(d, "loadavg")
+            with open(loadavg, "w") as f:
+                f.write("9.99 0 0 1/1 1\n")
+            stubs = {
+                "pgrep": "#!/bin/bash\necho 0\nexit 1\n",
+                "podman": "#!/bin/bash\nexit 7\n",
+            }
+            for name, body in stubs.items():
+                path = os.path.join(binx, name)
+                with open(path, "w") as f:
+                    f.write(body)
+                os.chmod(path, 0o755)
+            env = dict(os.environ)
+            env.update(
+                PATH=binx + os.pathsep + env["PATH"],
+                LOADAVG_FILE=loadavg,
+                SETTLE_WAIT_SECS="08",
+                ALLOW_BUSY="0",
+                RESULTS=os.path.join(d, "results"),
+            )
+            helper = subprocess.Popen(
+                ["bash", "-c",
+                 f'sleep 2; printf "0.10 0 0 1/1 1\\n" > {loadavg}'],
+            )
+            try:
+                result = subprocess.run(
+                    ["bash", self.SH], env=env,
+                    capture_output=True, text=True, timeout=60,
+                )
+            finally:
+                helper.wait(timeout=10)
+            self.assertNotIn("value too great for base", result.stderr)
+            self.assertIn("8s window", result.stderr)
+            self.assertNotIn("REFUSING", result.stderr)
+            self.assertNotEqual(result.returncode, 3, result.stderr)
 
     def test_the_gate_settles_with_the_same_knob(self):
         with tempfile.TemporaryDirectory() as d:

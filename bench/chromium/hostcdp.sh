@@ -46,6 +46,8 @@ quiet_sample() {
     if awk -v l="$la" 'BEGIN{exit !(l >= 1.0)}'; then return 1; fi
     return 0
 }
+# Base 10: "08" passes the validator and is invalid octal to bash arithmetic.
+SETTLE_WAIT_SECS=$((10#$SETTLE_WAIT_SECS))
 deadline=$((SECONDS + SETTLE_WAIT_SECS))
 until quiet_sample; do
     if [ "$SECONDS" -ge "$deadline" ]; then
