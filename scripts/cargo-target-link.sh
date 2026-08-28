@@ -300,8 +300,16 @@ if [ -L target ] && [ -d target ]; then
 	# A Cargo wrapper that already crossed the checkout→target lock handoff no
 	# longer holds the checkout lease. Pin and exclusively lease its resolved
 	# generation before publishing any different symlink target.
-	exec {old_target_lease_fd}<target ||
-		fallback_to_local "target/ cannot be opened for its lease"
+	# Fail closed if the published generation cannot be opened: without its
+	# lease there is no way to know whether a Cargo wrapper still holds it
+	# shared, and a generation that lost only READ permission (0333) is one
+	# Cargo can still create entries in. Replacing target/ under such a build
+	# would split it across two trees. Only the operator can fix this (chmod
+	# the generation, or remove the link by hand once nothing runs).
+	if ! exec {old_target_lease_fd}<target; then
+		echo "ERROR: cannot open the published generation $linked to lease it; a running build may still hold it, refusing to replace target/" >&2
+		exit 1
+	fi
 	flock -x "$old_target_lease_fd"
 	case "$linked" in
 		"$WT_TARGET"|"$WT_TARGET".generation-*)

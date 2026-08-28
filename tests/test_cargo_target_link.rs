@@ -2980,38 +2980,39 @@ fn run_link_with(dir: &Path, btrfs_root: &Path, args: &[&str]) -> (bool, String)
     (out.status.success(), text)
 }
 
-/// The PUBLISHED generation that cannot be opened falls back too (codex on
-/// #867): `target/` already points at a managed generation, `[ -d target ]`
-/// still passes, and the pin-and-lease open `exec {old_target_lease_fd}<target`
-/// failed under `set -e` before the candidate-lease fallback existed. Same
-/// unprivileged stand-in as the candidate case.
+/// The PUBLISHED generation that cannot be opened FAILS CLOSED (codex on #867,
+/// reversing an earlier fallback). Without that generation's lease the script
+/// cannot know whether a Cargo wrapper still holds it shared, and a generation
+/// that lost only read permission (0333) is one Cargo can still create entries
+/// in; replacing `target/` under such a build would split it across two trees.
+/// Same unprivileged stand-in as the candidate case.
 #[test]
-fn cargo_target_link_falls_back_when_the_published_generation_cannot_be_opened() {
+fn cargo_target_link_refuses_to_replace_a_published_generation_it_cannot_lease() {
     use std::os::unix::fs::PermissionsExt as _;
     let checkout = tempfile::tempdir().expect("checkout tempdir");
     let btrfs = tempfile::tempdir().expect("btrfs stand-in");
     let wt = managed_worktree_dir(checkout.path(), btrfs.path());
     std::fs::create_dir_all(&wt).expect("published generation");
     std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("published link");
-    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    // Write and search, no read: Cargo can still create entries here, the
+    // lease open (O_RDONLY) cannot succeed.
+    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o333)).expect("chmod 333");
 
     let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
 
     let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
     assert!(
-        ok,
-        "the recipe died instead of falling back when the published generation cannot \
-         be opened:\n{out}"
+        !ok,
+        "the recipe replaced target/ under a published generation it could not lease:\n{out}"
+    );
+    assert!(
+        out.contains("refusing to replace target/"),
+        "the refusal must say why:\n{out}"
     );
     let target = checkout.path().join("target");
     assert!(
-        target.is_dir() && !target.is_symlink(),
-        "target/ should be a local directory after the fallback, not {:?}\n{out}",
-        std::fs::symlink_metadata(&target).map(|m| m.file_type())
-    );
-    assert_target_usable(
-        checkout.path(),
-        "published generation that cannot be opened",
+        target.is_symlink() && std::fs::read_link(&target).expect("readlink") == wt,
+        "target/ must be left pointing at the published generation\n{out}"
     );
 }
 
