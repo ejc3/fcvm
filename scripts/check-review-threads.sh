@@ -189,6 +189,30 @@ fetch_payload() {
       'map(if .id == $id then .comments.nodes = $c[0] else . end)' <<<"$threads")
   done
 
+  # Re-read the COMMENTS after all paging, for the same reason the head is re-read below —
+  # and it is not the same check. Two of the three coverage signals live in comments that
+  # their bot EDITS IN PLACE: CodeRabbit's walkthrough and Codex's review summary. Both were
+  # captured at the start of a run that then spent minutes paging threads, and both can go
+  # from a clean result to a failed, rate-limited or in-progress one without the head moving
+  # an inch. The head recheck cannot see that. This second read is compared against the
+  # first below, and any difference blocks: the gate would otherwise grant coverage from a
+  # comment that no longer says what it said when it was read.
+  local rc2cursor=null rc2after="" rc2resp recheckcomments='[]'
+  while :; do
+    [ "$rc2cursor" != "null" ] && rc2after=", after: \"$rc2cursor\""
+    rc2resp=$(gh api graphql -f query="
+      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $pr) {
+            comments(first: $REVIEWS_PAGE_SIZE$rc2after) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login __typename } body createdAt updatedAt }
+            } } } }" 2>/dev/null) || return 1
+    recheckcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
+          <(echo "$recheckcomments") <(echo "$rc2resp"))
+    [ "$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage' <<<"$rc2resp")" = "true" ] || break
+    rc2cursor=$(jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor' <<<"$rc2resp")
+  done
+
   # Re-read the head AFTER all paging. A push landing mid-evaluation would otherwise leave
   # $headoid describing the commit captured by the first query, and the coverage check
   # would happily certify a SHA the PR no longer points at.
@@ -211,11 +235,13 @@ fetch_payload() {
   jq -n --slurpfile t <(printf '%s' "$threads") \
         --slurpfile r <(printf '%s' "$reviews") \
         --slurpfile c <(printf '%s' "$prcomments") \
+        --slurpfile rc <(printf '%s' "$recheckcomments") \
         --arg a "$prauthor" --arg h "$headoid" --arg d "$headdate" --argjson cs "${headsuites:-[]}" \
      '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
                                       commits:{nodes:[{commit:{committedDate:$d, checkSuites:{nodes:$cs}}}]},
                                       reviewThreads:{nodes:$t[0]}, reviews:{nodes:$r[0]},
-                                      comments:{nodes:$c[0]}}}}}'
+                                      comments:{nodes:$c[0]},
+                                      recheck:{comments:{nodes:$rc[0]}}}}}}'
 }
 
 # A fixture must be the payload the gate actually consumes, not a hand-written guess at
@@ -473,6 +499,48 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
                      and (($v or $sum) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
+
+# A coverage-bearing comment must still say, at the END of the run, what it said at the
+# start. `bodies` above was built from the FIRST read of the comments; the walkthrough and
+# the review summary are edited in place by their bots, so a clean result captured at
+# 22:11 can be a "Review failed" notice by 22:15 with the head never moving. Comparing the
+# two reads is the only way to notice, and the gate must block rather than certify a head
+# from a comment it can no longer quote. Every path compares, including --from-file: the
+# payload carries the second read under `recheck`, which is what fetch_payload fills, so a
+# fixture exercises the same code the live run does.
+COVERAGE_FP_JQ="$VERDICT_JQ"'($bots | split(",")) as $botlogins
+  | [ .[] | select(((.author.__typename // "") == "Bot") and (.author.login | IN($botlogins[])))
+          | select(((.body // "") | is_verdict) or ((.body // "") | is_codex_summary)
+                   or ((.body // "") | contains(cr_summarize_marker)))
+          | {login: .author.login, createdAt: (.createdAt // ""),
+             updatedAt: (.updatedAt // ""), body: (.body // "")} ]
+  | sort_by([.createdAt, .login, .body])'
+capturedfp=$(jq -c --arg bots "$VERDICT_BOTS" "$COVERAGE_FP_JQ" <<<"$prcomments") || {
+  echo "verdict: BLOCKED — could not read the coverage-bearing comments." >&2; exit 2; }
+if [ "$capturedfp" != "[]" ]; then
+  recheckcomments=$(jq -c '.data.repository.pullRequest.recheck.comments.nodes // "absent"' \
+    <<<"$payload" 2>/dev/null)
+  if [ "$recheckcomments" = '"absent"' ] || [ -z "$recheckcomments" ]; then
+    echo "verdict: BLOCKED — this PR carries a comment that can grant head coverage, and the" >&2
+    echo "payload has no second read of it to compare against. Those comments are edited in" >&2
+    echo "place, so one read cannot show what they said when the run ended. Re-run the gate," >&2
+    echo "or regenerate the fixture with --dump-payload." >&2
+    exit 2
+  fi
+  if ! jq -e 'type == "array" and all(((.body // "") | type) == "string")' \
+       >/dev/null 2>&1 <<<"$recheckcomments"; then
+    echo "verdict: BLOCKED — the second read of the PR comments is not an array of comments." >&2
+    exit 2
+  fi
+  recheckfp=$(jq -c --arg bots "$VERDICT_BOTS" "$COVERAGE_FP_JQ" <<<"$recheckcomments") || {
+    echo "verdict: BLOCKED — could not read the re-fetched coverage-bearing comments." >&2; exit 2; }
+  if [ "$capturedfp" != "$recheckfp" ]; then
+    echo "verdict: BLOCKED — a comment that can grant head coverage changed under us while" >&2
+    echo "this gate was reading the PR. Whatever it says now, the reading below was taken" >&2
+    echo "from what it said before. Re-run against a PR that is holding still." >&2
+    exit 2
+  fi
+fi
 
 # Observability seam for the probe. Paging is about what was FETCHED, and the verdict is a
 # poor proxy for that — the probe authors everything it posts, and the author-exclusion rule

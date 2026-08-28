@@ -226,11 +226,19 @@ echo "== finding 19: a reviewer with nothing to say posts no review object =="
 # #873). The verdict must be the whole comment, in the shape the bot actually posts (the
 # builders below copy live comments): a body carrying the phrase plus finding text is a
 # finding, claimable and not coverage.
-wrap6() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"},{"createdAt":"2026-01-02T00:31:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":%s}}}}}' "$1"; }
+wrap6() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"},{"createdAt":"2026-01-02T00:31:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":%s},"recheck":{"comments":{"nodes":%s}}}}}}' "$1" "${2:-$1}"; }
 # One top-level PR comment as GraphQL returns it: login, __typename, createdAt, a body
 # that is already a JSON string literal, and updatedAt ($5, defaulting to createdAt as
 # GitHub does for a comment nobody has edited).
 cmt() { printf '{"author":{"login":"%s","__typename":"%s"},"createdAt":"%s","updatedAt":"%s","body":%s}' "$1" "$2" "$3" "${5:-$3}" "$4"; }
+# Every payload carries the gate's SECOND read of the comments under `recheck` — what
+# fetch_payload fetches after all paging, and compares against the first read (finding 31).
+# The builders default it to the first read: a fixture models a run in which nothing changed,
+# unless the case is about something that did.
+#
+# wrap9 is the wrap6 head with a review object already on it, for cases about whether a
+# comment needs a disposition rather than about what covers the head.
+wrap9() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "${2:-$1}"; }
 # Codex's no-findings comment as posted: the phrase with sign-off $1, the reviewed commit
 # $2, and the folded About Codex block. Emits a JSON string literal.
 codex_body() { jq -n --arg s "$1" --arg sha "$2" '"Codex Review: Didn\u0027t find any major issues.\($s)\n\n**Reviewed commit:** `\($sha)`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>"'; }
@@ -251,7 +259,7 @@ run_case "a coderabbit review-finished reply with its note is not coverage eithe
   "$(wrap6 "[$(cmt me User 2026-01-02T00:40:00Z '"@coderabbitai review"'),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body "$CR_NOTE")")]")" \
   1 "UNREVIEWED HEAD" "the head commit has not been reviewed"
 run_case "a coderabbit reply with its note needs no disposition" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body "$CR_NOTE")")")" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body "$CR_NOTE")")")" \
   0 "CLEAR"
 run_case "a verdict dated after the commit but before the head arrived is not coverage" \
   "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T00:10:00Z "$(codex_body '' deadbeef)")]")" \
@@ -260,10 +268,10 @@ run_case "the author saying no findings is not coverage" \
   "$(wrap6 "[$(cmt me User 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")]")" \
   1 "UNREVIEWED HEAD"
 run_case "a verdict cannot cover a head that has no check suite (arrival unknown)" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")")" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")")" \
   1 "UNREVIEWED HEAD"
 run_case "a no-findings verdict is not a finding that needs a disposition" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")")" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")")" \
   0 "CLEAR"
 run_case "the verdict phrase beside finding text is a finding, not coverage" \
   "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body $'\n\nOne thing though: the lease is dropped before the rename, which races the pruner.' deadbeef)")]")" \
@@ -315,7 +323,7 @@ run_case "a codex verdict naming an older commit is not coverage" \
 # Guard, green before and after: a verdict for an older commit is still a verdict, and a
 # head covered by a review object does not go BLOCKED over an undisposed stale verdict.
 run_case "a codex verdict naming an older commit needs no disposition" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")")" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")")" \
   0 "CLEAR"
 
 echo "== finding 24: a trigger is a documented bot command, nothing else =="
@@ -366,7 +374,7 @@ HEAD40=5f8a63e13cd9fdc777d23165ecd5f149fb93f848
 BASE40=1aa0e96276e5500e60fc93f56d3c74298b4a2ba3
 OLD40=eb7fa388b1685edcb70514be82f072d7d6525819
 # wrap6 with a full-length head, which the walkthrough range names in full.
-wrap7() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"%s","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":%s}}}}}' "$HEAD40" "$1"; }
+wrap7() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"%s","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":%s},"recheck":{"comments":{"nodes":%s}}}}}}' "$HEAD40" "$1" "${2:-$1}"; }
 # CodeRabbit's walkthrough after a review that produced no comments (#815): the block
 # between the recent_review markers names the range reviewed, from $1 to $2.
 cr_walkthrough() { jq -n --arg from "$1" --arg to "$2" '"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- recent_review_start -->\n\nNo actionable comments were generated in the recent review. 🎉\n\n<details>\n<summary>ℹ️ Recent review info</summary>\n\n<details>\n<summary>⚙️ Run configuration</summary>\n\n**Configuration used**: defaults\n\n**Review profile**: CHILL\n\n**Plan**: Pro Plus\n\n**Run ID**: `80692642-637e-46d1-bd3e-dea6682a1c78`\n\n</details>\n\n<details>\n<summary>📥 Commits</summary>\n\nReviewing files that changed from the base of the PR and between \($from) and \($to).\n\n</details>\n\n<details>\n<summary>📒 Files selected for processing (1)</summary>\n\n* `scripts/check-review-threads.sh`\n\n</details>\n\n</details>\n\n---\n\n\n\n<!-- recent_review_end -->\n<!-- walkthrough_start -->\n\n<details>\n<summary>📝 Walkthrough</summary>\n\n## Walkthrough\n\nThe review gate binds a CodeRabbit result to the head it names.\n\n</details>\n\n<!-- walkthrough_end -->"'; }
@@ -395,8 +403,9 @@ run_case "a walkthrough from an unlisted bot is not coverage" \
 echo "== finding 27: a verdict covers a head that has no review object at all =="
 # HEAD COVERED required anyreview > 0, but a no-findings verdict has no review object, so
 # a head whose only review result was a valid Codex verdict could not be reported covered.
+VERDICT_CMT=$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")
 run_case "a codex verdict is coverage when no review objects exist" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$VERDICT_CMT" "$VERDICT_CMT")" \
   0 "HEAD COVERED"
 
 echo "== finding 28: a walkthrough after a review that did not run clean is not coverage =="
@@ -470,7 +479,7 @@ echo "== finding 29: a head with no review result of any kind is unreviewed, not
 # must be covered whether or not any review object exists, a PR with no review at all is
 # an unreviewed head, and a payload that names no head cannot be judged (regression case
 # below).
-wrap8() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]}}}}}' "$1" "$2"; }
+wrap8() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "$2" "${3:-$2}"; }
 SUITE='[{"createdAt":"2026-01-02T00:30:00Z"}]'
 run_case "reviews [] and a codex verdict naming an older sha is an unreviewed head" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")")" \
@@ -509,7 +518,7 @@ run_case "the live #867 shape: a summary row Completed at the head covers it" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
   0 "HEAD COVERED"
 run_case "a summary comment needs no disposition" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
   0 "CLEAR"
 # The rest answer the summary with $ANSWER, so coverage is the only thing left to decide.
 run_case "a summary row naming an older commit is not coverage" \
@@ -542,6 +551,76 @@ run_case "an unlisted bot posting the summary body is claimable, not coverage" \
 run_case "the legacy verdict still covers beside a summary that binds nothing" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)"),$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row 'In progress' 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z),$ANSWER")" \
   0 "HEAD COVERED"
+
+echo "== finding 31: a coverage-bearing comment must still say what it said =="
+# The gate reads the PR comments FIRST and pages threads afterwards, which on a real PR is
+# long enough for a bot to edit what it just read. Two of the three coverage signals are one
+# comment their bot edits in place: CodeRabbit's walkthrough and Codex's review summary. The
+# final consistency check re-read only headRefOid, so a walkthrough that went from a clean
+# review to a failed one, with the head standing still, still granted coverage from a body
+# captured minutes earlier — the gate certifying a head from a comment it could no longer
+# quote. fetch_payload now re-reads the comments after all paging and the gate compares the
+# two reads; the payload carries the second one under `recheck`, so these fixtures exercise
+# the same comparison a live run does.
+CLEAN_WALK=$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk none clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z)
+FAILED_WALK=$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_FAILED" failed "$BASE40" "$HEAD40")" 2026-01-02T01:20:00Z)
+run_case "a walkthrough that goes clean -> failed between the two reads blocks" \
+  "$(wrap7 "[$CLEAN_WALK,$ANSWER]" "[$FAILED_WALK,$ANSWER]")" \
+  2 "changed under us"
+SUM_DONE=$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)
+SUM_RUNNING=$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row 'In progress' 2026-01-02T01:10:00.123456Z deadbee)")" 2026-01-02T01:10:05Z)
+run_case "a summary that goes Completed -> in progress between the two reads blocks" \
+  "$(wrap8 "$SUITE" "$SUM_DONE,$ANSWER" "$SUM_RUNNING,$ANSWER")" \
+  2 "changed under us"
+# A payload that grants coverage from an editable comment and carries no second read of it
+# cannot be judged: one read cannot show what a comment said when the run ended.
+run_case "a coverage-bearing comment with no second read at all blocks" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]}}}}}' "$SUITE" "$SUM_DONE,$ANSWER")" \
+  2 "no second read"
+# Guards, green before and after: an unchanged second read changes nothing, and a comment
+# that cannot grant coverage is not compared, so ordinary traffic arriving mid-run does not
+# block. (Every other case in this file is also a guard for the unchanged path, since the
+# builders default the second read to the first.)
+run_case "an unchanged second read still covers" \
+  "$(wrap8 "$SUITE" "$SUM_DONE,$ANSWER" "$SUM_DONE,$ANSWER")" \
+  0 "HEAD COVERED"
+run_case "a comment that cannot grant coverage may differ between the reads" \
+  "$(wrap7 "[$CLEAN_WALK,$(cmt onlooker User 2026-01-02T00:50:00Z '"first wording"'),$ANSWER]" \
+           "[$CLEAN_WALK,$(cmt onlooker User 2026-01-02T00:50:00Z '"edited wording"' 2026-01-02T01:30:00Z),$ANSWER]")" \
+  0 "HEAD COVERED"
+
+echo "== finding 31: the LIVE path takes the second read =="
+# --from-file can only prove the comparison. That the gate actually re-fetches is a property
+# of fetch_payload, so it is tested through the gh shim: the second `comments(first:` query
+# is answered with an edited walkthrough, and the run must block. If the gate never issued
+# that query, comments2.json would go unread and this case would pass with CLEAR.
+mkdir -p "$TMP/bin"
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/threads.json"
+printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"%s","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' "$HEAD40" > "$TMP/reviews.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[%s,%s]}}}}}' "$CLEAN_WALK" "$ANSWER" > "$TMP/comments.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[%s,%s]}}}}}' "$FAILED_WALK" "$ANSWER" > "$TMP/comments2.json"
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
+  *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"comments(first"*)
+    n=$(cat "$GATE_TEST_DIR/ccount" 2>/dev/null || echo 0); n=$((n+1))
+    printf '%s' "$n" > "$GATE_TEST_DIR/ccount"
+    if [ "$n" -le 1 ]; then cat "$GATE_TEST_DIR/comments.json"; else cat "$GATE_TEST_DIR/comments2.json"; fi ;;
+  *headRefOid*)        printf '%s\n' "$GATE_TEST_HEAD" ;;  # the recheck passes --jq
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+rm -f "$TMP/ccount"
+out=$(GATE_TEST_DIR="$TMP" GATE_TEST_HEAD="$HEAD40" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+if [ "$rc" = 2 ] && grep -qF "changed under us" <<<"$out" && [ "$(cat "$TMP/ccount")" -ge 2 ]; then
+  echo "  PASS  the live path re-reads the comments and blocks when one changed"; pass=$((pass+1))
+else
+  echo "  FAIL  the live path re-reads the comments and blocks when one changed (rc=$rc, comment fetches=$(cat "$TMP/ccount" 2>/dev/null))"
+  sed 's/^/          /' <<<"$out" | head -4
+  fail=$((fail+1))
+fi
 
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \

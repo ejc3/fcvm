@@ -1243,6 +1243,165 @@
               "updatedAt": "2026-08-28T22:15:14Z"
             }
           ]
+        },
+        "recheck": {
+          "comments": {
+            "nodes": [
+              {
+                "author": {
+                  "login": "coderabbitai",
+                  "__typename": "Bot"
+                },
+                "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- review_stack_entry_start -->\n\n[![Review Change Stack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/ejc3/fcvm/pull/867)\n\n<!-- review_stack_entry_end -->\n<!-- walkthrough_start -->\n\n<details>\n<summary>📝 Walkthrough</summary>\n\n## Walkthrough\n\nThe cargo target link script now verifies writability for local and managed targets. It falls back to a writable local target when generation creation, lease acquisition, or managed-target writes fail. Tests cover link replacement, fallback paths, and lease ordering.\n\n### Changes\n\n**Cargo target link fallback**\n\n|Layer / File(s)|Summary|\n|---|---|\n|**Writable target checks and local fallback** <br> `scripts/cargo-target-link.sh`|The script probes local and managed target writability, removes unsafe managed symlinks, and centralizes fallback handling.|\n|**Lease-aware generation validation** <br> `scripts/cargo-target-link.sh`|Generation creation and lease failures now use local fallback. The script probes candidate writes while holding the exclusive lease.|\n|**Fallback and lease regression coverage** <br> `tests/test_cargo_target_link.rs`|Tests cover unwritable targets, managed-link replacement, inaccessible directories, local-target success paths, and lease ordering.|\n\n**Estimated code review effort:** 4 (Complex) | ~45 minutes\n\n<!-- final_review_risk_start -->\n**Merge Risk:** _🔵 Low_ · up to `2747c`\n\nThe change improves fallback from unusable shared Cargo targets, but an existing managed target that cannot be opened can still abort before a writable local target is created, and a stale dangling target symlink can cause a similar fallback failure. The impact is limited to affected local builds, so the PR is mergeable with explicit owner follow-up.\n<!-- final_review_risk_end -->\n\n</details>\n\n<!-- walkthrough_end -->\n<!-- pre_merge_checks_walkthrough_start -->\n\n<details>\n<summary>🚥 Pre-merge checks | ✅ 4 | ❌ 1</summary>\n\n### ❌ Failed checks (1 warning)\n\n|     Check name     | Status     | Explanation                                                                                                                                                                                 | Resolution                                                                         |\n| :----------------: | :--------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------- |\n| Docstring Coverage | ⚠️ Warning | Docstring coverage is 75.00% which is insufficient. The required threshold is 80.00%. Docstring coverage is scoped to functions touched by this diff. Analyzed 20 functions across 2 files. | Write docstrings for the functions missing them to satisfy the coverage threshold. |\n\n<details>\n<summary>✅ Passed checks (4 passed)</summary>\n\n|         Check name         | Status   | Explanation                                                                                                                            |\n| :------------------------: | :------- | :------------------------------------------------------------------------------------------------------------------------------------- |\n|     Linked Issues check    | ✅ Passed | Check skipped because no linked issues were found for this pull request.                                                               |\n| Out of Scope Changes check | ✅ Passed | Check skipped because no linked issues were found for this pull request.                                                               |\n|      Description Check     | ✅ Passed | Check skipped - CodeRabbit’s high-level summary is enabled.                                                                            |\n|         Title check        | ✅ Passed | The title clearly and concisely describes the primary change: an unwritable Btrfs volume now falls back to the local target directory. |\n\n</details>\n\n</details>\n\n<!-- pre_merge_checks_walkthrough_end -->\n\n- [ ] <!-- {\"checkboxId\":\"585bb3f6-faf5-4dbf-96d2-74e382adf19a\"} --> Fix all pre-merge checks with AI\n<!-- finishing_touch_checkbox_start -->\n\n<details>\n<summary>✨ Finishing Touches 💡 2</summary>\n\n<!-- finishing_touch_suggestion:docstrings -->\n<details>\n<summary>📝 Generate docstrings 💡</summary>\n\n- [ ] <!-- {\"checkboxId\":\"7962f53c-55bc-4827-bfbf-6a18da830691\"} --> Create stacked PR\n- [ ] <!-- {\"checkboxId\":\"3e1879ae-f29b-4d0d-8e06-d12b7ba33d98\"} --> Commit on current branch\n\n</details>\n<!-- finishing_touch_suggestion:fix_ci -->\n<details open>\n<summary>🛠️ Fix failing CI checks 💡</summary>\n\n- [ ] <!-- {\"checkboxId\": \"6d21cfe8-ec3f-40e2-9222-b8318b64d3b0\", \"radioGroupId\": \"fix-ci-output-choice-group-unknown_comment_id\"} -->   Create stacked PR\n- [ ] <!-- {\"checkboxId\": \"9f0d24fb-b419-4f01-baf0-8b26b6424f34\", \"radioGroupId\": \"fix-ci-output-choice-group-unknown_comment_id\"} -->   Commit on current branch\n\n</details>\n<details>\n<summary>🧪 Generate unit tests (beta)</summary>\n\n- [ ] <!-- {\"checkboxId\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Create PR with unit tests\n- [ ] <!-- {\"checkboxId\": \"6ba7b810-9dad-11d1-80b4-00c04fd430c8\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Commit unit tests in branch `fix-container-bench-target`\n\n</details>\n\n</details>\n\n<!-- finishing_touch_checkbox_end -->\n<!-- tips_start -->\n\n---\n\nThanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=ejc3/fcvm&utm_content=867)! It's free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.\n\n<details>\n<summary>❤️ Share</summary>\n\n- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A&url=https%3A//coderabbit.ai)\n- [Mastodon](https://mastodon.social/share?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A%20https%3A%2F%2Fcoderabbit.ai)\n- [Reddit](https://www.reddit.com/submit?title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&text=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code.%20Check%20it%20out%3A%20https%3A//coderabbit.ai)\n- [LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fcoderabbit.ai&mini=true&title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&summary=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code)\n\n</details>\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->",
+                "createdAt": "2026-08-28T06:51:25Z",
+                "updatedAt": "2026-08-28T20:59:04Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T07:02:43Z",
+                "updatedAt": "2026-08-28T07:02:43Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T07:45:36Z",
+                "updatedAt": "2026-08-28T07:45:36Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T08:32:44Z",
+                "updatedAt": "2026-08-28T08:32:44Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T09:50:22Z",
+                "updatedAt": "2026-08-28T09:50:22Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T11:18:21Z",
+                "updatedAt": "2026-08-28T11:18:21Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "CI on 55892ace: Host-Root-arm64-SnapshotEnabled failed (11 failed, 4 timed out in the warm pass; the cold pass was 1185/1185). Not this diff: the runner (runner-i-066ffbdeef2c172d4) wedged 3 minutes into the warm pass with firecracker processes in D-state inside `synchronize_srcu` under `mmu_notifier_unregister`/`kvm_destroy_vm`, 153 firecracker processes and 22 in D an hour later, and the post-job guard counted 161 stray process groups. Evidence and stacks in #871. The same lane passed for #869 at 12:10Z on a healthy runner. The wedged host was rebooted at 12:58Z (D-state is not killable); the next head of this PR gets a fresh run.",
+                "createdAt": "2026-08-28T12:59:22Z",
+                "updatedAt": "2026-08-28T12:59:22Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T13:05:50Z",
+                "updatedAt": "2026-08-28T13:05:50Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T13:52:09Z",
+                "updatedAt": "2026-08-28T13:52:09Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T14:43:13Z",
+                "updatedAt": "2026-08-28T14:43:13Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T15:54:43Z",
+                "updatedAt": "2026-08-28T15:54:43Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "CI on c486e99c: Host-Root-arm64-SnapshotDisabled failed only on `test_bench_fast_teardown_leaks_nothing_clone` (`expected the clone's state file to SURVIVE the SIGKILL`), the cross-test stale-state race that #869 fixes; this branch predates that fix. Fleet checked: no D-state on any arm64 runner. This PR rebases onto main after #869 merges; the next head carries that.",
+                "createdAt": "2026-08-28T16:28:49Z",
+                "updatedAt": "2026-08-28T16:28:49Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T17:47:41Z",
+                "updatedAt": "2026-08-28T17:47:41Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T19:14:48Z",
+                "updatedAt": "2026-08-28T19:14:48Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T20:58:53Z",
+                "updatedAt": "2026-08-28T20:58:53Z"
+              },
+              {
+                "author": {
+                  "login": "ejc3",
+                  "__typename": "User"
+                },
+                "body": "@codex review",
+                "createdAt": "2026-08-28T22:11:17Z",
+                "updatedAt": "2026-08-28T22:11:17Z"
+              },
+              {
+                "author": {
+                  "login": "chatgpt-codex-connector",
+                  "__typename": "Bot"
+                },
+                "body": "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-08-28T22:15:13.608405Z\">2026-08-28T22:15:13.608405Z</relative-time> | `9ebed54` | Manual request |\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>",
+                "createdAt": "2026-08-28T22:11:32Z",
+                "updatedAt": "2026-08-28T22:15:14Z"
+              }
+            ]
+          }
         }
       }
     }
