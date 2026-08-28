@@ -277,6 +277,15 @@ if ! jq -e 'all(((.body // "") | type) == "string"
   echo "verdict: BLOCKED — a top-level PR comment has a non-text body or no createdAt." >&2
   exit 2
 fi
+# The coverage check below certifies that the HEAD was reviewed, so a payload that names
+# no head is one it cannot judge. This used to skip the check instead, which made "no
+# head" and "no reviews" both read as CLEAR: nothing to answer is not nothing reviewed.
+headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$payload" 2>/dev/null)
+if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -z "$headoid" ]; then
+  echo "verdict: BLOCKED — the payload names no head commit, so this gate cannot tell" >&2
+  echo "whether the code being merged was reviewed. Re-run, or re-capture the fixture." >&2
+  exit 2
+fi
 
 # Reviews and top-level comments are two containers for the same thing: a PR-level
 # statement. Judge them as one list, so an answer posted either way settles a claim posted
@@ -326,6 +335,20 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # instead (walkthrough_sha below, and the coverage check for how a result is bound to
 # the head).
 #
+# walkthrough_sha is the last commit of a review that RAN CLEAN, or "". CodeRabbit edits
+# one walkthrough comment in place, and its recent-review block names the range it
+# reviewed after a failed review too: on #853 and #792 the range ended at the head under
+# a "Review failed" caution, with no review object on the head, and the range alone read
+# as coverage. So three things must hold, each failing closed: the block says "No
+# actionable comments were generated" (CodeRabbit adds that line only after a review that
+# finished with nothing to post); the summarize marker is the comment's ONLY
+# auto-generated-comment marker (the failure, rate-limit, skip, pause and in-progress
+# notices each add their own, and so would a notice this script has never seen); and the
+# comment carries no blockquoted heading, which is how every notice renders its title
+# (Review failed / skipped / limit reached, Reviews paused). A rate-limit or pause notice
+# beside a clean block at the head (#869) also declines: the comment is in a mixed state
+# from two runs, and which run wrote which block is not something this gate can read.
+#
 # The verdict must be the WHOLE comment. After dropping HTML comments, blank lines, the
 # About Codex block and the one blockquote line CodeRabbit's incremental reply carries
 # (matched whole; it is the only blockquote line that bot's replies on this repo have
@@ -355,10 +378,14 @@ def verdict_sha:
   verdict_lines as $l
   | if ($l | length) == 2 and ($l[1] | test(reviewed_re)) then ($l[1] | capture(reviewed_re) | .sha) else "" end;
 def cr_range_re: "Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and (?<sha>[0-9a-f]{40})\\.";
+def cr_marker_re: "<!-- This is an auto-generated comment: [^>]*-->";
+def cr_summarize_marker: "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->";
 def walkthrough_sha:
   ([ (. // "")
-     | select(test("<!-- This is an auto-generated comment: summarize by coderabbit\\.ai -->"))
+     | select([scan(cr_marker_re)] == [cr_summarize_marker])
+     | select(test("(?m)^>[[:space:]]*##") | not)
      | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r
+     | select(test("No actionable comments were generated in the recent review"))
      | capture(cr_range_re) | .sha ] | first) // "";'
 # Only these bots issue verdicts, and only from the account GitHub types as a Bot.
 # Anyone else posting the same words has written an ordinary comment: claimable like
@@ -522,11 +549,13 @@ fi
 # later — while the reviewer was still working. Its findings arrived five minutes after the
 # squash. Nothing was bypassed; the gate simply had no notion of review COVERAGE.
 #
-# Skipped when REQUIRE_REVIEWED_HEAD=0, and when no review has ever been submitted (a PR
-# nobody has reviewed at all is a different conversation, and the required-checks ruleset
-# is the right place for that policy).
-headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$payload" 2>/dev/null)
-if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
+# Skipped only when REQUIRE_REVIEWED_HEAD=0. It used to skip as well when no review
+# object had ever been submitted, on the theory that a PR nobody has reviewed is the
+# required-checks ruleset's business. That was the fail-open: a no-findings verdict
+# leaves no review object, so a PR whose only review ever was a clean Codex pass on an
+# OLDER commit had no review objects at all, and after a push it went CLEAR with nothing
+# reviewing the head. The head must be covered whether or not any review object exists.
+if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   # Only SOMEONE ELSE's review is coverage. Counting any review on the head meant the
   # author's own `gh pr review --comment` disposition — posted after the push, as the
   # workflow requires — marked the commit reviewed. The check certified precisely the
@@ -535,11 +564,6 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
              '[ .[] | select((.commit.oid // "") == $h) | select(.author.login != $me) ] | length' \
              <<<"$reviews") || {
     echo "verdict: BLOCKED — could not evaluate head-commit review coverage." >&2; exit 2; }
-  # No `|| echo 0`. That fallback turned "jq died" into "no reviews exist", which skips
-  # this block entirely and prints CLEAR — the fail-open shape this gate exists to refuse.
-  anyreview=$(jq -r --arg me "$prauthor" '[ .[] | select(.author.login != $me) ] | length' \
-              <<<"$reviews") || {
-    echo "verdict: BLOCKED — could not count reviews." >&2; exit 2; }
   # A no-findings result leaves no review object (see VERDICT_JQ), so it carries no commit
   # of its own. It counts for THIS head only when the bot itself names the head. A result
   # merely dated after the head arrived is not bound: a review of the old head that
@@ -550,15 +574,17 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
   #   - CodeRabbit's "Full review finished." reply names nothing, so it never covers a
   #     head on its own: it is a notice, exempt from dispositions and nothing more. What
   #     names the head is the walkthrough comment CodeRabbit edits in place. After a
-  #     review that produced no comments it carries, between "<!-- recent_review_start -->"
-  #     and "<!-- recent_review_end -->", the line "Reviewing files that changed from the
-  #     base of the PR and between <sha> and <sha>". The second sha is the last commit
-  #     reviewed and must be the head, and the comment's updatedAt must postdate the
-  #     head's arrival. (A review that did produce comments leaves a review object on the
-  #     head, which `reviewed` counts.) Only that block counts: the same comment quotes
-  #     an identical range line inside its "Review limit reached" notice for a review that
-  #     did NOT run. On #872 that notice named head 181fcbbb, which no CodeRabbit review
-  #     ever covered.
+  #     review that finished with no comments it carries, between "<!-- recent_review_start -->"
+  #     and "<!-- recent_review_end -->", the line "No actionable comments were generated"
+  #     and the line "Reviewing files that changed from the base of the PR and between
+  #     <sha> and <sha>". The second sha is the last commit reviewed and must be the head,
+  #     and the comment's updatedAt must postdate the head's arrival. (A review that did
+  #     produce comments leaves a review object on the head, which `reviewed` counts.)
+  #     Only that block, in a comment carrying no notice, counts (walkthrough_sha): the
+  #     same comment quotes an identical range line inside its "Review limit reached"
+  #     notice for a review that did NOT run (on #872 that notice named head 181fcbbb,
+  #     which no CodeRabbit review ever covered), and after a FAILED review the block
+  #     itself names the range under a "Review failed" caution (#853, #792).
   # An earlier version bound CodeRabbit's reply to the latest review request posted after
   # arrival. That is timestamp ordering, not binding: a review of the old head that
   # finished after a new request was counted as that request's answer. Withdrawn.
@@ -574,16 +600,16 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
         | select($hd != "" and ($r.reviewed_at // "") > $hd) ]
     | length' <<<"$bodies") || {
     echo "verdict: BLOCKED — could not evaluate no-findings verdicts." >&2; exit 2; }
-  # `anyreview` counts review objects, and a no-findings result has none. A head whose
-  # only review result is such a result must still print HEAD COVERED, so `anyreview`
-  # gates only the blocking branch, where "reviews exist, none on this commit" is the
-  # claim being made.
+  # A head is covered by a review object on it from someone other than the author, or by
+  # a verdict bound to it. Nothing else counts, and in particular the existence of review
+  # objects on OTHER commits does not: the blocking branch used to require one, so a PR
+  # with no review objects and an unbound verdict printed neither line and went CLEAR.
   if [ "${reviewed:-0}" -eq 0 ] && [ "${verdicts:-0}" -gt 0 ]; then
     echo
     echo "  HEAD COVERED  ${headoid:0:9}: no review object, but $verdicts no-findings verdict(s) bound to it (arrived $arrived)"
-  elif [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ]; then
+  elif [ "${reviewed:-0}" -eq 0 ]; then
     echo
-    echo "  UNREVIEWED HEAD  ${headoid:0:9} — reviews exist, none of them cover this commit"
+    echo "  UNREVIEWED HEAD  ${headoid:0:9} — no review object on this commit from anyone but the author, and no no-findings verdict bound to it"
     echo
     echo "verdict: BLOCKED — the head commit has not been reviewed."
     echo "Every finding raised so far is answered, but the code being merged is not the code"

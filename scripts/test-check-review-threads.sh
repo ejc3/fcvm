@@ -30,7 +30,14 @@ run_case() {
   fi
 }
 
-wrap() { printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":%s},"reviews":{"nodes":%s}}}}}' "$1" "${2:-[]}"; }
+# Every case runs under the full ruleset, head coverage included (finding 29 closed the
+# skip for a PR with no review objects). The builders for cases about dispositions put
+# the head on a covered commit: a stranger's APPROVED review of deadbeef, spliced in front
+# of the reviews the case supplies. A non-array passes through untouched so the
+# validation cases still reach the parser with it. Cases about coverage use wrap5-8.
+COVER='{"author":{"login":"reviewer"},"state":"APPROVED","submittedAt":"2025-12-31T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}'
+covered() { if jq -e 'type == "array"' >/dev/null 2>&1 <<<"${1:-[]}"; then jq -c --argjson c "$COVER" '[$c] + .' <<<"${1:-[]}"; else printf '%s' "$1"; fi; }
+wrap() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":%s},"reviews":{"nodes":%s}}}}}' "$1" "$(covered "${2:-[]}")"; }
 
 echo "== finding 1: a missing/nonexistent PR must not read as 'no threads' =="
 run_case "null pullRequest blocks" \
@@ -136,7 +143,7 @@ run_case "reviewer confirmation after a disposition clears" \
   0 "CLEAR"
 
 echo "== finding 13: findings in top-level PR comments count too =="
-wrap3() { printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "${2:-[]}" "${3:-[]}"; }
+wrap3() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "$(covered "${2:-[]}")" "${3:-[]}"; }
 run_case "undisposed top-level PR comment blocks" \
   "$(wrap3 '[]' '[]' '[{"author":{"login":"codex"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last row"}]')" \
   1 "BLOCKED"
@@ -150,7 +157,7 @@ run_case "malformed PR comment data exits 2" \
   "$(wrap3 '[]' '[]' '"nonsense"')" 2 "BLOCKED"
 
 echo "== finding 15: only real claimants raise PR-level claims =="
-wrap4() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"%s"},"reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "$2" "${3:-[]}" "${4:-[]}"; }
+wrap4() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"%s"},"headRefOid":"deadbeef","reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "$2" "$(covered "${3:-[]}")" "${4:-[]}"; }
 # The command this skill documents — posted by the PR author — is not a finding.
 run_case "author's own @codex review comment does not block" \
   "$(wrap4 me '[]' '[]' '[{"author":{"login":"me","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"@codex review"}]')" \
@@ -176,8 +183,9 @@ run_case "reviews exist but none cover the head blocks" \
 run_case "a review covering the head clears" \
   "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]')" \
   0 "CLEAR"
-run_case "no reviews at all is not this check's business" \
-  "$(wrap5 deadbeef '[]')" 0 "CLEAR"
+# Flipped by finding 29: this case expected CLEAR, which was the fail-open itself.
+run_case "no reviews at all is an unreviewed head, not a clear one (was CLEAR)" \
+  "$(wrap5 deadbeef '[]')" 1 "UNREVIEWED HEAD"
 
 echo "== finding 17: authorship does not decide what is a finding =="
 run_case "author's own defect report is claimable" \
@@ -391,11 +399,103 @@ run_case "a codex verdict is coverage when no review objects exist" \
   "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
   0 "HEAD COVERED"
 
+echo "== finding 28: a walkthrough after a review that did not run clean is not coverage =="
+# The recent-review block names its range after a FAILED review too. On #853 and #792 it
+# ended at the head, carried no "No actionable comments were generated" line, sat under a
+# "Review failed" caution, and no review object existed on the head; the gate printed
+# HEAD COVERED. The range alone proves nothing. A walkthrough now covers only when its
+# recent-review block says no actionable comments were generated, the summarize marker is
+# its only auto-generated-comment marker, and it carries no blockquoted heading (every
+# CodeRabbit notice title is one: Review failed / skipped / limit reached, Reviews paused;
+# the in-progress notice has a marker and no heading). Notice bodies copied from #853,
+# #869, #874, #837 and #872; the rest of the comment is the #853 body.
+NOTICE_FAILED=$'<!-- This is an auto-generated comment: failure by coderabbit.ai -->\n\n> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.\n\n<!-- end of auto-generated comment: failure by coderabbit.ai -->\n\n'
+NOTICE_LIMITED=$'<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> **Next included review available in 27 minutes.**\n> \n> <details>\n> <summary>View limit details</summary>\n> \n> **Limit details:** You’ve used the included review currently available.\n> \n> </details>\n\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->\n'
+NOTICE_SKIPPED=$'<!-- This is an auto-generated comment: skip review by coderabbit.ai -->\n\n> [!IMPORTANT]\n> ## Review skipped\n> \n> Auto reviews are disabled on base/target branches other than the default branch.\n> \n> Please check the settings in the CodeRabbit UI or the `.coderabbit.yaml` file in this repository. To trigger a single review, invoke the `@coderabbitai review` command.\n\n<!-- end of auto-generated comment: skip review by coderabbit.ai -->\n\n'
+NOTICE_PAUSED=$'<!-- This is an auto-generated comment: review paused by coderabbit.ai -->\n\n> [!NOTE]\n> ## Reviews paused\n> \n> It looks like this branch is under active development. To avoid overwhelming you with review comments due to an influx of new commits, CodeRabbit has automatically paused this review.\n\n<!-- end of auto-generated comment: review paused by coderabbit.ai -->\n'
+NOTICE_PROGRESS=$'<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->\n\n> [!NOTE]\n> Currently processing new changes in this PR. This may take a few minutes, please wait...\n\n<!-- end of auto-generated comment: review in progress by coderabbit.ai -->\n'
+# A heading with no marker: not observed live, pinned so the two rules are independent.
+NOTICE_HEADING_ONLY=$'\n> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.\n\n'
+# The #853 walkthrough with notice $1 above a recent-review block from $3 to $4; $2 is
+# "clean" for the no-actionable line CodeRabbit adds after a review with no comments, or
+# "failed" for the block as a failed review leaves it. "none" for $1 or $4 omits that part.
+cr_walk() { jq -n --arg notice "$1" --arg clean "$2" --arg from "$3" --arg to "$4" '
+  "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- review_stack_entry_start -->\n\n[![Review Change Stack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/ejc3/fcvm/pull/853)\n\n<!-- review_stack_entry_end -->\n"
+  + (if $notice == "none" then "" else $notice end)
+  + (if $to == "none" then "" else
+      "<!-- recent_review_start -->\n\n"
+      + (if $clean == "clean" then "No actionable comments were generated in the recent review. 🎉\n\n" else "" end)
+      + "<details>\n<summary>ℹ️ Recent review info</summary>\n\n<details>\n<summary>⚙️ Run configuration</summary>\n\n**Configuration used**: defaults\n\n**Review profile**: CHILL\n\n**Plan**: Pro Plus\n\n**Run ID**: `e2d05d3e-3f22-4137-a868-25f7f24b39df`\n\n</details>\n\n<details>\n<summary>📥 Commits</summary>\n\nReviewing files that changed from the base of the PR and between \($from) and \($to).\n\n</details>\n\n<details>\n<summary>📒 Files selected for processing (1)</summary>\n\n* `tests/test_ci_workflow_coverage.rs`\n\n</details>\n\n</details>\n\n---\n\n\n\n<!-- recent_review_end -->\n" end)
+  + "<!-- walkthrough_start -->\n\n<details>\n<summary>📝 Walkthrough</summary>\n\n## Walkthrough\n\nThe CI workflow updates path classification, renamed-file handling, and fail-open gate outputs.\n\n</details>\n\n<!-- walkthrough_end -->"'; }
+run_case "the #853 shape: a failed review whose range ends at the head is not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_FAILED" failed "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a range line without the no-actionable line is not coverage, even with no notice" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk none failed "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a rate-limit notice beside a clean recent review at the head is not coverage (#869)" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_LIMITED" clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a skipped-review notice beside a clean recent review at the head is not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_SKIPPED" clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a paused-reviews notice beside a clean recent review at the head is not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_PAUSED" clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "an in-progress notice (marker, no heading) beside a clean recent review is not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_PROGRESS" clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a Review failed heading with no marker is still a notice, not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_HEADING_ONLY" clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+# Guards, green before and after: the live skipped and in-progress shapes carry no
+# recent-review block at all, and the clean shape built here still covers.
+run_case "the live skipped shape (#874), with no recent review block, is not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_SKIPPED" clean "$BASE40" none)" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "the live in-progress shape (#872), with no recent review block, is not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_PROGRESS" clean "$BASE40" none)" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+run_case "the #853 body with a clean recent review at the head and no notice covers" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk none clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  0 "HEAD COVERED"
+
+echo "== finding 29: a head with no review result of any kind is unreviewed, not clear =="
+# Finding 27 let a bound verdict cover a head with no review objects, but the blocking
+# branch still required a review object to exist ("reviews exist, none on this commit").
+# So reviews [] plus a verdict that does NOT bind (an older sha; the head's sha but dated
+# before arrival; no check suite to date it against) printed neither HEAD COVERED nor
+# UNREVIEWED HEAD and exited CLEAR: a PR whose only review ever was a clean pass on an
+# older commit went CLEAR after a push, the race the coverage rule exists for. The head
+# must be covered whether or not any review object exists, a PR with no review at all is
+# an unreviewed head, and a payload that names no head cannot be judged (regression case
+# below).
+wrap8() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]}}}}}' "$1" "$2"; }
+SUITE='[{"createdAt":"2026-01-02T00:30:00Z"}]'
+run_case "reviews [] and a codex verdict naming an older sha is an unreviewed head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")")" \
+  1 "UNREVIEWED HEAD" "the head commit has not been reviewed"
+run_case "reviews [] and a head-sha verdict dated before arrival is an unreviewed head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:10:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  1 "UNREVIEWED HEAD" "the head commit has not been reviewed"
+run_case "reviews [] and a head-sha verdict with no check suite (arrival unknown) is an unreviewed head" \
+  "$(wrap8 '[]' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  1 "UNREVIEWED HEAD" "the head commit has not been reviewed"
+# Guard, green before and after: the bound verdict from finding 27 still covers.
+run_case "reviews [] and a head-sha verdict dated after arrival still covers" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  0 "HEAD COVERED"
+
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
   "$(wrap '[{"isResolved":false,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"something"}]}}]')" \
   1 "UNRESOLVED"
-run_case "no threads and no reviews is clear" "$(wrap '[]')" 0 "CLEAR"
+# This case expected CLEAR until finding 29: a payload with no threads, no reviews and no
+# head names nothing this gate can certify as reviewed, so it is BLOCKED, not CLEAR. The
+# literal is what wrap used to build before it put the head on a covered commit.
+run_case "no threads, no reviews and no head is BLOCKED, not CLEAR (was the fail-open)" \
+  '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviews":{"nodes":[]}}}}}' \
+  2 "BLOCKED"
 
 echo "== finding 19: a 128 KiB thread body must not kill the live-path merge =="
 # fetch_payload's final jq used --argjson, putting each array in ONE argv string;

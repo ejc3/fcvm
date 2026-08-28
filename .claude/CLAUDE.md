@@ -176,9 +176,12 @@ listed review bot's (`VERDICT_BOTS`) no-findings result as coverage of the head 
 bot names the head. Codex's "Didn't find any major issues" comment names the commit it
 reviewed, which must be the head. CodeRabbit's "Full review finished." reply names nothing
 and never covers on its own; what names the head is the walkthrough comment CodeRabbit
-edits in place, whose recent-review block says which commit range it reviewed. That range
-must end at the head and the edit must postdate the head's arrival at GitHub. Both bots'
-no-findings replies need no disposition.
+edits in place, whose recent-review block says which commit range it reviewed. That block
+must say no actionable comments were generated, the comment must carry no CodeRabbit
+notice (failed, skipped, paused, rate limited, in progress), the range must end at the
+head, and the edit must postdate the head's arrival at GitHub. Both bots' no-findings
+replies need no disposition. A PR with no review result of any kind is an unreviewed
+head, not a clear one.
 
 | `RED-VERIFIED: <test>` | a defect claim, closed by a test watched failing without the fix |
 | `NOT-A-DEFECT: <reason>` | naming, docs, style |
