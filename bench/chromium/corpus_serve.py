@@ -12,6 +12,13 @@ Resolution order for a request URL u:
   1. exact match on the full url (scheme-insensitive)
   2. match ignoring the query string (analytics beacons carry per-view ids)
   3. 404, counted in /––misses (read by the checker for the report)
+
+Two optional logs, one JSON object per line, flushed per line so the campaign
+can read them after a run while this process is still serving:
+  --dns-log PATH     {ts, peer, qname, qtype, answer} per DNS query; answer is
+                     the address for A queries and "" for everything else
+  --access-log PATH  {ts, peer, method, host, path, status, bytes, duration_ms}
+                     per HTTP and HTTPS request; host is the Host header as sent
 """
 
 import argparse
@@ -23,6 +30,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -47,12 +55,78 @@ def load_indexes(root: Path):
     return exact, noquery, redirects
 
 
+class JsonlLog:
+    """Append-only JSON-lines file; every line is flushed as it is written.
+
+    The campaign reads both replay logs while this process is still serving, so
+    a line may not sit in a stdio buffer. One lock serialises the HTTP handler
+    threads; the DNS responder is a single thread.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._fh = open(path, "a", encoding="utf-8")
+
+    def write(self, row: dict) -> None:
+        line = json.dumps(row, separators=(",", ":")) + "\n"
+        with self._lock:
+            self._fh.write(line)
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._fh.close()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     exact = {}
     noquery = {}
     redirects = {}
     misses = []
     lock = threading.Lock()
+    # --access-log: a JsonlLog, or None for no log. Set once by main().
+    access_log = None
+    _log_status = None
+    _log_bytes = 0
+
+    def handle_one_request(self):
+        # One access line per parsed request, written after the response has
+        # been flushed so `bytes` and `duration_ms` cover the whole exchange.
+        # A keep-alive close or an empty request line sends no response and
+        # gets no line; a 400 for an unparsable one is logged with what the
+        # parser managed to read.
+        ts = time.time()
+        t0 = time.monotonic()
+        self._log_status = None
+        self._log_bytes = 0
+        try:
+            super().handle_one_request()
+        finally:
+            if self.access_log is not None and self._log_status is not None:
+                headers = getattr(self, "headers", None)
+                self.access_log.write({
+                    "ts": ts,
+                    "peer": f"{self.client_address[0]}:{self.client_address[1]}",
+                    "method": getattr(self, "command", None) or "",
+                    "host": (headers.get("Host") or "") if headers is not None else "",
+                    "path": getattr(self, "path", None) or "",
+                    "status": self._log_status,
+                    "bytes": self._log_bytes,
+                    "duration_ms": (time.monotonic() - t0) * 1000,
+                })
+
+    def send_response(self, code, message=None):
+        self._log_status = int(code)
+        super().send_response(code, message)
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == "content-length":
+            try:
+                self._log_bytes = int(value)
+            except (TypeError, ValueError):
+                pass
+        super().send_header(keyword, value)
 
     def _serve(self):
         host = (self.headers.get("Host") or "").split(":")[0]
@@ -153,28 +227,49 @@ def selfsigned(tmpdir: Path):
     return crt, key
 
 
-def dns_responder(addr: str, port: int, answer_ip: str = "127.0.0.1"):
-    """Answer every A query with 127.0.0.1 (AAAA answered empty, forcing v4).
+def bind_dns(addr: str, port: int) -> socket.socket:
+    """Bind the responder's UDP socket; port 0 takes an ephemeral port.
+
+    Bound by the caller rather than inside the serving loop so a bind failure
+    (dnsmasq still holding :53) is a startup error, not a dead thread behind
+    HTTP servers that keep answering.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((addr, port))
+    return sock
+
+
+def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
+              log: JsonlLog | None = None):
+    """Answer every A query on `sock` with answer_ip (AAAA answered empty, forcing v4).
 
     Browser-agnostic host mapping for the replay arm: the replay container
     mounts a resolv.conf pointing here, so ANY engine (Chromium today, WebKit
     later) resolves every corpus host to this box with no engine flags — a
     space-containing --host-resolver-rules value cannot survive the container
     env word-split, which is how the flag approach died (2026-08-13).
+
+    With `log`, one line per answered query: {ts, peer, qname, qtype, answer}.
+    Returns when the socket is closed under it; every other error on a query
+    is dropped so one malformed packet cannot stop the replay.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((addr, port))
     while True:
         try:
             data, peer = sock.recvfrom(512)
+        except OSError:
+            if sock.fileno() < 0:
+                return
+            continue
+        try:
             if len(data) < 12:
                 continue
             txid = data[:2]
             flags = b"\x81\x80"
             qd = data[12:]
-            # parse qname end
+            labels = []
             i = 0
             while i < len(qd) and qd[i] != 0:
+                labels.append(qd[i + 1:i + 1 + qd[i]].decode("ascii", "replace"))
                 i += qd[i] + 1
             qend = i + 1 + 4  # name + qtype/qclass
             question = qd[:qend]
@@ -183,14 +278,24 @@ def dns_responder(addr: str, port: int, answer_ip: str = "127.0.0.1"):
                 answer = (b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 5, 4)
                           + socket.inet_aton(answer_ip))
                 resp = txid + flags + struct.pack(">HHHH", 1, 1, 0, 0) + question + answer
+                answered = answer_ip
             else:  # empty NOERROR (esp. AAAA -> fall back to A)
                 resp = txid + flags + struct.pack(">HHHH", 1, 0, 0, 0) + question
+                answered = ""
             sock.sendto(resp, peer)
+            if log is not None:
+                log.write({
+                    "ts": time.time(),
+                    "peer": f"{peer[0]}:{peer[1]}",
+                    "qname": ".".join(labels),
+                    "qtype": qtype,
+                    "answer": answered,
+                })
         except Exception:  # noqa: BLE001 - a malformed query must not kill the server
             continue
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=str(HERE / "corpus-live"))
     ap.add_argument("--port", type=int, default=80)
@@ -201,6 +306,17 @@ def main():
     # replay: 10.0.2.2, the pasta gateway, which maps guest connections onto
     # the host's loopback where this server listens.
     ap.add_argument("--answer-ip", default="127.0.0.1")
+    ap.add_argument("--dns-log", default=None, metavar="PATH",
+                    help="append one JSON line per DNS query: "
+                         "ts, peer, qname, qtype, answer")
+    ap.add_argument("--access-log", default=None, metavar="PATH",
+                    help="append one JSON line per HTTP/HTTPS request: "
+                         "ts, peer, method, host, path, status, bytes, duration_ms")
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
     # Validate up front: inet_aton runs inside the responder's broad exception
     # handler, so a malformed address would silently drop every A query while
@@ -212,10 +328,12 @@ def main():
         ap.error(f"--answer-ip is not a valid IPv4 address: {args.answer_ip!r}")
 
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
+    Handler.access_log = JsonlLog(args.access_log) if args.access_log else None
     print(f"loaded {len(Handler.exact)} urls", flush=True)
 
-    threading.Thread(target=dns_responder,
-                     args=(args.dns_addr, args.dns_port, args.answer_ip),
+    dns_log = JsonlLog(args.dns_log) if args.dns_log else None
+    dns_sock = bind_dns(args.dns_addr, args.dns_port)
+    threading.Thread(target=serve_dns, args=(dns_sock, args.answer_ip, dns_log),
                      daemon=True).start()
     print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> {args.answer_ip}", flush=True)
 
