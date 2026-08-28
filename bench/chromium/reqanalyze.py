@@ -42,7 +42,9 @@ Every rule here exists because of a defect listed in bench/chromium/AGENTS.md:
     for webkit, whose WebDriver navigate returns at the load event) exceeds N,
     is negative, or is missing from a successful render is listed under
     `stall_gate` and the run is refused. `per_url` reports each URL of a
-    multi-URL run on its own so a pooled median cannot hide one page.
+    multi-URL run on its own so a pooled median cannot hide one page; its
+    load-completing summary is keyed by the same engine-selected stage, which
+    every entry names in `load_stage`.
 """
 
 import argparse
@@ -1930,8 +1932,18 @@ def analyze_backend(
             )
 
     # ---- 4b. per-URL breakdown. A pooled corpus median hides the page that
-    # stalled; each URL gets its own medians, load-event time and count of
+    # stalled; each URL gets its own medians, load-completing time and count of
     # distinct screenshots (an error page renders to the same bytes every time).
+    engine = next((m.get("engine") or "chromium" for m in metas), "chromium")
+    # cdpdrive times the load event on every successful render. WebDriver
+    # classic exposes no such stage, but its navigate call returns at the
+    # load event, so for webkit the load-completing duration is navigate_ms.
+    # per_url and the stall gate (4c) read this one stage: reading
+    # navigate_load_event_ms for every engine left every webkit URL at n=0
+    # with a null median, and an armed gate that skipped webkit records
+    # passed having evaluated nothing. Each per_url entry names the stage in
+    # load_stage and carries its summary under that stage's own name.
+    load_stage = "navigate_ms" if engine == "webkit" else "navigate_load_event_ms"
     urls = []
     for m in metas:
         for url in declared_urls(m):
@@ -1949,8 +1961,9 @@ def analyze_backend(
             out["per_url"][url][a] = {
                 "n": len(rows),
                 "blocking_ms": metric_summary(rows, lambda r: r.get("blocking_ms")),
-                "navigate_load_event_ms": metric_summary(
-                    rows, lambda r: render_stage(r, "navigate_load_event_ms")
+                "load_stage": load_stage,
+                load_stage: metric_summary(
+                    rows, lambda r: render_stage(r, load_stage)
                 ),
                 "total_ms": metric_summary(
                     rows, lambda r: render_stage(r, "total_ms")
@@ -1964,7 +1977,7 @@ def analyze_backend(
             }
     if len(urls) > 1:
         print("\n" + "-" * 78)
-        print("PER URL (measured successes: blocking, load event, distinct screenshots)")
+        print(f"PER URL (measured successes: blocking, {load_stage}, distinct screenshots)")
         print("-" * 78)
         for url in urls:
             print(f"  {url}")
@@ -1973,30 +1986,25 @@ def analyze_backend(
                 if not per["n"]:
                     continue
                 blocking = per["blocking_ms"]
-                load_event = per["navigate_load_event_ms"]
+                load = per[load_stage]
                 print(
                     f"    {a:9s} n={per['n']:<4d} blocking "
                     f"{fmt(blocking['median'], blocking['lo'], blocking['hi'])}  "
-                    f"load-event "
-                    f"{fmt(load_event['median'], load_event['lo'], load_event['hi'])}  "
+                    f"{load_stage} "
+                    f"{fmt(load['median'], load['lo'], load['hi'])}  "
                     f"images {per['distinct_image_sha256']}"
                 )
 
     # ---- 4c. stall gate. A load event that takes tens of seconds is the guest
     # waiting on something other than the page (a resolver that never answers,
-    # for one), and one such record inside a pooled median is invisible.
-    engine = next((m.get("engine") or "chromium" for m in metas), "chromium")
-    # cdpdrive times the load event on every successful render. WebDriver
-    # classic exposes no such stage, but its navigate call returns at the
-    # load event, so a stall lands in navigate_ms; an armed gate that
-    # skipped webkit records passed having evaluated nothing.
-    stall_stage = "navigate_ms" if engine == "webkit" else "navigate_load_event_ms"
+    # for one), and one such record inside a pooled median is invisible. The
+    # gate reads the engine-selected load_stage chosen above 4b.
     violations = []
     evaluated = 0
     if stall_max_ms is not None:
         for r in recs:
             arm = r.get("arm")
-            value = render_stage(r, stall_stage)
+            value = render_stage(r, load_stage)
             # A success without the stage has not shown it did not stall.
             must_carry = r.get("ok") is True and is_cdp_class(arm)
             if value is None and not must_carry:
@@ -2008,8 +2016,8 @@ def analyze_backend(
                 violations.append({
                     "url": record_url(r),
                     "arm": arm,
-                    "stage": stall_stage,
-                    stall_stage: value,
+                    "stage": load_stage,
+                    load_stage: value,
                     "rep": r.get("rep"),
                     "warmup": bool(r.get("warmup")),
                     "record_id": r.get("record_id"),
@@ -2021,7 +2029,7 @@ def analyze_backend(
         "violations": violations,
     }
     print("\n" + "-" * 78)
-    print(f"STALL GATE (render.stages.{stall_stage}, every record incl. warmup)")
+    print(f"STALL GATE (render.stages.{load_stage}, every record incl. warmup)")
     print("-" * 78)
     if stall_max_ms is None:
         print("  not evaluated (no --stall-max-ms)")
@@ -2032,7 +2040,7 @@ def analyze_backend(
         for violation in violations:
             print(f"    {violation['arm']:9s} rep={violation['rep']}"
                   f"{' [warmup]' if violation['warmup'] else ''} "
-                  f"{stall_stage}={violation[stall_stage]!r} "
+                  f"{load_stage}={violation[load_stage]!r} "
                   f"url={violation['url']}")
 
     # ---- 5. teardown, three separate numbers, never one
@@ -2274,7 +2282,7 @@ def analyze_backend(
     if not out["stall_gate"]["passed"]:
         reasons.append(
             f"stall_gate: {len(violations)} record(s) exceed or lack "
-            f"{stall_stage} under the {stall_max_ms:g} ms limit"
+            f"{load_stage} under the {stall_max_ms:g} ms limit"
         )
 
     out["gate"] = {

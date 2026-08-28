@@ -7497,6 +7497,70 @@ class AnalyzerPerUrl(unittest.TestCase):
         # The pooled figures the existing consumers read are unchanged.
         self.assertEqual(out["arms"]["cdp"]["blocking_ms"]["median"], 400.0)
         self.assertEqual(out["arms"]["cdp"]["blocking_ms"]["n"], 200)
+        for url in self.URLS:
+            for arm in ("cdp", "cdp-fast", "noop"):
+                self.assertEqual(
+                    out["per_url"][url][arm]["load_stage"], "navigate_load_event_ms",
+                )
+
+    NAVIGATE = {URLS[0]: 180.0, URLS[1]: 360.0}
+
+    @classmethod
+    def write_webkit(cls, path):
+        """The multi-URL fixture reshaped into a webkit run. WebDriver
+        classic exposes no load-event stage; its navigate call returns at
+        the load event, so the load-completing duration is navigate_ms."""
+        AnalyzerResolverGate.write_multi_url(path, cls.URLS, engine="webkit")
+
+        def reshape(row):
+            render = row.get("render")
+            if not isinstance(render, dict):
+                return
+            row["render"] = {
+                "ok": True, "url": render["url"], "format": render["format"],
+                "engine": "webkit", "wd_host": row["endpoint"],
+                "session_prewired": True,
+                "stages": {
+                    "resolve_ms": 0.1, "connect_total_ms": 0.4,
+                    "navigate_ms": cls.NAVIGATE[row["url"]], "screenshot_ms": 1.0,
+                    "total_ms": render["stages"]["total_ms"],
+                },
+                "image_bytes": 1024, "image_sha256": "9" * 64,
+            }
+
+        _rewrite_records(path, reshape)
+
+    def test_a_webkit_run_reports_its_navigate_round_trip_per_url(self):
+        """per_url read navigate_load_event_ms for every engine, so a webkit
+        URL reported n=0 and a null median while its records carried the
+        load-completing duration as navigate_ms, the stage the stall gate
+        already selects by engine. The block now reads that stage and names
+        it in load_stage.
+
+        RED BEFORE THE FIX: KeyError: 'load_stage'; on the same fixture the
+        block's navigate_load_event_ms summary read
+        {"median": null, "lo": null, "hi": null, "n": 0} for every webkit URL.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self.write_webkit(src)
+            rc = _run_analyzer_fast(["--json-out", dst, src])
+            with open(dst) as source:
+                out = json.load(source)
+        self.assertEqual(rc, 0, out["gate"]["reasons"])
+        self.assertEqual(list(out["per_url"]), self.URLS)
+        for url in self.URLS:
+            for arm in ("cdp", "cdp-fast"):
+                cell = out["per_url"][url][arm]
+                self.assertEqual(cell["load_stage"], "navigate_ms", (url, arm))
+                self.assertNotIn("navigate_load_event_ms", cell)
+                self.assertEqual(cell["n"], 100, (url, arm))
+                self.assertEqual(cell["navigate_ms"]["n"], 100, (url, arm))
+                self.assertEqual(cell["navigate_ms"]["median"], self.NAVIGATE[url])
+            noop = out["per_url"][url]["noop"]
+            self.assertEqual(noop["load_stage"], "navigate_ms")
+            self.assertEqual(noop["navigate_ms"]["n"], 0)
 
     def test_a_single_url_run_reports_its_one_url(self):
         with tempfile.TemporaryDirectory() as d:
