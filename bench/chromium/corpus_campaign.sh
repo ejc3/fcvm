@@ -42,6 +42,12 @@ WARMUP="${WARMUP:-28}"          # two full 14-URL cycles; the harness fails clos
 UFFD_MODE="${UFFD_MODE:-minor}"
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 BACKEND="${BACKEND:-uffd}"
+# Arms reqanalyze's stall gate for the measured run. A corpus page replays
+# from the host and its load event completes in well under a second; a
+# resolver that never answers holds a navigation for ~30 s. 15 s separates
+# the two, and campaign_summary refuses an analysis whose gate was never
+# armed, so an unset value here would make every run un-indexable.
+STALL_MAX_MS="${STALL_MAX_MS:-15000}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULTS="${RESULTS:-$REPO/bench/chromium/results/reqbench-$STAMP-corpus}"
 LOGDIR="${LOGDIR:-/tmp/corpus-campaign-$STAMP}"
@@ -49,6 +55,10 @@ mkdir -p "$LOGDIR"
 # Created here, not left to reqbench: the replay server's logs and the resolver
 # evidence below are written into it before any reqbench phase runs.
 mkdir -p "$RESULTS"
+# An explicit RESULTS can be reused. Evidence an earlier campaign left there
+# must not outlive this one's start: a clean verdict beside a run this
+# campaign never finished would be indexed as if it were this run's.
+rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log
 
 # The 14 URLs, in the order the sealed 2026-08-14 run cycled them. Order is part
 # of the schedule: reqanalyze re-derives the expected URL per record from it, so
@@ -71,9 +81,11 @@ say() { printf '\n=== %s\n' "$*"; }
 #      DNS_SAMPLE_INTERVAL seconds while the run is in flight
 #      ($RESULTS/dns-owner.log).
 #   3. $RESULTS/dns-evidence.json ties them together with the replay server's
-#      own DNS and access logs (sha256) and a verdict: "clean" only when every
-#      bracket passed, every sample names this campaign's corpus_serve with
-#      dnsmasq inactive, and dnsmasq is still down after the clone restores.
+#      own DNS and access logs (sha256) and a verdict: "clean" only when all
+#      three brackets are present and passed, every sample names this
+#      campaign's corpus_serve with dnsmasq inactive, the sampler lived until
+#      the run ended, both replay logs exist, and dnsmasq is inactive after
+#      the clone restores.
 engine_target() {
     # $1 = golden | verify | run
     printf 'bench-%s-request-%s' "$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)" "$1"
@@ -92,7 +104,10 @@ run_verify() {
     # AND the evidence it left says passed=true.
     local stage="$1" copy="$RESULTS/verify-dns-$1.json" f
     say "verify ($stage): render hops + baked resolver on a restored clone"
-    rm -f "$RESULTS/verify-dns.json"
+    # Both removed first: this function runs as `run_verify X || ...`, where
+    # bash keeps errexit off, so an unchecked cp that failed would leave the
+    # jq below validating whatever copy was already there.
+    rm -f "$RESULTS/verify-dns.json" "$copy"
     if ! VERIFY_DNS_HOSTS="$CORPUS_HOSTS" VERIFY_DNS_ANSWER=10.0.2.2 VERIFY_DNS_URLS="$URLS" \
         TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" \
         make -C "$REPO" "$(engine_target verify)" 2>&1 | tee "$LOGDIR/verify-$stage.log"; then
@@ -105,45 +120,63 @@ run_verify() {
     done
     [ -s "$RESULTS/verify-dns.json" ] \
         || { echo "FAILED: verify ($stage) left no $RESULTS/verify-dns.json (HOP D did not run)" >&2; return 1; }
-    cp "$RESULTS/verify-dns.json" "$copy"
-    jq -e '.passed == true' "$copy" >/dev/null \
-        || { echo "FAILED: verify ($stage): $copy records passed=false" >&2; return 1; }
+    cp "$RESULTS/verify-dns.json" "$copy" \
+        || { echo "FAILED: verify ($stage): cannot keep the evidence as $copy" >&2; return 1; }
+    # passed=true is also what HOP D writes when it was given nothing to
+    # check; the bracket must show the replay resolver and every corpus host
+    # and URL answered through it.
+    jq -e --arg hosts "$CORPUS_HOSTS" --arg urls "$URLS" '
+        . as $e
+        | .passed == true and .dns_server == "10.0.2.2"
+        and all($hosts | split(",")[]; . as $h | $e.hosts[$h].ok == true)
+        and all($urls | split(",")[]; . as $u | $e.urls[$u].ok == true)' "$copy" >/dev/null \
+        || { echo "FAILED: verify ($stage): $copy does not record passed=true through 10.0.2.2 for every corpus host and URL" >&2; return 1; }
 }
 
 DNS_SAMPLE_INTERVAL="${DNS_SAMPLE_INTERVAL:-10}"
 SAMPLER_PID=""
+SAMPLER_ALIVE_AT_STOP=""
 
 dns_owner_sample() {
     # One line: "<utc ts> owner_pid=<pid|none> dnsmasq=<state>". The local
     # address is matched exactly: systemd-resolved (127.0.0.53) and dnsmasq's
     # per-interface listeners share the port. sudo is what makes ss show the
     # pid behind a root-owned socket; -n so a missing grant fails the sample
-    # (owner none, verdict unclean) instead of hanging the sampler on a prompt.
-    local owner state
-    owner=$(sudo -n ss -lnup 'sport = :53' 2>/dev/null \
-        | awk '$4 == "127.0.0.1:53" && match($0, /pid=[0-9]+/) { print substr($0, RSTART + 4, RLENGTH - 4); exit }')
+    # instead of hanging the sampler on a prompt. A sample that cannot be
+    # taken returns 1 and ends the sampler (below), which the evidence
+    # records as unclean.
+    local listing owner state
+    listing=$(sudo -n ss -lnup 'sport = :53' 2>/dev/null) || return 1
+    owner=$(awk '$4 == "127.0.0.1:53" && match($0, /pid=[0-9]+/) { print substr($0, RSTART + 4, RLENGTH - 4); exit }' <<<"$listing")
     state=$(systemctl is-active dnsmasq 2>/dev/null) || state="${state:-unknown}"
     printf '%s owner_pid=%s dnsmasq=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${owner:-none}" "$state"
 }
 
 dns_owner_sampler() {
-    # $1 = log; runs until killed.
+    # $1 = log; runs until killed, or until a sample cannot be taken.
     while :; do
-        dns_owner_sample >>"$1"
+        dns_owner_sample >>"$1" || exit 1
         sleep "$DNS_SAMPLE_INTERVAL"
     done
 }
 
 start_dns_sampler() {
     : >"$RESULTS/dns-owner.log"
+    SAMPLER_ALIVE_AT_STOP=""
     dns_owner_sampler "$RESULTS/dns-owner.log" &
     SAMPLER_PID=$!
 }
 
 stop_dns_sampler() {
+    # The sampler's exit status says what ended it: 143 is this SIGTERM,
+    # anything else means it died on its own before the run ended, and the
+    # samples it left cover only part of the run. `kill -0` cannot tell
+    # the two apart (a dead, unreaped child still answers it).
     [ -n "$SAMPLER_PID" ] || return 0
+    local status=0
     kill "$SAMPLER_PID" 2>/dev/null || true
-    wait "$SAMPLER_PID" 2>/dev/null || true
+    wait "$SAMPLER_PID" 2>/dev/null || status=$?
+    if [ "$status" -eq 143 ]; then SAMPLER_ALIVE_AT_STOP=yes; else SAMPLER_ALIVE_AT_STOP=no; fi
     SAMPLER_PID=""
 }
 
@@ -159,11 +192,17 @@ sha256_or_empty() {
 
 write_dns_evidence() {
     # $1 = clean | unclean from the verify brackets, $2 = optional reason.
-    # The samples, the dnsmasq state and an absence of samples can only lower
-    # the verdict, never lift it. Prints the final verdict.
+    # Everything checked here can only lower the verdict, never lift it:
+    # the samples and whether the sampler lived to the stop, the dnsmasq
+    # state, the three bracket files and the two replay logs. Prints the
+    # final verdict; a verdict that could not be written is unclean and the
+    # function returns 1.
     local verdict="$1" reason="${2:-}" log="$RESULTS/dns-owner.log"
-    local samples=0 first_mismatch="" before=false after=false f
+    local out="$RESULTS/dns-evidence.json"
+    local samples=0 first_mismatch="" before=false after=false after_state f
+    local sampler_alive=false
     [ "$DNSMASQ_WAS_ACTIVE" = yes ] && before=true
+    [ "$SAMPLER_ALIVE_AT_STOP" = yes ] && sampler_alive=true
     if [ -s "$log" ]; then
         samples=$(wc -l <"$log")
         first_mismatch=$(dns_first_mismatch "$log" "$SERVE_PID")
@@ -172,32 +211,56 @@ write_dns_evidence() {
         verdict=unclean; reason="${reason:-no 127.0.0.1:53 owner samples were taken}"
     elif [ -n "$first_mismatch" ]; then
         verdict=unclean; reason="${reason:-a sample did not name corpus_serve $SERVE_PID with dnsmasq inactive}"
+    elif [ "$sampler_alive" != true ]; then
+        verdict=unclean; reason="${reason:-the :53 owner sampler died before the measured run ended}"
     fi
     # "after restore" is the clone restores of the measured run: read before
-    # the exit trap starts dnsmasq again, so true means something restarted it
-    # while clones were being measured.
-    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
-        after=true; verdict=unclean; reason="${reason:-dnsmasq is active after the clone restores}"
+    # the exit trap starts dnsmasq again. Only "inactive" is clean: active
+    # means something restarted it while clones were being measured, and
+    # failed, activating, unknown or no answer from systemd is not evidence
+    # of absence.
+    after_state=$(systemctl is-active dnsmasq 2>/dev/null) || true
+    after_state="${after_state:-unknown}"
+    [ "$after_state" = active ] && after=true
+    if [ "$after_state" != inactive ]; then
+        verdict=unclean; reason="${reason:-dnsmasq is $after_state after the clone restores, not inactive}"
     fi
     local -a files=()
     for f in pre before-run after-run; do
         if [ -f "$RESULTS/verify-dns-$f.json" ]; then files+=("$RESULTS/verify-dns-$f.json"); fi
+        if ! jq -e '.passed == true' "$RESULTS/verify-dns-$f.json" >/dev/null 2>&1; then
+            verdict=unclean; reason="${reason:-the $f verify bracket is missing or did not pass}"
+        fi
     done
-    jq -n --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
+    for f in corpus-dns.log corpus-access.log; do
+        if [ ! -s "$RESULTS/$f" ]; then
+            verdict=unclean; reason="${reason:-replay log $f is missing or empty}"
+        fi
+    done
+    if ! jq -n --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
+        --arg after_state "$after_state" --argjson sampler_alive "$sampler_alive" \
         --argjson samples "$samples" --argjson interval "$DNS_SAMPLE_INTERVAL" \
         --arg first "$first_mismatch" --arg reason "$reason" --arg owner_log "$log" \
         --arg dns_sha "$(sha256_or_empty "$RESULTS/corpus-dns.log")" \
         --arg access_sha "$(sha256_or_empty "$RESULTS/corpus-access.log")" \
         --arg verdict "$verdict" --args \
         '{serve_pid: $serve_pid, dnsmasq_was_active_before: $before,
-          dnsmasq_active_after_restore: $after, samples: $samples,
+          dnsmasq_active_after_restore: $after,
+          dnsmasq_state_after_restore: $after_state,
+          sampler_alive_at_stop: $sampler_alive, samples: $samples,
           sample_interval_s: $interval, owner_log: $owner_log,
           first_mismatch: (if $first == "" then null else $first end),
           verify_files: $ARGS.positional,
           corpus_dns_log_sha256: (if $dns_sha == "" then null else $dns_sha end),
           corpus_access_log_sha256: (if $access_sha == "" then null else $access_sha end),
           reason: (if $reason == "" then null else $reason end),
-          verdict: $verdict}' "${files[@]}" >"$RESULTS/dns-evidence.json"
+          verdict: $verdict}' "${files[@]}" >"$out.tmp" \
+        || ! mv "$out.tmp" "$out"; then
+        rm -f "$out.tmp"
+        echo "FAILED: cannot write $out" >&2
+        printf 'unclean\n'
+        return 1
+    fi
     printf '%s\n' "$verdict"
 }
 
@@ -259,19 +322,18 @@ if systemctl is-active --quiet dnsmasq 2>/dev/null; then
 fi
 SERVE_PID=""
 
-cleanup() {
-    set +e
-    # The sampler is a background subshell of this script; nothing else reaps
-    # it when the campaign dies mid-run.
-    stop_dns_sampler
+stop_corpus_serve() {
     # `sudo kill -0`, not bare `kill -0`: corpus_serve runs as root (sudo -b)
     # while this script does not, so an unprivileged liveness probe gets EPERM
     # and the guard is ALWAYS false. The server then survives holding
-    # 127.0.0.1:53/80/443, the `systemctl start dnsmasq` below cannot bind, and
-    # the next run picks up the leaked pid and records DNSMASQ_WAS_ACTIVE=no.
+    # 127.0.0.1:53/80/443, the `systemctl start dnsmasq` in cleanup cannot
+    # bind, and the next run picks up the leaked pid and records
+    # DNSMASQ_WAS_ACTIVE=no. Called before the evidence is written (so the
+    # replay-log hashes name files nothing appends to afterwards) and again
+    # from the exit trap, which finds it already gone.
     if [ -n "$SERVE_PID" ] && sudo kill -0 "$SERVE_PID" 2>/dev/null; then
         say "stopping corpus_serve ($SERVE_PID)"
-        sudo kill "$SERVE_PID" 2>/dev/null
+        sudo kill "$SERVE_PID" 2>/dev/null || true
         # Not `wait`: the server is not a child of this shell (sudo -b detached
         # it), so wait returns immediately and proves nothing. Poll instead.
         for _ in $(seq 1 50); do
@@ -280,9 +342,17 @@ cleanup() {
         done
         if sudo kill -0 "$SERVE_PID" 2>/dev/null; then
             say "corpus_serve $SERVE_PID did not exit; escalating to SIGKILL"
-            sudo kill -9 "$SERVE_PID" 2>/dev/null
+            sudo kill -9 "$SERVE_PID" 2>/dev/null || true
         fi
     fi
+}
+
+cleanup() {
+    set +e
+    # The sampler is a background subshell of this script; nothing else reaps
+    # it when the campaign dies mid-run.
+    stop_dns_sampler
+    stop_corpus_serve
     if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
         say "restarting dnsmasq"
         # Retry and REPORT. corpus_serve can still be releasing :53 as this runs
@@ -445,16 +515,18 @@ start_dns_sampler
 run_rc=0
 TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
     UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
-    RESULTS="$RESULTS" ENGINE="$ENGINE" \
+    STALL_MAX_MS="$STALL_MAX_MS" RESULTS="$RESULTS" ENGINE="$ENGINE" \
     make -C "$REPO" "$(engine_target run)" 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
 stop_dns_sampler
 
 # The run's own exit is not the verdict: a run that measured cleanly against
 # the wrong resolver is worse than one that failed, so the after-run bracket
-# and the evidence are written whatever the run returned.
+# and the evidence are written whatever the run returned. The replay server
+# stops before the evidence hashes its logs.
 after_rc=0
 run_verify after-run || after_rc=$?
-verdict=$(write_dns_evidence "$([ "$after_rc" -eq 0 ] && echo clean || echo unclean)")
+stop_corpus_serve
+verdict=$(write_dns_evidence "$([ "$after_rc" -eq 0 ] && echo clean || echo unclean)") || verdict=unclean
 say "dns evidence: verdict=$verdict ($RESULTS/dns-evidence.json)"
 if [ "$run_rc" -ne 0 ] || [ "$after_rc" -ne 0 ] || [ "$verdict" != clean ]; then
     echo "FAILED: measured run exit $run_rc, after-run verify exit $after_rc, dns verdict $verdict" >&2

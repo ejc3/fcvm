@@ -322,6 +322,7 @@ exit "${MAKE_RC:-0}"
     # the SS_CHANGE_AT-th call on.
     FAKE_SS = """#!/bin/bash
 n=$(cat "$SS_CALLS" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$SS_CALLS"
+if [ -n "${SS_FAIL_AT:-}" ] && [ "$n" -ge "$SS_FAIL_AT" ]; then exit 1; fi
 pid="$SS_OWNER"
 if [ -n "${SS_CHANGE_AT:-}" ] && [ "$n" -ge "$SS_CHANGE_AT" ]; then pid="$SS_OTHER"; fi
 cat <<SSOUT
@@ -339,6 +340,30 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
 [ "$FAKE_DNSMASQ_STATE" = active ] && exit 0 || exit 3
 """
     FAKE_SUDO = '#!/bin/bash\n[ "${1:-}" = -n ] && shift\nexec "$@"\n'
+
+    @staticmethod
+    def _hosts_of(urls: str) -> list:
+        hosts = []
+        for url in urls.split(","):
+            host = url.split("://", 1)[1].split("/", 1)[0]
+            if host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    def _bracket_evidence(self, corpus_urls: str, **overrides) -> str:
+        """verify-dns.json as HOP D writes it for a passing corpus clone."""
+        evidence = {
+            "dns_server": "10.0.2.2",
+            "resolv_conf_vm": "nameserver 10.0.2.2\n",
+            "resolv_conf_container": "nameserver 10.0.2.2\n",
+            "hosts": {h: {"answer": "10.0.2.2", "ok": True}
+                      for h in self._hosts_of(corpus_urls)},
+            "urls": {u: {"status": 200, "ok": True} for u in corpus_urls.split(",")},
+            "timestamp": "2026-08-28T00:00:00Z",
+            "passed": True,
+        }
+        evidence.update(overrides)
+        return json.dumps(evidence)
 
     def _helpers(self) -> str:
         block = self.HELPERS.search(campaign())
@@ -402,7 +427,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                 hosts.append(host)
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
-            env["MAKE_VERIFY_JSON"] = '{"passed": true}'
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
             script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n{self._helpers()}\n'
                       'CORPUS_HOSTS=$(corpus_hosts)\nrun_verify pre\necho VERIFIED\n')
             result = self._run(script, env)
@@ -419,7 +444,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-verify", handle.read())
             with open(os.path.join(results, "verify-dns-pre.json")) as handle:
-                self.assertEqual(json.load(handle), {"passed": True})
+                self.assertEqual(json.load(handle), json.loads(env["MAKE_VERIFY_JSON"]))
 
     def test_verify_refuses_failed_or_missing_resolver_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -427,7 +452,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             base = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{self._urls()}"\n{self._helpers()}\n'
                     'CORPUS_HOSTS=$(corpus_hosts)\n')
             # verify's make exits 0 but HOP D recorded passed=false.
-            env["MAKE_VERIFY_JSON"] = '{"passed": false}'
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(self._urls(), passed=False)
             result = self._run(base + "run_verify before-run\necho VERIFIED\n", env)
             self.assertNotEqual(result.returncode, 0, "passed=false was accepted")
             self.assertNotIn("VERIFIED", result.stdout)
@@ -441,10 +466,136 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             self.assertIn("verify-dns.json", result.stderr)
             # verify's make itself failed.
             env["MAKE_RC"] = "1"
-            env["MAKE_VERIFY_JSON"] = '{"passed": true}'
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(self._urls())
             result = self._run(base + "run_verify pre\necho VERIFIED\n", env)
             self.assertNotEqual(result.returncode, 0, "a failed verify make was accepted")
             self.assertNotIn("VERIFIED", result.stdout)
+
+    def test_a_bracket_that_asserted_nothing_is_refused(self):
+        """`passed: true` is what HOP D writes when it was given nothing to
+        check. run_verify accepted it, so a bracket with an empty host list
+        (or a resolver other than the replay's, or a host it never asked
+        about) read as clean.
+
+        RED BEFORE THE FIX: `{"passed": true}` and the other three shapes
+        all printed VERIFIED with exit 0.
+        """
+        urls = self._urls()
+        hosts = self._hosts_of(urls)
+        partial = json.loads(self._bracket_evidence(urls))
+        del partial["hosts"][hosts[-1]]
+        cases = {
+            "asserted nothing": '{"passed": true}',
+            "another resolver": self._bracket_evidence(urls, dns_server="10.0.2.3"),
+            "a host never asked": json.dumps(partial),
+            "a url that failed": self._bracket_evidence(
+                urls, urls={u: {"status": 404, "ok": False} for u in urls.split(",")}),
+        }
+        for label, evidence in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, _results = self._fakes(tmp)
+                env["MAKE_VERIFY_JSON"] = evidence
+                script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                          f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                          'run_verify pre\necho VERIFIED\n')
+                result = self._run(script, env)
+                self.assertNotEqual(result.returncode, 0,
+                                    f"{label}: accepted\n{result.stdout}")
+                self.assertNotIn("VERIFIED", result.stdout)
+
+    def test_a_stale_read_only_bracket_copy_cannot_stand_in(self):
+        """run_verify is called as `run_verify pre || campaign_fail ...`, and
+        bash turns errexit off inside a function invoked that way. The copy
+        into verify-dns-<stage>.json was unchecked, so when it failed the
+        `jq -e` that follows validated whatever copy was already there.
+
+        RED BEFORE THE FIX: VERIFIED printed, exit 0, over a bracket whose
+        fresh evidence says passed=false.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            stale = os.path.join(results, "verify-dns-pre.json")
+            with open(stale, "w") as handle:
+                handle.write(self._bracket_evidence(urls))
+            os.chmod(stale, 0o444)
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls, passed=False)
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre || { echo REFUSED; exit 7; }\necho VERIFIED\n')
+            try:
+                result = self._run(script, env)
+            finally:
+                if os.path.exists(stale):
+                    os.chmod(stale, 0o644)
+            self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+            self.assertNotIn("VERIFIED", result.stdout)
+            with open(stale) as handle:
+                self.assertIs(json.load(handle)["passed"], False,
+                              "the stale copy survived under the stage name")
+
+    def test_the_run_sub_make_receives_the_stall_limit(self):
+        """reqanalyze's stall gate is armed by STALL_MAX_MS, and
+        campaign_summary refuses an analysis whose gate was never armed;
+        the campaign passed nothing, so every run it produced was
+        un-indexable by construction.
+
+        RED BEFORE THE FIX: no STALL_MAX_MS default line in the campaign,
+        and the run's make saw no STALL_MAX_MS.
+        """
+        body = campaign()
+        default = re.search(r'^STALL_MAX_MS="\$\{STALL_MAX_MS:-(\d+)\}"$', body, re.M)
+        self.assertIsNotNone(default, "the campaign sets no STALL_MAX_MS default")
+        self.assertEqual(default.group(1), "15000")
+        block = re.search(r'(TAG="\$TAG" URL="\$URLS" BACKEND=.*?\|\| run_rc=\$\?)',
+                          body, re.S)
+        self.assertIsNotNone(block, "the measured run invocation is gone")
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            env.pop("STALL_MAX_MS", None)
+            script = ('set -euo pipefail\nsay() { :; }\n'
+                      f'URLS="{self._urls()}"\nBACKEND=uffd\nUFFD_MODE=minor\n'
+                      'UFFD_PREFETCH=on\nARMS=noop,cdp\nREPS=1\nWARMUP=1\n'
+                      f'{default.group(0)}\n{self._helpers()}\nrun_rc=0\n'
+                      f'{block.group(1)}\necho "run_rc=$run_rc"\n')
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            seen = self._make_env(env)
+            self.assertEqual(seen.get("STALL_MAX_MS"), "15000")
+            self.assertEqual(seen.get("RESULTS"), results)
+            with open(env["MAKE_ARGV"]) as handle:
+                self.assertIn("bench-chromium-request-run", handle.read())
+
+    def test_stale_evidence_from_an_earlier_campaign_is_cleared_at_start(self):
+        """An explicit RESULTS can be reused. A clean dns-evidence.json left
+        by an earlier campaign, beside a run this campaign never finished,
+        would be indexed as if it were this run's.
+
+        RED BEFORE THE FIX: the block after `mkdir -p "$RESULTS"` removed
+        nothing.
+        """
+        block = re.search(r'(mkdir -p "\$RESULTS"\n(?:#[^\n]*\n)*rm -f [^\n]*\n)',
+                          campaign())
+        self.assertIsNotNone(block, "the campaign does not clear stale evidence at start")
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            stale = ["dns-evidence.json", "verify-dns-after-run.json",
+                     "verify-dns.json", "dns-owner.log"]
+            for name in stale:
+                with open(os.path.join(results, name), "w") as handle:
+                    handle.write('{"verdict": "clean", "passed": true}\n')
+            with open(os.path.join(results, "analysis.json"), "w") as handle:
+                handle.write("{}\n")
+            result = subprocess.run(
+                ["bash", "-c", f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in stale:
+                self.assertFalse(os.path.exists(os.path.join(results, name)),
+                                 f"stale {name} survived the campaign start")
+            self.assertTrue(os.path.exists(os.path.join(results, "analysis.json")),
+                            "the start wiped more than the evidence")
 
     def test_the_golden_sub_make_receives_results_and_the_baked_resolver(self):
         block = self.GOLDEN.search(campaign())
@@ -486,15 +637,42 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         self.assertLess(run, sampler_off, "sampler stops before the measured run")
         self.assertLess(sampler_off, after, "after-run verify runs under the sampler")
         self.assertLess(after, evidence, "evidence is written before the after-run verify")
+        # The evidence hashes the replay server's logs; a server still
+        # serving appends after the hash. It stops first, and the exit trap
+        # finds it already gone.
+        serve_off = body.index("stop_corpus_serve\n", after)
+        self.assertLess(serve_off, evidence,
+                        "the replay logs are hashed while corpus_serve still writes them")
+        call = body[evidence:body.index("\n", evidence)]
+        self.assertIn("|| verdict=unclean", call,
+                      "an evidence write that fails must not leave verdict=clean: " + call)
         cleanup = body.split("cleanup() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn("stop_dns_sampler", cleanup,
                       "a campaign that dies mid-run leaks the sampler")
+        self.assertIn("stop_corpus_serve", cleanup,
+                      "a campaign that dies mid-run leaks the replay server")
 
-    def _sample(self, env, results, verdict_in="clean", seconds=0.6):
+    BRACKETS = ("pre", "before-run", "after-run")
+    REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log")
+
+    def _leave_files(self, results, brackets=BRACKETS, logs=REPLAY_LOGS,
+                     bracket_passed=True):
+        """What the campaign leaves in $RESULTS before write_dns_evidence."""
+        for stage in brackets:
+            with open(os.path.join(results, f"verify-dns-{stage}.json"), "w") as handle:
+                handle.write(json.dumps({"passed": bracket_passed}) + "\n")
+        for name in logs:
+            with open(os.path.join(results, name), "w") as handle:
+                handle.write(name + "\n")
+
+    def _sample(self, env, results, verdict_in="clean", seconds=0.6, mid_run="",
+                files=True):
+        if files:
+            self._leave_files(results)
         script = (f'set -u\n{self._helpers()}\n'
                   f'RESULTS="{results}"\nSERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\n'
                   'DNS_SAMPLE_INTERVAL=0.05\nstart_dns_sampler\n'
-                  f'sleep {seconds}\nstop_dns_sampler\n'
+                  f'sleep {seconds}\n{mid_run}\nstop_dns_sampler\n'
                   f'write_dns_evidence {verdict_in}\n')
         result = self._run(script, env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -519,24 +697,125 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
     def test_a_steady_owner_with_dnsmasq_down_is_clean(self):
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
-            for name in ("corpus-dns.log", "corpus-access.log"):
-                with open(os.path.join(results, name), "w") as handle:
-                    handle.write(name + "\n")
-            with open(os.path.join(results, "verify-dns-pre.json"), "w") as handle:
-                handle.write('{"passed": true}\n')
             evidence, _ = self._sample(env, results)
             self.assertEqual(evidence["verdict"], "clean", evidence)
             self.assertEqual(evidence["serve_pid"], 4242)
             self.assertIs(evidence["dnsmasq_was_active_before"], True)
             self.assertIs(evidence["dnsmasq_active_after_restore"], False)
+            self.assertEqual(evidence["dnsmasq_state_after_restore"], "inactive")
+            self.assertIs(evidence["sampler_alive_at_stop"], True)
             self.assertGreaterEqual(evidence["samples"], 3)
             self.assertIsNone(evidence["first_mismatch"])
             self.assertEqual(evidence["verify_files"],
-                             [os.path.join(results, "verify-dns-pre.json")])
+                             [os.path.join(results, f"verify-dns-{s}.json")
+                              for s in self.BRACKETS])
             for key, name in (("corpus_dns_log_sha256", "corpus-dns.log"),
                               ("corpus_access_log_sha256", "corpus-access.log")):
                 self.assertEqual(evidence[key],
                                  hashlib.sha256((name + "\n").encode()).hexdigest())
+
+    def test_a_missing_or_failed_bracket_is_unclean(self):
+        """Three brackets run; a verdict built from fewer is a verdict over a
+        run whose resolver went unproven on one side.
+
+        RED BEFORE THE FIX: verdict clean with two brackets, and clean with a
+        bracket that recorded passed=false.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results, brackets=("pre", "before-run"))
+            evidence, _ = self._sample(env, results, files=False)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIn("after-run", evidence["reason"])
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results, bracket_passed=False)
+            evidence, _ = self._sample(env, results, files=False)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIn("pre", evidence["reason"])
+
+    def test_a_missing_or_empty_replay_log_is_unclean(self):
+        """The replay server's own logs are the other half of the evidence;
+        a null hash was recorded without lowering the verdict.
+
+        RED BEFORE THE FIX: verdict clean with corpus_dns_log_sha256 null.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results, logs=("corpus-access.log",))
+            evidence, _ = self._sample(env, results, files=False)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIsNone(evidence["corpus_dns_log_sha256"])
+            self.assertIn("corpus-dns.log", evidence["reason"])
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results)
+            open(os.path.join(results, "corpus-access.log"), "w").close()
+            evidence, _ = self._sample(env, results, files=False)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIn("corpus-access.log", evidence["reason"])
+
+    def test_a_sampler_that_died_mid_run_is_unclean(self):
+        """One clean sample followed by a dead sampler was accepted: the
+        evidence required samples > 0 and no mismatch, nothing about the
+        sampler covering the run. Its exit status now says whether the
+        stop is what ended it; a sample that cannot be taken (sudo -n
+        refused, ss missing) ends it on its own, with or without errexit.
+
+        RED BEFORE THE FIX: verdict clean, and KeyError: 'sampler_alive_at_stop'.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            env["SS_FAIL_AT"] = "3"
+            evidence, _ = self._sample(env, results)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIs(evidence["sampler_alive_at_stop"], False)
+            self.assertGreaterEqual(evidence["samples"], 2)
+            self.assertIsNone(evidence["first_mismatch"])
+            with open(os.path.join(results, "dns-owner.log")) as handle:
+                lines = handle.read().splitlines()
+            self.assertEqual(len(lines), 2, "the sampler kept going after a failed sample")
+            self.assertIn("sampler", evidence["reason"])
+
+    def test_an_unknown_dnsmasq_state_after_the_run_is_unclean(self):
+        """`systemctl is-active --quiet` exits non-zero for failed,
+        activating and unknown alike, and all of them read as inactive.
+
+        RED BEFORE THE FIX: verdict clean with dnsmasq state unknown.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp, dnsmasq="unknown")
+            evidence, _ = self._sample(env, results)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertEqual(evidence["dnsmasq_state_after_restore"], "unknown")
+            self.assertIs(evidence["dnsmasq_active_after_restore"], False)
+
+    def test_an_unwritable_evidence_file_is_an_unclean_verdict(self):
+        """write_dns_evidence printed its verdict after the write, whatever
+        the write did; a failed jq or redirect still yielded `clean` and a
+        campaign exit of 0 with no evidence on disk.
+
+        RED BEFORE THE FIX: stdout `clean`, exit 0.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results)
+            with open(os.path.join(results, "dns-owner.log"), "w") as handle:
+                handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n")
+            os.chmod(results, 0o555)
+            script = (f'set -u\n{self._helpers()}\nRESULTS="{results}"\n'
+                      'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\nSAMPLER_ALIVE_AT_STOP=yes\n'
+                      'write_dns_evidence clean\n')
+            try:
+                result = self._run(script, env)
+            finally:
+                os.chmod(results, 0o755)
+            self.assertNotEqual(result.returncode, 0, "a failed evidence write returned 0")
+            self.assertEqual(result.stdout.strip(), "unclean")
+            self.assertEqual(sorted(os.listdir(results)),
+                             sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log"]
+                                    + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
+                             "a partial evidence file or temp file was left behind")
 
     def test_a_bracket_failure_cannot_be_lifted_by_clean_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
