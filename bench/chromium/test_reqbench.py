@@ -7813,17 +7813,41 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
 
     @staticmethod
     def _evidence(run_dir, verdict):
+        """dns-evidence.json plus every file it names, as the campaign leaves them."""
+        verify_files = []
+        for stage in ("pre", "before-run", "after-run"):
+            path = os.path.join(run_dir, f"verify-dns-{stage}.json")
+            with open(path, "w") as handle:
+                json.dump({
+                    "dns_server": "10.0.2.2", "resolv_conf_vm": "nameserver 10.0.2.2\n",
+                    "resolv_conf_container": "nameserver 10.0.2.2\n",
+                    "hosts": {"example.com": {"answer": "10.0.2.2", "ok": True}},
+                    "urls": {"https://example.com/": {"status": 200, "ok": True}},
+                    "timestamp": "2026-08-28T00:00:00Z", "passed": True,
+                }, handle)
+            verify_files.append(path)
+        hashes = {}
+        for name in ("corpus-dns.log", "corpus-access.log"):
+            path = os.path.join(run_dir, name)
+            with open(path, "w") as handle:
+                handle.write('{"ts": 1.0}\n')
+            with open(path, "rb") as handle:
+                hashes[name] = hashlib.sha256(handle.read()).hexdigest()
+        with open(os.path.join(run_dir, "dns-owner.log"), "w") as handle:
+            handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n" * 12)
         return {
             "serve_pid": 4242,
             "dnsmasq_was_active_before": True,
             "dnsmasq_active_after_restore": False,
+            "dnsmasq_state_after_restore": "inactive",
+            "sampler_alive_at_stop": True,
             "samples": 12,
             "sample_interval_s": 10,
             "owner_log": os.path.join(run_dir, "dns-owner.log"),
             "first_mismatch": None,
-            "verify_files": [os.path.join(run_dir, "verify-dns-pre.json")],
-            "corpus_dns_log_sha256": "0" * 64,
-            "corpus_access_log_sha256": "0" * 64,
+            "verify_files": verify_files,
+            "corpus_dns_log_sha256": hashes["corpus-dns.log"],
+            "corpus_access_log_sha256": hashes["corpus-access.log"],
             "reason": None,
             "verdict": verdict,
         }
@@ -7882,6 +7906,10 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(cell["headline"]["cdp"]["n"], 200)
         self.assertEqual(
             {os.path.basename(entry["path"]) for entry in index["generated_from"]},
-            {"analysis.json", "dns-evidence.json"},
+            {
+                "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
+                "verify-dns-before-run.json", "verify-dns-after-run.json",
+                "dns-owner.log", "corpus-dns.log", "corpus-access.log",
+            },
         )
 

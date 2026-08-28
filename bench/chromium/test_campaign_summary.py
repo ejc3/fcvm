@@ -109,6 +109,24 @@ class EvidenceIgnoreRules(unittest.TestCase):
                 self.assertTrue(self._ignored(relative), f"{relative} is not ignored")
 
 
+VERIFY_STAGES = ("pre", "before-run", "after-run")
+CORPUS_LOGS = ("corpus-dns.log", "corpus-access.log")
+
+
+def write_verify(path, passed=True):
+    """One HOP D evidence file in reqbench.sh's shape."""
+    with open(path, "w") as handle:
+        json.dump({
+            "dns_server": "10.0.2.2",
+            "resolv_conf_vm": "nameserver 10.0.2.2\n",
+            "resolv_conf_container": "nameserver 10.0.2.2\n",
+            "hosts": {"example.com": {"answer": "10.0.2.2", "ok": passed}},
+            "urls": {"https://example.com/": {"status": 200, "ok": passed}},
+            "timestamp": "2026-08-28T00:00:00Z",
+            "passed": passed,
+        }, handle)
+
+
 def write_run(
     run_dir,
     *,
@@ -120,12 +138,18 @@ def write_run(
     engine="chromium",
     stall_max_ms=15000,
     stall_evaluated=404,
+    samples=12,
+    evidence_overrides=None,
 ):
     """A minimal run directory shaped like reqanalyze + the campaign evidence.
 
-    dns_verdict=None omits dns-evidence.json; diag=None omits diag/summary.json.
-    stall_max_ms=None is what reqanalyze writes when it ran without
-    --stall-max-ms (passed true, evaluated 0).
+    dns_verdict=None omits dns-evidence.json and everything it names; diag=None
+    omits diag/summary.json. stall_max_ms=None is what reqanalyze writes when
+    it ran without --stall-max-ms (passed true, evaluated 0). The evidence
+    names three passing verify brackets, an owner log with `samples` lines
+    and the two replay logs with their real sha256, the way
+    corpus_campaign.sh writes them; evidence_overrides rewrites fields on top.
+    Returns every path the index is expected to read.
     """
     os.makedirs(run_dir, exist_ok=True)
     analysis = {
@@ -162,9 +186,45 @@ def write_run(
     with open(paths["analysis"], "w") as handle:
         json.dump(analysis, handle)
     if dns_verdict is not None:
+        verify_files = []
+        for stage in VERIFY_STAGES:
+            verify_path = os.path.join(run_dir, f"verify-dns-{stage}.json")
+            write_verify(verify_path)
+            paths[f"verify-{stage}"] = verify_path
+            verify_files.append(verify_path)
+        hashes = {}
+        for name in CORPUS_LOGS:
+            log_path = os.path.join(run_dir, name)
+            with open(log_path, "w") as handle:
+                handle.write('{"ts": 1.0, "qname": "example.com"}\n')
+            paths[name] = log_path
+            hashes[name] = sha256_file(log_path)
+        owner_log = os.path.join(run_dir, "dns-owner.log")
+        with open(owner_log, "w") as handle:
+            handle.write(
+                "2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n" * samples
+            )
+        paths["owner_log"] = owner_log
+        evidence = {
+            "serve_pid": 4242,
+            "dnsmasq_was_active_before": True,
+            "dnsmasq_active_after_restore": False,
+            "dnsmasq_state_after_restore": "inactive",
+            "sampler_alive_at_stop": True,
+            "samples": samples,
+            "sample_interval_s": 10,
+            "owner_log": owner_log,
+            "first_mismatch": None,
+            "verify_files": verify_files,
+            "corpus_dns_log_sha256": hashes["corpus-dns.log"],
+            "corpus_access_log_sha256": hashes["corpus-access.log"],
+            "reason": None,
+            "verdict": dns_verdict,
+        }
+        evidence.update(evidence_overrides or {})
         paths["dns_evidence"] = os.path.join(run_dir, "dns-evidence.json")
         with open(paths["dns_evidence"], "w") as handle:
-            json.dump({"verdict": dns_verdict, "queries": 14}, handle)
+            json.dump(evidence, handle)
     if diag is not None:
         os.makedirs(os.path.join(run_dir, "diag"), exist_ok=True)
         paths["diag"] = os.path.join(run_dir, "diag", "summary.json")
@@ -313,6 +373,188 @@ class CampaignSummary(unittest.TestCase):
         self.assertIsNone(cell["dns_verdict"])
         self.assertIsNone(cell["guest_dns"])
         self.assertIsNone(cell["diag"])
+
+    def test_an_armed_gate_that_evaluated_nothing_refuses(self):
+        """max_ms alone is not proof the gate looked at anything.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, stall_evaluated=0)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("evaluated", text)
+
+    def test_a_nan_stall_limit_refuses(self):
+        """json.load accepts NaN, and `NaN <= 0` is False, so a NaN limit
+        read as armed.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, stall_max_ms=float("nan"))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+
+    def test_a_resolver_run_without_dns_evidence_refuses(self):
+        """A run whose guest resolved through a baked resolver is a campaign
+        run, and the bracket evidence is the only thing that says the
+        resolver held for the whole measured run. Absent evidence was
+        indexed as dns_verdict null.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, dns_verdict=None, guest_dns="10.0.2.2")
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("dns-evidence.json", text)
+
+    def _refused(self, d, **run_kwargs):
+        run_dir = os.path.join(d, "run")
+        paths = write_run(run_dir, **run_kwargs)
+        out = os.path.join(d, "campaign-x-summary.json")
+        rc, text = self._summarize(out, [run_dir])
+        self.assertNotEqual(rc, 0, text)
+        self.assertFalse(os.path.exists(out))
+        return paths, text
+
+    def test_clean_evidence_naming_a_missing_verify_bracket_refuses(self):
+        """The verdict is only as good as the brackets it cites.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote ...: 1 cell(s) (x3)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            paths = write_run(os.path.join(d, "run"))
+            os.unlink(paths["verify-after-run"])
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [paths["analysis"].rsplit("/", 1)[0]])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("verify-dns-after-run.json", text)
+        with tempfile.TemporaryDirectory() as d:
+            paths = write_run(os.path.join(d, "run"))
+            write_verify(paths["verify-before-run"], passed=False)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [os.path.join(d, "run")])
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("verify-dns-before-run.json", text)
+        with tempfile.TemporaryDirectory() as d:
+            # The evidence lists two brackets; the campaign runs three.
+            _paths, text = self._refused(
+                d, evidence_overrides={"verify_files": [
+                    os.path.join(d, "run", "verify-dns-pre.json"),
+                    os.path.join(d, "run", "verify-dns-after-run.json"),
+                ]},
+            )
+            self.assertIn("before-run", text)
+
+    def test_clean_evidence_whose_replay_log_changed_refuses(self):
+        """The sha256 in the evidence pins the replay logs; a log that no
+        longer matches is a log something appended to after the verdict.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote ...: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            with open(paths["corpus-dns.log"], "a") as handle:
+                handle.write('{"ts": 2.0, "qname": "late.example"}\n')
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("corpus-dns.log", text)
+
+    def test_clean_evidence_without_samples_or_a_live_sampler_refuses(self):
+        """RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote ...: 1 cell(s) (x4)"""
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(d, evidence_overrides={"samples": 0})
+            self.assertIn("samples", text)
+        with tempfile.TemporaryDirectory() as d:
+            # samples claims more lines than the owner log holds.
+            _paths, text = self._refused(d, evidence_overrides={"samples": 13})
+            self.assertIn("dns-owner.log", text)
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(
+                d, evidence_overrides={"sampler_alive_at_stop": False},
+            )
+            self.assertIn("sampler", text)
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(
+                d, evidence_overrides={"dnsmasq_state_after_restore": "unknown"},
+            )
+            self.assertIn("dnsmasq", text)
+
+    def test_the_hash_names_the_bytes_that_were_parsed(self):
+        """Parsing a file and hashing it later are two reads; an atomic
+        replacement in between produced a cell from one generation and a
+        hash for another. One read feeds both.
+
+        RED BEFORE THE FIX: AttributeError: module 'campaign_summary' has no
+        attribute 'read_bytes' (the parse and the hash were separate opens).
+        """
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            with open(paths["analysis"], "rb") as handle:
+                parsed_bytes = handle.read()
+            real_read = campaign_summary.read_bytes
+
+            def read_then_replace(path):
+                data = real_read(path)
+                if path == paths["analysis"]:
+                    replacement = json.loads(data)
+                    replacement["run_id"] = "1" * 32
+                    with open(path, "w") as handle:
+                        json.dump(replacement, handle)
+                return data
+
+            out = os.path.join(d, "campaign-x-summary.json")
+            with mock.patch.object(campaign_summary, "read_bytes", read_then_replace):
+                rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                index = json.load(handle)
+        entry = next(
+            entry for entry in index["generated_from"]
+            if entry["path"] == paths["analysis"]
+        )
+        self.assertEqual(entry["sha256"], hashlib.sha256(parsed_bytes).hexdigest())
+        self.assertEqual(index["cells"][0]["run_id"], "0" * 32)
+
+    def test_a_refused_rerun_removes_the_stale_index(self):
+        """`REFUSED: no index written` left the previous index in place, so
+        a reader who opened it after a failed re-index quoted cells the
+        refusal had just rejected.
+
+        RED BEFORE THE FIX: AssertionError: True is not false : the stale index survived
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(paths["dns_evidence"]) as handle:
+                evidence = json.load(handle)
+            evidence["verdict"] = "unclean"
+            with open(paths["dns_evidence"], "w") as handle:
+                json.dump(evidence, handle)
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0)
+            self.assertFalse(os.path.exists(out), "the stale index survived")
+            self.assertIn("removed", text)
 
     def test_the_index_cannot_alias_an_input(self):
         with tempfile.TemporaryDirectory() as d:

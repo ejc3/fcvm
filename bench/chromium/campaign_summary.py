@@ -4,27 +4,37 @@
     campaign_summary.py --out PATH <run_dir>...
 
 Each run directory holds reqanalyze's analysis.json (required; its stall_gate
-must have been armed with --stall-max-ms, since an unarmed gate reports
-passed=true having evaluated nothing), dns-evidence.json (optional; when
-present its verdict must be "clean") and
-diag/summary.json (optional). The index names every file it was generated
-from with its sha256, and carries one cell per run: engine, cpu, memory_mib,
-guest_dns, publishable, stall_gate_passed, dns_verdict, the headline median
-blocking_ms per arm with its CI, and the diag summary when there is one.
+must have been armed with --stall-max-ms and must have evaluated at least one
+record, since an unarmed gate reports passed=true having evaluated nothing),
+dns-evidence.json (required when the cell's guest_dns names a baked resolver,
+optional otherwise; when present its verdict must be "clean" and every file it
+cites must be present and agree with it) and diag/summary.json (optional). The
+index names every file it was generated from with its sha256, and carries one
+cell per run: engine, cpu, memory_mib, guest_dns, publishable,
+stall_gate_passed, dns_verdict, the headline median blocking_ms per arm with
+its CI, and the diag summary when there is one.
 
 The index is written only when every run is publishable, every stall gate
-passed and every DNS verdict is clean. Otherwise nothing is written and the
-exit status is 5, the same code reqanalyze uses for a refused run: an index
-that quietly carried an unpublishable cell would be quoted by someone who
-only opened the index. Inputs are only ever read.
+passed and every DNS verdict is clean. Otherwise nothing is written, an index
+already at --out is removed, and the exit status is 5, the same code reqanalyze
+uses for a refused run: an index that quietly carried an unpublishable cell
+would be quoted by someone who only opened the index. Inputs are only ever
+read, and each is read once so the hash names the bytes that were parsed.
 """
 
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import tempfile
+
+VERIFY_STAGES = ("pre", "before-run", "after-run")
+REPLAY_LOGS = {
+    "corpus_dns_log_sha256": "corpus-dns.log",
+    "corpus_access_log_sha256": "corpus-access.log",
+}
 
 
 class RunError(Exception):
@@ -40,20 +50,49 @@ def reject_duplicate_keys(pairs):
     return seen
 
 
-def read_json(path):
-    try:
-        with open(path) as handle:
-            return json.load(handle, object_pairs_hook=reject_duplicate_keys)
-    except (OSError, ValueError) as error:
-        raise RunError(f"{path}: cannot read: {error}")
+def reject_constant(name):
+    raise ValueError(f"non-standard JSON numeric constant {name}")
 
 
-def sha256_file(path):
-    digest = hashlib.sha256()
+def read_bytes(path):
     with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return handle.read()
+
+
+def parse_json(data, path):
+    try:
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RunError(f"{path}: cannot parse: {error}")
+
+
+class Sources:
+    """The files one cell was read from, each read once and hashed from those bytes."""
+
+    def __init__(self):
+        self.entries = []
+
+    def read_json(self, path):
+        try:
+            data = read_bytes(path)
+        except OSError as error:
+            raise RunError(f"{path}: cannot read: {error}")
+        self.entries.append({"path": path, "sha256": hashlib.sha256(data).hexdigest()})
+        return parse_json(data, path)
+
+    def read_hashed(self, path):
+        """Record a file the index does not parse; returns its sha256."""
+        try:
+            data = read_bytes(path)
+        except OSError as error:
+            raise RunError(f"{path}: cannot read: {error}")
+        digest = hashlib.sha256(data).hexdigest()
+        self.entries.append({"path": path, "sha256": digest})
+        return data, digest
 
 
 def write_json_atomic(path, value):
@@ -69,15 +108,93 @@ def write_json_atomic(path, value):
         raise
 
 
+def positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def check_evidence(run_dir, evidence, sources):
+    """Hold a clean verdict to the files it cites; raise RunError otherwise."""
+    verdict = evidence.get("verdict") if isinstance(evidence, dict) else None
+    if verdict != "clean":
+        raise RunError(f"{run_dir}: dns-evidence.json verdict is {verdict!r}, not 'clean'")
+    if not positive_int(evidence.get("samples")):
+        raise RunError(
+            f"{run_dir}: dns-evidence.json records samples={evidence.get('samples')!r}; "
+            "a clean verdict needs at least one :53 owner sample"
+        )
+    if evidence.get("first_mismatch") is not None:
+        raise RunError(
+            f"{run_dir}: dns-evidence.json is clean but records a mismatching sample: "
+            f"{evidence.get('first_mismatch')!r}"
+        )
+    if evidence.get("sampler_alive_at_stop") is not True:
+        raise RunError(
+            f"{run_dir}: dns-evidence.json does not show the :53 owner sampler "
+            "alive until the measured run ended"
+        )
+    if evidence.get("dnsmasq_active_after_restore") is not False:
+        raise RunError(f"{run_dir}: dns-evidence.json records dnsmasq active after the restores")
+    if evidence.get("dnsmasq_state_after_restore") != "inactive":
+        raise RunError(
+            f"{run_dir}: dns-evidence.json records dnsmasq state "
+            f"{evidence.get('dnsmasq_state_after_restore')!r} after the restores, not 'inactive'"
+        )
+    owner_log = os.path.join(run_dir, "dns-owner.log")
+    if not os.path.isfile(owner_log):
+        raise RunError(f"{run_dir}: dns-owner.log cited by dns-evidence.json is missing")
+    owner_bytes, _digest = sources.read_hashed(owner_log)
+    owner_lines = owner_bytes.count(b"\n")
+    if owner_lines != evidence["samples"]:
+        raise RunError(
+            f"{run_dir}: dns-evidence.json records {evidence['samples']} samples but "
+            f"dns-owner.log holds {owner_lines} lines"
+        )
+    # The brackets: every stage the campaign runs, each present and passed.
+    # Basenames are resolved inside run_dir so a relocated run directory
+    # still indexes; the evidence's own absolute paths are not trusted.
+    verify_files = evidence.get("verify_files")
+    if not isinstance(verify_files, list) or not all(isinstance(p, str) for p in verify_files):
+        raise RunError(f"{run_dir}: dns-evidence.json has no verify_files list")
+    cited = {os.path.basename(p) for p in verify_files}
+    for stage in VERIFY_STAGES:
+        name = f"verify-dns-{stage}.json"
+        if name not in cited:
+            raise RunError(f"{run_dir}: dns-evidence.json cites no {name} ({stage} bracket)")
+        path = os.path.join(run_dir, name)
+        if not os.path.isfile(path):
+            raise RunError(f"{run_dir}: {name} cited by dns-evidence.json is missing")
+        verify = sources.read_json(path)
+        if not isinstance(verify, dict) or verify.get("passed") is not True:
+            raise RunError(f"{run_dir}: {name} does not record passed=true")
+    # The replay server's own logs, pinned by hash at the verdict.
+    for field, name in REPLAY_LOGS.items():
+        recorded = evidence.get(field)
+        if (
+            not isinstance(recorded, str)
+            or len(recorded) != 64
+            or any(c not in "0123456789abcdef" for c in recorded)
+        ):
+            raise RunError(f"{run_dir}: dns-evidence.json has no sha256 for {name} ({field})")
+        path = os.path.join(run_dir, name)
+        if not os.path.isfile(path):
+            raise RunError(f"{run_dir}: {name} cited by dns-evidence.json is missing")
+        _data, digest = sources.read_hashed(path)
+        if digest != recorded:
+            raise RunError(
+                f"{run_dir}: {name} sha256 {digest} does not match the "
+                f"{recorded} dns-evidence.json recorded at the verdict"
+            )
+
+
 def load_cell(run_dir):
-    """Read one run directory into an index cell. Returns (cell, source paths)."""
+    """Read one run directory into an index cell. Returns (cell, source entries)."""
+    sources = Sources()
     analysis_path = os.path.join(run_dir, "analysis.json")
     if not os.path.isfile(analysis_path):
         raise RunError(f"{run_dir}: analysis.json is missing")
-    analysis = read_json(analysis_path)
+    analysis = sources.read_json(analysis_path)
     if not isinstance(analysis, dict):
         raise RunError(f"{analysis_path}: not a JSON object")
-    sources = [analysis_path]
 
     if analysis.get("publishable") is not True:
         reasons = (analysis.get("gate") or {}).get("reasons") or []
@@ -99,12 +216,22 @@ def load_cell(run_dir):
             f"{run_dir}: analysis.json has no stall_gate verdict; re-run reqanalyze"
         )
     max_ms = stall_gate.get("max_ms")
-    if isinstance(max_ms, bool) or not isinstance(max_ms, (int, float)) or max_ms <= 0:
+    if (
+        isinstance(max_ms, bool)
+        or not isinstance(max_ms, (int, float))
+        or not math.isfinite(max_ms)
+        or max_ms <= 0
+    ):
         # reqanalyze without --stall-max-ms writes passed=true, evaluated=0:
         # a gate that evaluated nothing has no pass to report.
         raise RunError(
             f"{run_dir}: stall_gate was not armed (max_ms is {max_ms!r}); "
             "re-run reqanalyze --stall-max-ms N"
+        )
+    if not positive_int(stall_gate.get("evaluated")):
+        raise RunError(
+            f"{run_dir}: stall_gate evaluated {stall_gate.get('evaluated')!r} "
+            "record(s); a pass over nothing is not a pass"
         )
     if stall_gate["passed"] is not True:
         raise RunError(
@@ -114,19 +241,22 @@ def load_cell(run_dir):
     dns_verdict = None
     evidence_path = os.path.join(run_dir, "dns-evidence.json")
     if os.path.isfile(evidence_path):
-        evidence = read_json(evidence_path)
-        sources.append(evidence_path)
-        dns_verdict = evidence.get("verdict") if isinstance(evidence, dict) else None
-        if dns_verdict != "clean":
-            raise RunError(
-                f"{run_dir}: dns-evidence.json verdict is {dns_verdict!r}, not 'clean'"
-            )
+        evidence = sources.read_json(evidence_path)
+        check_evidence(run_dir, evidence, sources)
+        dns_verdict = evidence["verdict"]
+    elif cell["guest_dns"] is not None:
+        # A guest that resolved through a baked resolver is a campaign run;
+        # only the bracket evidence says the resolver held for the whole
+        # measured run.
+        raise RunError(
+            f"{run_dir}: guest_dns is {cell['guest_dns']!r} but there is no "
+            "dns-evidence.json; a resolver run without its brackets is not indexed"
+        )
 
     diag = None
     diag_path = os.path.join(run_dir, "diag", "summary.json")
     if os.path.isfile(diag_path):
-        diag = read_json(diag_path)
-        sources.append(diag_path)
+        diag = sources.read_json(diag_path)
 
     arms = analysis.get("arms")
     if not isinstance(arms, dict) or not arms:
@@ -157,7 +287,7 @@ def load_cell(run_dir):
         "dns_verdict": dns_verdict,
         "headline": headline,
         "diag": diag,
-    }, sources
+    }, sources.entries
 
 
 def build_index(run_dirs):
@@ -177,9 +307,7 @@ def build_index(run_dirs):
             errors.append(str(error))
             continue
         cells.append(cell)
-        generated_from.extend(
-            {"path": path, "sha256": sha256_file(path)} for path in sources
-        )
+        generated_from.extend(sources)
     return {"generated_from": generated_from, "cells": cells}, errors
 
 
@@ -194,13 +322,21 @@ def main_with(argv=None):
     run_dirs = [os.path.normpath(run_dir) for run_dir in args.run_dir]
     index, errors = build_index(run_dirs)
     out_realpath = os.path.realpath(args.out)
+    aliases_input = False
     for entry in index["generated_from"]:
         if os.path.realpath(entry["path"]) == out_realpath:
             errors.append(f"--out {args.out} aliases input {entry['path']}")
+            aliases_input = True
     if errors:
         print("REFUSED: no index written", file=sys.stderr)
         for error in errors:
             print(f"  - {error}", file=sys.stderr)
+        # An index already at --out describes cells this refusal did not
+        # accept; it must not outlive the refusal. Never when --out is one
+        # of the inputs, which are only ever read.
+        if not aliases_input and os.path.lexists(args.out):
+            os.unlink(args.out)
+            print(f"  removed stale index {args.out}", file=sys.stderr)
         return 5
     write_json_atomic(args.out, index)
     print(f"wrote {args.out}: {len(index['cells'])} cell(s)")
