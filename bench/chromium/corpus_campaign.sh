@@ -116,7 +116,7 @@ say() { printf '\n=== %s\n' "$*"; }
 #      exited 0 (its logs are complete only then), and dnsmasq is inactive
 #      after the clone restores.
 engine_target() {
-    # $1 = golden | verify | run
+    # $1 = golden | verify | diag | run
     printf 'bench-%s-request-%s' "$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)" "$1"
 }
 
@@ -172,9 +172,14 @@ run_diag() {
     # must resolve, every load event must land inside DIAG_MAX_LOAD_MS. The
     # sub-make must exit 0 AND the summary it leaves must say passed=true:
     # a stale summary from an earlier campaign is removed at start.
-    local out="$RESULTS/diag/summary.json"
-    say "diag: one traced render per corpus URL on restored clones of $TAG (limit ${DIAG_MAX_LOAD_MS} ms)"
-    if ! DIAG_URLS="$URLS" DIAG_EXPECT_IPS=10.0.2.2 DIAG_MAX_LOAD_MS="$DIAG_MAX_LOAD_MS" \
+    local out="$RESULTS/diag/summary.json" expect=10.0.2.2
+    # Only Chromium's render carries a network trace; reqbench refuses an
+    # IP expectation it cannot enforce, so the WebKit diag is asked for
+    # load events and render success alone, and the verify brackets hold
+    # the resolver evidence for both engines.
+    [ "$ENGINE" = webkit ] && expect=""
+    say "diag: one traced render per corpus URL on restored clones of $TAG (limit ${DIAG_MAX_LOAD_MS} ms, expect ${expect:-<no trace>})"
+    if ! DIAG_URLS="$URLS" DIAG_EXPECT_IPS="$expect" DIAG_MAX_LOAD_MS="$DIAG_MAX_LOAD_MS" \
         TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" BACKEND="$BACKEND" \
         UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH="$UFFD_PREFETCH" \
         make -C "$REPO" "$(engine_target diag)" 2>&1 | tee "$LOGDIR/diag.log"; then

@@ -1521,6 +1521,28 @@ class DiagPhase(unittest.TestCase):
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-diag", handle.read())
 
+    def test_the_webkit_diag_is_not_asked_for_addresses_it_cannot_see(self):
+        """WebKit renders carry no network trace, and reqbench refuses a
+        DIAG_EXPECT_IPS it cannot enforce; the campaign passes the
+        expectation to the Chromium diag only, and the verify brackets keep
+        the resolver evidence for both engines."""
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _results = self._fakes(tmp)
+            env["ENGINE"] = "webkit"
+            for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS", "DIAG_EXPECT_IPS"):
+                env.pop(key, None)
+            env["MAKE_DIAG_JSON"] = self._diag_summary(urls)
+            result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            seen = self._make_env(env)
+            self.assertFalse(seen.get("DIAG_EXPECT_IPS"),
+                             "the webkit diag was handed an IP expectation it cannot check")
+            self.assertEqual(seen.get("DIAG_URLS"), urls)
+            self.assertEqual(seen.get("DIAG_MAX_LOAD_MS"), "15000")
+            with open(env["MAKE_ARGV"]) as handle:
+                self.assertIn("bench-webkit-request-diag", handle.read())
+
     def test_a_failed_or_missing_diag_refuses_to_measure(self):
         urls = self._urls()
         cases = {

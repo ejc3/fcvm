@@ -142,15 +142,25 @@ SEAL = {
 DIAG_DEFAULT = object()
 
 
+# The snapshot generation the fixture run measured and its diag diagnosed:
+# the one SEAL names, so a diag_summary() binds to write_run's cell.
+GENERATION_ID = SEAL["snapshot_generation_id"]
+CONFIG_SHA256 = SEAL["snapshot_config_sha256"]
+
+
 def diag_summary(urls=("https://example.com/",), passed=True, violations=(),
-                 max_load_ms=812.5, engine="chromium"):
-    """diag/summary.json in the shape reqbench.sh diag writes."""
+                 max_load_ms=812.5, engine="chromium", **identity):
+    """diag/summary.json in the shape reqbench.sh diag writes. identity
+    overrides the fields campaign_summary binds to the cell."""
     return {
         "engine": engine,
-        "tag": "cb-req-corpus",
-        "backend": "uffd",
-        "uffd_mode": "minor",
+        "tag": identity.get("tag", "cb-req-corpus"),
+        "backend": identity.get("backend", "uffd"),
+        "uffd_mode": identity.get("uffd_mode", "minor"),
         "uffd_prefetch": "on",
+        "snapshot_generation_id": identity.get("snapshot_generation_id", GENERATION_ID),
+        "snapshot_config_sha256": identity.get("snapshot_config_sha256", CONFIG_SHA256),
+        "runtime_bundle_intact": identity.get("runtime_bundle_intact", True),
         "reps": 3,
         "urls": {
             url: {"reps": 3, "renders_ok": 3, "max_load_ms": max_load_ms,
@@ -194,6 +204,7 @@ def write_run(
     dns_verdict="clean",
     diag=DIAG_DEFAULT,
     guest_dns="10.0.2.2",
+    guest_env=(),
     engine="chromium",
     stall_max_ms=15000,
     stall_evaluated=404,
@@ -235,7 +246,9 @@ def write_run(
         "cpu": 2,
         "memory_mib": 1024,
         "guest_dns": guest_dns,
+        "guest_env": list(guest_env),
         "url": "https://example.com/",
+        "snapshot": "cb-req-corpus",
         **SEAL,
     }
     for field, value in (cell_overrides or {}).items():
@@ -244,7 +257,7 @@ def write_run(
         else:
             cell[field] = value
     if diag is DIAG_DEFAULT:
-        diag = diag_summary() if guest_dns is not None else None
+        diag = diag_summary(engine=engine) if guest_dns is not None else None
     analysis = {
         "publishable": publishable,
         "gate": {"passed": publishable, "reasons": [] if publishable else ["x"]},
@@ -622,6 +635,104 @@ class CampaignSummary(unittest.TestCase):
             self.assertNotEqual(rc, 0, text)
             self.assertFalse(os.path.exists(out))
             self.assertIn("https://example.com/", text)
+
+    def test_a_diag_beside_a_cell_that_names_no_url_is_refused(self):
+        """The coverage check compares the diag's urls with the cell's url
+        list; a cell without one gives it nothing to compare, and a diag
+        over any pages would pass. That is a refusal, not a pass."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir, diag=diag_summary(urls=("https://other.example/",)))
+            with open(paths["analysis"]) as handle:
+                analysis = json.load(handle)
+            del analysis["cell"]["url"]
+            with open(paths["analysis"], "w") as handle:
+                json.dump(analysis, handle)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("url", text)
+
+    def test_a_diag_of_another_snapshot_or_setup_is_refused(self):
+        """The diag sits beside the run it vouches for; a summary naming
+        another snapshot generation, config, tag, engine, backend or UFFD
+        mode diagnosed something else and is not this run's evidence."""
+        cases = {
+            "snapshot_generation_id": "87654321-4321-4321-8321-cba987654321",
+            "snapshot_config_sha256": "b" * 64,
+            "tag": "cb-req-other",
+            "engine": "webkit",
+            "backend": "file",
+            "uffd_mode": "major",
+        }
+        for field, other in cases.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, diag=diag_summary(**{field: other}))
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{field}: {text}")
+                self.assertFalse(os.path.exists(out))
+                self.assertIn(field, text)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            summary = diag_summary()
+            del summary["snapshot_generation_id"]
+            write_run(run_dir, diag=summary)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, "a diag naming no generation was accepted")
+            self.assertIn("snapshot_generation_id", text)
+
+    def test_a_diag_without_a_load_event_for_a_measured_url_is_refused(self):
+        """A passing diag has a load event for every rep of every URL; a
+        null max_load_ms is a summary the index cannot quote a load from."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=diag_summary(max_load_ms=None))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("max_load_ms", text)
+
+    def test_a_diag_whose_bundle_changed_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=diag_summary(runtime_bundle_intact=False))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("runtime_bundle_intact", text)
+
+    def test_a_resolver_rule_cell_needs_its_diag(self):
+        """A golden with GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> resolves through
+        Chromium's rule, not resolv.conf, so its runs carry guest_dns null;
+        the diag is what says the pages came from the replay, and a run
+        without it is not indexed. The index carries guest_env so a reader
+        can tell the two corpus arms apart."""
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, dns_verdict=None, guest_dns=None, guest_env=rule, diag=None)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, "a resolver-rule run without its diag was indexed")
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("diag/summary.json", text)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, dns_verdict=None, guest_dns=None, guest_env=rule,
+                      diag=diag_summary())
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                cell = json.load(handle)["cells"][0]
+            self.assertEqual(cell["guest_env"], rule)
+            self.assertIsNone(cell["guest_dns"])
+            self.assertIs(cell["diag"]["diag_passed"], True)
 
     def test_a_fixture_run_keeps_its_previous_shape(self):
         """No resolver, no diag: the medium.html runs index as before."""

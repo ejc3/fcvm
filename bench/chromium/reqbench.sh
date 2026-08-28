@@ -1527,9 +1527,12 @@ apply_publication_gates() {
 # diag_stem).
 #
 # The phase exits non-zero, and summary.json says passed=false, on any remote
-# IP outside DIAG_EXPECT_IPS, any net::ERR_NAME_NOT_RESOLVED in a trace, any
-# load event over DIAG_MAX_LOAD_MS, any failed render, and any clone or serve
-# whose teardown was not clean.
+# IP outside DIAG_EXPECT_IPS, a trace that names no remote address at all
+# while DIAG_EXPECT_IPS is set, any net::ERR_NAME_NOT_RESOLVED in a trace,
+# any load event over DIAG_MAX_LOAD_MS, any failed render (a record that is
+# not this URL's, does not say ok, was written under a non-zero driver exit
+# status, or timed no load event), any clone or serve whose teardown was not
+# clean, and a sealed runtime bundle that changed during the phase.
 
 # The record stem for a URL: scheme and trailing slashes dropped, every run of
 # characters outside [A-Za-z0-9._-] folded to one '-'. A root URL's stem is
@@ -1544,14 +1547,17 @@ diag_stem() {
 diag_failed_record() {
     local record="$1"
     jq -n --arg url "$2" --arg err "$3" --arg stage "$4" \
-        '{ok: false, url: $url, error: $err, stage: $stage}' >"$record.tmp" \
+        '{ok: false, url: $url, error: $err, stage: $stage, driver_status: null}' >"$record.tmp" \
         && mv -f "$record.tmp" "$record"
 }
 
 # One render against a clone. $1 = url, $2 = record path, $3 = trace path,
 # $4 = clone pid, $5 = clone host-side ip. The record is written whatever the
-# driver did: its own when it printed a JSON object, one naming the exit
-# status otherwise. Returns the driver's status.
+# driver did: its own, with the driver's exit status added as driver_status,
+# when it printed a JSON object; one naming the exit status otherwise. The
+# summary holds a render to that status, not to the record's ok alone:
+# cdpdrive exits 1 with a record saying ok when only the trace write failed.
+# Returns the driver's status.
 diag_render() {
     local url="$1" record="$2" trace="$3" cpid="$4" ip="$5"
     local tmp="$record.tmp" status=0
@@ -1584,7 +1590,13 @@ PYWD
             --net-trace "$trace" >"$tmp" 2>>"$RESULTS/logs/diag-render.log" || status=$?
     fi
     if jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
-        mv -f "$tmp" "$record"
+        if jq --argjson status "$status" '. + {driver_status: $status}' "$tmp" >"$tmp.status" \
+            && mv -f "$tmp.status" "$record"; then
+            rm -f "$tmp"
+        else
+            rm -f "$tmp" "$tmp.status"
+            diag_failed_record "$record" "$url" "driver exited $status; its record could not be kept" driver
+        fi
     else
         rm -f "$tmp"
         diag_failed_record "$record" "$url" "driver exited $status without a record" driver
@@ -1593,26 +1605,49 @@ PYWD
 }
 
 # Reads every record and trace the loop left in $RESULTS/diag, writes
-# summary.json whole (tmp + rename) and returns 1 when it says passed=false.
-# $1 = clone/serve teardowns that were not clean, then url/stem pairs.
+# summary.json whole (tmp + rename) and returns 1 when it says passed=false
+# or when the snapshot under $TAG cannot be identified (then nothing is
+# written). $1 = clone/serve teardowns that were not clean, $2 = 1 when the
+# sealed runtime bundle was still intact at the end of the phase, then
+# url/stem pairs. The summary names the snapshot generation and config it
+# diagnosed, read under the generation lock this phase holds, so
+# campaign_summary can bind it to the run measured on the same generation.
 diag_write_summary() {
-    local teardown_failures="$1"
-    shift
-    # The UFFD knobs describe nothing on the file backend; recorded as null.
+    local teardown_failures="$1" bundle_ok="$2"
+    shift 2
+    # On the file backend the mode is "file", the value reqbench.py records
+    # in the run meta (so campaign_summary can bind the two), and the
+    # prefetch knob describes nothing and is recorded as null.
     local mode="$UFFD_MODE" prefetch="$UFFD_PREFETCH"
-    [ "$BACKEND" = uffd ] || { mode=""; prefetch=""; }
+    [ "$BACKEND" = uffd ] || { mode="file"; prefetch=""; }
+    local cfg="$DATA_ROOT/snapshots/$TAG/config.json" generation config_sha
+    generation=$($SUDO jq -er '.generation_id' "$cfg" 2>/dev/null) \
+        || { log "diag: cannot read generation_id from $cfg"; return 1; }
+    config_sha=$($SUDO sha256sum "$cfg" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$config_sha" ] || { log "diag: cannot hash $cfg"; return 1; }
     python3 - "$RESULTS/diag" "$ENGINE" "$TAG" "$BACKEND" "$mode" "$prefetch" \
-        "$DIAG_REPS" "$DIAG_EXPECT_IPS" "$DIAG_MAX_LOAD_MS" "$teardown_failures" "$@" <<'PY'
-import json, os, sys, tempfile, time
+        "$DIAG_REPS" "$DIAG_EXPECT_IPS" "$DIAG_MAX_LOAD_MS" "$teardown_failures" \
+        "$bundle_ok" "$generation" "$config_sha" "$@" <<'PY'
+import json, os, sys, tempfile, time, uuid
 from collections import Counter
 
 (diag_dir, engine, tag, backend, uffd_mode, uffd_prefetch, reps_raw,
- expect_raw, max_load_raw, teardown_raw) = sys.argv[1:11]
-pairs = sys.argv[11:]
+ expect_raw, max_load_raw, teardown_raw, bundle_raw, generation_id,
+ config_sha256) = sys.argv[1:14]
+pairs = sys.argv[14:]
 reps = int(reps_raw)
 expect_ips = [ip for ip in expect_raw.split(",") if ip] or None
 max_load_ms = int(max_load_raw) if max_load_raw else None
 teardown_failures = int(teardown_raw)
+bundle_intact = bundle_raw == "1"
+try:
+    canonical = str(uuid.UUID(generation_id))
+except (TypeError, ValueError):
+    canonical = None
+if canonical != generation_id:
+    raise SystemExit(f"snapshot {tag} has non-canonical generation_id {generation_id!r}")
+if len(config_sha256) != 64 or set(config_sha256) - set("0123456789abcdef"):
+    raise SystemExit(f"snapshot {tag} config digest is not a sha256: {config_sha256!r}")
 # Chromium's load event is timed from the navigate command's response;
 # WebDriver's navigate returns after the classic load event, so its round
 # trip is the same question.
@@ -1653,21 +1688,37 @@ for i in range(0, len(pairs), 2):
 
         base = os.path.join(diag_dir, f"{stem}-{rep}")
         record, why = read_json(base + ".json")
+        # A render counts only when the record is this URL's, says ok, was
+        # written under a zero driver exit status and timed the load event.
+        rendered = True
         if not isinstance(record, dict):
             violation("render_failed", f"record {base}.json {why or 'is not a JSON object'}")
             record = {}
-        elif record.get("ok") is True:
-            renders_ok += 1
-        else:
+            rendered = False
+        elif record.get("url") != url:
+            violation("render_failed",
+                      f"record {base}.json is for {record.get('url')!r}, not this url")
+            rendered = False
+        elif record.get("ok") is not True:
             violation("render_failed",
                       f"{record.get('error') or 'ok is not true'} "
                       f"(stage {record.get('stage') or 'unknown'})")
+            rendered = False
+        elif record.get("driver_status") != 0:
+            violation("render_failed",
+                      f"driver exited {record.get('driver_status')!r} with a record saying ok")
+            rendered = False
         stages = record.get("stages")
         load = stages.get(load_key) if isinstance(stages, dict) else None
         if number(load):
             max_load = load if max_load is None else max(max_load, load)
             if max_load_ms is not None and load > max_load_ms:
                 violation("stall", f"{load_key}={load:.0f} ms exceeds DIAG_MAX_LOAD_MS={max_load_ms}")
+        elif rendered:
+            violation("render_failed", f"no {load_key} in the record's stages")
+            rendered = False
+        if rendered:
+            renders_ok += 1
         if engine == "webkit":
             continue
         trace, why = read_json(base + ".trace.json")
@@ -1679,11 +1730,13 @@ for i in range(0, len(pairs), 2):
         pending = 0
         foreign = {}
         unresolved = []
+        addressed = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
             ip = row.get("remote_ip") or ""
             if ip:
+                addressed += 1
                 remote_ips[ip] += 1
                 if expect_ips is not None and ip not in expect_ips:
                     foreign.setdefault(ip, []).append(row.get("url", ""))
@@ -1697,6 +1750,11 @@ for i in range(0, len(pairs), 2):
         max_pending = pending if max_pending is None else max(max_pending, pending)
         for ip, hit in sorted(foreign.items()):
             violation("remote_ip", f"{ip} served {len(hit)} request(s), first {hit[0]}")
+        if expect_ips is not None and addressed == 0:
+            # Rows without an address prove nothing about where the page
+            # came from; an expectation nothing was held to is not met.
+            violation("no_remote_ip",
+                      f"none of the {len(rows)} traced request(s) names a remote address")
         if unresolved:
             violation("name_not_resolved",
                       f"{len(unresolved)} request(s) failed to resolve, first {unresolved[0]}")
@@ -1709,13 +1767,16 @@ for i in range(0, len(pairs), 2):
         "errors": dict(sorted(errors.items(), key=by_count)),
     }
 
-passed = not violations and teardown_failures == 0
+passed = not violations and teardown_failures == 0 and bundle_intact
 summary = {
     "engine": engine,
     "tag": tag,
     "backend": backend,
     "uffd_mode": uffd_mode or None,
     "uffd_prefetch": uffd_prefetch or None,
+    "snapshot_generation_id": generation_id,
+    "snapshot_config_sha256": config_sha256,
+    "runtime_bundle_intact": bundle_intact,
     "reps": reps,
     "urls": urls,
     "violations": violations,
@@ -1746,24 +1807,21 @@ for entry in violations:
     print(f"  VIOLATION {entry['kind']} {entry['url']} rep {entry['rep']}: {entry['detail']}")
 if teardown_failures:
     print(f"  {teardown_failures} teardown(s) were not clean")
+if not bundle_intact:
+    print("  the sealed runtime bundle changed during the phase")
 sys.exit(0 if passed else 1)
 PY
 }
 
 cmd_diag() {
-    # The run's own preamble: backend and pool sanity under the generation
-    # lock, for the reasons cmd_run gives. No quiet-host guard, nothing here
-    # is measured.
-    acquire_generation_lock || return 1
-    local huge_state
-    huge_state=$(hugepage_snapshot_state)
-    if [ "$BACKEND" = file ] && [ "$huge_state" != normal ]; then
-        log "diag: BACKEND=file refused: snapshot '$TAG' hugepage state is '$huge_state' (a hugepage snapshot restores via an implicit UFFD server and the record would be mislabeled); use BACKEND=uffd or a non-hugepage TAG"
-        return 2
-    fi
-    if [ "$huge_state" = huge ]; then
-        ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
-    fi
+    # summary.json is the verdict of the latest diag over this RESULTS. Gone
+    # before anything can fail, so a diag that ends without writing its own
+    # (a refused knob, a serve or clone that never came up) leaves no earlier
+    # passed=true summary for campaign_summary to read as this one's.
+    rm -f "$RESULTS/diag/summary.json"
+    # The knobs first: a refused request must not have taken the generation
+    # lock or grown the host's hugepage pool (gigabytes, host-global,
+    # persistent) on its way to the refusal.
     [[ "$DIAG_REPS" =~ ^[1-9][0-9]*$ ]] \
         || { log "diag: DIAG_REPS must be a positive integer (got '$DIAG_REPS')"; return 2; }
     if [ -n "$DIAG_MAX_LOAD_MS" ] && [[ ! "$DIAG_MAX_LOAD_MS" =~ ^[1-9][0-9]*$ ]]; then
@@ -1774,6 +1832,12 @@ cmd_diag() {
         uffd|file) ;;
         *) log "diag: unknown BACKEND=$BACKEND (want uffd|file)"; return 2 ;;
     esac
+    # Only the Chromium render carries a network trace; an IP expectation
+    # the WebKit phase cannot check is refused rather than passed by default.
+    if [ "$ENGINE" = webkit ] && [ -n "$DIAG_EXPECT_IPS" ]; then
+        log "diag: DIAG_EXPECT_IPS cannot be checked on webkit (its render carries no network trace); unset it"
+        return 2
+    fi
     # Name every record before starting anything: two URLs that fold to one
     # stem would overwrite each other's records and the summary would read
     # one page's trace as the other's.
@@ -1792,6 +1856,23 @@ cmd_diag() {
         stems[$stem]="$url"
         pairs+=("$url" "$stem")
     done
+    # The run's own preamble: backend and pool sanity under the generation
+    # lock, for the reasons cmd_run gives. No quiet-host guard, nothing here
+    # is measured.
+    acquire_generation_lock || return 1
+    local huge_state
+    huge_state=$(hugepage_snapshot_state)
+    if [ "$huge_state" = unknown ]; then
+        log "diag: snapshot '$TAG' hugepage state is 'unknown' (config.json unreadable or jq missing); refusing to diagnose a snapshot it cannot classify"
+        return 1
+    fi
+    if [ "$BACKEND" = file ] && [ "$huge_state" != normal ]; then
+        log "diag: BACKEND=file refused: snapshot '$TAG' hugepage state is '$huge_state' (a hugepage snapshot restores via an implicit UFFD server and the record would be mislabeled); use BACKEND=uffd or a non-hugepage TAG"
+        return 2
+    fi
+    if [ "$huge_state" = huge ]; then
+        ensure_hugepage_pool "$(snapshot_memory_mib)" || return 1
+    fi
     mkdir -p "$RESULTS/diag" "$RESULTS/logs"
     local rc=0 teardown_failures=0
     if [ "$BACKEND" = uffd ]; then
@@ -1843,8 +1924,12 @@ cmd_diag() {
         done
     done
     stop_serve diag || teardown_failures=$((teardown_failures + 1))
-    verify_runtime_bundle || rc=1
-    if diag_write_summary "$teardown_failures" "${pairs[@]}"; then
+    # The bundle verdict is part of the summary, not only of the exit
+    # status: a consumer reading summary.json alone must see the phase's
+    # refusal too.
+    local bundle_ok=1
+    verify_runtime_bundle || { bundle_ok=0; rc=1; }
+    if diag_write_summary "$teardown_failures" "$bundle_ok" "${pairs[@]}"; then
         log "diag: passed ($RESULTS/diag/summary.json)"
     else
         rc=1

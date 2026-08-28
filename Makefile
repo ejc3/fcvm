@@ -835,9 +835,12 @@ bench-webkit-request-run:
 		BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
 		bash bench/chromium/reqbench.sh run
 
+# TAG is quoted: unquoted, `TAG='x #'` left bash an assignment followed by a
+# comment and the target exited 0 having run nothing; reqbench.sh is what
+# refuses a bad tag and has to be reached.
 bench-webkit-request-diag:
 	@echo "==> Diagnosing page loads on restored WebKit clones ($(BACKEND), $(if $(DIAG_REPS),$(DIAG_REPS),3) clone(s) per URL)..."
-	@ENGINE=webkit TAG=$(if $(TAG),$(TAG),cb-req-webkit) \
+	@ENGINE=webkit TAG="$(if $(TAG),$(TAG),cb-req-webkit)" \
 		BACKEND="$(BACKEND)" DIAG_URLS="$(DIAG_URLS)" DIAG_REPS="$(DIAG_REPS)" \
 		DIAG_EXPECT_IPS="$(DIAG_EXPECT_IPS)" DIAG_MAX_LOAD_MS="$(DIAG_MAX_LOAD_MS)" \
 		RESULTS="$(RESULTS)" bash bench/chromium/reqbench.sh diag

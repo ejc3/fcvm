@@ -42,7 +42,11 @@ the default snapshot).
 
 `GUEST_ENV=` (golden only) bakes extra container environment into the
 snapshot: comma-separated `KEY=VALUE` entries, one `fcvm podman prepare
---env` each, recorded as `guest_env` in `reqbench-provenance.json`. The
+--env` each, recorded as `guest_env` in `reqbench-provenance.json`, carried
+into every run's meta and analysis cell (a golden whose provenance lacks it
+is refused, like one without `guest_dns`), and treated by campaign_summary
+like a baked resolver: a run with a non-empty `guest_env` needs its
+`diag/summary.json` to be indexed. The
 resolver-rule A/B is the one use today:
 `make bench-chromium-request-golden TAG=cb-req-golden-resolve GUEST_ENV=BENCH_RESOLVE_ALL_TO=10.0.2.2`
 makes `entry.sh` launch Chromium with `--host-resolver-rules=MAP * 10.0.2.2`
@@ -64,17 +68,27 @@ renders through wddrive without a trace. Each render's record and trace land
 under `$RESULTS/diag/`, and `summary.json` there carries, per URL, the render
 count, the slowest load event, the most requests still open at the load
 event, every remote IP with its request count and every failure text, plus a
-violations list and `passed`. The phase exits non-zero, and `passed` is false,
-on any remote IP outside `DIAG_EXPECT_IPS=` (comma-separated, when set), any
-`net::ERR_NAME_NOT_RESOLVED` in a trace, any load event over
-`DIAG_MAX_LOAD_MS=` (when set), any failed render, and any clone whose
-teardown was not clean. The corpus campaign (`make bench-chromium-corpus`)
+violations list, `passed`, `runtime_bundle_intact`, and the
+`snapshot_generation_id` and `snapshot_config_sha256` of the snapshot it
+diagnosed. The phase exits non-zero, and `passed` is false, on any remote IP
+outside `DIAG_EXPECT_IPS=` (comma-separated, when set), a trace naming no
+remote address at all while it is set, any `net::ERR_NAME_NOT_RESOLVED` in a
+trace, any load event over `DIAG_MAX_LOAD_MS=` (when set), any failed render
+(a record for another URL, one not saying ok, one written under a non-zero
+driver exit status, or one without a load event timing), any clone whose
+teardown was not clean, and a sealed bundle that changed during the phase.
+Each render record keeps the driver's exit status as `driver_status`. A
+knob is checked before the generation lock and the hugepage pool are
+touched, and the webkit diag refuses `DIAG_EXPECT_IPS=` because its render
+has no trace to hold it to. The corpus campaign (`make bench-chromium-corpus`)
 runs it after the verify that follows the golden, with every corpus URL,
-`DIAG_EXPECT_IPS=10.0.2.2` and `DIAG_MAX_LOAD_MS` defaulting to 15000, and
-refuses to measure when it fails; `DIAG_ONLY=1` stops the campaign after
-golden, verify and diag, for a throwaway golden round, and `DIAG_REPS=`
-passes through to the diag. campaign_summary.py refuses a corpus run without
-its `diag/summary.json`.
+`DIAG_EXPECT_IPS=10.0.2.2` on Chromium and `DIAG_MAX_LOAD_MS` defaulting to
+15000, and refuses to measure when it fails; `DIAG_ONLY=1` stops the
+campaign after golden, verify and diag, for a throwaway golden round, and
+`DIAG_REPS=` passes through to the diag. campaign_summary.py refuses a
+corpus run without its `diag/summary.json`, and a summary that names another
+snapshot generation, config, tag, engine, backend or UFFD mode than the
+run's analysis cell.
 
 `verify`, `diag` and `run` deliberately have NO build dependency: reqbench.sh
 seals fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and

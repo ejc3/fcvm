@@ -144,12 +144,15 @@ fi
 # leaves the argv exactly as it was (no empty element either).
 set --
 if [ -n "${BENCH_RESOLVE_ALL_TO:-}" ]; then
-    case "$BENCH_RESOLVE_ALL_TO" in
-        *[!0-9A-Fa-f.:]*)
-            echo "ERROR: BENCH_RESOLVE_ALL_TO must be one IP literal, got '$BENCH_RESOLVE_ALL_TO'" >&2
-            exit 2
-            ;;
-    esac
+    # One IPv4 or IPv6 address, parsed as such: a character whitelist let
+    # `deadbeef`, `1.2.3.999` and `:::` through to Chromium, where every
+    # request then failed far from the knob. python3 is in the image (the
+    # readiness probe above uses it).
+    if ! python3 -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' \
+            "$BENCH_RESOLVE_ALL_TO" 2>/dev/null; then
+        echo "ERROR: BENCH_RESOLVE_ALL_TO must be one IP literal, got '$BENCH_RESOLVE_ALL_TO'" >&2
+        exit 2
+    fi
     set -- "--host-resolver-rules=MAP * $BENCH_RESOLVE_ALL_TO"
     echo "chromium-bench: every host resolves to $BENCH_RESOLVE_ALL_TO (--host-resolver-rules)"
 fi

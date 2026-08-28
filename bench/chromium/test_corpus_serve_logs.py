@@ -128,6 +128,54 @@ class DnsLog(unittest.TestCase):
             self.assertEqual(row["peer"], me)
             self.assertIsInstance(row["ts"], float)
 
+    def test_a_query_is_logged_before_it_is_answered(self):
+        """The responder answered first and logged second, so a client that
+        read the log on receiving its answer raced the write: seen once in
+        the full suite on a loaded box, `(row,) = read_jsonl(log_path)` got
+        no rows. Writing the line first makes "answered" imply "on disk",
+        which is also the invariant the docstring claims. A log whose write
+        waits on a gate makes the order observable: no answer may arrive
+        while the gate is closed.
+        """
+        gate = threading.Event()
+        inner = []
+        real_log = corpus_serve.JsonlLog
+
+        class GatedLog:
+            def __init__(self, path):
+                inner.append(real_log(path))
+
+            def write(self, row):
+                gate.wait(10)
+                inner[0].write(row)
+
+            def close(self):
+                inner[0].close()
+
+        with tempfile.TemporaryDirectory() as d:
+            log_path = os.path.join(d, "corpus-dns.log")
+            corpus_serve.JsonlLog = GatedLog
+            try:
+                port = self._responder(log_path)
+            finally:
+                corpus_serve.JsonlLog = real_log
+            self.addCleanup(gate.set)
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.addCleanup(client.close)
+            client.bind(("127.0.0.1", 0))
+            client.sendto(dns_query("fonts.gstatic.com", QTYPE_AAAA), ("127.0.0.1", port))
+            client.settimeout(0.5)
+            with self.assertRaises(socket.timeout,
+                                   msg="the answer arrived before its log line was written"):
+                client.recvfrom(512)
+            self.assertEqual(read_jsonl(log_path), [])
+            gate.set()
+            client.settimeout(5)
+            reply, _ = client.recvfrom(512)
+            self.assertEqual(reply[:2], b"\x12\x34")
+            (row,) = read_jsonl(log_path)
+            self.assertEqual(row["qname"], "fonts.gstatic.com")
+
     def test_an_aaaa_query_is_logged_with_an_empty_answer(self):
         with tempfile.TemporaryDirectory() as d:
             log_path = os.path.join(d, "corpus-dns.log")
@@ -159,7 +207,9 @@ class DnsLog(unittest.TestCase):
         campaign hashes. The broad handler swallowed the write error and the
         resolver kept answering, unlogged, for the rest of the run. It now
         closes its socket and ends: the guest stops resolving, the :53 owner
-        sampler sees no owner, and the run is refused on both counts.
+        sampler sees no owner, and the run is refused on both counts. The
+        line is written before the answer is sent, so the query whose line
+        could not be written is not answered either.
 
         Red: the second query was answered (thread alive, socket open).
         """
@@ -179,9 +229,9 @@ class DnsLog(unittest.TestCase):
         thread = threading.Thread(target=corpus_serve.serve_dns,
                                   args=(sock, "10.0.2.2", BrokenLog()), daemon=True)
         thread.start()
-        reply, _ = self._ask(port, "blog.cloudflare.com", QTYPE_A)
-        self.assertEqual(socket.inet_ntoa(reply[-4:]), "10.0.2.2",
-                         "the query before the failed write must still be answered")
+        with self.assertRaises(socket.timeout,
+                               msg="a query whose log line could not be written was answered"):
+            self._ask(port, "blog.cloudflare.com", QTYPE_A)
         thread.join(timeout=5)
         self.assertFalse(thread.is_alive(), "serve_dns kept serving after a failed log write")
         self.assertEqual(sock.fileno(), -1, "the responder left its socket open")

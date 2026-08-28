@@ -13,16 +13,18 @@ agree with the sha256 it recorded, each verify bracket must record the run's
 resolver with the URL probes run under no proxy and every host and URL
 answered through it, and every sample in dns-owner.log must name its
 serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive and a load the
-evidence accounts for) and diag/summary.json (reqbench.sh diag; required
-under the same condition as dns-evidence.json, optional otherwise; when
-present it must say passed=true, list no violations, and cover every URL the
-cell measured). The index names every file it was generated from with its
-sha256, and carries one cell per run: engine, cpu, memory_mib, guest_dns,
-the seal identity,
-publishable, stall_gate_passed, dns_verdict, load_max_1min (the maximum 1-min
-load the campaign's sampler saw during the measured run, when the evidence
-records it), the headline median blocking_ms per arm with its CI, and for the
-diag its verdict, violation count and slowest load event per URL.
+evidence accounts for) and diag/summary.json (reqbench.sh diag; required when
+the cell's guest_dns names a baked resolver or its guest_env is non-empty,
+optional otherwise; when present it must name the run's snapshot generation,
+config, tag, engine, backend and UFFD mode, say passed=true with the sealed
+bundle intact, list no violations, cover every URL the cell measured and
+carry a load event for each). The index names every file it was generated
+from with its sha256, and carries one cell per run: engine, cpu, memory_mib,
+guest_dns, guest_env, the seal identity, publishable, stall_gate_passed,
+dns_verdict, load_max_1min (the maximum 1-min load the campaign's sampler saw
+during the measured run, when the evidence records it), the headline median
+blocking_ms per arm with its CI, and for the diag its verdict, violation
+count and slowest load event per URL.
 
 The publication rule (REVIEW.md) is to quote only from sealed runs that passed
 their gates and were never withdrawn, and publishable=true alone proves none
@@ -397,10 +399,39 @@ def check_evidence(run_dir, evidence, sources, guest_dns):
             )
 
 
-def summarize_diag(run_dir, diag, measured_urls):
+# What binds a diag to the run it sits beside: diag summary key -> analysis
+# cell key. The two must name the same snapshot generation and config, the
+# same tag, engine, backend and UFFD mode, or the diag diagnosed something
+# other than what the run measured.
+DIAG_IDENTITY = (
+    ("snapshot_generation_id", "snapshot_generation_id"),
+    ("snapshot_config_sha256", "snapshot_config_sha256"),
+    ("tag", "snapshot"),
+    ("engine", "engine"),
+    ("backend", "backend"),
+    ("uffd_mode", "uffd_mode"),
+)
+
+
+def summarize_diag(run_dir, diag, cell, measured_urls):
     """The diag's verdict, violation count and slowest load per URL; RunError otherwise."""
     if not isinstance(diag, dict):
         raise RunError(f"{run_dir}: diag/summary.json is not a JSON object")
+    for diag_key, cell_key in DIAG_IDENTITY:
+        if diag_key not in diag:
+            raise RunError(f"{run_dir}: diag/summary.json names no {diag_key}")
+        if cell_key not in cell:
+            raise RunError(f"{run_dir}: analysis.json cell names no {cell_key}")
+        if diag[diag_key] != cell[cell_key]:
+            raise RunError(
+                f"{run_dir}: diag/summary.json {diag_key}={diag[diag_key]!r} is not the "
+                f"run's {cell_key}={cell[cell_key]!r}; that diag diagnosed something else"
+            )
+    if diag.get("runtime_bundle_intact") is not True:
+        raise RunError(
+            f"{run_dir}: diag/summary.json records runtime_bundle_intact="
+            f"{diag.get('runtime_bundle_intact')!r}; the sealed bundle changed under the diag"
+        )
     passed = diag.get("passed")
     if not isinstance(passed, bool):
         raise RunError(f"{run_dir}: diag/summary.json records no boolean passed")
@@ -413,12 +444,19 @@ def summarize_diag(run_dir, diag, measured_urls):
     max_load = {}
     for url, data in urls.items():
         value = data.get("max_load_ms") if isinstance(data, dict) else None
-        if value is not None and (
-            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-        ):
+        # A passing diag timed a load event on every rep; null here is a
+        # summary the index cannot quote a load from.
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise RunError(f"{run_dir}: diag/summary.json max_load_ms for {url} is {value!r}")
         max_load[url] = value
-    # A diag over other pages says nothing about the pages this run measured.
+    # A diag over other pages says nothing about the pages this run measured,
+    # and a cell that names no url gives the comparison nothing to hold the
+    # diag to.
+    if not measured_urls:
+        raise RunError(
+            f"{run_dir}: analysis.json cell names no url, so diag/summary.json "
+            "cannot be checked against what the run measured"
+        )
     missing = [url for url in measured_urls if url not in urls]
     if missing:
         raise RunError(
@@ -522,16 +560,31 @@ def load_cell(run_dir):
             "dns-evidence.json; a resolver run without its brackets is not indexed"
         )
 
+    # The container environment the golden baked (reqbench.sh GUEST_ENV):
+    # the resolver-rule arm carries BENCH_RESOLVE_ALL_TO here and resolves
+    # nothing through resolv.conf, so its guest_dns is null.
+    guest_env = cell.get("guest_env", [])
+    if not isinstance(guest_env, list) or not all(
+        isinstance(entry, str) and "=" in entry for entry in guest_env
+    ):
+        raise RunError(f"{run_dir}: analysis.json cell guest_env is not a list of KEY=VALUE")
+
     diag = None
     diag_path = os.path.join(run_dir, "diag", "summary.json")
     if os.path.isfile(diag_path):
         measured = [part.strip() for part in str(cell.get("url") or "").split(",") if part.strip()]
-        diag = summarize_diag(run_dir, sources.read_json(diag_path), measured)
-    elif cell["guest_dns"] is not None:
-        # The campaign diagnoses the golden before measuring on it; a
-        # resolver run without the summary is a run nobody diagnosed.
+        diag = summarize_diag(run_dir, sources.read_json(diag_path), cell, measured)
+    elif cell["guest_dns"] is not None or guest_env:
+        # The campaign diagnoses the golden before measuring on it; a run
+        # whose golden was shaped for the corpus (a baked resolver, or a
+        # baked environment such as the resolver rule) without the summary
+        # is a run nobody diagnosed.
+        shaped = (
+            f"guest_dns is {cell['guest_dns']!r}" if cell["guest_dns"] is not None
+            else f"guest_env is {guest_env!r}"
+        )
         raise RunError(
-            f"{run_dir}: guest_dns is {cell['guest_dns']!r} but there is no "
+            f"{run_dir}: {shaped} but there is no "
             "diag/summary.json; a corpus run without its diag is not indexed"
         )
 
@@ -557,6 +610,7 @@ def load_cell(run_dir):
         "cpu": cell["cpu"],
         "memory_mib": cell["memory_mib"],
         "guest_dns": cell["guest_dns"],
+        "guest_env": guest_env,
         "backend": cell.get("backend"),
         "uffd_mode": cell.get("uffd_mode"),
         "seal": seal,

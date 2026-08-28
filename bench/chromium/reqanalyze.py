@@ -55,6 +55,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import sys
 import tempfile
@@ -79,7 +80,9 @@ def is_cdp_class(arm):
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
-ANALYZER_SCHEMA_VERSION = 5
+ANALYZER_SCHEMA_VERSION = 6
+# One baked container environment entry, as reqbench.sh GUEST_ENV records it.
+GUEST_ENV_ENTRY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 SEALED_ANALYZER_FD_ENV = "REQANALYZE_SEALED_FD"
 ANALYZER_SOURCE_PATH_ENV = "REQANALYZE_SOURCE_PATH"
 
@@ -93,6 +96,7 @@ CELL_FIELDS = (
     "url",
     "engine",
     "guest_dns",
+    "guest_env",
     "format",
     "quality",
     "image",
@@ -322,6 +326,16 @@ def _cell_from_meta(meta, source):
             # chromium, the same reading _validate_schedule gives it.
             value = meta.get("engine") or "chromium"
             valid = value in SUPPORTED_ENGINES
+        elif field == "guest_env":
+            # The container environment the golden baked (reqbench.sh
+            # GUEST_ENV): KEY=VALUE entries, [] when none. Absent means none,
+            # the same reading `engine` gets; a resolver-rule arm
+            # (BENCH_RESOLVE_ALL_TO) is a different population from a plain
+            # run and campaign_summary keys its diag requirement on this.
+            value = meta.get("guest_env", [])
+            valid = isinstance(value, list) and all(
+                isinstance(entry, str) and GUEST_ENV_ENTRY.match(entry) for entry in value
+            )
         elif field == "guest_dns":
             # null: the guest used the host resolvers (fixture runs). A string
             # must be the canonical IP literal fcvm baked into resolv.conf.

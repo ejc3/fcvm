@@ -740,11 +740,16 @@ then on "Custom firecracker not found", because a hand-rolled runner called
   implicit UFFD server; the record would be mislabeled), and the pool is
   ensured MEM-derived (4 x MEM/2 pages) at golden, verify, AND run time.
 - The diag phase renders each URL on its own clone with cdpdrive's
-  `--net-trace` and refuses on any remote IP outside `DIAG_EXPECT_IPS=`, any
-  name that did not resolve, any load event over `DIAG_MAX_LOAD_MS=`, any
-  failed render, or an unclean clone teardown; `$RESULTS/diag/summary.json`
-  holds the verdict. `make bench-chromium-corpus` runs it after the golden's
-  verify with the corpus URLs, `DIAG_EXPECT_IPS=10.0.2.2` and
+  `--net-trace` and refuses on any remote IP outside `DIAG_EXPECT_IPS=`, a
+  trace naming no remote address while that knob is set, any name that did
+  not resolve, any load event over `DIAG_MAX_LOAD_MS=`, any failed render (a
+  record for another URL, not ok, written under a non-zero driver exit
+  status, or without a load event timing), an unclean clone teardown, or a
+  sealed bundle that changed during the phase; `$RESULTS/diag/summary.json`
+  holds the verdict and names the snapshot generation and config it
+  diagnosed. WebKit renders carry no trace, so the webkit diag refuses
+  `DIAG_EXPECT_IPS=`. `make bench-chromium-corpus` runs it after the golden's
+  verify with the corpus URLs, `DIAG_EXPECT_IPS=10.0.2.2` (Chromium only) and
   `DIAG_MAX_LOAD_MS=15000` (overridable), and does not measure when it fails;
   `DIAG_ONLY=1` stops the campaign after golden, verify and diag.
 - Structural pin: `MakefileBenchGraph` in bench/chromium/test_reqbench.py

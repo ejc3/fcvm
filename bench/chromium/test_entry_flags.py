@@ -139,6 +139,28 @@ class EntryResolverRule(unittest.TestCase):
                     self.assertIn("BENCH_RESOLVE_ALL_TO", result.stderr,
                                   "the refusal does not name the knob")
 
+    def test_a_value_that_is_not_an_ip_literal_is_refused(self):
+        """Hex digits, dots and colons alone do not make an address:
+        `deadbeef`, `1.2.3.999` and `:::` all reach Chromium as a resolver
+        target under a character whitelist, and every request then fails
+        far from the knob that caused it. The value must parse as one IPv4
+        or IPv6 address; a real IPv6 literal is accepted."""
+        for shell in SHELLS:
+            for bad in ("deadbeef", "1.2.3.999", ":::", "10.0.2", "1.2.3.4.5", "10.0.2.2."):
+                with self.subTest(shell=shell, value=bad):
+                    result, argv = self._run(shell, {"BENCH_RESOLVE_ALL_TO": bad})
+                    self.assertNotEqual(
+                        result.returncode, 0,
+                        f"chromium was launched with BENCH_RESOLVE_ALL_TO={bad!r}: {argv}")
+                    self.assertIsNone(argv, "chromium was launched before the refusal")
+                    self.assertIn("BENCH_RESOLVE_ALL_TO", result.stderr)
+            with self.subTest(shell=shell, value="fd00::2"):
+                result, argv = self._run(shell, {"BENCH_RESOLVE_ALL_TO": "fd00::2"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [a for a in (argv or []) if a.startswith("--host-resolver-rules")],
+                    ["--host-resolver-rules=MAP * fd00::2"])
+
 
 if __name__ == "__main__":
     unittest.main()
