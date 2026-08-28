@@ -1837,17 +1837,24 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         // Two earlier drafts reaped nothing: `fcvm ls` (`list_vms` does not
         // clean) and `exec --pid <base>` (a hit, so the cleanup never ran).
         // Both passed; neither proved anything. Hence the assertion after it.
-        let reaper = tokio::process::Command::new(common::find_fcvm_binary()?)
-            .args(["exec", "--pid", &u32::MAX.to_string(), "--", "true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .context("running `fcvm exec` as the stale-state reaper")?;
+        let reaper = match common::find_fcvm_binary() {
+            Ok(fcvm) => tokio::process::Command::new(fcvm)
+                .args(["exec", "--pid", &u32::MAX.to_string(), "--", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .context("running `fcvm exec` as the stale-state reaper"),
+            Err(e) => Err(e),
+        };
         // Verdicts are RECORDED here and asserted after the fixture is torn down
-        // (below, with the others): a panic at this point would skip the
+        // (below, with the others): a panic or `?` at this point would skip the
         // baseline's and the serve's graceful shutdown and the snapshot delete.
-        let reaper_hit_a_vm = reaper.success();
+        // That includes the reaper failing to START (fd or process exhaustion
+        // is exactly when it would), which is why its spawn error is a verdict
+        // too and not an early return.
+        let reaper_hit_a_vm = matches!(&reaper, Ok(status) if status.success());
+        let reaper_could_not_run = reaper.err().map(|e| format!("{e:#}"));
         let state_reaped = !state_file.exists();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1902,6 +1909,12 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
             std::fs::remove_dir_all(d).ok();
         }
 
+        assert!(
+            reaper_could_not_run.is_none(),
+            "the stale-state reaper (`fcvm exec --pid {}`) could not be run: {}",
+            u32::MAX,
+            reaper_could_not_run.clone().unwrap_or_default()
+        );
         assert!(
             !reaper_hit_a_vm,
             "`fcvm exec --pid {}` SUCCEEDED: no process can hold that PID, so a hit \
