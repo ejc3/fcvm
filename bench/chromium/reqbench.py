@@ -1229,11 +1229,11 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         raise RuntimeError(f"snapshot config {path} has invalid network_mode {network_mode!r}")
     if not isinstance(port_mappings, list):
         raise RuntimeError(f"snapshot config {path} has no port_mappings list")
-    # The guest resolver the golden was prepared with (`fcvm podman prepare
-    # --dns`, reqbench.sh GUEST_DNS). fcvm records it as
-    # metadata.network_config.dns_server; null means the guest used the host
-    # resolvers, which is what a fixture run wants and what a corpus run must
-    # never have (the analyzer refuses hostnames without a named resolver).
+    # The resolver fcvm gave the guest, as metadata.network_config.dns_server.
+    # With `fcvm podman prepare --dns` (reqbench.sh GUEST_DNS) it is the
+    # requested one; without, rootless guests record null and bridged guests
+    # record the host's first resolver. Which of those it is comes from the
+    # provenance's guest_dns below, not from this value.
     network_config = metadata.get("network_config")
     dns_server = None
     if network_config is not None:
@@ -1298,6 +1298,33 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         or any(character not in "0123456789abcdef" for character in image_cache_key)
     ):
         raise RuntimeError(f"snapshot provenance {provenance_path} has invalid image_cache_key")
+    # guest_dns is the resolver the golden REQUESTED (null: none), which is
+    # what the run meta records and the analyzer gates on. The effective
+    # dns_server is not a substitute: a bridged guest inherits the host's
+    # resolver without anyone asking for it, and a run that resolved its
+    # hostnames on the live internet must not read as one with a controlled
+    # resolver. When one was requested the snapshot has to have baked it.
+    if "guest_dns" not in provenance:
+        raise RuntimeError(
+            f"snapshot provenance {provenance_path} records no guest_dns; "
+            "recreate the golden snapshot with reqbench.sh golden"
+        )
+    guest_dns = provenance["guest_dns"]
+    if guest_dns is not None:
+        try:
+            canonical_guest_dns = str(ipaddress.ip_address(guest_dns))
+        except (TypeError, ValueError):
+            canonical_guest_dns = None
+        if not isinstance(guest_dns, str) or canonical_guest_dns != guest_dns:
+            raise RuntimeError(
+                f"snapshot provenance {provenance_path} has invalid guest_dns "
+                f"{guest_dns!r}: expected an IP literal or null"
+            )
+        if dns_server != guest_dns:
+            raise RuntimeError(
+                f"snapshot provenance {provenance_path} requested guest_dns "
+                f"{guest_dns!r} but the snapshot baked dns_server {dns_server!r}"
+            )
     image_disk_path = metadata.get("image_disk_path")
     if (
         not isinstance(image_disk_path, str)
@@ -1342,6 +1369,7 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         "network_mode": network_mode,
         "port_mappings": port_mappings,
         "dns_server": dns_server,
+        "guest_dns": guest_dns,
     }
 
 
@@ -4183,7 +4211,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "uffd_mode": uffd_mode,
             "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
             "engine": args.engine,
-            "guest_dns": snapshot["dns_server"],
+            "guest_dns": snapshot["guest_dns"],
             "quality": args.quality,
             "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,

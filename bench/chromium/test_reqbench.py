@@ -2188,6 +2188,7 @@ class SnapshotGenerationIdentity(unittest.TestCase):
             "creator_fcvm_sha256": "c" * 64,
             "creator_runtime_bundle_sha256": "d" * 64,
             "source_revision": "e" * 40,
+            "guest_dns": None,
         }
         with open(
             os.path.join(snapshot_dir, "reqbench-provenance.json"), "w"
@@ -6972,35 +6973,85 @@ class SnapshotGenerationDns(unittest.TestCase):
     GENERATION_ID = "11111111-1111-4111-8111-111111111111"
 
     @classmethod
-    def write_generation(cls, data_root, network_config):
-        """The identity fixture plus a network_config block (None omits it)."""
+    def write_generation(cls, data_root, network_config, guest_dns=None,
+                         drop_guest_dns=False):
+        """The identity fixture plus a network_config block (None omits it).
+
+        guest_dns is what the golden's provenance records as the requested
+        resolver (reqbench.sh GUEST_DNS, null when none was requested);
+        drop_guest_dns removes the key, the shape of a pre-feature golden.
+        """
         config_path, _digest = SnapshotGenerationIdentity._write_generation(
             data_root, cls.GENERATION_ID,
         )
-        if network_config is None:
-            return
-        with open(config_path) as source:
-            config = json.load(source)
-        config["metadata"]["network_config"] = network_config
-        config_json = (
-            json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode()
-        with open(config_path, "wb") as target:
-            target.write(config_json)
         provenance_path = os.path.join(
             data_root, "snapshots", cls.SNAPSHOT, "reqbench-provenance.json",
         )
         with open(provenance_path) as source:
             provenance = json.load(source)
-        provenance["snapshot_config_sha256"] = hashlib.sha256(config_json).hexdigest()
+        if network_config is not None:
+            with open(config_path) as source:
+                config = json.load(source)
+            config["metadata"]["network_config"] = network_config
+            config_json = (
+                json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            with open(config_path, "wb") as target:
+                target.write(config_json)
+            provenance["snapshot_config_sha256"] = hashlib.sha256(config_json).hexdigest()
+        provenance["guest_dns"] = guest_dns
+        if drop_guest_dns:
+            del provenance["guest_dns"]
         with open(provenance_path, "w") as target:
             json.dump(provenance, target)
 
     def test_a_dns_override_is_returned_as_dns_server(self):
         with tempfile.TemporaryDirectory() as data_root:
-            self.write_generation(data_root, {"dns_server": "10.0.2.2"})
+            self.write_generation(
+                data_root, {"dns_server": "10.0.2.2"}, guest_dns="10.0.2.2",
+            )
             generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
             self.assertEqual(generation["dns_server"], "10.0.2.2")
+            self.assertEqual(generation["guest_dns"], "10.0.2.2")
+
+    def test_a_host_filled_resolver_without_an_override_is_not_a_guest_dns(self):
+        """Bridged goldens carry the host's first resolver in dns_server
+        when no --dns was given (src/commands/podman/mod.rs,
+        with_dns_server(host_dns.first())). That resolver was recorded as
+        guest_dns, so a run that resolved its hostnames on the live
+        internet satisfied the analyzer's "names its resolver" gate.
+
+        RED BEFORE THE FIX: KeyError: 'guest_dns'.
+        """
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": "192.168.94.1"}, guest_dns=None,
+            )
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertEqual(generation["dns_server"], "192.168.94.1")
+            self.assertIsNone(generation["guest_dns"])
+
+    def test_a_provenance_without_guest_dns_is_refused(self):
+        """A golden made before the field existed cannot say whether its
+        resolver was requested; it is re-recorded, not guessed at.
+
+        RED BEFORE THE FIX: RuntimeError not raised.
+        """
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": "10.0.2.2"}, drop_guest_dns=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "guest_dns"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_an_override_the_snapshot_did_not_bake_is_refused(self):
+        """RED BEFORE THE FIX: RuntimeError not raised."""
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": "10.0.2.3"}, guest_dns="10.0.2.2",
+            )
+            with self.assertRaisesRegex(RuntimeError, "10.0.2.2"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
 
     def test_no_override_is_returned_as_none(self):
         with tempfile.TemporaryDirectory() as data_root:
@@ -7038,8 +7089,10 @@ class RunMetaGuestDns(unittest.TestCase):
 
     SNAPSHOT = SnapshotGenerationIdentity.SNAPSHOT
 
-    def _drive_main(self, data_root, network_config):
-        SnapshotGenerationDns.write_generation(data_root, network_config)
+    def _drive_main(self, data_root, network_config, guest_dns=None):
+        SnapshotGenerationDns.write_generation(
+            data_root, network_config, guest_dns=guest_dns,
+        )
         runtime_bundle = os.path.join(data_root, "runtime")
         os.makedirs(runtime_bundle)
         manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
@@ -7141,7 +7194,9 @@ class RunMetaGuestDns(unittest.TestCase):
 
     def test_the_resolver_override_is_recorded(self):
         with tempfile.TemporaryDirectory() as data_root:
-            meta = self._drive_main(data_root, {"dns_server": "10.0.2.2"})
+            meta = self._drive_main(
+                data_root, {"dns_server": "10.0.2.2"}, guest_dns="10.0.2.2",
+            )
         self.assertEqual(meta["guest_dns"], "10.0.2.2")
         self.assertEqual(meta["engine"], "chromium")
 
@@ -7149,6 +7204,17 @@ class RunMetaGuestDns(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_root:
             meta = self._drive_main(data_root, {"dns_server": None})
         self.assertIn("guest_dns", meta)
+        self.assertIsNone(meta["guest_dns"])
+
+    def test_a_host_filled_resolver_is_recorded_as_null(self):
+        """The meta's guest_dns is the resolver the golden REQUESTED, from
+        its provenance; the effective dns_server a bridged guest inherits
+        from the host is not a controlled resolver.
+
+        RED BEFORE THE FIX: AssertionError: '192.168.94.1' is not None.
+        """
+        with tempfile.TemporaryDirectory() as data_root:
+            meta = self._drive_main(data_root, {"dns_server": "192.168.94.1"})
         self.assertIsNone(meta["guest_dns"])
 
 
