@@ -884,14 +884,64 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(os.path.join(results, "corpus-serve.status"), "w") as handle:
                 handle.write(serve_status + "\n")
 
-    def _sample(self, env, results, verdict_in="clean", seconds=0.6, mid_run="",
+    # Waits for what the assertion needs, never for a duration. A fixed
+    # sleep here assumed a sample rate the box has to deliver: at 0.3 s per
+    # `ss` call the 0.6 s this used to sleep buys one sample, the
+    # SS_CHANGE_AT-th call never happens, and the owner-change case reports
+    # clean (Codex, 2026-08-28). Each helper ends the script with a message
+    # and a non-zero status when its deadline passes, so a wait that will
+    # never finish fails the test loudly instead of hanging to the
+    # subprocess timeout.
+    SYNC = """
+sync_deadline() { echo $((SECONDS + 30)); }
+sync_expired() {
+    [ "$SECONDS" -lt "$1" ] && return 1
+    echo "TIMEOUT after ${2}: $3" >&2
+    exit 97
+}
+wait_rows() {
+    # $1 = rows dns-owner.log must carry before the script goes on.
+    local deadline; deadline=$(sync_deadline)
+    while [ "$(wc -l <"$RESULTS/dns-owner.log" 2>/dev/null || echo 0)" -lt "$1" ]; do
+        sync_expired "$deadline" 30s "dns-owner.log never reached $1 rows"
+        sleep 0.02
+    done
+}
+wait_last_load() {
+    # $1 = the load1 value the newest sample must carry.
+    local deadline; deadline=$(sync_deadline)
+    while [ "$(sed -n 's/.* load1=//p' "$RESULTS/dns-owner.log" 2>/dev/null | tail -n 1)" != "$1" ]; do
+        sync_expired "$deadline" 30s "no sample carried load1=$1"
+        sleep 0.02
+    done
+}
+wait_sampler_gone() {
+    # The sampler ended on its own. `kill -0` cannot see this (a dead,
+    # unreaped child still answers it) and `wait` would consume the status
+    # stop_dns_sampler reads, so this watches the process state: Z once it
+    # has exited and is waiting to be reaped.
+    local deadline state; deadline=$(sync_deadline)
+    while :; do
+        state=$(sed -e 's/^.*) //' -e 's/ .*//' "/proc/$SAMPLER_PID/stat" 2>/dev/null || true)
+        case "${state:-gone}" in gone | Z) return 0 ;; esac
+        sync_expired "$deadline" 30s "the sampler is still running"
+        sleep 0.02
+    done
+}
+"""
+
+    def _sample(self, env, results, verdict_in="clean", rows=1, mid_run="",
                 files=True):
+        """Sample until dns-owner.log carries `rows` rows, run `mid_run`,
+        stop, write the evidence. `rows` is what the caller's assertions
+        need, and mid_run has the SYNC helpers to wait for anything it
+        causes."""
         if files:
             self._leave_files(results)
-        script = (f'set -u\n{self._helpers()}\n'
+        script = (f'set -u\n{self._helpers()}\n{self.SYNC}\n'
                   f'RESULTS="{results}"\nSERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\n'
                   'DNS_SAMPLE_INTERVAL=0.05\nstart_dns_sampler\n'
-                  f'sleep {seconds}\n{mid_run}\nstop_dns_sampler\n'
+                  f'wait_rows {rows}\n{mid_run}\nstop_dns_sampler\n'
                   f'write_dns_evidence {verdict_in}\n')
         result = self._run(script, env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -899,10 +949,17 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             return json.load(handle), result
 
     def test_a_port_owner_change_mid_run_is_unclean(self):
+        """The owner changes from the third sample on, so the case only
+        exists once three samples are in the log.
+
+        RED WITH A SLOW SAMPLER (0.3 s per `ss` call, the fixed 0.6 s sleep
+        this used to wait): "127.0.0.1:53 changed hands and the verdict is
+        clean", samples 1.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
             env["SS_CHANGE_AT"] = "3"
-            evidence, _ = self._sample(env, results)
+            evidence, _ = self._sample(env, results, rows=3)
             self.assertEqual(evidence["verdict"], "unclean",
                              f"127.0.0.1:53 changed hands and the verdict is clean: {evidence}")
             self.assertGreaterEqual(evidence["samples"], 3)
@@ -914,9 +971,14 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             self.assertRegex(lines[0], r"^\S+ owner_pid=4242 dnsmasq=inactive load1=0\.42$")
 
     def test_a_steady_owner_with_dnsmasq_down_is_clean(self):
+        """The clean case, over the same three samples.
+
+        RED WITH A SLOW SAMPLER: AssertionError: 1 not greater than or equal
+        to 3.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
-            evidence, _ = self._sample(env, results)
+            evidence, _ = self._sample(env, results, rows=3)
             self.assertEqual(evidence["verdict"], "clean", evidence)
             self.assertEqual(evidence["serve_pid"], 4242)
             self.assertIs(evidence["dnsmasq_was_active_before"], True)
@@ -986,7 +1048,8 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
             env["SS_FAIL_AT"] = "3"
-            evidence, _ = self._sample(env, results)
+            evidence, _ = self._sample(env, results, rows=2,
+                                       mid_run="wait_sampler_gone\n")
             self.assertEqual(evidence["verdict"], "unclean", evidence)
             self.assertIs(evidence["sampler_alive_at_stop"], False)
             self.assertGreaterEqual(evidence["samples"], 2)
@@ -1063,9 +1126,9 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         """
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
-            raise_load = (f'sleep 0.3\nprintf "1.87 0.30 0.20 1/100 1234\\n" '
-                          f'> "{env["LOADAVG_FILE"]}"\nsleep 0.3\n')
-            evidence, _ = self._sample(env, results, mid_run=raise_load)
+            raise_load = (f'printf "1.87 0.30 0.20 1/100 1234\\n" '
+                          f'> "{env["LOADAVG_FILE"]}"\nwait_last_load 1.87\n')
+            evidence, _ = self._sample(env, results, rows=3, mid_run=raise_load)
             with open(os.path.join(results, "dns-owner.log")) as handle:
                 lines = handle.read().splitlines()
             self.assertGreaterEqual(len(lines), 4)
@@ -1087,7 +1150,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         """
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
-            cut_load = f'rm -f "{env["LOADAVG_FILE"]}"\nsleep 0.3\n'
+            cut_load = f'rm -f "{env["LOADAVG_FILE"]}"\nwait_sampler_gone\n'
             evidence, _ = self._sample(env, results, mid_run=cut_load)
             self.assertEqual(evidence["verdict"], "unclean", evidence)
             self.assertIs(evidence["sampler_alive_at_stop"], False)
