@@ -153,7 +153,9 @@ def diag_summary(urls=("https://example.com/",), passed=True, violations=(),
     """diag/summary.json in the shape reqbench.sh diag writes. identity
     overrides the fields campaign_summary binds to the cell, and
     uffd_prefetch, which it holds to "off" (the diag's serve never records
-    a working set; null on the file backend, which has no serve)."""
+    a working set; null on the file backend, which has no serve), and
+    runtime_bundle_sha256, the sealed runtime the diag rendered from, which
+    it holds to the run's seal."""
     return {
         "engine": engine,
         "tag": identity.get("tag", "cb-req-corpus"),
@@ -163,6 +165,8 @@ def diag_summary(urls=("https://example.com/",), passed=True, violations=(),
         "snapshot_generation_id": identity.get("snapshot_generation_id", GENERATION_ID),
         "snapshot_config_sha256": identity.get("snapshot_config_sha256", CONFIG_SHA256),
         "runtime_bundle_intact": identity.get("runtime_bundle_intact", True),
+        "runtime_bundle_sha256": identity.get(
+            "runtime_bundle_sha256", SEAL["runtime_bundle_sha256"]),
         "reps": 3,
         "urls": {
             url: {"reps": 3, "renders_ok": 3, "max_load_ms": max_load_ms,
@@ -708,6 +712,39 @@ class CampaignSummary(unittest.TestCase):
             rc, text = self._summarize(out, [run_dir])
             self.assertNotEqual(rc, 0, text)
             self.assertIn("runtime_bundle_intact", text)
+
+    def test_a_diag_from_another_sealed_runtime_is_refused(self):
+        """runtime_bundle_intact says the bundle did not change under the
+        diag, not that it is the bundle the run measured from. A later
+        standalone diag, staged from edited sources, writes its summary
+        beside an earlier run and passes every other identity check, so the
+        summary names its own sealed bundle and the index holds that to the
+        run's seal. A summary carrying none is refused rather than read as
+        this run's.
+        """
+        missing = diag_summary()
+        missing.pop("runtime_bundle_sha256", None)
+        cases = (
+            ("another bundle", diag_summary(runtime_bundle_sha256="9" * 64)),
+            ("no bundle at all", missing),
+            ("null", diag_summary(runtime_bundle_sha256=None)),
+        )
+        for label, diag in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, diag=diag)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{label}: indexed")
+                self.assertFalse(os.path.exists(out))
+                self.assertIn("runtime_bundle_sha256", text)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=diag_summary(
+                runtime_bundle_sha256=SEAL["runtime_bundle_sha256"]))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
 
     def test_a_diag_whose_serve_could_have_recorded_its_renders_is_refused(self):
         """The diag's clones fault the golden's pages. A UFFD serve with

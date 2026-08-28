@@ -74,9 +74,11 @@ under `$RESULTS/diag/`, and `summary.json` there carries, per URL, the render
 count, the slowest load event, the most requests still open at the load
 event, every remote IP with its request count and every failure text, plus a
 violations list, `passed`, `runtime_bundle_intact`, `uffd_prefetch` (`"off"`;
-`null` on the file backend, which has no serve), and the
+`null` on the file backend, which has no serve), the
 `snapshot_generation_id` and `snapshot_config_sha256` of the snapshot it
-diagnosed. The phase exits non-zero, and `passed` is false, on any remote IP
+diagnosed, and `runtime_bundle_sha256`, the sealed runtime it rendered from
+(the hash the measured run records; `null` when the phase ran outside a
+staged bundle). The phase exits non-zero, and `passed` is false, on any remote IP
 outside `DIAG_EXPECT_IPS=` (comma-separated, when set), a trace naming no
 remote address at all while it is set, any `net::ERR_NAME_NOT_RESOLVED` in a
 trace, any load event over `DIAG_MAX_LOAD_MS=` (when set), any failed render
@@ -99,7 +101,10 @@ renders (every corpus URL, three clones each) do not warm the sidecar the run
 replays and a fresh golden still measures as one. campaign_summary.py
 refuses a corpus run without its `diag/summary.json`, a summary that names
 another snapshot generation, config, tag, engine, backend or UFFD mode than
-the run's analysis cell, one whose `uffd_prefetch` is not `"off"` (`null`
+the run's analysis cell, one whose `runtime_bundle_sha256` is not the run's
+sealed bundle or is absent (a standalone diag staged from edited sources
+leaves a summary that is intact and matches every snapshot field, and it
+rendered with other code), one whose `uffd_prefetch` is not `"off"` (`null`
 on the file backend), including a summary from before the field existed,
 and one whose `limits` were not armed for the run: `passed` is true when
 nothing the diag was asked to check went wrong, and a standalone diag over

@@ -16,10 +16,10 @@ serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive and a load the
 evidence accounts for) and diag/summary.json (reqbench.sh diag; required when
 the cell's guest_dns names a baked resolver or its guest_env is non-empty,
 optional otherwise; when present it must name the run's snapshot generation,
-config, tag, engine, backend and UFFD mode, record uffd_prefetch "off" (null
-on the file backend, which has no serve), say passed=true with the sealed
-bundle intact, list no violations, cover every URL the cell measured, carry
-a load event for each and have rendered each reps times). A diag's
+config, tag, engine, backend, UFFD mode and sealed runtime bundle, record
+uffd_prefetch "off" (null on the file backend, which has no serve), say
+passed=true with that bundle intact, list no violations, cover every URL the
+cell measured, carry a load event for each and have rendered each reps times). A diag's
 passed=true means only that nothing it was asked to check went wrong, so its
 limits must have been armed for this run: on Chromium limits.expect_ips must
 be exactly the address set the run's records name (the answers the verify
@@ -492,7 +492,8 @@ def recorded_addresses(run_dir, measured_urls, guest_env, answers):
 # What binds a diag to the run it sits beside: diag summary key -> analysis
 # cell key. The two must name the same snapshot generation and config, the
 # same tag, engine, backend and UFFD mode, or the diag diagnosed something
-# other than what the run measured.
+# other than what the run measured. The sealed runtime bundle is checked
+# beside them, below.
 DIAG_IDENTITY = (
     ("snapshot_generation_id", "snapshot_generation_id"),
     ("snapshot_config_sha256", "snapshot_config_sha256"),
@@ -522,6 +523,29 @@ def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
                 f"{run_dir}: diag/summary.json {diag_key}={diag[diag_key]!r} is not the "
                 f"run's {cell_key}={cell[cell_key]!r}; that diag diagnosed something else"
             )
+    # The sealed runtime the diag rendered from. reqbench.sh stages fcvm,
+    # fc-agent and its five sources into one hash-bound bundle; the run stamps
+    # that bundle's hash into every record's meta and reqanalyze carries it
+    # into the cell's seal, and reqbench.sh diag records the same hash under
+    # the same name. runtime_bundle_intact below says only that the bundle did
+    # not change under the phase, so a later standalone diag staged from
+    # edited sources overwrites the campaign's summary, matches every snapshot
+    # field, reports itself intact, and rendered with other code. A summary
+    # naming no bundle cannot be bound to the run at all.
+    if "runtime_bundle_sha256" not in diag:
+        raise RunError(
+            f"{run_dir}: diag/summary.json names no runtime_bundle_sha256; a diag that "
+            "does not say which sealed runtime it ran from is not this run's evidence"
+        )
+    if "runtime_bundle_sha256" not in cell:
+        raise RunError(f"{run_dir}: analysis.json cell names no runtime_bundle_sha256")
+    if diag["runtime_bundle_sha256"] != cell["runtime_bundle_sha256"]:
+        raise RunError(
+            f"{run_dir}: diag/summary.json runtime_bundle_sha256="
+            f"{diag['runtime_bundle_sha256']!r} is not the run's "
+            f"{cell['runtime_bundle_sha256']!r}; that diag rendered with other code "
+            "than the run measured with"
+        )
     # The diag's clones fault the golden's pages, and a UFFD serve with
     # working-set replay on records those faults into memory.bin.working-set
     # beside the golden, the file the measured run replays. reqbench.sh diag

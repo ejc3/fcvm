@@ -1615,8 +1615,9 @@ PYWD
 # written). $1 = clone/serve teardowns that were not clean, $2 = 1 when the
 # sealed runtime bundle was still intact at the end of the phase, then
 # url/stem pairs. The summary names the snapshot generation and config it
-# diagnosed, read under the generation lock this phase holds, so
-# campaign_summary can bind it to the run measured on the same generation.
+# diagnosed, read under the generation lock this phase holds, and the sealed
+# runtime bundle it ran from, so campaign_summary can bind it to a run
+# measured on the same generation from the same code.
 diag_write_summary() {
     local teardown_failures="$1" bundle_ok="$2"
     shift 2
@@ -1632,16 +1633,33 @@ diag_write_summary() {
         || { log "diag: cannot read generation_id from $cfg"; return 1; }
     config_sha=$($SUDO sha256sum "$cfg" 2>/dev/null | cut -d' ' -f1)
     [ -n "$config_sha" ] || { log "diag: cannot hash $cfg"; return 1; }
+    # The sealed runtime that rendered these pages, named the way the measured
+    # run names it: reqbench.py stamps the sha256 of the staged bundle's
+    # MANIFEST.sha256 into every record's meta as runtime_bundle_sha256, and
+    # reqanalyze carries it into the cell's seal. runtime_bundle_intact says
+    # only that the bundle did not change under this phase, so without the
+    # hash a later standalone diag, staged from edited sources, overwrites
+    # this summary and still binds to the run. Empty (recorded as null) when
+    # the phase ran outside a staged bundle; campaign_summary refuses that
+    # rather than reading it as a run's evidence.
+    local bundle_sha=""
+    if [ -n "${REQBENCH_RUNTIME_BUNDLE:-}" ]; then
+        bundle_sha=$(sha256sum "$REQBENCH_RUNTIME_BUNDLE/MANIFEST.sha256" 2>/dev/null | cut -d' ' -f1)
+        [ -n "$bundle_sha" ] || {
+            log "diag: cannot hash the sealed runtime manifest $REQBENCH_RUNTIME_BUNDLE/MANIFEST.sha256"
+            return 1
+        }
+    fi
     python3 - "$RESULTS/diag" "$ENGINE" "$TAG" "$BACKEND" "$mode" "$prefetch" \
         "$DIAG_REPS" "$DIAG_EXPECT_IPS" "$DIAG_MAX_LOAD_MS" "$teardown_failures" \
-        "$bundle_ok" "$generation" "$config_sha" "$@" <<'PY'
+        "$bundle_ok" "$generation" "$config_sha" "$bundle_sha" "$@" <<'PY'
 import json, os, sys, tempfile, time, uuid
 from collections import Counter
 
 (diag_dir, engine, tag, backend, uffd_mode, uffd_prefetch, reps_raw,
  expect_raw, max_load_raw, teardown_raw, bundle_raw, generation_id,
- config_sha256) = sys.argv[1:14]
-pairs = sys.argv[14:]
+ config_sha256, bundle_sha256) = sys.argv[1:15]
+pairs = sys.argv[15:]
 reps = int(reps_raw)
 expect_ips = [ip for ip in expect_raw.split(",") if ip] or None
 max_load_ms = int(max_load_raw) if max_load_raw else None
@@ -1655,6 +1673,9 @@ if canonical != generation_id:
     raise SystemExit(f"snapshot {tag} has non-canonical generation_id {generation_id!r}")
 if len(config_sha256) != 64 or set(config_sha256) - set("0123456789abcdef"):
     raise SystemExit(f"snapshot {tag} config digest is not a sha256: {config_sha256!r}")
+if bundle_sha256 and (len(bundle_sha256) != 64
+                      or set(bundle_sha256) - set("0123456789abcdef")):
+    raise SystemExit(f"runtime bundle digest is not a sha256: {bundle_sha256!r}")
 # Chromium's load event is timed from the navigate command's response;
 # WebDriver's navigate returns after the classic load event, so its round
 # trip is the same question.
@@ -1784,6 +1805,7 @@ summary = {
     "snapshot_generation_id": generation_id,
     "snapshot_config_sha256": config_sha256,
     "runtime_bundle_intact": bundle_intact,
+    "runtime_bundle_sha256": bundle_sha256 or None,
     "reps": reps,
     "urls": urls,
     "violations": violations,

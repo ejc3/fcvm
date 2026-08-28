@@ -5675,6 +5675,48 @@ exec __PYTHON__ "$@"
             self.assertEqual(summary["snapshot_config_sha256"], config_sha256)
             self.assertIs(summary["runtime_bundle_intact"], True)
 
+    def test_the_summary_names_the_sealed_runtime_it_ran_from(self):
+        """A diag is evidence about a run only when it executed that run's
+        sealed code. campaign_summary binds the two on the bundle hash the
+        run records (reqbench.py's meta runtime_bundle_sha256, the sha256 of
+        the staged bundle's MANIFEST.sha256), so the summary has to carry the
+        same value under the same name. runtime_bundle_intact says only that
+        the bundle did not change under the phase, not which bundle it was.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            bundle = os.path.join(d, "bundle")
+            os.makedirs(bundle)
+            sealed = os.path.join(bundle, "reqbench.sh")
+            with open(sealed, "w") as handle:
+                handle.write("# the sealed copy this phase ran from\n")
+            with open(sealed, "rb") as handle:
+                sealed_sha256 = hashlib.sha256(handle.read()).hexdigest()
+            manifest = os.path.join(bundle, "MANIFEST.sha256")
+            with open(manifest, "w") as handle:
+                handle.write(f"{sealed_sha256}  reqbench.sh\n")
+            with open(manifest, "rb") as handle:
+                bundle_sha256 = hashlib.sha256(handle.read()).hexdigest()
+            env["REQBENCH_RUNTIME_BUNDLE"] = bundle
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            summary = self._diag_summary(env)
+            self.assertIs(summary["runtime_bundle_intact"], True)
+            self.assertEqual(summary["runtime_bundle_sha256"], bundle_sha256)
+
+    def test_a_diag_that_ran_outside_a_staged_bundle_names_no_runtime(self):
+        """No staged bundle, no bundle identity: the summary records null
+        rather than a hash it does not have, and campaign_summary refuses a
+        diag that names none instead of reading it as the run's."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            self.assertNotIn("REQBENCH_RUNTIME_BUNDLE", env)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            summary = self._diag_summary(env)
+            self.assertIn("runtime_bundle_sha256", summary)
+            self.assertIsNone(summary["runtime_bundle_sha256"])
+
 
 class HostCdpQuietGate(unittest.TestCase):
     """hostcdp.sh shares reqbench's SETTLE_WAIT_SECS quiet-gate knob.
@@ -9093,8 +9135,9 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         # The diag summary reqbench.sh diag leaves beside a corpus run; the
         # index refuses a resolver run without one, and binds the one it
         # finds to the analyzer's cell (snapshot generation and config, tag,
-        # engine, backend, UFFD mode), so the identity comes from the
-        # analysis the analyzer just wrote, spelled the way it spells it.
+        # engine, backend, UFFD mode, sealed runtime bundle), so the identity
+        # comes from the analysis the analyzer just wrote, spelled the way it
+        # spells it.
         with open(analysis) as handle:
             cell = json.load(handle)["cell"]
         os.makedirs(os.path.join(run_dir, "diag"))
@@ -9105,7 +9148,9 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 "uffd_prefetch": None,
                 "snapshot_generation_id": cell["snapshot_generation_id"],
                 "snapshot_config_sha256": cell["snapshot_config_sha256"],
-                "runtime_bundle_intact": True, "reps": 3,
+                "runtime_bundle_intact": True,
+                "runtime_bundle_sha256": cell["runtime_bundle_sha256"],
+                "reps": 3,
                 "urls": {url: {"reps": 3, "renders_ok": 3, "max_load_ms": 812.5,
                                "max_pending_at_load": 2, "remote_ips": {"10.0.2.2": 9},
                                "errors": {}} for url in self.CORPUS},
