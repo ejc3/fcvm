@@ -3070,6 +3070,60 @@ fn cargo_target_link_replaces_a_dangling_unmanaged_link_on_fallback() {
     assert_target_usable(checkout.path(), "dangling unmanaged link replaced");
 }
 
+/// A RETIRED generation that is readable but no longer writable rotates to a
+/// fresh one (codex on #867). The candidate write probe used to run before the
+/// retirement check, so `fallback_to_local` dropped the managed link and every
+/// later run retained the real local target/ it had created, putting all Cargo
+/// artifacts on the root filesystem for good. The probe now runs only when the
+/// candidate is REUSED; a retired candidate goes to `new_generation`, which
+/// needs only its parent writable. Unprivileged stand-in as elsewhere: root
+/// writes anything.
+#[test]
+fn cargo_target_link_rotates_a_retired_generation_it_cannot_write() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("retired generation");
+    // Mark it retired exactly as retire_target does.
+    let marked = Command::new("python3")
+        .args([
+            "-c",
+            "import os, sys; os.setxattr(sys.argv[1], b'user.fcvm.retired', b'v1')",
+        ])
+        .arg(&wt)
+        .status()
+        .expect("python3");
+    assert!(
+        marked.success(),
+        "set the retirement xattr on {} (user xattrs must be supported there)",
+        wt.display()
+    );
+    std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("published link");
+    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+
+    let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
+
+    let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        ok,
+        "the recipe failed on a retired read-only generation:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_symlink(),
+        "target/ was replaced by a local directory instead of rotating to a fresh \
+         managed generation:\n{out}"
+    );
+    let link = std::fs::read_link(&target).expect("readlink");
+    assert!(
+        link.to_string_lossy().contains("/cargo-target/") && link != wt,
+        "target/ should point at a FRESH managed generation, not {}\n{out}",
+        link.display()
+    );
+    assert_target_usable(checkout.path(), "rotated to a fresh generation");
+}
+
 /// Every exit that leaves target/ as a plain local directory probes it first.
 ///
 /// Behavioural coverage above reaches two of the three exits; this pins all of

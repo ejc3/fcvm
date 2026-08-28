@@ -327,20 +327,16 @@ else
 		candidate_state_fd="$candidate_lease_fd"
 	fi
 fi
-# The write probe, under the exclusive lease: `mkdir -p` above is idempotent
-# and says nothing about an EXISTING directory that has since gone read-only
-# (ownership change, ro remount). Creating an entry is the operation Cargo
-# needs, and the one root cannot fake past EROFS. It happens here, and only
-# here, because the pruner holds LOCK_EX on a generation across its census and
-# rewalk -- an entry created or removed outside that lock is exactly the
-# "target entry disappeared during reclaim" abort.
-if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
-	fallback_to_local "$candidate cannot be written"
-fi
-rm -f -- "$write_probe"
 retired_rc=0
 target_is_retired "$candidate_state_fd" || retired_rc=$?
-if ((FORCE_ROTATE)); then
+if ((FORCE_ROTATE)) && [ "$retired_rc" != 0 ]; then
+	# Retiring writes the marker into the candidate, so one that cannot be
+	# written cannot take it; the fallback refuses under --rotate. An already
+	# retired candidate needs no marker and rotates below.
+	if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
+		fallback_to_local "$candidate cannot be written"
+	fi
+	rm -f -- "$write_probe"
 	retire_target "$candidate_state_fd"
 	retired_rc=0
 fi
@@ -352,11 +348,35 @@ case "$retired_rc" in
 		echo "==> Rotating retired target/ → $candidate"
 		;;
 	3)
+		# The candidate is REUSED, so it must be writable. The probe runs here,
+		# after the retirement check, under the exclusive lease: `mkdir -p`
+		# above is idempotent and says nothing about an EXISTING directory that
+		# has since gone read-only (ownership change, ro remount), and creating
+		# an entry is the operation Cargo needs, the one root cannot fake past
+		# EROFS. Under the lease, because the pruner holds LOCK_EX on a
+		# generation across its census and rewalk; an entry created or removed
+		# outside that lock is exactly the "target entry disappeared during
+		# reclaim" abort. A RETIRED candidate is never probed: new_generation
+		# needs only its parent writable, and a retired generation that went
+		# read-only used to fall back to a local target/ that every later run
+		# then retained.
+		if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
+			fallback_to_local "$candidate cannot be written"
+		fi
+		rm -f -- "$write_probe"
 		# Downgrade the exclusive inspection lease while publishing the link.
 		flock -s "$candidate_state_fd"
 		final_lease_fd="$candidate_state_fd"
 		;;
 	*)
+		# The retirement marker could not be read at all. On a directory that
+		# cannot even be written (a read-only or foreign filesystem) that is
+		# just an unusable managed target, and the fallback applies; on a
+		# writable one it is a protocol error and stays fatal.
+		if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
+			fallback_to_local "$candidate cannot be written"
+		fi
+		rm -f -- "$write_probe"
 		echo "ERROR: cannot read target retirement state for $candidate (rc=$retired_rc)" >&2
 		exit 1
 		;;
