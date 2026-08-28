@@ -719,14 +719,16 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             for name in stale:
                 with open(os.path.join(results, name), "w") as handle:
                     handle.write('{"verdict": "clean", "passed": true}\n')
-            with open(os.path.join(results, "analysis.json"), "w") as handle:
-                handle.write("{}\n")
+            bundle = os.path.join(results, "runtime", "c" * 64, "MANIFEST.sha256")
+            os.makedirs(os.path.dirname(bundle))
+            with open(bundle, "w") as handle:
+                handle.write("0" * 64 + "  fcvm\n")
             result = self._run_start_cleanup(results)
             self.assertEqual(result.returncode, 0, result.stderr)
             for name in stale:
                 self.assertFalse(os.path.exists(os.path.join(results, name)),
                                  f"stale {name} survived the campaign start")
-            self.assertTrue(os.path.exists(os.path.join(results, "analysis.json")),
+            self.assertTrue(os.path.exists(bundle),
                             "the start wiped more than the evidence")
 
     def test_stale_replay_logs_from_an_earlier_campaign_are_cleared_at_start(self):
@@ -749,6 +751,42 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             for name in self.REPLAY_LOGS:
                 self.assertFalse(os.path.exists(os.path.join(results, name)),
                                  f"stale {name} survived the campaign start")
+
+    def test_a_stale_run_record_from_an_earlier_attempt_is_cleared_at_start(self):
+        """reqbench.py opens reqbench.jsonl for append, so a retry into a
+        reused RESULTS appends a second run_id and reqanalyze emits a pooled
+        multi-run analysis with no top-level cell, which campaign_summary
+        refuses. A retry that fails before its own analysis leaves the
+        earlier attempt's analysis.json beside this attempt's fresh DNS
+        evidence. Both go at start. The content-addressed runtime bundles
+        and the phase logs are not this attempt's record and stay.
+
+        RED BEFORE THE FIX: `stale reqbench.jsonl survived the campaign start`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(os.path.join(results, "logs"))
+            stale = {
+                "reqbench.jsonl": '{"kind": "meta", "run_id": "earlier"}\n',
+                "analysis.json": '{"publishable": true, "run_id": "earlier"}\n',
+            }
+            for name, text in stale.items():
+                with open(os.path.join(results, name), "w") as handle:
+                    handle.write(text)
+            kept = [os.path.join(results, "runtime", "c" * 64, "MANIFEST.sha256"),
+                    os.path.join(results, "logs", "golden.log")]
+            os.makedirs(os.path.dirname(kept[0]))
+            for path in kept:
+                with open(path, "w") as handle:
+                    handle.write("earlier attempt\n")
+            result = self._run_start_cleanup(results)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in stale:
+                self.assertFalse(os.path.exists(os.path.join(results, name)),
+                                 f"stale {name} survived the campaign start")
+            for path in kept:
+                self.assertTrue(os.path.exists(path),
+                                f"the start wiped {os.path.relpath(path, results)}")
 
     def test_the_golden_sub_make_receives_results_and_the_baked_resolver(self):
         block = self.GOLDEN.search(campaign())

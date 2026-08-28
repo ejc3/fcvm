@@ -59,9 +59,16 @@ mkdir -p "$RESULTS"
 # must not outlive this one's start: a clean verdict beside a run this
 # campaign never finished would be indexed as if it were this run's, and
 # corpus_serve appends to its replay logs, so an earlier attempt's queries and
-# requests would be hashed into this run's evidence as its own.
+# requests would be hashed into this run's evidence as its own. The run
+# record goes too: reqbench.py appends to reqbench.jsonl, so a retry would
+# carry two run_ids and reqanalyze would emit a pooled analysis with no
+# top-level cell, and a retry that fails before its own analysis would leave
+# the earlier analysis.json beside this attempt's fresh evidence. The
+# content-addressed runtime bundles under runtime/ and the phase logs under
+# logs/ are not the record and stay.
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
-    "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log
+    "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log \
+    "$RESULTS"/reqbench.jsonl "$RESULTS"/analysis.json
 
 # The 14 URLs, in the order the sealed 2026-08-14 run cycled them. Order is part
 # of the schedule: reqanalyze re-derives the expected URL per record from it, so
