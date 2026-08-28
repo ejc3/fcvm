@@ -173,10 +173,14 @@ disposition. One vocabulary for both:
 
 A head that no reviewer has anything to say about is still reviewed: the gate counts a
 listed review bot's (`VERDICT_BOTS`) no-findings result as coverage of the head when the
-bot names the head. Codex's "Didn't find any major issues" comment names the commit it
-reviewed, which must be the head. CodeRabbit's "Full review finished." reply names nothing
-and never covers on its own; what names the head is the walkthrough comment CodeRabbit
-edits in place, whose recent-review block says which commit range it reviewed. That block
+bot names the head. Codex names the commit it reviewed in two shapes, and both count: the
+"Didn't find any major issues" comment, and the review-summary comment it edits in place,
+whose table row must say Completed, name the head, and carry a datetime after the head
+arrived. That comment is created before any review has finished, so neither of its own
+timestamps dates a result, and a table holding any row that is not a finished review covers
+nothing. CodeRabbit's "Full review finished." reply names nothing and never covers on its
+own; what names the head is the walkthrough comment CodeRabbit edits in place, whose
+recent-review block says which commit range it reviewed. That block
 must say no actionable comments were generated, the comment must carry no CodeRabbit
 notice (failed, skipped, paused, rate limited, in progress), the range must end at the
 head, and the edit must postdate the head's arrival at GitHub. Both bots' no-findings

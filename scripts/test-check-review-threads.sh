@@ -486,6 +486,63 @@ run_case "reviews [] and a head-sha verdict dated after arrival still covers" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
   0 "HEAD COVERED"
 
+echo "== finding 30: Codex's review-summary comment is a notice, and a sha-bound verdict =="
+# Since 2026-08-28 ~21:25Z Codex no longer posts "Didn't find any major issues" per review.
+# It opens ONE comment per PR carrying <!-- codex-pull-request-review-summary --> when a
+# review starts and EDITS that comment in place as reviews finish, so its createdAt predates
+# every result in it and only a row's own datetime dates that row. Bodies copied from
+# #867/#872/#873/#874, whose rows all read: Completed, a 7-char commit, "Manual request".
+# The comment is a notice — never a finding — and it covers the head when a row is Completed,
+# names a prefix of the head and is dated after the head arrived. Anything else in the table
+# (a review still running, a status this gate has never seen, a row it cannot parse) makes
+# the whole comment cover nothing, because a table with a review still in it is a review
+# that has not finished.
+#
+# $1 status, $2 datetime, $3 commit, $4 review name. The live status cell reads
+# "✅ **Completed**" and an unfinished one is not observed here, so the icon is fixed and
+# the rule keys on the bolded word.
+sum_row() { printf '| 📝 **%s** | ✅ **%s** <relative-time datetime="%s">%s</relative-time> | `%s` | Manual request |' "${4:-Code Review}" "$1" "$2" "$2" "$3"; }
+codex_summary() { jq -n --arg rows "$1" '"<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n\($rows)\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>"'; }
+# The #867 shape: the comment was created at 00:20, BEFORE the head arrived at 00:30, and
+# edited at 01:00 when the review finished. createdAt cannot date this result; the row can.
+run_case "the live #867 shape: a summary row Completed at the head covers it" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  0 "HEAD COVERED"
+run_case "a summary comment needs no disposition" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  0 "CLEAR"
+# The rest answer the summary with $ANSWER, so coverage is the only thing left to decide.
+run_case "a summary row naming an older commit is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z abc123def4)")" 2026-01-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "a summary row dated before the head arrived is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T00:10:00.123456Z deadbee)")" 2026-01-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "a summary row still in progress is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row 'In progress' 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "one Completed row at the head beside one still in progress is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)
+$(sum_row 'In progress' 2026-01-02T01:02:00.123456Z deadbee 'Security Review')")" 2026-01-02T01:02:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "a Completed row with an unparsable datetime is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 'a while ago' deadbee)")" 2026-01-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "a summary table row this gate cannot parse is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary '| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="2026-01-02T01:00:00.123456Z">t</relative-time> |')" 2026-01-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "a human posting the summary body is claimable, not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt helpful-human User 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "an unlisted bot posting the summary body is claimable, not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt some-other-bot Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+# The legacy comment may still appear, and both shapes are Codex verdicts: a summary that
+# binds nothing does not take away what the legacy verdict covers.
+run_case "the legacy verdict still covers beside a summary that binds nothing" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)"),$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row 'In progress' 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z),$ANSWER")" \
+  0 "HEAD COVERED"
+
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
   "$(wrap '[{"isResolved":false,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"something"}]}}]')" \

@@ -359,6 +359,22 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # beside a clean block at the head (#869) also declines: the comment is in a mixed state
 # from two runs, and which run wrote which block is not something this gate can read.
 #
+# Codex's SECOND no-findings shape, and since 2026-08-28 the only one it has posted here:
+# one comment per PR carrying "<!-- codex-pull-request-review-summary -->", opened when a
+# review STARTS and edited in place as reviews finish. Its table holds one row per review:
+#   | Code Review | Completed <relative-time datetime="..."> | `9ebed54` | Manual request |
+# The comment is a notice, never a finding. A row covers the head when it says Completed,
+# names a prefix of the head, and its own datetime postdates the head's arrival. Neither
+# timestamp on the comment can date a row: createdAt is written before any result exists
+# (on #867, created 22:11:32Z for a review it reported at 22:15:13Z), and updatedAt only
+# says when the last of them was published.
+#
+# summary_rows returns the {sha, at} of every row, or [] for the whole comment when
+# anything in the table is not a finished review: a row still in progress, a status this
+# gate has never seen, a row it cannot split into the table's four cells. A table holding a
+# review that is still running is a review that has not finished, whatever sits beside it.
+# A Completed row whose commit or datetime will not parse names nothing and binds nothing.
+#
 # The verdict must be the WHOLE comment. After dropping HTML comments, blank lines, the
 # About Codex block and the one blockquote line CodeRabbit's incremental reply carries
 # (matched whole; it is the only blockquote line that bot's replies on this repo have
@@ -387,6 +403,26 @@ def is_verdict:
 def verdict_sha:
   verdict_lines as $l
   | if ($l | length) == 2 and ($l[1] | test(reviewed_re)) then ($l[1] | capture(reviewed_re) | .sha) else "" end;
+def codex_summary_marker: "<!-- codex-pull-request-review-summary -->";
+def is_codex_summary: ((. // "") | contains(codex_summary_marker));
+def summary_cells:
+  split("|") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+  | (if (.[0] // "") == "" then .[1:] else . end)
+  | (if (.[-1] // "") == "" then .[:-1] else . end);
+def summary_rows:
+  [ (. // "") | split("\n")[] | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+    | select(startswith("|")) | summary_cells ]
+  | map(select((((.[0] // "") == "Review") and ((.[1] // "") == "Status")) | not))
+  | map(select(((length > 0) and all(.[]; test("^:?-{3,}:?$"))) | not))
+  | . as $rows
+  | if ($rows | length) == 0 then []
+    elif ($rows | any(length != 4)) then []
+    elif ($rows | any((([.[1] | capture("\\*\\*(?<s>[^*]+)\\*\\*").s] | first) // "")
+                      | gsub("^[[:space:]]+|[[:space:]]+$"; "") | . != "Completed")) then []
+    else [ $rows[]
+           | { sha: (([.[2] | capture("^`(?<x>[0-9a-f]{7,40})`$").x] | first) // ""),
+               at: (([.[1] | capture("datetime=\"(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z)\"").d] | first) // "") } ]
+    end;
 def cr_range_re: "Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and (?<sha>[0-9a-f]{40})\\.";
 def cr_marker_re: "<!-- This is an auto-generated comment: [^>]*-->";
 def cr_summarize_marker: "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->";
@@ -405,10 +441,17 @@ VERDICT_BOTS=${VERDICT_BOTS:-chatgpt-codex-connector,coderabbitai}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
 #
-# Each top-level comment also records `reviewed_sha`, the commit a listed bot says it
-# reviewed (Codex: the verdict's reviewed-commit line; CodeRabbit: the walkthrough's
-# recent-review range), and `reviewed_at`, when it said so. A verdict is posted once, so
-# its createdAt is that time; the walkthrough is edited in place, so its updatedAt is.
+# Each top-level comment also records `reviewed_rows`: every {sha, at} pair by which a
+# listed bot says it reviewed a commit, and when it said so. There are three sources, and
+# each dates itself differently, which is the whole difficulty:
+#   - Codex's legacy verdict names one commit and is posted once, so its createdAt is the
+#     time of the result.
+#   - Codex's review-summary comment names one commit per table row and is edited in place,
+#     so only a row's own datetime dates that row.
+#   - CodeRabbit's walkthrough names the range it reviewed and is edited in place, so its
+#     updatedAt is the time of the result.
+# The coverage check below asks only whether some row names the head and postdates its
+# arrival, so a comment carrying several results is judged row by row.
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
   | ($bots | split(",")) as $botlogins
@@ -417,14 +460,17 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
   + (.[1] | map(. as $c
       | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))) as $listed
       | ($listed and ($c.body | is_verdict)) as $v
+      | ($listed and ($c.body | is_codex_summary)) as $sum
       | {author, state: "COMMENT", body, at: .createdAt,
-         verdict: $v,
-         reviewed_sha: (if $v then ($c.body | verdict_sha)
-                        elif $listed then ($c.body | walkthrough_sha) else "" end),
-         reviewed_at: (if $v then .createdAt else (.updatedAt // "") end),
+         verdict: ($v or $sum),
+         reviewed_rows: ((if $v then [{sha: ($c.body | verdict_sha), at: .createdAt}]
+                          elif $sum then ($c.body | summary_rows)
+                          elif $listed then [{sha: ($c.body | walkthrough_sha), at: (.updatedAt // "")}]
+                          else [] end)
+                         | map(select((.sha // "") != "" and (.at // "") != ""))),
          claimable: ((.author.login | IN($skip[]) | not)
                      and ((.body // "") | test($trig; "i") | not)
-                     and ($v | not))}))' \
+                     and (($v or $sum) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 
@@ -581,6 +627,13 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   #   - Codex writes the commit it reviewed into the verdict. That sha must be a prefix
   #     of the head. A verdict naming an older commit was issued for that commit and is
   #     ignored here (it still needs no disposition).
+  #   - Codex's review-summary comment (the shape it has posted since 2026-08-28) names a
+  #     commit per table row, and a row counts when it says Completed, names a prefix of
+  #     the head, and its own datetime postdates arrival. A table holding any row that is
+  #     not a finished Completed review covers nothing at all, because a review still
+  #     running is one whose findings have not landed. When Codex does have findings it
+  #     posts a review object, which `reviewed` counts, and those findings answer to
+  #     dispositions exactly as they did before.
   #   - CodeRabbit's "Full review finished." reply names nothing, so it never covers a
   #     head on its own: it is a notice, exempt from dispositions and nothing more. What
   #     names the head is the walkthrough comment CodeRabbit edits in place. After a
@@ -605,9 +658,9 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   arrived=$(jq -r '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[]?.createdAt // empty] | min // ""' <<<"$payload" 2>/dev/null)
   verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" --arg h "$headoid" '
     [ .[] | select(.state == "COMMENT" and .author.login != $me)
-        | . as $r
-        | select(($r.reviewed_sha // "") != "" and ($h | startswith($r.reviewed_sha)))
-        | select($hd != "" and ($r.reviewed_at // "") > $hd) ]
+        | select(any(.reviewed_rows[]?; . as $row
+                     | ($row.sha // "") != "" and ($h | startswith($row.sha))
+                     and $hd != "" and (($row.at // "") > $hd))) ]
     | length' <<<"$bodies") || {
     echo "verdict: BLOCKED — could not evaluate no-findings verdicts." >&2; exit 2; }
   # A head is covered by a review object on it from someone other than the author, or by
