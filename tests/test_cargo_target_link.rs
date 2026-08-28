@@ -2883,6 +2883,86 @@ fn cargo_target_link_drops_a_managed_link_it_cannot_lease() {
     );
 }
 
+/// An existing `$WT_TARGET` that cannot be OPENED falls back too (codex on
+/// #867). Losing read permission as well as write (an ownership change that
+/// leaves a fresh checkout's directory 0700, say) passes `mkdir -p`, but the
+/// generation-lease open `exec {fd}<"$candidate"` fails, and under `set -e`
+/// the script died there instead of creating the promised local target/.
+/// Root can open any directory, so when the tests are root the script runs as
+/// uid 65534 through `setpriv`, from a copy of scripts/ that uid can read, over
+/// tempdirs handed to that uid.
+#[test]
+fn cargo_target_link_falls_back_when_the_managed_dir_cannot_be_opened() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("existing managed dir");
+    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
+
+    // Hand the directory back before asserting, so the tempdir can be removed.
+    let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        ok,
+        "the recipe died instead of falling back when the managed dir cannot be \
+         opened:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_dir() && !target.is_symlink(),
+        "target/ should be a local directory after the fallback, not {:?}\n{out}",
+        std::fs::symlink_metadata(&target).map(|m| m.file_type())
+    );
+    assert_target_usable(checkout.path(), "managed dir that cannot be opened");
+}
+
+/// `run_link`, but as uid 65534 when the tests are root: root can open and
+/// write any directory, so a fixture about permissions must run as someone who
+/// cannot. Both tempdirs are handed to that uid, and scripts/ is copied where it
+/// can read them (the script sources cargo-target-lib.sh next to itself).
+fn run_link_unprivileged(dir: &Path, btrfs_root: &Path) -> (bool, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } != 0 {
+        return run_link(dir, btrfs_root);
+    }
+    let tools = tempfile::tempdir().expect("tools tempdir");
+    std::fs::set_permissions(tools.path(), std::fs::Permissions::from_mode(0o755)).expect("0755");
+    let scripts = tools.path().join("scripts");
+    std::fs::create_dir(&scripts).expect("scripts dir");
+    for name in ["cargo-target-link.sh", "cargo-target-lib.sh"] {
+        std::fs::copy(repo_root().join("scripts").join(name), scripts.join(name)).expect(name);
+    }
+    std::fs::set_permissions(
+        scripts.join("cargo-target-link.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("0755");
+    for owned in [dir, btrfs_root] {
+        let chowned = Command::new("chown")
+            .args(["-R", "65534:65534"])
+            .arg(owned)
+            .status()
+            .expect("chown -R");
+        assert!(chowned.success(), "hand {} to uid 65534", owned.display());
+    }
+    let out = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg(scripts.join("cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs_root)
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(dir)
+        .output()
+        .expect("run scripts/cargo-target-link.sh as uid 65534");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
 /// Every exit that leaves target/ as a plain local directory probes it first.
 ///
 /// Behavioural coverage above reaches two of the three exits; this pins all of

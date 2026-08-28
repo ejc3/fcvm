@@ -296,7 +296,8 @@ mkdir -p -- "$candidate"
 if [[ -n $old_target_lease_fd && ${linked:-} == "$candidate" ]]; then
 	candidate_state_fd="$old_target_lease_fd"
 else
-	exec {candidate_lease_fd}<"$candidate"
+	exec {candidate_lease_fd}<"$candidate" ||
+		fallback_to_local "$candidate cannot be opened for its lease"
 	if [[ -n $old_target_lease_fd ]] &&
 		[[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$old_target_lease_fd")" == \
 		"$(stat -Lc '%d:%i' -- "/proc/$$/fd/$candidate_lease_fd")" ]]; then
