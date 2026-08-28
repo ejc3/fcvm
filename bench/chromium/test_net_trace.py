@@ -280,7 +280,10 @@ class NetTraceRecorded(unittest.TestCase):
         self.assertEqual(summary["remote_ips"], {"10.0.2.2": 2, "93.184.216.34": 1})
         self.assertEqual(summary["errors"], {"net::ERR_NAME_NOT_RESOLVED": 1})
         self.assertEqual(summary["slowest_10"][0],
-                         {"url": "http://slow.test/font.woff", "end_ms": 450.0})
+                         {"url": "http://slow.test/font.woff", "end_ms": 450.0,
+                          "duration_ms": 420.0})
+        self.assertEqual(summary["pending_at_load"],
+                         [{"url": "http://slow.test/font.woff", "start_ms": 30.0}])
         self.assertEqual(summary["load_event_ms"], 100.0)
         self.assertEqual(server.methods,
                          ["Page.enable", "Network.enable", "Page.navigate",
@@ -313,6 +316,56 @@ class NetTraceRecorded(unittest.TestCase):
         r5 = rows["http://late.test/beacon"]
         self.assertIsNone(r5["end_ms"])
         self.assertFalse(r5["pending_at_load"])
+
+    def test_slowest_ranks_by_duration_and_names_the_rows_open_at_load(self):
+        """slowest_10 was sorted by end_ms, completion relative to the first
+        request, so a request that started late and finished fast outranked
+        an earlier, longer one, and a request still open at the load event,
+        the first thing a stall investigation reads, was not in the summary
+        at all. Rank by duration, carry it per entry, and list the open rows.
+
+        Red: `{'url': 'http://fast.test/late', 'end_ms': 350.0}` first, then
+        `KeyError: 'pending_at_load'`.
+        """
+        events = [
+            request_will_be_sent("r1", "http://slow.test/long", 1000.000),
+            request_will_be_sent("r2", "http://hang.test/open", 1000.010),
+            request_will_be_sent("r3", "http://fast.test/late", 1000.250),
+            response_received("r1", 1000.290, "10.0.2.2", 80, "http/1.1", 200),
+            loading_finished("r1", 1000.300),
+            response_received("r3", 1000.340, "10.0.2.2", 80, "http/1.1", 200),
+            loading_finished("r3", 1000.350),
+            load_event_fired(1000.400),
+        ]
+        out, _, _ = self._drive(events, drain_ms=100.0)
+        self.assertTrue(out["ok"], out)
+        summary = out["net_trace"]
+        self.assertEqual(summary["slowest_10"], [
+            {"url": "http://slow.test/long", "end_ms": 300.0, "duration_ms": 300.0},
+            {"url": "http://fast.test/late", "end_ms": 350.0, "duration_ms": 100.0},
+        ])
+        self.assertEqual(summary["pending_at_load"],
+                         [{"url": "http://hang.test/open", "start_ms": 10.0}])
+        self.assertEqual(summary["n_pending_at_load"], 1)
+
+    def test_pending_at_load_lists_at_most_ten_rows_in_start_order(self):
+        """Twelve requests open at the load event: the list names the ten
+        that started first, and the count still says twelve.
+
+        Red: `KeyError: 'pending_at_load'`.
+        """
+        events = [request_will_be_sent(f"r{i}", f"http://open.test/{i}", 1000.0 + i / 1000)
+                  for i in range(12)]
+        events.append(request_will_be_sent("done", "http://done.test/", 1000.020))
+        events.append(loading_finished("done", 1000.030))
+        trace = cdpdrive.reduce_net_trace(events, 1000.100, 100.0)
+        summary = trace["summary"]
+        self.assertEqual(summary["n_pending_at_load"], 12)
+        self.assertEqual(summary["pending_at_load"],
+                         [{"url": f"http://open.test/{i}", "start_ms": float(i)}
+                          for i in range(10)])
+        self.assertEqual(summary["slowest_10"],
+                         [{"url": "http://done.test/", "end_ms": 30.0, "duration_ms": 10.0}])
 
     def test_the_drain_is_bounded_by_net_trace_drain_ms(self):
         out, _, _ = self._drive(drain_ms=200.0)

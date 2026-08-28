@@ -340,7 +340,9 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
     when the event never arrived; then "pending at load" means still open when
     observation ended, which is the question a stalled load asks. A redirect
     re-announces its requestId with the next url; the row keeps its first url
-    and start and counts the hop.
+    and start and counts the hop. The summary ranks slowest_10 by duration
+    (end_ms minus start_ms), not by completion time, and lists the rows that
+    had no end before the load event as pending_at_load, capped at ten each.
     """
     rows: dict = {}
     order: list = []
@@ -415,11 +417,17 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
             not ended or (load_ts is not None and r["end_ts"] > load_ts)
         )
         timing = r["timing"] if isinstance(r["timing"], dict) else {}
+        start_ms = rel_ms(r["start_ts"])
+        end_ms = rel_ms(r["end_ts"])
+        duration_ms = None
+        if start_ms is not None and end_ms is not None:
+            duration_ms = round(end_ms - start_ms, 3)
         requests.append({
             "request_id": rid,
             "url": r["url"],
-            "start_ms": rel_ms(r["start_ts"]),
-            "end_ms": rel_ms(r["end_ts"]),
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "duration_ms": duration_ms,
             "remote_ip": r["remote_ip"],
             "remote_port": r["remote_port"],
             "protocol": r["protocol"],
@@ -437,10 +445,20 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
 
     remote_ips = Counter(row["remote_ip"] for row in requests if row["remote_ip"])
     errors = Counter(row["error_text"] for row in requests if row["failed"])
-    ended_rows = sorted(
-        (row for row in requests if row["end_ms"] is not None),
-        key=lambda row: -row["end_ms"],
+    # By duration, not by end_ms: end_ms is completion relative to the first
+    # request, so a request that started late and finished fast would outrank
+    # an earlier, longer one. Ties go to the earlier start.
+    slowest = sorted(
+        (row for row in requests if row["duration_ms"] is not None),
+        key=lambda row: (-row["duration_ms"], row["start_ms"]),
     )
+    # What held the load, earliest start first: the rows a stall
+    # investigation reads before any completed one.
+    pending = sorted(
+        (row for row in requests if row["pending_at_load"]),
+        key=lambda row: row["start_ms"] if row["start_ms"] is not None else float("inf"),
+    )
+
     def by_count(item):
         return (-item[1], item[0])
 
@@ -451,7 +469,10 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
         "n_pending_at_load": sum(row["pending_at_load"] for row in requests),
         "remote_ips": dict(sorted(remote_ips.items(), key=by_count)),
         "errors": dict(sorted(errors.items(), key=by_count)),
-        "slowest_10": [{"url": row["url"], "end_ms": row["end_ms"]} for row in ended_rows[:10]],
+        "slowest_10": [{"url": row["url"], "end_ms": row["end_ms"],
+                        "duration_ms": row["duration_ms"]} for row in slowest[:10]],
+        "pending_at_load": [{"url": row["url"], "start_ms": row["start_ms"]}
+                            for row in pending[:10]],
         "load_event_ms": rel_ms(load_ts),
         "drain_ms": drain_ms,
     }
