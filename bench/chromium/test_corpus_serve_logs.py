@@ -93,11 +93,11 @@ class DnsLog(unittest.TestCase):
     def _rows(self, log_path: str) -> list:
         """The log once the responder has ended.
 
-        The line follows the answer, so a client holding the reply can still
-        be ahead of the line; reading the file at that moment found zero rows
-        once in 25 runs of this module (2026-08-28). The shipped stop_dns
-        ends the responder and joins it; the log stays open, so a line that
-        is there was flushed by the responder, not by close().
+        The line follows the answer, so a client that already holds the reply
+        can be ahead of the line, and a read at that moment sees a log that
+        is short by it. The shipped stop_dns ends the responder and joins it;
+        the log stays open, so a line that is there was flushed by the
+        responder, not by close().
         """
         corpus_serve.stop_dns(*self._dns)
         return read_jsonl(log_path)
@@ -278,11 +278,11 @@ class AccessLog(unittest.TestCase):
     def _rows(self, server, log_path: str) -> list:
         """The log once every handler `server` dequeued has finished.
 
-        The access line is written after the response, so a client holding
-        the whole body can still be ahead of the line; reading the file at
-        that moment found zero rows once in 454 (2026-08-28). The shipped
-        shutdown sequence waits for the handlers; the log stays open, so a
-        line that is there was flushed by the handler, not by close().
+        The access line is written after the response, so a client that
+        already holds the whole body can be ahead of the line, and a read at
+        that moment sees a log that is short by it. The shipped shutdown
+        sequence waits for the handlers; the log stays open, so a line that
+        is there was flushed by the handler, not by close().
         """
         corpus_serve.stop_listeners([server])
         return read_jsonl(log_path)
