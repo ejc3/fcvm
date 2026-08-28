@@ -42,6 +42,13 @@ def campaign() -> str:
         return handle.read()
 
 
+def read_if_exists(path, default=""):
+    if not os.path.exists(path):
+        return default
+    with open(path) as handle:
+        return handle.read()
+
+
 class RunPackaging(unittest.TestCase):
     """One run, one directory, one stamp -- decided once."""
 
@@ -483,6 +490,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             "hosts": {h: {"answer": "10.0.2.2", "ok": True}
                       for h in self._hosts_of(corpus_urls)},
             "urls": {u: {"status": 200, "ok": True} for u in corpus_urls.split(",")},
+            "proxies_disabled": True,
             "timestamp": "2026-08-28T00:00:00Z",
             "passed": True,
         }
@@ -624,6 +632,11 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             "a host never asked": json.dumps(partial),
             "a url that failed": self._bracket_evidence(
                 urls, urls={u: {"status": 404, "ok": False} for u in urls.split(",")}),
+            # HOP D's URL probe records that it ran with proxies disabled;
+            # a bracket that does not say so may have fetched through the
+            # proxy fc-agent injects into the exec, live site and all.
+            "proxies not disabled": self._bracket_evidence(urls, proxies_disabled=False),
+            "proxy handling unrecorded": self._bracket_evidence(urls, proxies_disabled=None),
         }
         for label, evidence in cases.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
@@ -725,7 +738,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             results = os.path.join(tmp, "results")
             os.makedirs(results)
             stale = ["dns-evidence.json", "verify-dns-after-run.json",
-                     "verify-dns.json", "dns-owner.log"]
+                     "verify-dns.json", "dns-owner.log", "corpus-serve.status"]
             for name in stale:
                 with open(os.path.join(results, name), "w") as handle:
                     handle.write('{"verdict": "clean", "passed": true}\n')
@@ -857,14 +870,19 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
     REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log")
 
     def _leave_files(self, results, brackets=BRACKETS, logs=REPLAY_LOGS,
-                     bracket_passed=True):
-        """What the campaign leaves in $RESULTS before write_dns_evidence."""
+                     bracket_passed=True, serve_status="0"):
+        """What the campaign leaves in $RESULTS before write_dns_evidence:
+        the bracket files, the replay logs and corpus-serve.status, the exit
+        status the server's wrapper writes once it is gone (None: no file)."""
         for stage in brackets:
             with open(os.path.join(results, f"verify-dns-{stage}.json"), "w") as handle:
                 handle.write(json.dumps({"passed": bracket_passed}) + "\n")
         for name in logs:
             with open(os.path.join(results, name), "w") as handle:
                 handle.write(name + "\n")
+        if serve_status is not None:
+            with open(os.path.join(results, "corpus-serve.status"), "w") as handle:
+                handle.write(serve_status + "\n")
 
     def _sample(self, env, results, verdict_in="clean", seconds=0.6, mid_run="",
                 files=True):
@@ -1025,7 +1043,8 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                 self.assertIn("cannot write", result.stderr,
                               f"the failed {tool} was not what made the verdict unclean")
                 self.assertEqual(sorted(os.listdir(results)),
-                                 sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log"]
+                                 sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log",
+                                         "corpus-serve.status"]
                                         + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
                                  "a partial evidence file or temp file was left behind")
 
@@ -1152,6 +1171,148 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             self.assertEqual(evidence["verdict"], "unclean")
             self.assertEqual(evidence["samples"], 0)
             self.assertIs(evidence["dnsmasq_was_active_before"], False)
+
+    def test_a_replay_server_that_did_not_exit_zero_is_unclean(self):
+        """corpus_serve exits 1 when a log line could not be written, after
+        the response bytes were already sent (007b726d, 181fcbbb). Its exit
+        status was discarded by `sudo -b`: stop_corpus_serve polled liveness
+        only, and the evidence hashed the truncated log as clean. The wrapper
+        now writes the status to $RESULTS/corpus-serve.status once the server
+        is gone, and a clean verdict needs that file to say 0; a missing or
+        non-zero status is unclean with the reason, and the evidence carries
+        it as corpus_serve_exit_status.
+
+        RED BEFORE THE FIX: verdict clean with corpus-serve.status holding 1,
+        clean with no status file, and KeyError: 'corpus_serve_exit_status'.
+        """
+        cases = {"1": 1, "137": 137, None: None}
+        for status, recorded in cases.items():
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                self._leave_files(results, serve_status=status)
+                script = (f'set -u\n{self._helpers()}\nRESULTS="{results}"\n'
+                          'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\nSAMPLER_ALIVE_AT_STOP=yes\n'
+                          'printf "%s owner_pid=4242 dnsmasq=inactive load1=0.42\\n" '
+                          '2026-08-28T00:00:00Z 2026-08-28T00:00:10Z > "$RESULTS/dns-owner.log"\n'
+                          'write_dns_evidence clean\n')
+                result = self._run(script, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "unclean",
+                                 f"corpus_serve exit status {status!r} was hashed as clean")
+                with open(os.path.join(results, "dns-evidence.json")) as handle:
+                    evidence = json.load(handle)
+                self.assertEqual(evidence["verdict"], "unclean", evidence)
+                self.assertEqual(evidence["corpus_serve_exit_status"], recorded)
+                self.assertIn("corpus_serve", evidence["reason"])
+                if status is not None:
+                    self.assertIn(status, evidence["reason"])
+                else:
+                    self.assertIn("corpus-serve.status", evidence["reason"])
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            evidence, _ = self._sample(env, results)
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            self.assertEqual(evidence["corpus_serve_exit_status"], 0)
+
+    STOP_SERVE = re.compile(r"(stop_corpus_serve\(\) \{\n.*?\n\}\n)", re.S)
+    # The launch: the pidfile name through the liveness check on the pid it
+    # published. The readiness probes that follow need the real server.
+    START_SERVE = re.compile(
+        r'(SERVE_PIDFILE="\$LOGDIR/corpus_serve\.pid"\n.*?\n'
+        r'sudo kill -0 "\$SERVE_PID" 2>/dev/null \|\| \{ echo "BLOCKED: corpus_serve pid[^\n]*\n)',
+        re.S)
+    # Stands in for corpus_serve.py under the shipped launch line: the same
+    # startup line, its own pid where the test can read it, and on SIGTERM
+    # the exit status the test chose, as the real server exits 1 after a
+    # log line it could not write.
+    FAKE_SERVE = """import os, signal, sys, time
+signal.signal(signal.SIGTERM,
+              lambda *_: sys.exit(int(os.environ.get("FAKE_SERVE_EXIT", "0"))))
+print("loaded 3 urls", flush=True)
+with open(os.environ["FAKE_SERVE_PIDOUT"], "w") as handle:
+    handle.write(f"{os.getpid()}\\n")
+while True:
+    time.sleep(0.05)
+"""
+    FAKE_SUDO_B = ('#!/bin/bash\n[ "${1:-}" = -n ] && shift\n'
+                   'if [ "${1:-}" = -b ]; then shift; "$@" & exit 0; fi\nexec "$@"\n')
+
+    def _serve_harness(self, tmp, exit_status):
+        env, results = self._fakes(tmp)
+        for name, body in (("sudo", self.FAKE_SUDO_B),):
+            path = os.path.join(tmp, "bin", name)
+            with open(path, "w") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+        serve_dir = os.path.join(tmp, "bench", "chromium")
+        os.makedirs(serve_dir)
+        with open(os.path.join(serve_dir, "corpus_serve.py"), "w") as handle:
+            handle.write(self.FAKE_SERVE)
+        env.update(FAKE_SERVE_EXIT=str(exit_status),
+                   FAKE_SERVE_PIDOUT=os.path.join(tmp, "serve-pid"))
+        start = self.START_SERVE.search(campaign())
+        self.assertIsNotNone(start, "the corpus_serve launch block is gone")
+        stop = self.STOP_SERVE.search(campaign())
+        self.assertIsNotNone(stop, "stop_corpus_serve is gone")
+        # One owner sample naming the server that was started, and a live
+        # sampler and inactive dnsmasq, so the exit status is the only thing
+        # that can lower the verdict. The stop waits for the stand-in to have
+        # installed its handler (it writes its pid after), as the campaign's
+        # readiness probes do for the real server.
+        script = (f'set -euo pipefail\nsay() {{ :; }}\n{self._helpers()}\n'
+                  f'SERVE_PID=""\n{stop.group(1)}\n{start.group(1)}\n'
+                  'echo "started $SERVE_PID"\n'
+                  'for _ in $(seq 1 100); do [ -s "$FAKE_SERVE_PIDOUT" ] && break; sleep 0.05; done\n'
+                  'printf "%s owner_pid=%s dnsmasq=inactive load1=0.42\\n" '
+                  '2026-08-28T00:00:00Z "$SERVE_PID" > "$RESULTS/dns-owner.log"\n'
+                  'SAMPLER_ALIVE_AT_STOP=yes\nDNSMASQ_WAS_ACTIVE=yes\n'
+                  'stop_corpus_serve\necho "stopped $SERVE_PID"\n'
+                  'write_dns_evidence clean\n')
+        return env, results, script
+
+    def test_the_replay_server_exit_status_is_recorded_when_it_stops(self):
+        """The shipped launch line and stop_corpus_serve, run against a
+        stand-in server under a sudo that honours -b. The pidfile must name
+        the server itself (the sampler matches that pid against the owner of
+        127.0.0.1:53), the stop must wait for the status the wrapper writes
+        once the server is gone, and the evidence must carry it: 3 is
+        unclean with the reason, 0 is clean.
+
+        RED BEFORE THE FIX: no corpus-serve.status was written at all, so
+        `MISSING != '3'`, and write_dns_evidence printed clean over it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results, script = self._serve_harness(tmp, 3)
+            self._leave_files(results, serve_status=None)
+            result = self._run(script, env, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with open(os.path.join(tmp, "logs", "corpus_serve.pid")) as handle:
+                published = handle.read().strip()
+            with open(env["FAKE_SERVE_PIDOUT"]) as handle:
+                self.assertEqual(published, handle.read().strip(),
+                                 "the pidfile names the wrapper, not the server")
+            self.assertIn(f"started {published}", result.stdout)
+            status_path = os.path.join(results, "corpus-serve.status")
+            self.assertEqual(read_if_exists(status_path, "MISSING").strip(), "3",
+                             "the server's exit status was not recorded when it stopped")
+            self.assertEqual(result.stdout.strip().splitlines()[-1], "unclean")
+            with open(os.path.join(results, "dns-evidence.json")) as handle:
+                evidence = json.load(handle)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertEqual(evidence["corpus_serve_exit_status"], 3)
+            self.assertIn("corpus_serve", evidence["reason"])
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results, script = self._serve_harness(tmp, 0)
+            self._leave_files(results, serve_status=None)
+            result = self._run(script, env, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(read_if_exists(
+                os.path.join(results, "corpus-serve.status"), "MISSING").strip(), "0")
+            self.assertEqual(result.stdout.strip().splitlines()[-1], "clean")
+            with open(os.path.join(results, "dns-evidence.json")) as handle:
+                evidence = json.load(handle)
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            self.assertEqual(evidence["corpus_serve_exit_status"], 0)
 
     def test_the_replay_server_logs_into_the_run_directory(self):
         """corpus_serve's DNS and access logs are the other half of the

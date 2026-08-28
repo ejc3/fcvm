@@ -70,6 +70,30 @@ campaign's startup probes through the three verify brackets and every rep of
 every arm of the measured run, so it is the biggest record in the directory
 and a short one means the server was not serving the whole run.
 
+The evidence is only as good as the checks behind it, and three of them are
+easy to get wrong:
+
+- The server's exit status. `corpus_serve.py` exits 1 when a log line could
+  not be written, after the response bytes went out, and `sudo -b` discards
+  that status. The launch wrapper waits for the server and writes the status
+  to `corpus-serve.status` in the run directory; `stop_corpus_serve` waits
+  for the file, `write_dns_evidence` records it as `corpus_serve_exit_status`
+  and is unclean unless it is 0, and `campaign_summary.py` refuses evidence
+  that does not carry 0. A liveness poll cannot see this case.
+- The owner samples. `campaign_summary.py` parses every `dns-owner.log` line
+  and holds it to the rule the campaign applied at the verdict (owner is
+  `serve_pid`, dnsmasq inactive, the load column adds up to `load_samples`
+  and `load_max_1min`). The evidence's `first_mismatch: null` is a claim
+  about those lines, not proof of them.
+- Proxies in the container exec. fc-agent runs every `fcvm exec -c` under
+  the host's saved `HTTP_PROXY`/`HTTPS_PROXY`, and `urllib` honours them by
+  default, so HOP D's URL probe would fetch the live site through the proxy
+  while the hostname check beside it resolved through the replay resolver.
+  The probe installs an empty `ProxyHandler`, clears every `*_proxy`
+  variable first, and reports what it ignored; `verify-dns.json` carries
+  `proxies_disabled` and `run_verify` refuses a bracket without it. Any new
+  in-guest probe that opens a URL needs the same treatment.
+
 ## Six methodology defects — do not reintroduce
 
 1. **Matched accounting basis.** Sum memory over the SAME process set for every

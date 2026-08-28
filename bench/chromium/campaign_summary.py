@@ -7,8 +7,11 @@ Each run directory holds reqanalyze's analysis.json (required; its stall_gate
 must have been armed with --stall-max-ms and must have evaluated at least one
 record, since an unarmed gate reports passed=true having evaluated nothing),
 dns-evidence.json (required when the cell's guest_dns names a baked resolver,
-optional otherwise; when present its verdict must be "clean" and every file it
-cites must be present and agree with it) and diag/summary.json (optional). The
+optional otherwise; when present its verdict must be "clean", it must carry
+the replay server's exit status 0, every file it cites must be present and
+agree with it, and every sample in dns-owner.log must name its serve_pid as
+the owner of 127.0.0.1:53 with dnsmasq inactive and a load the evidence
+accounts for) and diag/summary.json (optional). The
 index names every file it was generated from with its sha256, and carries one
 cell per run: engine, cpu, memory_mib, guest_dns, the seal identity,
 publishable, stall_gate_passed, dns_verdict, load_max_1min (the maximum 1-min
@@ -40,10 +43,20 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
+# One :53 owner sample, as corpus_campaign.sh's dns_owner_sample prints it.
+# The load column is absent from logs written before the sampler carried it.
+OWNER_SAMPLE = re.compile(
+    r"^(?P<ts>\S+) owner_pid=(?P<owner>\S+) dnsmasq=(?P<dnsmasq>\S+)"
+    r"(?: load1=(?P<load>\S+))?$"
+)
+# The sampler accepts a load only in this shape; dns_load_stats counts only
+# these when it reports load_samples and load_max_1min.
+LOAD_NUMBER = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 # The seal identity of one run, as reqbench.py stamps it into every record's
 # meta and reqanalyze carries it into the cell (CELL_FIELDS).
 SEAL_FIELDS = (
@@ -149,6 +162,59 @@ def withdrawal_reason(marker):
     return reason or "(no reason recorded in the marker)"
 
 
+def check_owner_log(run_dir, evidence, owner_bytes):
+    """Hold every sample in dns-owner.log to the rule the campaign applied at
+    the verdict: the owner of 127.0.0.1:53 is serve_pid, dnsmasq is inactive,
+    and the load column adds up to load_samples and load_max_1min. The
+    evidence's own first_mismatch is a claim about these lines, not proof;
+    a log rewritten under the same line count indexed clean on it."""
+    serve_pid = evidence.get("serve_pid")
+    if not positive_int(serve_pid):
+        raise RunError(
+            f"{run_dir}: dns-evidence.json is clean but records serve_pid="
+            f"{serve_pid!r}; the samples have no server to be held to"
+        )
+    try:
+        text = owner_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RunError(f"{run_dir}: dns-owner.log is not UTF-8: {error}")
+    loads = []
+    for number, line in enumerate(text.splitlines(), 1):
+        match = OWNER_SAMPLE.match(line)
+        if match is None:
+            raise RunError(f"{run_dir}: dns-owner.log line {number} is not a sample: {line!r}")
+        if match["owner"] != str(serve_pid):
+            raise RunError(
+                f"{run_dir}: dns-owner.log line {number} names {match['owner']} as the "
+                f"owner of 127.0.0.1:53, not corpus_serve {serve_pid}: {line!r}"
+            )
+        if match["dnsmasq"] != "inactive":
+            raise RunError(
+                f"{run_dir}: dns-owner.log line {number} records dnsmasq="
+                f"{match['dnsmasq']}, not inactive: {line!r}"
+            )
+        if match["load"] is not None:
+            if not LOAD_NUMBER.match(match["load"]):
+                raise RunError(
+                    f"{run_dir}: dns-owner.log line {number} carries a load1 that is "
+                    f"not a number: {line!r}"
+                )
+            loads.append(float(match["load"]))
+    load_samples = evidence.get("load_samples", 0)
+    load_max = evidence.get("load_max_1min")
+    if isinstance(load_samples, bool) or not isinstance(load_samples, int):
+        raise RunError(f"{run_dir}: dns-evidence.json records load_samples={load_samples!r}")
+    if isinstance(load_max, bool) or not (load_max is None or isinstance(load_max, (int, float))):
+        raise RunError(f"{run_dir}: dns-evidence.json records load_max_1min={load_max!r}")
+    found_max = max(loads) if loads else None
+    if len(loads) != load_samples or found_max != load_max:
+        raise RunError(
+            f"{run_dir}: dns-owner.log carries {len(loads)} load sample(s) with maximum "
+            f"{found_max} but dns-evidence.json records load_samples={load_samples}, "
+            f"load_max_1min={load_max}"
+        )
+
+
 def check_evidence(run_dir, evidence, sources):
     """Hold a clean verdict to the files it cites; raise RunError otherwise."""
     if not isinstance(evidence, dict):
@@ -189,6 +255,17 @@ def check_evidence(run_dir, evidence, sources):
         raise RunError(
             f"{run_dir}: dns-evidence.json records {evidence['samples']} samples but "
             f"dns-owner.log holds {owner_lines} lines"
+        )
+    check_owner_log(run_dir, evidence, owner_bytes)
+    # The replay server's exit status, recorded by the campaign once the
+    # server was gone: 0 is the shutdown sequence completing with both logs
+    # closed; 1 is a log line it could not write after the response was
+    # sent, so the logs it hashed are short. Only 0 is a complete log.
+    serve_status = evidence.get("corpus_serve_exit_status")
+    if isinstance(serve_status, bool) or not isinstance(serve_status, int) or serve_status != 0:
+        raise RunError(
+            f"{run_dir}: dns-evidence.json records corpus_serve exit status "
+            f"{serve_status!r}, not 0; the replay logs it hashed may be short"
         )
     # The brackets: every stage the campaign runs, each present and passed.
     # Basenames are resolved inside run_dir so a relocated run directory

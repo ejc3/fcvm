@@ -19,11 +19,13 @@ real.
 Run: python3 -m unittest test_verify_dns -v
 """
 
+import http.server
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,7 +74,17 @@ PY
         "-c cat /etc/resolv.conf") printf '%b' "$STUB_RESOLV_CONTAINER"; exit "${STUB_RESOLV_RC:-0}" ;;
         "-c python3 /opt/bench/"*) exit 0 ;;
         "-c python3 -c "*gethostbyname*) echo "$STUB_ANSWER" ;;
-        "-c python3 -c "*urllib*) echo "$STUB_URL_STATUS" ;;
+        "-c python3 -c "*urllib*)
+            # $1=python3 $2=-c $3=<probe text> $4=<url>. With STUB_RUN_URL_PROBE
+            # the shipped probe text runs for real, under the proxy variables
+            # fc-agent injects into every container exec (HTTP_PROXY,
+            # HTTPS_PROXY, no_proxy, NO_PROXY from the host's saved settings).
+            if [ "${STUB_RUN_URL_PROBE:-0}" = 1 ]; then
+                exec env HTTP_PROXY="$STUB_PROXY_ADDR" HTTPS_PROXY="$STUB_PROXY_ADDR" \
+                    no_proxy=intranet.example NO_PROXY=intranet.example \
+                    "$STUB_PYTHON" -c "$3" "$4"
+            fi
+            echo "$STUB_URL_STATUS none" ;;
         *) echo "stub fcvm: unexpected exec: $view $*" >&2; exit 97 ;;
       esac ;;
   *) exit 0 ;;
@@ -171,6 +183,92 @@ class VerifyDnsHop(unittest.TestCase):
         with open(path) as handle:
             return json.load(handle)
 
+    class Answer200(http.server.BaseHTTPRequestHandler):
+        """Answers 200 to every request and records the request line's
+        path. Standing in for the replay server it sees "/one"; standing in
+        for a proxy it sees the absolute URL urllib sends a proxy."""
+        seen = None
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.seen.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def _http_stub(self):
+        class Stub(self.Answer200):
+            seen = []
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_port, Stub.seen
+
+    def test_the_url_probe_ignores_the_proxy_the_exec_environment_carries(self):
+        """fc-agent runs every container exec under the host's saved
+        HTTP_PROXY and HTTPS_PROXY (fc-agent/src/exec.rs, read_proxy_settings),
+        and urllib.request.build_opener() installs a ProxyHandler from the
+        environment. The hostname check resolved through the baked resolver
+        while each URL request went to the proxy: a working proxy fetched the
+        live site, the status came back 200 and HOP D passed without the
+        replay server having answered one URL.
+
+        The stub exec runs the shipped probe text under that environment.
+        The proxy variables name a local stub that answers 200 to anything
+        (the live site through a working proxy); the URLs name a second stub
+        standing in for the replay server. A control sends a default urllib
+        request through the same environment and requires the proxy stub to
+        answer it, so a pass here cannot come from an environment the probe
+        never saw. The evidence must say the probe ran with proxies disabled
+        and which variables it ignored.
+
+        RED BEFORE THE FIX: the proxy stub answered both URLs
+        (['http://127.0.0.1:P/one', 'http://127.0.0.1:P/two']) and the replay
+        stub answered none.
+        """
+        replay_port, replay_seen = self._http_stub()
+        proxy_port, proxy_seen = self._http_stub()
+        proxy = f"http://127.0.0.1:{proxy_port}"
+        urls = f"http://127.0.0.1:{replay_port}/one,http://127.0.0.1:{replay_port}/two"
+        control_env = {k: v for k, v in os.environ.items()
+                       if not k.lower().endswith("_proxy")}
+        control_env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy)
+        control = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, urllib.request as u; "
+             "print(u.build_opener().open(sys.argv[1], timeout=10).status)",
+             f"http://127.0.0.1:{replay_port}/control"],
+            env=control_env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(proxy_seen, [f"http://127.0.0.1:{replay_port}/control"],
+                         "the control request did not go through the proxy stub, "
+                         "so this environment proves nothing about the probe")
+        self.assertEqual(replay_seen, [])
+        del proxy_seen[:]
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._fixture(d, urls=urls)
+            env.update(STUB_RUN_URL_PROBE="1", STUB_PROXY_ADDR=proxy)
+            result = self._verify(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-2500:]}")
+            self.assertEqual(proxy_seen, [],
+                             "the URL probe went through the proxy the exec "
+                             "environment named instead of to the replay server")
+            self.assertEqual(sorted(replay_seen), ["/one", "/two"],
+                             "the replay server did not answer every corpus URL")
+            evidence = self._evidence(env)
+            self.assertIs(evidence["passed"], True)
+            self.assertIs(evidence["proxies_disabled"], True)
+            for url in urls.split(","):
+                self.assertEqual(evidence["urls"][url], {
+                    "status": 200, "ok": True,
+                    "proxy_env_ignored": ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "no_proxy"],
+                })
+            self.assertEqual(os.listdir(state_dir), [])
+
     def test_a_clone_answering_the_real_address_fails_hop_d(self):
         """The failure the hop exists for: the guest resolves example.com to
         its real address, so a render would fetch the live site, not the
@@ -210,7 +308,7 @@ class VerifyDnsHop(unittest.TestCase):
                 self.assertEqual(evidence["hosts"][host],
                                  {"answer": "10.0.2.2", "ok": True})
             for url in URLS.split(","):
-                self.assertEqual(evidence["urls"][url], {"status": 200, "ok": True})
+                self.assertEqual(evidence["urls"][url], {"status": 200, "ok": True, "proxy_env_ignored": []})
             self.assertTrue(evidence["timestamp"])
             execs = read_if_exists(env["STUB_EXEC_LOG"]).splitlines()
             self.assertIn("--vm cat /etc/resolv.conf", execs,
@@ -250,7 +348,7 @@ class VerifyDnsHop(unittest.TestCase):
             evidence = self._evidence(env)
             self.assertIs(evidence["passed"], False)
             self.assertEqual(evidence["urls"]["https://example.com/"],
-                             {"status": 404, "ok": False})
+                             {"status": 404, "ok": False, "proxy_env_ignored": []})
 
     def test_hosts_without_a_baked_resolver_fail(self):
         """A golden made without GUEST_DNS carries no resolver to verify
@@ -316,7 +414,7 @@ class VerifyDnsHop(unittest.TestCase):
             evidence = self._evidence(env)
             self.assertIs(evidence["passed"], False)
             self.assertEqual(evidence["urls"]["https://example.com/"],
-                             {"status": 404, "ok": False})
+                             {"status": 404, "ok": False, "proxy_env_ignored": []})
         with tempfile.TemporaryDirectory() as d:
             env, _ = self._fixture(d, hosts="")
             result = self._verify(env)
@@ -326,7 +424,7 @@ class VerifyDnsHop(unittest.TestCase):
             self.assertIs(evidence["passed"], True)
             self.assertEqual(evidence["hosts"], {})
             for url in URLS.split(","):
-                self.assertEqual(evidence["urls"][url], {"status": 200, "ok": True})
+                self.assertEqual(evidence["urls"][url], {"status": 200, "ok": True, "proxy_env_ignored": []})
         with tempfile.TemporaryDirectory() as d:
             # URLs alone, with no baked resolver to fetch through: refuse.
             env, _ = self._fixture(d, hosts="", dns_server=None)

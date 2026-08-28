@@ -67,7 +67,7 @@ mkdir -p "$RESULTS"
 # content-addressed runtime bundles under runtime/ and the phase logs under
 # logs/ are not the record and stay.
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
-    "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log \
+    "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-serve.status \
     "$RESULTS"/reqbench.jsonl "$RESULTS"/analysis.json
 
 # The 14 URLs, in the order the sealed 2026-08-14 run cycled them. Order is part
@@ -92,12 +92,14 @@ say() { printf '\n=== %s\n' "$*"; }
 #      flight ($RESULTS/dns-owner.log). The quiet gate reads the load once,
 #      before the run; the samples are what says it stayed quiet.
 #   3. $RESULTS/dns-evidence.json ties them together with the replay server's
-#      own DNS and access logs (sha256), the maximum 1-min load over the
-#      samples (load_max_1min), and a verdict: "clean" only when all three
-#      brackets are present and passed, every sample names this campaign's
-#      corpus_serve with dnsmasq inactive, the sampler lived until the run
-#      ended, both replay logs exist, and dnsmasq is inactive after the clone
-#      restores.
+#      own DNS and access logs (sha256), its exit status
+#      (corpus_serve_exit_status, from $RESULTS/corpus-serve.status), the
+#      maximum 1-min load over the samples (load_max_1min), and a verdict:
+#      "clean" only when all three brackets are present and passed, every
+#      sample names this campaign's corpus_serve with dnsmasq inactive, the
+#      sampler lived until the run ended, both replay logs exist, the server
+#      exited 0 (its logs are complete only then), and dnsmasq is inactive
+#      after the clone restores.
 engine_target() {
     # $1 = golden | verify | run
     printf 'bench-%s-request-%s' "$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)" "$1"
@@ -136,13 +138,16 @@ run_verify() {
         || { echo "FAILED: verify ($stage): cannot keep the evidence as $copy" >&2; return 1; }
     # passed=true is also what HOP D writes when it was given nothing to
     # check; the bracket must show the replay resolver and every corpus host
-    # and URL answered through it.
+    # and URL answered through it, with the URL probes run under no proxy
+    # (proxies_disabled): fc-agent injects the host's HTTP_PROXY/HTTPS_PROXY
+    # into the exec, and a probe that honoured them would have fetched the
+    # live site with the replay resolver never consulted.
     jq -e --arg hosts "$CORPUS_HOSTS" --arg urls "$URLS" '
         . as $e
-        | .passed == true and .dns_server == "10.0.2.2"
+        | .passed == true and .dns_server == "10.0.2.2" and .proxies_disabled == true
         and all($hosts | split(",")[]; . as $h | $e.hosts[$h].ok == true)
         and all($urls | split(",")[]; . as $u | $e.urls[$u].ok == true)' "$copy" >/dev/null \
-        || { echo "FAILED: verify ($stage): $copy does not record passed=true through 10.0.2.2 for every corpus host and URL" >&2; return 1; }
+        || { echo "FAILED: verify ($stage): $copy does not record passed=true through 10.0.2.2 with proxies disabled for every corpus host and URL" >&2; return 1; }
 }
 
 DNS_SAMPLE_INTERVAL="${DNS_SAMPLE_INTERVAL:-10}"
@@ -275,6 +280,22 @@ write_dns_evidence() {
             verdict=unclean; reason="${reason:-replay log $f is missing or empty}"
         fi
     done
+    # The replay server's exit status, as its wrapper wrote it once the
+    # process was gone. 0 is the shutdown sequence completing with both logs
+    # closed. 1 is a log line it could not write, with the response already
+    # sent, so the logs are short by at least that line; 137 is the SIGKILL
+    # escalation; no file means the server is still running, never started,
+    # or its wrapper died with it. Only 0 is clean.
+    local status_file="$RESULTS/corpus-serve.status" serve_status="" serve_status_json=null
+    if [ -f "$status_file" ]; then serve_status=$(tr -d '[:space:]' <"$status_file"); fi
+    if [[ "$serve_status" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
+        serve_status_json=$serve_status
+        if [ "$serve_status" -ne 0 ]; then
+            verdict=unclean; reason="${reason:-corpus_serve exited $serve_status, not 0, so its replay logs may be short}"
+        fi
+    else
+        verdict=unclean; reason="${reason:-corpus_serve left no exit status in $status_file}"
+    fi
     if ! jq -n --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
         --arg after_state "$after_state" --argjson sampler_alive "$sampler_alive" \
         --argjson samples "$samples" --argjson interval "$DNS_SAMPLE_INTERVAL" \
@@ -282,6 +303,7 @@ write_dns_evidence() {
         --arg first "$first_mismatch" --arg reason "$reason" --arg owner_log "$log" \
         --arg dns_sha "$(sha256_or_empty "$RESULTS/corpus-dns.log")" \
         --arg access_sha "$(sha256_or_empty "$RESULTS/corpus-access.log")" \
+        --argjson serve_status "$serve_status_json" \
         --arg verdict "$verdict" --args \
         '{serve_pid: $serve_pid, dnsmasq_was_active_before: $before,
           dnsmasq_active_after_restore: $after,
@@ -293,6 +315,7 @@ write_dns_evidence() {
           verify_files: $ARGS.positional,
           corpus_dns_log_sha256: (if $dns_sha == "" then null else $dns_sha end),
           corpus_access_log_sha256: (if $access_sha == "" then null else $access_sha end),
+          corpus_serve_exit_status: $serve_status,
           reason: (if $reason == "" then null else $reason end),
           verdict: $verdict}' "${files[@]}" >"$out.tmp" \
         || ! mv "$out.tmp" "$out"; then
@@ -372,10 +395,16 @@ stop_corpus_serve() {
     # replay-log hashes name files nothing appends to afterwards) and again
     # from the exit trap, which finds it already gone. On SIGTERM the server
     # stops accepting, waits for the handlers still answering (their access
-    # lines follow their responses), closes both logs and exits, so once the
-    # poll below sees it gone the logs are complete; the SIGKILL fallback
-    # is for a handler that never finishes, which owes no line.
-    if [ -n "$SERVE_PID" ] && sudo kill -0 "$SERVE_PID" 2>/dev/null; then
+    # lines follow their responses), closes both logs and exits 0; it exits 1
+    # when a log line could not be written, which liveness cannot see, so
+    # the exit status is what says the logs are complete. The wrapper that
+    # launched the server writes that status to $RESULTS/corpus-serve.status
+    # once the server is gone; this waits for the file and write_dns_evidence
+    # requires it to say 0. The SIGKILL fallback is for a handler that never
+    # finishes; the wrapper records 137 and the verdict is unclean.
+    local status_file="$RESULTS/corpus-serve.status"
+    [ -n "$SERVE_PID" ] || return 0
+    if sudo kill -0 "$SERVE_PID" 2>/dev/null; then
         say "stopping corpus_serve ($SERVE_PID)"
         sudo kill "$SERVE_PID" 2>/dev/null || true
         # Not `wait`: the server is not a child of this shell (sudo -b detached
@@ -388,6 +417,17 @@ stop_corpus_serve() {
             say "corpus_serve $SERVE_PID did not exit; escalating to SIGKILL"
             sudo kill -9 "$SERVE_PID" 2>/dev/null || true
         fi
+    fi
+    # A wrapper that never writes (killed with the server, never started)
+    # leaves no file, which the evidence records as unclean.
+    for _ in $(seq 1 50); do
+        if [ -f "$status_file" ]; then break; fi
+        sleep 0.1
+    done
+    if [ -f "$status_file" ]; then
+        say "corpus_serve $SERVE_PID exit status: $(tr -d '[:space:]' <"$status_file")"
+    else
+        say "corpus_serve $SERVE_PID left no exit status in $status_file"
     fi
 }
 
@@ -429,17 +469,27 @@ fi
 
 say "starting corpus_serve (DNS 127.0.0.1:53 answering 10.0.2.2; HTTP 80; HTTPS 443)"
 # The PID comes from THIS invocation, via a pidfile the wrapper shell writes
-# before exec'ing. `pgrep -f corpus_serve.py` would match any campaign's server,
-# so a concurrent run's cleanup could kill this one's and leave its own alive --
-# and the survivor still holds :53/:80/:443, so the next campaign's preflight
-# passes against a server nobody is tracking. `exec` means the shell BECOMES
-# python, so $$ is the server's own pid, not a parent's.
+# from $! of the server it started. `pgrep -f corpus_serve.py` would match any
+# campaign's server, so a concurrent run's cleanup could kill this one's and
+# leave its own alive -- and the survivor still holds :53/:80/:443, so the
+# next campaign's preflight passes against a server nobody is tracking.
+#
+# The wrapper is also what keeps the exit status: `sudo -b` detaches the
+# server from this shell, so `wait` cannot reach it and a status the server
+# exits with (1 after a log line it could not write, with the response bytes
+# already sent) would be lost. The wrapper waits for the server and writes
+# the status to $RESULTS/corpus-serve.status by rename, so a partial write is
+# never read; stop_corpus_serve waits for the file, write_dns_evidence
+# requires it to say 0, and campaign_summary refuses evidence that does not
+# carry it.
 SERVE_PIDFILE="$LOGDIR/corpus_serve.pid"
+SERVE_STATUS_FILE="$RESULTS/corpus-serve.status"
+rm -f "$SERVE_PIDFILE" "$SERVE_STATUS_FILE"
 # --dns-log / --access-log: the server's per-query DNS log and HTTP access
 # log, kept with the run; dns-evidence.json records their sha256.
-sudo -b sh -c 'echo $$ > "$1"; exec python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 --dns-log "$4" --access-log "$5"' \
+sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 --dns-log "$4" --access-log "$5" & pid=$!; echo "$pid" > "$1"; wait "$pid"; rc=$?; echo "$rc" > "$6.tmp" && mv "$6.tmp" "$6"' \
     _ "$SERVE_PIDFILE" "$REPO/bench/chromium/corpus_serve.py" "$REPO/bench/chromium/corpus-live" \
-    "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" \
+    "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" "$SERVE_STATUS_FILE" \
     > "$LOGDIR/corpus_serve.log" 2>&1
 # `[ -s f ] && break` would be the last command in the body, so on the first
 # iteration (pidfile not written yet) it returns 1 and `set -e` kills the whole

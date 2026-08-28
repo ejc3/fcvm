@@ -266,6 +266,7 @@ def write_run(
             "verify_files": verify_files,
             "corpus_dns_log_sha256": hashes["corpus-dns.log"],
             "corpus_access_log_sha256": hashes["corpus-access.log"],
+            "corpus_serve_exit_status": 0,
             "reason": None,
             "verdict": dns_verdict,
         }
@@ -574,6 +575,83 @@ class CampaignSummary(unittest.TestCase):
                 d, evidence_overrides={"dnsmasq_state_after_restore": "unknown"},
             )
             self.assertIn("dnsmasq", text)
+
+    def test_evidence_without_the_replay_server_exit_status_refuses(self):
+        """corpus_serve exits 1 after a log line it could not write, with the
+        response bytes already sent; the campaign records the status the
+        server's wrapper leaves as corpus_serve_exit_status. A verdict that
+        does not carry status 0 is a verdict over logs that may be short.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s) (every subtest)
+        """
+        cases = {"exit 1": 1, "exit 137": 137, "null": None, "bool": True, "string": "0"}
+        for label, status in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                _paths, text = self._refused(
+                    d, evidence_overrides={"corpus_serve_exit_status": status})
+                self.assertIn("corpus_serve", text)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            with open(paths["dns_evidence"]) as handle:
+                evidence = json.load(handle)
+            del evidence["corpus_serve_exit_status"]
+            with open(paths["dns_evidence"], "w") as handle:
+                json.dump(evidence, handle)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("corpus_serve", text)
+
+    def test_an_owner_log_whose_lines_contradict_the_evidence_refuses(self):
+        """The owner log was accepted by line count, and first_mismatch: null
+        was taken on trust: a log rewritten to name owner_pid=9999 on every
+        line still indexed clean. The index now reads every sample and holds
+        it to the rule the campaign applied at the verdict: each names
+        serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive, the
+        lines carrying load1 number load_samples and their maximum is
+        load_max_1min, and every line parses as a sample. The first
+        contradiction refuses the run.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s) (every subtest)
+        """
+        good = "2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive load1=0.42\n"
+        cases = {
+            "another owner on every line": (
+                good.replace("owner_pid=4242", "owner_pid=9999") * 12, "9999"),
+            "no owner on one line": (
+                good * 5 + good.replace("owner_pid=4242", "owner_pid=none") + good * 6,
+                "owner_pid=none"),
+            "dnsmasq active on one line": (
+                good * 11 + good.replace("dnsmasq=inactive", "dnsmasq=active"),
+                "dnsmasq=active"),
+            "a load above the recorded maximum": (
+                good * 3 + good.replace("load1=0.42", "load1=5.00") + good * 8, "5.0"),
+            "fewer load samples than recorded": (
+                good * 11 + good.replace(" load1=0.42", ""), "load"),
+            "a line that is not a sample": (
+                good * 11 + "not a sample\n", "not a sample"),
+        }
+        for label, (log, quoted) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                paths = write_run(run_dir)
+                with open(paths["owner_log"], "w") as handle:
+                    handle.write(log)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, text)
+                self.assertFalse(os.path.exists(out))
+                self.assertIn("dns-owner.log", text)
+                self.assertIn(quoted, text)
+        with tempfile.TemporaryDirectory() as d:
+            # Clean evidence naming no server pid has nothing to hold the
+            # samples to.
+            _paths, text = self._refused(d, evidence_overrides={"serve_pid": None})
+            self.assertIn("serve_pid", text)
 
     def test_the_hash_names_the_bytes_that_were_parsed(self):
         """Parsing a file and hashing it later are two reads; an atomic

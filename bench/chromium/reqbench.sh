@@ -837,10 +837,25 @@ VERIFY_DNS_URLS="${VERIFY_DNS_URLS:-}"
 # error processor is replaced so every status comes back as a number instead
 # of an exception; redirects are therefore not followed, and a 3xx counts as
 # the request having reached the replay server. Both bench images ship python3.
-VERIFY_DNS_URL_PROBE='import ssl,sys,urllib.request as u
+#
+# No proxy, whatever the environment says. fc-agent runs every container exec
+# under the host's saved HTTP_PROXY/HTTPS_PROXY/no_proxy/NO_PROXY
+# (fc-agent/src/exec.rs, read_proxy_settings), and build_opener() installs a
+# ProxyHandler from the environment by default, so the request would go to
+# the proxy and come back with the live site's status while the hostname
+# check next to it resolved through the replay resolver. The empty
+# ProxyHandler replaces the default one and every *_proxy variable is
+# removed before the request, so the only place it can go is the host the
+# resolver under test names. The probe prints the status and the proxy
+# variables it found and ignored (comma-separated, or "none"); the evidence
+# records both.
+VERIFY_DNS_URL_PROBE='import os,ssl,sys,urllib.request as u
+p=sorted(k for k in os.environ if k.lower().endswith("_proxy"))
+for k in p: del os.environ[k]
 c=ssl._create_unverified_context()
 H=type("H",(u.HTTPErrorProcessor,),{"http_response":lambda s,q,r:r,"https_response":lambda s,q,r:r})
-print(u.build_opener(u.HTTPSHandler(context=c),H).open(u.Request(sys.argv[1]),timeout=30).status)'
+r=u.build_opener(u.ProxyHandler({}),u.HTTPSHandler(context=c),H).open(u.Request(sys.argv[1]),timeout=30)
+print(r.status,",".join(p) or "none")'
 
 verify_guest_dns() {
     local cpid="$1" cfg="$DATA_ROOT/snapshots/$TAG/config.json"
@@ -911,30 +926,50 @@ verify_guest_dns() {
             hosts_json=$(jq -c --arg h "$host" --arg a "$answer" --argjson ok "$ok" \
                 '.[$h] = {answer: $a, ok: $ok}' <<<"$hosts_json")
         done
-        local url status
+        local url line status proxy_env rc
         for url in "${urls[@]}"; do
             [ -n "$url" ] || continue
-            status=$($SUDO "$FCVM" exec --pid "$cpid" -c -- python3 -c "$VERIFY_DNS_URL_PROBE" "$url" 2>>"$errlog") \
-                || status="${status:-}<exec rc=$?>"
-            if [[ "$status" =~ ^[0-9]+$ ]] && [ "$status" -ge 200 ] && [ "$status" -le 399 ]; then
+            rc=0
+            line=$($SUDO "$FCVM" exec --pid "$cpid" -c -- python3 -c "$VERIFY_DNS_URL_PROBE" "$url" 2>>"$errlog") \
+                || rc=$?
+            # "<status> <ignored proxy variables|none>". A line without the
+            # second field did not come from the probe above and proves
+            # nothing about where the request went.
+            status=${line%% *}
+            proxy_env=""
+            [ "$line" = "$status" ] || proxy_env=${line#* }
+            [ "$rc" -eq 0 ] || status="${line:-}<exec rc=$rc>"
+            if [ "$rc" -eq 0 ] && [ -n "$proxy_env" ] && [[ "$status" =~ ^[0-9]+$ ]] \
+                && [ "$status" -ge 200 ] && [ "$status" -le 399 ]; then
                 ok=true
             else
                 ok=false; failed=1
-                echo "HOP D FAILED: GET $url inside the clone returned '$status', want 200-399" >&2
+                if [ "$rc" -eq 0 ] && [ -z "$proxy_env" ]; then
+                    echo "HOP D FAILED: GET $url inside the clone printed '$line', not the probe's '<status> <ignored proxies>'" >&2
+                else
+                    echo "HOP D FAILED: GET $url inside the clone returned '$status', want 200-399" >&2
+                fi
             fi
-            echo "  GET $url -> $status ($ok)"
-            urls_json=$(jq -c --arg u "$url" --arg s "$status" --argjson ok "$ok" \
-                '.[$u] = {status: (if ($s | test("^[0-9]+$")) then ($s | tonumber) else null end), ok: $ok}' \
+            echo "  GET $url -> $status ($ok)${proxy_env:+ proxy_env_ignored=$proxy_env}"
+            urls_json=$(jq -c --arg u "$url" --arg s "$status" --argjson ok "$ok" --arg p "$proxy_env" \
+                '.[$u] = {status: (if ($s | test("^[0-9]+$")) then ($s | tonumber) else null end), ok: $ok,
+                          proxy_env_ignored: (if $p == "" then null elif $p == "none" then [] else ($p | split(",")) end)}' \
                 <<<"$urls_json")
         done
     fi
     local passed=true
     [ "$failed" -eq 0 ] || passed=false
+    # proxies_disabled: every URL probe reported the proxy variables it
+    # ignored, so none of the requests can have left through a proxy; null
+    # when no URL was probed.
     jq -n --arg dns "$dns_server" --arg rv "$resolv_vm" --arg rc "$resolv_container" \
         --argjson hosts "$hosts_json" --argjson urls "$urls_json" \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson passed "$passed" \
         '{dns_server: (if $dns == "" then null else $dns end), resolv_conf_vm: $rv,
-          resolv_conf_container: $rc, hosts: $hosts, urls: $urls, timestamp: $ts, passed: $passed}' \
+          resolv_conf_container: $rc, hosts: $hosts, urls: $urls,
+          proxies_disabled: (if ($urls | length) == 0 then null
+                             else ($urls | to_entries | all(.value.proxy_env_ignored != null)) end),
+          timestamp: $ts, passed: $passed}' \
         >"$out.tmp" && mv "$out.tmp" "$out" \
         || { echo "HOP D BLOCKED: cannot write $out" >&2; return 1; }
     [ "$failed" -eq 0 ] || return 1

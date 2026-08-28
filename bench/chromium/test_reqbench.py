@@ -7886,7 +7886,9 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                     "dns_server": "10.0.2.2", "resolv_conf_vm": "nameserver 10.0.2.2\n",
                     "resolv_conf_container": "nameserver 10.0.2.2\n",
                     "hosts": {"example.com": {"answer": "10.0.2.2", "ok": True}},
-                    "urls": {"https://example.com/": {"status": 200, "ok": True}},
+                    "urls": {"https://example.com/": {"status": 200, "ok": True,
+                                                      "proxy_env_ignored": []}},
+                    "proxies_disabled": True,
                     "timestamp": "2026-08-28T00:00:00Z", "passed": True,
                 }, handle)
             verify_files.append(path)
@@ -7912,6 +7914,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
             "verify_files": verify_files,
             "corpus_dns_log_sha256": hashes["corpus-dns.log"],
             "corpus_access_log_sha256": hashes["corpus-access.log"],
+            "corpus_serve_exit_status": 0,
             "reason": None,
             "verdict": verdict,
         }
