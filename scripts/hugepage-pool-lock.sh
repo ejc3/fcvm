@@ -16,12 +16,14 @@
 #   That is what a root-created lock did to every later unprivileged run
 #   (`flock: cannot open lock file ...: Permission denied`). flock(2) does not
 #   care about the open mode.
-# - Created atomically: a hard link fails if the name already exists, so
-#   concurrent creators agree on one inode. The invoking user creates it when
-#   the directory is writable, root (sudo) only on a fresh box whose data root
-#   is still root-owned. Nothing here chmods or chowns a path: `install -m`
-#   sets the mode on the file it creates, and a planted symlink at that name
-#   is replaced, not followed.
+# - Created atomically, as root: a hard link fails if the name already exists,
+#   so concurrent creators agree on one inode, and root is an owner every
+#   caller's allowlist accepts. Privilege is spent only on the fixed shared
+#   path, through fixed programs with quoted arguments; an overridden path
+#   (HUGEPAGE_POOL_LOCK, a test knob) is created unprivileged or refused.
+#   Nothing here chmods or chowns a path: `install -m` sets the mode on the
+#   file it creates, and a planted symlink at that name is replaced, not
+#   followed.
 # - The entry is checked before AND after opening. A symlink, a non-regular
 #   file, or a file owned by anyone but root, the invoking user, or the
 #   directory's owner is refused: its owner could repoint or recreate it under
@@ -29,11 +31,20 @@
 #   pool concurrently. After the open, the descriptor's inode must be the
 #   path's own (lstat) inode, which closes the window between check and open.
 #
+# Not defended: the data root's owner. In a sticky directory that owner can
+# unlink any entry, root-owned included, and could replace the lock under a
+# holder. That account is the box's operator (it ran setup, owns the checkout,
+# holds sudo on every box this runs on), and a lock cannot defend against its
+# own operator; moving the lock out of the data root would change the identity
+# in-flight reqbench.sh phases hold.
+#
 # The command runs as a CHILD while this script keeps fd 9: `exec` would hand
 # the descriptor to the command, and sudo closes inherited descriptors, which
 # would release the lock right before the privileged pool write.
 set -eu
-lock="${HUGEPAGE_POOL_LOCK:-/mnt/fcvm-btrfs/hugepage-pool.lock}"
+default_dir=/mnt/fcvm-btrfs
+default_lock="$default_dir/hugepage-pool.lock"
+lock="${HUGEPAGE_POOL_LOCK:-$default_lock}"
 wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
 [ $# -gt 0 ] || { echo "usage: $0 <command...>" >&2; exit 2; }
 
@@ -52,13 +63,24 @@ create_if_absent() {
 }
 
 if ! [ -e "$lock" ] && ! [ -L "$lock" ]; then
-	dir="$(dirname "$lock")"
-	if [ -d "$dir" ] && [ -w "$dir" ]; then
-		create_if_absent "$lock"
+	if [ "$lock" = "$default_lock" ]; then
+		# The shared lock is created as ROOT: a stable owner every caller's
+		# allowlist accepts, whoever runs first. Privilege is spent only here,
+		# only on the fixed path, and only through fixed programs with quoted
+		# arguments: no shell string, no caller-supplied path.
+		tmp="$(mktemp -u -- "$default_lock.XXXXXXXX")"
+		sudo mkdir -p -- "$default_dir"
+		sudo install -m 644 -- /dev/null "$tmp"
+		sudo ln -- "$tmp" "$default_lock" 2>/dev/null || true
+		sudo rm -f -- "$tmp"
 	else
-		# A fresh box: the data root is root-owned until setup hands it over.
-		sudo mkdir -p "$dir"
-		sudo bash -c "$(declare -f create_if_absent); create_if_absent \"\$1\"" _ "$lock"
+		# An overridden path (HUGEPAGE_POOL_LOCK, a test knob) is never created
+		# with privileges.
+		dir="$(dirname -- "$lock")"
+		if ! [ -d "$dir" ] || ! [ -w "$dir" ]; then
+			refuse "$lock is not the shared lock and its directory is not writable; not creating it with privileges"
+		fi
+		create_if_absent "$lock"
 	fi
 fi
 

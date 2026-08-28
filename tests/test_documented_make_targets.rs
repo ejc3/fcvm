@@ -815,6 +815,27 @@ fn hugepage_lock_is_taken_through_the_helper_at_every_site() {
              creates, and nothing may follow a path under the user's directory"
         );
     }
+    // Privilege is spent only on the fixed shared path, through fixed programs
+    // (CodeRabbit on #868): never `sudo bash -c`/`sudo sh -c`, never a
+    // caller-supplied path.
+    // `$tmp` is the one derived name sudo may see, and only as a sibling of
+    // the fixed path.
+    assert!(
+        helper_code.contains("tmp=\"$(mktemp -u -- \"$default_lock.XXXXXXXX\")\""),
+        "the temp name sudo creates must be derived from the fixed shared path"
+    );
+    for line in helper_code.lines().filter(|l| l.contains("sudo ")) {
+        assert!(
+            !line.contains("sudo bash -c") && !line.contains("sudo sh -c"),
+            "the helper hands sudo a shell string:\n{line}"
+        );
+        assert!(
+            line.contains("$default_lock")
+                || line.contains("$default_dir")
+                || line.contains("\"$tmp\""),
+            "the helper runs sudo on something other than the fixed shared lock:\n{line}"
+        );
+    }
 }
 
 /// Run `program` as an unprivileged stand-in when the tests are root.
@@ -915,6 +936,132 @@ fn hugepage_lock_helper_opens_the_lock_without_o_creat() {
         // Hand the directory back so the tempdir can be removed.
         let _ = std::os::unix::fs::chown(dir.path(), Some(0), Some(0));
     }
+}
+
+/// Every writer of the hugepage pool takes the shared lock (codex on #868).
+///
+/// The pool is host-global, and reqbench.sh holds the lock SHARED for a whole
+/// phase precisely so that nobody shrinks the pool under its clones. A writer
+/// that skips the lock (`bench-hugepages*` restoring the pool to zero, bench.sh
+/// growing or restoring it) defeats that lease. So every line that writes
+/// `nr_hugepages`, in the Makefile and in every bench/scripts shell script, must
+/// be an argument of `scripts/hugepage-pool-lock.sh`, on the same line or on an
+/// earlier line of the same backslash-continued command. reqbench.sh writes
+/// through `$HUGEPAGE_POOL_FILE` under its own lease, which
+/// bench/chromium/test_reqbench.py pins (`test_pool_grow_respects_exclusive_holder`),
+/// so this enumeration deliberately keys on the literal path.
+#[test]
+fn every_hugepage_pool_writer_takes_the_lock() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("Makefile")];
+    for dir in ["bench/chromium", "scripts"] {
+        for entry in std::fs::read_dir(root.join(dir)).expect(dir) {
+            let path = entry.expect("entry").path();
+            if path.extension().is_some_and(|e| e == "sh") {
+                files.push(path);
+            }
+        }
+    }
+    let writes_pool = |line: &str| {
+        let code = line.trim_start();
+        !code.starts_with('#')
+            && line.contains("nr_hugepages")
+            && (line.contains("> /proc/sys/vm/nr_hugepages")
+                || line.contains("tee")
+                || line.contains("sysctl"))
+    };
+    let mut writers = 0;
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !writes_pool(line) {
+                continue;
+            }
+            writers += 1;
+            let mut covered = line.contains("hugepage-pool-lock.sh");
+            let mut j = i;
+            while !covered && j > 0 && lines[j - 1].trim_end().ends_with('\\') {
+                j -= 1;
+                covered = lines[j].contains("hugepage-pool-lock.sh");
+            }
+            assert!(
+                covered,
+                "{}:{}: writes nr_hugepages outside scripts/hugepage-pool-lock.sh; a bench \
+                 phase holding the pool lease can have the pool shrunk under its clones:\n{line}",
+                file.strip_prefix(root).unwrap().display(),
+                i + 1
+            );
+        }
+    }
+    assert!(
+        writers >= 8,
+        "expected the six Makefile writers and bench.sh's two; found {writers}. If a \
+         writer moved, move this pin with it."
+    );
+}
+
+/// An overridden lock path is never created with privileges (CodeRabbit on
+/// #868): `HUGEPAGE_POOL_LOCK` is a test knob, and a caller-supplied path must
+/// not reach `sudo`. Only the fixed default path is created as root, through
+/// fixed programs. A `sudo` stub first on PATH records any escalation.
+#[test]
+fn hugepage_lock_helper_never_escalates_for_an_overridden_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("bin");
+    let marker = dir.path().join("sudo-was-called");
+    std::fs::write(
+        bin.join("sudo"),
+        format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+    )
+    .expect("stub");
+    std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/hugepage-pool-lock.sh");
+    let run = |lock: &std::path::Path| {
+        let out = std::process::Command::new(helper)
+            .env("PATH", &path)
+            .env("HUGEPAGE_POOL_LOCK", lock)
+            .env("HUGEPAGE_POOL_LOCK_WAIT", "2")
+            .args(["sh", "-c", "echo took-it"])
+            .output()
+            .expect("run helper");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success() && text.contains("took-it"), text)
+    };
+
+    // Absent lock in a writable directory: created unprivileged.
+    let (ok, text) = run(&dir.path().join("hugepage-pool.lock"));
+    assert!(
+        ok,
+        "the helper failed to create an overridden lock unprivileged:\n{text}"
+    );
+    assert!(
+        !marker.exists(),
+        "the helper reached for sudo to create a caller-supplied path:\n{text}"
+    );
+
+    // Absent lock where nothing can be created: refused, still without sudo.
+    let (ok, text) = run(std::path::Path::new("/proc/self/hugepage-pool.lock"));
+    assert!(
+        !ok,
+        "the helper claimed to lock a path it cannot create:\n{text}"
+    );
+    assert!(
+        !marker.exists(),
+        "the helper escalated to create a caller-supplied path under /proc:\n{text}"
+    );
 }
 
 /// A symlink at the lock path is refused, not followed (codex, CodeRabbit on

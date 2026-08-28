@@ -1244,22 +1244,22 @@ HUGEPAGE_POOL_TEST := 1200
 
 bench-hugepages: build setup-default
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_FULL) pages = $$(( $(HUGEPAGE_POOL_FULL) * 2 ))MB)..."
-	sudo sh -c 'echo $(HUGEPAGE_POOL_FULL) > /proc/sys/vm/nr_hugepages'
+	scripts/hugepage-pool-lock.sh sudo sh -c 'echo $(HUGEPAGE_POOL_FULL) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (full)..."
 	TMPDIR=/mnt/fcvm-btrfs/tmp $(CARGO) bench --bench hugepages; \
 	RC=$$?; \
 	echo "==> Releasing hugepage pool..."; \
-	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
+	scripts/hugepage-pool-lock.sh sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
 	exit $$RC
 
 bench-hugepages-test: build setup-default
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TEST) pages = $$(( $(HUGEPAGE_POOL_TEST) * 2 ))MB)..."
-	sudo sh -c 'echo $(HUGEPAGE_POOL_TEST) > /proc/sys/vm/nr_hugepages'
+	scripts/hugepage-pool-lock.sh sudo sh -c 'echo $(HUGEPAGE_POOL_TEST) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (test)..."
 	TMPDIR=/mnt/fcvm-btrfs/tmp $(CARGO) bench --bench hugepages -- --test; \
 	RC=$$?; \
 	echo "==> Releasing hugepage pool..."; \
-	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
+	scripts/hugepage-pool-lock.sh sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
 	exit $$RC
 
 bench-container-import: build setup-default
