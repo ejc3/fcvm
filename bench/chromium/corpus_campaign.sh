@@ -178,10 +178,20 @@ run_diag() {
     # load events and render success alone, and the verify brackets hold
     # the resolver evidence for both engines.
     [ "$ENGINE" = webkit ] && expect=""
-    say "diag: one traced render per corpus URL on restored clones of $TAG (limit ${DIAG_MAX_LOAD_MS} ms, expect ${expect:-<no trace>})"
+    # The diag's serve runs with working-set replay off, whatever the
+    # measured run will use. With it on, the UFFD server records every
+    # clone's faults into memory.bin.working-set beside the golden, and the
+    # run would replay the working set of the diag's renders (every corpus
+    # URL, DIAG_REPS clones each) instead of the golden's own: a fresh golden
+    # would measure like a reused one, and the PHASE comparison below would
+    # be two warmed sidecars. off records nothing and writes no file;
+    # reqbench refuses anything else for the diag, and campaign_summary
+    # refuses a diag summary that does not say off. Set on the make line so
+    # it also beats a UFFD_PREFETCH exported into this campaign's environment.
+    say "diag: one traced render per corpus URL on restored clones of $TAG, replay off (limit ${DIAG_MAX_LOAD_MS} ms, expect ${expect:-<no trace>})"
     if ! DIAG_URLS="$URLS" DIAG_EXPECT_IPS="$expect" DIAG_MAX_LOAD_MS="$DIAG_MAX_LOAD_MS" \
         TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" BACKEND="$BACKEND" \
-        UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH="$UFFD_PREFETCH" \
+        UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH=off \
         make -C "$REPO" "$(engine_target diag)" 2>&1 | tee "$LOGDIR/diag.log"; then
         echo "FAILED: diag did not pass; see $LOGDIR/diag.log and $out" >&2
         return 1
@@ -618,7 +628,9 @@ say "fcvm binary $FCVM_BIN sha256=$FCVM_SHA (recorded per run in cell.fcvm_sha25
 # PHASE=run reuses the installed golden. The working-set sidecar beside the
 # snapshot is the reason that is worth doing separately: a freshly created
 # golden has none, so the first measured run pays cold-working-set costs that
-# every later run does not. Comparing the two is a one-variable experiment.
+# every later run does not. Comparing the two is a one-variable experiment;
+# the diag between golden and run serves with replay off (run_diag), so it
+# leaves that sidecar as it found it.
 PHASE="${PHASE:-all}"
 CORPUS_HOSTS=$(corpus_hosts)
 if [ "$PHASE" = all ]; then

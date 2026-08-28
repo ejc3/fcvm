@@ -16,7 +16,8 @@ serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive and a load the
 evidence accounts for) and diag/summary.json (reqbench.sh diag; required when
 the cell's guest_dns names a baked resolver or its guest_env is non-empty,
 optional otherwise; when present it must name the run's snapshot generation,
-config, tag, engine, backend and UFFD mode, say passed=true with the sealed
+config, tag, engine, backend and UFFD mode, record uffd_prefetch "off" (null
+on the file backend, which has no serve), say passed=true with the sealed
 bundle intact, list no violations, cover every URL the cell measured and
 carry a load event for each). The index names every file it was generated
 from with its sha256, and carries one cell per run: engine, cpu, memory_mib,
@@ -427,6 +428,25 @@ def summarize_diag(run_dir, diag, cell, measured_urls):
                 f"{run_dir}: diag/summary.json {diag_key}={diag[diag_key]!r} is not the "
                 f"run's {cell_key}={cell[cell_key]!r}; that diag diagnosed something else"
             )
+    # The diag's clones fault the golden's pages, and a UFFD serve with
+    # working-set replay on records those faults into memory.bin.working-set
+    # beside the golden, the file the measured run replays. reqbench.sh diag
+    # serves with --uffd-prefetch off and records "off"; on the file backend
+    # there is no serve and it records null. Anything else, including a
+    # summary from before the field existed, is not evidence that the run
+    # measured the golden's own working set.
+    if "uffd_prefetch" not in diag:
+        raise RunError(
+            f"{run_dir}: diag/summary.json names no uffd_prefetch; a diag that may have "
+            "recorded its renders into the golden's working set is not this run's evidence"
+        )
+    expected = None if diag["backend"] == "file" else "off"
+    if diag["uffd_prefetch"] != expected:
+        raise RunError(
+            f"{run_dir}: diag/summary.json records uffd_prefetch={diag['uffd_prefetch']!r} "
+            f"on the {diag['backend']} backend, not {expected!r}; a diag served with "
+            "working-set replay on recorded its renders into the sidecar the run replays"
+        )
     if diag.get("runtime_bundle_intact") is not True:
         raise RunError(
             f"{run_dir}: diag/summary.json records runtime_bundle_intact="

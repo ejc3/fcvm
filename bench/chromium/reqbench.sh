@@ -1226,6 +1226,11 @@ BACKEND="${BACKEND:-uffd}"
 # copy is fcvm's serve default; minor shares clean pages across clones via
 # UFFDIO_CONTINUE and is the production-lean configuration. Recorded per run.
 UFFD_MODE="${UFFD_MODE:-copy}"
+# The diag phase never serves with replay on (cmd_diag says why), so the value
+# as it arrived is kept apart from the run default: cmd_diag refuses an
+# explicit request for anything but off rather than serving with a knob other
+# than the one asked for.
+UFFD_PREFETCH_REQUESTED="${UFFD_PREFETCH:-}"
 # Replay of recorded fault working sets. PINNED explicitly on the serve line so
 # the sealed record proves the effective state — the 08-13 runs left it to the
 # binary default and an env override could not be excluded, making replay's
@@ -1615,10 +1620,12 @@ PYWD
 diag_write_summary() {
     local teardown_failures="$1" bundle_ok="$2"
     shift 2
-    # On the file backend the mode is "file", the value reqbench.py records
-    # in the run meta (so campaign_summary can bind the two), and the
-    # prefetch knob describes nothing and is recorded as null.
-    local mode="$UFFD_MODE" prefetch="$UFFD_PREFETCH"
+    # The serve this phase started ran with replay off (cmd_diag), and the
+    # summary says so for campaign_summary to hold it to. On the file backend
+    # the mode is "file", the value reqbench.py records in the run meta (so
+    # campaign_summary can bind the two), and there was no serve to carry
+    # the prefetch knob, which is recorded as null.
+    local mode="$UFFD_MODE" prefetch=off
     [ "$BACKEND" = uffd ] || { mode="file"; prefetch=""; }
     local cfg="$DATA_ROOT/snapshots/$TAG/config.json" generation config_sha
     generation=$($SUDO jq -er '.generation_id' "$cfg" 2>/dev/null) \
@@ -1832,6 +1839,19 @@ cmd_diag() {
         uffd|file) ;;
         *) log "diag: unknown BACKEND=$BACKEND (want uffd|file)"; return 2 ;;
     esac
+    # The diag's serve never records a working set. With replay on, the UFFD
+    # server unions every clone's faults into memory.bin.working-set beside
+    # the golden, and the measured run that follows replays that file: its
+    # restores would carry the working set of the diag's renders (every URL,
+    # DIAG_REPS clones each) instead of the golden's own, and a fresh golden
+    # would measure like a reused one. off opens no store
+    # (src/uffd/server.rs, Prefetch::Off): nothing recorded, nothing
+    # replayed, no file. A request for anything else is refused rather than
+    # served with a knob other than the one asked for.
+    if [ -n "$UFFD_PREFETCH_REQUESTED" ] && [ "$UFFD_PREFETCH_REQUESTED" != off ]; then
+        log "diag: UFFD_PREFETCH=$UFFD_PREFETCH_REQUESTED refused: the diag serves with --uffd-prefetch off so its renders are not recorded into the golden's working-set sidecar; unset it or pass off"
+        return 2
+    fi
     # Only the Chromium render carries a network trace; an IP expectation
     # the WebKit phase cannot check is refused rather than passed by default.
     if [ "$ENGINE" = webkit ] && [ -n "$DIAG_EXPECT_IPS" ]; then
@@ -1876,9 +1896,9 @@ cmd_diag() {
     mkdir -p "$RESULTS/diag" "$RESULTS/logs"
     local rc=0 teardown_failures=0
     if [ "$BACKEND" = uffd ]; then
-        log "diag: BACKEND=uffd, starting serve for $TAG (mode=$UFFD_MODE prefetch=$UFFD_PREFETCH)"
+        log "diag: BACKEND=uffd, starting serve for $TAG (mode=$UFFD_MODE prefetch=off: nothing recorded into the golden's working set)"
         start_serve diag "$RESULTS/logs/diag-serve.log" \
-            --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" || return 1
+            --uffd-mode "$UFFD_MODE" --uffd-prefetch off || return 1
     else
         log "diag: BACKEND=file, no UFFD serve, restoring from $TAG directly"
     fi

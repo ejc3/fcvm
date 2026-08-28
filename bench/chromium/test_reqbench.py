@@ -5018,6 +5018,14 @@ exit 1
 echo "$*" >> "$STUB_ARGV"
 case "$1 $2" in
   "snapshot serve")
+      # The real server's working-set contract (src/uffd/server.rs): with
+      # --uffd-prefetch off it opens no store and writes nothing; otherwise
+      # (on, or the flag absent, which the binary defaults to on) it
+      # publishes the union of its clones' faults to memory.bin.working-set
+      # beside the snapshot it serves ($3).
+      prefetch=on; prev=""
+      for a in "$@"; do [ "$prev" = --uffd-prefetch ] && prefetch="$a"; prev="$a"; done
+      [ "$prefetch" = off ] || : > "$(dirname "$STATE_DIR")/snapshots/$3/memory.bin.working-set"
       echo "Serve PID: $$"; echo "Waiting for VMs"
       sleep 30 & sl=$!
       trap 'echo "torn down serve" >> "$STUB_TEARDOWN_LOG"; kill $sl 2>/dev/null; exit 0' TERM
@@ -5180,7 +5188,6 @@ exec __PYTHON__ "$@"
             ENGINE=engine,
             BACKEND=backend,
             UFFD_MODE="minor",
-            UFFD_PREFETCH="on",
             DIAG_REPS=reps,
             DIAG_EXPECT_IPS=expect_ips,
             DIAG_MAX_LOAD_MS=max_load_ms,
@@ -5207,6 +5214,12 @@ exec __PYTHON__ "$@"
 
     def _diag_teardowns(self, env):
         return self._read_if_exists(env["STUB_TEARDOWN_LOG"]).splitlines()
+
+    def _diag_sidecar(self, env):
+        """Where the fcvm stub's serve publishes a working set for the
+        snapshot under test, as the real server would beside the golden."""
+        return os.path.join(os.path.dirname(env["STATE_DIR"]), "snapshots",
+                            "tag-under-test", "memory.bin.working-set")
 
     def test_diag_renders_each_url_on_its_own_clone_and_summarises_the_traces(self):
         """One clone per (URL, rep), one traced render each, torn down each
@@ -5244,8 +5257,8 @@ exec __PYTHON__ "$@"
                 self.assertTrue(os.path.exists(os.path.join(diag_dir, stem + ".trace.json")),
                                 f"{stem}: no trace was written")
             argv = self._read_if_exists(env["STUB_ARGV"])
-            self.assertIn("snapshot serve tag-under-test --uffd-mode minor --uffd-prefetch on",
-                          argv, "the serve did not carry the run's backend knobs")
+            self.assertIn("snapshot serve tag-under-test --uffd-mode minor --uffd-prefetch off",
+                          argv, "the serve did not carry the run's UFFD mode with replay off")
             self.assertEqual(argv.count("snapshot run --pid "), 4, argv)
             driver = self._read_if_exists(env["STUB_DRIVER_ARGV"]).splitlines()
             self.assertEqual(len(driver), 4, driver)
@@ -5424,6 +5437,71 @@ exec __PYTHON__ "$@"
             self.assertEqual(summary["uffd_mode"], "file")
             self.assertIsNone(summary["uffd_prefetch"])
             self.assertEqual(os.listdir(state_dir), [])
+
+    def test_diag_serves_with_working_set_replay_off_and_leaves_no_sidecar(self):
+        """The diag's clones fault the golden's pages. Served with replay on,
+        the UFFD server records those faults and publishes their union to
+        memory.bin.working-set beside the golden; the measured run that
+        follows replays that file, so it would restore the working set of the
+        diag's renders instead of the golden's own, and a fresh golden would
+        measure like a reused one. The diag serves with --uffd-prefetch off,
+        which opens no store (src/uffd/server.rs, Prefetch::Off: nothing
+        recorded, nothing replayed, no file), and records "off" in its
+        summary for campaign_summary to hold it to.
+
+        The sidecar check is at the harness level: the fcvm stub writes the
+        sidecar whenever its serve line does not say off, as the real server
+        does, so an absent sidecar here proves the flag the diag put on the
+        serve line, not the server. The end-to-end proof needs a live serve:
+        on a bench box with a golden that has no sidecar yet, `make
+        bench-chromium-request-diag DIAG_REPS=1`, then
+        `test ! -e /mnt/fcvm-btrfs/snapshots/<TAG>/memory.bin.working-set`.
+
+        Watched red 2026-08-28 at 8cd77713: the serve line said
+        `--uffd-prefetch on` (reqbench.sh's run default), the summary
+        recorded "on", and the stub's sidecar existed after the phase.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            self.assertNotIn("UFFD_PREFETCH", env)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            argv = self._read_if_exists(env["STUB_ARGV"])
+            self.assertIn("snapshot serve tag-under-test --uffd-mode minor --uffd-prefetch off",
+                          argv)
+            self.assertNotIn("--uffd-prefetch on", argv)
+            self.assertEqual(self._diag_summary(env)["uffd_prefetch"], "off")
+            self.assertFalse(os.path.exists(self._diag_sidecar(env)),
+                             "the diag's serve recorded a working set beside the golden")
+
+    def test_diag_refuses_a_request_to_serve_with_working_set_replay_on(self):
+        """UFFD_PREFETCH is a run knob; the diag's serve is always off. A
+        request for anything else is refused before the serve, the generation
+        lock and the hugepage pool, not served with a different knob than the
+        one asked for; an explicit off is accepted.
+
+        Watched red 2026-08-28 at 8cd77713: `AssertionError: 0 != 2`, the
+        diag served with `--uffd-prefetch on` and passed.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", UFFD_PREFETCH="on")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("UFFD_PREFETCH", result.stderr)
+            self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]),
+                             "the serve started before the knob was refused")
+            self.assertFalse(os.path.exists(
+                os.path.join(env["RESULTS"], "diag", "summary.json")))
+            self.assertFalse(os.path.exists(self._diag_sidecar(env)))
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", UFFD_PREFETCH="off")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            self.assertIn("--uffd-prefetch off", self._read_if_exists(env["STUB_ARGV"]))
+            self.assertEqual(self._diag_summary(env)["uffd_prefetch"], "off")
+            self.assertFalse(os.path.exists(self._diag_sidecar(env)))
 
     def test_diag_refuses_a_rep_count_or_limit_that_is_not_a_positive_integer(self):
         for knob, value in (("DIAG_REPS", "0"), ("DIAG_REPS", "two"),

@@ -59,8 +59,13 @@ The host control takes the same variable directly:
 
 `bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
 answers what holds a page's load event inside a restored clone, on the
-golden the run uses and with the run's serve setup (`BACKEND=`, `UFFD_MODE=`,
-`UFFD_PREFETCH=`, `TAG=`), without a measured arm. One clone per URL in
+golden the run uses, on the run's backend and UFFD mode (`BACKEND=`,
+`UFFD_MODE=`, `TAG=`), without a measured arm. Its serve always runs
+`--uffd-prefetch off`, and a `UFFD_PREFETCH=` set to anything else is
+refused: with replay on, the server would record the diag's renders into
+`memory.bin.working-set` beside the golden, the file the measured run
+replays, so the run would restore the diag's working set instead of the
+golden's own. One clone per URL in
 `DIAG_URLS=` (comma-separated; default the run's URL) times `DIAG_REPS=`
 (default 3): clone, one render, teardown. On Chromium the render is
 cdpdrive.py with `--net-trace`, which the measured arms never send; WebKit
@@ -68,7 +73,8 @@ renders through wddrive without a trace. Each render's record and trace land
 under `$RESULTS/diag/`, and `summary.json` there carries, per URL, the render
 count, the slowest load event, the most requests still open at the load
 event, every remote IP with its request count and every failure text, plus a
-violations list, `passed`, `runtime_bundle_intact`, and the
+violations list, `passed`, `runtime_bundle_intact`, `uffd_prefetch` (`"off"`;
+`null` on the file backend, which has no serve), and the
 `snapshot_generation_id` and `snapshot_config_sha256` of the snapshot it
 diagnosed. The phase exits non-zero, and `passed` is false, on any remote IP
 outside `DIAG_EXPECT_IPS=` (comma-separated, when set), a trace naming no
@@ -85,10 +91,14 @@ runs it after the verify that follows the golden, with every corpus URL,
 `DIAG_EXPECT_IPS=10.0.2.2` on Chromium and `DIAG_MAX_LOAD_MS` defaulting to
 15000, and refuses to measure when it fails; `DIAG_ONLY=1` stops the
 campaign after golden, verify and diag, for a throwaway golden round, and
-`DIAG_REPS=` passes through to the diag. campaign_summary.py refuses a
-corpus run without its `diag/summary.json`, and a summary that names another
-snapshot generation, config, tag, engine, backend or UFFD mode than the
-run's analysis cell.
+`DIAG_REPS=` passes through to the diag. The campaign hands the diag
+`UFFD_PREFETCH=off` whatever the measured run's setting, so the diag's
+renders (every corpus URL, three clones each) do not warm the sidecar the run
+replays and a fresh golden still measures as one. campaign_summary.py
+refuses a corpus run without its `diag/summary.json`, a summary that names
+another snapshot generation, config, tag, engine, backend or UFFD mode than
+the run's analysis cell, and one whose `uffd_prefetch` is not `"off"` (`null`
+on the file backend), including a summary from before the field existed.
 
 `verify`, `diag` and `run` deliberately have NO build dependency: reqbench.sh
 seals fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and

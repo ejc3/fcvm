@@ -300,7 +300,7 @@ help:
 	@echo "  bench-chromium-request-verify  Prove CDP hops on a restored clone (TAG=)"
 	@echo "  bench-chromium-request-run     Measured run (TAG=, BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, WARMUP=, ARMS=, RESULTS=)"
 	@echo "  bench-chromium-request-all     Full chain: image, golden, verify, run"
-	@echo "  bench-chromium-request-diag    In-guest load diagnostics, one traced render per clone (TAG=, BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
+	@echo "  bench-chromium-request-diag    In-guest load diagnostics, one traced render per clone, serve always --uffd-prefetch off (TAG=, BACKEND=, UFFD_MODE=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
 	@echo "  bench-webkit-request-diag      WebKit twin of bench-chromium-request-diag (TAG=, BACKEND=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
 	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=)"
 	@echo "  bench-stop                    Stop all bench processes, reap stray VMs, restore dnsmasq"

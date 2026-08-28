@@ -1490,8 +1490,9 @@ class DiagPhase(unittest.TestCase):
 
     def test_run_diag_hands_the_corpus_and_the_replay_answer_to_the_diag_target(self):
         """Every corpus URL, the replay's answer as the only expected remote
-        IP, the 15 s limit, this run's RESULTS and the run's backend knobs,
-        to the engine's diag target; the summary it leaves must say passed.
+        IP, the 15 s limit, this run's RESULTS and the run's backend and
+        UFFD mode, to the engine's diag target; the summary it leaves must
+        say passed.
 
         Watched red 2026-08-28 at 55d6fb7d: `bash: line N: run_diag: command
         not found` (the helpers block has no run_diag) after the knob
@@ -1514,12 +1515,62 @@ class DiagPhase(unittest.TestCase):
                              "the diag's records land outside the run directory")
             self.assertEqual(seen.get("TAG"), "cb-req-corpus")
             self.assertEqual(seen.get("ENGINE"), "chromium")
-            for knob, want in (("BACKEND", "uffd"), ("UFFD_MODE", "minor"),
-                               ("UFFD_PREFETCH", "on")):
+            for knob, want in (("BACKEND", "uffd"), ("UFFD_MODE", "minor")):
                 self.assertEqual(seen.get(knob), want,
                                  f"the diag does not run on the measured run's {knob}")
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-diag", handle.read())
+
+    RUN_BLOCK = re.compile(r'(TAG="\$TAG" URL="\$URLS" BACKEND=.*?\|\| run_rc=\$\?)', re.S)
+
+    def test_the_diag_serves_with_working_set_replay_off_whatever_the_run_will_use(self):
+        """A UFFD serve with working-set replay on records every clone's
+        faults into memory.bin.working-set beside the golden, and the measured
+        run replays that file. The diag renders every corpus URL on DIAG_REPS
+        clones each, so a diag served with replay on would leave the run
+        replaying the diag's working set rather than the golden's own, and a
+        fresh golden would measure like a reused one. --uffd-prefetch off opens
+        no working-set store (src/uffd/server.rs, Prefetch::Off): nothing
+        recorded, nothing replayed, no file. run_diag hands the diag target
+        UFFD_PREFETCH=off whatever the campaign was started with, as the shell
+        variable and in the exported environment a sub-make would otherwise
+        inherit, while the measured run's sub-make still receives the
+        campaign's value.
+
+        Watched red 2026-08-28 at 8cd77713: the diag's make saw
+        UFFD_PREFETCH=on.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _results = self._fakes(tmp)
+            for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS", "STALL_MAX_MS"):
+                env.pop(key, None)
+            # As `UFFD_PREFETCH=on make bench-chromium-corpus` leaves it:
+            # exported, so a sub-make inherits it unless the call overrides.
+            env["UFFD_PREFETCH"] = "on"
+            env["MAKE_DIAG_JSON"] = self._diag_summary(urls)
+            result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("DIAGNOSED", result.stdout)
+            seen = self._make_env(env)
+            self.assertEqual(seen.get("UFFD_PREFETCH"), "off",
+                             "the diag's serve would record its renders into the "
+                             "golden's working set")
+            self.assertEqual(seen.get("BACKEND"), "uffd")
+            self.assertEqual(seen.get("UFFD_MODE"), "minor")
+            body = campaign()
+            run = self.RUN_BLOCK.search(body)
+            self.assertIsNotNone(run, "the measured run invocation is gone")
+            stall = re.search(r'^STALL_MAX_MS="\$\{STALL_MAX_MS:-\d+\}"$', body, re.M)
+            self.assertIsNotNone(stall, "the campaign sets no STALL_MAX_MS default")
+            script = (self._prelude(urls) + "ARMS=noop,cdp\nREPS=1\nWARMUP=1\n"
+                      f"{stall.group(0)}\nrun_rc=0\n{run.group(1)}\n"
+                      'echo "run_rc=$run_rc"\n')
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("run_rc=0", result.stdout)
+            self.assertEqual(self._make_env(env).get("UFFD_PREFETCH"), "on",
+                             "the diag's pin leaked into the measured run")
 
     def test_the_webkit_diag_is_not_asked_for_addresses_it_cannot_see(self):
         """WebKit renders carry no network trace, and reqbench refuses a

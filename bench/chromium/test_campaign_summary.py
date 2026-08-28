@@ -151,13 +151,15 @@ CONFIG_SHA256 = SEAL["snapshot_config_sha256"]
 def diag_summary(urls=("https://example.com/",), passed=True, violations=(),
                  max_load_ms=812.5, engine="chromium", **identity):
     """diag/summary.json in the shape reqbench.sh diag writes. identity
-    overrides the fields campaign_summary binds to the cell."""
+    overrides the fields campaign_summary binds to the cell, and
+    uffd_prefetch, which it holds to "off" (the diag's serve never records
+    a working set; null on the file backend, which has no serve)."""
     return {
         "engine": engine,
         "tag": identity.get("tag", "cb-req-corpus"),
         "backend": identity.get("backend", "uffd"),
         "uffd_mode": identity.get("uffd_mode", "minor"),
-        "uffd_prefetch": "on",
+        "uffd_prefetch": identity.get("uffd_prefetch", "off"),
         "snapshot_generation_id": identity.get("snapshot_generation_id", GENERATION_ID),
         "snapshot_config_sha256": identity.get("snapshot_config_sha256", CONFIG_SHA256),
         "runtime_bundle_intact": identity.get("runtime_bundle_intact", True),
@@ -705,6 +707,55 @@ class CampaignSummary(unittest.TestCase):
             rc, text = self._summarize(out, [run_dir])
             self.assertNotEqual(rc, 0, text)
             self.assertIn("runtime_bundle_intact", text)
+
+    def test_a_diag_whose_serve_could_have_recorded_its_renders_is_refused(self):
+        """The diag's clones fault the golden's pages. A UFFD serve with
+        working-set replay on records those faults into memory.bin.working-set
+        beside the golden, and the measured run replays that file, so the run
+        would restore the diag's working set instead of the golden's own. The
+        diag serves with --uffd-prefetch off and records "off" (null on the
+        file backend, which has no serve to carry the knob); a summary saying
+        anything else, or one from before the field existed, is not evidence
+        that the run measured the golden's own working set.
+
+        Watched red 2026-08-28 at 8cd77713: every refused case was indexed
+        (rc 0, `AssertionError: 0 == 0`).
+        """
+        file_cell = {"backend": "file", "uffd_mode": "file"}
+        missing = diag_summary()
+        del missing["uffd_prefetch"]
+        cases = (
+            ("on", diag_summary(uffd_prefetch="on"), None),
+            ("null on the uffd backend", diag_summary(uffd_prefetch=None), None),
+            ("missing", missing, None),
+            ("on on the file backend",
+             diag_summary(backend="file", uffd_mode="file", uffd_prefetch="on"), file_cell),
+            ("off on the file backend, which had no serve",
+             diag_summary(backend="file", uffd_mode="file", uffd_prefetch="off"), file_cell),
+        )
+        for label, diag, cell in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, diag=diag, cell_overrides=cell)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{label}: indexed")
+                self.assertFalse(os.path.exists(out))
+                self.assertIn("uffd_prefetch", text)
+        # The two shapes the diag writes are the two that index.
+        for label, diag, cell in (
+            ("off on uffd", diag_summary(), None),
+            ("null on file",
+             diag_summary(backend="file", uffd_mode="file", uffd_prefetch=None), file_cell),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, diag=diag, cell_overrides=cell)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertEqual(rc, 0, text)
+                with open(out) as handle:
+                    self.assertIs(json.load(handle)["cells"][0]["diag"]["diag_passed"], True)
 
     def test_a_resolver_rule_cell_needs_its_diag(self):
         """A golden with GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> resolves through
