@@ -556,6 +556,33 @@ class CampaignSummary(unittest.TestCase):
             self.assertFalse(os.path.exists(out), "the stale index survived")
             self.assertIn("removed", text)
 
+    def test_dns_evidence_that_is_not_a_json_object_refuses(self):
+        """A dns-evidence.json holding valid JSON that is not an object ([]
+        here) was read as a missing verdict by the inline guard on the
+        verdict line, so the refusal said `verdict is None, not 'clean'`
+        about a file that has no verdict field at all, and every .get()
+        after that line relied on the same guard. Non-object evidence is now
+        rejected first, by name.
+
+        RED BEFORE THE FIX: AssertionError: 'dns-evidence.json is not a JSON
+        object' not found in "REFUSED: no index written\n  - .../run:
+        dns-evidence.json verdict is None, not 'clean'\n  removed stale index
+        .../campaign-x-summary.json\n"
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(paths["dns_evidence"], "w") as handle:
+                handle.write("[]\n")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out), "the stale index survived")
+            self.assertIn(run_dir, text)
+            self.assertIn("dns-evidence.json is not a JSON object", text)
+
     def test_the_index_cannot_alias_an_input(self):
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "run")

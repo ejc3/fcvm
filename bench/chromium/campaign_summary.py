@@ -114,7 +114,11 @@ def positive_int(value):
 
 def check_evidence(run_dir, evidence, sources):
     """Hold a clean verdict to the files it cites; raise RunError otherwise."""
-    verdict = evidence.get("verdict") if isinstance(evidence, dict) else None
+    if not isinstance(evidence, dict):
+        # Valid JSON that is not an object ([] for one) has no verdict to
+        # read; refusing it here keeps every .get() below on a dict.
+        raise RunError(f"{run_dir}: dns-evidence.json is not a JSON object")
+    verdict = evidence.get("verdict")
     if verdict != "clean":
         raise RunError(f"{run_dir}: dns-evidence.json verdict is {verdict!r}, not 'clean'")
     if not positive_int(evidence.get("samples")):
