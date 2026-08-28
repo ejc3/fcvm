@@ -87,15 +87,17 @@ say() { printf '\n=== %s\n' "$*"; }
 #      corpus URL fetches through that resolver: once before the settle wait,
 #      once immediately before the measured run, once after it. Each bracket
 #      keeps its evidence as $RESULTS/verify-dns-<stage>.json.
-#   2. a sampler names the owner of 127.0.0.1:53 and the dnsmasq state every
-#      DNS_SAMPLE_INTERVAL seconds while the run is in flight
-#      ($RESULTS/dns-owner.log).
+#   2. a sampler names the owner of 127.0.0.1:53, the dnsmasq state and the
+#      1-min load every DNS_SAMPLE_INTERVAL seconds while the run is in
+#      flight ($RESULTS/dns-owner.log). The quiet gate reads the load once,
+#      before the run; the samples are what says it stayed quiet.
 #   3. $RESULTS/dns-evidence.json ties them together with the replay server's
-#      own DNS and access logs (sha256) and a verdict: "clean" only when all
-#      three brackets are present and passed, every sample names this
-#      campaign's corpus_serve with dnsmasq inactive, the sampler lived until
-#      the run ended, both replay logs exist, and dnsmasq is inactive after
-#      the clone restores.
+#      own DNS and access logs (sha256), the maximum 1-min load over the
+#      samples (load_max_1min), and a verdict: "clean" only when all three
+#      brackets are present and passed, every sample names this campaign's
+#      corpus_serve with dnsmasq inactive, the sampler lived until the run
+#      ended, both replay logs exist, and dnsmasq is inactive after the clone
+#      restores.
 engine_target() {
     # $1 = golden | verify | run
     printf 'bench-%s-request-%s' "$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)" "$1"
@@ -144,22 +146,30 @@ run_verify() {
 }
 
 DNS_SAMPLE_INTERVAL="${DNS_SAMPLE_INTERVAL:-10}"
+# The same override reqbench.sh's quiet gate takes; tests point it at a file.
+LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 SAMPLER_PID=""
 SAMPLER_ALIVE_AT_STOP=""
 
 dns_owner_sample() {
-    # One line: "<utc ts> owner_pid=<pid|none> dnsmasq=<state>". The local
-    # address is matched exactly: systemd-resolved (127.0.0.53) and dnsmasq's
-    # per-interface listeners share the port. sudo is what makes ss show the
-    # pid behind a root-owned socket; -n so a missing grant fails the sample
-    # instead of hanging the sampler on a prompt. A sample that cannot be
-    # taken returns 1 and ends the sampler (below), which the evidence
-    # records as unclean.
-    local listing owner state
+    # One line: "<utc ts> owner_pid=<pid|none> dnsmasq=<state> load1=<1-min
+    # load>". The local address is matched exactly: systemd-resolved
+    # (127.0.0.53) and dnsmasq's per-interface listeners share the port. sudo
+    # is what makes ss show the pid behind a root-owned socket; -n so a
+    # missing grant fails the sample instead of hanging the sampler on a
+    # prompt. The load is the first field of LOADAVG_FILE and must be a
+    # number: a column that silently went missing would read as a quiet
+    # box. A sample that cannot be taken returns 1 and ends the sampler
+    # (below), which the evidence records as unclean.
+    local listing owner state load1
     listing=$(sudo -n ss -lnup 'sport = :53' 2>/dev/null) || return 1
     owner=$(awk '$4 == "127.0.0.1:53" && match($0, /pid=[0-9]+/) { print substr($0, RSTART + 4, RLENGTH - 4); exit }' <<<"$listing")
     state=$(systemctl is-active dnsmasq 2>/dev/null) || state="${state:-unknown}"
-    printf '%s owner_pid=%s dnsmasq=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${owner:-none}" "$state"
+    load1=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>/dev/null) || return 1
+    case "$load1" in
+        '' | *[!0-9.]* | .* | *. | *.*.*) return 1 ;;
+    esac
+    printf '%s owner_pid=%s dnsmasq=%s load1=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${owner:-none}" "$state" "$load1"
 }
 
 dns_owner_sampler() {
@@ -196,6 +206,19 @@ dns_first_mismatch() {
     awk -v pid="$2" '$2 != "owner_pid=" pid || $3 != "dnsmasq=inactive" { print; exit }' "$1"
 }
 
+dns_load_stats() {
+    # $1 = sample log. Prints "<count> <max>": how many samples carry a
+    # numeric load1= field and the largest value among them, as the sample
+    # wrote it (a JSON number as-is), or "0 null" when none does.
+    awk '{
+        for (i = 1; i <= NF; i++) {
+            if (substr($i, 1, 6) != "load1=") continue
+            v = substr($i, 7)
+            if (v ~ /^[0-9]+(\.[0-9]+)?$/) { n++; if (n == 1 || v + 0 > max + 0) max = v }
+        }
+    } END { printf "%d %s\n", n, (n ? max : "null") }' "$1"
+}
+
 sha256_or_empty() {
     if [ -f "$1" ]; then sha256sum "$1" | cut -d' ' -f1; fi
 }
@@ -204,18 +227,23 @@ write_dns_evidence() {
     # $1 = clean | unclean from the verify brackets, $2 = optional reason.
     # Everything checked here can only lower the verdict, never lift it:
     # the samples and whether the sampler lived to the stop, the dnsmasq
-    # state, the three bracket files and the two replay logs. Prints the
-    # final verdict; a verdict that could not be written is unclean and the
-    # function returns 1.
+    # state, the three bracket files and the two replay logs. The load
+    # maximum is reported, not judged: the run driver's own gate refused a
+    # busy box at the start, and the record is what says how busy it got.
+    # Prints the final verdict; a verdict that could not be written is
+    # unclean and the function returns 1.
     local verdict="$1" reason="${2:-}" log="$RESULTS/dns-owner.log"
     local out="$RESULTS/dns-evidence.json"
     local samples=0 first_mismatch="" before=false after=false after_state f
-    local sampler_alive=false
+    local sampler_alive=false load_stats load_samples=0 load_max=null
     [ "$DNSMASQ_WAS_ACTIVE" = yes ] && before=true
     [ "$SAMPLER_ALIVE_AT_STOP" = yes ] && sampler_alive=true
     if [ -s "$log" ]; then
         samples=$(wc -l <"$log")
         first_mismatch=$(dns_first_mismatch "$log" "$SERVE_PID")
+        load_stats=$(dns_load_stats "$log")
+        load_samples=${load_stats%% *}
+        load_max=${load_stats##* }
     fi
     if [ "$samples" -eq 0 ]; then
         verdict=unclean; reason="${reason:-no 127.0.0.1:53 owner samples were taken}"
@@ -250,6 +278,7 @@ write_dns_evidence() {
     if ! jq -n --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
         --arg after_state "$after_state" --argjson sampler_alive "$sampler_alive" \
         --argjson samples "$samples" --argjson interval "$DNS_SAMPLE_INTERVAL" \
+        --argjson load_max "$load_max" --argjson load_samples "$load_samples" \
         --arg first "$first_mismatch" --arg reason "$reason" --arg owner_log "$log" \
         --arg dns_sha "$(sha256_or_empty "$RESULTS/corpus-dns.log")" \
         --arg access_sha "$(sha256_or_empty "$RESULTS/corpus-access.log")" \
@@ -259,6 +288,7 @@ write_dns_evidence() {
           dnsmasq_state_after_restore: $after_state,
           sampler_alive_at_stop: $sampler_alive, samples: $samples,
           sample_interval_s: $interval, owner_log: $owner_log,
+          load_max_1min: $load_max, load_samples: $load_samples,
           first_mismatch: (if $first == "" then null else $first end),
           verify_files: $ARGS.positional,
           corpus_dns_log_sha256: (if $dns_sha == "" then null else $dns_sha end),
@@ -311,7 +341,7 @@ FCVM_SHA=$(sha256sum "$FCVM_BIN" | cut -d" " -f1)
 # --- preflight -------------------------------------------------------------
 # The run driver enforces its own quiet gate and would void the record anyway;
 # failing here costs seconds instead of the golden's minutes.
-load1=$(awk '{print $1}' /proc/loadavg)
+load1=$(awk '{print $1}' "$LOADAVG_FILE")
 if awk -v l="$load1" 'BEGIN{exit !(l > 2.0)}'; then
     echo "BLOCKED: 1-min load $load1 exceeds the quiet gate (2.0)" >&2
     exit 2
@@ -508,7 +538,7 @@ fi
 # the wait is bounded so a genuinely busy box still fails rather than hanging.
 settle_deadline=$(( $(date +%s) + 900 ))
 while :; do
-    load1=$(awk '{print $1}' /proc/loadavg)
+    load1=$(awk '{print $1}' "$LOADAVG_FILE")
     if awk -v l="$load1" 'BEGIN{exit !(l < 1.5)}'; then break; fi
     if [ "$(date +%s)" -ge "$settle_deadline" ]; then
         echo "BLOCKED: load stayed at $load1 for 15 min; refusing to measure on a busy box" >&2

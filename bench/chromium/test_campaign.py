@@ -514,6 +514,10 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         logs = os.path.join(tmp, "logs")
         os.makedirs(results, exist_ok=True)
         os.makedirs(logs, exist_ok=True)
+        # /proc/loadavg's shape, at a value the real box will not show, so a
+        # sampler that read the real file instead of LOADAVG_FILE is caught.
+        loadavg = os.path.join(tmp, "loadavg")
+        self._set_load(loadavg, "0.42")
         env = dict(os.environ)
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
@@ -522,10 +526,16 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             SS_CALLS=os.path.join(tmp, "ss-calls"),
             SS_OWNER="4242", SS_OTHER="999",
             FAKE_DNSMASQ_STATE=dnsmasq,
+            LOADAVG_FILE=loadavg,
             RESULTS=results, LOGDIR=logs, REPO=tmp, TAG="cb-req-corpus",
             ENGINE="chromium",
         )
         return env, results
+
+    @staticmethod
+    def _set_load(loadavg, load1):
+        with open(loadavg, "w") as handle:
+            handle.write(f"{load1} 0.30 0.20 1/100 1234\n")
 
     def _make_env(self, env):
         seen = {}
@@ -883,7 +893,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(os.path.join(results, "dns-owner.log")) as handle:
                 lines = handle.read().splitlines()
             self.assertEqual(lines[2], evidence["first_mismatch"])
-            self.assertRegex(lines[0], r"^\S+ owner_pid=4242 dnsmasq=inactive$")
+            self.assertRegex(lines[0], r"^\S+ owner_pid=4242 dnsmasq=inactive load1=0\.42$")
 
     def test_a_steady_owner_with_dnsmasq_down_is_clean(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1018,6 +1028,101 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                                  sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log"]
                                         + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
                                  "a partial evidence file or temp file was left behind")
+
+    def test_every_sample_carries_the_one_minute_load(self):
+        """The quiet gate reads the load once, before the run, and nothing
+        recorded it while clones were being measured, so a build or a stray
+        process that arrived mid-run left no evidence in the record. Each
+        sample now ends in load1=<first field of LOADAVG_FILE>, read from
+        /proc/loadavg by default, and the evidence reports the maximum over
+        the samples as load_max_1min with load_samples counting them.
+
+        RED BEFORE THE FIX: AssertionError: Regex didn't match:
+        '^\\S+ owner_pid=4242 dnsmasq=inactive load1=0\\.42$' not found in
+        '2026-08-28T..Z owner_pid=4242 dnsmasq=inactive', then
+        KeyError: 'load_max_1min'.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            raise_load = (f'sleep 0.3\nprintf "1.87 0.30 0.20 1/100 1234\\n" '
+                          f'> "{env["LOADAVG_FILE"]}"\nsleep 0.3\n')
+            evidence, _ = self._sample(env, results, mid_run=raise_load)
+            with open(os.path.join(results, "dns-owner.log")) as handle:
+                lines = handle.read().splitlines()
+            self.assertGreaterEqual(len(lines), 4)
+            self.assertRegex(lines[0], r"^\S+ owner_pid=4242 dnsmasq=inactive load1=0\.42$")
+            self.assertRegex(lines[-1], r"^\S+ owner_pid=4242 dnsmasq=inactive load1=1\.87$")
+            for line in lines:
+                self.assertRegex(line, r" load1=(0\.42|1\.87)$")
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            self.assertEqual(evidence["load_max_1min"], 1.87)
+            self.assertEqual(evidence["load_samples"], len(lines))
+            self.assertEqual(evidence["samples"], len(lines))
+
+    def test_a_sample_whose_load_cannot_be_read_ends_the_sampler(self):
+        """A load column that silently went missing would read as a quiet
+        box. An unreadable LOADAVG_FILE fails the sample, which ends the
+        sampler, which the evidence records as unclean.
+
+        RED BEFORE THE FIX: AssertionError: 'unclean' != 'clean'.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            cut_load = f'rm -f "{env["LOADAVG_FILE"]}"\nsleep 0.3\n'
+            evidence, _ = self._sample(env, results, mid_run=cut_load)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIs(evidence["sampler_alive_at_stop"], False)
+            self.assertIn("sampler", evidence["reason"])
+            with open(os.path.join(results, "dns-owner.log")) as handle:
+                lines = handle.read().splitlines()
+            for line in lines:
+                self.assertRegex(line, r" load1=0\.42$")
+
+    def test_the_evidence_reports_the_maximum_load_over_the_samples(self):
+        """write_dns_evidence over a fixture owner log: the maximum of the
+        load1 column as a number, and the count of samples carrying one. An
+        owner log from before the column existed yields null and 0 rather
+        than a verdict change; the sampler, not the evidence, is what
+        guarantees the column is present.
+
+        RED BEFORE THE FIX: KeyError: 'load_max_1min'.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results)
+            with open(os.path.join(results, "dns-owner.log"), "w") as handle:
+                handle.write(
+                    "2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive load1=0.31\n"
+                    "2026-08-28T00:00:10Z owner_pid=4242 dnsmasq=inactive load1=1.87\n"
+                    "2026-08-28T00:00:20Z owner_pid=4242 dnsmasq=inactive load1=0.90\n")
+            script = (f'set -u\n{self._helpers()}\nRESULTS="{results}"\n'
+                      'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\nSAMPLER_ALIVE_AT_STOP=yes\n'
+                      'write_dns_evidence clean\n')
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(os.path.join(results, "dns-evidence.json")) as handle:
+                evidence = json.load(handle)
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            self.assertEqual(evidence["load_max_1min"], 1.87)
+            self.assertIsInstance(evidence["load_max_1min"], float)
+            self.assertEqual(evidence["load_samples"], 3)
+            self.assertEqual(evidence["samples"], 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results)
+            with open(os.path.join(results, "dns-owner.log"), "w") as handle:
+                handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n" * 2)
+            script = (f'set -u\n{self._helpers()}\nRESULTS="{results}"\n'
+                      'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\nSAMPLER_ALIVE_AT_STOP=yes\n'
+                      'write_dns_evidence clean\n')
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(os.path.join(results, "dns-evidence.json")) as handle:
+                evidence = json.load(handle)
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            self.assertIsNone(evidence["load_max_1min"])
+            self.assertEqual(evidence["load_samples"], 0)
+            self.assertEqual(evidence["samples"], 2)
 
     def test_a_bracket_failure_cannot_be_lifted_by_clean_samples(self):
         with tempfile.TemporaryDirectory() as tmp:

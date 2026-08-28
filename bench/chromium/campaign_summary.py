@@ -11,8 +11,10 @@ optional otherwise; when present its verdict must be "clean" and every file it
 cites must be present and agree with it) and diag/summary.json (optional). The
 index names every file it was generated from with its sha256, and carries one
 cell per run: engine, cpu, memory_mib, guest_dns, the seal identity,
-publishable, stall_gate_passed, dns_verdict, the headline median blocking_ms
-per arm with its CI, and the diag summary when there is one.
+publishable, stall_gate_passed, dns_verdict, load_max_1min (the maximum 1-min
+load the campaign's sampler saw during the measured run, when the evidence
+records it), the headline median blocking_ms per arm with its CI, and the
+diag summary when there is one.
 
 The publication rule (REVIEW.md) is to quote only from sealed runs that passed
 their gates and were never withdrawn, and publishable=true alone proves none
@@ -295,11 +297,16 @@ def load_cell(run_dir):
         )
 
     dns_verdict = None
+    load_max_1min = None
     evidence_path = os.path.join(run_dir, "dns-evidence.json")
     if os.path.isfile(evidence_path):
         evidence = sources.read_json(evidence_path)
         check_evidence(run_dir, evidence, sources)
         dns_verdict = evidence["verdict"]
+        # Reported, not gated: the run driver refused a busy box at the
+        # start, and evidence from before the sampler carried the load
+        # column has no value to copy.
+        load_max_1min = evidence.get("load_max_1min")
     elif cell["guest_dns"] is not None:
         # A guest that resolved through a baked resolver is a campaign run;
         # only the bracket evidence says the resolver held for the whole
@@ -342,6 +349,7 @@ def load_cell(run_dir):
         "publishable": True,
         "stall_gate_passed": True,
         "dns_verdict": dns_verdict,
+        "load_max_1min": load_max_1min,
         "headline": headline,
         "diag": diag,
     }, sources.entries

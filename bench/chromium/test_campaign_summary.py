@@ -154,6 +154,7 @@ def write_run(
     stall_max_ms=15000,
     stall_evaluated=404,
     samples=12,
+    load_max_1min=0.42,
     evidence_overrides=None,
     cell_overrides=None,
     analysis_overrides=None,
@@ -167,6 +168,9 @@ def write_run(
     names three passing verify brackets, an owner log with `samples` lines
     and the two replay logs with their real sha256, the way
     corpus_campaign.sh writes them; evidence_overrides rewrites fields on top.
+    load_max_1min is the 1-min load the campaign's sampler recorded, carried
+    on every owner line and reported in the evidence; None writes an owner
+    log and evidence from before the sampler recorded it.
     The cell carries SEAL; cell_overrides rewrites cell fields (a None value
     removes the field) and analysis_overrides rewrites top-level fields.
     withdrawn=<reason> writes a WITHDRAWN marker whose first line is the
@@ -232,9 +236,11 @@ def write_run(
             paths[name] = log_path
             hashes[name] = sha256_file(log_path)
         owner_log = os.path.join(run_dir, "dns-owner.log")
+        load_column = "" if load_max_1min is None else f" load1={load_max_1min}"
         with open(owner_log, "w") as handle:
             handle.write(
-                "2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n" * samples
+                f"2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive{load_column}\n"
+                * samples
             )
         paths["owner_log"] = owner_log
         evidence = {
@@ -253,6 +259,9 @@ def write_run(
             "reason": None,
             "verdict": dns_verdict,
         }
+        if load_max_1min is not None:
+            evidence["load_max_1min"] = load_max_1min
+            evidence["load_samples"] = samples
         evidence.update(evidence_overrides or {})
         paths["dns_evidence"] = os.path.join(run_dir, "dns-evidence.json")
         with open(paths["dns_evidence"], "w") as handle:
@@ -406,6 +415,34 @@ class CampaignSummary(unittest.TestCase):
         self.assertIsNone(cell["dns_verdict"])
         self.assertIsNone(cell["guest_dns"])
         self.assertIsNone(cell["diag"])
+
+    def test_the_maximum_load_is_carried_into_the_cell(self):
+        """The campaign samples the 1-min load through the measured run and
+        dns-evidence.json reports the maximum as load_max_1min; the index
+        carries it so a reader sees it beside the numbers without opening
+        the run. Evidence from before the sampler recorded it indexes with
+        null.
+
+        RED BEFORE THE FIX: KeyError: 'load_max_1min'.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, load_max_1min=1.87)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                index = json.load(handle)
+        self.assertEqual(index["cells"][0]["load_max_1min"], 1.87)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, load_max_1min=None)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                index = json.load(handle)
+        self.assertIsNone(index["cells"][0]["load_max_1min"])
 
     def test_an_armed_gate_that_evaluated_nothing_refuses(self):
         """max_ms alone is not proof the gate looked at anything.
