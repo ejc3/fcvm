@@ -92,21 +92,45 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # cannot create in (procfs, a read-only mount). Try the mkdir, and let its
 # outcome decide -- loudly, because artifacts on the root filesystem are the
 # thing this indirection exists to avoid and a reader should see it happen.
-# And "was created" is not "is writable" either: `mkdir -p` on a directory
-# that already exists succeeds without touching it, so an existing worktree
-# directory that has since gone read-only (ownership change, ro remount) would
-# pass the mkdir and then receive a symlink Cargo cannot write into -- exit 0
-# here, an opaque failure several steps later. The probe therefore CREATES an
-# entry inside the directory; that is the operation Cargo needs, and it is the
-# one root cannot fake past EROFS. (Raised on #867.)
+# Give up on the managed volume and leave a REAL local target/ behind.
+#
+# Loud, because artifacts on the root filesystem are the thing this indirection
+# exists to avoid and a reader should see it happen. If target/ is a managed
+# symlink it is REPLACED, not left: a link that still resolves would pass every
+# later `-d target` check while Cargo cannot create a file there (raised on
+# #867). Replacing it is safe here because this script holds the checkout lock
+# (no Cargo runs in this checkout meanwhile) and, whenever target/ resolved,
+# the exclusive lease on its generation taken below.
+fallback_to_local() {
+	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
+	if [ -L target ]; then
+		case "$(readlink target)" in
+			"$BTRFS_ROOT"/cargo-target/*) rm -f -- target ;;
+		esac
+	fi
+	[ -e target ] || mkdir -p target
+	if [ ! -d target ]; then
+		echo "ERROR: target exists but is not a usable directory:" >&2
+		ls -ld target >&2
+		exit 1
+	fi
+	exit 0
+}
+
+# "Is a directory" is not "is usable": on a GitHub-hosted runner podman creates
+# a missing /mnt/fcvm-btrfs as an empty root-owned directory to satisfy the
+# bind mount, so the volume passes `-d` and the mkdir below fails. Whether an
+# EXISTING directory can be written is settled later, under its lease -- see
+# the write probe in the lease block. Probing here, before the generation is
+# leased, is the race the pruner's census/rewalk cannot tolerate (raised on
+# #867): an entry that appears after the census or vanishes during the rewalk
+# aborts the hourly preflight.
 btrfs_usable=0
 if [ -d "$BTRFS_ROOT" ]; then
-	if mkdir -p "$WT_TARGET" 2>/dev/null \
-		&& write_probe="$(mktemp -p "$WT_TARGET" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
-		rm -f -- "$write_probe"
+	if mkdir -p "$WT_TARGET" 2>/dev/null; then
 		btrfs_usable=1
 	else
-		echo "==> WARNING: $BTRFS_ROOT exists but $WT_TARGET cannot be written; build artifacts stay on the root filesystem" >&2
+		echo "==> WARNING: $BTRFS_ROOT exists but $WT_TARGET cannot be created; build artifacts stay on the root filesystem" >&2
 	fi
 fi
 if ((btrfs_usable)); then
@@ -143,7 +167,8 @@ finally:
 new_generation() {
 	local retired_rc
 	while :; do
-		FRESH_GENERATION="$(mktemp -d -- "${WT_TARGET}.generation-XXXXXXXX")"
+		FRESH_GENERATION="$(mktemp -d -- "${WT_TARGET}.generation-XXXXXXXX" 2>/dev/null)" \
+			|| fallback_to_local "cannot create a fresh generation beside $WT_TARGET"
 		exec {fresh_lease_fd}<"$FRESH_GENERATION"
 		flock -x "$fresh_lease_fd"
 		retired_rc=0
@@ -255,6 +280,17 @@ else
 		candidate_state_fd="$candidate_lease_fd"
 	fi
 fi
+# The write probe, under the exclusive lease: `mkdir -p` above is idempotent
+# and says nothing about an EXISTING directory that has since gone read-only
+# (ownership change, ro remount). Creating an entry is the operation Cargo
+# needs, and the one root cannot fake past EROFS. It happens here, and only
+# here, because the pruner holds LOCK_EX on a generation across its census and
+# rewalk -- an entry created or removed outside that lock is exactly the
+# "target entry disappeared during reclaim" abort.
+if ! write_probe="$(mktemp -p "$candidate" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
+	fallback_to_local "$candidate cannot be written"
+fi
+rm -f -- "$write_probe"
 retired_rc=0
 target_is_retired "$candidate_state_fd" || retired_rc=$?
 if ((FORCE_ROTATE)); then

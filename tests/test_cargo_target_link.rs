@@ -2796,3 +2796,154 @@ fn cargo_target_link_falls_back_when_the_existing_worktree_dir_is_unwritable() {
     );
     assert_target_usable(checkout.path(), "existing but unwritable worktree dir");
 }
+
+/// Helper: this checkout's managed worktree dir, exactly as the script names it.
+fn managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
+    let p = std::fs::canonicalize(checkout).expect("canonical checkout path");
+    let base: String = p
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let digest = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(p.to_string_lossy().as_bytes()))
+    };
+    btrfs_root
+        .join("cargo-target")
+        .join(format!("{base}-{}", &digest[..8]))
+}
+
+/// A managed symlink whose directory has become unwritable must be REPLACED.
+///
+/// Codex on #867 (P2): with `target` already pointing at the managed directory,
+/// the probe correctly notices the directory is unwritable, warns, and then
+/// leaves the symlink in place. The link still resolves, so the dangling-link
+/// repair is skipped and the final `-d target` check passes: exit 0 with a
+/// target Cargo cannot create files in. The fallback has to repoint an existing
+/// managed link at a real local directory -- under the generation lease it
+/// already holds for exactly this kind of replacement.
+#[test]
+fn cargo_target_link_replaces_a_managed_link_to_an_unwritable_dir() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("managed dir");
+    std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("managed link");
+
+    let root = nix_geteuid_is_root();
+    if root {
+        let b = btrfs.path().to_str().unwrap();
+        let ok = Command::new("mount")
+            .args(["--bind", b, b])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            && Command::new("mount")
+                .args(["-o", "remount,ro,bind", b])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        assert!(ok, "could not remount the btrfs stand-in read-only as root");
+    } else {
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).expect("chmod 0555");
+    }
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    if root {
+        let _ = Command::new("umount").arg(btrfs.path()).status();
+    } else {
+        let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
+    }
+
+    assert!(ok, "the recipe failed outright:\n{out}");
+    let target = checkout.path().join("target");
+    assert!(
+        !target.is_symlink(),
+        "target/ still links to the unwritable managed directory {}; the fallback \
+         warned and walked away\n{out}",
+        std::fs::read_link(&target)
+            .map(|l| l.display().to_string())
+            .unwrap_or_default()
+    );
+    assert_target_usable(checkout.path(), "managed link to an unwritable dir");
+}
+
+/// The write probe must happen INSIDE the generation lease, never before it.
+///
+/// Codex on #867 (P1): `prune-cargo-target.sh` takes LOCK_EX on a generation,
+/// takes a census of its entries, then rewalks the locked tree. A probe entry
+/// created before the script has leased the generation appears after the census
+/// with no record, and one removed during the rewalk raises
+/// "target entry disappeared during reclaim" -- so an ordinary concurrent `make`
+/// aborts the hourly preflight and its job. AGENTS.md: ZERO RACE CONDITIONS.
+///
+/// The test IS the pruner: it holds LOCK_EX on the worktree directory and runs
+/// the script under a timeout. Correct behaviour is to block at the lease
+/// without having touched the directory -- so its mtime (which any create or
+/// unlink inside it bumps) must be unchanged when the timeout fires.
+#[test]
+fn cargo_target_link_does_not_touch_a_generation_it_has_not_leased() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("managed dir");
+
+    // Be the pruner: LOCK_EX on the generation directory.
+    let dir = std::fs::File::open(&wt).expect("open the generation dir");
+    use std::os::unix::io::AsRawFd;
+    let locked = unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        locked,
+        0,
+        "could not take the pruner's LOCK_EX on {}",
+        wt.display()
+    );
+    // Settle so that a later create/unlink moves the mtime by a visible amount.
+    // (`touch`, not set_file_time: that helper opens for write, which a
+    // directory refuses with EISDIR.)
+    assert!(
+        Command::new("touch")
+            .args(["-d", "@1600000000"])
+            .arg(&wt)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "could not settle the directory mtime"
+    );
+    let before = std::fs::metadata(&wt).expect("stat").mtime();
+
+    let out = Command::new("timeout")
+        .arg("4")
+        .arg(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs.path())
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(checkout.path())
+        .output()
+        .expect("run the script under timeout");
+    let after = std::fs::metadata(&wt).expect("stat").mtime();
+    drop(dir); // releases the lock
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the script did not block on the pruner's lease; it completed with {:?}\n{}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        before, after,
+        "the generation directory was modified (mtime {before} -> {after}) while the \
+         pruner held its lease: the write probe ran outside the lock"
+    );
+}
