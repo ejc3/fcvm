@@ -715,3 +715,42 @@ fn a_bench_that_persisted_nothing_fails_its_target() {
         );
     }
 }
+
+/// The hugepage pool lock must be owned by the invoking user, not root.
+///
+/// Both `setup-hugepages` recipes create `/mnt/fcvm-btrfs/hugepage-pool.lock`
+/// with `sudo touch` and `chmod 666`. On a box where `/mnt/fcvm-btrfs` is a
+/// sticky world-writable directory (mode 1777, as a fresh setup leaves it),
+/// `fs.protected_regular` then refuses every later unprivileged open of that
+/// root-owned file -- so `make test-root` dies at the very first step:
+///
+/// ```text
+/// ==> Allocating hugepage pool (512 pages = 1024MB)...
+/// flock: cannot open lock file /mnt/fcvm-btrfs/hugepage-pool.lock: Permission denied
+/// make: *** [Makefile:643: setup-hugepages] Error 66
+/// ```
+///
+/// CI never sees it because the runner user owns the whole volume. The recipe
+/// must hand the lock to the invoker the way `check-disk` already hands over
+/// `~/.cargo`, on EVERY site that creates it.
+#[test]
+fn hugepage_lock_is_chowned_to_the_invoker_wherever_it_is_created() {
+    let makefile = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Makefile"))
+        .expect("read Makefile");
+    let creators: Vec<&str> = makefile
+        .lines()
+        .filter(|l| l.contains("touch /mnt/fcvm-btrfs/hugepage-pool.lock"))
+        .collect();
+    assert!(
+        !creators.is_empty(),
+        "no recipe creates /mnt/fcvm-btrfs/hugepage-pool.lock any more; if the lock \
+         moved, move this test with it"
+    );
+    for line in creators {
+        assert!(
+            line.contains("chown $$(id -u):$$(id -g) /mnt/fcvm-btrfs/hugepage-pool.lock"),
+            "a recipe creates the hugepage lock without chowning it to the invoker, so a \
+             sticky /mnt/fcvm-btrfs refuses the next unprivileged flock (protected_regular):\n{line}"
+        );
+    }
+}

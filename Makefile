@@ -646,7 +646,11 @@ setup-hugepages:
 	else \
 		echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TESTS) pages = $$(( $(HUGEPAGE_POOL_TESTS) * 2 ))MB)..."; \
 		sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true; \
-		sudo sh -c 'touch /mnt/fcvm-btrfs/hugepage-pool.lock && chmod 666 /mnt/fcvm-btrfs/hugepage-pool.lock'; \
+		# chown to the invoker: a root-owned 666 file in a sticky world-writable
+		# directory is exactly what fs.protected_regular refuses to open for
+		# anyone else, so the unprivileged flock below fails with EACCES on
+		# every run after the first. Same treatment check-disk gives ~/.cargo.
+		sudo sh -c "touch /mnt/fcvm-btrfs/hugepage-pool.lock && chmod 666 /mnt/fcvm-btrfs/hugepage-pool.lock && chown $$(id -u):$$(id -g) /mnt/fcvm-btrfs/hugepage-pool.lock"; \
 		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock \
 			sudo sh -c 'echo $(HUGEPAGE_POOL_TESTS) > /proc/sys/vm/nr_hugepages'; \
 	fi
@@ -1007,7 +1011,11 @@ FAULT_POOL ?= 4096
 bench-chromium-fault: build setup-default
 	@test -n "$(FAULT_OUT)" || (echo "ERROR: FAULT_OUT required (results directory)"; exit 1)
 	@if ls -d /mnt/fcvm-btrfs/snapshots/cb-golden-huge* >/dev/null 2>&1; then \
-		sudo sh -c 'touch /mnt/fcvm-btrfs/hugepage-pool.lock && chmod 666 /mnt/fcvm-btrfs/hugepage-pool.lock'; \
+		# chown to the invoker: a root-owned 666 file in a sticky world-writable
+		# directory is exactly what fs.protected_regular refuses to open for
+		# anyone else, so the unprivileged flock below fails with EACCES on
+		# every run after the first. Same treatment check-disk gives ~/.cargo.
+		sudo sh -c "touch /mnt/fcvm-btrfs/hugepage-pool.lock && chmod 666 /mnt/fcvm-btrfs/hugepage-pool.lock && chown $$(id -u):$$(id -g) /mnt/fcvm-btrfs/hugepage-pool.lock"; \
 		flock -x -w 60 /mnt/fcvm-btrfs/hugepage-pool.lock sh -c ' \
 			current=$$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0); \
 			if [ "$$current" -lt "$(FAULT_POOL)" ]; then \
