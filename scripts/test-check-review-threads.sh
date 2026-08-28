@@ -206,6 +206,33 @@ run_case "someone else reviewed the head" \
   "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]')" \
   0 "CLEAR"
 
+echo "== finding 19: a reviewer with nothing to say posts no review object =="
+# Codex answers "Didn't find any major issues" as a plain comment; CodeRabbit's full
+# review with no comments replies "Full review finished." and creates no review. A head
+# that no bot has anything to say about must not sit BLOCKED forever: a non-author bot's
+# no-findings verdict dated AFTER the head commit covers it. Dated before it, it covered
+# an older head. The author's own such comment is not coverage, and without the head
+# commit's date nothing can be dated after it.
+wrap6() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z"}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":%s}}}}}' "$1"; }
+run_case "a codex no-findings comment after the head commit covers it" \
+  "$(wrap6 '[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues. Bravo.","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  0 "HEAD COVERED"
+run_case "a coderabbit full-review-finished after the head commit covers it" \
+  "$(wrap6 '[{"author":{"login":"coderabbitai","__typename":"Bot"},"body":"<!-- x -->\n\n✅ Action performed\n\nFull review finished.\n","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  0 "HEAD COVERED"
+run_case "a no-findings verdict dated before the head commit is not coverage" \
+  "$(wrap6 '[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-01T23:00:00Z"}]')" \
+  1 "UNREVIEWED HEAD"
+run_case "the author saying no findings is not coverage" \
+  "$(wrap6 '[{"author":{"login":"me","__typename":"User"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  1 "UNREVIEWED HEAD"
+run_case "a verdict cannot cover a head whose commit date is unknown" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-02T01:00:00Z"}]}}}}}')" \
+  1 "UNREVIEWED HEAD"
+run_case "a no-findings verdict is not a finding that needs a disposition" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z"}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-02T01:00:00Z"}]}}}}}')" \
+  0 "CLEAR"
+
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
   "$(wrap '[{"isResolved":false,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"something"}]}}]')" \
