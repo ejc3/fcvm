@@ -23,6 +23,7 @@ import os
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -51,6 +52,7 @@ class FakeCdpServer:
     def __init__(self, script):
         self.script = script
         self.methods = []
+        self.messages = []  # (method, params) in wire order
         self._buf = b""
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -84,6 +86,7 @@ class FakeCdpServer:
                     return
                 request = json.loads(text)
                 self.methods.append(request["method"])
+                self.messages.append((request["method"], request.get("params", {})))
                 result, events = self.script(request["method"], request.get("params", {}))
                 self._send_text(conn, json.dumps({"id": request["id"], "result": result}))
                 for event in events:
@@ -211,22 +214,36 @@ NAV_EVENTS = [
 ]
 
 
+NAV_ENTRY = {
+    "domainLookupStart": 1.0, "domainLookupEnd": 2.0, "connectStart": 2.0,
+    "connectEnd": 3.0, "requestStart": 3.0, "responseStart": 4.0,
+    "responseEnd": 5.0, "loadEventEnd": 6.0,
+}
+
+
 def scripted(nav_events):
     def script(method, _params):
         if method == "Page.navigate":
             return {"frameId": "F", "loaderId": "L1"}, list(nav_events)
         if method == "Page.captureScreenshot":
             return {"data": base64.b64encode(JPEG).decode()}, []
+        if method == "Runtime.evaluate":
+            return {"result": {"type": "string", "value": json.dumps(NAV_ENTRY)}}, []
         return {}, []
     return script
 
 
 def args_for(server, **overrides):
-    """CdpDriveNavigationFailurePhases._args, pointed at the fake endpoint."""
+    """reqbench.py's closed cdpdrive Namespace, pointed at the fake endpoint.
+
+    nav_timing=True, idle_wait_ms=0 and host_header="" are what the measured
+    producer sets (reqbench.py, run_cdp_request), so the wire sequence pinned
+    below is the measured arm's.
+    """
     ns = argparse.Namespace(
         cdp_host="127.0.0.1:1", url="http://site.test/", format="jpeg", quality=80,
         timeout=5.0, idle_wait_ms=0.0, out_prefix="", ws_url=server.ws_url,
-        connect_retries=1, nav_timing=False, print_target=False,
+        connect_retries=1, nav_timing=True, print_target=False,
         host_header="", render_module=os.path.join(HERE, "render.py"),
     )
     for key, value in overrides.items():
@@ -267,7 +284,7 @@ class NetTraceRecorded(unittest.TestCase):
         self.assertEqual(summary["load_event_ms"], 100.0)
         self.assertEqual(server.methods,
                          ["Page.enable", "Network.enable", "Page.navigate",
-                          "Page.captureScreenshot"])
+                          "Page.captureScreenshot", "Runtime.evaluate"])
 
     def test_file_rows_carry_per_request_fields_and_match_the_record(self):
         out, path, _ = self._drive()
@@ -323,10 +340,59 @@ class NetTraceRecorded(unittest.TestCase):
         self.assertEqual(summary["n_pending_at_load"], 1)
 
 
-class NetTraceOff(unittest.TestCase):
-    """Without the flag the wire sequence is today's, message for message."""
+class NetTraceWrite(unittest.TestCase):
+    """The trace file is whole or absent, and a trace that was asked for and
+    not written fails the CLI.
 
-    TODAY = ["Page.enable", "Page.navigate", "Page.captureScreenshot"]
+    Red: an empty trace.json left behind by an interrupted write
+    (`open(path, "w")` truncates before json.dump runs), and exit 0 from a
+    CLI whose --net-trace PATH does not exist afterwards.
+    """
+
+    def test_an_interrupted_write_leaves_no_partial_file(self):
+        from unittest import mock
+        server = FakeCdpServer(scripted(NAV_EVENTS))
+        self.addCleanup(server.close)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "trace.json")
+            with mock.patch("json.dump", side_effect=OSError(28, "No space left on device")):
+                out = cdpdrive.drive(args_for(server, net_trace=path, net_trace_drain_ms=100.0))
+            self.assertTrue(out["ok"], out)
+            self.assertIn("net_trace_error", out)
+            self.assertIn("No space left", out["net_trace_error"])
+            self.assertFalse(os.path.exists(path), "a partial trace file was left behind")
+            self.assertEqual(os.listdir(d), [], "a temp file was left behind")
+
+    def test_a_trace_that_could_not_be_written_fails_the_cli(self):
+        server = FakeCdpServer(scripted(NAV_EVENTS))
+        self.addCleanup(server.close)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "no-such-dir", "trace.json")
+            result = subprocess.run(
+                [sys.executable, os.path.join(HERE, "cdpdrive.py"),
+                 "127.0.0.1:1", "http://site.test/", "--ws-url", server.ws_url,
+                 "--format", "jpeg", "--timeout", "5", "--connect-retries", "1",
+                 "--net-trace", path, "--net-trace-drain-ms", "100"],
+                capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(result.returncode, 0,
+                                "exit 0 with no trace file\n" + result.stdout + result.stderr)
+            record = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertTrue(record["ok"], record)
+            self.assertIn("net_trace_error", record)
+            self.assertFalse(os.path.exists(path))
+
+
+class NetTraceOff(unittest.TestCase):
+    """Without the flag the wire is the measured arm's, message for message.
+
+    The fake records (method, params) in wire order, and the trace-on run is
+    held to exactly one extra message: Network.enable before Page.navigate.
+    Verified red by fault injection (an unconditional Network.enable in
+    cdpdrive.drive fails both trace-off tests and the one-extra-message
+    assertion).
+    """
+
+    TODAY = ["Page.enable", "Page.navigate", "Page.captureScreenshot", "Runtime.evaluate"]
 
     def _drive(self, **overrides):
         server = FakeCdpServer(scripted(NAV_EVENTS))
@@ -335,22 +401,41 @@ class NetTraceOff(unittest.TestCase):
         server.close()
         return out, server
 
+    def _assert_measured_wire(self, out, server):
+        self.assertTrue(out["ok"], out)
+        self.assertEqual([m for m, _ in server.messages], self.TODAY)
+        self.assertEqual(server.messages[0], ("Page.enable", {}))
+        self.assertEqual(server.messages[1], ("Page.navigate", {"url": "http://site.test/"}))
+        self.assertEqual(server.messages[3][1].get("returnByValue"), True)
+        self.assertNotIn("net_trace", out)
+        self.assertNotIn("net_trace_error", out)
+        self.assertNotIn("net_trace_drain_ms", out["stages"])
+        self.assertIn("nav_timing_ms", out["stages"])
+
     def test_no_attribute_sends_no_network_enable(self):
         """reqbench.py builds a closed Namespace without net_trace."""
         out, server = self._drive()
-        self.assertTrue(out["ok"], out)
-        self.assertEqual(server.methods, self.TODAY)
-        self.assertNotIn("net_trace", out)
-        self.assertNotIn("net_trace_drain_ms", out["stages"])
+        self._assert_measured_wire(out, server)
 
     def test_net_trace_none_sends_no_network_enable(self):
         """The CLI default is None, and None means off."""
+        out, server = self._drive(net_trace=None, net_trace_drain_ms=5000.0)
+        self._assert_measured_wire(out, server)
+
+    def test_the_trace_adds_exactly_one_message(self):
+        off_out, off_server = self._drive()
         with tempfile.TemporaryDirectory() as d:
-            out, server = self._drive(net_trace=None, net_trace_drain_ms=5000.0)
-            self.assertTrue(out["ok"], out)
-            self.assertEqual(server.methods, self.TODAY)
-            self.assertNotIn("net_trace", out)
-            self.assertEqual(os.listdir(d), [])
+            on_server = FakeCdpServer(scripted(NAV_EVENTS))
+            self.addCleanup(on_server.close)
+            on_out = cdpdrive.drive(args_for(
+                on_server, net_trace=os.path.join(d, "trace.json"), net_trace_drain_ms=100.0))
+            on_server.close()
+        self.assertTrue(off_out["ok"] and on_out["ok"], (off_out, on_out))
+        on = list(on_server.messages)
+        self.assertEqual(on[1], ("Network.enable", {}))
+        del on[1]
+        self.assertEqual(on, off_server.messages,
+                         "the trace changed more than the one Network.enable")
 
 
 if __name__ == "__main__":

@@ -37,9 +37,11 @@ its two halves separately.
 before the navigate, collects requestWillBeSent / responseReceived /
 loadingFinished / loadingFailed until Page.loadEventFired, keeps draining for
 `--net-trace-drain-ms` (default 5000) so requests still open at the load event
-show how they end, and writes PATH as {"requests": [...], "summary": {...}}.
-The record gains a "net_trace" key holding the summary. Without the flag not
-one extra CDP message is sent; test_net_trace.py pins the wire sequence.
+show how they end, and writes PATH whole (temp file, then rename) as
+{"requests": [...], "summary": {...}}. The record gains a "net_trace" key
+holding the summary; a PATH that could not be written puts "net_trace_error"
+on the record and exits 1. Without the flag not one extra CDP message is
+sent; test_net_trace.py pins the wire sequence.
 """
 
 import argparse
@@ -670,15 +672,24 @@ def drive(args) -> dict:
         if trace_path and cdp is not None:
             # Written on failure too: a load event that never fired is the
             # case the trace exists for. A filesystem error goes on the record
-            # rather than out of drive(), which never raises for its own faults.
+            # rather than out of drive(), which never raises for its own
+            # faults; main() then exits non-zero, since a trace that was
+            # asked for and not written is a failed invocation. The file is
+            # renamed into place whole: a reader never sees a truncated one.
             trace = reduce_net_trace(cdp.events, load_ts, trace_drain_ms)
+            temp_path = f"{trace_path}.{os.getpid()}.tmp"
             try:
-                with open(trace_path, "w") as f:
+                with open(temp_path, "w") as f:
                     json.dump(trace, f, separators=(",", ":"))
                     f.write("\n")
+                os.replace(temp_path, trace_path)
                 out["net_trace"] = trace["summary"]
             except OSError as e:
                 out["net_trace_error"] = f"{type(e).__name__}: {e}"
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
         if ws is not None:
             try:
                 ws.close()
@@ -729,7 +740,7 @@ def main() -> int:
         return 0
     out = drive(args)
     print(json.dumps(out, separators=(",", ":")), flush=True)
-    return 0 if out["ok"] else 1
+    return 0 if out["ok"] and "net_trace_error" not in out else 1
 
 
 if __name__ == "__main__":
