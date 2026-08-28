@@ -38,9 +38,11 @@ Every rule here exists because of a defect listed in bench/chromium/AGENTS.md:
     literals and localhost need none. `engine` and `guest_dns` are cell
     fields: runs that differ in either never pool.
   * A load event that takes tens of seconds is a stall, not a slow page. With
-    `--stall-max-ms N` every record whose navigate_load_event_ms exceeds N is
-    listed under `stall_gate` and the run is refused. `per_url` reports each
-    URL of a multi-URL run on its own so a pooled median cannot hide one page.
+    `--stall-max-ms N` every record whose navigate_load_event_ms (navigate_ms
+    for webkit, whose WebDriver navigate returns at the load event) exceeds N,
+    is negative, or is missing from a successful render is listed under
+    `stall_gate` and the run is refused. `per_url` reports each URL of a
+    multi-URL run on its own so a pooled median cannot hide one page.
 """
 
 import argparse
@@ -1984,27 +1986,30 @@ def analyze_backend(
     # waiting on something other than the page (a resolver that never answers,
     # for one), and one such record inside a pooled median is invisible.
     engine = next((m.get("engine") or "chromium" for m in metas), "chromium")
+    # cdpdrive times the load event on every successful render. WebDriver
+    # classic exposes no such stage, but its navigate call returns at the
+    # load event, so a stall lands in navigate_ms; an armed gate that
+    # skipped webkit records passed having evaluated nothing.
+    stall_stage = "navigate_ms" if engine == "webkit" else "navigate_load_event_ms"
     violations = []
     evaluated = 0
     if stall_max_ms is not None:
         for r in recs:
             arm = r.get("arm")
-            value = render_stage(r, "navigate_load_event_ms")
-            # cdpdrive times the load event on every successful render; a
-            # chromium success without the stage has not shown it did not
-            # stall. WebDriver classic exposes no such stage.
-            must_carry = (
-                r.get("ok") is True and is_cdp_class(arm) and engine != "webkit"
-            )
+            value = render_stage(r, stall_stage)
+            # A success without the stage has not shown it did not stall.
+            must_carry = r.get("ok") is True and is_cdp_class(arm)
             if value is None and not must_carry:
                 continue
             if value is not None:
                 evaluated += 1
-            if value is None or value > stall_max_ms:
+            # A negative duration was not timed either.
+            if value is None or value < 0 or value > stall_max_ms:
                 violations.append({
                     "url": record_url(r),
                     "arm": arm,
-                    "navigate_load_event_ms": value,
+                    "stage": stall_stage,
+                    stall_stage: value,
                     "rep": r.get("rep"),
                     "warmup": bool(r.get("warmup")),
                     "record_id": r.get("record_id"),
@@ -2016,7 +2021,7 @@ def analyze_backend(
         "violations": violations,
     }
     print("\n" + "-" * 78)
-    print("STALL GATE (render.stages.navigate_load_event_ms, every record incl. warmup)")
+    print(f"STALL GATE (render.stages.{stall_stage}, every record incl. warmup)")
     print("-" * 78)
     if stall_max_ms is None:
         print("  not evaluated (no --stall-max-ms)")
@@ -2027,7 +2032,7 @@ def analyze_backend(
         for violation in violations:
             print(f"    {violation['arm']:9s} rep={violation['rep']}"
                   f"{' [warmup]' if violation['warmup'] else ''} "
-                  f"load-event={violation['navigate_load_event_ms']!r} "
+                  f"{stall_stage}={violation[stall_stage]!r} "
                   f"url={violation['url']}")
 
     # ---- 5. teardown, three separate numbers, never one
@@ -2269,7 +2274,7 @@ def analyze_backend(
     if not out["stall_gate"]["passed"]:
         reasons.append(
             f"stall_gate: {len(violations)} record(s) exceed or lack "
-            f"navigate_load_event_ms under the {stall_max_ms:g} ms limit"
+            f"{stall_stage} under the {stall_max_ms:g} ms limit"
         )
 
     out["gate"] = {

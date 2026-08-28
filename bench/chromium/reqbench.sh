@@ -1113,6 +1113,10 @@ HUGEPAGES="${HUGEPAGES:-0}"
 # corpus replay arm sets GUEST_DNS=10.0.2.2 so every corpus hostname
 # resolves through the host-loopback replay server via the pasta gateway.
 GUEST_DNS="${GUEST_DNS:-}"
+# Arms the analyzer's stall gate (reqanalyze --stall-max-ms). Empty leaves the
+# gate unarmed, which campaign_summary refuses to index; the corpus campaign
+# sets it.
+STALL_MAX_MS="${STALL_MAX_MS:-}"
 # Overridable for unit tests only; production is the real kernel knob.
 HUGEPAGE_POOL_FILE="${HUGEPAGE_POOL_FILE:-/proc/sys/vm/nr_hugepages}"
 
@@ -1370,11 +1374,17 @@ cmd_run() {
     # the run contract and propagate its gate status.
     if [ "$rc" -eq 0 ]; then
         log "run: applying publication gates"
-        $SUDO python3 "$HERE/reqanalyze.py" --json-out "$RESULTS/analysis.json" \
-            "$RESULTS/reqbench.jsonl" || rc=$?
+        apply_publication_gates || rc=$?
     fi
     log "run: results in $RESULTS (backend=$BACKEND, gated run exit $rc)"
     return $rc
+}
+
+apply_publication_gates() {
+    local -a stall_args=()
+    [ -z "$STALL_MAX_MS" ] || stall_args=(--stall-max-ms "$STALL_MAX_MS")
+    $SUDO python3 "$HERE/reqanalyze.py" --json-out "$RESULTS/analysis.json" \
+        "${stall_args[@]}" "$RESULTS/reqbench.jsonl"
 }
 
 # Only dispatch when EXECUTED. Sourcing the file makes its helpers unit-testable

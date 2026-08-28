@@ -7575,6 +7575,157 @@ class AnalyzerStallGate(unittest.TestCase):
             # flag existed; the refusal has to be the range check.
             self.assertIn("positive", stderr.getvalue())
 
+    def test_a_negative_load_event_is_a_violation(self):
+        """A stage that ran backwards was not timed; it cannot prove the
+        render did not stall, and the gate treated it as within the limit."""
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "r.jsonl"), -1.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        gate = out["stall_gate"]
+        self.assertIs(gate["passed"], False, gate)
+        self.assertEqual(len(gate["violations"]), 1, gate)
+        self.assertEqual(gate["violations"][0]["navigate_load_event_ms"], -1.0)
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+
+    @staticmethod
+    def _webkit(path, navigate_ms):
+        """The chromium fixture reshaped into a webkit run.
+
+        WebDriver classic exposes no load-event stage; its navigate call
+        returns at the load event, so a stall lands in navigate_ms.
+        """
+        AnalyzerAvailability._write_clean_backend(
+            path, "file", 200, 384.0, engine="webkit",
+        )
+
+        def reshape(row):
+            render = row.get("render")
+            if not isinstance(render, dict):
+                return
+            row["render"] = {
+                "ok": True, "url": render["url"], "format": render["format"],
+                "engine": "webkit", "wd_host": row["endpoint"],
+                "session_prewired": True,
+                "stages": {
+                    "resolve_ms": 0.1, "connect_total_ms": 0.4,
+                    "navigate_ms": navigate_ms, "screenshot_ms": 1.0,
+                    "total_ms": render["stages"]["total_ms"],
+                },
+                "image_bytes": 1024, "image_sha256": "9" * 64,
+            }
+
+        _rewrite_records(path, reshape)
+
+    def test_a_webkit_run_is_gated_on_its_navigate_round_trip(self):
+        """An armed gate that skipped every webkit record reported
+        passed=true having evaluated nothing, so a webkit stall of any
+        length published."""
+        with tempfile.TemporaryDirectory() as d:
+            self._webkit(os.path.join(d, "r.jsonl"), 1.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+        self.assertIs(out["stall_gate"]["passed"], True)
+        self.assertEqual(out["stall_gate"]["evaluated"], 404)
+        with tempfile.TemporaryDirectory() as d:
+            self._webkit(os.path.join(d, "r.jsonl"), 31000.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        self.assertIs(out["stall_gate"]["passed"], False, out["stall_gate"])
+        self.assertEqual(rc, 5)
+        violation = out["stall_gate"]["violations"][0]
+        self.assertEqual(violation["stage"], "navigate_ms")
+        self.assertEqual(violation["navigate_ms"], 31000.0)
+
+
+class PublicationGateInvocation(unittest.TestCase):
+    """`reqbench.sh run` arms the analyzer's stall gate from STALL_MAX_MS.
+
+    reqanalyze grew --stall-max-ms and campaign_summary refuses an analysis
+    whose gate was never armed, but nothing passed the flag: every run the
+    campaign produced was un-indexable by construction. The analyzer call
+    is a function so it can be driven here with a python3 stub on PATH, the
+    way HugepageGuards drives the pool helpers.
+
+    RED BEFORE THE FIX: bash: line 1: apply_publication_gates: command not
+    found (the call was inline in cmd_run), and `make -n` printed the
+    analyze recipe without --stall-max-ms.
+    """
+
+    SH = os.path.join(HERE, "reqbench.sh")
+    REPO = os.path.dirname(os.path.dirname(HERE))
+
+    def _gate(self, env_extra):
+        d = tempfile.mkdtemp(prefix="pubgate-")
+        self.addCleanup(shutil.rmtree, d)
+        binx = os.path.join(d, "bin")
+        os.makedirs(binx)
+        argv_log = os.path.join(d, "python3-argv")
+        for name, body in (
+            ("sudo", '#!/bin/bash\nexec "$@"\n'),
+            ("python3", f'#!/bin/bash\nprintf "%s\\n" "$@" > "{argv_log}"\nexit 0\n'),
+        ):
+            with open(os.path.join(binx, name), "w") as handle:
+                handle.write(body)
+            os.chmod(os.path.join(binx, name), 0o755)
+        results = os.path.join(d, "results")
+        os.makedirs(results)
+        env = dict(os.environ)
+        env.pop("STALL_MAX_MS", None)
+        env.update(
+            PATH=binx + os.pathsep + env["PATH"],
+            TAG="tag-under-test",
+            STATE_DIR=os.path.join(d, "state"),
+            RESULTS=results,
+        )
+        env.update(env_extra)
+        result = subprocess.run(
+            ["bash", "-c", f'source "{self.SH}" && apply_publication_gates'],
+            capture_output=True, text=True, env=env, timeout=60)
+        argv = []
+        if os.path.exists(argv_log):
+            with open(argv_log) as handle:
+                argv = handle.read().splitlines()
+        return result, argv, results
+
+    def test_stall_max_ms_reaches_the_analyzer(self):
+        result, argv, results = self._gate({"STALL_MAX_MS": "15000"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(argv and argv[0].endswith("reqanalyze.py"), argv)
+        self.assertIn("--stall-max-ms", argv)
+        self.assertEqual(argv[argv.index("--stall-max-ms") + 1], "15000")
+        self.assertEqual(argv[argv.index("--json-out") + 1],
+                         os.path.join(results, "analysis.json"))
+        self.assertEqual(argv[-1], os.path.join(results, "reqbench.jsonl"))
+
+    def test_an_unset_knob_leaves_the_gate_unarmed(self):
+        """The fixture runs (medium.html) keep their existing behaviour."""
+        result, argv, _results = self._gate({})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(argv and argv[0].endswith("reqanalyze.py"), argv)
+        self.assertNotIn("--stall-max-ms", argv)
+
+    def test_the_make_analyze_target_passes_the_knob(self):
+        """`make analyze-chromium-request` calls reqanalyze directly and has
+        to arm the gate the same way."""
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "reqbench.jsonl"), "w") as handle:
+                handle.write("{}\n")
+            armed = subprocess.run(
+                ["make", "-n", "-C", self.REPO, "analyze-chromium-request",
+                 f"RESULTS={d}", "STALL_MAX_MS=15000"],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(armed.returncode, 0, armed.stderr[-2000:])
+            self.assertIn("reqanalyze.py", armed.stdout)
+            self.assertIn("--stall-max-ms 15000", armed.stdout)
+            unarmed = subprocess.run(
+                ["make", "-n", "-C", self.REPO, "analyze-chromium-request",
+                 f"RESULTS={d}"],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(unarmed.returncode, 0, unarmed.stderr[-2000:])
+            self.assertIn("reqanalyze.py", unarmed.stdout)
+            self.assertNotIn("--stall-max-ms", unarmed.stdout)
+
 
 class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
     """campaign_summary.py reads what reqanalyze.py actually writes.
