@@ -1653,9 +1653,9 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
             common::unique_names("fastteardown");
 
         // Baseline VM -> snapshot -> memory server: the exact topology the bench uses.
-        let (mut base_child, base_pid) = common::spawn_fcvm_with_logs(
+        let (mut base_child, base_pid, base_log) = common::spawn_fcvm_with_env_and_log_path(
             &["podman", "run", "--name", &base_name, common::TEST_IMAGE],
-            &base_name,
+            &[],
         )
         .await
         .context("spawning baseline VM")?;
@@ -1686,7 +1686,7 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
 
         // The clone: no --exec, exactly as the `cdp-fast` arm restores it.
-        let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        let (mut clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
             &[
                 "snapshot",
                 "run",
@@ -1695,7 +1695,7 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                 "--name",
                 &clone_name,
             ],
-            &clone_name,
+            &[],
         )
         .await
         .context("spawning clone")?;
@@ -1814,6 +1814,40 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         send_signal(clone_pid, "KILL").context("SIGKILL to clone fcvm")?;
         let _ = clone_child.wait().await;
 
+        // THE REAPER, ON PURPOSE. `StateManager::load_state_by_pid` and
+        // `allocate_loopback_ip` both run `cleanup_stale_state`, which removes
+        // the state file of any dead PID -- this clone's, the instant it is
+        // dead. So every `fcvm exec --pid`, every `snapshot ... --pid`, and
+        // every VM START on the box is a reaper. In the shared container state
+        // dir that is exactly what a CONCURRENT test's fcvm did on 2026-08-28
+        // (Container-x64, #867: a starting `uffd-slot-exit-base-…` logged
+        // "cleanup_stale_state: removing state file for dead or replaced
+        // process pid=<this clone>"), and this test then asserted the file had
+        // survived and failed. Main was green only by scheduling. Running a
+        // reaper here makes that interleaving deterministic, so the assertions
+        // below must hold against it rather than hope to precede it.
+        //
+        // The trigger is precise: `load_state_by_pid` cleans only on a MISS,
+        // and a dead PID whose file still exists IS a miss (its identity check
+        // fails). So `fcvm exec --pid <the dead clone>` runs the cleanup, reaps
+        // the clone's own file, and then fails because there is no such VM --
+        // the expected outcome. Two earlier drafts reaped nothing: `fcvm ls`
+        // (`list_vms` does not clean) and `exec --pid <base>` (a hit, so the
+        // cleanup never ran). Both passed; neither proved anything.
+        let reaper = tokio::process::Command::new(common::find_fcvm_binary()?)
+            .args(["exec", "--pid", &clone_pid.to_string(), "--", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .context("running `fcvm exec` as the stale-state reaper")?;
+        anyhow::ensure!(
+            !reaper.success(),
+            "`fcvm exec --pid {clone_pid}` SUCCEEDED against a SIGKILLed clone: that PID \
+             now belongs to a live VM, so the identity check that gates stale-state \
+             cleanup is not doing its job"
+        );
+
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
             if !fc.running() && !holder.running() && !pasta.running() {
@@ -1881,13 +1915,37 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
 
         // The other half of the contract: SIGKILL cannot be caught, so cleanup_vm did NOT run
         // and BOTH on-disk artifacts are still there. The harness must reap both synchronously.
+        // The contract fcvm owns is narrower than "the file is still there": it is
+        // that fcvm's OWN cleanup did not run under SIGKILL. Whether the file is
+        // still there also depends on every other fcvm on the box (see the reaper
+        // above), which this test does not control and reqbench.py must already
+        // tolerate. The killed process's own debug log is the direct evidence:
+        // `cleanup_vm` logs "cleaning up resources" and `delete_state` logs
+        // "delete_state: deleting state file"; under SIGKILL neither can appear.
+        let clone_trace = std::fs::read_to_string(&clone_log)
+            .with_context(|| format!("reading the clone's debug log {}", clone_log.display()))?;
         assert!(
-            state_survived,
-            "expected the clone's state file to SURVIVE the SIGKILL (at {}). If it is gone, \
-             fcvm gained a cleanup path that runs under SIGKILL and reqbench.py's synchronous \
-             on-disk reap should be revisited.",
-            state_file.display()
+            clone_trace.contains("snapshot"),
+            "the clone's debug log {} carries no restore trace at all; an absence check \
+             against an empty or wrong log proves nothing",
+            clone_log.display()
         );
+        for self_cleanup in ["delete_state: deleting state file", "cleaning up resources"] {
+            assert!(
+                !clone_trace.contains(self_cleanup),
+                "the SIGKILLed clone's own log contains {self_cleanup:?}: fcvm gained a \
+                 cleanup path that runs under SIGKILL, and reqbench.py's synchronous \
+                 on-disk reap should be revisited ({})",
+                clone_log.display()
+            );
+        }
+        if !state_survived {
+            println!(
+                "  note: the clone's state file was reaped by another fcvm's \
+                 cleanup_stale_state (the deliberate `fcvm exec --pid <dead clone>` above, or a concurrent \
+                 test); the clone itself deleted nothing, which is the contract"
+            );
+        }
         assert!(
             data_survived,
             "expected the clone's data dir to SURVIVE the SIGKILL (at {}). It holds a reflinked \
@@ -1930,6 +1988,19 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
             snapshot_name
         );
 
+        // POSITIVE CONTROL for the absence check above: the baseline was torn
+        // down gracefully, so its log MUST show the very line the clone's log must
+        // not. A detector that cannot fire is the class of test this repo keeps
+        // finding; this proves it fires on the path where the event is real.
+        let base_trace = std::fs::read_to_string(&base_log)
+            .with_context(|| format!("reading the baseline's debug log {}", base_log.display()))?;
+        assert!(
+            base_trace.contains("delete_state: deleting state file"),
+            "the baseline's graceful teardown logged no state-file delete in {}; the \
+             self-cleanup detector above would then be checking for a line fcvm \
+             never emits",
+            base_log.display()
+        );
         println!("test_bench_fast_teardown_leaks_nothing_clone PASSED");
         Ok::<(), anyhow::Error>(())
     })
