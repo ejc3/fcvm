@@ -18,9 +18,12 @@ results/**
 !results/**/charts/
 !results/**/charts/*.svg
 !results/**/summary.md
-# DNS-campaign evidence: the in-clone resolver check, the campaign verdict,
-# the diagnostic summary, the resolver-owner log and the campaign index.
+# DNS-campaign evidence: the in-clone resolver check (plus the per-bracket
+# copies verify-dns-pre/before-run/after-run.json that dns-evidence.json lists
+# in verify_files), the campaign verdict, the diagnostic summary, the
+# resolver-owner log and the campaign index.
 !results/**/verify-dns.json
+!results/**/verify-dns-*.json
 !results/**/dns-evidence.json
 !results/**/diag/summary.json
 !results/**/dns-owner.log

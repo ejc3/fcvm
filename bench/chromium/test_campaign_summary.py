@@ -40,11 +40,19 @@ class EvidenceIgnoreRules(unittest.TestCase):
     RED BEFORE THE FIX: verify-dns.json, dns-evidence.json and dns-owner.log
     were ignored by `results/**` (git check-ignore exit 0), and the literal
     negations for them were absent from bench/chromium/.gitignore.
+
+    RED BEFORE THE SECOND FIX: the campaign keeps each verify bracket as
+    verify-dns-<stage>.json (pre, before-run, after-run) and dns-evidence.json
+    lists them in verify_files, but only the unsuffixed name was negated, so
+    `results/run-x/verify-dns-pre.json is ignored and would be lost on the
+    next wipe` (three subtests) and the literal `!results/**/verify-dns-*.json`
+    was absent.
     """
 
     IGNORE = os.path.join(HERE, ".gitignore")
     NEGATIONS = (
         "!results/**/verify-dns.json",
+        "!results/**/verify-dns-*.json",
         "!results/**/dns-evidence.json",
         "!results/**/diag/summary.json",
         "!results/**/dns-owner.log",
@@ -52,6 +60,9 @@ class EvidenceIgnoreRules(unittest.TestCase):
     )
     EVIDENCE = (
         "results/run-x/verify-dns.json",
+        "results/run-x/verify-dns-pre.json",
+        "results/run-x/verify-dns-before-run.json",
+        "results/run-x/verify-dns-after-run.json",
         "results/run-x/dns-evidence.json",
         "results/run-x/diag/summary.json",
         "results/run-x/dns-owner.log",
