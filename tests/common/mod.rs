@@ -731,7 +731,7 @@ pub fn spawn_log_consumer_stderr_with_logger(
 /// When a logger is provided:
 /// - All lines (including DEBUG/TRACE) are written to the file
 /// - Only non-debug lines are printed to console for cleaner output
-fn spawn_log_consumer_to_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+pub fn spawn_log_consumer_to_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     reader: Option<R>,
     name: &str,
     logger: Option<TestLogger>,
@@ -760,7 +760,37 @@ fn spawn_log_consumer_opts<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         tokio::spawn(async move {
             let reader = BufReader::new(reader);
             let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    // One unreadable line (a guest console is not obliged to
+                    // emit UTF-8) must not end the capture: the rest of the
+                    // stream is still coming, and the end-of-stream marker
+                    // below would then certify a truncated log as complete.
+                    // tokio has already consumed the offending line, so the
+                    // next read starts at the line after it.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        if let Some(ref log) = logger {
+                            log.log_raw(&format!(
+                                "[fcvm-test] {} consumer skipped an unreadable line: {}",
+                                name, e
+                            ));
+                        }
+                        continue;
+                    }
+                    // Any other read error is the stream itself failing; there
+                    // is nothing further to read, and the marker records it.
+                    Err(e) => {
+                        if let Some(ref log) = logger {
+                            log.log_raw(&format!(
+                                "[fcvm-test] {} consumer stopped on a read error: {}",
+                                name, e
+                            ));
+                        }
+                        break;
+                    }
+                };
                 let prefix = if is_stderr {
                     format!("[{} ERR]", name)
                 } else {
@@ -781,6 +811,15 @@ fn spawn_log_consumer_opts<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 }
             }
 
+            // The stream is closed: every line this consumer will ever write is
+            // in the file. `Child::wait()` only waits for the PROCESS; this task
+            // can still be copying buffered output when it returns, so a test that
+            // reads the log right after `wait()` races it. The marker is what
+            // `wait_for_log_eof` polls for.
+            if let Some(ref log) = logger {
+                log.log_raw(log_eof_marker(is_stderr));
+            }
+
             // Print log file path when stderr stream ends (once per process)
             if is_stderr {
                 if let Some(ref log) = logger {
@@ -788,6 +827,54 @@ fn spawn_log_consumer_opts<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 }
             }
         });
+    }
+}
+
+/// The line a log consumer appends when its stream reaches end-of-file.
+///
+/// Deliberately free of the words tests grep log files for (error, panic,
+/// leak, cleanup, delete), so its presence never trips an absence check.
+fn log_eof_marker(is_stderr: bool) -> &'static str {
+    if is_stderr {
+        "[fcvm-test] child stderr reached end of stream"
+    } else {
+        "[fcvm-test] child stdout reached end of stream"
+    }
+}
+
+/// Wait until BOTH of a spawned fcvm's log consumers have drained their streams
+/// into `log_path`, then return. Call this after the child has exited and before
+/// asserting on the log's contents.
+///
+/// The consumers spawned by `spawn_fcvm_with_env_and_log_path` (and every helper
+/// built on it) are detached tokio tasks; the child's exit does not join them,
+/// and a stream only closes once every holder of its write end has exited, which
+/// for fcvm includes the VMM it spawned. Reading the file before both end-of-stream
+/// markers are present can miss the last lines fcvm wrote: a positive control
+/// looking for a shutdown line fails spuriously, and an absence check passes
+/// vacuously against a still-filling file.
+pub async fn wait_for_log_eof(log_path: &std::path::Path, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(log_path)
+            .with_context(|| format!("reading log {}", log_path.display()))?;
+        // Whole-line match: child output is written with a `[name]` prefix and
+        // the harness's own records with a timestamp, so nothing but the marker
+        // itself can produce this line. A substring test would be satisfied by
+        // an argv or a child line that merely quotes the marker's text.
+        let reached = |marker: &str| text.lines().any(|line| line == marker);
+        if reached(log_eof_marker(false)) && reached(log_eof_marker(true)) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "log {} did not reach end of stream on both stdout and stderr within {:?}; \
+             the child (or a process holding its pipes) is still alive, or the log \
+             consumer is wedged",
+            log_path.display(),
+            timeout
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
