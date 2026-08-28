@@ -2709,3 +2709,90 @@ fn nix_geteuid_is_root() -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
+
+/// The worktree directory EXISTS on the volume but cannot be written into.
+///
+/// `mkdir -p` is idempotent: on an existing directory it succeeds without
+/// creating anything, so a writability probe built on it alone selects the
+/// managed branch and publishes a symlink to a directory Cargo cannot write --
+/// exit 0, then an opaque failure several steps later. Raised by Codex on #867.
+/// Ownership changes and read-only remounts both produce this state. The probe
+/// has to CREATE an entry inside the directory, not merely confirm the directory.
+///
+/// Root cannot be stopped by mode bits, so the root branch remounts the volume
+/// read-only through a bind mount and gets EROFS instead.
+#[test]
+fn cargo_target_link_falls_back_when_the_existing_worktree_dir_is_unwritable() {
+    // A FRESH checkout: no target/ yet. With one pre-existing, the script's
+    // "retaining unmanaged local target/" exit fires before any symlink is
+    // published and hides exactly the defect under test.
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+
+    // The script's own naming: sanitized basename + sha256(pwd -P)[..8].
+    let p = std::fs::canonicalize(checkout.path()).expect("canonical checkout path");
+    let base: String = p
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let digest = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(p.to_string_lossy().as_bytes()))
+    };
+    let wt_target = btrfs
+        .path()
+        .join("cargo-target")
+        .join(format!("{base}-{}", &digest[..8]));
+    std::fs::create_dir_all(&wt_target).expect("pre-create the worktree dir");
+
+    let root = nix_geteuid_is_root();
+    if root {
+        let ok = Command::new("mount")
+            .args([
+                "--bind",
+                btrfs.path().to_str().unwrap(),
+                btrfs.path().to_str().unwrap(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            && Command::new("mount")
+                .args(["-o", "remount,ro,bind", btrfs.path().to_str().unwrap()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        assert!(ok, "could not remount the btrfs stand-in read-only as root");
+    } else {
+        std::fs::set_permissions(&wt_target, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod 0555 on the worktree dir");
+    }
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    if root {
+        let _ = Command::new("umount").arg(btrfs.path()).status();
+    } else {
+        let _ = std::fs::set_permissions(&wt_target, std::fs::Permissions::from_mode(0o755));
+    }
+
+    assert!(ok, "the recipe failed outright:\n{out}");
+    let target = checkout.path().join("target");
+    assert!(
+        !target.is_symlink(),
+        "target/ was pointed at the unwritable managed directory {}; a probe that only \
+         `mkdir -p`s an existing directory cannot see that it is unwritable\n{out}",
+        std::fs::read_link(&target)
+            .map(|l| l.display().to_string())
+            .unwrap_or_default()
+    );
+    assert_target_usable(checkout.path(), "existing but unwritable worktree dir");
+}

@@ -92,12 +92,21 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # cannot create in (procfs, a read-only mount). Try the mkdir, and let its
 # outcome decide -- loudly, because artifacts on the root filesystem are the
 # thing this indirection exists to avoid and a reader should see it happen.
+# And "was created" is not "is writable" either: `mkdir -p` on a directory
+# that already exists succeeds without touching it, so an existing worktree
+# directory that has since gone read-only (ownership change, ro remount) would
+# pass the mkdir and then receive a symlink Cargo cannot write into -- exit 0
+# here, an opaque failure several steps later. The probe therefore CREATES an
+# entry inside the directory; that is the operation Cargo needs, and it is the
+# one root cannot fake past EROFS. (Raised on #867.)
 btrfs_usable=0
 if [ -d "$BTRFS_ROOT" ]; then
-	if mkdir -p "$WT_TARGET" 2>/dev/null; then
+	if mkdir -p "$WT_TARGET" 2>/dev/null \
+		&& write_probe="$(mktemp -p "$WT_TARGET" .fcvm-write-probe.XXXXXXXX 2>/dev/null)"; then
+		rm -f -- "$write_probe"
 		btrfs_usable=1
 	else
-		echo "==> WARNING: $BTRFS_ROOT exists but $WT_TARGET cannot be created; build artifacts stay on the root filesystem" >&2
+		echo "==> WARNING: $BTRFS_ROOT exists but $WT_TARGET cannot be written; build artifacts stay on the root filesystem" >&2
 	fi
 fi
 if ((btrfs_usable)); then
