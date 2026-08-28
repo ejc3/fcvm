@@ -307,9 +307,10 @@ fi
 #
 # Add to IGNORED_COMMENT_AUTHORS deliberately, and never a bot that reviews.
 IGNORED_COMMENT_AUTHORS=${IGNORED_COMMENT_AUTHORS:-vercel,vercel[bot],dependabot,dependabot[bot],github-actions,github-actions[bot],codecov,codecov[bot]}
-# Comments that are ONLY a trigger, e.g. "@codex review". Anchored and whole-body: a
-# finding that merely mentions @codex still counts.
-TRIGGER_RE='\A[[:space:]]*@[A-Za-z0-9_-]+([[:space:]]+[A-Za-z-]+)?[[:space:]]*\z'
+# Comments that are ONLY a trigger, e.g. "@codex review" or "@coderabbitai full review".
+# Anchored and whole-body, at most two words after the mention: a finding that merely
+# mentions @codex still counts.
+TRIGGER_RE='\A[[:space:]]*@[A-Za-z0-9_-]+([[:space:]]+[A-Za-z-]+){0,2}[[:space:]]*\z'
 # A reviewer with nothing to say posts no review object. Codex answers with a plain
 # comment: "Codex Review: Didn't find any major issues." plus one of a few short
 # sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
@@ -339,18 +340,30 @@ def is_verdict:
   verdict_lines as $l
   | ($l == ["<details>", "<summary>✅ Action performed</summary>", "Full review finished.", "</details>"])
     or ($l == ["<details>", "<summary>✅ Action performed</summary>", "Review finished.", "</details>"])
-    or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)));'
+    or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)));
+def verdict_sha:
+  verdict_lines as $l
+  | if ($l | length) == 2 and ($l[1] | test(reviewed_re)) then ($l[1] | capture(reviewed_re) | .sha) else "" end;'
+# Only these bots issue verdicts, and only from the account GitHub types as a Bot.
+# Anyone else posting the same words has written an ordinary comment: claimable like
+# any other, never coverage. Entries are `login` or `login=handle`, where handle is the
+# @-mention that requests a review from that bot (see the coverage check below).
+VERDICT_BOTS=${VERDICT_BOTS:-chatgpt-codex-connector=codex,coderabbitai}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
-bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" \
+bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
+  | ($bots | split(",") | map(split("=")[0])) as $botlogins
   | (.[0] | map({author, state, body, at: .submittedAt,
                  claimable: ((.state // "COMMENTED") != "APPROVED")}))
-  + (.[1] | map({author, state: "COMMENT", body, at: .createdAt,
-                 verdict: (.body | is_verdict),
-                 claimable: ((.author.login | IN($skip[]) | not)
-                             and ((.body // "") | test($trig) | not)
-                             and ((.body | is_verdict) | not))}))' \
+  + (.[1] | map(. as $c
+      | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))
+         and ($c.body | is_verdict)) as $v
+      | {author, state: "COMMENT", body, at: .createdAt,
+         verdict: $v, verdict_sha: (if $v then ($c.body | verdict_sha) else "" end),
+         claimable: ((.author.login | IN($skip[]) | not)
+                     and ((.body // "") | test($trig) | not)
+                     and ($v | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 
@@ -503,21 +516,54 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
   anyreview=$(jq -r --arg me "$prauthor" '[ .[] | select(.author.login != $me) ] | length' \
               <<<"$reviews") || {
     echo "verdict: BLOCKED — could not count reviews." >&2; exit 2; }
-  # A verdict with no findings leaves no review object (see VERDICT_JQ). One from someone
-  # other than the author, dated AFTER the head ARRIVED at GitHub, was issued for this
-  # head; dated before that, it was issued for an older one. Arrival is the creation of
-  # the head's earliest check suite, not committedDate: a commit made locally before an
-  # older head's verdict and pushed afterwards would otherwise read as covered. Without a
-  # check suite nothing can be dated after arrival, and the head stays uncovered.
+  # A verdict with no findings leaves no review object (see VERDICT_JQ), so it carries no
+  # commit of its own. It counts for THIS head only when something binds it here, and a
+  # verdict that is merely dated after the head arrived is not bound: a review of the old
+  # head that finishes after the push is dated the same way. Two bindings, both of which
+  # fail closed:
+  #   - Codex names the commit it reviewed in the verdict. That sha must be a prefix of
+  #     the head. A verdict naming an older commit was issued for that commit and is
+  #     ignored here (it still needs no disposition).
+  #   - CodeRabbit's reply names nothing, and its check suite on the head stays queued
+  #     with no check run, so there is no signal that names the head. The reply answers a
+  #     command, so it must answer a review request: a TRIGGER_RE comment, by anyone,
+  #     whose mention is that bot's handle, posted after the head ARRIVED and before the
+  #     verdict. The verdict must be that bot's first after that request; a later one
+  #     answers something else.
+  # Arrival is the creation of the head's earliest check suite, not committedDate: a
+  # commit made locally before an older head's verdict and pushed afterwards would
+  # otherwise read as covered. Without a check suite nothing can be dated after arrival
+  # and the head stays uncovered. Every verdict must postdate arrival under both bindings.
+  #
+  # The request binding leaves one window open: a review of the OLD head that finishes
+  # after a post-arrival request and before that request's own verdict is counted as the
+  # answer. Reaching it takes two overlapping reviews from one bot within minutes of each
+  # other, and closing it needs a signal that names the head, which CodeRabbit's reply
+  # does not carry. The sha binding closes it entirely for Codex.
   arrived=$(jq -r '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[]?.createdAt // empty] | min // ""' <<<"$payload" 2>/dev/null)
-  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" \
-             '[ .[] | select(.state == "COMMENT") | select(.author.login != $me)
-                | select(.verdict == true)
-                | select($hd != "" and (.at // "") > $hd) ] | length' <<<"$bodies") || {
+  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" --arg h "$headoid" \
+                --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" '
+    ($bots | split(",") | map(split("=") | {key: .[0], value: (.[1] // .[0])}) | from_entries) as $handle
+    | [ .[] | select(.state == "COMMENT") ] as $c
+    | [ $c[] | select(.verdict == true and .author.login != $me)
+        | select($hd != "" and (.at // "") > $hd)
+        | . as $v
+        | if ($v.verdict_sha // "") != "" then select($h | startswith($v.verdict_sha))
+          else
+            (($handle[$v.author.login] // $v.author.login) | ascii_downcase) as $mention
+            | ([ $c[] | select((.body // "") | test($trig))
+                      | select((((.body // "") | capture("\\A[[:space:]]*@(?<m>[A-Za-z0-9_-]+)") | .m)
+                                | ascii_downcase) == $mention)
+                      | .at | select(. > $hd and . < $v.at) ] | max) as $req
+            | select($req != null)
+            | select([ $c[] | select(.verdict == true and .author.login == $v.author.login)
+                            | .at | select(. > $req and . < $v.at) ] | length == 0)
+          end ]
+    | length' <<<"$bodies") || {
     echo "verdict: BLOCKED — could not evaluate no-findings verdicts." >&2; exit 2; }
   if [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ] && [ "${verdicts:-0}" -gt 0 ]; then
     echo
-    echo "  HEAD COVERED  ${headoid:0:9} — no review object, but $verdicts no-findings verdict(s) dated after it arrived ($arrived)"
+    echo "  HEAD COVERED  ${headoid:0:9}: no review object, but $verdicts no-findings verdict(s) bound to it (arrived $arrived)"
   elif [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ]; then
     echo
     echo "  UNREVIEWED HEAD  ${headoid:0:9} — reviews exist, none of them cover this commit"

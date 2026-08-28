@@ -231,11 +231,11 @@ CR_NOTE=$'Review finished.\n\n> Note: CodeRabbit is an incremental review system
 run_case "a codex no-findings comment after the head arrived covers it" \
   "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")]")" \
   0 "HEAD COVERED"
-run_case "a coderabbit full-review-finished after the head arrived covers it" \
-  "$(wrap6 "[$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+run_case "a coderabbit full-review-finished answering a request after arrival covers it" \
+  "$(wrap6 "[$(cmt me User 2026-01-02T00:40:00Z '"@coderabbitai full review"'),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
   0 "HEAD COVERED"
 run_case "a coderabbit incremental review-finished with its note covers it" \
-  "$(wrap6 "[$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body "$CR_NOTE")")]")" \
+  "$(wrap6 "[$(cmt me User 2026-01-02T00:40:00Z '"@coderabbitai review"'),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body "$CR_NOTE")")]")" \
   0 "HEAD COVERED"
 run_case "a verdict dated after the commit but before the head arrived is not coverage" \
   "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T00:10:00Z "$(codex_body '' deadbeef)")]")" \
@@ -278,6 +278,53 @@ run_case "a P1 on the codex phrase line, in the posted shape, is claimable, not 
 run_case "a details block other than About Codex is not stripped" \
   "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body $'\n\n<details><summary>Findings</summary>\nP1: drops data\n</details>' deadbeef)")]")" \
   1 "carry no disposition" "UNREVIEWED HEAD"
+
+echo "== finding 22: only a listed review bot can issue a verdict =="
+# The verdict words from anyone but the Bot account of a listed reviewer are an ordinary
+# comment: claimable like any other, and never coverage. Both fixtures name the head in
+# the reviewed-commit line, so only the author decides the outcome.
+run_case "a human posting the codex verdict is claimable, not coverage" \
+  "$(wrap6 "[$(cmt helpful-human User 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "an unlisted bot posting the codex verdict is claimable, not coverage" \
+  "$(wrap6 "[$(cmt some-other-bot Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+
+echo "== finding 23: a verdict is bound to the head, not merely dated after it =="
+# A review of the OLD head that finishes after the new one arrives is dated after arrival
+# too. Codex names the commit it reviewed, so that sha must be a prefix of the head.
+# CodeRabbit names nothing, so its reply must answer a review request addressed to it and
+# posted after arrival, and be its first verdict after that request.
+run_case "a codex verdict naming an older commit is not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")]")" \
+  1 "UNREVIEWED HEAD"
+# Guard, green before and after: a verdict for an older commit is still a verdict, and a
+# head covered by a review object does not go BLOCKED over an undisposed stale verdict.
+run_case "a codex verdict naming an older commit needs no disposition" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")")" \
+  0 "CLEAR"
+run_case "a coderabbit verdict with no request after arrival is not coverage" \
+  "$(wrap6 "[$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a request before arrival does not bind a verdict after it" \
+  "$(wrap6 "[$(cmt me User 2026-01-02T00:20:00Z '"@coderabbitai full review"'),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a request addressed to another bot does not bind a coderabbit verdict" \
+  "$(wrap6 "[$(cmt me User 2026-01-02T00:40:00Z '"@codex review"'),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a verdict before the request does not count, the one after it does" \
+  "$(wrap6 "[$(cmt coderabbitai Bot 2026-01-02T00:50:00Z "$(cr_body 'Full review finished.')"),$(cmt me User 2026-01-02T00:55:00Z '"@coderabbitai full review"'),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+  0 "HEAD COVERED" "1 no-findings verdict(s)"
+run_case "only the first verdict after a request answers it" \
+  "$(wrap6 "[$(cmt me User 2026-01-02T00:40:00Z '"@coderabbitai full review"'),$(cmt coderabbitai Bot 2026-01-02T00:50:00Z "$(cr_body 'Full review finished.')"),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+  0 "HEAD COVERED" "1 no-findings verdict(s)"
+# Guard, green before and after: GitHub logins are case-insensitive, so the mention is too.
+run_case "a request that mentions the bot in another case still binds" \
+  "$(wrap6 "[$(cmt me User 2026-01-02T00:40:00Z '"@CodeRabbitAI review"'),$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+  0 "HEAD COVERED"
+run_case "@coderabbitai full review is a trigger, not a finding" \
+  "$(wrap4 me '[]' '[]' "[$(cmt anyone User 2026-01-01T00:00:00Z '"@coderabbitai full review"')]")" \
+  0 "CLEAR"
 
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
