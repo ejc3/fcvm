@@ -3,8 +3,10 @@
 
     campaign_summary.py --out PATH <run_dir>...
 
-Each run directory holds reqanalyze's analysis.json (required),
-dns-evidence.json (optional; when present its verdict must be "clean") and
+Each run directory holds reqanalyze's analysis.json (required; its stall_gate
+must have been armed with --stall-max-ms, since an unarmed gate reports
+passed=true having evaluated nothing), dns-evidence.json (optional; when
+present its verdict must be "clean") and
 diag/summary.json (optional). The index names every file it was generated
 from with its sha256, and carries one cell per run: engine, cpu, memory_mib,
 guest_dns, publishable, stall_gate_passed, dns_verdict, the headline median
@@ -95,6 +97,14 @@ def load_cell(run_dir):
     if not isinstance(stall_gate, dict) or not isinstance(stall_gate.get("passed"), bool):
         raise RunError(
             f"{run_dir}: analysis.json has no stall_gate verdict; re-run reqanalyze"
+        )
+    max_ms = stall_gate.get("max_ms")
+    if isinstance(max_ms, bool) or not isinstance(max_ms, (int, float)) or max_ms <= 0:
+        # reqanalyze without --stall-max-ms writes passed=true, evaluated=0:
+        # a gate that evaluated nothing has no pass to report.
+        raise RunError(
+            f"{run_dir}: stall_gate was not armed (max_ms is {max_ms!r}); "
+            "re-run reqanalyze --stall-max-ms N"
         )
     if stall_gate["passed"] is not True:
         raise RunError(

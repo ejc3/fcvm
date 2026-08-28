@@ -31,11 +31,12 @@ import time
 import types
 import unittest
 import urllib.request
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import campaign_summary  # noqa: E402
 import reqanalyze  # noqa: E402
 import reqbench  # noqa: E402
 
@@ -7547,3 +7548,97 @@ class AnalyzerStallGate(unittest.TestCase):
             # An unknown flag also exits 2, which let this pass before the
             # flag existed; the refusal has to be the range check.
             self.assertIn("positive", stderr.getvalue())
+
+
+class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
+    """campaign_summary.py reads what reqanalyze.py actually writes.
+
+    test_campaign_summary.py drives the index from hand-written analysis.json
+    fixtures, so a field the analyzer spells differently, or a gate the
+    analyzer leaves unarmed, would pass both modules' own tests and fail only
+    on a real campaign. This runs the analyzer on a corpus-shaped run (two
+    hostnames, guest_dns set) and hands its analysis.json, plus a
+    dns-evidence.json in corpus_campaign.sh's shape, to the index.
+
+    RED BEFORE THE FIX: without --stall-max-ms the analyzer writes stall_gate
+    {max_ms: null, passed: true, evaluated: 0} and the index accepted it:
+    AssertionError: 0 == 0 : wrote .../campaign-x-summary.json: 1 cell(s).
+    The armed case is the positive control.
+    """
+
+    CORPUS = ["https://example.com/", "https://developer.mozilla.org/en-US/"]
+
+    @staticmethod
+    def _evidence(run_dir, verdict):
+        return {
+            "serve_pid": 4242,
+            "dnsmasq_was_active_before": True,
+            "dnsmasq_active_after_restore": False,
+            "samples": 12,
+            "sample_interval_s": 10,
+            "owner_log": os.path.join(run_dir, "dns-owner.log"),
+            "first_mismatch": None,
+            "verify_files": [os.path.join(run_dir, "verify-dns-pre.json")],
+            "corpus_dns_log_sha256": "0" * 64,
+            "corpus_access_log_sha256": "0" * 64,
+            "reason": None,
+            "verdict": verdict,
+        }
+
+    def _run_dir(self, d, analyzer_argv):
+        run_dir = os.path.join(d, "reqbench-20260828-000000-corpus")
+        os.makedirs(run_dir)
+        src = os.path.join(run_dir, "reqbench.jsonl")
+        AnalyzerResolverGate.write_multi_url(src, self.CORPUS, guest_dns="10.0.2.2")
+        analysis = os.path.join(run_dir, "analysis.json")
+        rc = _run_analyzer_fast(analyzer_argv + ["--json-out", analysis, src])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(run_dir, "dns-evidence.json"), "w") as handle:
+            json.dump(self._evidence(run_dir, "clean"), handle)
+        return run_dir
+
+    @staticmethod
+    def _summarize(out, run_dirs):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = campaign_summary.main_with(["--out", out] + list(run_dirs))
+        return rc, stdout.getvalue() + stderr.getvalue()
+
+    def test_an_analysis_without_a_stall_limit_is_not_indexed(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = self._run_dir(d, [])
+            with open(os.path.join(run_dir, "analysis.json")) as source:
+                gate = json.load(source)["stall_gate"]
+            self.assertIsNone(gate["max_ms"])
+            self.assertEqual(gate["evaluated"], 0)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("--stall-max-ms", text)
+
+    def test_a_gated_analysis_with_clean_evidence_is_indexed(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = self._run_dir(d, ["--stall-max-ms", "15000"])
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as source:
+                index = json.load(source)
+        self.assertEqual(len(index["cells"]), 1)
+        cell = index["cells"][0]
+        self.assertEqual(cell["engine"], "chromium")
+        self.assertEqual(cell["cpu"], 2)
+        self.assertEqual(cell["memory_mib"], 1024)
+        self.assertEqual(cell["guest_dns"], "10.0.2.2")
+        self.assertEqual(cell["backend"], "file")
+        self.assertEqual(cell["uffd_mode"], "file")
+        self.assertIs(cell["stall_gate_passed"], True)
+        self.assertEqual(cell["dns_verdict"], "clean")
+        self.assertEqual(cell["headline"]["cdp"]["blocking_ms"], 384.0)
+        self.assertEqual(cell["headline"]["cdp"]["n"], 200)
+        self.assertEqual(
+            {os.path.basename(entry["path"]) for entry in index["generated_from"]},
+            {"analysis.json", "dns-evidence.json"},
+        )
+

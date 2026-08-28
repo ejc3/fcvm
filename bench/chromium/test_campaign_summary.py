@@ -118,10 +118,14 @@ def write_run(
     diag=None,
     guest_dns="10.0.2.2",
     engine="chromium",
+    stall_max_ms=15000,
+    stall_evaluated=404,
 ):
     """A minimal run directory shaped like reqanalyze + the campaign evidence.
 
     dns_verdict=None omits dns-evidence.json; diag=None omits diag/summary.json.
+    stall_max_ms=None is what reqanalyze writes when it ran without
+    --stall-max-ms (passed true, evaluated 0).
     """
     os.makedirs(run_dir, exist_ok=True)
     analysis = {
@@ -147,7 +151,12 @@ def write_run(
                 "blocking_ms": {"median": 41.1, "lo": 40.0, "hi": 42.5, "n": 202},
             },
         },
-        "stall_gate": {"max_ms": 15000, "passed": stall_passed, "violations": []},
+        "stall_gate": {
+            "max_ms": stall_max_ms,
+            "passed": stall_passed,
+            "evaluated": stall_evaluated,
+            "violations": [],
+        },
     }
     paths = {"analysis": os.path.join(run_dir, "analysis.json")}
     with open(paths["analysis"], "w") as handle:
@@ -262,6 +271,24 @@ class CampaignSummary(unittest.TestCase):
             self.assertNotEqual(rc, 0)
             self.assertFalse(os.path.exists(out))
             self.assertIn("stall_gate", text)
+
+    def test_an_unarmed_stall_gate_refuses(self):
+        """reqbench.sh runs reqanalyze without --stall-max-ms, and the
+        analyzer then writes stall_gate {max_ms: null, passed: true,
+        evaluated: 0}. A pass from a gate that evaluated nothing is not a
+        pass; the index must refuse it rather than print stall_gate_passed.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, stall_max_ms=None, stall_evaluated=0)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("stall_gate", text)
+            self.assertIn("--stall-max-ms", text)
 
     def test_a_missing_analysis_refuses(self):
         with tempfile.TemporaryDirectory() as d:
