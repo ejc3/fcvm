@@ -10,16 +10,27 @@ dns-evidence.json (required when the cell's guest_dns names a baked resolver,
 optional otherwise; when present its verdict must be "clean" and every file it
 cites must be present and agree with it) and diag/summary.json (optional). The
 index names every file it was generated from with its sha256, and carries one
-cell per run: engine, cpu, memory_mib, guest_dns, publishable,
-stall_gate_passed, dns_verdict, the headline median blocking_ms per arm with
-its CI, and the diag summary when there is one.
+cell per run: engine, cpu, memory_mib, guest_dns, the seal identity,
+publishable, stall_gate_passed, dns_verdict, the headline median blocking_ms
+per arm with its CI, and the diag summary when there is one.
 
-The index is written only when every run is publishable, every stall gate
-passed and every DNS verdict is clean. Otherwise nothing is written, an index
-already at --out is removed, and the exit status is 5, the same code reqanalyze
-uses for a refused run: an index that quietly carried an unpublishable cell
-would be quoted by someone who only opened the index. Inputs are only ever
-read, and each is read once so the hash names the bytes that were parsed.
+The publication rule (REVIEW.md) is to quote only from sealed runs that passed
+their gates and were never withdrawn, and publishable=true alone proves none
+of that. The seal is the cell's identity, SEAL_FIELDS below: the runtime
+bundle reqbench.sh sealed, the fcvm binary and harness sources hashed into
+it, the source revision, and the image and snapshot generation measured. A
+cell missing any of them is not a sealed run. A run is withdrawn by a file
+named WITHDRAWN in its directory whose first line is the reason, or by
+"withdrawn": true in its analysis.json; either refuses the run and the
+refusal quotes the reason.
+
+The index is written only when every run is sealed, publishable and not
+withdrawn, every stall gate passed and every DNS verdict is clean. Otherwise
+nothing is written, an index already at --out is removed, and the exit status
+is 5, the same code reqanalyze uses for a refused run: an index that quietly
+carried an unpublishable cell would be quoted by someone who only opened the
+index. Inputs are only ever read, and each is read once so the hash names the
+bytes that were parsed.
 """
 
 import argparse
@@ -31,6 +42,18 @@ import sys
 import tempfile
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
+# The seal identity of one run, as reqbench.py stamps it into every record's
+# meta and reqanalyze carries it into the cell (CELL_FIELDS).
+SEAL_FIELDS = (
+    "runtime_bundle_sha256",
+    "fcvm_sha256",
+    "harness_sha256",
+    "source_revision",
+    "image_id",
+    "snapshot_generation_id",
+    "snapshot_config_sha256",
+)
+WITHDRAWN_MARKER = "WITHDRAWN"
 REPLAY_LOGS = {
     "corpus_dns_log_sha256": "corpus-dns.log",
     "corpus_access_log_sha256": "corpus-access.log",
@@ -110,6 +133,18 @@ def write_json_atomic(path, value):
 
 def positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def withdrawal_reason(marker):
+    """The first line of a WITHDRAWN marker; a marker that cannot be read
+    still withdraws the run."""
+    try:
+        with open(marker, "rb") as handle:
+            first_line = handle.readline()
+    except OSError as error:
+        return f"(marker present but unreadable: {error})"
+    reason = first_line.decode("utf-8", errors="replace").strip()
+    return reason or "(no reason recorded in the marker)"
 
 
 def check_evidence(run_dir, evidence, sources):
@@ -193,6 +228,9 @@ def check_evidence(run_dir, evidence, sources):
 def load_cell(run_dir):
     """Read one run directory into an index cell. Returns (cell, source entries)."""
     sources = Sources()
+    marker = os.path.join(run_dir, WITHDRAWN_MARKER)
+    if os.path.lexists(marker):
+        raise RunError(f"{run_dir}: withdrawn: {withdrawal_reason(marker)}")
     analysis_path = os.path.join(run_dir, "analysis.json")
     if not os.path.isfile(analysis_path):
         raise RunError(f"{run_dir}: analysis.json is missing")
@@ -200,6 +238,11 @@ def load_cell(run_dir):
     if not isinstance(analysis, dict):
         raise RunError(f"{analysis_path}: not a JSON object")
 
+    if analysis.get("withdrawn", False) is not False:
+        raise RunError(
+            f"{run_dir}: withdrawn: analysis.json records "
+            f"withdrawn={analysis.get('withdrawn')!r}"
+        )
     if analysis.get("publishable") is not True:
         reasons = (analysis.get("gate") or {}).get("reasons") or []
         raise RunError(f"{run_dir}: analysis.json is not publishable: {reasons}")
@@ -214,6 +257,15 @@ def load_cell(run_dir):
             raise RunError(
                 f"{run_dir}: analysis.json cell has no {field}; re-run reqanalyze"
             )
+    seal = {}
+    for field in SEAL_FIELDS:
+        value = cell.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RunError(
+                f"{run_dir}: analysis.json cell has no {field}; a run without its "
+                f"seal identity ({', '.join(SEAL_FIELDS)}) is not a sealed run"
+            )
+        seal[field] = value
     stall_gate = analysis.get("stall_gate")
     if not isinstance(stall_gate, dict) or not isinstance(stall_gate.get("passed"), bool):
         raise RunError(
@@ -286,6 +338,7 @@ def load_cell(run_dir):
         "guest_dns": cell["guest_dns"],
         "backend": cell.get("backend"),
         "uffd_mode": cell.get("uffd_mode"),
+        "seal": seal,
         "publishable": True,
         "stall_gate_passed": True,
         "dns_verdict": dns_verdict,

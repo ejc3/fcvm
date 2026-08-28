@@ -28,6 +28,9 @@ results/**
 !results/**/diag/summary.json
 !results/**/dns-owner.log
 !results/**/campaign-*-summary.json
+# The withdrawal marker: its first line is why the run may never be quoted,
+# and campaign_summary refuses the run while it is present.
+!results/**/WITHDRAWN
 !results/**/cpuprobe-*-curated.json
 !results/**/webkit-host-probe.json
 __pycache__/

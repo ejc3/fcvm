@@ -57,6 +57,7 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "!results/**/diag/summary.json",
         "!results/**/dns-owner.log",
         "!results/**/campaign-*-summary.json",
+        "!results/**/WITHDRAWN",
     )
     EVIDENCE = (
         "results/run-x/verify-dns.json",
@@ -68,6 +69,7 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "results/run-x/dns-owner.log",
         "results/campaign-x-summary.json",
         "results/campaign-x/campaign-x-summary.json",
+        "results/run-x/WITHDRAWN",
     )
     RAW = (
         "results/run-x/reqbench.jsonl",
@@ -111,6 +113,19 @@ class EvidenceIgnoreRules(unittest.TestCase):
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
 CORPUS_LOGS = ("corpus-dns.log", "corpus-access.log")
+# The seal identity reqbench.py stamps into every record's meta and
+# reqanalyze carries into the cell: the runtime bundle reqbench.sh sealed,
+# the binaries and sources hashed into it, the source revision, and the
+# image and snapshot generation that were measured.
+SEAL = {
+    "runtime_bundle_sha256": "8" * 64,
+    "fcvm_sha256": "a" * 64,
+    "harness_sha256": "c" * 64,
+    "source_revision": "b" * 40,
+    "image_id": "sha256:" + "e" * 64,
+    "snapshot_generation_id": "33333333-3333-4333-8333-333333333333",
+    "snapshot_config_sha256": "5" * 64,
+}
 
 
 def write_verify(path, passed=True):
@@ -140,6 +155,9 @@ def write_run(
     stall_evaluated=404,
     samples=12,
     evidence_overrides=None,
+    cell_overrides=None,
+    analysis_overrides=None,
+    withdrawn=None,
 ):
     """A minimal run directory shaped like reqanalyze + the campaign evidence.
 
@@ -149,23 +167,33 @@ def write_run(
     names three passing verify brackets, an owner log with `samples` lines
     and the two replay logs with their real sha256, the way
     corpus_campaign.sh writes them; evidence_overrides rewrites fields on top.
-    Returns every path the index is expected to read.
+    The cell carries SEAL; cell_overrides rewrites cell fields (a None value
+    removes the field) and analysis_overrides rewrites top-level fields.
+    withdrawn=<reason> writes a WITHDRAWN marker whose first line is the
+    reason. Returns every path the index is expected to read.
     """
     os.makedirs(run_dir, exist_ok=True)
+    cell = {
+        "backend": "uffd",
+        "uffd_mode": "minor",
+        "engine": engine,
+        "cpu": 2,
+        "memory_mib": 1024,
+        "guest_dns": guest_dns,
+        "url": "https://example.com/",
+        **SEAL,
+    }
+    for field, value in (cell_overrides or {}).items():
+        if value is None:
+            cell.pop(field, None)
+        else:
+            cell[field] = value
     analysis = {
         "publishable": publishable,
         "gate": {"passed": publishable, "reasons": [] if publishable else ["x"]},
         "run_id": "0" * 32,
         "backend": "uffd",
-        "cell": {
-            "backend": "uffd",
-            "uffd_mode": "minor",
-            "engine": engine,
-            "cpu": 2,
-            "memory_mib": 1024,
-            "guest_dns": guest_dns,
-            "url": "https://example.com/",
-        },
+        "cell": cell,
         "arms": {
             "cdp": {
                 "blocking_ms": {"median": 647.2, "lo": 567.6, "hi": 702.9, "n": 202},
@@ -182,9 +210,13 @@ def write_run(
             "violations": [],
         },
     }
+    analysis.update(analysis_overrides or {})
     paths = {"analysis": os.path.join(run_dir, "analysis.json")}
     with open(paths["analysis"], "w") as handle:
         json.dump(analysis, handle)
+    if withdrawn is not None:
+        with open(os.path.join(run_dir, "WITHDRAWN"), "w") as handle:
+            handle.write(f"{withdrawn}\nsecond line: detail the refusal need not quote\n")
     if dns_verdict is not None:
         verify_files = []
         for stage in VERIFY_STAGES:
@@ -288,6 +320,7 @@ class CampaignSummary(unittest.TestCase):
         self.assertEqual(cell["guest_dns"], "10.0.2.2")
         self.assertIs(cell["publishable"], True)
         self.assertIs(cell["stall_gate_passed"], True)
+        self.assertEqual(cell["seal"], SEAL)
         self.assertEqual(cell["dns_verdict"], "clean")
         self.assertEqual(cell["headline"]["cdp"]["blocking_ms"], 647.2)
         self.assertEqual(cell["headline"]["cdp"]["blocking_ms_ci"], [567.6, 702.9])
@@ -582,6 +615,46 @@ class CampaignSummary(unittest.TestCase):
             self.assertFalse(os.path.exists(out), "the stale index survived")
             self.assertIn(run_dir, text)
             self.assertIn("dns-evidence.json is not a JSON object", text)
+
+    def test_a_cell_without_its_seal_identity_refuses(self):
+        """publishable=true was the only publication-state proof the index
+        took. The rule (REVIEW.md) is to quote only sealed runs, and the
+        seal is the cell's identity: reqbench.sh's runtime bundle hash, the
+        fcvm and harness hashes sealed into it, the source revision, the
+        image ID and the snapshot generation with its config digest. A cell
+        missing any of them, or carrying one blank, was indexed.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s) (seven missing-field subtests
+        and the blank one)
+        """
+        for field in SEAL:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as d:
+                _paths, text = self._refused(d, cell_overrides={field: None})
+                self.assertIn(field, text)
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(d, cell_overrides={"source_revision": "  "})
+            self.assertIn("source_revision", text)
+
+    def test_a_withdrawn_run_refuses_with_its_reason(self):
+        """Withdrawn runs stay unquotable forever (REVIEW.md), and nothing in
+        a run directory said so to the index. A file named WITHDRAWN in the
+        run directory withdraws it; its first line is the reason and the
+        refusal quotes it. An analysis.json carrying "withdrawn": true is
+        refused the same way.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s) (both cases)
+        """
+        reason = "measured on a tree without pasta's pdeathsig"
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(d, withdrawn=reason)
+            self.assertIn("withdrawn", text)
+            self.assertIn(reason, text)
+            self.assertNotIn("second line", text)
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(d, analysis_overrides={"withdrawn": True})
+            self.assertIn("withdrawn", text)
 
     def test_the_index_cannot_alias_an_input(self):
         with tempfile.TemporaryDirectory() as d:

@@ -54,6 +54,13 @@ must not kill the run, and "the log stopped growing" is not a completion
 signal. Fresh-box prerequisites (packages, NVMe store, sibling checkouts) are
 in the repo-root AGENTS.md quickstart.
 
+To withdraw a run after the fact, add a file named `WITHDRAWN` to its results
+directory whose first line is the reason; `campaign_summary.py` refuses the run
+and quotes that line, and refuses an `analysis.json` carrying `"withdrawn":
+true` the same way. The marker is tracked (`!results/**/WITHDRAWN` in
+`bench/chromium/.gitignore`) and is never removed, because a withdrawn run
+stays unquotable (REVIEW.md).
+
 ## Six methodology defects — do not reintroduce
 
 1. **Matched accounting basis.** Sum memory over the SAME process set for every
