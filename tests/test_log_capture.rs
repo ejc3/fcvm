@@ -83,6 +83,70 @@ impl tokio::io::AsyncRead for TornPipe {
     }
 }
 
+/// A reader that serves one line, then fails with an `InvalidData` I/O error,
+/// then reports end-of-stream.
+struct InvalidDataThenEof {
+    step: u8,
+}
+
+impl tokio::io::AsyncRead for InvalidDataThenEof {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        me.step += 1;
+        match me.step {
+            1 => {
+                buf.put_slice(b"served before the failure\n");
+                std::task::Poll::Ready(Ok(()))
+            }
+            2 => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reader reported corrupt input",
+            ))),
+            _ => std::task::Poll::Ready(Ok(())), // EOF
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_reader_invalid_data_error_is_a_failed_capture_not_a_skipped_line() {
+    // tokio's `Lines` reports a UTF-8 decode failure AND an `InvalidData`
+    // error from the reader itself the same way. Only the former is "one bad
+    // line, keep going"; the latter is the stream failing, and an EOF after it
+    // must not certify the capture complete (CodeRabbit on #869).
+    let logger = common::TestLogger::new("log-capture-reader-invalid-data");
+    let path = logger.path().clone();
+    let stderr: &'static [u8] = b"";
+    common::spawn_log_consumer_to_file(
+        Some(InvalidDataThenEof { step: 0 }),
+        "rid",
+        Some(logger.clone()),
+        false,
+    );
+    common::spawn_log_consumer_to_file(Some(stderr), "rid", Some(logger), true);
+
+    let result = common::wait_for_log_eof(&path, Duration::from_secs(5)).await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let err = match result {
+        Ok(()) => panic!(
+            "a reader error of kind InvalidData was treated as a skipped line and the \
+             following EOF certified the capture complete:\n{text}"
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("reader reported corrupt input"),
+        "the waiter's error must carry the reader's error:\n{err}\n{text}"
+    );
+    assert!(
+        text.contains("served before the failure"),
+        "lines before the failure stay:\n{text}"
+    );
+}
+
 #[tokio::test]
 async fn wait_for_log_eof_reports_a_failed_capture_instead_of_certifying_it() {
     let logger = common::TestLogger::new("log-capture-torn");

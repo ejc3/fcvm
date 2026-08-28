@@ -758,32 +758,45 @@ fn spawn_log_consumer_opts<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         let name = name.to_string();
         let has_logger = logger.is_some();
         tokio::spawn(async move {
-            let reader = BufReader::new(reader);
-            let mut lines = reader.lines();
+            let mut reader = BufReader::new(reader);
+            let mut raw = Vec::new();
             loop {
-                let line = match lines.next_line().await {
-                    Ok(Some(line)) => line,
-                    Ok(None) => break,
-                    // One unreadable line (a guest console is not obliged to
-                    // emit UTF-8) must not end the capture: the rest of the
-                    // stream is still coming, and the end-of-stream marker
-                    // below would then certify a truncated log as complete.
-                    // tokio has already consumed the offending line, so the
-                    // next read starts at the line after it.
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                        if let Some(ref log) = logger {
-                            log.log_raw(&format!(
-                                "[fcvm-test] {} consumer skipped an unreadable line: {}",
-                                name, e
-                            ));
+                raw.clear();
+                // `read_until` + `from_utf8`, not `Lines`: tokio's `Lines` reports
+                // a UTF-8 decode failure AND an `InvalidData` error from the
+                // reader itself the same way, and only the former is "one bad
+                // line, keep going". Every reader error ends the capture with
+                // the failure record below, never the clean marker.
+                let line = match reader.read_until(b'\n', &mut raw).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if raw.last() == Some(&b'\n') {
+                            raw.pop();
+                            if raw.last() == Some(&b'\r') {
+                                raw.pop();
+                            }
                         }
-                        continue;
+                        match String::from_utf8(std::mem::take(&mut raw)) {
+                            Ok(line) => line,
+                            // A guest console is not obliged to emit UTF-8. One
+                            // undecodable line must not end the capture: the rest
+                            // of the stream is still coming.
+                            Err(e) => {
+                                if let Some(ref log) = logger {
+                                    log.log_raw(&format!(
+                                        "[fcvm-test] {} consumer skipped an unreadable line: {}",
+                                        name, e
+                                    ));
+                                }
+                                continue;
+                            }
+                        }
                     }
-                    // Any other read error is the stream itself failing, and
-                    // whatever the child wrote after it is lost. That is NOT
-                    // end-of-stream: the failure record below is what
-                    // `wait_for_log_eof` turns into an error, and the clean
-                    // marker is deliberately not written.
+                    // The stream itself failed, whatever the error's kind:
+                    // whatever the child wrote after this is lost, so this is
+                    // NOT end-of-stream. `wait_for_log_eof` turns the record
+                    // into an error; the clean marker is deliberately not
+                    // written.
                     Err(e) => {
                         if let Some(ref log) = logger {
                             log.log_raw(&format!("{}{}", log_failure_prefix(is_stderr), e));
