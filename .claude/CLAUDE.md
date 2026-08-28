@@ -172,11 +172,13 @@ unresolved, and while any finding — inline OR in a PR-level review body — ca
 disposition. One vocabulary for both:
 
 A head that no reviewer has anything to say about is still reviewed: the gate counts a
-review bot's no-findings verdict (Codex's "Didn't find any major issues" comment,
-CodeRabbit's "Full review finished." reply) as coverage of the head when the verdict is
-bound to it. Codex's names the commit it reviewed, which must be the head; CodeRabbit's
-must answer a review request posted after the head arrived at GitHub. Only the bots the
-gate lists (`VERDICT_BOTS`) can issue one, and such verdicts need no disposition.
+listed review bot's (`VERDICT_BOTS`) no-findings result as coverage of the head when the
+bot names the head. Codex's "Didn't find any major issues" comment names the commit it
+reviewed, which must be the head. CodeRabbit's "Full review finished." reply names nothing
+and never covers on its own; what names the head is the walkthrough comment CodeRabbit
+edits in place, whose recent-review block says which commit range it reviewed. That range
+must end at the head and the edit must postdate the head's arrival at GitHub. Both bots'
+no-findings replies need no disposition.
 
 | `RED-VERIFIED: <test>` | a defect claim, closed by a test watched failing without the fix |
 | `NOT-A-DEFECT: <reason>` | naming, docs, style |

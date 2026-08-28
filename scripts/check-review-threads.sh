@@ -98,7 +98,7 @@ fetch_payload() {
           pullRequest(number: $pr) {
             comments(first: $REVIEWS_PAGE_SIZE$cafter) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login __typename } body createdAt }
+              nodes { author { login __typename } body createdAt updatedAt }
             } } } }" 2>/dev/null) || return 1
     prcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
           <(echo "$prcomments") <(echo "$cresp2"))
@@ -307,33 +307,43 @@ fi
 #
 # Add to IGNORED_COMMENT_AUTHORS deliberately, and never a bot that reviews.
 IGNORED_COMMENT_AUTHORS=${IGNORED_COMMENT_AUTHORS:-vercel,vercel[bot],dependabot,dependabot[bot],github-actions,github-actions[bot],codecov,codecov[bot]}
-# Comments that are ONLY a trigger, e.g. "@codex review" or "@coderabbitai full review".
-# Anchored and whole-body, at most two words after the mention: a finding that merely
-# mentions @codex still counts.
-TRIGGER_RE='\A[[:space:]]*@[A-Za-z0-9_-]+([[:space:]]+[A-Za-z-]+){0,2}[[:space:]]*\z'
+# Comments that are ONLY a documented bot command: "@codex review", "@codex security
+# review", or "@coderabbitai" followed by one of review, full review, resume, pause,
+# ignore, resolve, summary, help, configuration. The handles are the mention names of the
+# bots in VERDICT_BOTS and the commands are the ones each bot documents (Codex in its
+# About block, CodeRabbit in its command reference). Case-insensitive, because GitHub
+# logins are. Any other comment that opens with a mention is a finding and stays
+# claimable: "@me drops records" and "@codex drops records" both need a disposition. An
+# earlier version exempted any mention plus up to two words, which exempted exactly those.
+TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coderabbitai[[:space:]]+(full[[:space:]]+review|review|resume|pause|ignore|resolve|summary|help|configuration))[[:space:]]*\z'
 # A reviewer with nothing to say posts no review object. Codex answers with a plain
 # comment: "Codex Review: Didn't find any major issues." plus one of a few short
 # sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
 # block. A CodeRabbit review that produces no comments replies "Full review finished."
 # (or "Review finished." for an incremental one) folded under "Action performed". Those
-# are verdicts, not findings: they need no disposition, and they are the only coverage a
-# clean head will ever get (see the coverage check below for who may issue one and how
-# it is bound to the head).
+# are verdicts, not findings: they need no disposition. Codex's also covers the commit it
+# names; CodeRabbit's names nothing, and its coverage comes from the walkthrough comment
+# instead (walkthrough_sha below, and the coverage check for how a result is bound to
+# the head).
 #
-# The verdict must be the WHOLE comment. After dropping HTML comments, blank lines,
-# "> Note:" lines and the About Codex block, the remaining lines must be exactly one of
-# the shapes below; anything else is a finding and stays claimable. The Codex sign-off
-# is matched against the list of ones Codex has actually posted on this repo, because
+# The verdict must be the WHOLE comment. After dropping HTML comments, blank lines, the
+# About Codex block and the one blockquote line CodeRabbit's incremental reply carries
+# (matched whole; it is the only blockquote line that bot's replies on this repo have
+# ever contained), the remaining lines must be exactly one of the shapes below; anything
+# else is a finding and stays claimable. Dropping every line that starts with ">" was a
+# hole: a bot quoting its finding, "> P1: this drops records", had posted a verdict. The
+# Codex sign-off is matched against the list of ones Codex has posted on this repo, because
 # an open-ended tail would accept "Didn't find any major issues. P1: drops data" as a
 # verdict. An unlisted sign-off is not a verdict, so the gate blocks until someone reads
 # the comment, which is the right direction; extend the list when Codex says something
 # new. Only the About Codex block is stripped, and only under that exact summary text:
 # a details block with any other summary is where a bot folds its findings.
-VERDICT_JQ='def verdict_lines:
+VERDICT_JQ='def cr_note: "> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.";
+def verdict_lines:
   ((. // "") | gsub("<!--(.|\n)*?-->"; "")
     | gsub("<details> <summary>ℹ️ About Codex in GitHub</summary>(.|\n)*?</details>"; "")
     | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
-    | map(select(length > 0 and (startswith(">") | not))));
+    | map(select(length > 0 and . != cr_note)));
 def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| 👍)?$";
 def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
 def is_verdict:
@@ -343,26 +353,40 @@ def is_verdict:
     or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)));
 def verdict_sha:
   verdict_lines as $l
-  | if ($l | length) == 2 and ($l[1] | test(reviewed_re)) then ($l[1] | capture(reviewed_re) | .sha) else "" end;'
+  | if ($l | length) == 2 and ($l[1] | test(reviewed_re)) then ($l[1] | capture(reviewed_re) | .sha) else "" end;
+def cr_range_re: "Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and (?<sha>[0-9a-f]{40})\\.";
+def walkthrough_sha:
+  ([ (. // "")
+     | select(test("<!-- This is an auto-generated comment: summarize by coderabbit\\.ai -->"))
+     | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r
+     | capture(cr_range_re) | .sha ] | first) // "";'
 # Only these bots issue verdicts, and only from the account GitHub types as a Bot.
 # Anyone else posting the same words has written an ordinary comment: claimable like
-# any other, never coverage. Entries are `login` or `login=handle`, where handle is the
-# @-mention that requests a review from that bot (see the coverage check below).
-VERDICT_BOTS=${VERDICT_BOTS:-chatgpt-codex-connector=codex,coderabbitai}
+# any other, never coverage. Entries are logins; their mention handles (@codex,
+# @coderabbitai) are the ones TRIGGER_RE accepts.
+VERDICT_BOTS=${VERDICT_BOTS:-chatgpt-codex-connector,coderabbitai}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
+#
+# Each top-level comment also records `reviewed_sha`, the commit a listed bot says it
+# reviewed (Codex: the verdict's reviewed-commit line; CodeRabbit: the walkthrough's
+# recent-review range), and `reviewed_at`, when it said so. A verdict is posted once, so
+# its createdAt is that time; the walkthrough is edited in place, so its updatedAt is.
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
-  | ($bots | split(",") | map(split("=")[0])) as $botlogins
+  | ($bots | split(",")) as $botlogins
   | (.[0] | map({author, state, body, at: .submittedAt,
                  claimable: ((.state // "COMMENTED") != "APPROVED")}))
   + (.[1] | map(. as $c
-      | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))
-         and ($c.body | is_verdict)) as $v
+      | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))) as $listed
+      | ($listed and ($c.body | is_verdict)) as $v
       | {author, state: "COMMENT", body, at: .createdAt,
-         verdict: $v, verdict_sha: (if $v then ($c.body | verdict_sha) else "" end),
+         verdict: $v,
+         reviewed_sha: (if $v then ($c.body | verdict_sha)
+                        elif $listed then ($c.body | walkthrough_sha) else "" end),
+         reviewed_at: (if $v then .createdAt else (.updatedAt // "") end),
          claimable: ((.author.login | IN($skip[]) | not)
-                     and ((.body // "") | test($trig) | not)
+                     and ((.body // "") | test($trig; "i") | not)
                      and ($v | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
@@ -516,52 +540,45 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
   anyreview=$(jq -r --arg me "$prauthor" '[ .[] | select(.author.login != $me) ] | length' \
               <<<"$reviews") || {
     echo "verdict: BLOCKED — could not count reviews." >&2; exit 2; }
-  # A verdict with no findings leaves no review object (see VERDICT_JQ), so it carries no
-  # commit of its own. It counts for THIS head only when something binds it here, and a
-  # verdict that is merely dated after the head arrived is not bound: a review of the old
-  # head that finishes after the push is dated the same way. Two bindings, both of which
-  # fail closed:
-  #   - Codex names the commit it reviewed in the verdict. That sha must be a prefix of
-  #     the head. A verdict naming an older commit was issued for that commit and is
+  # A no-findings result leaves no review object (see VERDICT_JQ), so it carries no commit
+  # of its own. It counts for THIS head only when the bot itself names the head. A result
+  # merely dated after the head arrived is not bound: a review of the old head that
+  # finishes after the push is dated the same way. What names the head, per bot:
+  #   - Codex writes the commit it reviewed into the verdict. That sha must be a prefix
+  #     of the head. A verdict naming an older commit was issued for that commit and is
   #     ignored here (it still needs no disposition).
-  #   - CodeRabbit's reply names nothing, and its check suite on the head stays queued
-  #     with no check run, so there is no signal that names the head. The reply answers a
-  #     command, so it must answer a review request: a TRIGGER_RE comment, by anyone,
-  #     whose mention is that bot's handle, posted after the head ARRIVED and before the
-  #     verdict. The verdict must be that bot's first after that request; a later one
-  #     answers something else.
+  #   - CodeRabbit's "Full review finished." reply names nothing, so it never covers a
+  #     head on its own: it is a notice, exempt from dispositions and nothing more. What
+  #     names the head is the walkthrough comment CodeRabbit edits in place. After a
+  #     review that produced no comments it carries, between "<!-- recent_review_start -->"
+  #     and "<!-- recent_review_end -->", the line "Reviewing files that changed from the
+  #     base of the PR and between <sha> and <sha>". The second sha is the last commit
+  #     reviewed and must be the head, and the comment's updatedAt must postdate the
+  #     head's arrival. (A review that did produce comments leaves a review object on the
+  #     head, which `reviewed` counts.) Only that block counts: the same comment quotes
+  #     an identical range line inside its "Review limit reached" notice for a review that
+  #     did NOT run. On #872 that notice named head 181fcbbb, which no CodeRabbit review
+  #     ever covered.
+  # An earlier version bound CodeRabbit's reply to the latest review request posted after
+  # arrival. That is timestamp ordering, not binding: a review of the old head that
+  # finished after a new request was counted as that request's answer. Withdrawn.
   # Arrival is the creation of the head's earliest check suite, not committedDate: a
   # commit made locally before an older head's verdict and pushed afterwards would
   # otherwise read as covered. Without a check suite nothing can be dated after arrival
-  # and the head stays uncovered. Every verdict must postdate arrival under both bindings.
-  #
-  # The request binding leaves one window open: a review of the OLD head that finishes
-  # after a post-arrival request and before that request's own verdict is counted as the
-  # answer. Reaching it takes two overlapping reviews from one bot within minutes of each
-  # other, and closing it needs a signal that names the head, which CodeRabbit's reply
-  # does not carry. The sha binding closes it entirely for Codex.
+  # and the head stays uncovered.
   arrived=$(jq -r '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[]?.createdAt // empty] | min // ""' <<<"$payload" 2>/dev/null)
-  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" --arg h "$headoid" \
-                --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" '
-    ($bots | split(",") | map(split("=") | {key: .[0], value: (.[1] // .[0])}) | from_entries) as $handle
-    | [ .[] | select(.state == "COMMENT") ] as $c
-    | [ $c[] | select(.verdict == true and .author.login != $me)
-        | select($hd != "" and (.at // "") > $hd)
-        | . as $v
-        | if ($v.verdict_sha // "") != "" then select($h | startswith($v.verdict_sha))
-          else
-            (($handle[$v.author.login] // $v.author.login) | ascii_downcase) as $mention
-            | ([ $c[] | select((.body // "") | test($trig))
-                      | select((((.body // "") | capture("\\A[[:space:]]*@(?<m>[A-Za-z0-9_-]+)") | .m)
-                                | ascii_downcase) == $mention)
-                      | .at | select(. > $hd and . < $v.at) ] | max) as $req
-            | select($req != null)
-            | select([ $c[] | select(.verdict == true and .author.login == $v.author.login)
-                            | .at | select(. > $req and . < $v.at) ] | length == 0)
-          end ]
+  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" --arg h "$headoid" '
+    [ .[] | select(.state == "COMMENT" and .author.login != $me)
+        | . as $r
+        | select(($r.reviewed_sha // "") != "" and ($h | startswith($r.reviewed_sha)))
+        | select($hd != "" and ($r.reviewed_at // "") > $hd) ]
     | length' <<<"$bodies") || {
     echo "verdict: BLOCKED — could not evaluate no-findings verdicts." >&2; exit 2; }
-  if [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ] && [ "${verdicts:-0}" -gt 0 ]; then
+  # `anyreview` counts review objects, and a no-findings result has none. A head whose
+  # only review result is such a result must still print HEAD COVERED, so `anyreview`
+  # gates only the blocking branch, where "reviews exist, none on this commit" is the
+  # claim being made.
+  if [ "${reviewed:-0}" -eq 0 ] && [ "${verdicts:-0}" -gt 0 ]; then
     echo
     echo "  HEAD COVERED  ${headoid:0:9}: no review object, but $verdicts no-findings verdict(s) bound to it (arrived $arrived)"
   elif [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ]; then
