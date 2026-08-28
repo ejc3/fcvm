@@ -24,10 +24,10 @@ Either log is evidence the campaign hashes once this process has exited, so
 the log has to be complete when it exits. SIGTERM and SIGINT run the shutdown
 sequence (stop_listeners): every listener stops accepting, the DNS responder
 ends, every handler already dequeued finishes and writes its line, the logs
-are closed, and main() returns 0. A line that cannot be written stops the
-server through the same sequence: the DNS responder closes its socket, an
-access line that fails ends both HTTP listeners, and main() returns 1 with
-the reason.
+are closed, and main() returns 0. A line that cannot be written, in either
+log, stops the server through the same sequence (ReplayServer.fail_closed):
+the DNS responder closes its socket as well, both HTTP listeners end, and
+main() returns 1 with the reason.
 """
 
 import argparse
@@ -405,7 +405,7 @@ def bind_dns(addr: str, port: int) -> socket.socket:
 
 
 def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
-              log: JsonlLog | None = None):
+              log: JsonlLog | None = None, server: "ReplayServer | None" = None):
     """Answer every A query on `sock` with answer_ip (AAAA answered empty, forcing v4).
 
     Browser-agnostic host mapping for the replay arm: the replay container
@@ -419,8 +419,14 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
     is dropped so one malformed packet cannot stop the replay. A log line that
     cannot be written is the one exception: an answered, unlogged query is a
     hole in the evidence the campaign hashes, so the responder closes its
-    socket and raises. The guest then stops resolving and the campaign's :53
-    owner sampler finds no owner, and the run is refused on both counts.
+    socket, reports the failure to `server` (any one of the HTTP listeners;
+    fail_closed stops them all and main() exits 1 with the reason) and
+    raises, which puts the traceback in corpus_serve.log. The guest then
+    stops resolving and fetching. Closing only the socket was not enough: in
+    the after-run bracket the :53 owner sampler has already stopped, so a
+    clone that still held its answers fetched through the listeners that
+    were still up, the bracket passed, and the truncated log was hashed as
+    clean.
     """
     while True:
         try:
@@ -463,8 +469,10 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
                     "qtype": qtype,
                     "answer": answered,
                 })
-            except OSError:
+            except OSError as exc:
                 sock.close()
+                if server is not None:
+                    server.fail_closed(exc, "dns")
                 raise
 
 
@@ -520,8 +528,8 @@ def main():
         ctx.load_cert_chain(str(crt), str(key))
     tls.socket = ctx.wrap_socket(tls.socket, server_side=True)
 
-    dns_thread = threading.Thread(target=serve_dns, args=(dns_sock, args.answer_ip, dns_log),
-                                  daemon=True)
+    dns_thread = threading.Thread(target=serve_dns,
+                                  args=(dns_sock, args.answer_ip, dns_log, plain), daemon=True)
     dns_thread.start()
     print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> {args.answer_ip}", flush=True)
     install_signal_handlers(plain)

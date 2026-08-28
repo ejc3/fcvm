@@ -452,6 +452,66 @@ class AccessLog(unittest.TestCase):
             self.assertIn("FAILED", err.getvalue())
             self.assertIn("No space left on device", err.getvalue())
 
+    def test_a_dns_log_line_that_cannot_be_written_stops_the_http_listeners(self):
+        """A DNS line that could not be written closed the responder's socket
+        and raised in its own thread, and nothing else: the HTTP listeners
+        kept answering. In the after-run bracket the :53 owner sampler has
+        already stopped, the clone resolves what it still holds and fetches
+        through the listeners that are still up, the bracket passes, and the
+        truncated DNS log is hashed as clean. The failure must reach the
+        server-wide state the access log's failure uses, so every listener
+        stops and main() exits 1 with the reason.
+
+        The line follows the answer, so the query whose line fails is still
+        answered; what must not happen is an HTTP request after it.
+
+        Red: the responder thread died on `TypeError: serve_dns() got an
+        unexpected keyword argument 'server'` before answering, so the first
+        query timed out (`TimeoutError: timed out`); with the argument
+        accepted and unused: `True is not false : the HTTP listener kept
+        serving after a failed DNS-log write`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            access_log = corpus_serve.JsonlLog(os.path.join(d, "corpus-access.log"))
+            self.addCleanup(access_log.close)
+            server, thread = self._replay(d, access_log)
+            dns_log_path = os.path.join(d, "corpus-dns.log")
+            dns_log = self.BreaksAfter(dns_log_path, 1)
+            self.addCleanup(dns_log.close)
+            sock = corpus_serve.bind_dns("127.0.0.1", 0)
+            port = sock.getsockname()[1]
+            seen = []
+            saved_hook = threading.excepthook
+            threading.excepthook = lambda args: seen.append(args.exc_value)
+            self.addCleanup(setattr, threading, "excepthook", saved_hook)
+            responder = threading.Thread(target=corpus_serve.serve_dns,
+                                         args=(sock, "10.0.2.2", dns_log),
+                                         kwargs={"server": server}, daemon=True)
+            responder.start()
+            for name in ("first.test", "second.test"):
+                client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.addCleanup(client.close)
+                client.settimeout(5)
+                client.sendto(dns_query(name, QTYPE_A), ("127.0.0.1", port))
+                reply, _ = client.recvfrom(512)
+                self.assertEqual(socket.inet_ntoa(reply[-4:]), "10.0.2.2", f"{name} was not answered")
+            responder.join(timeout=5)
+            self.assertFalse(responder.is_alive(), "serve_dns kept serving after a failed log write")
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive(),
+                             "the HTTP listener kept serving after a failed DNS-log write")
+            self.assertIsInstance(server.log_failure, OSError)
+            self.assertEqual(server.log_failure.errno, errno.ENOSPC)
+            self.assertEqual(server.failed_log, "dns")
+            self.assertEqual([r["qname"] for r in read_jsonl(dns_log_path)], ["first.test"])
+            self.assertTrue(seen and isinstance(seen[0], OSError),
+                            f"the failure no longer reaches corpus_serve.log through the thread: {seen}")
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=1)
+            self.addCleanup(conn.close)
+            with self.assertRaises(OSError, msg="a request was answered after the failed DNS-log write"):
+                conn.request("GET", "/a.txt", headers={"Host": "example.test"})
+                conn.getresponse()
+
     def test_a_signal_stop_waits_for_the_handlers_in_flight_before_closing_the_log(self):
         """The access line follows the response, so a client can hold the
         whole body while the line is still unwritten. The campaign sends
