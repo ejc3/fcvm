@@ -542,8 +542,12 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
 
     @staticmethod
     def _set_load(loadavg, load1):
-        with open(loadavg, "w") as handle:
+        """Write, then rename over: the sampler reads this file by name every
+        DNS_SAMPLE_INTERVAL, and a truncate followed by a write leaves it a
+        window in which the load column is empty."""
+        with open(loadavg + ".new", "w") as handle:
             handle.write(f"{load1} 0.30 0.20 1/100 1234\n")
+        os.replace(loadavg + ".new", loadavg)
 
     def _make_env(self, env):
         seen = {}
@@ -1123,11 +1127,27 @@ wait_sampler_gone() {
         '^\\S+ owner_pid=4242 dnsmasq=inactive load1=0\\.42$' not found in
         '2026-08-28T..Z owner_pid=4242 dnsmasq=inactive', then
         KeyError: 'load_max_1min'.
+
+        The mid-run swap must be atomic, or the test fails for a reason it
+        is not about (CodeRabbit, 2026-08-28). RED WITH THE SWAP WRITTEN IN
+        PLACE, over the same interleaving: `AssertionError: 97 != 0 :
+        TIMEOUT after 30s: dns-owner.log never reached 4 rows`, because the
+        sample taken while the file was truncated read an empty load1 and
+        the sampler ended. The shipped campaign has no such write: it
+        truncates dns-owner.log before the sampler exists, and both files
+        another process reads, dns-evidence.json and corpus-serve.status,
+        are written to a temp file and renamed.
         """
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
-            raise_load = (f'printf "1.87 0.30 0.20 1/100 1234\\n" '
-                          f'> "{env["LOADAVG_FILE"]}"\nwait_last_load 1.87\n')
+            loadavg = env["LOADAVG_FILE"]
+            # The swap writes a second file and renames it over the first,
+            # and a sample is taken while both exist. In place, the sample
+            # landing between the truncate and the bytes reads an empty
+            # load1, which ends the sampler.
+            raise_load = (f'printf "1.87 0.30 0.20 1/100 1234\\n" > "{loadavg}.new"\n'
+                          f'wait_rows 4\nmv "{loadavg}.new" "{loadavg}"\n'
+                          'wait_last_load 1.87\n')
             evidence, _ = self._sample(env, results, rows=3, mid_run=raise_load)
             with open(os.path.join(results, "dns-owner.log")) as handle:
                 lines = handle.read().splitlines()
