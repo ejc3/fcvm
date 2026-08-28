@@ -208,7 +208,7 @@ cleanup() {
     cg_cleanup_all
     if [ "$HUGE_CHANGED" = 1 ]; then
         log "restoring nr_hugepages=$ORIG_HUGEPAGES"
-        sudo -n sh -c "echo $ORIG_HUGEPAGES > /proc/sys/vm/nr_hugepages" || true
+        "$REPO_ROOT/scripts/hugepage-pool-lock.sh" sudo -n sh -c "echo $ORIG_HUGEPAGES > /proc/sys/vm/nr_hugepages" || true
     fi
 }
 trap cleanup EXIT
@@ -567,7 +567,7 @@ phase0() {
     if sudo -n true 2>/dev/null; then
         local cur; cur=$(cat /proc/sys/vm/nr_hugepages)
         if [ "$cur" -lt "$HUGEPAGE_POOL" ]; then
-            sudo sh -c "echo $HUGEPAGE_POOL > /proc/sys/vm/nr_hugepages"
+            "$REPO_ROOT/scripts/hugepage-pool-lock.sh" sudo sh -c "echo $HUGEPAGE_POOL > /proc/sys/vm/nr_hugepages"
             HUGE_CHANGED=1
             cur=$(cat /proc/sys/vm/nr_hugepages)
         fi

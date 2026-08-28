@@ -6060,13 +6060,16 @@ class MakefileBenchGraph(unittest.TestCase):
         # And the grow must hold the cross-harness pool lock (codex P1,
         # PR #815): the pool is host-global and reqbench/faultbench/bench.sh
         # all write it.
-        self.assertIn("hugepage-pool.lock", recipe,
-                      "fault recipe must serialize on the shared pool lock")
-        # The lock file must be creatable by unprivileged callers even when
-        # the data root is root-owned (fresh boxes): the recipe pre-creates
-        # it with sudo before flock (CodeRabbit round 2, PR #815).
-        self.assertRegex(recipe, r"sudo[^\n]*touch[^\n]*hugepage-pool\.lock",
-                         "fault recipe must sudo-pre-create the pool lock")
+        self.assertIn("scripts/hugepage-pool-lock.sh", recipe,
+                      "fault recipe must take the shared pool lock through the helper")
+        # The helper (PR #868) opens the lock READ-ONLY, never with O_CREAT,
+        # and creates it atomically when absent (sudo when the data root is
+        # root-owned: fresh boxes, CodeRabbit round 2 on PR #815). A recipe
+        # that touches, chowns, or chmods the lock itself is the bug coming
+        # back: a root-created file is refused by fs.protected_regular on the
+        # next unprivileged O_CREAT open, and a chown races between users.
+        self.assertNotRegex(recipe, r"(touch|chown|chmod)[^\n]*hugepage-pool\.lock",
+                            "fault recipe must not create, chown, or chmod the lock")
 
     def test_run_help_documents_tag(self):
         # Following the documented huge flow without TAG= on the run line
@@ -6270,10 +6273,29 @@ class SnapshotLockHeldAcrossRun(unittest.TestCase):
             {"BACKEND": "uffd", "UFFD_MODE": "minor"})
         self.assertIn("POOL-HELD", r.stdout + r.stderr)
 
+    def test_pool_lock_refuses_a_planted_symlink(self):
+        # A symlink at the lock path, planted by another writer of the sticky
+        # data root, would be followed by the read-only open; its owner can
+        # repoint it under a holder so a later caller locks a different inode
+        # and writes the pool concurrently (codex + CodeRabbit on #868). Fail
+        # closed, pool untouched.
+        r, pool = self._bash(
+            'touch "$DATA_ROOT/elsewhere"; '
+            'ln -s "$DATA_ROOT/elsewhere" "$DATA_ROOT/hugepage-pool.lock"; '
+            'HUGEPAGE_POOL_LOCK_WAIT=1 ensure_hugepage_pool')
+        self.assertNotEqual(r.returncode, 0,
+                            "a symlinked lock path must be refused")
+        self.assertEqual(open(pool).read().strip(), "100",
+                         "pool must be untouched behind a refused lock")
+        self.assertIn("symlink", r.stdout + r.stderr)
+
     def test_pool_grow_respects_exclusive_holder(self):
         # While another process holds the pool lock exclusive, a grow must
         # not proceed concurrently: bounded wait, then fail closed.
         r, pool = self._bash(
+            # The holder is an OLD reqbench.sh phase: it created the lock file
+            # and opened it read-write (codex on #868: a lock whose identity
+            # changes under an in-flight phase is not a lock).
             'touch "$DATA_ROOT/hugepage-pool.lock"; '
             'exec 9<>"$DATA_ROOT/hugepage-pool.lock"; flock -x 9; '
             'HUGEPAGE_POOL_LOCK_WAIT=1 ensure_hugepage_pool')

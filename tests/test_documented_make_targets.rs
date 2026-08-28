@@ -715,3 +715,549 @@ fn a_bench_that_persisted_nothing_fails_its_target() {
         );
     }
 }
+
+/// The hugepage pool lock must be owned by the invoking user, not root.
+///
+/// The hugepage pool lock is one FILE, opened read-only, never with O_CREAT.
+///
+/// The pool is host-global state shared by `setup-hugepages`,
+/// `bench-chromium-fault`, and `bench/chromium/reqbench.sh` (which holds the
+/// lock for a phase lifetime), so all of them serialize on one inode:
+/// `/mnt/fcvm-btrfs/hugepage-pool.lock`. The recipes take it through
+/// `scripts/hugepage-pool-lock.sh`. What went wrong before, in order:
+///
+/// - The recipes created it with `sudo touch` + `chmod 666`. `fs.protected_regular`
+///   refuses an O_CREAT open of a file owned by someone else in a sticky
+///   world-writable directory, root included, and util-linux `flock <path>` and
+///   bash `<>` both use O_CREAT. So every unprivileged run after the first died:
+///
+///   ```text
+///   ==> Allocating hugepage pool (512 pages = 1024MB)...
+///   flock: cannot open lock file /mnt/fcvm-btrfs/hugepage-pool.lock: Permission denied
+///   make: *** [Makefile:643: setup-hugepages] Error 66
+///   ```
+///
+/// - `chown` to the invoker at every site raced between two users (codex, #868)
+///   and made root `chmod`/`chown` a path the directory owner can replace with a
+///   symlink (CodeRabbit, #868).
+/// - A lock DIRECTORY had neither problem but changed the lock's identity, so an
+///   old reqbench.sh phase still holding the file was no longer serialized
+///   against new code holding the directory (codex, #868).
+///
+/// So: the same file, opened READ-ONLY (`flock(2)` does not care about the open
+/// mode, and protected_regular only governs O_CREAT), created atomically when
+/// absent (a hard link fails if the name exists, so concurrent creators agree on
+/// one inode), and never chmod'ed or chown'ed by anyone.
+#[test]
+fn hugepage_lock_is_taken_through_the_helper_at_every_site() {
+    let makefile = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Makefile"))
+        .expect("read Makefile");
+    let recipe_lines: Vec<&str> = makefile
+        .lines()
+        .filter(|l| l.starts_with('\t') && l.contains("hugepage-pool"))
+        .collect();
+    assert!(
+        recipe_lines.len() >= 2,
+        "expected both recipes to take the hugepage pool lock; found {recipe_lines:?}"
+    );
+    for line in &recipe_lines {
+        assert!(
+            line.contains("scripts/hugepage-pool-lock.sh"),
+            "a recipe takes the hugepage pool lock without the helper, so it is one \
+             more site that has to get O_CREAT and creation right on its own:\n{line}"
+        );
+        for verb in ["touch ", "chown ", "chmod ", "mkdir "] {
+            assert!(
+                !line.contains(verb),
+                "a recipe runs `{verb}` around the hugepage lock; creation belongs to \
+                 the helper, and a privileged metadata change under the invoker's \
+                 directory follows whatever symlink sits there:\n{line}"
+            );
+        }
+    }
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/hugepage-pool-lock.sh"
+    ))
+    .expect("read scripts/hugepage-pool-lock.sh");
+    // Code lines only: the helper's comments name the very forms it avoids.
+    let helper_code: String = helper
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        helper_code.contains("exec 9<\"$lock\""),
+        "the helper must open the lock READ-ONLY (`exec 9<\"$lock\"`); any O_CREAT open \
+         (`flock <path>`, `<>`) is refused by protected_regular for a file someone else \
+         owns"
+    );
+    assert!(
+        !helper_code.contains("<>") && !helper_code.contains("flock -x -w \"$wait_s\" \"$lock\""),
+        "the helper opens the lock with O_CREAT somewhere"
+    );
+    assert!(
+        helper_code.contains("ln \"$tmp\" \"$1\""),
+        "the helper must create the lock atomically (hard link onto the final name)"
+    );
+    assert!(
+        helper_code.contains("[ -L \"$lock\" ]"),
+        "the helper must refuse a symlink at the lock path before opening it"
+    );
+    assert!(
+        helper_code.contains("stat -Lc %d:%i \"/proc/$$/fd/9\""),
+        "the helper must verify, after the open, that fd 9 is the path's own inode"
+    );
+    for verb in ["chown ", "chmod "] {
+        assert!(
+            !helper_code.contains(verb),
+            "the helper runs `{verb}`; the mode is set by `install -m` on the file it \
+             creates, and nothing may follow a path under the user's directory"
+        );
+    }
+    // Privilege is spent only on the fixed shared path, through fixed programs
+    // (CodeRabbit on #868): never `sudo bash -c`/`sudo sh -c`, never a
+    // caller-supplied path.
+    // `$tmp` is the one derived name sudo may see, and only as a sibling of
+    // the fixed path.
+    assert!(
+        helper_code.contains("tmp=\"$(mktemp -u -- \"$default_lock.XXXXXXXX\")\""),
+        "the temp name sudo creates must be derived from the fixed shared path"
+    );
+    for line in helper_code.lines().filter(|l| l.contains("sudo ")) {
+        assert!(
+            !line.contains("sudo bash -c") && !line.contains("sudo sh -c"),
+            "the helper hands sudo a shell string:\n{line}"
+        );
+        assert!(
+            line.contains("$default_lock")
+                || line.contains("$default_dir")
+                || line.contains("\"$tmp\""),
+            "the helper runs sudo on something other than the fixed shared lock:\n{line}"
+        );
+    }
+}
+
+/// Run `program` as an unprivileged stand-in when the tests are root.
+///
+/// The read-only open matters only for an unprivileged opener: for root,
+/// "protected_regular would refuse O_CREAT" and "the owner is untrusted" are
+/// the same condition (a file owned by neither root nor the directory's
+/// owner). Under the privileged runner the helper is therefore driven as uid
+/// 65534 through `setpriv`, from a copy placed where that uid can read it. No
+/// sudo anywhere: `make test-fast` shims it to fail, and root needs none.
+fn as_unprivileged(program: &str) -> std::process::Command {
+    if unsafe { libc::geteuid() } == 0 {
+        let mut c = std::process::Command::new("setpriv");
+        c.args(["--reuid=65534", "--regid=65534", "--clear-groups"]);
+        c.arg(program);
+        c
+    } else {
+        std::process::Command::new(program)
+    }
+}
+
+/// A copy of the helper an unprivileged stand-in can execute.
+fn helper_copy(dir: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/hugepage-pool-lock.sh");
+    let dst = dir.join("hugepage-pool-lock.sh");
+    std::fs::copy(src, &dst).expect("copy helper");
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    dst.to_string_lossy().into_owned()
+}
+
+/// The helper opens the lock read-only, never with O_CREAT.
+///
+/// Two fixtures, one per lane, each proving the failure it guards against
+/// before showing the helper succeed:
+/// - as root (the privileged lanes): the production shape, a root-owned lock
+///   in a user-owned 1777 directory, opened by uid 65534, where `flock <path>`
+///   (O_CREAT) is refused by protected_regular;
+/// - as a user (the unprivileged lanes, where no other uid's file can be
+///   staged): a 0444 lock of one's own, which a `<>` open refuses.
+///
+/// A box with the sysctl off fails the root branch instead of passing it.
+#[test]
+fn hugepage_lock_helper_opens_the_lock_without_o_creat() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock = dir.path().join("hugepage-pool.lock");
+    let root = unsafe { libc::geteuid() } == 0;
+    let helper = helper_copy(dir.path());
+    if root {
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777))
+            .expect("chmod 1777");
+        std::os::unix::fs::chown(dir.path(), Some(65534), Some(65534)).expect("chown dir");
+        std::fs::write(&lock, b"").expect("root-owned lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).expect("0644");
+        let refused = as_unprivileged("flock")
+            .args(["-x", "-n"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .expect("flock by path as uid 65534");
+        assert!(
+            !refused.success(),
+            "fixture does not reproduce: `flock <path>` (O_CREAT) on a root-owned lock in \
+             a user-owned sticky directory succeeded for uid 65534, so fs.protected_regular \
+             is off on this box"
+        );
+    } else {
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).expect("0444");
+        let refused = std::process::Command::new("bash")
+            .args(["-c", "exec 9<>\"$1\"", "_"])
+            .arg(&lock)
+            .status()
+            .expect("run <> open");
+        assert!(
+            !refused.success(),
+            "fixture does not reproduce: a `<>` open of a 0444 lock succeeded"
+        );
+    }
+
+    let out = as_unprivileged(&helper)
+        .env("HUGEPAGE_POOL_LOCK", &lock)
+        .env("HUGEPAGE_POOL_LOCK_WAIT", "2")
+        .args(["sh", "-c", "echo took-it"])
+        .output()
+        .expect("run helper");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && text.contains("took-it"),
+        "the helper failed to take a lock it only needs to open read-only:\n{text}"
+    );
+    if root {
+        // Hand the directory back so the tempdir can be removed.
+        let _ = std::os::unix::fs::chown(dir.path(), Some(0), Some(0));
+    }
+}
+
+/// Every writer of the hugepage pool takes the shared lock (codex on #868).
+///
+/// The pool is host-global, and reqbench.sh holds the lock SHARED for a whole
+/// phase precisely so that nobody shrinks the pool under its clones. A writer
+/// that skips the lock (`bench-hugepages*` restoring the pool to zero, bench.sh
+/// growing or restoring it) defeats that lease. So every line that writes
+/// `nr_hugepages`, in the Makefile and in every bench/scripts shell script, must
+/// be an argument of `scripts/hugepage-pool-lock.sh`, on the same line or on an
+/// earlier line of the same backslash-continued command. reqbench.sh writes
+/// through `$HUGEPAGE_POOL_FILE` under its own lease, which
+/// bench/chromium/test_reqbench.py pins (`test_pool_grow_respects_exclusive_holder`),
+/// so this enumeration deliberately keys on the literal path.
+#[test]
+fn every_hugepage_pool_writer_takes_the_lock() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("Makefile")];
+    for dir in ["bench/chromium", "scripts"] {
+        for entry in std::fs::read_dir(root.join(dir)).expect(dir) {
+            let path = entry.expect("entry").path();
+            if path.extension().is_some_and(|e| e == "sh") {
+                files.push(path);
+            }
+        }
+    }
+    let writes_pool = |line: &str| {
+        let code = line.trim_start();
+        !code.starts_with('#')
+            && line.contains("nr_hugepages")
+            && (line.contains("> /proc/sys/vm/nr_hugepages")
+                || line.contains("tee")
+                || line.contains("sysctl"))
+    };
+    let mut writers = 0;
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !writes_pool(line) {
+                continue;
+            }
+            writers += 1;
+            let mut covered = line.contains("hugepage-pool-lock.sh");
+            let mut j = i;
+            while !covered && j > 0 && lines[j - 1].trim_end().ends_with('\\') {
+                j -= 1;
+                covered = lines[j].contains("hugepage-pool-lock.sh");
+            }
+            assert!(
+                covered,
+                "{}:{}: writes nr_hugepages outside scripts/hugepage-pool-lock.sh; a bench \
+                 phase holding the pool lease can have the pool shrunk under its clones:\n{line}",
+                file.strip_prefix(root).unwrap().display(),
+                i + 1
+            );
+        }
+    }
+    assert!(
+        writers >= 8,
+        "expected the six Makefile writers and bench.sh's two; found {writers}. If a \
+         writer moved, move this pin with it."
+    );
+}
+
+/// An overridden lock path is never created with privileges (CodeRabbit on
+/// #868): `HUGEPAGE_POOL_LOCK` is a test knob, and a caller-supplied path must
+/// not reach `sudo`. Only the fixed default path is created as root, through
+/// fixed programs. A `sudo` stub first on PATH records any escalation.
+#[test]
+fn hugepage_lock_helper_never_escalates_for_an_overridden_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("bin");
+    let marker = dir.path().join("sudo-was-called");
+    std::fs::write(
+        bin.join("sudo"),
+        format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+    )
+    .expect("stub");
+    std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/hugepage-pool-lock.sh");
+    let run = |lock: &std::path::Path| {
+        let out = std::process::Command::new(helper)
+            .env("PATH", &path)
+            .env("HUGEPAGE_POOL_LOCK", lock)
+            .env("HUGEPAGE_POOL_LOCK_WAIT", "2")
+            .args(["sh", "-c", "echo took-it"])
+            .output()
+            .expect("run helper");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success() && text.contains("took-it"), text)
+    };
+
+    // Absent lock in a writable directory: created unprivileged.
+    let (ok, text) = run(&dir.path().join("hugepage-pool.lock"));
+    assert!(
+        ok,
+        "the helper failed to create an overridden lock unprivileged:\n{text}"
+    );
+    assert!(
+        !marker.exists(),
+        "the helper reached for sudo to create a caller-supplied path:\n{text}"
+    );
+
+    // Absent lock where nothing can be created: refused, still without sudo.
+    let (ok, text) = run(std::path::Path::new("/proc/self/hugepage-pool.lock"));
+    assert!(
+        !ok,
+        "the helper claimed to lock a path it cannot create:\n{text}"
+    );
+    assert!(
+        !marker.exists(),
+        "the helper escalated to create a caller-supplied path under /proc:\n{text}"
+    );
+}
+
+/// A symlink at the lock path is refused, not followed (codex, CodeRabbit on
+/// #868): whoever planted it can repoint it under a holder, and the next
+/// caller would lock a different inode.
+#[test]
+fn hugepage_lock_helper_refuses_a_planted_symlink() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::write(&elsewhere, b"").expect("target file");
+    let lock = dir.path().join("hugepage-pool.lock");
+    std::os::unix::fs::symlink(&elsewhere, &lock).expect("planted symlink");
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/hugepage-pool-lock.sh");
+    let out = std::process::Command::new(helper)
+        .env("HUGEPAGE_POOL_LOCK", &lock)
+        .env("HUGEPAGE_POOL_LOCK_WAIT", "2")
+        .args(["sh", "-c", "echo took-it"])
+        .output()
+        .expect("run helper");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && !text.contains("took-it"),
+        "the helper locked THROUGH a planted symlink instead of refusing it:\n{text}"
+    );
+    assert!(
+        text.contains("symlink"),
+        "the refusal must say why:\n{text}"
+    );
+    assert!(
+        lock.is_symlink(),
+        "the helper must not replace an entry it did not create"
+    );
+}
+
+/// A lock owned by anyone but root, the invoking user, or the directory's
+/// owner is refused: that owner can unlink and recreate it under a holder.
+///
+/// Privileged lanes only: staging a file owned by another uid takes root, and
+/// `make test-fast` shims sudo to fail.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn hugepage_lock_helper_refuses_a_lock_another_user_can_recreate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock = dir.path().join("hugepage-pool.lock");
+    std::fs::write(&lock, b"").expect("lock");
+    std::os::unix::fs::chown(&lock, Some(65534), Some(65534))
+        .expect("stage a lock owned by another uid (this test runs as root)");
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/hugepage-pool-lock.sh");
+    let out = std::process::Command::new(helper)
+        .env("HUGEPAGE_POOL_LOCK", &lock)
+        .env("HUGEPAGE_POOL_LOCK_WAIT", "2")
+        .args(["sh", "-c", "echo took-it"])
+        .output()
+        .expect("run helper");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && !text.contains("took-it"),
+        "the helper trusted a lock owned by uid 65534, who can recreate it under a \
+         holder:\n{text}"
+    );
+    assert!(
+        text.contains("owned by uid 65534"),
+        "the refusal must say why:\n{text}"
+    );
+}
+
+/// Concurrent first-time creators end up on ONE inode, and the helper keeps
+/// the lock for the whole command (it must not `exec` into it: sudo closes
+/// inherited descriptors, which would release the lock right before the
+/// privileged pool write it exists to serialize).
+#[test]
+fn hugepage_lock_helper_holds_the_lock_while_the_command_runs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock = dir.path().join("hugepage-pool.lock");
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/hugepage-pool-lock.sh");
+
+    // Eight racers create the lock at once and each reports the inode behind
+    // its fd 9.
+    let racers: Vec<_> = (0..8)
+        .map(|_| {
+            std::process::Command::new(helper)
+                .env("HUGEPAGE_POOL_LOCK", &lock)
+                .env("HUGEPAGE_POOL_LOCK_WAIT", "10")
+                .args(["sh", "-c", "stat -L -c %i /proc/self/fd/9"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn racer")
+        })
+        .collect();
+    let mut inodes = std::collections::BTreeSet::new();
+    for racer in racers {
+        let out = racer.wait_with_output().expect("racer exit");
+        assert!(out.status.success(), "a racer failed: {out:?}");
+        inodes.insert(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    assert_eq!(
+        inodes.len(),
+        1,
+        "concurrent creators locked different inodes {inodes:?}; the lock file was \
+         replaced under a holder"
+    );
+    let meta = std::fs::metadata(&lock).expect("lock exists");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o644, "lock mode");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n != "hugepage-pool.lock")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "creation left temp files behind: {leftovers:?}"
+    );
+
+    // Hold the lock via the helper; a by-path contender must be refused until
+    // the held command exits.
+    let mut holder = std::process::Command::new(helper)
+        .env("HUGEPAGE_POOL_LOCK", &lock)
+        .args(["sh", "-c", "echo held; read -r _"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn holder");
+    {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .expect("holder line");
+        assert_eq!(line.trim(), "held");
+    }
+    let contended = std::process::Command::new("bash")
+        .args(["-c", "exec 9<\"$1\" && flock -x -n 9", "_"])
+        .arg(&lock)
+        .status()
+        .expect("contender");
+    assert!(
+        !contended.success(),
+        "a contender took the lock while the helper's command was still running"
+    );
+    drop(holder.stdin.take());
+    let _ = holder.wait();
+    let free = std::process::Command::new("bash")
+        .args(["-c", "exec 9<\"$1\" && flock -x -n 9", "_"])
+        .arg(&lock)
+        .status()
+        .expect("taker");
+    assert!(
+        free.success(),
+        "the lock stayed held after the helper's command exited"
+    );
+}
+
+/// Every recipe that creates the hugepage lock must be valid shell AS MAKE RUNS IT.
+///
+/// #868's first revision put explanatory `#` lines inside a backslash-continued
+/// recipe. In a Makefile a tab-indented `#` line is shell text, and a shell
+/// comment swallows the trailing backslash, cutting the command in half:
+///
+/// ```text
+/// /bin/bash: -c: line 8: syntax error: unexpected end of file
+/// make: *** [Makefile:643: setup-hugepages] Error 2
+/// ```
+///
+/// `make -n` printed it happily, and a first version of THIS test -- `make -n`
+/// piped into `bash -n` -- passed against the broken Makefile, because what make
+/// prints is not what make hands the shell. So the recipe is run through make
+/// itself with `SHELL='bash -n'`: make invokes the shell exactly as it would in
+/// CI, and the shell only parses. The threshold is forced high so the allocating
+/// branch (the one with the lock) is the code path taken. Nothing is executed,
+/// so no sudo, no /proc write.
+#[test]
+fn hugepage_lock_recipes_are_valid_shell_as_make_runs_them() {
+    let repo = concat!(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("make")
+        .args([
+            "setup-hugepages",
+            "HUGEPAGE_POOL_TESTS=99999",
+            "SHELL=bash -n",
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("run make with a syntax-only shell");
+    assert!(
+        out.status.success(),
+        "the setup-hugepages recipe is not valid shell as make runs it:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

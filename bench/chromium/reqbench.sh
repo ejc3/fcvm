@@ -1023,14 +1023,52 @@ ensure_hugepage_pool() {
     # EXCLUSIVE and atomically downgrades. Bounded waits fail closed rather
     # than hanging behind a stuck owner.
     local wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
+    # Opened READ-ONLY, never with O_CREAT (PR #868): fs.protected_regular
+    # refuses an O_CREAT open of a file owned by someone else in a sticky
+    # world-writable directory, which is what `<>` did against the lock a
+    # root `make setup-hugepages` had created. flock(2) does not care about
+    # the open mode. Created atomically when absent (a hard link fails if
+    # the name exists), so concurrent creators agree on one inode; same
+    # mechanism as scripts/hugepage-pool-lock.sh, which the recipes use.
     local pool_lock="$DATA_ROOT/hugepage-pool.lock"
     mkdir -p "$DATA_ROOT" 2>/dev/null || true
-    touch "$pool_lock" 2>/dev/null || true
+    if [ ! -e "$pool_lock" ]; then
+        local tmp
+        if tmp="$(mktemp -u "$pool_lock.XXXXXX" 2>/dev/null)"; then
+            { install -m 644 /dev/null "$tmp" && ln "$tmp" "$pool_lock"; } 2>/dev/null || true
+            rm -f "$tmp"
+        fi
+    fi
+    # The entry is checked before AND after opening (codex + CodeRabbit on
+    # #868): a symlink, a non-regular file, or a file owned by anyone but
+    # root, this user, or the data root's owner is refused, since its owner
+    # could repoint or recreate it under a holder and a later caller would
+    # lock a different inode. After the open, the descriptor's inode must be
+    # the path's own (lstat) inode.
+    if [ -L "$pool_lock" ]; then
+        log "hugepages: $pool_lock is a symlink (owner uid $(stat -c %u "$pool_lock")); refusing to lock through a path another user can repoint"
+        return 1
+    fi
+    if [ ! -f "$pool_lock" ]; then
+        log "hugepages: pool lock unavailable at $pool_lock (not a regular file)"
+        return 1
+    fi
+    local lock_owner root_owner
+    lock_owner="$(stat -c %u "$pool_lock")"
+    root_owner="$(stat -c %u "$DATA_ROOT")"
+    case "$lock_owner" in
+        0|"$(id -u)"|"$root_owner") ;;
+        *) log "hugepages: $pool_lock is owned by uid $lock_owner, who can recreate it under a holder; refusing"; return 1 ;;
+    esac
     if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
-        exec {REQBENCH_POOL_LOCK_FD}<>"$pool_lock" || true
+        exec {REQBENCH_POOL_LOCK_FD}<"$pool_lock" || true
     fi
     if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
         log "hugepages: pool lock unavailable at $pool_lock"
+        return 1
+    fi
+    if [ "$(stat -c %d:%i "$pool_lock")" != "$(stat -Lc %d:%i "/proc/$$/fd/$REQBENCH_POOL_LOCK_FD")" ]; then
+        log "hugepages: $pool_lock was replaced between check and open; refusing"
         return 1
     fi
     if ! flock -s -w "$wait_s" "$REQBENCH_POOL_LOCK_FD"; then
