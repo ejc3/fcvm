@@ -754,3 +754,41 @@ fn hugepage_lock_is_chowned_to_the_invoker_wherever_it_is_created() {
         );
     }
 }
+
+/// Every recipe that creates the hugepage lock must be valid shell AS MAKE RUNS IT.
+///
+/// #868's first revision put explanatory `#` lines inside a backslash-continued
+/// recipe. In a Makefile a tab-indented `#` line is shell text, and a shell
+/// comment swallows the trailing backslash, cutting the command in half:
+///
+/// ```text
+/// /bin/bash: -c: line 8: syntax error: unexpected end of file
+/// make: *** [Makefile:643: setup-hugepages] Error 2
+/// ```
+///
+/// `make -n` printed it happily, and a first version of THIS test -- `make -n`
+/// piped into `bash -n` -- passed against the broken Makefile, because what make
+/// prints is not what make hands the shell. So the recipe is run through make
+/// itself with `SHELL='bash -n'`: make invokes the shell exactly as it would in
+/// CI, and the shell only parses. The threshold is forced high so the allocating
+/// branch (the one with the lock) is the code path taken. Nothing is executed,
+/// so no sudo, no /proc write.
+#[test]
+fn hugepage_lock_recipes_are_valid_shell_as_make_runs_them() {
+    let repo = concat!(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("make")
+        .args([
+            "setup-hugepages",
+            "HUGEPAGE_POOL_TESTS=99999",
+            "SHELL=bash -n",
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("run make with a syntax-only shell");
+    assert!(
+        out.status.success(),
+        "the setup-hugepages recipe is not valid shell as make runs it:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
