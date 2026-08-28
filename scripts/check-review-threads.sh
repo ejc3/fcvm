@@ -310,20 +310,36 @@ IGNORED_COMMENT_AUTHORS=${IGNORED_COMMENT_AUTHORS:-vercel,vercel[bot],dependabot
 # Comments that are ONLY a trigger, e.g. "@codex review". Anchored and whole-body: a
 # finding that merely mentions @codex still counts.
 TRIGGER_RE='\A[[:space:]]*@[A-Za-z0-9_-]+([[:space:]]+[A-Za-z-]+)?[[:space:]]*\z'
-# A reviewer with nothing to say posts no review object: Codex answers "Didn't find any
-# major issues" as a plain comment, and CodeRabbit's review that produces no comments
-# replies "Full review finished." (or "Review finished."). Those are verdicts, not
-# findings: they need no disposition, and (dated after the head ARRIVED, from someone
-# other than the author) they are the only coverage a clean head will ever get. The
-# verdict must be the WHOLE comment: after dropping HTML comments, blank lines and the
-# "> Note:" trailer, exactly the acknowledgement lines and nothing else. A body carrying
-# the phrase beside review text is a finding and stays claimable.
-VERDICT_JQ='def is_verdict:
-  ((. // "") | gsub("<!--(.|\n)*?-->"; "") | split("\n")
-    | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0 and (startswith(">") | not)))) as $l
-  | ($l == ["✅ Action performed", "Full review finished."])
-    or ($l == ["✅ Action performed", "Review finished."])
-    or (($l | length) == 1 and ($l[0] | test("^Codex Review: Didn.t find any major issues[^\n]{0,40}$")));'
+# A reviewer with nothing to say posts no review object. Codex answers with a plain
+# comment: "Codex Review: Didn't find any major issues." plus one of a few short
+# sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
+# block. A CodeRabbit review that produces no comments replies "Full review finished."
+# (or "Review finished." for an incremental one) folded under "Action performed". Those
+# are verdicts, not findings: they need no disposition, and they are the only coverage a
+# clean head will ever get (see the coverage check below for who may issue one and how
+# it is bound to the head).
+#
+# The verdict must be the WHOLE comment. After dropping HTML comments, blank lines,
+# "> Note:" lines and the About Codex block, the remaining lines must be exactly one of
+# the shapes below; anything else is a finding and stays claimable. The Codex sign-off
+# is matched against the list of ones Codex has actually posted on this repo, because
+# an open-ended tail would accept "Didn't find any major issues. P1: drops data" as a
+# verdict. An unlisted sign-off is not a verdict, so the gate blocks until someone reads
+# the comment, which is the right direction; extend the list when Codex says something
+# new. Only the About Codex block is stripped, and only under that exact summary text:
+# a details block with any other summary is where a bot folds its findings.
+VERDICT_JQ='def verdict_lines:
+  ((. // "") | gsub("<!--(.|\n)*?-->"; "")
+    | gsub("<details> <summary>ℹ️ About Codex in GitHub</summary>(.|\n)*?</details>"; "")
+    | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+    | map(select(length > 0 and (startswith(">") | not))));
+def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| 👍)?$";
+def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
+def is_verdict:
+  verdict_lines as $l
+  | ($l == ["<details>", "<summary>✅ Action performed</summary>", "Full review finished.", "</details>"])
+    or ($l == ["<details>", "<summary>✅ Action performed</summary>", "Review finished.", "</details>"])
+    or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)));'
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" \

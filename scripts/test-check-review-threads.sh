@@ -14,13 +14,14 @@ GATE=${1:-"$(dirname "$0")/check-review-threads.sh"}
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0
 
-# $1 name, $2 fixture json, $3 expected exit code, $4 substring expected in output
+# $1 name, $2 fixture json, $3 expected exit code, $4 and $5 substrings expected in output
 run_case() {
-  local name=$1 json=$2 want_rc=$3 want_txt=${4:-}
+  local name=$1 json=$2 want_rc=$3 want_txt=${4:-} want_txt2=${5:-}
   printf '%s' "$json" > "$TMP/f.json"
   local out rc
   out=$(bash "$GATE" --from-file "$TMP/f.json" 2>&1); rc=$?
-  if [ "$rc" = "$want_rc" ] && { [ -z "$want_txt" ] || grep -qF "$want_txt" <<<"$out"; }; then
+  if [ "$rc" = "$want_rc" ] && { [ -z "$want_txt" ] || grep -qF "$want_txt" <<<"$out"; } \
+     && { [ -z "$want_txt2" ] || grep -qF "$want_txt2" <<<"$out"; }; then
     echo "  PASS  $name"; pass=$((pass+1))
   else
     echo "  FAIL  $name (rc=$rc want=$want_rc)"
@@ -209,37 +210,74 @@ run_case "someone else reviewed the head" \
 echo "== finding 19: a reviewer with nothing to say posts no review object =="
 # Codex answers "Didn't find any major issues" as a plain comment; CodeRabbit's full
 # review with no comments replies "Full review finished." and creates no review. A head
-# that no bot has anything to say about must not sit BLOCKED forever: a non-author bot's
-# no-findings verdict dated AFTER the head ARRIVED at GitHub covers it. Arrival is the
-# creation of the head's first check suite, not the commit's own date: a commit made
-# locally before an older head's verdict and pushed afterwards carries a committedDate
-# that predates that verdict (codex on #873). The verdict must be the whole comment: a
-# body carrying the phrase plus finding text is a finding, claimable and not coverage.
+# that no bot has anything to say about must not sit BLOCKED forever: a bot's no-findings
+# verdict dated AFTER the head ARRIVED at GitHub covers it. Arrival is the creation of the
+# head's first check suite, not the commit's own date: a commit made locally before an
+# older head's verdict and pushed afterwards carries a committedDate that predates that
+# verdict (codex on #873). The verdict must be the whole comment, in the shape the bot
+# actually posts (the builders below copy live comments): a body carrying the phrase plus
+# finding text is a finding, claimable and not coverage.
 wrap6() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"},{"createdAt":"2026-01-02T00:31:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":%s}}}}}' "$1"; }
+# One top-level PR comment as GraphQL returns it: login, __typename, createdAt, and a body
+# that is already a JSON string literal.
+cmt() { printf '{"author":{"login":"%s","__typename":"%s"},"createdAt":"%s","body":%s}' "$1" "$2" "$3" "$4"; }
+# Codex's no-findings comment as posted: the phrase with sign-off $1, the reviewed commit
+# $2, and the folded About Codex block. Emits a JSON string literal.
+codex_body() { jq -n --arg s "$1" --arg sha "$2" '"Codex Review: Didn\u0027t find any major issues.\($s)\n\n**Reviewed commit:** `\($sha)`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>"'; }
+# CodeRabbit's command acknowledgement as posted, folding $1 under "Action performed".
+cr_body() { jq -n --arg t "$1" '"<!-- This is an auto-generated reply by CodeRabbit -->\n<!-- CodeRabbit review command invocation: 8fd6df2f-253d-45d8-a76b-9078ed862337 -->\n<details>\n<summary>✅ Action performed</summary>\n\n\($t)\n\n</details>"'; }
+CODEX=chatgpt-codex-connector
+CR_NOTE=$'Review finished.\n\n> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.'
 run_case "a codex no-findings comment after the head arrived covers it" \
-  "$(wrap6 '[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues. Bravo.","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")]")" \
   0 "HEAD COVERED"
 run_case "a coderabbit full-review-finished after the head arrived covers it" \
-  "$(wrap6 '[{"author":{"login":"coderabbitai","__typename":"Bot"},"body":"<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Action performed\n\nFull review finished.\n\n> Note: CodeRabbit is an incremental review system.\n","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  "$(wrap6 "[$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body 'Full review finished.')")]")" \
+  0 "HEAD COVERED"
+run_case "a coderabbit incremental review-finished with its note covers it" \
+  "$(wrap6 "[$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body "$CR_NOTE")")]")" \
   0 "HEAD COVERED"
 run_case "a verdict dated after the commit but before the head arrived is not coverage" \
-  "$(wrap6 '[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-02T00:10:00Z"}]')" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T00:10:00Z "$(codex_body '' deadbeef)")]")" \
   1 "UNREVIEWED HEAD"
 run_case "the author saying no findings is not coverage" \
-  "$(wrap6 '[{"author":{"login":"me","__typename":"User"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  "$(wrap6 "[$(cmt me User 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")]")" \
   1 "UNREVIEWED HEAD"
 run_case "a verdict cannot cover a head that has no check suite (arrival unknown)" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-02T01:00:00Z"}]}}}}}')" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")")" \
   1 "UNREVIEWED HEAD"
 run_case "a no-findings verdict is not a finding that needs a disposition" \
-  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues.","createdAt":"2026-01-02T01:00:00Z"}]}}}}}')" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]}}}}}' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body '' deadbeef)")")" \
   0 "CLEAR"
 run_case "the verdict phrase beside finding text is a finding, not coverage" \
-  "$(wrap6 '[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"Codex Review: Didn'"'"'t find any major issues.\n\nOne thing though: the lease is dropped before the rename, which races the pruner.","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body $'\n\nOne thing though: the lease is dropped before the rename, which races the pruner.' deadbeef)")]")" \
   1 "carry no disposition"
 run_case "a coderabbit ack with extra review text is a finding, not coverage" \
-  "$(wrap6 '[{"author":{"login":"coderabbitai","__typename":"Bot"},"body":"✅ Action performed\n\nFull review finished.\n\nActionable comments posted: 1\n\nThe stall gate is never armed.","createdAt":"2026-01-02T01:00:00Z"}]')" \
+  "$(wrap6 "[$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_body $'Full review finished.\n\nActionable comments posted: 1\n\nThe stall gate is never armed.')")]")" \
   1 "carry no disposition"
+
+echo "== finding 21: a verdict is a fixed shape, not a phrase with an open tail =="
+# "[^\n]{0,40}" after the Codex phrase accepted a P1 on the same line as a verdict, and a
+# one-line phrase with no reviewed-commit line, which Codex never posts. The sign-off is
+# now one of an enumerated list; the reviewed-commit line is required; and only the About
+# Codex details block is stripped, since any other details block is where findings fold.
+for signoff in ' :rocket:' ' Keep it up!' " You're on a roll."; do
+  run_case "the codex sign-off '$signoff' is a verdict" \
+    "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body "$signoff" deadbeef)")]")" \
+    0 "HEAD COVERED"
+done
+run_case "the codex phrase with a P1 on the same line is not a verdict" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z '"Codex Review: Didn'"'"'t find any major issues. P1: drops data"')]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "the codex phrase alone, without the reviewed-commit line, is not a verdict" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z '"Codex Review: Didn'"'"'t find any major issues."')]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a P1 on the codex phrase line, in the posted shape, is claimable, not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' P1: drops data' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a details block other than About Codex is not stripped" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body $'\n\n<details><summary>Findings</summary>\nP1: drops data\n</details>' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
 
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
