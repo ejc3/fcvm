@@ -4038,8 +4038,11 @@ exit 1
         )
 
     def _golden_image_identity_fixture(self, d, snapshot_cache_key,
-                                       built_image_id=None):
+                                       built_image_id=None, env_extra=None):
         env, binx = self._env(d, DATA_ROOT=d)
+        # The developer's shell must not decide what the golden bakes.
+        env.pop("GUEST_ENV", None)
+        env.update(env_extra or {})
         if built_image_id is not None:
             os.makedirs(os.path.join(d, "reqbench-locks"), exist_ok=True)
             with open(self._built_id_path(d), "w") as f:
@@ -4294,6 +4297,68 @@ exit 1
             )) as source:
                 provenance = json.load(source)
             self.assertEqual(provenance["built_image_id"], recorded)
+
+    def _golden_provenance(self, d):
+        with open(os.path.join(
+            d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
+        )) as source:
+            return json.load(source)
+
+    def test_golden_forwards_guest_env_to_prepare_and_records_it(self):
+        """GUEST_ENV=A=1,B=2 is one `--env` per entry on prepare, and the
+        record names them as guest_env so the A/B's two goldens are told
+        apart by their provenance rather than by their tag alone.
+
+        Watched red 2026-08-28 at 13cb9543: `AssertionError: ' --env A=1
+        --env B=2 ' not found in 'podman prepare --tag cb-req-golden --force
+        --name cb-req-g-... localhost/chromium-bench-req'`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, env_extra={"GUEST_ENV": "A=1,B=2"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            prepare_line = next(
+                line for line in argv.splitlines() if line.startswith("podman prepare ")
+            )
+            self.assertIn(" --env A=1 --env B=2 ", prepare_line)
+            self.assertEqual(self._golden_provenance(d)["guest_env"], ["A=1", "B=2"])
+
+    def test_golden_without_guest_env_passes_no_env_and_records_an_empty_list(self):
+        """Watched red 2026-08-28 at 13cb9543: `KeyError: 'guest_env'`; a
+        golden made without the knob carried no field a reader could compare
+        against the A/B arm's."""
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            prepare_line = next(
+                line for line in argv.splitlines() if line.startswith("podman prepare ")
+            )
+            self.assertNotIn("--env", prepare_line)
+            self.assertEqual(self._golden_provenance(d)["guest_env"], [])
+
+    def test_golden_refuses_a_guest_env_entry_that_is_not_key_value(self):
+        """An entry without `KEY=` would reach fcvm as `--env notakv` and be
+        baked into the snapshot as whatever fcvm makes of it; the golden
+        refuses before prepare runs, naming the entry.
+
+        Watched red 2026-08-28 at 13cb9543: `AssertionError: 0 == 0 : golden
+        accepted GUEST_ENV=A=1,notakv`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, env_extra={"GUEST_ENV": "A=1,notakv"},
+            )
+            self.assertNotEqual(result.returncode, 0,
+                                "golden accepted GUEST_ENV=A=1,notakv")
+            self.assertNotIn("podman prepare", argv,
+                             "prepare ran before the entry was checked")
+            self.assertIn("notakv", result.stderr, "the refusal does not name the entry")
+            self.assertFalse(os.path.exists(os.path.join(
+                d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
+            )), "a refused golden still wrote provenance")
 
     def test_golden_consumes_the_build_record(self):
         """The record is one build-to-golden handshake, not a standing fact.

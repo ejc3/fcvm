@@ -582,6 +582,18 @@ cmd_golden() {
     log "golden: podman prepare --tag $TAG (cold build, snapshot at the image health gate, hugepages=$HUGEPAGES)"
     local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
     local image_record image_digest image_id image_cache_key
+    # GUEST_ENV is checked first, before the build record below is consumed:
+    # an entry without KEY= would reach fcvm as `--env <entry>` and be baked
+    # into the snapshot as whatever fcvm makes of it.
+    local guest_env_entries=() guest_env_flags=() guest_env_entry
+    if [ -n "$GUEST_ENV" ]; then
+        IFS=',' read -ra guest_env_entries <<<"$GUEST_ENV"
+        for guest_env_entry in "${guest_env_entries[@]}"; do
+            [[ "$guest_env_entry" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] \
+                || { log "golden: GUEST_ENV entry '$guest_env_entry' is not KEY=VALUE"; return 1; }
+            guest_env_flags+=(--env "$guest_env_entry")
+        done
+    fi
     # One inspect binds the mutable tag's manifest digest and immutable image ID
     # to the same observation. fcvm performs the same atomic resolution before
     # exporting by ID; the cache-path check committed with the snapshot below
@@ -654,6 +666,7 @@ cmd_golden() {
     local dns_flag=()
     [ -n "$GUEST_DNS" ] && dns_flag=(--dns "$GUEST_DNS")
     $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag "${dns_flag[@]}" \
+        "${guest_env_flags[@]}" \
         --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
         --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" 2>"$lf" >"$prepared_json" \
         || { log "golden: PREPARE FAILED"; tail -20 "$lf" >&2; return 1; }
@@ -672,13 +685,16 @@ cmd_golden() {
         "$prepared_generation" "$prepared_digest" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
-        "${REQBENCH_SOURCE_REVISION:-}" "$GUEST_DNS" <<'PY'
+        "${REQBENCH_SOURCE_REVISION:-}" "$GUEST_DNS" "${guest_env_entries[@]}" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
     image_cache_key, built_image_id, prepared_generation, prepared_digest,
     fcvm_sha256, runtime_bundle_sha256, source_revision, guest_dns,
-) = sys.argv[1:]
+) = sys.argv[1:15]
+# The GUEST_ENV entries that became `--env` flags, in order; empty when the
+# knob was unset.
+guest_env = sys.argv[15:]
 lock = open(lock_path, "a+")
 fcntl.flock(lock, fcntl.LOCK_SH)
 with open(config_path, "rb") as source:
@@ -734,6 +750,7 @@ if guest_dns and baked_dns != guest_dns:
     )
 record = {
     "guest_dns": guest_dns or None,
+    "guest_env": guest_env,
     "snapshot_generation_id": generation_id,
     "snapshot_config_sha256": config_sha256,
     "snapshot_created_at": config.get("created_at"),
@@ -1193,6 +1210,14 @@ HUGEPAGES="${HUGEPAGES:-0}"
 # corpus replay arm sets GUEST_DNS=10.0.2.2 so every corpus hostname
 # resolves through the host-loopback replay server via the pasta gateway.
 GUEST_DNS="${GUEST_DNS:-}"
+# Extra container environment baked into the golden: comma-separated KEY=VALUE
+# entries, one `fcvm podman prepare --env` each (a value cannot hold a comma).
+# GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> is the resolver-rule arm of the corpus
+# A/B; entry.sh builds the Chromium flag from that variable. The entries change
+# what the snapshot does, so a golden made with GUEST_ENV needs its own TAG
+# (--force would otherwise replace the other arm under the default tag). They
+# are recorded as guest_env in reqbench-provenance.json.
+GUEST_ENV="${GUEST_ENV:-}"
 # Arms the analyzer's stall gate (reqanalyze --stall-max-ms). Empty leaves the
 # gate unarmed, which campaign_summary refuses to index; the corpus campaign
 # sets it.

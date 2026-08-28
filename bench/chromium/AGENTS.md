@@ -38,6 +38,19 @@ are part of the snapshot identity — give them their own tag
 the same `TAG=` must then be passed to `-verify` and `-run`, or they select
 the default snapshot).
 
+`GUEST_ENV=` (golden only) bakes extra container environment into the
+snapshot: comma-separated `KEY=VALUE` entries, one `fcvm podman prepare
+--env` each, recorded as `guest_env` in `reqbench-provenance.json`. The
+resolver-rule A/B is the one use today:
+`make bench-chromium-request-golden TAG=cb-req-golden-resolve GUEST_ENV=BENCH_RESOLVE_ALL_TO=10.0.2.2`
+makes `entry.sh` launch Chromium with `--host-resolver-rules=MAP * 10.0.2.2`
+as one argv element (the knob is the IP alone because the rule holds a space,
+which the container env word-split when the whole flag was passed). The
+entries change what the snapshot does, so such a golden needs its own `TAG=`.
+The host control takes the same variable directly:
+`make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
+`resolve_all_to` in its `run.json` (null when unset).
+
 `verify` and `run` deliberately have NO build dependency: reqbench.sh seals
 fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and the
 run refuses a golden whose provenance records a different bundle hash.
