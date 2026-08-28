@@ -47,6 +47,12 @@ class EvidenceIgnoreRules(unittest.TestCase):
     `results/run-x/verify-dns-pre.json is ignored and would be lost on the
     next wipe` (three subtests) and the literal `!results/**/verify-dns-*.json`
     was absent.
+
+    RED BEFORE THE THIRD FIX: campaign_summary requires corpus-dns.log and
+    corpus-access.log beside dns-evidence.json and verifies their sha256
+    before indexing a run, but both matched `results/**`, so
+    `results/run-x/corpus-dns.log is ignored and would be lost on the next
+    wipe` (two subtests) and the two literal negations were absent.
     """
 
     IGNORE = os.path.join(HERE, ".gitignore")
@@ -56,6 +62,8 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "!results/**/dns-evidence.json",
         "!results/**/diag/summary.json",
         "!results/**/dns-owner.log",
+        "!results/**/corpus-dns.log",
+        "!results/**/corpus-access.log",
         "!results/**/campaign-*-summary.json",
         "!results/**/WITHDRAWN",
     )
@@ -67,6 +75,8 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "results/run-x/dns-evidence.json",
         "results/run-x/diag/summary.json",
         "results/run-x/dns-owner.log",
+        "results/run-x/corpus-dns.log",
+        "results/run-x/corpus-access.log",
         "results/campaign-x-summary.json",
         "results/campaign-x/campaign-x-summary.json",
         "results/run-x/WITHDRAWN",

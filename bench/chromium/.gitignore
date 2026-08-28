@@ -27,6 +27,10 @@ results/**
 !results/**/dns-evidence.json
 !results/**/diag/summary.json
 !results/**/dns-owner.log
+# The replay server's own logs: dns-evidence.json records their sha256 and
+# campaign_summary refuses the run unless both are present and match.
+!results/**/corpus-dns.log
+!results/**/corpus-access.log
 !results/**/campaign-*-summary.json
 # The withdrawal marker: its first line is why the run may never be quoted,
 # and campaign_summary refuses the run while it is present.

@@ -61,6 +61,15 @@ true` the same way. The marker is tracked (`!results/**/WITHDRAWN` in
 `bench/chromium/.gitignore`) and is never removed, because a withdrawn run
 stays unquotable (REVIEW.md).
 
+A corpus campaign's run directory also keeps the replay server's two logs,
+`corpus-dns.log` and `corpus-access.log`, tracked because `dns-evidence.json`
+records their sha256 and `campaign_summary.py` refuses the run unless both are
+present and match. Expect them to be large: the DNS log has one line per query
+and the access log one line per HTTP request the server answered, from the
+campaign's startup probes through the three verify brackets and every rep of
+every arm of the measured run, so it is the biggest record in the directory
+and a short one means the server was not serving the whole run.
+
 ## Six methodology defects — do not reintroduce
 
 1. **Matched accounting basis.** Sum memory over the SAME process set for every
