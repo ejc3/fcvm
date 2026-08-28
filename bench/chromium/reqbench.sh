@@ -1406,6 +1406,33 @@ acquire_generation_lock() {
     fi
 }
 
+# Exclusive lock on the diag's OUTPUT DIRECTORY, taken before the first
+# removal and held past the summary's atomic rename. Every record, trace and
+# temporary file the phase writes is named from $RESULTS and the URL alone, so
+# two invocations over one RESULTS write the same paths; the generation lock
+# does not serialize them, because two TAGs are two different locks. Unlocked,
+# one phase removes the record the other is about to render into and a summary
+# naming its own generation counts the other snapshot's renders. Bounded wait
+# then refusal, the shape acquire_generation_lock and scripts/hugepage-pool-lock.sh
+# use: a diag that cannot own the directory removes nothing, starts no serve
+# and writes no summary.
+acquire_diag_lock() {
+    local lock="$RESULTS/diag/.lock" wait_s="${DIAG_LOCK_WAIT:-${HUGEPAGE_POOL_LOCK_WAIT:-60}}"
+    mkdir -p "$RESULTS/diag" || { log "diag: cannot create $RESULTS/diag"; return 1; }
+    touch "$lock" 2>/dev/null || true
+    if [ -z "${REQBENCH_DIAG_LOCK_FD:-}" ]; then
+        exec {REQBENCH_DIAG_LOCK_FD}<>"$lock" || true
+    fi
+    if [ -z "${REQBENCH_DIAG_LOCK_FD:-}" ]; then
+        log "diag: output lock unavailable at $lock"
+        return 1
+    fi
+    if ! flock -x -w "$wait_s" "$REQBENCH_DIAG_LOCK_FD"; then
+        log "diag: another diag owns $RESULTS/diag (waited ${wait_s}s); its records, traces and summary share these paths, so this one refuses rather than interleaving with it"
+        return 1
+    fi
+}
+
 # The installed snapshot's guest size; falls back to ambient MEM when the
 # config predates the field.
 snapshot_memory_mib() {
@@ -1537,7 +1564,9 @@ apply_publication_gates() {
 # any load event over DIAG_MAX_LOAD_MS, any failed render (a record that is
 # not this URL's, does not say ok, was written under a non-zero driver exit
 # status, or timed no load event), any clone or serve whose teardown was not
-# clean, and a sealed runtime bundle that changed during the phase.
+# clean, and a sealed runtime bundle that changed during the phase. It
+# refuses outright, before removing or writing anything, when another diag
+# holds $RESULTS/diag.
 
 # The record stem for a URL: scheme and trailing slashes dropped, every run of
 # characters outside [A-Za-z0-9._-] folded to one '-'. A root URL's stem is
@@ -1843,6 +1872,16 @@ PY
 }
 
 cmd_diag() {
+    # The output directory first, before anything under it is removed: this
+    # phase is the only writer of $RESULTS/diag from here to the summary's
+    # rename. Refusing (exit 3, as the TAG lock does) rather than queueing
+    # keeps a second invocation out of a directory whose paths it shares.
+    acquire_diag_lock || return 3
+    # Temporary records an invocation that died mid-render left behind.
+    # diag_render promotes a $record.tmp that parses as an object into the
+    # record, so an abandoned one is a record waiting to be adopted; they go
+    # here, under the lock, before any render can read them.
+    rm -f "$RESULTS"/diag/*.tmp "$RESULTS"/diag/*.tmp.status
     # summary.json is the verdict of the latest diag over this RESULTS. Gone
     # before anything can fail, so a diag that ends without writing its own
     # (a refused knob, a serve or clone that never came up) leaves no earlier

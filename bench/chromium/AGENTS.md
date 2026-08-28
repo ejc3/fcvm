@@ -85,9 +85,17 @@ trace, any load event over `DIAG_MAX_LOAD_MS=` (when set), any failed render
 (a record for another URL, one not saying ok, one written under a non-zero
 driver exit status, or one without a load event timing), any clone whose
 teardown was not clean, and a sealed bundle that changed during the phase.
-Each render record keeps the driver's exit status as `driver_status`. A
-knob is checked before the generation lock and the hugepage pool are
-touched, and the webkit diag refuses `DIAG_EXPECT_IPS=` because its render
+Each render record keeps the driver's exit status as `driver_status`. One
+diag owns `$RESULTS/diag` at a time: the phase takes an exclusive lock on
+`$RESULTS/diag/.lock` before it removes anything and holds it past the
+summary's rename, and a second invocation over the same `RESULTS` waits
+`DIAG_LOCK_WAIT` seconds (default 60) and then refuses with exit 3 rather
+than interleaving records with the holder. The generation lock does not
+serialize them: two `TAG`s are two different locks over one output
+directory. Stale `.tmp` records from an invocation that died mid-render are
+swept under that lock, since diag_render adopts a `.tmp` that parses as an
+object. A knob is checked before the generation lock and the hugepage pool
+are touched, and the webkit diag refuses `DIAG_EXPECT_IPS=` because its render
 has no trace to hold it to. The corpus campaign (`make bench-chromium-corpus`)
 runs it after the verify that follows the golden, with every corpus URL,
 `DIAG_EXPECT_IPS=10.0.2.2` on Chromium and `DIAG_MAX_LOAD_MS` defaulting to

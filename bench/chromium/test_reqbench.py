@@ -5071,6 +5071,15 @@ esac
 case "$1 ${2:-}" in
   *cdpdrive.py*)
       printf '%s\n' "$*" >> "$STUB_DRIVER_ARGV"
+      # STUB_BARRIER: park inside the render until the test releases it, so a
+      # second invocation meets this one holding what it holds.
+      if [ -n "${STUB_BARRIER:-}" ]; then
+          touch "$STUB_BARRIER/rendering"
+          deadline=$((SECONDS + 120))
+          while [ ! -e "$STUB_BARRIER/release" ] && [ "$SECONDS" -lt "$deadline" ]; do
+              sleep 0.05
+          done
+      fi
       exec __PYTHON__ - "$@" <<'PY'
 import json, os, sys
 argv = sys.argv[2:]
@@ -5523,6 +5532,80 @@ exec __PYTHON__ "$@"
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("example.com-a-b", result.stderr)
             self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]))
+
+    def test_a_second_diag_over_one_results_directory_refuses_while_the_first_holds_it(self):
+        """Records, traces, temporary files and summary.json are named from
+        $RESULTS and the URL alone, so two diags over one RESULTS write the
+        same paths. The generation lock does not serialize them: different
+        TAGs are different locks. The second must not remove and rewrite what
+        the first is rendering into, or a summary naming its own generation
+        counts the other's records.
+
+        The first parks inside its render (STUB_BARRIER), so the second runs
+        while it demonstrably holds the phase.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            first, _state_dir = self._diag_fixture(d, reps="1", urls="https://example.com/")
+            barrier = os.path.join(d, "barrier")
+            os.makedirs(barrier)
+            first["STUB_BARRIER"] = barrier
+            snapshots = os.path.join(d, "data", "snapshots")
+            shutil.copytree(os.path.join(snapshots, "tag-under-test"),
+                            os.path.join(snapshots, "other-tag"))
+            second = dict(first, TAG="other-tag", RUNID="1" * 32, DIAG_LOCK_WAIT="2",
+                          STUB_ARGV=os.path.join(d, "argv-second.log"),
+                          STUB_DRIVER_ARGV=os.path.join(d, "driver-argv-second.log"))
+            del second["STUB_BARRIER"]
+            running = subprocess.Popen(
+                ["bash", "-c", f'source "{self.SH}" && cmd_diag'], env=first,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.time() + 120
+                while not os.path.exists(os.path.join(barrier, "rendering")):
+                    self.assertIsNone(running.poll(), "the first diag exited before rendering")
+                    self.assertLess(time.time(), deadline, "the first diag never rendered")
+                    time.sleep(0.05)
+                blocked = self._diag(second)
+                self.assertNotEqual(blocked.returncode, 0,
+                                    blocked.stdout + blocked.stderr)
+                self.assertIn(os.path.join(second["RESULTS"], "diag"), blocked.stderr)
+                self.assertNotIn("snapshot serve",
+                                 self._read_if_exists(second["STUB_ARGV"]),
+                                 "the second diag started a serve in the first's directory")
+                self.assertEqual(self._read_if_exists(second["STUB_DRIVER_ARGV"]), "",
+                                 "the second diag rendered into the first's directory")
+            finally:
+                open(os.path.join(barrier, "release"), "w").close()
+                _out, err = running.communicate(timeout=180)
+            self.assertEqual(running.returncode, 0, err[-3000:])
+            summary = self._diag_summary(first)
+            self.assertEqual(summary["tag"], "tag-under-test")
+            self.assertIs(summary["passed"], True)
+            self.assertEqual(summary["urls"]["https://example.com/"]["renders_ok"], 1)
+
+    def test_a_diag_sweeps_the_temporary_records_an_earlier_invocation_left(self):
+        """A diag killed mid-render leaves <stem>-<rep>.json.tmp and its
+        .status sibling behind, and diag_render promotes a .tmp that parses
+        as an object into the record. An abandoned one is therefore a record
+        waiting to be adopted; they go at the start of the phase, under the
+        output lock, before anything can read them.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", urls="https://example.com/")
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            os.makedirs(diag_dir)
+            leftovers = [os.path.join(diag_dir, name) for name in (
+                "example.com-1.json.tmp", "example.com-1.json.tmp.status",
+                "elsewhere.example-1.json.tmp")]
+            for path in leftovers:
+                with open(path, "w") as handle:
+                    json.dump({"ok": True, "url": "https://elsewhere.example/",
+                               "stages": {"navigate_load_event_ms": 1.0}}, handle)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            for path in leftovers:
+                self.assertFalse(os.path.exists(path), f"{path} outlived the diag")
+            self.assertIs(self._diag_summary(env)["passed"], True)
 
     def test_a_summary_from_an_earlier_diag_does_not_outlive_a_diag_that_wrote_none(self):
         """summary.json in RESULTS/diag is the verdict of the latest diag over
