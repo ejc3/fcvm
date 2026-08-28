@@ -108,7 +108,17 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # how the original outage read. So create it if absent, then prove a file
 # can be made in it.
 require_writable_local_target() {
-	[ -e target ] || mkdir -p target
+	# A dangling UNMANAGED link (a managed one was dropped by the caller) would
+	# make `mkdir -p` fail with EEXIST, under `set -e` and before any diagnostic.
+	if [ -L target ] && ! [ -e target ]; then
+		echo "==> WARNING: dropping dangling target/ → $(readlink target); a local directory takes its place" >&2
+		rm -f -- target
+	fi
+	if ! [ -e target ] && ! mkdir -p target; then
+		echo "ERROR: cannot create a local target/ directory:" >&2
+		ls -ld target >&2 2>/dev/null || true
+		exit 1
+	fi
 	if [ ! -d target ]; then
 		echo "ERROR: target exists but is not a usable directory:" >&2
 		ls -ld target >&2
@@ -140,6 +150,13 @@ drop_managed_link() {
 fallback_to_local() {
 	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
 	drop_managed_link
+	# `--rotate` promises a logically clean target/. Retaining an unmanaged
+	# link or directory here would report a clean while its payload survives;
+	# the unusable-volume branch refuses the same way.
+	if ((FORCE_ROTATE)) && { [ -L target ] || [ -d target ]; }; then
+		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
+		exit 1
+	fi
 	require_writable_local_target
 	exit 0
 }
@@ -283,7 +300,8 @@ if [ -L target ] && [ -d target ]; then
 	# A Cargo wrapper that already crossed the checkout→target lock handoff no
 	# longer holds the checkout lease. Pin and exclusively lease its resolved
 	# generation before publishing any different symlink target.
-	exec {old_target_lease_fd}<target
+	exec {old_target_lease_fd}<target ||
+		fallback_to_local "target/ cannot be opened for its lease"
 	flock -x "$old_target_lease_fd"
 	case "$linked" in
 		"$WT_TARGET"|"$WT_TARGET".generation-*)

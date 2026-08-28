@@ -2963,6 +2963,113 @@ fn run_link_unprivileged(dir: &Path, btrfs_root: &Path) -> (bool, String) {
     (out.status.success(), text)
 }
 
+/// `run_link` with extra script arguments (`--rotate`).
+fn run_link_with(dir: &Path, btrfs_root: &Path, args: &[&str]) -> (bool, String) {
+    let out = Command::new(repo_root().join("scripts/cargo-target-link.sh"))
+        .args(args)
+        .env("BTRFS_ROOT", btrfs_root)
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(dir)
+        .output()
+        .expect("run scripts/cargo-target-link.sh");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// The PUBLISHED generation that cannot be opened falls back too (codex on
+/// #867): `target/` already points at a managed generation, `[ -d target ]`
+/// still passes, and the pin-and-lease open `exec {old_target_lease_fd}<target`
+/// failed under `set -e` before the candidate-lease fallback existed. Same
+/// unprivileged stand-in as the candidate case.
+#[test]
+fn cargo_target_link_falls_back_when_the_published_generation_cannot_be_opened() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("published generation");
+    std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("published link");
+    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
+
+    let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        ok,
+        "the recipe died instead of falling back when the published generation cannot \
+         be opened:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_dir() && !target.is_symlink(),
+        "target/ should be a local directory after the fallback, not {:?}\n{out}",
+        std::fs::symlink_metadata(&target).map(|m| m.file_type())
+    );
+    assert_target_usable(
+        checkout.path(),
+        "published generation that cannot be opened",
+    );
+}
+
+/// `--rotate` must not report a clean it did not perform (codex on #867).
+///
+/// With an UNMANAGED `target/` link and a managed candidate that cannot be
+/// written, `fallback_to_local` used to retain the link and exit 0, so `make
+/// clean` reported success while the linked directory's payload survived. The
+/// unusable-volume branch already refused this; the fallback now does too.
+#[test]
+fn cargo_target_link_rotate_refuses_to_retain_an_unmanaged_link() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+    let elsewhere = tempfile::tempdir().expect("unmanaged payload dir");
+    let payload = elsewhere.path().join("payload");
+    std::fs::write(&payload, b"built artifacts").expect("payload");
+    std::os::unix::fs::symlink(elsewhere.path(), checkout.path().join("target"))
+        .expect("unmanaged link");
+
+    let (ok, out) = run_link_with(checkout.path(), btrfs.path(), &["--rotate"]);
+
+    assert!(
+        !ok,
+        "--rotate reported success while retaining an unmanaged target/ link whose \
+         payload it cannot rotate away:\n{out}"
+    );
+    assert!(
+        out.contains("refusing unsafe clean"),
+        "the refusal must say why:\n{out}"
+    );
+    assert!(
+        payload.exists(),
+        "a refused rotation must not delete the payload either"
+    );
+}
+
+/// A dangling UNMANAGED link is replaced on the fallback path, not tripped over
+/// (CodeRabbit on #867): `[ -e target ] || mkdir -p target` saw the dangling
+/// link as absent, and `mkdir -p` then failed with EEXIST under `set -e`,
+/// before the diagnostic that follows it.
+#[test]
+fn cargo_target_link_replaces_a_dangling_unmanaged_link_on_fallback() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+    std::os::unix::fs::symlink("/nonexistent/elsewhere", checkout.path().join("target"))
+        .expect("dangling unmanaged link");
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(
+        ok,
+        "the recipe died on a dangling unmanaged target/ link instead of replacing it:\n{out}"
+    );
+    assert_target_usable(checkout.path(), "dangling unmanaged link replaced");
+}
+
 /// Every exit that leaves target/ as a plain local directory probes it first.
 ///
 /// Behavioural coverage above reaches two of the three exits; this pins all of
