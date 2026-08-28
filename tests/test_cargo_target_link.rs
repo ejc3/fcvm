@@ -3125,6 +3125,61 @@ fn cargo_target_link_rotates_a_retired_generation_it_cannot_write() {
     assert_target_usable(checkout.path(), "rotated to a fresh generation");
 }
 
+/// Dropping a published managed link waits for the build that holds it
+/// (codex on #867). On the unusable-volume path the script used to unlink
+/// `target/` with no lease on the generation it published; a Cargo wrapper
+/// holding that generation SHARED would then resolve later `target/...` paths
+/// into a different tree. The script must take the generation's exclusive
+/// lease first: with a shared holder present it blocks, and the link stays.
+#[test]
+fn cargo_target_link_waits_for_a_shared_holder_before_dropping_a_managed_link() {
+    use std::os::unix::io::AsRawFd as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(wt.parent().unwrap()).expect("cargo-target parent");
+    let generation = wt.with_file_name(format!(
+        "{}.generation-held0000",
+        wt.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&generation).expect("published generation");
+    // $WT_TARGET cannot be created (dangling symlink), so the volume is unusable.
+    std::os::unix::fs::symlink(btrfs.path().join("cargo-target/absent"), &wt)
+        .expect("dangling $WT_TARGET");
+    std::os::unix::fs::symlink(&generation, checkout.path().join("target"))
+        .expect("target/ -> published generation");
+    // A Cargo wrapper mid-build: the generation is held SHARED for the run.
+    let holder = std::fs::File::open(&generation).expect("open generation");
+    let held = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_SH) };
+    assert_eq!(held, 0, "take the shared lease");
+
+    let out = Command::new("timeout")
+        .arg("4")
+        .arg(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs.path())
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(checkout.path())
+        .output()
+        .expect("run under timeout");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(holder);
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the script did not wait for the shared holder (expected timeout exit 124):\n{text}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_symlink() && std::fs::read_link(&target).expect("readlink") == generation,
+        "target/ was dropped while a build still held its generation\n{text}"
+    );
+}
+
 /// Every exit that leaves target/ as a plain local directory probes it first.
 ///
 /// Behavioural coverage above reaches two of the three exits; this pins all of

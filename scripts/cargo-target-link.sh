@@ -142,7 +142,21 @@ drop_managed_link() {
 	[ -L target ] || return 0
 	case "$(readlink target)" in
 		"$BTRFS_ROOT"/cargo-target/*)
-			echo "==> WARNING: dropping target/ → $(readlink target); no lease can be taken on it" >&2
+			# The link publishes a generation a Cargo wrapper may still hold
+			# SHARED while it resolves later target/... paths. Removing the
+			# pathname under that build splits its outputs across two trees,
+			# so the generation is leased EXCLUSIVELY first (this blocks until
+			# the wrapper is done), and a generation that cannot be opened is
+			# a refusal, as for the published-generation open above. The fd
+			# stays open until exit. A dangling link publishes nothing.
+			if [[ -z ${old_target_lease_fd:-} ]] && [ -d target ]; then
+				if ! exec {old_target_lease_fd}<target; then
+					echo "ERROR: cannot open the published generation $(readlink target) to lease it; a running build may still hold it, refusing to replace target/" >&2
+					exit 1
+				fi
+				flock -x "$old_target_lease_fd"
+			fi
+			echo "==> WARNING: dropping target/ → $(readlink target); its volume cannot be used" >&2
 			rm -f -- target ;;
 	esac
 }
@@ -169,6 +183,7 @@ fallback_to_local() {
 # leased, is the race the pruner's census/rewalk cannot tolerate (raised on
 # #867): an entry that appears after the census or vanishes during the rewalk
 # aborts the hourly preflight.
+old_target_lease_fd=""
 btrfs_usable=0
 if [ -d "$BTRFS_ROOT" ]; then
 	if mkdir -p "$WT_TARGET" 2>/dev/null; then
@@ -294,7 +309,6 @@ if [ -e target ] && ! [ -L target ]; then
 fi
 
 candidate="$WT_TARGET"
-old_target_lease_fd=""
 if [ -L target ] && [ -d target ]; then
 	linked="$(readlink target)"
 	# A Cargo wrapper that already crossed the checkout→target lock handoff no
