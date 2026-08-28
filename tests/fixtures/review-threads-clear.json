@@ -1,3 +1,80 @@
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
- {"isResolved":true,"isOutdated":true,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"src/uffd/server.rs","line":216,"originalLine":210,"body":"Nit: `srv` reads as an abbreviation of server here."},{"author":{"login":"ejc3"},"path":"src/uffd/server.rs","line":216,"originalLine":210,"body":"NOT-A-DEFECT: naming only, no behavior claimed."}]}}
-]}}}}}
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "author": {
+          "login": "ejc3"
+        },
+        "headRefOid": "dff10de24c30fe5c61175fe8d355af2a01a0ef46",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "committedDate": "2026-08-20T11:00:00Z",
+                "checkSuites": {
+                  "nodes": [
+                    {
+                      "createdAt": "2026-08-20T11:00:12Z"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "reviews": {
+          "nodes": [
+            {
+              "author": {
+                "login": "a-reviewer"
+              },
+              "state": "APPROVED",
+              "submittedAt": "2026-08-20T11:30:00Z",
+              "body": "",
+              "commit": {
+                "oid": "dff10de24c30fe5c61175fe8d355af2a01a0ef46"
+              }
+            }
+          ]
+        },
+        "comments": {
+          "nodes": []
+        },
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "isResolved": true,
+              "isOutdated": true,
+              "comments": {
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "coderabbitai"
+                    },
+                    "path": "src/uffd/server.rs",
+                    "line": 216,
+                    "originalLine": 210,
+                    "body": "Nit: `srv` reads as an abbreviation of server here."
+                  },
+                  {
+                    "author": {
+                      "login": "ejc3"
+                    },
+                    "path": "src/uffd/server.rs",
+                    "line": 216,
+                    "originalLine": 210,
+                    "body": "NOT-A-DEFECT: naming only, no behavior claimed."
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

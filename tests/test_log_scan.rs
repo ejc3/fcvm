@@ -239,6 +239,12 @@ fn require_jq() {
     );
 }
 
+/// Every review-thread fixture carries the PR-level fields the gate reads: the head
+/// commit, a check suite dating its arrival, and a stranger's APPROVED review of that
+/// head. Without them the gate blocks on an unreviewed head — correctly — and each of
+/// these tests would then pass for the wrong reason, testing coverage instead of the
+/// rule it is named for. An APPROVED review is not a finding, so it adds nothing to
+/// answer; it only says the head was looked at.
 fn run_threads(fixture: &str) -> (String, i32) {
     require_jq();
     let out = Command::new("bash")
@@ -357,19 +363,22 @@ fn the_gate_blocks_when_it_cannot_run_at_all() {
 /// This exists because a hand-written fixture lied. It carried two comments per thread
 /// while the query asked for `comments(first: 1)`, so the "a RED-VERIFIED reply satisfies
 /// the gate" test passed against a response the code could never produce — green, and
-/// proving nothing. `scripts/capture-review-threads-fixture.sh` regenerates this file
-/// straight from a live PR so the shape cannot drift from the query again.
+/// proving nothing. `scripts/capture-review-threads-fixture.sh` now dumps what the gate
+/// itself assembles (`--dump-payload`), so a fixture cannot drift from the query, and
+/// cannot omit a field the gate later starts reading — which is how the previous capture,
+/// taken before the gate read the head at all, ended up blocking every test that used it.
 ///
-/// Captured from PR #748 (the PR that added this gate), which at capture time had 10
-/// threads, 9 unresolved.
+/// Captured from PR #867 on 2026-08-28 at 22:43Z: head 9ebed542, 18 threads with 3
+/// unresolved, 44 reviews, 17 top-level comments. It replaces a capture of PR #748, whose
+/// threads have all been resolved since, leaving nothing unresolved to parse.
 #[test]
 fn the_gate_handles_a_real_captured_pr_response() {
-    let (out, code) = run_threads("review-threads-live-748.json");
+    let (out, code) = run_threads("review-threads-live-867.json");
 
     assert_ne!(code, 0, "a PR with unresolved threads must block:\n{out}");
     assert!(
-        out.contains("10 total, 9 unresolved"),
-        "the captured response has 10 threads with 9 unresolved; if this count moved, \
+        out.contains("18 total, 3 unresolved"),
+        "the captured response has 18 threads with 3 unresolved; if this count moved, \
          re-capture with scripts/capture-review-threads-fixture.sh and check WHY.\n{out}"
     );
     // Real bodies are markdown with badges, HTML comments and embedded shell blocks —
@@ -385,6 +394,11 @@ fn the_gate_handles_a_real_captured_pr_response() {
 #[test]
 fn every_fixture_matches_the_shape_the_query_returns() {
     const REQUIRED: [&str; 5] = ["author", "body", "line", "originalLine", "path"];
+    // The gate reads these too, and a fixture without them is judged under a rule it
+    // cannot satisfy: no head means "this gate cannot tell whether the code being merged
+    // was reviewed", which is a BLOCK, so every test using such a fixture fails for a
+    // reason that has nothing to do with what it asserts.
+    const REQUIRED_PR_LEVEL: [&str; 4] = ["headRefOid", "checkSuites", "reviews", "comments"];
     let dir = repo_root().join("tests/fixtures");
     let mut checked = 0;
 
@@ -401,6 +415,14 @@ fn every_fixture_matches_the_shape_the_query_returns() {
                 "fixture {name} is missing the `{field}` field that the live query selects. \
                  A fixture that does not match the query lets a test pass against data the \
                  code can never receive."
+            );
+        }
+        for field in REQUIRED_PR_LEVEL {
+            assert!(
+                text.contains(&format!("\"{field}\"")),
+                "fixture {name} is missing the `{field}` field the gate reads at PR level. \
+                 Regenerate it with scripts/capture-review-threads-fixture.sh, or add the \
+                 field by hand; a fixture the gate cannot judge blocks on its own shape."
             );
         }
         assert!(

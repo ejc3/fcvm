@@ -1,5 +1,105 @@
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
- {"isResolved":true,"isOutdated":true,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"src/uffd/server.rs","line":216,"originalLine":210,"body":"Already handled in a follow-up commit."}]}},
- {"isResolved":false,"isOutdated":true,"comments":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"src/uffd/prefetch.rs","line":196,"originalLine":179,"body":"P1: indexing the mapping can panic inside the fault handler and hang the guest."}]}},
- {"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"tests/test_snapshot_clone.rs","line":2413,"originalLine":2413,"body":"Leaks two clone VMs when an assertion trips."}]}}
-]}}}}}
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "author": {
+          "login": "ejc3"
+        },
+        "headRefOid": "2ea0c9d5b2f7399d33667ae3dbeaacef47191d22",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "committedDate": "2026-08-20T11:00:00Z",
+                "checkSuites": {
+                  "nodes": [
+                    {
+                      "createdAt": "2026-08-20T11:00:12Z"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "reviews": {
+          "nodes": [
+            {
+              "author": {
+                "login": "a-reviewer"
+              },
+              "state": "APPROVED",
+              "submittedAt": "2026-08-20T11:30:00Z",
+              "body": "",
+              "commit": {
+                "oid": "2ea0c9d5b2f7399d33667ae3dbeaacef47191d22"
+              }
+            }
+          ]
+        },
+        "comments": {
+          "nodes": []
+        },
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "isResolved": true,
+              "isOutdated": true,
+              "comments": {
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "coderabbitai"
+                    },
+                    "path": "src/uffd/server.rs",
+                    "line": 216,
+                    "originalLine": 210,
+                    "body": "Already handled in a follow-up commit."
+                  }
+                ]
+              }
+            },
+            {
+              "isResolved": false,
+              "isOutdated": true,
+              "comments": {
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "chatgpt-codex-connector"
+                    },
+                    "path": "src/uffd/prefetch.rs",
+                    "line": 196,
+                    "originalLine": 179,
+                    "body": "P1: indexing the mapping can panic inside the fault handler and hang the guest."
+                  }
+                ]
+              }
+            },
+            {
+              "isResolved": false,
+              "isOutdated": false,
+              "comments": {
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "coderabbitai"
+                    },
+                    "path": "tests/test_snapshot_clone.rs",
+                    "line": 2413,
+                    "originalLine": 2413,
+                    "body": "Leaks two clone VMs when an assertion trips."
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

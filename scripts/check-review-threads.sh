@@ -19,8 +19,9 @@
 # handled. `isResolved` is the only field that means resolved.
 #
 # Usage:
-#   check-review-threads.sh <pr-number>          # query GitHub
-#   check-review-threads.sh --from-file <json>   # parse a saved response (tests)
+#   check-review-threads.sh <pr-number>            # query GitHub
+#   check-review-threads.sh --from-file <json>     # parse a saved response (tests)
+#   check-review-threads.sh --dump-payload <pr>    # print that response, for fixtures
 set -uo pipefail
 
 # A GATE MUST FAIL CLOSED. Without this check the script degraded silently when `jq`
@@ -216,6 +217,15 @@ fetch_payload() {
                                       reviewThreads:{nodes:$t[0]}, reviews:{nodes:$r[0]},
                                       comments:{nodes:$c[0]}}}}}'
 }
+
+# A fixture must be the payload the gate actually consumes, not a hand-written guess at
+# it. One already drifted: it carried two comments per thread while the query asked for
+# `comments(first: 1)`, so a test passed against data the code could never return. Dumping
+# from fetch_payload keeps the fixtures and the query the same thing by construction.
+if [ "${1:-}" = "--dump-payload" ]; then
+  fetch_payload "${2:?usage: check-review-threads.sh --dump-payload <pr-number>}" || exit 2
+  exit 0
+fi
 
 if [ "${1:-}" = "--from-file" ]; then
   payload=$(cat "${2:?need a json file}")
