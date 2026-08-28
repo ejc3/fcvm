@@ -19,6 +19,10 @@ can read them after a run while this process is still serving:
                      the address for A queries and "" for everything else
   --access-log PATH  {ts, peer, method, host, path, status, bytes, duration_ms}
                      per HTTP and HTTPS request; host is the Host header as sent
+
+Either log is evidence the campaign hashes, so a line that cannot be written
+stops the server: the DNS responder closes its socket, and an access line
+that fails ends both HTTP listeners and main() exits 1 with the reason.
 """
 
 import argparse
@@ -105,16 +109,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             if self.access_log is not None and self._log_status is not None:
                 headers = getattr(self, "headers", None)
-                self.access_log.write({
-                    "ts": ts,
-                    "peer": f"{self.client_address[0]}:{self.client_address[1]}",
-                    "method": getattr(self, "command", None) or "",
-                    "host": (headers.get("Host") or "") if headers is not None else "",
-                    "path": getattr(self, "path", None) or "",
-                    "status": self._log_status,
-                    "bytes": self._log_bytes,
-                    "duration_ms": (time.monotonic() - t0) * 1000,
-                })
+                try:
+                    self.access_log.write({
+                        "ts": ts,
+                        "peer": f"{self.client_address[0]}:{self.client_address[1]}",
+                        "method": getattr(self, "command", None) or "",
+                        "host": (headers.get("Host") or "") if headers is not None else "",
+                        "path": getattr(self, "path", None) or "",
+                        "status": self._log_status,
+                        "bytes": self._log_bytes,
+                        "duration_ms": (time.monotonic() - t0) * 1000,
+                    })
+                except Exception as exc:  # noqa: BLE001 - whatever it was, the line is not on disk
+                    # An answered, unlogged request is a hole in the evidence
+                    # the campaign hashes, as an unlogged DNS query is. Left to
+                    # ThreadingHTTPServer this would end one handler thread and
+                    # the server would keep answering, unlogged, for the rest
+                    # of the run. Stop every listener instead; the re-raise
+                    # puts the traceback in corpus_serve.log via handle_error.
+                    self.server.fail_closed(exc)
+                    raise
 
     def send_response(self, code, message=None):
         self._log_status = int(code)
@@ -214,6 +228,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # quiet
         pass
+
+
+# Serialises fail_closed across handler threads: the first failure is the one
+# recorded, and the listeners are shut down once.
+_FAIL_CLOSED = threading.Lock()
+
+
+class ReplayServer(http.server.ThreadingHTTPServer):
+    """One replay listener; `peers` is the list of listeners sharing the log.
+
+    A handler whose access line could not be written calls fail_closed(): the
+    error is recorded as log_failure on every peer and every peer's
+    serve_forever() returns, so serve_http() exits 1 with the reason instead
+    of serving on with a truncated log. Both listeners stop because the guest
+    fetches through both, and a log with only one side's lines is as short as
+    one with neither. Nothing clears the failure.
+    """
+
+    def __init__(self, address, handler, peers=None):
+        super().__init__(address, handler)
+        self.log_failure = None
+        self.peers = peers if peers is not None else []
+        self.peers.append(self)
+
+    def fail_closed(self, exc: BaseException) -> None:
+        with _FAIL_CLOSED:
+            if any(peer.log_failure is not None for peer in self.peers):
+                return
+            for peer in self.peers:
+                peer.log_failure = exc
+        # shutdown() blocks until a serve_forever loop has returned, so it
+        # runs off the handler thread; peers are stopped in list order, and
+        # main() blocks in the last one's serve_forever.
+        threading.Thread(target=self._stop_peers, name="fail-closed", daemon=True).start()
+
+    def _stop_peers(self) -> None:
+        for peer in self.peers:
+            peer.shutdown()
+
+
+def serve_http(plain: ReplayServer, tls: ReplayServer, err=None) -> int:
+    """Serve both listeners until a failed access-log write stops them.
+
+    serve_forever() returns only through ReplayServer.fail_closed (nothing
+    else calls shutdown), so a return is a failure: the reason goes to `err`
+    (stderr by default) and the status is 1. The process exits with it, the
+    guest's fetches and lookups start failing, and the campaign records the
+    run as unclean on the after-run bracket and the :53 owner samples.
+    """
+    threading.Thread(target=plain.serve_forever, daemon=True).start()
+    tls.serve_forever()
+    plain.shutdown()
+    failure = tls.log_failure or plain.log_failure
+    print(f"FAILED: an access log line could not be written, replay stopped: {failure!r}",
+          file=err or sys.stderr, flush=True)
+    return 1
 
 
 def selfsigned(tmpdir: Path):
@@ -345,18 +415,19 @@ def main():
                      daemon=True).start()
     print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> {args.answer_ip}", flush=True)
 
-    plain = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    threading.Thread(target=plain.serve_forever, daemon=True).start()
-
+    # Both listeners exist before either serves: a failure on one must find
+    # the other in `peers`, and neither answers a request before that.
+    peers = []
+    plain = ReplayServer(("127.0.0.1", args.port), Handler, peers)
     tmp = Path("/tmp/corpus-replay-cert")
     tmp.mkdir(exist_ok=True)
     crt, key = selfsigned(tmp)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(str(crt), str(key))
-    tls = http.server.ThreadingHTTPServer(("127.0.0.1", args.tls_port), Handler)
+    tls = ReplayServer(("127.0.0.1", args.tls_port), Handler, peers)
     tls.socket = ctx.wrap_socket(tls.socket, server_side=True)
     print(f"replaying on http://127.0.0.1:{args.port} and https://127.0.0.1:{args.tls_port}", flush=True)
-    tls.serve_forever()
+    return serve_http(plain, tls)
 
 
 if __name__ == "__main__":
