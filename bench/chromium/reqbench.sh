@@ -1023,14 +1023,22 @@ ensure_hugepage_pool() {
     # EXCLUSIVE and atomically downgrades. Bounded waits fail closed rather
     # than hanging behind a stuck owner.
     local wait_s="${HUGEPAGE_POOL_LOCK_WAIT:-60}"
-    # A DIRECTORY, not a file (PR #868): mkdir -p is idempotent for any
-    # creator, and a 0755 directory opens read-only for any user with no
-    # O_CREAT and no ownership, so who created it never matters. A lock FILE
-    # created by root (make setup-hugepages) under a sticky user-owned data
-    # root is refused by fs.protected_regular on the next unprivileged
-    # O_CREAT open, which is what `<>` and util-linux `flock <path>` do.
-    local pool_lock="$DATA_ROOT/hugepage-pool.lock.d"
-    mkdir -p -m 755 "$pool_lock" 2>/dev/null || true
+    # Opened READ-ONLY, never with O_CREAT (PR #868): fs.protected_regular
+    # refuses an O_CREAT open of a file owned by someone else in a sticky
+    # world-writable directory, which is what `<>` did against the lock a
+    # root `make setup-hugepages` had created. flock(2) does not care about
+    # the open mode. Created atomically when absent (a hard link fails if
+    # the name exists), so concurrent creators agree on one inode; same
+    # mechanism as scripts/hugepage-pool-lock.sh, which the recipes use.
+    local pool_lock="$DATA_ROOT/hugepage-pool.lock"
+    mkdir -p "$DATA_ROOT" 2>/dev/null || true
+    if [ ! -e "$pool_lock" ]; then
+        local tmp
+        if tmp="$(mktemp -u "$pool_lock.XXXXXX" 2>/dev/null)"; then
+            { install -m 644 /dev/null "$tmp" && ln "$tmp" "$pool_lock"; } 2>/dev/null || true
+            rm -f "$tmp"
+        fi
+    fi
     if [ -z "${REQBENCH_POOL_LOCK_FD:-}" ]; then
         exec {REQBENCH_POOL_LOCK_FD}<"$pool_lock" || true
     fi
