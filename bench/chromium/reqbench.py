@@ -98,6 +98,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -1228,6 +1229,27 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         raise RuntimeError(f"snapshot config {path} has invalid network_mode {network_mode!r}")
     if not isinstance(port_mappings, list):
         raise RuntimeError(f"snapshot config {path} has no port_mappings list")
+    # The guest resolver the golden was prepared with (`fcvm podman prepare
+    # --dns`, reqbench.sh GUEST_DNS). fcvm records it as
+    # metadata.network_config.dns_server; null means the guest used the host
+    # resolvers, which is what a fixture run wants and what a corpus run must
+    # never have (the analyzer refuses hostnames without a named resolver).
+    network_config = metadata.get("network_config")
+    dns_server = None
+    if network_config is not None:
+        if not isinstance(network_config, dict):
+            raise RuntimeError(f"snapshot config {path} has no network_config object")
+        dns_server = network_config.get("dns_server")
+        if dns_server is not None:
+            try:
+                canonical_dns_server = str(ipaddress.ip_address(dns_server))
+            except (TypeError, ValueError):
+                canonical_dns_server = None
+            if canonical_dns_server != dns_server:
+                raise RuntimeError(
+                    f"snapshot config {path} has invalid network_config.dns_server "
+                    f"{dns_server!r}: expected an IP literal"
+                )
 
     provenance_path = os.path.join(
         data_root, "snapshots", snapshot_name, "reqbench-provenance.json"
@@ -1319,6 +1341,7 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         "memory_mib": memory_mib,
         "network_mode": network_mode,
         "port_mappings": port_mappings,
+        "dns_server": dns_server,
     }
 
 
@@ -4160,6 +4183,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "uffd_mode": uffd_mode,
             "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
             "engine": args.engine,
+            "guest_dns": snapshot["dns_server"],
             "quality": args.quality,
             "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,
