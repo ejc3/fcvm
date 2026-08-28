@@ -512,8 +512,9 @@ class AccessLog(unittest.TestCase):
         server-wide state the access log's failure uses, so every listener
         stops and main() exits 1 with the reason.
 
-        The line follows the answer, so the query whose line fails is still
-        answered; what must not happen is an HTTP request after it.
+        The line precedes the answer, so the query whose line fails is never
+        answered; the responder exits without replying, and no HTTP request
+        can follow it.
 
         Red: the responder thread died on `TypeError: serve_dns() got an
         unexpected keyword argument 'server'` before answering, so the first
@@ -538,15 +539,20 @@ class AccessLog(unittest.TestCase):
                                          args=(sock, "10.0.2.2", dns_log),
                                          kwargs={"server": server}, daemon=True)
             responder.start()
-            for name in ("first.test", "second.test"):
-                client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self.addCleanup(client.close)
-                client.settimeout(5)
-                client.sendto(dns_query(name, QTYPE_A), ("127.0.0.1", port))
-                reply, _ = client.recvfrom(512)
-                self.assertEqual(socket.inet_ntoa(reply[-4:]), "10.0.2.2", f"{name} was not answered")
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.addCleanup(client.close)
+            client.settimeout(5)
+            client.sendto(dns_query("first.test", QTYPE_A), ("127.0.0.1", port))
+            reply, _ = client.recvfrom(512)
+            self.assertEqual(socket.inet_ntoa(reply[-4:]), "10.0.2.2", "first.test was not answered")
+            client.sendto(dns_query("second.test", QTYPE_A), ("127.0.0.1", port))
             responder.join(timeout=5)
             self.assertFalse(responder.is_alive(), "serve_dns kept serving after a failed log write")
+            # The responder has exited, so a reply it had sent over loopback
+            # would already be in this socket's buffer.
+            client.setblocking(False)
+            with self.assertRaises(BlockingIOError, msg="second.test was answered although its line was not written"):
+                client.recvfrom(512)
             thread.join(timeout=5)
             self.assertFalse(thread.is_alive(),
                              "the HTTP listener kept serving after a failed DNS-log write")
