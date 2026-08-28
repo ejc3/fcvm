@@ -32,6 +32,14 @@ WebSocket framing comes from render.py so the host-driven arm and the in-guest
 per-request arm speak CDP through identical code; a divergence there would
 silently invalidate the A/B. Only the connect path is reimplemented here, to time
 its two halves separately.
+
+`--net-trace PATH` is a diagnostic, not a measurement. It sends `Network.enable`
+before the navigate, collects requestWillBeSent / responseReceived /
+loadingFinished / loadingFailed until Page.loadEventFired, keeps draining for
+`--net-trace-drain-ms` (default 5000) so requests still open at the load event
+show how they end, and writes PATH as {"requests": [...], "summary": {...}}.
+The record gains a "net_trace" key holding the summary. Without the flag not
+one extra CDP message is sent; test_net_trace.py pins the wire sequence.
 """
 
 import argparse
@@ -46,6 +54,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from urllib.parse import urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -309,8 +318,151 @@ def transport_signal(error: BaseException, render_mod) -> str:
     return "not-transport"
 
 
+def _timing_ms(timing: dict, start_key: str, end_key: str):
+    """A ResourceTiming interval in ms, or None when Chromium reports -1 (not applicable)."""
+    start, end = timing.get(start_key, -1), timing.get(end_key, -1)
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+    if start < 0 or end < 0:
+        return None
+    return round(end - start, 3)
+
+
+def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
+    """Fold one navigation's Network.* events into per-request rows and a summary.
+
+    Times are browser-clock seconds (Network.MonotonicTime), reported in ms
+    relative to the earliest requestWillBeSent, which is the navigation's own
+    document request and so sits inside the navigate command's round trip.
+    `load_ts` is Page.loadEventFired's timestamp on the same clock, or None
+    when the event never arrived; then "pending at load" means still open when
+    observation ended, which is the question a stalled load asks. A redirect
+    re-announces its requestId with the next url; the row keeps its first url
+    and start and counts the hop.
+    """
+    rows: dict = {}
+    order: list = []
+    for event in events:
+        method = event.get("method", "")
+        params = event.get("params", {})
+        rid = params.get("requestId")
+        if not method.startswith("Network.") or rid is None:
+            continue
+        row = rows.get(rid)
+        if method == "Network.requestWillBeSent":
+            if row is None:
+                rows[rid] = {
+                    "request_id": rid,
+                    "url": params.get("request", {}).get("url", ""),
+                    "start_ts": params.get("timestamp"),
+                    "end_ts": None,
+                    "remote_ip": "",
+                    "remote_port": None,
+                    "protocol": "",
+                    "status": None,
+                    "timing": None,
+                    "failed": False,
+                    "canceled": False,
+                    "error_text": "",
+                    "redirects": 0,
+                }
+                order.append(rid)
+            else:
+                row["redirects"] += 1
+            continue
+        if row is None:
+            continue  # announced before Network.enable; nothing to attach to
+        if method == "Network.responseReceived":
+            response = params.get("response", {})
+            row.update(
+                remote_ip=response.get("remoteIPAddress", ""),
+                remote_port=response.get("remotePort"),
+                protocol=response.get("protocol", ""),
+                status=response.get("status"),
+                timing=response.get("timing"),
+            )
+        elif method == "Network.loadingFinished":
+            if row["end_ts"] is None:
+                row["end_ts"] = params.get("timestamp")
+        elif method == "Network.loadingFailed":
+            if row["end_ts"] is None:
+                row["end_ts"] = params.get("timestamp")
+            row["failed"] = True
+            row["canceled"] = bool(params.get("canceled", False))
+            row["error_text"] = params.get("errorText", "")
+
+    starts = [r["start_ts"] for r in rows.values() if r["start_ts"] is not None]
+    base = min(starts) if starts else None
+
+    def rel_ms(ts):
+        if ts is None or base is None:
+            return None
+        return round((ts - base) * 1000, 3)
+
+    requests = []
+    for rid in order:
+        r = rows[rid]
+        ended = r["end_ts"] is not None
+        finished_before_load = (
+            ended and not r["failed"] and load_ts is not None and r["end_ts"] <= load_ts
+        )
+        started_by_load = load_ts is None or (
+            r["start_ts"] is not None and r["start_ts"] <= load_ts
+        )
+        pending_at_load = started_by_load and (
+            not ended or (load_ts is not None and r["end_ts"] > load_ts)
+        )
+        timing = r["timing"] if isinstance(r["timing"], dict) else {}
+        requests.append({
+            "request_id": rid,
+            "url": r["url"],
+            "start_ms": rel_ms(r["start_ts"]),
+            "end_ms": rel_ms(r["end_ts"]),
+            "remote_ip": r["remote_ip"],
+            "remote_port": r["remote_port"],
+            "protocol": r["protocol"],
+            "status": r["status"],
+            "finished_before_load": finished_before_load,
+            "pending_at_load": pending_at_load,
+            "failed": r["failed"],
+            "canceled": r["canceled"],
+            "error_text": r["error_text"],
+            "redirects": r["redirects"],
+            "dns_ms": _timing_ms(timing, "dnsStart", "dnsEnd"),
+            "connect_ms": _timing_ms(timing, "connectStart", "connectEnd"),
+            "timing": r["timing"],
+        })
+
+    remote_ips = Counter(row["remote_ip"] for row in requests if row["remote_ip"])
+    errors = Counter(row["error_text"] for row in requests if row["failed"])
+    ended_rows = sorted(
+        (row for row in requests if row["end_ms"] is not None),
+        key=lambda row: -row["end_ms"],
+    )
+    def by_count(item):
+        return (-item[1], item[0])
+
+    summary = {
+        "n_requests": len(requests),
+        "n_finished_before_load": sum(row["finished_before_load"] for row in requests),
+        "n_failed": sum(row["failed"] for row in requests),
+        "n_pending_at_load": sum(row["pending_at_load"] for row in requests),
+        "remote_ips": dict(sorted(remote_ips.items(), key=by_count)),
+        "errors": dict(sorted(errors.items(), key=by_count)),
+        "slowest_10": [{"url": row["url"], "end_ms": row["end_ms"]} for row in ended_rows[:10]],
+        "load_event_ms": rel_ms(load_ts),
+        "drain_ms": drain_ms,
+    }
+    return {"requests": requests, "summary": summary}
+
+
 def drive(args) -> dict:
     render = load_render(args.render_module)
+    # getattr, for the same reason as host_header below: reqbench builds a
+    # closed Namespace. A missing attribute or None means the trace is off,
+    # and off sends nothing the untraced path does not send.
+    trace_path = getattr(args, "net_trace", None)
+    trace_drain_ms = float(getattr(args, "net_trace_drain_ms", 5000.0))
     t0 = time.monotonic()
     deadline = t0 + args.timeout
     out: dict = {"ok": False, "cdp_host": args.cdp_host, "url": args.url, "format": args.format}
@@ -318,6 +470,8 @@ def drive(args) -> dict:
     stage = "resolve"
     stage_started = t0
     ws = None
+    cdp = None
+    load_ts = None
     try:
         if args.ws_url:
             ws_url = args.ws_url
@@ -353,6 +507,10 @@ def drive(args) -> dict:
         cdp.cmd("Page.enable", deadline=deadline)
         if args.idle_wait_ms > 0:
             cdp.cmd("Page.setLifecycleEventsEnabled", {"enabled": True}, deadline=deadline)
+        if trace_path:
+            # The one message the trace adds before the navigate. Measured
+            # arms never set the flag and stay byte-identical on the wire.
+            cdp.cmd("Network.enable", deadline=deadline)
         stages["enable_ms"] = (time.monotonic() - t) * 1000
         stages["connect_total_ms"] = (time.monotonic() - t0) * 1000
 
@@ -367,9 +525,27 @@ def drive(args) -> dict:
 
         stage = "navigate-load-event"
         stage_started = time.monotonic()
-        cdp.wait_event(lambda ev: ev["method"] == "Page.loadEventFired", deadline)
+        load_event = cdp.wait_event(lambda ev: ev["method"] == "Page.loadEventFired", deadline)
         stages["navigate_load_event_ms"] = (time.monotonic() - stage_started) * 1000
         stages["navigate_ms"] = (time.monotonic() - t) * 1000
+
+        if trace_path:
+            load_ts = load_event.get("params", {}).get("timestamp")
+            stage = "net-trace-drain"
+            stage_started = time.monotonic()
+            t = stage_started
+            if trace_drain_ms > 0:
+                # Keep reading so requests still open at the load event show
+                # how they end. wait_event stashes every event it reads; the
+                # bound is the socket timeout, the same mechanism as the idle
+                # wait above.
+                try:
+                    cdp.wait_event(
+                        lambda _ev: False, min(deadline, t + trace_drain_ms / 1000)
+                    )
+                except TimeoutError:
+                    pass
+            stages["net_trace_drain_ms"] = (time.monotonic() - t) * 1000
 
         stage = "network-idle"
         stage_started = time.monotonic()
@@ -491,6 +667,18 @@ def drive(args) -> dict:
             else "render"
         )
     finally:
+        if trace_path and cdp is not None:
+            # Written on failure too: a load event that never fired is the
+            # case the trace exists for. A filesystem error goes on the record
+            # rather than out of drive(), which never raises for its own faults.
+            trace = reduce_net_trace(cdp.events, load_ts, trace_drain_ms)
+            try:
+                with open(trace_path, "w") as f:
+                    json.dump(trace, f, separators=(",", ":"))
+                    f.write("\n")
+                out["net_trace"] = trace["summary"]
+            except OSError as e:
+                out["net_trace_error"] = f"{type(e).__name__}: {e}"
         if ws is not None:
             try:
                 ws.close()
@@ -518,6 +706,13 @@ def main() -> int:
     p.add_argument("--host-header", default="",
                    help="override the Host header on /json/list; proves Chromium's "
                         "DevTools host validation rejects non-IP, non-localhost names")
+    p.add_argument("--net-trace", default=None, metavar="PATH",
+                   help="write the navigation's Network.* events as per-request rows plus "
+                        "a summary to PATH; adds Network.enable and a post-load drain, "
+                        "so never on a measured arm")
+    p.add_argument("--net-trace-drain-ms", type=float, default=5000.0,
+                   help="with --net-trace: keep collecting events this long after "
+                        "Page.loadEventFired")
     p.add_argument("--render-module", default=os.path.join(HERE, "render.py"))
     args = p.parse_args()
     if args.print_target:
