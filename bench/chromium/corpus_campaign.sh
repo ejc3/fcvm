@@ -57,8 +57,11 @@ mkdir -p "$LOGDIR"
 mkdir -p "$RESULTS"
 # An explicit RESULTS can be reused. Evidence an earlier campaign left there
 # must not outlive this one's start: a clean verdict beside a run this
-# campaign never finished would be indexed as if it were this run's.
-rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log
+# campaign never finished would be indexed as if it were this run's, and
+# corpus_serve appends to its replay logs, so an earlier attempt's queries and
+# requests would be hashed into this run's evidence as its own.
+rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
+    "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log
 
 # The 14 URLs, in the order the sealed 2026-08-14 run cycled them. Order is part
 # of the schedule: reqanalyze re-derives the expected URL per record from it, so
@@ -420,11 +423,15 @@ grep -q "loaded [1-9]" "$LOGDIR/corpus_serve.log" || {
 # after switching to a pidfile the curl below raced the TLS bind and returned
 # 000, which `set -e` turned into a bare exit 7. Poll the sockets instead, so
 # the wait is as long as it needs to be and no longer.
+# --noproxy '*' on this curl and the one below: both talk to 127.0.0.1 and
+# nothing else. With http_proxy/HTTPS_PROXY in the environment curl would go to
+# the proxy instead: a working one fetches the live site and passes an
+# incomplete replay, an unreachable one returns 000 for a replay that is up.
 answer=""
 code=""
 for _ in $(seq 1 100); do
     answer=$(dig +short +time=2 +tries=1 @127.0.0.1 blog.cloudflare.com A 2>/dev/null | head -1 || true)
-    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+    code=$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 5 \
            --resolve 'blog.cloudflare.com:443:127.0.0.1' https://blog.cloudflare.com/ 2>/dev/null || true)
     if [ "$answer" = "10.0.2.2" ] && [ "$code" = "200" ]; then break; fi
     sudo kill -0 "$SERVE_PID" 2>/dev/null || { echo "BLOCKED: corpus_serve died during startup" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
@@ -442,7 +449,7 @@ say "replay server up: DNS -> 10.0.2.2, HTTPS 200"
 missing=""
 for url in $(printf '%s\n' "$URLS" | tr ',' ' '); do
     host=$(printf '%s' "$url" | sed -E 's#^https?://([^/]+).*#\1#')
-    ucode=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+    ucode=$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 10 \
             --resolve "$host:443:127.0.0.1" "$url" 2>/dev/null || true)
     case "$ucode" in
     200 | 30[1278]) ;;

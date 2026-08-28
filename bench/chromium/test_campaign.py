@@ -286,6 +286,130 @@ class PartialCorpus(unittest.TestCase):
                       f"a complete corpus was refused\n{result.stderr}")
 
 
+class LocalProbesIgnoreProxies(unittest.TestCase):
+    """The replay probes talk to 127.0.0.1 and nothing else.
+
+    A proxy in the environment (a bench host behind an egress proxy, a shell
+    with http_proxy exported) sends curl to the proxy instead of the replay
+    server unless the URL's host is in no_proxy, and the corpus hosts are not.
+    A working proxy then fetches the LIVE site, so an incomplete replay passes
+    the completeness probe on live status codes; an unreachable proxy rejects a
+    replay that is complete. Neither reads as a proxy problem: the first is a
+    plausible campaign, the second is `BLOCKED: HTTPS replay returned '000'`.
+
+    Both probes run here against a local stub with every proxy variable set to
+    an address nothing listens on (127.0.0.1:9). curl reads http_proxy in lower
+    case only (the CGI convention) and https_proxy in either case; all four are
+    set so the retargeted http:// probe sees what the shipped https:// one
+    would. A control runs the same probe with --noproxy removed and requires it
+    to fail, so a pass cannot come from an environment curl never saw. dig
+    honours no proxy variable and needs nothing.
+
+    Watched red 2026-08-28 against corpus_campaign.sh at 13cb9543; the failure
+    text is quoted on each test.
+    """
+
+    DEAD_PROXY = "http://127.0.0.1:9"
+    READINESS = re.compile(
+        r'(answer=""\ncode=""\nfor _ in \$\(seq 1 100\); do\n.*?\ndone\n'
+        r'\[ "\$answer" = "10\.0\.2\.2" \][^\n]*\n\[ "\$code" = "200" \][^\n]*\n)', re.S)
+
+    def _env(self) -> dict:
+        env = {k: v for k, v in os.environ.items()
+               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+        for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
+            env[name] = self.DEAD_PROXY
+        return env
+
+    def _stub(self, served: str) -> int:
+        class Stub(PartialCorpus.OnlyOne):
+            pass
+
+        Stub.served = served
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def _run(self, script: str, env: dict):
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        return subprocess.run(["bash", path], env=env, capture_output=True,
+                              text=True, timeout=60)
+
+    def _control(self, script: str, env: dict):
+        """The same probe with --noproxy removed must go to the dead proxy."""
+        stripped = script.replace("--noproxy '*' ", "")
+        control = self._run(stripped, env)
+        self.assertEqual(control.returncode, 3,
+                         "the control probe reached the stub through the proxy "
+                         "environment, so a pass here would prove nothing\n"
+                         + control.stdout + control.stderr)
+        return control
+
+    def test_the_completeness_probe_reaches_the_replay_server_through_a_proxy_environment(self):
+        """Red: exit 3, `BLOCKED: the corpus does not serve every configured
+        URL:` naming `000  http://x/served`."""
+        block = re.search(r"(missing=\"\"\n.*?\nfi)\n", campaign(), re.S)
+        self.assertIsNotNone(block, "the corpus completeness probe is gone")
+        probe = PartialCorpus.retarget(block.group(1), self._stub("/served"))
+        script = f'set -u\nURLS="http://x/served"\n{probe}\necho COMPLETE\n'
+        env = self._env()
+        control = self._control(script, env)
+        self.assertIn("000  http://x/served", control.stderr)
+        result = self._run(script, env)
+        self.assertEqual(result.returncode, 0,
+                         "a complete corpus was refused because curl went to the "
+                         f"proxy instead of 127.0.0.1\n{result.stdout}{result.stderr}")
+        self.assertIn("COMPLETE", result.stdout)
+
+    def test_the_readiness_probe_reaches_the_replay_server_through_a_proxy_environment(self):
+        """Red: exit 3, `BLOCKED: HTTPS replay returned '000' for blog.cloudflare.com`."""
+        block = self.READINESS.search(campaign())
+        self.assertIsNotNone(block, "the replay readiness probe is gone")
+        port = self._stub("/")
+        probe = (block.group(1)
+                 .replace("--resolve 'blog.cloudflare.com:443:127.0.0.1' "
+                          "https://blog.cloudflare.com/",
+                          f"--connect-to 'blog.cloudflare.com:80:127.0.0.1:{port}' "
+                          "http://blog.cloudflare.com/")
+                 .replace("curl -sk", "curl -s")
+                 # The shipped loop polls 100 times at 0.2 s for a server that
+                 # is still binding; the stub is up before the probe starts, so
+                 # two rounds bound the failing case at under a second.
+                 .replace("seq 1 100", "seq 1 2"))
+        for applied in ("--connect-to", "http://blog.cloudflare.com/", "seq 1 2"):
+            self.assertIn(applied, probe, "the retarget did not apply; the probe "
+                                          "would hit 127.0.0.1:443, not the stub")
+        self.assertNotIn("-sk", probe)
+        with tempfile.TemporaryDirectory() as tmp:
+            binx = os.path.join(tmp, "bin")
+            logs = os.path.join(tmp, "logs")
+            os.makedirs(binx)
+            os.makedirs(logs)
+            for name, body in (("dig", "#!/bin/bash\necho 10.0.2.2\n"),
+                               ("sudo", DnsBrackets.FAKE_SUDO)):
+                path = os.path.join(binx, name)
+                with open(path, "w") as handle:
+                    handle.write(body)
+                os.chmod(path, 0o755)
+            open(os.path.join(logs, "corpus_serve.log"), "w").close()
+            env = self._env()
+            env["PATH"] = binx + os.pathsep + env["PATH"]
+            script = (f'set -euo pipefail\nLOGDIR="{logs}"\nSERVE_PID=$$\n'
+                      f'{probe}\necho READY\n')
+            control = self._control(script, env)
+            self.assertIn("returned '000'", control.stderr)
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0,
+                             "a replay server that is up was reported down because "
+                             f"curl went to the proxy instead of 127.0.0.1\n{result.stderr}")
+            self.assertIn("READY", result.stdout)
+
+
 class DnsBrackets(unittest.TestCase):
     """Resolver evidence around the measured run: verify on each side, sample between.
 
@@ -566,6 +690,19 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-run", handle.read())
 
+    # The rm may continue over backslash-newlines; the block runs whole.
+    START_CLEANUP = re.compile(
+        r'(mkdir -p "\$RESULTS"\n(?:#[^\n]*\n)*rm -f (?:[^\n]*\\\n)*[^\n]*\n)')
+
+    def _run_start_cleanup(self, results: str):
+        """Execute the block after `mkdir -p "$RESULTS"` that clears an
+        earlier campaign's evidence, against a pre-filled RESULTS."""
+        block = self.START_CLEANUP.search(campaign())
+        self.assertIsNotNone(block, "the campaign does not clear stale evidence at start")
+        return subprocess.run(
+            ["bash", "-c", f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'],
+            capture_output=True, text=True, timeout=30)
+
     def test_stale_evidence_from_an_earlier_campaign_is_cleared_at_start(self):
         """An explicit RESULTS can be reused. A clean dns-evidence.json left
         by an earlier campaign, beside a run this campaign never finished,
@@ -574,9 +711,6 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         RED BEFORE THE FIX: the block after `mkdir -p "$RESULTS"` removed
         nothing.
         """
-        block = re.search(r'(mkdir -p "\$RESULTS"\n(?:#[^\n]*\n)*rm -f [^\n]*\n)',
-                          campaign())
-        self.assertIsNotNone(block, "the campaign does not clear stale evidence at start")
         with tempfile.TemporaryDirectory() as tmp:
             results = os.path.join(tmp, "results")
             os.makedirs(results)
@@ -587,15 +721,34 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                     handle.write('{"verdict": "clean", "passed": true}\n')
             with open(os.path.join(results, "analysis.json"), "w") as handle:
                 handle.write("{}\n")
-            result = subprocess.run(
-                ["bash", "-c", f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'],
-                capture_output=True, text=True, timeout=30)
+            result = self._run_start_cleanup(results)
             self.assertEqual(result.returncode, 0, result.stderr)
             for name in stale:
                 self.assertFalse(os.path.exists(os.path.join(results, name)),
                                  f"stale {name} survived the campaign start")
             self.assertTrue(os.path.exists(os.path.join(results, "analysis.json")),
                             "the start wiped more than the evidence")
+
+    def test_stale_replay_logs_from_an_earlier_campaign_are_cleared_at_start(self):
+        """corpus_serve opens both replay logs for append (JsonlLog), so a
+        reused RESULTS carries an earlier attempt's queries and requests into
+        the logs this campaign hashes into dns-evidence.json as its own. The
+        server writes them from its first query, so they go with the rest of
+        the stale evidence, before it starts.
+
+        RED BEFORE THE FIX: `stale corpus-dns.log survived the campaign start`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            for name in self.REPLAY_LOGS:
+                with open(os.path.join(results, name), "w") as handle:
+                    handle.write('{"ts": 0, "peer": "earlier attempt"}\n')
+            result = self._run_start_cleanup(results)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in self.REPLAY_LOGS:
+                self.assertFalse(os.path.exists(os.path.join(results, name)),
+                                 f"stale {name} survived the campaign start")
 
     def test_the_golden_sub_make_receives_results_and_the_baked_resolver(self):
         block = self.GOLDEN.search(campaign())
@@ -795,27 +948,38 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         the write did; a failed jq or redirect still yielded `clean` and a
         campaign exit of 0 with no evidence on disk.
 
+        The write is failed by a jq or an mv on PATH that exits 1, one per
+        subtest, so both halves of `jq ... >tmp || ! mv tmp out` are covered.
+        The first version made $RESULTS read-only instead, and root writes
+        into a 0o555 directory: under sudo the write succeeded and this test
+        failed with `0 == 0 : a failed evidence write returned 0` (Codex,
+        2026-08-28). A stub on PATH fails the same way for every uid.
+
         RED BEFORE THE FIX: stdout `clean`, exit 0.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            env, results = self._fakes(tmp)
-            self._leave_files(results)
-            with open(os.path.join(results, "dns-owner.log"), "w") as handle:
-                handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n")
-            os.chmod(results, 0o555)
-            script = (f'set -u\n{self._helpers()}\nRESULTS="{results}"\n'
-                      'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\nSAMPLER_ALIVE_AT_STOP=yes\n'
-                      'write_dns_evidence clean\n')
-            try:
+        for tool in ("jq", "mv"):
+            with self.subTest(tool), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                self._leave_files(results)
+                with open(os.path.join(results, "dns-owner.log"), "w") as handle:
+                    handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n")
+                stub = os.path.join(tmp, "bin", tool)
+                with open(stub, "w") as handle:
+                    handle.write("#!/bin/bash\nexit 1\n")
+                os.chmod(stub, 0o755)
+                script = (f'set -u\n{self._helpers()}\nRESULTS="{results}"\n'
+                          'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\nSAMPLER_ALIVE_AT_STOP=yes\n'
+                          'write_dns_evidence clean\n')
                 result = self._run(script, env)
-            finally:
-                os.chmod(results, 0o755)
-            self.assertNotEqual(result.returncode, 0, "a failed evidence write returned 0")
-            self.assertEqual(result.stdout.strip(), "unclean")
-            self.assertEqual(sorted(os.listdir(results)),
-                             sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log"]
-                                    + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
-                             "a partial evidence file or temp file was left behind")
+                self.assertNotEqual(result.returncode, 0,
+                                    f"a failed {tool} in the evidence write returned 0")
+                self.assertEqual(result.stdout.strip(), "unclean")
+                self.assertIn("cannot write", result.stderr,
+                              f"the failed {tool} was not what made the verdict unclean")
+                self.assertEqual(sorted(os.listdir(results)),
+                                 sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log"]
+                                        + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
+                                 "a partial evidence file or temp file was left behind")
 
     def test_a_bracket_failure_cannot_be_lifted_by_clean_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
