@@ -8588,6 +8588,62 @@ class AnalyzerResolverGate(unittest.TestCase):
         errors = out["gate"]["backend_metadata"]["errors"]
         self.assertTrue(any("guest_env" in error for error in errors), errors)
 
+    def test_a_baked_resolver_rule_is_the_recorded_resolver(self):
+        """GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> is a recorded resolver.
+
+        That golden answers every hostname inside Chromium's own resolver
+        (`--host-resolver-rules=MAP * <ip>`), so nothing is asked of
+        resolv.conf and guest_dns is null. The record still names what
+        resolved the corpus, so the gate publishes it.
+        """
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_env=rule),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(out["cell"]["guest_dns"])
+        self.assertEqual(out["cell"]["guest_env"], rule)
+
+    def test_a_baked_environment_that_is_not_a_resolver_rule_is_refused(self):
+        """Only BENCH_RESOLVE_ALL_TO answers hostnames. A golden that baked
+        some other variable and no guest_dns resolved its corpus somewhere
+        the record does not say."""
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_env=["CB_SITE_ISOLATION=off"]),
+            )
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(
+            any("guest_dns" in error and "example.com" in error for error in errors),
+            f"the refusal must name the missing resolver and a hostname: {errors}",
+        )
+
+    def test_a_resolver_rule_whose_value_is_not_an_address_is_refused(self):
+        """entry.sh refuses a BENCH_RESOLVE_ALL_TO that is not one IP
+        literal, so a record carrying one is a record that cannot be read.
+        It is refused whether or not a guest_dns is also recorded."""
+        for extra in ({}, {"guest_dns": "10.0.2.2"}):
+            with self.subTest(extra=extra):
+                with tempfile.TemporaryDirectory() as d:
+                    rc, out = self._analyze(
+                        d, lambda src: self.write_multi_url(
+                            src, self.CORPUS,
+                            guest_env=["BENCH_RESOLVE_ALL_TO=notanip"], **extra),
+                    )
+                self.assertIs(out["publishable"], False)
+                self.assertEqual(rc, 5)
+                errors = out["gate"]["backend_metadata"]["errors"]
+                self.assertTrue(
+                    any("BENCH_RESOLVE_ALL_TO" in error for error in errors),
+                    f"the refusal must name the unreadable rule: {errors}",
+                )
+
     def test_corpus_hostnames_with_guest_dns_are_publishable(self):
         with tempfile.TemporaryDirectory() as d:
             rc, out = self._analyze(
