@@ -47,6 +47,7 @@
           },
           "nodes": [
             {
+              "id": "PRRT_fixture_unresolved_0",
               "isResolved": true,
               "isOutdated": true,
               "comments": {
@@ -64,6 +65,7 @@
               }
             },
             {
+              "id": "PRRT_fixture_unresolved_1",
               "isResolved": false,
               "isOutdated": true,
               "comments": {
@@ -81,6 +83,7 @@
               }
             },
             {
+              "id": "PRRT_fixture_unresolved_2",
               "isResolved": false,
               "isOutdated": false,
               "comments": {

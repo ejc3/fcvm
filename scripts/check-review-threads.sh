@@ -50,6 +50,8 @@ COMMENTS_PAGE_SIZE=${COMMENTS_PAGE_SIZE:-100}
 # Same idea for the reviews connection, so its paging is reachable on an ordinary PR
 # instead of one with 100+ submitted reviews.
 REVIEWS_PAGE_SIZE=${REVIEWS_PAGE_SIZE:-100}
+# And for the PR's commits, whose paging needs a PR with 100+ commits to reach.
+COMMITS_PAGE_SIZE=${COMMITS_PAGE_SIZE:-100}
 
 # Ordering timestamps. GitHub does not return them all in one shape: check-suite and
 # comment timestamps are whole-second ("2026-01-02T00:30:00Z"), while the datetime Codex
@@ -92,67 +94,21 @@ TS_JQ='def ts:
   end;'
 
 # What a thread contributes to the verdict, in a form the two reads can be compared in.
-THREAD_FP_JQ='[ .[] | {id, isResolved, total: (.comments.totalCount // null)} ] | sort_by(.id | tostring)'
+# The comment bodies are IN it: they are what the disposition and unresolved-listing rules
+# read, and an in-place edit moves neither the thread's flags nor its comment count. pageInfo
+# is deliberately out, since a cursor is not content and one differing between two reads of
+# the same threads would block on nothing.
+THREAD_FP_JQ='[ .[] | {id, isResolved, isOutdated, total: (.comments.totalCount // null),
+                       comments: [ .comments.nodes[]? | {author: (.author.login // null), path,
+                                                         line, originalLine, body: (.body // null)} ]} ]
+  | sort_by(.id | tostring)'
 
-fetch_payload() {
-  local pr=$1 cursor=null threads='[]' reviews='[]' prcomments='[]' prauthor='' headoid=''
-
-  # Reviews are their OWN connection and must be paged on their OWN cursor. They used to
-  # ride along inside the reviewThreads loop, which was wrong twice over: past 100 reviews
-  # a defect claim in review 101 was never fetched at all (CLEAR with nothing answered),
-  # and on a PR with 2+ pages of THREADS the same first review page was appended once per
-  # iteration, duplicating every claim.
-  local rcursor=null rafter="" rresp
-  while :; do
-    [ "$rcursor" != "null" ] && rafter=", after: \"$rcursor\""
-    rresp=$(gh api graphql -f query="
-      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
-          pullRequest(number: $pr) {
-            author { login }
-            headRefOid
-            commits(last: 1) { nodes { commit { committedDate checkSuites(first: 10) { nodes { createdAt } } } } }
-            prcommits: commits(last: 100) { nodes { commit { oid } } }
-            reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
-              pageInfo { hasNextPage endCursor }
-              nodes { author { login } state body submittedAt commit { oid } }
-            } } } }" 2>/dev/null) || return 1
-    if [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$rresp")" = "null" ]; then
-      echo "verdict: BLOCKED — no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is" >&2
-      echo "not visible to this token). Refusing to report CLEAR for a PR never read." >&2
-      return 2
-    fi
-    reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
-          <(echo "$reviews") <(echo "$rresp"))
-    prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$rresp")
-    headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$rresp")
-    headdate=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.committedDate // ""' <<<"$rresp")
-    headsuites=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes // []' <<<"$rresp")
-    # The PR's own commits, which is the universe an abbreviated sha resolves against.
-    prcommits=$(jq -c '.data.repository.pullRequest.prcommits.nodes // []' <<<"$rresp")
-    [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
-    rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
-  done
-
-  # THIRD place a finding can live: a top-level PR comment. Not a thread, not a review —
-  # its own `comments` connection. This gate told people to answer with `gh pr comment`
-  # while never reading what that command produces, so a defect claim posted the way the
-  # docs suggest could sit on a PR that reported CLEAR.
-  local ccursor2=null cafter="" cresp2
-  while :; do
-    [ "$ccursor2" != "null" ] && cafter=", after: \"$ccursor2\""
-    cresp2=$(gh api graphql -f query="
-      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
-          pullRequest(number: $pr) {
-            comments(first: $REVIEWS_PAGE_SIZE$cafter) {
-              pageInfo { hasNextPage endCursor }
-              nodes { author { login __typename } body createdAt updatedAt }
-            } } } }" 2>/dev/null) || return 1
-    prcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
-          <(echo "$prcomments") <(echo "$cresp2"))
-    [ "$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage' <<<"$cresp2")" = "true" ] || break
-    ccursor2=$(jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor' <<<"$cresp2")
-  done
-
+# ONE read of the PR's review threads: every thread, every comment, with each oversized
+# thread's comments paged to the end. Prints the thread array on stdout; says why and
+# returns non-zero when a page could not be fetched. fetch_payload calls it TWICE, and the
+# two reads must agree.
+fetch_threads() {
+  local pr=$1 cursor=null threads='[]'
   while :; do
     local after="" resp
     # `\"` here, NOT `\\\"`: the latter puts a literal backslash into the GraphQL
@@ -234,6 +190,91 @@ fetch_payload() {
     threads=$(jq --arg id "$tid" --slurpfile c <(printf '%s' "$all_comments") \
       'map(if .id == $id then .comments.nodes = $c[0] else . end)' <<<"$threads")
   done
+  printf '%s' "$threads"
+}
+
+fetch_payload() {
+  local pr=$1 threads='[]' reviews='[]' prcomments='[]' prauthor='' headoid=''
+
+  # Reviews are their OWN connection and must be paged on their OWN cursor. They used to
+  # ride along inside the reviewThreads loop, which was wrong twice over: past 100 reviews
+  # a defect claim in review 101 was never fetched at all (CLEAR with nothing answered),
+  # and on a PR with 2+ pages of THREADS the same first review page was appended once per
+  # iteration, duplicating every claim.
+  local rcursor=null rafter="" rresp
+  while :; do
+    [ "$rcursor" != "null" ] && rafter=", after: \"$rcursor\""
+    rresp=$(gh api graphql -f query="
+      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $pr) {
+            author { login }
+            headRefOid
+            commits(last: 1) { nodes { commit { committedDate checkSuites(first: 10) { nodes { createdAt } } } } }
+            reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login } state body submittedAt commit { oid } }
+            } } } }" 2>/dev/null) || return 1
+    if [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$rresp")" = "null" ]; then
+      echo "verdict: BLOCKED — no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is" >&2
+      echo "not visible to this token). Refusing to report CLEAR for a PR never read." >&2
+      return 2
+    fi
+    reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
+          <(echo "$reviews") <(echo "$rresp"))
+    prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$rresp")
+    headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$rresp")
+    headdate=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.committedDate // ""' <<<"$rresp")
+    headsuites=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes // []' <<<"$rresp")
+    [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
+    rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
+  done
+
+  # The PR's own commits: the universe an abbreviated sha in a review result resolves
+  # against. Its own connection, paged on its own cursor to completion. It used to ride the
+  # reviews query as `commits(last: 100)`, which truncates in silence: past 100 commits an
+  # omitted OLDER commit sharing the head's seven-character prefix made the abbreviation
+  # look unambiguous, so a result issued for that commit certified the head. totalCount
+  # travels with the list, and the reader refuses a list that does not account for it, so a
+  # fetch that stopped early blocks instead of resolving against a fragment.
+  local pccursor=null pcafter="" pcresp prcommitcount=null prcommits='[]'
+  while :; do
+    [ "$pccursor" != "null" ] && pcafter=", after: \"$pccursor\""
+    pcresp=$(gh api graphql -f query="
+      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $pr) {
+            commits(first: $COMMITS_PAGE_SIZE$pcafter) {
+              totalCount
+              pageInfo { hasNextPage endCursor }
+              nodes { commit { oid } }
+            } } } }" 2>/dev/null) || return 1
+    prcommits=$(jq -s '.[0] + (.[1].data.repository.pullRequest.commits.nodes // [])' \
+          <(echo "$prcommits") <(echo "$pcresp"))
+    prcommitcount=$(jq -r '.data.repository.pullRequest.commits.totalCount // "null"' <<<"$pcresp")
+    [ "$(jq -r '.data.repository.pullRequest.commits.pageInfo.hasNextPage' <<<"$pcresp")" = "true" ] || break
+    pccursor=$(jq -r '.data.repository.pullRequest.commits.pageInfo.endCursor' <<<"$pcresp")
+  done
+
+  # THIRD place a finding can live: a top-level PR comment. Not a thread, not a review —
+  # its own `comments` connection. This gate told people to answer with `gh pr comment`
+  # while never reading what that command produces, so a defect claim posted the way the
+  # docs suggest could sit on a PR that reported CLEAR.
+  local ccursor2=null cafter="" cresp2
+  while :; do
+    [ "$ccursor2" != "null" ] && cafter=", after: \"$ccursor2\""
+    cresp2=$(gh api graphql -f query="
+      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $pr) {
+            comments(first: $REVIEWS_PAGE_SIZE$cafter) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login __typename } body createdAt updatedAt }
+            } } } }" 2>/dev/null) || return 1
+    prcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
+          <(echo "$prcomments") <(echo "$cresp2"))
+    [ "$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage' <<<"$cresp2")" = "true" ] || break
+    ccursor2=$(jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor' <<<"$cresp2")
+  done
+
+  threads=$(fetch_threads "$pr") || return $?
 
   # Re-read the COMMENTS after all paging, for the same reason the head is re-read below —
   # and it is not the same check. Two of the three coverage signals live in comments that
@@ -288,24 +329,16 @@ fetch_payload() {
     return 2
   fi
 
-  # Only id, isResolved and the comment count: those are what the verdict turns on, and they
-  # are the fields the oversized-thread paging above does not rewrite, so the first read can
-  # be compared after it.
-  local th2='[]' th2cursor=null th2after="" th2resp
-  while :; do
-    [ "$th2cursor" != "null" ] && th2after=", after: \"$th2cursor\""
-    th2resp=$(gh api graphql -f query="
-      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
-          pullRequest(number: $pr) {
-            reviewThreads(first: 100$th2after) {
-              pageInfo { hasNextPage endCursor }
-              nodes { id isResolved comments(first: 1) { totalCount } }
-            } } } }" 2>/dev/null) || return 1
-    th2=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviewThreads.nodes // [])' \
-          <(echo "$th2") <(echo "$th2resp"))
-    [ "$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$th2resp")" = "true" ] || break
-    th2cursor=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$th2resp")
-  done
+  # The second read is the SAME read, comments and all. It used to fetch only id,
+  # isResolved and comments.totalCount, on the theory that those are what the verdict turns
+  # on. They are not: the verdict turns on the BODIES from the first read, and GitHub lets a
+  # review comment be edited in place, which moves none of those three. A disposition edited
+  # mid-run into something that disposes of nothing left the fingerprint identical, and the
+  # gate certified the thread from a reply that no longer existed. Reading the comments twice
+  # costs the slowest part of the run twice; a cheaper comparison that cannot see an edit
+  # costs correctness.
+  local th2
+  th2=$(fetch_threads "$pr") || return $?
   if [ "$(jq -c "$THREAD_FP_JQ" <<<"$threads")" != "$(jq -c "$THREAD_FP_JQ" <<<"$th2")" ]; then
     echo "verdict: BLOCKED — the review threads on this PR changed while this gate was" >&2
     echo "reading them. The reading below was taken from what they said before. Re-run" >&2
@@ -337,10 +370,10 @@ fetch_payload() {
         --slurpfile c <(printf '%s' "$prcomments") \
         --slurpfile rc <(printf '%s' "$recheckcomments") \
         --arg a "$prauthor" --arg h "$headoid" --arg d "$headdate" --argjson cs "${headsuites:-[]}" \
-        --argjson pc "${prcommits:-[]}" \
+        --slurpfile pc <(printf '%s' "${prcommits:-[]}") --argjson pct "${prcommitcount:-null}" \
      '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
                                       commits:{nodes:[{commit:{committedDate:$d, checkSuites:{nodes:$cs}}}]},
-                                      prcommits:{nodes:$pc},
+                                      prcommits:{totalCount:$pct, nodes:$pc[0]},
                                       reviewThreads:{nodes:$t[0]}, reviews:{nodes:$r[0]},
                                       comments:{nodes:$c[0]},
                                       recheck:{comments:{nodes:$rc[0]}}}}}}'
@@ -895,6 +928,22 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   # review row can be naming, and it covers the head only when it resolves to exactly one
   # commit and that commit IS the head. A full sha is compared as an identity and needs no
   # resolution. An ambiguous or unresolvable abbreviation names nothing and binds nothing.
+  # A FRAGMENT of the commit list is worse than none of it: `deadbee` is ambiguous across
+  # the PR's real commits and unique across the hundred that happened to be fetched, and the
+  # second reading certifies a head nobody reviewed. The list is paged to completion above
+  # and carries the totalCount GitHub reported, so a payload whose list does not account for
+  # every commit blocks. An ABSENT list is a different thing and stays allowed: no universe
+  # resolves no abbreviation, which is the fail-closed direction, and it is the shape of
+  # every fixture captured before this gate read the commits at all.
+  if [ "$(jq -r '.data.repository.pullRequest | has("prcommits")' <<<"$payload" 2>/dev/null)" = "true" ] \
+     && ! jq -e '.data.repository.pullRequest.prcommits
+                 | (.totalCount | type) == "number" and (.totalCount == (.nodes | length))' \
+          >/dev/null 2>&1 <<<"$payload"; then
+    echo "verdict: BLOCKED — the PR's commit list does not account for every commit on the" >&2
+    echo "PR, so an abbreviated sha in a review result would resolve against a fragment of" >&2
+    echo "it and could name the head by accident. Re-run, or re-capture the fixture." >&2
+    exit 2
+  fi
   proids=$(jq -c '[.data.repository.pullRequest.prcommits.nodes[]?.commit.oid // empty]' \
     <<<"$payload" 2>/dev/null) || {
     echo "verdict: BLOCKED — could not read the PR's commit list." >&2; exit 2; }

@@ -446,6 +446,20 @@ fn fixture_shape_problem(name: &str, text: &str) -> Option<String> {
                  and it is the only field that means 'resolved'. {hint}"
             ));
         }
+        // The other two fields the query selects on a thread. `id` is what the gate pages an
+        // oversized thread's comments by, and what orders the two reads it compares;
+        // `isOutdated` is the flag the unresolved rule ignores on purpose, and a fixture
+        // without it cannot show that an outdated finding still counts.
+        if !thread["id"].is_string() {
+            return Some(format!(
+                "fixture {name}: reviewThreads.nodes[{i}].id is not a string. {hint}"
+            ));
+        }
+        if !thread["isOutdated"].is_boolean() {
+            return Some(format!(
+                "fixture {name}: reviewThreads.nodes[{i}].isOutdated is not a boolean. {hint}"
+            ));
+        }
         let Some(comments) = thread["comments"]["nodes"].as_array() else {
             return Some(format!(
                 "fixture {name}: reviewThreads.nodes[{i}].comments.nodes is not an array. \
@@ -490,7 +504,8 @@ fn the_fixture_shape_check_reads_the_payload_not_the_text() {
         "commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z",
           "checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},
         "reviews":{"nodes":[]},
-        "reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[
+        "reviewThreads":{"nodes":[{"id":"PRRT_inline_1","isResolved":false,"isOutdated":false,
+          "comments":{"nodes":[
           {"author":{"login":"reviewer"},"path":"a.rs","line":1,"originalLine":1,
            "body":"P1: this drops the last row"}]}}]}
       }}}}"#;
@@ -510,7 +525,8 @@ fn the_fixture_shape_check_reads_the_payload_not_the_text() {
           "checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},
         "reviews":{"nodes":[]},
         "comments":{"nodes":[]},
-        "reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[
+        "reviewThreads":{"nodes":[{"id":"PRRT_inline_2","isResolved":false,"isOutdated":false,
+          "comments":{"nodes":[
           {"author":{"login":"reviewer"},"path":"a.rs","line":1,"originalLine":1,
            "body":"P1: this drops the last row"}]}}]}
       }}}}"#;
@@ -518,6 +534,76 @@ fn the_fixture_shape_check_reads_the_payload_not_the_text() {
         fixture_shape_problem("complete", complete),
         None,
         "a payload carrying every field the query selects must be accepted"
+    );
+}
+
+/// A thread comes back from the query with an `id` and an `isOutdated` flag, so a fixture
+/// without them is a shape GitHub cannot return.
+///
+/// The validator checked `isResolved` alone. `id` is what the gate keys an oversized
+/// thread's comment paging on, and what orders the two reads it compares; `isOutdated` is
+/// the flag the unresolved rule deliberately ignores, and a fixture that omits it cannot
+/// show that it does. Five fixtures were missing the id, and so was the payload the test
+/// above accepts as complete: a check that certifies a shape the live query never produces.
+#[test]
+fn a_fixture_thread_without_an_id_or_an_outdated_flag_is_rejected() {
+    let payload = |thread_fields: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{
+        "author":{{"login":"me"}},
+        "headRefOid":"deadbeef",
+        "commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z",
+          "checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},
+        "reviews":{{"nodes":[]}},
+        "comments":{{"nodes":[]}},
+        "reviewThreads":{{"nodes":[{{{thread_fields},"comments":{{"nodes":[
+          {{"author":{{"login":"reviewer"}},"path":"a.rs","line":1,"originalLine":1,
+           "body":"P1: this drops the last row"}}]}}}}]}}
+      }}}}}}}}"#
+        )
+    };
+
+    assert!(
+        fixture_shape_problem(
+            "no-id",
+            &payload(r#""isResolved":false,"isOutdated":false"#)
+        )
+        .is_some(),
+        "a thread with no `id` must be rejected: the query selects it, and the gate pages \
+         an oversized thread's comments by it."
+    );
+    assert!(
+        fixture_shape_problem(
+            "id-not-a-string",
+            &payload(r#""id":7,"isResolved":false,"isOutdated":false"#)
+        )
+        .is_some(),
+        "an `id` that is not a string is not the id the query returns."
+    );
+    assert!(
+        fixture_shape_problem(
+            "no-outdated",
+            &payload(r#""id":"PRRT_x","isResolved":false"#)
+        )
+        .is_some(),
+        "a thread with no `isOutdated` must be rejected: the query selects it, and a \
+         fixture that omits it cannot show that an outdated finding still counts."
+    );
+    assert!(
+        fixture_shape_problem(
+            "outdated-not-a-bool",
+            &payload(r#""id":"PRRT_x","isResolved":false,"isOutdated":"true""#)
+        )
+        .is_some(),
+        "the string \"true\" is not the boolean the query returns."
+    );
+    assert_eq!(
+        fixture_shape_problem(
+            "complete",
+            &payload(r#""id":"PRRT_x","isResolved":false,"isOutdated":false"#)
+        ),
+        None,
+        "a thread carrying every field the query selects must be accepted"
     );
 }
 

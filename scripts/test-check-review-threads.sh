@@ -480,9 +480,10 @@ echo "== finding 29: a head with no review result of any kind is unreviewed, not
 # an unreviewed head, and a payload that names no head cannot be judged (regression case
 # below).
 # The PR's own commits, which is the universe an abbreviated sha is resolved against
-# (finding 37). $4 overrides it; by default the head is the only commit.
-PRCOMMITS_HEAD='[{"commit":{"oid":"deadbeef"}}]'
-wrap8() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"prcommits":{"nodes":%s},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "${4:-$PRCOMMITS_HEAD}" "$2" "${3:-$2}"; }
+# (finding 37). $4 overrides it, as the whole connection: the nodes plus the totalCount
+# that says how many there are (finding 39). By default the head is the only commit.
+PRCOMMITS_HEAD='{"totalCount":1,"nodes":[{"commit":{"oid":"deadbeef"}}]}'
+wrap8() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"prcommits":%s,"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "${4:-$PRCOMMITS_HEAD}" "$2" "${3:-$2}"; }
 SUITE='[{"createdAt":"2026-01-02T00:30:00Z"}]'
 run_case "reviews [] and a codex verdict naming an older sha is an unreviewed head" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")")" \
@@ -592,6 +593,11 @@ run_case "a comment that cannot grant coverage may differ between the reads" \
            "[$CLEAN_WALK,$(cmt onlooker User 2026-01-02T00:50:00Z '"edited wording"' 2026-01-02T01:30:00Z),$ANSWER]")" \
   0 "HEAD COVERED"
 
+# Every gh shim below answers the PR's commit list from this file: the two heads the live
+# cases use, and the totalCount that says the list is whole (finding 39). A case about
+# resolving an abbreviation overwrites it.
+PRCOMMITS_LIVE=$(printf '{"data":{"repository":{"pullRequest":{"commits":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"commit":{"oid":"deadbeef"}},{"commit":{"oid":"%s"}}]}}}}}' "$HEAD40")
+
 echo "== finding 31: the LIVE path takes the second read =="
 # --from-file can only prove the comparison. That the gate actually re-fetches is a property
 # of fetch_payload, so it is tested through the gh shim: the second `comments(first:` query
@@ -605,6 +611,7 @@ printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPa
 cat > "$TMP/bin/gh" <<'SHIM'
 #!/bin/bash
 case "$*" in
+  *"commits(first"*)   cat "$GATE_TEST_DIR/prcommits.json" ;;
   *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
   *"comments(first"*)
@@ -614,6 +621,7 @@ case "$*" in
   *headRefOid*)        printf '%s\n' "$GATE_TEST_HEAD" ;;  # the recheck passes --jq
 esac
 SHIM
+printf '%s' "$PRCOMMITS_LIVE" > "$TMP/prcommits.json"
 chmod +x "$TMP/bin/gh"
 rm -f "$TMP/ccount"
 out=$(GATE_TEST_DIR="$TMP" GATE_TEST_HEAD="$HEAD40" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
@@ -763,13 +771,14 @@ printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPa
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments2.json"
 printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/threads.json"
 printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":false,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"body":"P1: this landed while the gate was paging"}]}}]}}}}}' > "$TMP/threads2.json"
-review_payload() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"prcommits":{"nodes":[{"commit":{"oid":"deadbeef"}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":%s,"commit":{"oid":"deadbeef"}}]}}}}}' "$1"; }
+review_payload() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"prcommits":{"totalCount":1,"nodes":[{"commit":{"oid":"deadbeef"}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":%s,"commit":{"oid":"deadbeef"}}]}}}}}' "$1"; }
 review_payload '""' > "$TMP/reviews.json"
 review_payload '"P1: this landed while the gate was paging"' > "$TMP/reviews2.json"
 cat > "$TMP/bin/gh" <<'SHIM'
 #!/bin/bash
 nth() { local f=$GATE_TEST_DIR/$1.count n; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$f"; printf '%s' "$n"; }
 case "$*" in
+  *"commits(first"*)   cat "$GATE_TEST_DIR/prcommits.json" ;;
   *reviewThreads*)
     if [ "$(nth threads)" -le 1 ]; then cat "$GATE_TEST_DIR/threads.json"; else cat "$GATE_TEST_DIR/${GATE_TEST_THREADS2:-threads}.json"; fi ;;
   *"reviews(first"*)
@@ -778,6 +787,7 @@ case "$*" in
   *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq
 esac
 SHIM
+printf '%s' "$PRCOMMITS_LIVE" > "$TMP/prcommits.json"
 chmod +x "$TMP/bin/gh"
 live_case() {
   local name=$1 want_rc=$2 want_txt=$3 out rc
@@ -821,9 +831,9 @@ echo "== finding 37: a seven-character prefix is not a commit identity =="
 # exactly one of the PR's commits and that commit has to be the head; a full sha still
 # matches by identity.
 # deadbee abbreviates both of these, so on this PR it names neither.
-PRCOMMITS_AMBIG='[{"commit":{"oid":"deadbee0"}},{"commit":{"oid":"deadbeef"}}]'
+PRCOMMITS_AMBIG='{"totalCount":2,"nodes":[{"commit":{"oid":"deadbee0"}},{"commit":{"oid":"deadbeef"}}]}'
 # The head is not in this list, so deadbee resolves to a commit that is not the head.
-PRCOMMITS_OTHER='[{"commit":{"oid":"deadbee0"}}]'
+PRCOMMITS_OTHER='{"totalCount":1,"nodes":[{"commit":{"oid":"deadbee0"}}]}'
 run_case "a summary row naming a prefix two PR commits share is not coverage" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z),$ANSWER" "" "$PRCOMMITS_AMBIG")" \
   1 "UNREVIEWED HEAD"
@@ -901,12 +911,14 @@ printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPa
 cat > "$TMP/bin/gh" <<'SHIM'
 #!/bin/bash
 case "$*" in
+  *"commits(first"*)   cat "$GATE_TEST_DIR/prcommits.json" ;;
   *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
   *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
   *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq; apply it here
 esac
 SHIM
+printf '%s' "$PRCOMMITS_LIVE" > "$TMP/prcommits.json"
 chmod +x "$TMP/bin/gh"
 out=$(GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
 if [ "$rc" = 0 ] && grep -qF "CLEAR" <<<"$out" && ! grep -qi "argument list too long" <<<"$out"; then
@@ -927,6 +939,7 @@ printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor"
 cat > "$TMP/bin/gh" <<'SHIM'
 #!/bin/bash
 case "$*" in
+  *"commits(first"*)   cat "$GATE_TEST_DIR/prcommits.json" ;;
   *"node(id"*)         cat "$GATE_TEST_DIR/threadpage.json" ;;
   *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
@@ -934,6 +947,7 @@ case "$*" in
   *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq; apply it here
 esac
 SHIM
+printf '%s' "$PRCOMMITS_LIVE" > "$TMP/prcommits.json"
 chmod +x "$TMP/bin/gh"
 out=$(COMMENTS_PAGE_SIZE=2 GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
 if [ "$rc" = 0 ] && grep -qF "CLEAR" <<<"$out" && ! grep -qi "argument list too long" <<<"$out"; then
@@ -943,6 +957,151 @@ else
   sed 's/^/          /' <<<"$out" | head -4
   fail=$((fail+1))
 fi
+
+echo "== finding 39: an abbreviation resolves against the WHOLE commit list, or none =="
+# The PR's commits arrived as `commits(last: 100)`, and names_head resolves an abbreviated
+# sha against that list. Past 100 commits an omitted OLDER commit sharing the head's
+# seven-character prefix is invisible: the abbreviation resolves to the head alone, reads
+# as unambiguous, and a result issued for the old commit certifies the head. The connection
+# is now paged to completion and carries the count of what it should hold, so a list that
+# does not account for every commit resolves nothing.
+PRCOMMITS_TRUNC='{"totalCount":2,"nodes":[{"commit":{"oid":"deadbeef"}}]}'
+PRCOMMITS_NOCOUNT='{"nodes":[{"commit":{"oid":"deadbeef"}}]}'
+run_case "a commit list holding fewer commits than it says blocks" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")" "" "$PRCOMMITS_TRUNC")" \
+  2 "does not account for every commit"
+run_case "a commit list that says nothing about its size blocks" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")" "" "$PRCOMMITS_NOCOUNT")" \
+  2 "does not account for every commit"
+# Guards, green before and after: a complete list still resolves an abbreviation, and a
+# payload with no commit list at all is no universe, so an abbreviation resolves to nothing
+# while a full sha still matches by identity.
+run_case "a complete commit list still resolves the abbreviation" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")")" \
+  0 "HEAD COVERED"
+run_case "no commit list at all resolves no abbreviation" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")]")" \
+  1 "UNREVIEWED HEAD"
+run_case "no commit list at all still matches a full sha by identity" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")]")" \
+  0 "HEAD COVERED"
+
+echo "== finding 39: the LIVE path pages the commit list to completion =="
+# --from-file can only prove the completeness check. That the gate FETCHES every commit is
+# a property of fetch_payload, so it goes through the gh shim: 150 commits whose oldest
+# shares the head's seven-character prefix. One `commits(last: 100)` omits that commit, the
+# verdict's `deadbee` resolves to the head alone, and the head reads as covered by a result
+# bound to nothing. With both pages fetched it is ambiguous, and it covers nothing.
+mkdir -p "$TMP/bin"
+HEAD150=deadbeef00000000000000000000000000000000
+python3 - "$TMP" "$HEAD150" <<'COMMITS'
+import json, sys
+tmp, head = sys.argv[1:3]
+old = "deadbee0" + "0" * 32                       # shares deadbee with the head
+oids = [old] + ["%040x" % (0xaaa0000 + i) for i in range(148)] + [head]
+assert len(oids) == 150 and len(set(oids)) == 150
+def page(nodes, has_next, cursor):
+    return {"data": {"repository": {"pullRequest": {"commits": {
+        "totalCount": len(oids),
+        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+        "nodes": [{"commit": {"oid": o}} for o in nodes]}}}}}
+json.dump(page(oids[:100], True, "C1"), open(tmp + "/prcommits.json", "w"))
+json.dump(page(oids[100:], False, None), open(tmp + "/prcommits2.json", "w"))
+# What `commits(last: 100)` returned: the NEWEST 100, without the old commit that shares
+# the head's prefix. An unpaged gate reads this and resolves deadbee to the head alone.
+json.dump({"data": {"repository": {"pullRequest": {
+    "author": {"login": "me"}, "headRefOid": head,
+    "commits": {"nodes": [{"commit": {"committedDate": "2026-01-02T00:00:00Z",
+        "checkSuites": {"nodes": [{"createdAt": "2026-01-02T00:30:00Z"}]}}}]},
+    "prcommits": {"nodes": [{"commit": {"oid": o}} for o in oids[50:]]},
+    "reviews": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}}},
+    open(tmp + "/reviews.json", "w"))
+COMMITS
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/threads.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[%s]}}}}}' \
+  "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")" > "$TMP/comments.json"
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *"commits(first"*)
+    n=$(cat "$GATE_TEST_DIR/pcount" 2>/dev/null || echo 0); n=$((n+1))
+    printf '%s' "$n" > "$GATE_TEST_DIR/pcount"
+    if [ "$n" -le 1 ]; then cat "$GATE_TEST_DIR/prcommits.json"; else cat "$GATE_TEST_DIR/prcommits2.json"; fi ;;
+  *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
+  *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
+  *headRefOid*)        printf '%s\n' "$GATE_TEST_HEAD" ;;  # the recheck passes --jq
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+rm -f "$TMP/pcount"
+out=$(GATE_TEST_DIR="$TMP" GATE_TEST_HEAD="$HEAD150" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+if [ "$rc" = 1 ] && grep -qF "UNREVIEWED HEAD" <<<"$out" && [ "$(cat "$TMP/pcount" 2>/dev/null || echo 0)" -ge 2 ]; then
+  echo "  PASS  the live path pages every commit, so a shared prefix stays ambiguous"; pass=$((pass+1))
+else
+  echo "  FAIL  the live path pages every commit, so a shared prefix stays ambiguous (rc=$rc, commit fetches=$(cat "$TMP/pcount" 2>/dev/null || echo 0))"
+  sed 's/^/          /' <<<"$out" | head -4
+  fail=$((fail+1))
+fi
+
+echo "== finding 40: the thread comparison must read the comment BODIES =="
+# The second read of the threads fetched only id, isResolved and comments.totalCount, and
+# the verdict is computed from the first read's BODIES. GitHub lets a review comment be
+# edited in place, which moves none of those three: a disposition edited mid-run into
+# something that disposes of nothing leaves the fingerprint identical, and the gate certifies
+# a thread from a reply that no longer exists. Both reads now fetch the comments, paging the
+# oversized ones exactly as the first read does, and any difference blocks.
+mkdir -p "$TMP/bin"
+thread_read() {  # $1 the reply on the thread, $2 totalCount, $3.. the page-1 comments
+  local reply=$1
+  printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"isOutdated":false,"comments":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"originalLine":1,"body":"this drops the last row"},{"author":{"login":"me"},"path":"a.ts","line":1,"originalLine":1,"body":%s}]}}]}}}}}' "$reply"
+}
+thread_read '"NOT-A-DEFECT: renamed only, no behaviour change"' > "$TMP/threads.json"
+thread_read '"Actually the rename changed behaviour, this still drops the row"' > "$TMP/threads2.json"
+printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":"","commit":{"oid":"deadbeef"}}]}}}}}' > "$TMP/reviews.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments.json"
+# An oversized thread: page 1 holds the finding and one line of chatter, page 2 holds the
+# reply, and the reply is what gets edited between the reads.
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"isOutdated":false,"comments":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"originalLine":1,"body":"this drops the last row"},{"author":{"login":"onlooker"},"path":"a.ts","line":1,"originalLine":1,"body":"discussion"}]}}]}}}}}' > "$TMP/paged.json"
+threadpage() { printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"me"},"path":"a.ts","line":1,"originalLine":1,"body":%s}]}}}}' "$1"; }
+threadpage '"NOT-A-DEFECT: renamed only, no behaviour change"' > "$TMP/threadpage.json"
+threadpage '"Actually the rename changed behaviour, this still drops the row"' > "$TMP/threadpage2.json"
+printf '%s' "$PRCOMMITS_LIVE" > "$TMP/prcommits.json"
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+nth() { local f=$GATE_TEST_DIR/$1.count n; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$f"; printf '%s' "$n"; }
+case "$*" in
+  *"commits(first"*)   cat "$GATE_TEST_DIR/prcommits.json" ;;
+  *"node(id"*)
+    if [ "$(nth page)" -le 1 ]; then cat "$GATE_TEST_DIR/threadpage.json"
+    else cat "$GATE_TEST_DIR/${GATE_TEST_PAGE2:-threadpage}.json"; fi ;;
+  *reviewThreads*)
+    if [ "$(nth threads)" -le 1 ]; then cat "$GATE_TEST_DIR/${GATE_TEST_THREADS1:-threads}.json"
+    else cat "$GATE_TEST_DIR/${GATE_TEST_THREADS2:-${GATE_TEST_THREADS1:-threads}}.json"; fi ;;
+  *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
+  *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+edit_case() {
+  local name=$1 want_rc=$2 want_txt=$3 out rc
+  rm -f "$TMP/threads.count" "$TMP/page.count"
+  out=$(GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+  if [ "$rc" = "$want_rc" ] && grep -qF "$want_txt" <<<"$out"; then
+    echo "  PASS  $name"; pass=$((pass+1))
+  else
+    echo "  FAIL  $name (rc=$rc want=$want_rc)"; sed 's/^/          /' <<<"$out" | head -4; fail=$((fail+1))
+  fi
+}
+GATE_TEST_THREADS2=threads2 \
+  edit_case "a disposition edited between the two reads blocks" 2 "review threads on this PR changed"
+COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS1=paged GATE_TEST_PAGE2=threadpage2 \
+  edit_case "a disposition edited on a comment PAGE blocks" 2 "review threads on this PR changed"
+# Guards, green before and after: two identical reads reach a verdict, paged or not.
+edit_case "two identical thread reads still reach a verdict" 0 "CLEAR"
+COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS1=paged \
+  edit_case "two identical paged thread reads still reach a verdict" 0 "CLEAR"
 
 echo
 echo "passed=$pass failed=$fail"
