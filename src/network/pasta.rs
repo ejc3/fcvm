@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -812,6 +814,10 @@ pub struct PastaNetwork {
     loopback_ip: Option<String>, // Unique loopback IP for port forwarding (127.x.y.z)
     holder_pid: Option<u32>,     // Namespace PID (set in post_start)
     restore_mode: bool,          // Skip port probe in post_start (VM not loaded yet)
+    // The resolver this launch bakes into the guest's resolv.conf (--dns, or
+    // the snapshot's baked value on a restore). None for the default rootless
+    // guest, which takes pasta's own DNS handling.
+    dns_server: Option<String>,
 }
 
 impl PastaNetwork {
@@ -922,6 +928,7 @@ impl PastaNetwork {
             loopback_ip: None,
             holder_pid: None,
             restore_mode: false,
+            dns_server: None,
         }
     }
 
@@ -948,6 +955,15 @@ impl PastaNetwork {
     /// the VM is resumed and fc-agent has sent its gratuitous ARP.
     pub fn with_restore_mode(mut self) -> Self {
         self.restore_mode = true;
+        self
+    }
+
+    /// Set the resolver this launch bakes into the guest's resolv.conf.
+    ///
+    /// Rootless mode sets no resolver of its own, so this is `--dns` on the
+    /// boot path and the snapshot's baked value on a restore.
+    pub fn with_dns_server(mut self, dns_server: Option<String>) -> Self {
+        self.dns_server = dns_server;
         self
     }
 
@@ -1161,6 +1177,179 @@ impl PastaNetwork {
         Some(proxy_url)
     }
 
+    /// Is `dns_server` the address pasta answers for as the guest's gateway?
+    ///
+    /// Parsed rather than matched as text, so the IPv6 gateway is recognised
+    /// in any of its spellings.
+    fn resolver_is_pasta_gateway(dns_server: Option<&str>) -> bool {
+        let Some(addr) = dns_server.and_then(|s| s.trim().parse::<IpAddr>().ok()) else {
+            return false;
+        };
+        [GUEST_GATEWAY, GUEST_IPV6_GATEWAY]
+            .iter()
+            .filter_map(|gw| gw.parse::<IpAddr>().ok())
+            .any(|gw| gw == addr)
+    }
+
+    /// The complete pasta argument vector for this launch, in invocation order.
+    ///
+    /// Split out from the spawn so a unit test can assert the wiring: these
+    /// arguments decide where the guest's packets land, and a flag that is
+    /// computed but never passed looks exactly like one that works.
+    fn build_pasta_args(
+        &self,
+        pid_file: &Path,
+        namespace_pid: u32,
+        host_ipv6: Option<&str>,
+        run_as_root: bool,
+    ) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![
+            "--foreground".into(),
+            "--quiet".into(),
+            "-P".into(),
+            pid_file.as_os_str().to_os_string(),
+        ];
+        let mut push = |arg: &str| args.push(OsString::from(arg));
+
+        // When running as root (e.g., sudo in tests), pasta drops to nobody by
+        // default and then can't access the user namespace. Tell it to stay as root.
+        if run_as_root {
+            push("--runas");
+            push("0:0");
+        }
+
+        // Don't use --config-net: it sets an IP on pasta0's kernel interface, which
+        // conflicts with the bridge (kernel responds to ARP for that IP via bridge's
+        // weak host model, stealing traffic from pasta's userspace L2 handler).
+        // Instead, pasta creates the TAP but we bring it up in build_bridge_script().
+        //
+        // -a must be the VM's actual IP (GUEST_IP), not the gateway. pasta uses -a
+        // as the "guest address" and ignores ARP requests for it (don't resolve self).
+        // If -a == gateway, pasta ignores ARP for the gateway and the VM can't route.
+        push("--ns-ifname");
+        push(&self.pasta_device);
+        push("-a");
+        push(GUEST_IP); // VM's actual IP — pasta ignores ARP for this address
+        push("-n");
+        push("255.255.255.0");
+        push("-g");
+        push(GUEST_GATEWAY); // Gateway — pasta responds to ARP for this
+        push("--no-dhcp");
+
+        // If host has global IPv6, configure pasta for IPv6 outbound
+        if let Some(ipv6) = host_ipv6 {
+            // Add IPv6 guest address and gateway so pasta handles IPv6 L2↔L4 translation.
+            // -a/-g can each be specified twice (once IPv4, once IPv6).
+            push("-a");
+            push(GUEST_IPV6); // Guest IPv6 address — pasta ignores NDP for this
+            push("-g");
+            push(GUEST_IPV6_GATEWAY); // IPv6 gateway — pasta responds to NDP for this
+            push("-o");
+            push(ipv6); // Outbound source address for IPv6
+
+            // Keep NDP enabled: the guest needs NDP Neighbor Solicitation/Advertisement
+            // to resolve the IPv6 gateway's MAC address (like ARP for IPv4).
+            // Disable only RA (router advertisements) and DHCPv6 — we configure the
+            // guest's IPv6 address statically via kernel cmdline, not SLAAC.
+            push("--no-ra");
+            push("--no-dhcpv6");
+        } else {
+            // No host IPv6 — disable IPv6 entirely
+            push("--ipv4-only");
+            // NDP/RA/DHCPv6 are moot with --ipv4-only, but be explicit
+            push("--no-ndp");
+            push("--no-dhcpv6");
+            push("--no-ra");
+        }
+
+        // pasta reads the HOST's /etc/resolv.conf, and when its first
+        // nameserver is a loopback address it claims the gateway for DNS:
+        // conf.c's add_dns_resolv4() sets dns_match = map_host_loopback, which
+        // defaults to the gateway passed above, and fwd_nat_from_tap() in
+        // fwd.c applies that redirect BEFORE the gateway-to-loopback
+        // translation. A guest told to resolve at 10.0.2.2 then reaches
+        // whatever the host resolves with (127.0.0.53 under systemd-resolved,
+        // 127.0.0.1 under dnsmasq) rather than the service bound on host
+        // 127.0.0.1:53, which is what --dns 10.0.2.2 names. The result is
+        // host-dependent: the corpus replay benchmark worked on a dnsmasq box
+        // and silently resolved against the live internet on a
+        // systemd-resolved one.
+        //
+        // -D none clears dns_match, so port 53 goes through the same
+        // gateway-to-loopback translation as every other port. Only launches
+        // that named the gateway as their resolver get it; a default rootless
+        // guest keeps pasta's DNS handling.
+        if Self::resolver_is_pasta_gateway(self.dns_server.as_deref()) {
+            push("-D");
+            push("none");
+        }
+
+        // Port forwarding: pasta binds on host, L2 frames go through bridge to VM
+        if self.port_mappings.is_empty() {
+            push("-t");
+            push("none");
+            push("-u");
+            push("none");
+        } else {
+            let mut tcp_specs = Vec::new();
+            let mut udp_specs = Vec::new();
+
+            for mapping in &self.port_mappings {
+                let bind_addr = match &mapping.host_ip {
+                    Some(ip) => ip.as_str(),
+                    None => self.loopback_ip.as_deref().unwrap_or("127.0.0.1"),
+                };
+
+                // pasta spec: "bind_addr/host_port:guest_port"
+                let spec = format!("{}/{}:{}", bind_addr, mapping.host_port, mapping.guest_port);
+
+                match mapping.proto {
+                    Protocol::Tcp => tcp_specs.push(spec),
+                    Protocol::Udp => udp_specs.push(spec),
+                }
+
+                info!(
+                    proto = ?mapping.proto,
+                    host = %format!("{}:{}", bind_addr, mapping.host_port),
+                    guest = %format!("{}:{}", self.guest_ip, mapping.guest_port),
+                    "adding port forward"
+                );
+            }
+
+            if tcp_specs.is_empty() {
+                push("-t");
+                push("none");
+            } else {
+                for spec in &tcp_specs {
+                    push("-t");
+                    push(spec);
+                }
+            }
+            if udp_specs.is_empty() {
+                push("-u");
+                push("none");
+            } else {
+                for spec in &udp_specs {
+                    push("-u");
+                    push(spec);
+                }
+            }
+        }
+
+        // Disable host→namespace port forwarding (reverse direction).
+        // These don't affect outbound traffic — pasta's L2↔L4 translation handles
+        // that independently. Matches Podman's invocation pattern.
+        push("-T");
+        push("none");
+        push("-U");
+        push("none");
+
+        // Attach to the holder's namespace
+        push(&namespace_pid.to_string());
+
+        args
+    }
+
     /// Start pasta process attached to the namespace
     ///
     /// pasta creates its own TAP device (pasta0) in the namespace and provides
@@ -1220,113 +1409,15 @@ impl PastaNetwork {
         let pasta_bin = crate::setup::get_pasta_for_config(config.pasta.as_ref())?;
         info!(pasta_bin = %pasta_bin.display(), "resolved pasta binary");
 
+        let args = self.build_pasta_args(
+            &pid_file,
+            namespace_pid,
+            host_ipv6.as_deref(),
+            nix::unistd::geteuid().is_root(),
+        );
+        debug!(pasta_args = ?args, "pasta arguments");
         let mut cmd = Command::new(&pasta_bin);
-        cmd.arg("--foreground")
-            .arg("--quiet")
-            .arg("-P")
-            .arg(&pid_file);
-
-        // When running as root (e.g., sudo in tests), pasta drops to nobody by
-        // default and then can't access the user namespace. Tell it to stay as root.
-        if nix::unistd::geteuid().is_root() {
-            cmd.arg("--runas").arg("0:0");
-        }
-
-        // Don't use --config-net: it sets an IP on pasta0's kernel interface, which
-        // conflicts with the bridge (kernel responds to ARP for that IP via bridge's
-        // weak host model, stealing traffic from pasta's userspace L2 handler).
-        // Instead, pasta creates the TAP but we bring it up in build_bridge_script().
-        //
-        // -a must be the VM's actual IP (GUEST_IP), not the gateway. pasta uses -a
-        // as the "guest address" and ignores ARP requests for it (don't resolve self).
-        // If -a == gateway, pasta ignores ARP for the gateway and the VM can't route.
-        cmd.arg("--ns-ifname")
-            .arg(&self.pasta_device)
-            .arg("-a")
-            .arg(GUEST_IP) // VM's actual IP — pasta ignores ARP for this address
-            .arg("-n")
-            .arg("255.255.255.0")
-            .arg("-g")
-            .arg(GUEST_GATEWAY) // Gateway — pasta responds to ARP for this
-            .arg("--no-dhcp");
-
-        // If host has global IPv6, configure pasta for IPv6 outbound
-        if let Some(ref ipv6) = host_ipv6 {
-            // Add IPv6 guest address and gateway so pasta handles IPv6 L2↔L4 translation.
-            // -a/-g can each be specified twice (once IPv4, once IPv6).
-            cmd.arg("-a")
-                .arg(GUEST_IPV6) // Guest IPv6 address — pasta ignores NDP for this
-                .arg("-g")
-                .arg(GUEST_IPV6_GATEWAY) // IPv6 gateway — pasta responds to NDP for this
-                .arg("-o")
-                .arg(ipv6); // Outbound source address for IPv6
-
-            // Keep NDP enabled: the guest needs NDP Neighbor Solicitation/Advertisement
-            // to resolve the IPv6 gateway's MAC address (like ARP for IPv4).
-            // Disable only RA (router advertisements) and DHCPv6 — we configure the
-            // guest's IPv6 address statically via kernel cmdline, not SLAAC.
-            cmd.arg("--no-ra").arg("--no-dhcpv6");
-        } else {
-            // No host IPv6 — disable IPv6 entirely
-            cmd.arg("--ipv4-only")
-                // NDP/RA/DHCPv6 are moot with --ipv4-only, but be explicit
-                .arg("--no-ndp")
-                .arg("--no-dhcpv6")
-                .arg("--no-ra");
-        }
-
-        // Port forwarding: pasta binds on host, L2 frames go through bridge to VM
-        if self.port_mappings.is_empty() {
-            cmd.arg("-t").arg("none").arg("-u").arg("none");
-        } else {
-            let mut tcp_specs = Vec::new();
-            let mut udp_specs = Vec::new();
-
-            for mapping in &self.port_mappings {
-                let bind_addr = match &mapping.host_ip {
-                    Some(ip) => ip.as_str(),
-                    None => self.loopback_ip.as_deref().unwrap_or("127.0.0.1"),
-                };
-
-                // pasta spec: "bind_addr/host_port:guest_port"
-                let spec = format!("{}/{}:{}", bind_addr, mapping.host_port, mapping.guest_port);
-
-                match mapping.proto {
-                    Protocol::Tcp => tcp_specs.push(spec),
-                    Protocol::Udp => udp_specs.push(spec),
-                }
-
-                info!(
-                    proto = ?mapping.proto,
-                    host = %format!("{}:{}", bind_addr, mapping.host_port),
-                    guest = %format!("{}:{}", self.guest_ip, mapping.guest_port),
-                    "adding port forward"
-                );
-            }
-
-            if tcp_specs.is_empty() {
-                cmd.arg("-t").arg("none");
-            } else {
-                for spec in &tcp_specs {
-                    cmd.arg("-t").arg(spec);
-                }
-            }
-            if udp_specs.is_empty() {
-                cmd.arg("-u").arg("none");
-            } else {
-                for spec in &udp_specs {
-                    cmd.arg("-u").arg(spec);
-                }
-            }
-        }
-
-        // Disable host→namespace port forwarding (reverse direction).
-        // These don't affect outbound traffic — pasta's L2↔L4 translation handles
-        // that independently. Matches Podman's invocation pattern.
-        cmd.arg("-T").arg("none").arg("-U").arg("none");
-
-        // Attach to the holder's namespace
-        cmd.arg(namespace_pid.to_string());
+        cmd.args(&args);
 
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2055,6 +2146,218 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render an argument vector as strings for assertions.
+    fn arg_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Does `args` contain `needle` as a consecutive run?
+    fn contains_run(args: &[String], needle: &[&str]) -> bool {
+        args.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The argument vector pasta is actually spawned with, for a plain rootless
+    /// launch. Pins the flags the guest's routing depends on: the gateway pasta
+    /// answers ARP for, the guest address it must not answer for, and the
+    /// trailing namespace PID that decides which namespace is connected.
+    #[test]
+    fn pasta_args_carry_the_guest_addressing_and_the_namespace_pid() {
+        let network = PastaNetwork::new("args-plain".into(), "tap0".into(), vec![]);
+        let args = arg_strings(&network.build_pasta_args(
+            Path::new("/run/pasta-args-plain.pid"),
+            4242,
+            None,
+            false,
+        ));
+
+        assert!(contains_run(&args, &["-a", "10.0.2.100"]), "{args:?}");
+        assert!(contains_run(&args, &["-g", "10.0.2.2"]), "{args:?}");
+        assert!(contains_run(&args, &["-n", "255.255.255.0"]), "{args:?}");
+        assert!(contains_run(&args, &["--no-dhcp"]), "{args:?}");
+        assert!(contains_run(&args, &["--ipv4-only"]), "{args:?}");
+        assert!(
+            contains_run(&args, &["-P", "/run/pasta-args-plain.pid"]),
+            "{args:?}"
+        );
+        assert!(
+            contains_run(&args, &["-t", "none", "-u", "none"]),
+            "{args:?}"
+        );
+        assert!(
+            contains_run(&args, &["-T", "none", "-U", "none"]),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("4242"),
+            "the namespace PID is pasta's trailing positional argument: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--runas"),
+            "--runas is for the root launch only: {args:?}"
+        );
+    }
+
+    /// Root launches keep uid/gid at 0:0 (pasta otherwise drops to nobody and
+    /// cannot reach the holder's user namespace), and a host with global IPv6
+    /// gets the second -a/-g pair plus the outbound source address.
+    #[test]
+    fn pasta_args_cover_the_root_and_ipv6_launches() {
+        let network = PastaNetwork::new("args-v6".into(), "tap0".into(), vec![]);
+        let args = arg_strings(&network.build_pasta_args(
+            Path::new("/run/pasta-args-v6.pid"),
+            7,
+            Some("2001:db8::1"),
+            true,
+        ));
+
+        assert!(contains_run(&args, &["--runas", "0:0"]), "{args:?}");
+        assert!(contains_run(&args, &["-a", "fd00::100"]), "{args:?}");
+        assert!(contains_run(&args, &["-g", "fd00::2"]), "{args:?}");
+        assert!(contains_run(&args, &["-o", "2001:db8::1"]), "{args:?}");
+        assert!(contains_run(&args, &["--no-ra", "--no-dhcpv6"]), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--ipv4-only"),
+            "an IPv6-capable host must not disable IPv6: {args:?}"
+        );
+    }
+
+    /// Port mappings become one -t/-u spec each, bound to the VM's loopback IP
+    /// when the mapping named no host address.
+    #[test]
+    fn pasta_args_bind_port_mappings_to_the_vm_loopback_ip() {
+        let network = PastaNetwork::new(
+            "args-ports".into(),
+            "tap0".into(),
+            vec![
+                PortMapping {
+                    host_ip: None,
+                    host_port: 8080,
+                    guest_port: 80,
+                    proto: Protocol::Tcp,
+                },
+                PortMapping {
+                    host_ip: Some("127.0.0.9".into()),
+                    host_port: 5300,
+                    guest_port: 53,
+                    proto: Protocol::Udp,
+                },
+            ],
+        )
+        .with_loopback_ip("127.0.0.5".into());
+        let args = arg_strings(&network.build_pasta_args(
+            Path::new("/run/pasta-args-ports.pid"),
+            9,
+            None,
+            false,
+        ));
+
+        assert!(
+            contains_run(&args, &["-t", "127.0.0.5/8080:80"]),
+            "{args:?}"
+        );
+        assert!(
+            contains_run(&args, &["-u", "127.0.0.9/5300:53"]),
+            "{args:?}"
+        );
+    }
+
+    /// pasta reads the HOST's /etc/resolv.conf, and when its first nameserver
+    /// is a loopback address (systemd-resolved's 127.0.0.53, dnsmasq's
+    /// 127.0.0.1) it silently claims the gateway for DNS: conf.c's
+    /// `add_dns_resolv4()` sets `dns_match = map_host_loopback`, and
+    /// `fwd_nat_from_tap()` in fwd.c tests that BEFORE the gateway-to-loopback
+    /// translation. Guest queries to 10.0.2.2:53 then go to whatever the host
+    /// resolves with, not to the service bound on host 127.0.0.1:53 that
+    /// `--dns 10.0.2.2` names.
+    ///
+    /// `-D none` clears `dns_match`, so port 53 falls through to the same
+    /// translation as every other port. Only the launches that asked for the
+    /// gateway as their resolver get it; a default rootless guest still uses
+    /// pasta's DNS handling, and never names the gateway anyway
+    /// (`is_usable_nameserver` drops loopback resolvers from the host list).
+    ///
+    /// This test sees the argument vector and nothing else.
+    /// `scripts/probe-pasta-dns-gateway.sh` runs the pinned pasta binary and
+    /// asks which server actually answered, with the flag and without it.
+    #[test]
+    fn a_gateway_resolver_disables_pastas_dns_special_case() {
+        for resolver in ["10.0.2.2", "fd00::2", "fd00:0:0:0:0:0:0:2"] {
+            let network = PastaNetwork::new("args-dns".into(), "tap0".into(), vec![])
+                .with_dns_server(Some(resolver.to_string()));
+            let args = arg_strings(&network.build_pasta_args(
+                Path::new("/run/pasta-args-dns.pid"),
+                11,
+                None,
+                false,
+            ));
+            assert!(
+                contains_run(&args, &["-D", "none"]),
+                "resolver {resolver} is the pasta gateway, so pasta's DNS \
+                 special case must be off: {args:?}"
+            );
+        }
+    }
+
+    /// Every other resolver leaves pasta's DNS handling alone. A default
+    /// rootless guest (no --dns) reaches the host's resolver through pasta,
+    /// and that must keep working.
+    #[test]
+    fn other_resolvers_leave_pastas_dns_handling_alone() {
+        for resolver in [None, Some("8.8.8.8"), Some("127.0.0.1"), Some("not-an-ip")] {
+            let network = PastaNetwork::new("args-dns-other".into(), "tap0".into(), vec![])
+                .with_dns_server(resolver.map(str::to_string));
+            let args = arg_strings(&network.build_pasta_args(
+                Path::new("/run/pasta-args-dns-other.pid"),
+                12,
+                None,
+                false,
+            ));
+            assert!(
+                !args.iter().any(|a| a == "-D"),
+                "resolver {resolver:?} is not the pasta gateway; pasta's DNS \
+                 handling must be left as it is: {args:?}"
+            );
+        }
+    }
+
+    /// Both rootless launch paths must hand pasta the resolver the guest will
+    /// actually use, or the decision above is made from a `None` that nothing
+    /// set and pasta keeps its DNS special case. A boot passes `--dns`; a
+    /// restore passes the value the snapshot baked. Asserted at the source
+    /// because neither call site can be reached from a unit test: both sit
+    /// inside functions that spawn a VM.
+    #[test]
+    fn both_rootless_launch_paths_hand_pasta_the_guest_resolver() {
+        for (label, src) in [
+            ("podman run", include_str!("../commands/podman/mod.rs")),
+            ("snapshot run", include_str!("../commands/snapshot.rs")),
+        ] {
+            let sites: Vec<_> = src.match_indices("PastaNetwork::new").collect();
+            assert_eq!(
+                sites.len(),
+                1,
+                "{label} builds {} PastaNetworks; every one of them needs the \
+                 guest's resolver, so this test must cover each",
+                sites.len()
+            );
+            let start = sites[0].0;
+            let end = start
+                + src[start..]
+                    .find(';')
+                    .expect("a construction statement ends in a semicolon");
+            assert!(
+                src[start..end].contains(".with_dns_server("),
+                "{label} builds its PastaNetwork without the guest's resolver, so \
+                 pasta keeps its DNS special case and a --dns naming the gateway \
+                 reaches the host's own resolver instead: {}",
+                &src[start..end]
+            );
+        }
+    }
 
     /// A failed cleanup step must surface as an Err. Callers treat cleanup's
     /// Ok as proof the host resources are gone: `cleanup_vm_verified`

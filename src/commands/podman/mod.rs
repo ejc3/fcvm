@@ -1512,9 +1512,14 @@ async fn prepare_vm_for_lifecycle(
                 .await
                 .context("allocating loopback IP")?;
 
+            // --dns reaches pasta as well as the guest: naming the pasta
+            // gateway as the resolver means "the service on host
+            // 127.0.0.1:53", and pasta must be told not to claim port 53 for
+            // the host's own resolver instead (see resolver_is_pasta_gateway).
             Box::new(
                 PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_loopback_ip(loopback_ip),
+                    .with_loopback_ip(loopback_ip)
+                    .with_dns_server(args.dns.clone()),
             )
         }
     };
