@@ -10,8 +10,9 @@ dns-evidence.json (required when the cell's guest_dns names a baked resolver,
 optional otherwise; when present its verdict must be "clean", it must carry
 the replay server's exit status 0, every file it cites must be present and
 agree with the sha256 it recorded, each verify bracket must record the run's
-resolver with the URL probes run under no proxy and every host and URL
-answered through it, and every sample in dns-owner.log must name its
+resolver in both captured /etc/resolv.conf views and nowhere else, with the
+URL probes run under no proxy and every host and URL answered through it,
+and every sample in dns-owner.log must name its
 serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive and a load the
 evidence accounts for) and diag/summary.json (reqbench.sh diag; required when
 the cell's guest_dns names a baked resolver or its guest_env is non-empty,
@@ -78,6 +79,10 @@ OWNER_SAMPLE = re.compile(
 # The sampler accepts a load only in this shape; dns_load_stats counts only
 # these when it reports load_samples and load_max_1min.
 LOAD_NUMBER = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+# One resolver line of a captured /etc/resolv.conf. resolv.conf(5) allows
+# leading whitespace and ignores anything after the address; `#` and `;`
+# start a comment, so a commented-out nameserver establishes nothing.
+NAMESERVER_LINE = re.compile(r"^[ \t]*nameserver[ \t]+(\S+)", re.MULTILINE)
 # The seal identity of one run, as reqbench.py stamps it into every record's
 # meta and reqanalyze carries it into the cell (CELL_FIELDS).
 SEAL_FIELDS = (
@@ -244,6 +249,11 @@ def check_owner_log(run_dir, evidence, owner_bytes):
         )
 
 
+def resolv_conf_resolvers(text):
+    """The resolvers one captured /etc/resolv.conf establishes, in order."""
+    return NAMESERVER_LINE.findall(text)
+
+
 def canonical_ip(value):
     """The address as a string, or None when value is not one."""
     if not isinstance(value, str):
@@ -284,8 +294,9 @@ def bracket_answers(run_dir, name, verify):
 def check_verify_bracket(run_dir, name, verify, resolver):
     """Hold one HOP D bracket to what the campaign asserted when it ran it:
     the clone resolved through `resolver` (None takes the bracket's own, so
-    the remaining brackets are held to the first), the URL probes ran with
-    no proxy, and every corpus host and URL answered through that resolver.
+    the remaining brackets are held to the first), both captured
+    /etc/resolv.conf views named that resolver and no other, the URL probes
+    ran with no proxy, and every corpus host and URL answered through it.
     Returns the resolver the bracket names.
 
     passed=true is also what HOP D writes when it was given nothing to check,
@@ -305,6 +316,34 @@ def check_verify_bracket(run_dir, name, verify, resolver):
             f"{run_dir}: {name} records dns_server {dns_server!r}, not the "
             f"{resolver!r} this run was measured through"
         )
+    # The two /etc/resolv.conf views HOP D captured inside the restored
+    # clone: fc-agent writes the VM's from the boot plan and podman derives
+    # the container's from it, which is the one the browser reads. dns_server
+    # and the host answers are the bracket's claim about where queries went;
+    # these are the configuration that sent them, and nothing else in the run
+    # records it (proxies_disabled says only that no proxy was honoured). A
+    # second nameserver is refused for the reason HOP D refuses one: glibc
+    # walks the whole list, so a fallback answers the moment the replay
+    # server misses a query.
+    for field in ("resolv_conf_vm", "resolv_conf_container"):
+        text = verify.get(field)
+        if not isinstance(text, str):
+            raise RunError(
+                f"{run_dir}: {name} records {field}={text!r}; the bracket does "
+                "not say what resolver the clone was configured with"
+            )
+        resolvers = resolv_conf_resolvers(text)
+        if not resolvers:
+            raise RunError(
+                f"{run_dir}: {name} records a {field} with no nameserver line, "
+                f"so nothing says the probes reached {dns_server}"
+            )
+        others = sorted(set(resolvers) - {dns_server})
+        if others:
+            raise RunError(
+                f"{run_dir}: {name} records {field} naming {', '.join(others)}, "
+                f"not the {dns_server!r} its answers are credited to"
+            )
     if verify.get("proxies_disabled") is not True:
         raise RunError(
             f"{run_dir}: {name} records proxies_disabled="

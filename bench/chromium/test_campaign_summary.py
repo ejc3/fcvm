@@ -186,7 +186,8 @@ def write_verify(path, passed=True, **overrides):
     """One HOP D evidence file in reqbench.sh's shape; overrides rewrite
     fields on top of a bracket that resolved every corpus host and URL
     through the replay resolver with the proxy variables ignored (hosts,
-    for a bracket whose resolver answered elsewhere)."""
+    for a bracket whose resolver answered elsewhere). An override value of
+    None removes the field, the way write_run's cell_overrides does."""
     record = {
         "dns_server": "10.0.2.2",
         "resolv_conf_vm": "nameserver 10.0.2.2\n",
@@ -198,7 +199,11 @@ def write_verify(path, passed=True, **overrides):
         "timestamp": "2026-08-28T00:00:00Z",
         "passed": passed,
     }
-    record.update(overrides)
+    for field, value in overrides.items():
+        if value is None:
+            record.pop(field, None)
+        else:
+            record[field] = value
     with open(path, "w") as handle:
         json.dump(record, handle)
 
@@ -1159,6 +1164,52 @@ class CampaignSummary(unittest.TestCase):
         .../campaign-x-summary.json: 1 cell(s), on all seven shapes.
         """
         for overrides, expected in self.BRACKETS_THAT_PROVE_NOTHING:
+            with self.subTest(bracket=overrides), tempfile.TemporaryDirectory() as d:
+                _paths, text = self._refused(d, verify_overrides=overrides)
+                self.assertIn("verify-dns-", text)
+                self.assertIn(expected, text)
+
+    def test_a_bracket_whose_captured_resolver_config_names_another_resolver_refuses(self):
+        """HOP D captures both /etc/resolv.conf views inside the restored
+        clone, and its own gate requires each to name dns_server and nothing
+        else: fc-agent writes the VM's from the boot plan, podman derives the
+        container's from it, and the browser reads the second. The index
+        re-derived everything else from the bracket and read neither, so a
+        bracket carrying a foreign resolver config was indexed as long as
+        dns_server and the host answers named the replay address. Nothing
+        else in the run proves the URL probes went through the replay
+        resolver: proxies_disabled says only that no proxy was honoured, and
+        each bracket carries its own sha256, so index-time revalidation is
+        the only place this can be caught.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s), on all seven shapes.
+        """
+        # The captured config may carry the other resolv.conf lines and
+        # indented nameservers; only the resolvers it establishes matter.
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, verify_overrides={
+                "resolv_conf_vm": "search corp.example\noptions ndots:1\n\tnameserver 10.0.2.2\n",
+                "resolv_conf_container": "# generated\nnameserver 10.0.2.2\n",
+            })
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+        foreign = "nameserver 8.8.8.8\n"
+        cases = (
+            ({"resolv_conf_vm": foreign}, "8.8.8.8"),
+            ({"resolv_conf_container": foreign}, "8.8.8.8"),
+            # glibc walks the whole list, so a fallback answers the moment
+            # the replay server misses a query.
+            ({"resolv_conf_vm": "nameserver 10.0.2.2\nnameserver 8.8.8.8\n"}, "8.8.8.8"),
+            ({"resolv_conf_container": "nameserver 10.0.2.2\nnameserver 1.1.1.1\n"},
+             "1.1.1.1"),
+            ({"resolv_conf_vm": "search corp.example\n"}, "resolv_conf_vm"),
+            ({"resolv_conf_vm": ""}, "resolv_conf_vm"),
+            ({"resolv_conf_container": None}, "resolv_conf_container"),
+        )
+        for overrides, expected in cases:
             with self.subTest(bracket=overrides), tempfile.TemporaryDirectory() as d:
                 _paths, text = self._refused(d, verify_overrides=overrides)
                 self.assertIn("verify-dns-", text)
