@@ -391,14 +391,138 @@ fn the_gate_handles_a_real_captured_pr_response() {
 
 /// Every fixture must carry the fields the live query actually selects. A fixture missing
 /// one would make the gate silently skip a check it believes it performed.
+///
+/// The check reads the payload rather than searching its text. A substring search cannot
+/// say WHERE a name appears, and every PR-level name also occurs inside a thread comment,
+/// so `"comments"` is found in a payload that carries no PR-level comments connection at
+/// all. `the_fixture_shape_check_reads_the_payload_not_the_text` pins that.
+fn fixture_shape_problem(name: &str, text: &str) -> Option<String> {
+    let hint = "Regenerate it with scripts/capture-review-threads-fixture.sh, or add the \
+                field by hand; a fixture that does not match the query lets a test pass \
+                against data the code can never receive.";
+    let doc: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return Some(format!("fixture {name} is not JSON: {e}")),
+    };
+    let pr = &doc["data"]["repository"]["pullRequest"];
+    if !pr.is_object() {
+        return Some(format!(
+            "fixture {name} has no .data.repository.pullRequest object. {hint}"
+        ));
+    }
+    // The head, and the check suites that date its arrival. Without them the gate answers
+    // "this gate cannot tell whether the code being merged was reviewed", which is a BLOCK,
+    // so every test using such a fixture fails for a reason unrelated to what it asserts.
+    if !pr["headRefOid"].is_string() {
+        return Some(format!(
+            "fixture {name}: .data.repository.pullRequest.headRefOid is not a string. {hint}"
+        ));
+    }
+    let suites = &pr["commits"]["nodes"][0]["commit"]["checkSuites"]["nodes"];
+    if !suites.is_array() {
+        return Some(format!(
+            "fixture {name}: .commits.nodes[0].commit.checkSuites.nodes is not an array. {hint}"
+        ));
+    }
+    // The three connections a claim can arrive in. Each is its own PR-level field: a
+    // thread's comments connection is not the PR's.
+    for field in ["reviews", "comments", "reviewThreads"] {
+        if !pr[field]["nodes"].is_array() {
+            return Some(format!(
+                "fixture {name}: .data.repository.pullRequest.{field}.nodes is not an \
+                 array. {hint}"
+            ));
+        }
+    }
+    for (i, thread) in pr["reviewThreads"]["nodes"]
+        .as_array()
+        .expect("checked above")
+        .iter()
+        .enumerate()
+    {
+        if !thread["isResolved"].is_boolean() {
+            return Some(format!(
+                "fixture {name}: reviewThreads.nodes[{i}].isResolved is not a boolean, \
+                 and it is the only field that means 'resolved'. {hint}"
+            ));
+        }
+        let Some(comments) = thread["comments"]["nodes"].as_array() else {
+            return Some(format!(
+                "fixture {name}: reviewThreads.nodes[{i}].comments.nodes is not an array. \
+                 {hint}"
+            ));
+        };
+        for (j, comment) in comments.iter().enumerate() {
+            let at = format!("reviewThreads.nodes[{i}].comments.nodes[{j}]");
+            for (path, value) in [
+                ("author.login", &comment["author"]["login"]),
+                ("body", &comment["body"]),
+                ("path", &comment["path"]),
+            ] {
+                if !value.is_string() {
+                    return Some(format!(
+                        "fixture {name}: {at}.{path} is not a string. {hint}"
+                    ));
+                }
+            }
+            // Both are selected and either may be null; the gate falls back from one to
+            // the other, so a fixture that omits either is answering a question the live
+            // query does not.
+            for key in ["line", "originalLine"] {
+                if comment.get(key).is_none() {
+                    return Some(format!("fixture {name}: {at} has no `{key}` key. {hint}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A payload whose only `comments` key is a thread's must not pass the PR-level check.
+#[test]
+fn the_fixture_shape_check_reads_the_payload_not_the_text() {
+    // This payload carries every PR-level field but `comments`, and the only `"comments"`
+    // in its text is the thread's own connection. A substring search finds that one and
+    // reports the fixture complete.
+    let no_pr_comments = r#"{"data":{"repository":{"pullRequest":{
+        "author":{"login":"me"},
+        "headRefOid":"deadbeef",
+        "commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z",
+          "checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},
+        "reviews":{"nodes":[]},
+        "reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[
+          {"author":{"login":"reviewer"},"path":"a.rs","line":1,"originalLine":1,
+           "body":"P1: this drops the last row"}]}}]}
+      }}}}"#;
+    assert!(
+        fixture_shape_problem("no-pr-comments", no_pr_comments).is_some(),
+        "a payload with no PR-level comments connection must be rejected; finding the \
+         word inside a thread's own comments connection is not finding the field."
+    );
+
+    // The same payload with the PR-level connections really present is accepted, so the
+    // rejection above is about the missing fields and not about the shape check refusing
+    // everything.
+    let complete = r#"{"data":{"repository":{"pullRequest":{
+        "author":{"login":"me"},
+        "headRefOid":"deadbeef",
+        "commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z",
+          "checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},
+        "reviews":{"nodes":[]},
+        "comments":{"nodes":[]},
+        "reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[
+          {"author":{"login":"reviewer"},"path":"a.rs","line":1,"originalLine":1,
+           "body":"P1: this drops the last row"}]}}]}
+      }}}}"#;
+    assert_eq!(
+        fixture_shape_problem("complete", complete),
+        None,
+        "a payload carrying every field the query selects must be accepted"
+    );
+}
+
 #[test]
 fn every_fixture_matches_the_shape_the_query_returns() {
-    const REQUIRED: [&str; 5] = ["author", "body", "line", "originalLine", "path"];
-    // The gate reads these too, and a fixture without them is judged under a rule it
-    // cannot satisfy: no head means "this gate cannot tell whether the code being merged
-    // was reviewed", which is a BLOCK, so every test using such a fixture fails for a
-    // reason that has nothing to do with what it asserts.
-    const REQUIRED_PR_LEVEL: [&str; 4] = ["headRefOid", "checkSuites", "reviews", "comments"];
     let dir = repo_root().join("tests/fixtures");
     let mut checked = 0;
 
@@ -409,26 +533,7 @@ fn every_fixture_matches_the_shape_the_query_returns() {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("read fixture");
-        for field in REQUIRED {
-            assert!(
-                text.contains(&format!("\"{field}\"")),
-                "fixture {name} is missing the `{field}` field that the live query selects. \
-                 A fixture that does not match the query lets a test pass against data the \
-                 code can never receive."
-            );
-        }
-        for field in REQUIRED_PR_LEVEL {
-            assert!(
-                text.contains(&format!("\"{field}\"")),
-                "fixture {name} is missing the `{field}` field the gate reads at PR level. \
-                 Regenerate it with scripts/capture-review-threads-fixture.sh, or add the \
-                 field by hand; a fixture the gate cannot judge blocks on its own shape."
-            );
-        }
-        assert!(
-            text.contains("\"isResolved\""),
-            "fixture {name} lacks isResolved — the only field that means 'resolved'."
-        );
+        assert_eq!(fixture_shape_problem(&name, &text), None);
         checked += 1;
     }
     assert!(

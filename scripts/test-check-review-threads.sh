@@ -145,13 +145,13 @@ run_case "reviewer confirmation after a disposition clears" \
 echo "== finding 13: findings in top-level PR comments count too =="
 wrap3() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "$(covered "${2:-[]}")" "${3:-[]}"; }
 run_case "undisposed top-level PR comment blocks" \
-  "$(wrap3 '[]' '[]' '[{"author":{"login":"codex"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last row"}]')" \
+  "$(wrap3 '[]' '[]' '[{"author":{"login":"codex"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last row"}]')" \
   1 "BLOCKED"
 run_case "disposed top-level PR comment clears" \
-  "$(wrap3 '[]' '[]' '[{"author":{"login":"codex"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last row"},{"author":{"login":"me"},"createdAt":"2026-01-02T00:00:00Z","body":"DISAGREE: the guard above rejects that input"}]')" \
+  "$(wrap3 '[]' '[]' '[{"author":{"login":"codex"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"P1: this silently drops the last row"},{"author":{"login":"me"},"createdAt":"2026-01-02T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z","body":"DISAGREE: the guard above rejects that input"}]')" \
   0 "CLEAR"
 run_case "a PR comment can answer a review body" \
-  "$(wrap3 '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: drops a row"}]' '[{"author":{"login":"me"},"createdAt":"2026-01-02T00:00:00Z","body":"RED-VERIFIED: row.test.ts"}]')" \
+  "$(wrap3 '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: drops a row"}]' '[{"author":{"login":"me"},"createdAt":"2026-01-02T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z","body":"RED-VERIFIED: row.test.ts"}]')" \
   0 "CLEAR"
 run_case "malformed PR comment data exits 2" \
   "$(wrap3 '[]' '[]' '"nonsense"')" 2 "BLOCKED"
@@ -160,16 +160,16 @@ echo "== finding 15: only real claimants raise PR-level claims =="
 wrap4() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"%s"},"headRefOid":"deadbeef","reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":%s}}}}}' "$1" "$2" "$(covered "${3:-[]}")" "${4:-[]}"; }
 # The command this skill documents — posted by the PR author — is not a finding.
 run_case "author's own @codex review comment does not block" \
-  "$(wrap4 me '[]' '[]' '[{"author":{"login":"me","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"@codex review"}]')" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"me","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"@codex review"}]')" \
   0 "CLEAR"
 run_case "deploy bot notification does not block" \
-  "$(wrap4 me '[]' '[]' '[{"author":{"login":"vercel","__typename":"Bot"},"createdAt":"2026-01-01T00:00:00Z","body":"Deployment ready at https://preview.example"}]')" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"vercel","__typename":"Bot"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"Deployment ready at https://preview.example"}]')" \
   0 "CLEAR"
 run_case "a human finding in a top-level comment still blocks" \
-  "$(wrap4 me '[]' '[]' '[{"author":{"login":"reviewer","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"reviewer","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]')" \
   1 "BLOCKED"
 run_case "a reviewing bot's top-level comment still blocks" \
-  "$(wrap4 me '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":""}]' '[{"author":{"login":"codex","__typename":"Bot"},"createdAt":"2026-01-02T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  "$(wrap4 me '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":""}]' '[{"author":{"login":"codex","__typename":"Bot"},"createdAt":"2026-01-02T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z","body":"P1: this drops the last row"}]')" \
   1 "BLOCKED"
 run_case "a bot REVIEW body still blocks" \
   "$(wrap4 me '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]' '[]')" \
@@ -189,10 +189,10 @@ run_case "no reviews at all is an unreviewed head, not a clear one (was CLEAR)" 
 
 echo "== finding 17: authorship does not decide what is a finding =="
 run_case "author's own defect report is claimable" \
-  "$(wrap4 me '[]' '[]' '[{"author":{"login":"me","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this drops records"}]')" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"me","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"P1: this drops records"}]')" \
   1 "BLOCKED"
 run_case "a standalone bot finding with no review history is claimable" \
-  "$(wrap4 me '[]' '[]' '[{"author":{"login":"codex","__typename":"Bot"},"createdAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"codex","__typename":"Bot"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}]')" \
   1 "BLOCKED"
 run_case "an APPROVED review body is not a finding" \
   "$(wrap4 me '[]' '[{"author":{"login":"reviewer"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z","body":"LGTM, nice work"}]' '[]')" \
@@ -201,10 +201,10 @@ run_case "a COMMENTED review body still is" \
   "$(wrap4 me '[]' '[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"LGTM, nice work"}]' '[]')" \
   1 "BLOCKED"
 run_case "a bare @codex trigger is not a finding" \
-  "$(wrap4 me '[]' '[]' '[{"author":{"login":"anyone","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"@codex review"}]')" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"anyone","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"@codex review"}]')" \
   0 "CLEAR"
 run_case "a finding that merely mentions @codex still blocks" \
-  "$(wrap4 me '[]' '[]' '[{"author":{"login":"anyone","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","body":"@codex review this: P1 it drops rows"}]')" \
+  "$(wrap4 me '[]' '[]' '[{"author":{"login":"anyone","__typename":"User"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","body":"@codex review this: P1 it drops rows"}]')" \
   1 "BLOCKED"
 
 echo "== finding 18: the author reviewing their own push is not coverage =="
@@ -479,7 +479,10 @@ echo "== finding 29: a head with no review result of any kind is unreviewed, not
 # must be covered whether or not any review object exists, a PR with no review at all is
 # an unreviewed head, and a payload that names no head cannot be judged (regression case
 # below).
-wrap8() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "$2" "${3:-$2}"; }
+# The PR's own commits, which is the universe an abbreviated sha is resolved against
+# (finding 37). $4 overrides it; by default the head is the only commit.
+PRCOMMITS_HEAD='[{"commit":{"oid":"deadbeef"}}]'
+wrap8() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"prcommits":{"nodes":%s},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "${4:-$PRCOMMITS_HEAD}" "$2" "${3:-$2}"; }
 SUITE='[{"createdAt":"2026-01-02T00:30:00Z"}]'
 run_case "reviews [] and a codex verdict naming an older sha is an unreviewed head" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' abc123def4)")")" \
@@ -647,8 +650,8 @@ run_case "arrival is the earliest check suite by instant, not by string" \
   "$(wrap8 '[{"createdAt":"2026-01-02T00:30:00.900Z"},{"createdAt":"2026-01-02T00:30:00Z"}]' "$(cmt "$CODEX" Bot 2026-01-02T00:30:00.500Z "$(codex_body ' Bravo.' deadbeef)")")" \
   0 "HEAD COVERED"
 # An unparsable timestamp orders against nothing, so it grants no coverage and answers no
-# claim. Where the gate validates the field it says so and exits 2; where it does not
-# (updatedAt), the comment simply binds nothing.
+# claim. Every field the gate orders by is validated, so it says so and exits 2 rather than
+# carrying an unordered value into a comparison. updatedAt joined that list with finding 36.
 run_case "a check-suite timestamp that will not parse blocks" \
   "$(wrap8 '[{"createdAt":"2026-01-02T00:30"}]' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
   2 "check-suite timestamp"
@@ -658,9 +661,9 @@ run_case "a review body whose timestamp will not parse blocks" \
 run_case "an answer whose timestamp will not parse answers nothing" \
   "$(wrap4 me '[]' '[]' "[$(cmt codex Bot 2026-01-02T00:30:00Z '"P1: this drops the last row"'),$(cmt me User yesterday '"RED-VERIFIED: tests/row.rs"')]")" \
   2 "no parsable createdAt"
-run_case "a walkthrough whose updatedAt will not parse is not coverage" \
+run_case "a walkthrough whose updatedAt will not parse blocks" \
   "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk none clean "$BASE40" "$HEAD40")" 'a while ago'),$ANSWER]")" \
-  1 "UNREVIEWED HEAD"
+  2 "no parsable updatedAt"
 # Guard: the parse is UTC (jq mktime is timegm), so a verdict must not depend on where the
 # runner sits. The same fixture under a non-UTC zone reaches the same verdict.
 export TZ=America/New_York
@@ -668,6 +671,208 @@ run_case "the same-second verdict holds under a non-UTC host timezone" \
   "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T00:30:00.100Z deadbee)")" 2026-01-02T00:30:05Z)")" \
   0 "HEAD COVERED"
 unset TZ
+
+echo "== finding 33: a zone offset's minutes are minutes, not seconds =="
+# `ts` built the offset as $zh * 3600 + $zm, adding the MINUTES field as seconds. Z, +00:00
+# and every whole-hour offset are exact, which is why the +01:00 case above passes; a
+# half- or quarter-hour zone is off by $zm * 59 seconds, up to 44 minutes. The direction is
+# fail-open for positive offsets on both ordering sites: the instant reads LATER than it is,
+# so a verdict recorded before the head arrived covers it, and a claim edited after its
+# answer reads as though it came first.
+# Head arrival is 2026-01-02T00:30:00Z in every wrap8 case below.
+run_case "a +05:30 verdict 5 minutes before arrival is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T05:55:00+05:30 "$(codex_body ' Bravo.' deadbeef)")")" \
+  1 "UNREVIEWED HEAD"
+run_case "a +09:30 verdict a minute before arrival is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T09:59:00+09:30 "$(codex_body ' Bravo.' deadbeef)")")" \
+  1 "UNREVIEWED HEAD"
+run_case "a +12:45 verdict a minute before arrival is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T13:14:00+12:45 "$(codex_body ' Bravo.' deadbeef)")")" \
+  1 "UNREVIEWED HEAD"
+# A negative half-hour offset reads EARLIER than it is, which fails open on the claim side:
+# the claim's true instant 04:05:00Z is after the answer's 04:00:00Z, so it is unanswered.
+run_case "a -03:30 claim posted after its answer is not answered by it" \
+  "$(wrap4 me '[]' '[]' "[$(cmt codex Bot 2026-01-02T00:35:00-03:30 '"P1: this drops the last row"'),$(cmt me User 2026-01-02T04:00:00Z '"RED-VERIFIED: tests/row.rs"')]")" \
+  1 "carry no disposition"
+# Guards, green before and after: a half-hour verdict that really is after arrival covers,
+# and whole-hour offsets were never affected.
+run_case "a +09:30 verdict 5 minutes after arrival covers the head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T10:05:00+09:30 "$(codex_body ' Bravo.' deadbeef)")")" \
+  0 "HEAD COVERED"
+
+echo "== finding 34: only Codex, in the whole shape it posts, writes a review summary =="
+# is_codex_summary was `contains("<!-- codex-pull-request-review-summary -->")` applied to
+# any listed bot, so two things followed. CodeRabbit carrying that marker became a Codex
+# summary: exempt from dispositions, and its table read as coverage. And a real finding from
+# Codex that merely QUOTED the marker stopped being claimable, which is a P1 exiting CLEAR
+# with nothing answered. The marker must open the comment, the comment must be the whole
+# posted shape (heading, the one-line explanation, the four-column table header, its
+# separator, and table rows to the end), and the account must be Codex.
+codex_summary_plus() { jq -n --argjson b "$(codex_summary "$1")" --arg x "$2" '$b + "\n\n" + $x'; }
+run_case "a coderabbit comment in the codex summary shape is a finding, not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt coderabbitai Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a codex finding that quotes the summary marker is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(jq -n '"P1: this drops the last row.\n\nThe run is in the summary comment (<!-- codex-pull-request-review-summary -->)."')")")" \
+  1 "carry no disposition"
+run_case "a codex summary with a finding appended after the table is claimable, not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary_plus "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)" 'P1: this drops the last row')" 2026-01-02T01:00:05Z)")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a codex summary missing the table header is claimable, not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(jq -n --arg r "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)" '"<!-- codex-pull-request-review-summary -->\n\n\($r)"')" 2026-01-02T01:00:05Z)")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+# Guards, green before and after: the shape Codex actually posts still covers and still needs
+# no disposition, and CodeRabbit's own walkthrough is judged by its own rule.
+run_case "the posted codex summary shape still covers the head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  0 "HEAD COVERED"
+run_case "a coderabbit walkthrough is still judged as a walkthrough" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk none clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z),$ANSWER]")" \
+  0 "HEAD COVERED"
+
+echo "== finding 35: the gate judges the FINAL snapshot, not the one it opened with =="
+# The second read existed only to fingerprint the comments that can grant coverage, and the
+# verdict was still computed from the FIRST read. Everything else that arrived or vanished
+# while the gate paged threads was invisible: a P1 posted mid-run went unjudged, and a
+# disposition deleted mid-run still answered its claim. The PR-level bodies are now taken
+# from the final read of the comments.
+COV_C=$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")
+LATE_CLAIM=$(cmt reviewer User 2026-01-02T01:10:00Z '"P1: this drops the last row"')
+LATE_DISP=$(cmt me User 2026-01-02T01:20:00Z '"NOT-A-DEFECT: the guard above rejects that input"')
+NEW_CLAIM=$(cmt reviewer User 2026-01-02T01:30:00Z '"P1: this one landed while the gate was paging"')
+run_case "a disposition deleted between the two reads leaves its claim unanswered" \
+  "$(wrap8 "$SUITE" "$COV_C,$LATE_CLAIM,$LATE_DISP" "$COV_C,$LATE_CLAIM")" \
+  1 "carry no disposition"
+run_case "a claim that lands between the two reads is judged, not missed" \
+  "$(wrap8 "$SUITE" "$COV_C" "$COV_C,$NEW_CLAIM")" \
+  1 "carry no disposition"
+# Guards, green before and after: an unchanged second read reaches the same verdict, and a
+# disposition present in both still answers.
+run_case "an unchanged second read reaches the same verdict" \
+  "$(wrap8 "$SUITE" "$COV_C,$LATE_CLAIM,$LATE_DISP" "$COV_C,$LATE_CLAIM,$LATE_DISP")" \
+  0 "HEAD COVERED"
+
+echo "== finding 35: reviews and threads are consistency-checked too =="
+# Comments are re-read and re-judged; reviews and threads are re-read and COMPARED, because
+# re-paging every thread body would double the cost of the slowest part of the run. Either
+# one moving means the reading was taken from data that has since changed, so it blocks.
+# Both are live-path properties, so both go through the gh shim: with only one read of each,
+# the second file is never fetched and the run reports CLEAR.
+mkdir -p "$TMP/bin"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments2.json"
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/threads.json"
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":false,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"body":"P1: this landed while the gate was paging"}]}}]}}}}}' > "$TMP/threads2.json"
+review_payload() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"prcommits":{"nodes":[{"commit":{"oid":"deadbeef"}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":%s,"commit":{"oid":"deadbeef"}}]}}}}}' "$1"; }
+review_payload '""' > "$TMP/reviews.json"
+review_payload '"P1: this landed while the gate was paging"' > "$TMP/reviews2.json"
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+nth() { local f=$GATE_TEST_DIR/$1.count n; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$f"; printf '%s' "$n"; }
+case "$*" in
+  *reviewThreads*)
+    if [ "$(nth threads)" -le 1 ]; then cat "$GATE_TEST_DIR/threads.json"; else cat "$GATE_TEST_DIR/${GATE_TEST_THREADS2:-threads}.json"; fi ;;
+  *"reviews(first"*)
+    if [ "$(nth reviews)" -le 1 ]; then cat "$GATE_TEST_DIR/reviews.json"; else cat "$GATE_TEST_DIR/${GATE_TEST_REVIEWS2:-reviews}.json"; fi ;;
+  *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
+  *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+live_case() {
+  local name=$1 want_rc=$2 want_txt=$3 out rc
+  rm -f "$TMP/threads.count" "$TMP/reviews.count"
+  out=$(GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+  if [ "$rc" = "$want_rc" ] && grep -qF "$want_txt" <<<"$out"; then
+    echo "  PASS  $name"; pass=$((pass+1))
+  else
+    echo "  FAIL  $name (rc=$rc want=$want_rc)"; sed 's/^/          /' <<<"$out" | head -4; fail=$((fail+1))
+  fi
+}
+GATE_TEST_REVIEWS2=reviews2 live_case "a review body edited between the two reads blocks" 2 "reviews on this PR changed"
+GATE_TEST_THREADS2=threads2 live_case "a thread opened between the two reads blocks" 2 "review threads on this PR changed"
+# Guard, green before and after: unchanged reviews and threads reach a verdict.
+live_case "unchanged reviews and threads still reach a verdict" 0 "CLEAR"
+
+echo "== finding 36: a comment is dated by its last edit, not by its creation =="
+# Comments are mutable and GitHub keeps createdAt fixed across edits. Ordering claims and
+# answers by createdAt therefore reads the CURRENT body against the ORIGINAL time: a comment
+# opened Jan 1, edited Jan 3 to add a defect, counted as answered by a Jan 2 disposition.
+# updatedAt dates the body the gate is actually reading, and is validated like createdAt.
+run_case "a comment edited after its answer is not answered by it" \
+  "$(wrap4 me '[]' '[]' "[$(cmt reviewer User 2026-01-01T00:00:00Z '"P1: this drops the last row"' 2026-01-03T00:00:00Z),$(cmt me User 2026-01-02T00:00:00Z '"RED-VERIFIED: tests/row.rs"')]")" \
+  1 "carry no disposition"
+run_case "a disposition edited after the claim answers it" \
+  "$(wrap4 me '[]' '[]' "[$(cmt reviewer User 2026-01-02T00:00:00Z '"P1: this drops the last row"'),$(cmt me User 2026-01-01T00:00:00Z '"RED-VERIFIED: tests/row.rs"' 2026-01-03T00:00:00Z)]")" \
+  0 "CLEAR"
+run_case "a PR comment whose updatedAt will not parse blocks" \
+  "$(wrap4 me '[]' '[]' "[$(cmt reviewer User 2026-01-02T00:30:00Z '"P1: this drops the last row"' 'a while ago')]")" \
+  2 "no parsable updatedAt"
+# Guards, green before and after: an unedited comment orders the same either way, and an
+# edit that lands before the answer is still answered.
+run_case "a comment edited before its answer is still answered" \
+  "$(wrap4 me '[]' '[]' "[$(cmt reviewer User 2026-01-01T00:00:00Z '"P1: this drops the last row"' 2026-01-02T00:00:00Z),$(cmt me User 2026-01-03T00:00:00Z '"RED-VERIFIED: tests/row.rs"')]")" \
+  0 "CLEAR"
+
+echo "== finding 37: a seven-character prefix is not a commit identity =="
+# Coverage matched the sha a bot named against the head with `startswith`, so any commit
+# whose abbreviation prefixes the head could cover it: a result for the OLD head, named as
+# `deadbee`, certified the NEW head `deadbeef`. An abbreviation now has to resolve to
+# exactly one of the PR's commits and that commit has to be the head; a full sha still
+# matches by identity.
+# deadbee abbreviates both of these, so on this PR it names neither.
+PRCOMMITS_AMBIG='[{"commit":{"oid":"deadbee0"}},{"commit":{"oid":"deadbeef"}}]'
+# The head is not in this list, so deadbee resolves to a commit that is not the head.
+PRCOMMITS_OTHER='[{"commit":{"oid":"deadbee0"}}]'
+run_case "a summary row naming a prefix two PR commits share is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z),$ANSWER" "" "$PRCOMMITS_AMBIG")" \
+  1 "UNREVIEWED HEAD"
+run_case "a codex verdict naming a prefix two PR commits share is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")" "" "$PRCOMMITS_AMBIG")" \
+  1 "UNREVIEWED HEAD"
+run_case "an abbreviation that resolves to a commit other than the head is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")" "" "$PRCOMMITS_OTHER")" \
+  1 "UNREVIEWED HEAD"
+# Guards, green before and after: an abbreviation unique among the PR's commits still
+# resolves to the head, and a full sha matches by identity without resolving anything.
+run_case "an abbreviation unique among the PR's commits still covers" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee)")")" \
+  0 "HEAD COVERED"
+run_case "the full head sha still covers" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  0 "HEAD COVERED"
+run_case "an abbreviation of a sibling commit is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbee0)")" "" "$PRCOMMITS_AMBIG")" \
+  1 "UNREVIEWED HEAD"
+
+echo "== finding 38: a date that does not exist is not a date =="
+# mktime NORMALISES out-of-range components, so "2026-02-31T01:00:00Z" converts to
+# 2026-03-03T01:00:00Z and orders as a real instant three days later. Every ordering site
+# then treats it as a timestamp, and a summary row or a check suite carrying one can grant
+# coverage. The day is now checked against the month's real length, leap years included.
+SUITE_MAR='[{"createdAt":"2026-03-02T00:30:00Z"}]'
+run_case "a summary row dated 2026-02-31 is not coverage" \
+  "$(wrap8 "$SUITE_MAR" "$(cmt "$CODEX" Bot 2026-03-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-02-31T01:00:00.123456Z deadbee)")" 2026-03-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "a check-suite timestamp of 2026-02-31 blocks" \
+  "$(wrap8 '[{"createdAt":"2026-02-31T00:30:00Z"}]' "$(cmt "$CODEX" Bot 2026-03-04T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  2 "check-suite timestamp"
+run_case "a check-suite timestamp of 2026-02-29 blocks (2026 is not a leap year)" \
+  "$(wrap8 '[{"createdAt":"2026-02-29T00:30:00Z"}]' "$(cmt "$CODEX" Bot 2026-03-04T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  2 "check-suite timestamp"
+run_case "a check-suite timestamp of 2026-04-31 blocks (April has 30 days)" \
+  "$(wrap8 '[{"createdAt":"2026-04-31T00:30:00Z"}]' "$(cmt "$CODEX" Bot 2026-05-04T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  2 "check-suite timestamp"
+run_case "a review submittedAt of 2026-02-31 blocks" \
+  "$(wrap '[]' '[{"author":{"login":"x"},"state":"COMMENTED","submittedAt":"2026-02-31T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  2 "no parsable submittedAt"
+# Guards, green before and after: real dates still parse, including a leap day.
+run_case "2028-02-29 is a real date and still orders" \
+  "$(wrap8 '[{"createdAt":"2028-02-29T00:30:00Z"}]' "$(cmt "$CODEX" Bot 2028-02-29T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  0 "HEAD COVERED"
+run_case "2026-02-28 is a real date and still orders" \
+  "$(wrap8 '[{"createdAt":"2026-02-28T00:30:00Z"}]' "$(cmt "$CODEX" Bot 2026-02-28T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  0 "HEAD COVERED"
 
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
