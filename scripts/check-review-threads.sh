@@ -103,6 +103,55 @@ THREAD_FP_JQ='[ .[] | {id, isResolved, isOutdated, total: (.comments.totalCount 
                                                          line, originalLine, body: (.body // null)} ]} ]
   | sort_by(.id | tostring)'
 
+# Every paging loop below folds a page in with `<connection>.nodes // []` and then reads
+# `hasNextPage` from that same page. Both readings turn a response the loop CANNOT READ into
+# "this connection is empty and it is finished": a null `pullRequest` (a wrong number, a
+# renamed repo, a token that cannot see the PR, a partial GraphQL result) contributes no
+# nodes, and hasNextPage evaluates to null rather than "true", so the loop stops holding [].
+# `[]` is indistinguishable from a connection that is genuinely empty, and the verdict is
+# then computed from a list nobody fetched. That is the gate's recurring fail-open shape: a
+# check that could not evaluate anything reporting that it found nothing. On the recheck
+# comments loop it dropped every top-level claim while the run reported CLEAR (#882).
+#
+# So no page is folded in before this says it can be read: parsable JSON, a pullRequest that
+# is there, the named connection present, a `nodes` array, and a boolean `hasNextPage`.
+# Anything else blocks with a reason and returns 2, the code this gate already uses for
+# "cannot evaluate". It prints to stderr because the fetchers' stdout is the payload.
+require_page() {
+  local resp=$1 path=$2 what=$3 pr=${4:-} why=""
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$resp"; then
+    why="the response is not JSON this gate can read"
+  elif [[ $path == data.repository.pullRequest.* ]] \
+       && [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$resp")" = "null" ]; then
+    why="no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is not visible to this token)"
+  elif ! jq -e --arg p "$path" 'getpath($p | split("."))
+         | type == "object" and (.nodes | type) == "array"
+         and (.pageInfo.hasNextPage | type) == "boolean"' >/dev/null 2>&1 <<<"$resp"; then
+    why="the page carries no nodes array and no boolean hasNextPage"
+  # hasNextPage without a cursor is the same hole one field over: the page says another
+  # page follows and names nothing to fetch it with. `jq -r` renders a null endCursor as
+  # the STRING "null", which is the outer loops' own "no cursor yet" sentinel, so the next
+  # request omits `after` and asks for the FIRST page again, and the same page answers
+  # forever. An empty cursor sends `after: ""`. The oversized-thread loop tests the cursor
+  # for "null"/empty as its exit condition instead, so it ENDS and the thread is judged
+  # from the pages that did arrive. A literal "null" is rejected for the same reason a null
+  # is: the call sites cannot tell it apart from the sentinel.
+  elif ! jq -e --arg p "$path" 'getpath($p | split("."))
+         | .pageInfo.hasNextPage == false
+           or ((.pageInfo.endCursor | type) == "string"
+               and (.pageInfo.endCursor | length) > 0
+               and .pageInfo.endCursor != "null")' >/dev/null 2>&1 <<<"$resp"; then
+    why="the page says another page follows and names no cursor to fetch it with"
+  else
+    return 0
+  fi
+  echo "verdict: BLOCKED. Could not read $what: $why." >&2
+  echo "A page this gate could not read is not an empty page. Folding one in as [] is" >&2
+  echo "indistinguishable from a connection that is genuinely empty, so this run refuses" >&2
+  echo "to report a verdict computed from a list nobody fetched." >&2
+  return 2
+}
+
 # ONE read of the PR's review threads: every thread, every comment, with each oversized
 # thread's comments paged to the end. Prints the thread array on stdout; says why and
 # returns non-zero when a page could not be fetched. fetch_payload calls it TWICE, and the
@@ -133,11 +182,7 @@ fetch_threads() {
     # pullRequest with no GraphQL error. Coalescing that to [] turned "I could not find
     # this PR" into "this PR has nothing to answer" and exited CLEAR. A gate that cannot
     # find its subject must block, never bless it.
-    if [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$resp")" = "null" ]; then
-      echo "verdict: BLOCKED — no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is" >&2
-      echo "not visible to this token). Refusing to report CLEAR for a PR never read." >&2
-      return 2
-    fi
+    require_page "$resp" data.repository.pullRequest.reviewThreads "the review threads" "$pr" || return 2
 
     threads=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviewThreads.nodes // [])' \
           <(echo "$threads") <(echo "$resp"))
@@ -164,6 +209,17 @@ fetch_threads() {
       '.[] | select(.id == $id) | .comments.pageInfo.endCursor // "null"' <<<"$threads")
     all_comments=$(jq -c --arg id "$tid" \
       '.[] | select(.id == $id) | .comments.nodes' <<<"$threads")
+    # require_page checked the reviewThreads page; this cursor comes from a comments
+    # connection nested INSIDE one of its nodes, which that check does not reach. The
+    # thread is here because it holds more comments than one page, so a cursor the loop
+    # cannot use means the tail can never be asked for, and the loop below would simply
+    # not run.
+    if [ "$ccursor" = "null" ] || [ -z "$ccursor" ]; then
+      echo "verdict: BLOCKED. Cannot page thread $tid: it holds more comments than one" >&2
+      echo "page and its first page names no cursor to fetch the rest with. A thread judged" >&2
+      echo "from the comments that did arrive is a thread nobody finished reading." >&2
+      return 2
+    fi
     while [ "$ccursor" != "null" ] && [ -n "$ccursor" ]; do
       cresp=$(gh api graphql -f query="
         { node(id: \"$tid\") { ... on PullRequestReviewThread {
@@ -176,6 +232,11 @@ fetch_threads() {
         echo "verdict: BLOCKED — could not page comments for thread $tid." >&2
         return 1
       }
+      # A node the query cannot resolve (a deleted thread, an id this token cannot see)
+      # comes back as a null `node`, which folded in as an empty page and read hasNextPage
+      # as null: the loop ended and the thread was judged from the pages fetched so far,
+      # exactly the truncation the failure branch above refuses to accept.
+      require_page "$cresp" data.node.comments "the comments page for thread $tid" || return 2
       all_comments=$(jq -c -s '.[0] + (.[1].data.node.comments.nodes // [])' \
         <(echo "$all_comments") <(echo "$cresp"))
       if [ "$(jq -r '.data.node.comments.pageInfo.hasNextPage' <<<"$cresp")" = "true" ]; then
@@ -214,11 +275,7 @@ fetch_payload() {
               pageInfo { hasNextPage endCursor }
               nodes { author { login } state body submittedAt commit { oid } }
             } } } }" 2>/dev/null) || return 1
-    if [ "$(jq -r '.data.repository.pullRequest // "null"' <<<"$rresp")" = "null" ]; then
-      echo "verdict: BLOCKED — no pull request #$pr in $REPO_OWNER/$REPO_NAME (or it is" >&2
-      echo "not visible to this token). Refusing to report CLEAR for a PR never read." >&2
-      return 2
-    fi
+    require_page "$rresp" data.repository.pullRequest.reviews "the reviews" "$pr" || return 2
     reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
           <(echo "$reviews") <(echo "$rresp"))
     prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$rresp")
@@ -247,6 +304,7 @@ fetch_payload() {
               pageInfo { hasNextPage endCursor }
               nodes { commit { oid } }
             } } } }" 2>/dev/null) || return 1
+    require_page "$pcresp" data.repository.pullRequest.commits "the PR's commit list" "$pr" || return 2
     prcommits=$(jq -s '.[0] + (.[1].data.repository.pullRequest.commits.nodes // [])' \
           <(echo "$prcommits") <(echo "$pcresp"))
     prcommitcount=$(jq -r '.data.repository.pullRequest.commits.totalCount // "null"' <<<"$pcresp")
@@ -268,6 +326,7 @@ fetch_payload() {
               pageInfo { hasNextPage endCursor }
               nodes { author { login __typename } body createdAt updatedAt }
             } } } }" 2>/dev/null) || return 1
+    require_page "$cresp2" data.repository.pullRequest.comments "the top-level comments" "$pr" || return 2
     prcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
           <(echo "$prcomments") <(echo "$cresp2"))
     [ "$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage' <<<"$cresp2")" = "true" ] || break
@@ -294,6 +353,7 @@ fetch_payload() {
               pageInfo { hasNextPage endCursor }
               nodes { author { login __typename } body createdAt updatedAt }
             } } } }" 2>/dev/null) || return 1
+    require_page "$rc2resp" data.repository.pullRequest.comments "the second read of the top-level comments" "$pr" || return 2
     recheckcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
           <(echo "$recheckcomments") <(echo "$rc2resp"))
     [ "$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage' <<<"$rc2resp")" = "true" ] || break
@@ -317,6 +377,7 @@ fetch_payload() {
               pageInfo { hasNextPage endCursor }
               nodes { author { login } state body submittedAt commit { oid } }
             } } } }" 2>/dev/null) || return 1
+    require_page "$rv2resp" data.repository.pullRequest.reviews "the second read of the reviews" "$pr" || return 2
     rv2=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
           <(echo "$rv2") <(echo "$rv2resp"))
     [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rv2resp")" = "true" ] || break
@@ -354,7 +415,16 @@ fetch_payload() {
     { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
         pullRequest(number: $pr) { headRefOid } } }" \
     --jq '.data.repository.pullRequest.headRefOid' 2>/dev/null) || return 1
-  if [ -n "$headnow" ] && [ "$headnow" != "$headoid" ]; then
+  # `--jq` prints an EMPTY line when its filter lands on a null pullRequest, and the check
+  # used to skip on an empty result: the one read that exists to catch a push landing
+  # mid-run was disabled by precisely the response that says the gate could not see the PR.
+  if [ -z "$headnow" ] || [ "$headnow" = "null" ]; then
+    echo "verdict: BLOCKED. The re-read of the head named no commit, so this gate cannot" >&2
+    echo "tell whether a push landed while it was reading the PR. Re-run against a PR this" >&2
+    echo "token can see." >&2
+    return 2
+  fi
+  if [ "$headnow" != "$headoid" ]; then
     echo "verdict: BLOCKED — the head moved from ${headoid:0:9} to ${headnow:0:9} while this" >&2
     echo "gate was reading the PR. Re-run against a branch that is holding still." >&2
     return 2
