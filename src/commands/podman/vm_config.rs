@@ -986,8 +986,18 @@ pub(crate) fn effective_extra_boot_args(
 /// window for the guest to boot with a value the key never saw.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GuestBootInputs {
-    pub host_dns: Vec<String>,
-    pub dns_search: Vec<String>,
+    /// The resolvers this launch may hand the guest, each carrying the search
+    /// domains that belong to it.
+    ///
+    /// Grouped rather than flattened into two lists because the two are not
+    /// independent: a short name is completed with a search domain and then
+    /// asked of a resolver, so a domain is only meaningful against a resolver
+    /// that knows it. Bridged forwards ONE resolver, and with a flat pair the
+    /// server list could be narrowed while the whole merged search list
+    /// stayed, sending a private suffix from an unselected source to the
+    /// resolver that was selected (CWE-200). Grouped, a narrowing cannot drop
+    /// a server without dropping its domains.
+    pub dns: Vec<crate::network::ResolverGroup>,
     pub fuse_readers: Option<String>,
     pub fuse_trace_rate: Option<String>,
     pub fuse_max_write: Option<String>,
@@ -1034,25 +1044,22 @@ impl GuestBootInputs {
         // network_config.dns_server is replaced by --dns for every mode
         // (src/commands/podman/mod.rs), including routed mode's
         // detect_ipv6_dns result.
-        let (host_dns, dns_search) = if dns_override.is_some() {
-            (Vec::new(), Vec::new())
+        let dns = if dns_override.is_some() {
+            Vec::new()
         } else {
-            let host_dns = crate::network::nameservers_from_sources(sources).unwrap_or_else(|e| {
-                // Bridged mode turns an empty list into a launch failure and the
-                // other modes degrade to the gateway, so either way the reason
-                // belongs in the log. Discarding it is what left #875 reporting
-                // only that there was no usable host DNS.
+            // Bridged mode turns an empty resolver list into a launch failure
+            // and the other modes degrade to the gateway, so either way the
+            // reason belongs in the log. Discarding it is what left #875
+            // reporting only that there was no usable host DNS.
+            // nameservers_from_sources fails in exactly the cases
+            // resolver_groups comes back empty, so the two cannot disagree.
+            if let Err(e) = crate::network::nameservers_from_sources(sources) {
                 warn!("{e:#}");
-                Vec::new()
-            });
-            (
-                host_dns,
-                crate::network::search_domains_from_sources(sources),
-            )
+            }
+            crate::network::resolver_groups(sources)
         };
         Self {
-            host_dns,
-            dns_search,
+            dns,
             fuse_readers: runtime_config
                 .fuse_readers
                 .map(|r| r.to_string())
@@ -1063,6 +1070,25 @@ impl GuestBootInputs {
         }
     }
 
+    /// The resolvers this launch gives the guest, in source order,
+    /// de-duplicated with the first occurrence winning.
+    pub(crate) fn host_dns(&self) -> Vec<String> {
+        let mut servers: Vec<String> = Vec::new();
+        for group in &self.dns {
+            for server in &group.servers {
+                if !servers.contains(server) {
+                    servers.push(server.clone());
+                }
+            }
+        }
+        servers
+    }
+
+    /// The search domains that belong to those resolvers.
+    pub(crate) fn dns_search(&self) -> Vec<String> {
+        crate::network::search_domains_of(&self.dns)
+    }
+
     /// Drop the inputs this launch cannot observe, so the key hashes exactly
     /// what the guest boots with (#863). Applied by both config constructors:
     ///
@@ -1070,6 +1096,18 @@ impl GuestBootInputs {
     ///   (network_config.dns_server carries the first host entry), so only
     ///   the first entry can reach it; keying the rest would cold-boot a
     ///   guest whose cmdline is identical when a secondary nameserver moves.
+    ///   The narrowing is applied to the resolver GROUPS, so the search
+    ///   domains of the sources whose resolver was not selected go with them.
+    /// * Rootless mode sets no dns_server (src/network/pasta.rs), so
+    ///   build_runtime_boot_args emits the whole host_dns list and every
+    ///   source's resolver reaches the guest. Its groups are left alone and
+    ///   the guest keeps every source's search domains.
+    /// * Routed mode forwards a single resolver too, but it picks it inside
+    ///   RoutedNetwork::setup (detect_ipv6_dns) after this config and its
+    ///   snapshot key already exist, so the choice is not visible here and its
+    ///   groups are left whole. Narrowing them needs that choice threaded into
+    ///   the config the way #863 threaded bridged's; guessing the rule here
+    ///   would drop the suffixes the probe fallback's resolver does serve.
     /// * The four FUSE knobs are read only inside fc-agent's FUSE mount path
     ///   (fc-agent/src/fuse/mod.rs), and mount_fuse_volumes runs only when
     ///   the boot plan carries volumes (fc-agent/src/agent.rs), so a
@@ -1080,7 +1118,23 @@ impl GuestBootInputs {
         has_fuse_volumes: bool,
     ) -> Self {
         if matches!(network_mode, crate::firecracker::FcNetworkMode::Bridged) {
-            self.host_dns.truncate(1);
+            // Bridged forwards exactly one resolver: network_config.dns_server
+            // carries the first host entry. Narrow the groups to the sources
+            // that named it, so the guest keeps that resolver and only the
+            // search domains belonging to it.
+            let selected = self.host_dns().into_iter().next();
+            let groups = std::mem::take(&mut self.dns);
+            self.dns = match selected {
+                Some(server) => groups
+                    .into_iter()
+                    .filter(|group| group.servers.contains(&server))
+                    .map(|group| crate::network::ResolverGroup {
+                        servers: vec![server.clone()],
+                        search_domains: group.search_domains,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
         }
         if !has_fuse_volumes {
             self.fuse_readers = None;
@@ -1170,8 +1224,8 @@ pub(crate) fn build_launch_config(
         // Launch-only config: never hashed into a snapshot key, so the image
         // disk's build identity is not resolved here.
         image_disk_identity: None,
-        host_dns: boot_inputs.host_dns,
-        dns_search: boot_inputs.dns_search,
+        host_dns: boot_inputs.host_dns(),
+        dns_search: boot_inputs.dns_search(),
         fuse_readers: boot_inputs.fuse_readers,
         fuse_trace_rate: boot_inputs.fuse_trace_rate,
         fuse_max_write: boot_inputs.fuse_max_write,
@@ -1823,7 +1877,7 @@ mod tests {
         let inputs = GuestBootInputs::resolve(Some("10.0.2.2"), &runtime_config);
         assert_eq!(inputs.fuse_readers.as_deref(), Some("8"));
         assert!(
-            inputs.host_dns.is_empty(),
+            inputs.host_dns().is_empty(),
             "--dns wins outright, so the host fallback must not fragment the key"
         );
     }
@@ -1858,18 +1912,18 @@ mod tests {
 
         let inputs = GuestBootInputs::from_sources(Some("8.8.8.8"), &sources, &no_runtime_knobs());
         assert!(
-            inputs.host_dns.is_empty(),
+            inputs.host_dns().is_empty(),
             "the host resolver is already dropped on override"
         );
         assert!(
-            inputs.dns_search.is_empty(),
+            inputs.dns_search().is_empty(),
             "the host search list must be dropped with it, got {:?}",
-            inputs.dns_search
+            inputs.dns_search()
         );
 
         let config = crate::firecracker::FirecrackerConfig {
-            host_dns: inputs.host_dns.clone(),
-            dns_search: inputs.dns_search.clone(),
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
             ..Default::default()
         };
         let network_config = crate::network::NetworkConfig {
@@ -1904,18 +1958,103 @@ mod tests {
         )];
 
         let inputs = GuestBootInputs::from_sources(None, &sources, &no_runtime_knobs());
-        assert_eq!(inputs.host_dns, vec!["10.1.0.2"]);
-        assert_eq!(inputs.dns_search, vec!["corp.example"]);
+        assert_eq!(inputs.host_dns(), vec!["10.1.0.2"]);
+        assert_eq!(inputs.dns_search(), vec!["corp.example"]);
 
         let config = crate::firecracker::FirecrackerConfig {
-            host_dns: inputs.host_dns.clone(),
-            dns_search: inputs.dns_search.clone(),
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
             ..Default::default()
         };
         let boot_args = build_runtime_boot_args(&crate::network::NetworkConfig::default(), &config);
         assert!(
             boot_args.contains("fcvm_dns_search=corp.example"),
             "boot args: {boot_args:?}"
+        );
+    }
+
+    /// Two sources, each with its own resolver and its own suffix.
+    fn two_source_host() -> [crate::network::ResolvSource; 2] {
+        [
+            resolv_source(
+                crate::network::RESOLV_CONF_SOURCES[0],
+                "nameserver 10.1.0.2\nsearch corp.example\n",
+            ),
+            resolv_source(
+                crate::network::ETC_RESOLV_CONF,
+                "nameserver 192.0.2.53\nsearch lab.example\n",
+            ),
+        ]
+    }
+
+    /// Bridged forwards ONE resolver, so the guest must see only the suffixes
+    /// belonging to it. Keeping the whole merged search list expands a short
+    /// name with a private suffix from a source whose resolver was never
+    /// selected and asks the resolver that was, disclosing the internal name
+    /// to it (CWE-200).
+    #[test]
+    fn bridged_forwards_only_the_search_domains_of_the_resolver_it_selects() {
+        let inputs = GuestBootInputs::from_sources(None, &two_source_host(), &no_runtime_knobs())
+            .for_launch(crate::firecracker::FcNetworkMode::Bridged, false);
+
+        assert_eq!(
+            inputs.host_dns(),
+            vec!["10.1.0.2"],
+            "bridged forwards the first resolver only"
+        );
+        assert_eq!(
+            inputs.dns_search(),
+            vec!["corp.example"],
+            "the unselected resolver's suffix must not travel with it"
+        );
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
+            ..Default::default()
+        };
+        // Bridged threads that same first entry into the network config.
+        let network_config = crate::network::NetworkConfig {
+            dns_server: Some("10.1.0.2".to_string()),
+            ..Default::default()
+        };
+
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        assert!(
+            !boot_args.contains("lab.example"),
+            "a suffix whose resolver the guest never gets must not be emitted: {boot_args:?}"
+        );
+        assert!(
+            boot_args.contains("fcvm_dns_search=corp.example"),
+            "the selected resolver's suffix still has to reach the guest: {boot_args:?}"
+        );
+    }
+
+    /// The other side, so the narrowing cannot be over-corrected into dropping
+    /// legitimate domains. Rootless sets no dns_server (pasta.rs), so
+    /// build_runtime_boot_args emits the whole host_dns list and every source's
+    /// resolver reaches the guest. Every source's suffixes must reach it too.
+    #[test]
+    fn a_mode_that_forwards_every_resolver_keeps_every_search_domain() {
+        let inputs = GuestBootInputs::from_sources(None, &two_source_host(), &no_runtime_knobs())
+            .for_launch(crate::firecracker::FcNetworkMode::Rootless, false);
+
+        assert_eq!(inputs.host_dns(), vec!["10.1.0.2", "192.0.2.53"]);
+        assert_eq!(inputs.dns_search(), vec!["corp.example", "lab.example"]);
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
+            ..Default::default()
+        };
+        let boot_args = build_runtime_boot_args(&crate::network::NetworkConfig::default(), &config);
+        assert!(
+            boot_args.contains("fcvm_dns=10.1.0.2|192.0.2.53"),
+            "boot args: {boot_args:?}"
+        );
+        assert!(
+            boot_args.contains("fcvm_dns_search=corp.example|lab.example"),
+            "every forwarded resolver keeps its suffixes: {boot_args:?}"
         );
     }
 

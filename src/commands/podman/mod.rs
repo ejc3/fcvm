@@ -1465,7 +1465,7 @@ async fn prepare_vm_for_lifecycle(
             // of re-read inside setup() (#863). Fail closed like the old
             // in-setup read did: a bridged guest NATs straight out and needs
             // a real resolver, and --dns is the override.
-            if args.dns.is_none() && boot_inputs.host_dns.is_empty() {
+            if args.dns.is_none() && boot_inputs.host_dns().is_empty() {
                 bail!(
                     "no usable host DNS server for bridged mode: neither {} named a \
                      nameserver this guest can reach (the warning above says what each \
@@ -1475,7 +1475,7 @@ async fn prepare_vm_for_lifecycle(
             }
             Box::new(
                 BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_dns_server(boot_inputs.host_dns.first().cloned()),
+                    .with_dns_server(boot_inputs.host_dns().first().cloned()),
             )
         }
         NetworkMode::Routed => {
@@ -2830,6 +2830,19 @@ mod tests {
         key_for(&test_args(), inputs)
     }
 
+    /// One resolv.conf source's contribution: the servers it named and the
+    /// search domains that belong to them. Grouped, because a narrowing mode
+    /// drops a server together with its domains.
+    fn resolvers(servers: &[&str], search: &[&str]) -> GuestBootInputs {
+        GuestBootInputs {
+            dns: vec![crate::network::ResolverGroup {
+                servers: servers.iter().map(|s| s.to_string()).collect(),
+                search_domains: search.iter().map(|s| s.to_string()).collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
     /// #863: bridged mode forwards exactly one resolver to the guest
     /// (network_config.dns_server is the first host entry), so the key must
     /// hash exactly that. Keying the whole host list cold-boots a guest whose
@@ -2837,10 +2850,7 @@ mod tests {
     /// mode emits the whole list, so every entry must keep keying there.
     #[test]
     fn bridged_mode_keys_only_the_emitted_dns() {
-        let dns = |servers: &[&str]| GuestBootInputs {
-            host_dns: servers.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        };
+        let dns = |servers: &[&str]| resolvers(servers, &[]);
         let bridged = |servers: &[&str]| {
             let mut args = test_args();
             args.network = NetworkMode::Bridged;
@@ -2898,10 +2908,7 @@ mod tests {
 
     #[test]
     fn host_dns_fallback_changes_snapshot_key() {
-        let dns = |servers: &[&str]| GuestBootInputs {
-            host_dns: servers.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        };
+        let dns = |servers: &[&str]| resolvers(servers, &[]);
         assert_ne!(
             boot_inputs_key(GuestBootInputs::default()),
             boot_inputs_key(dns(&["1.1.1.1"])),
@@ -2916,12 +2923,11 @@ mod tests {
 
     #[test]
     fn dns_search_changes_snapshot_key() {
+        // Same resolver on both sides, so only the search domains vary and the
+        // assertion cannot pass on a difference in the server list.
         assert_ne!(
-            boot_inputs_key(GuestBootInputs::default()),
-            boot_inputs_key(GuestBootInputs {
-                dns_search: vec!["corp.example".to_string()],
-                ..Default::default()
-            }),
+            boot_inputs_key(resolvers(&["1.1.1.1"], &[])),
+            boot_inputs_key(resolvers(&["1.1.1.1"], &["corp.example"])),
             "DNS search domains must change the key"
         );
     }

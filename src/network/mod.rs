@@ -255,29 +255,57 @@ pub fn nameservers_from_sources(sources: &[ResolvSource]) -> anyhow::Result<Vec<
     Ok(servers)
 }
 
-/// The search domains named by the sources that supplied a usable nameserver,
-/// in source order, de-duplicated with the first occurrence winning.
+/// One source's usable resolvers together with the search domains that belong
+/// to them.
 ///
-/// A short name is completed against a search domain and then asked of a
-/// server, so the search list has to describe the same resolvers the guest is
-/// given. Only a source that contributed to [`nameservers_from_sources`] gets
-/// a say: #875's stub-only run file holds `search .` and no usable server,
-/// and taking its list left the guest searching the root domain while
-/// `/etc/resolv.conf` supplied both the resolver and `search corp.example`.
+/// The pairing is the point. A search domain is only meaningful against a
+/// resolver that knows it, so a domain must not outlive the selection of its
+/// resolvers. Bridged mode forwards ONE server, and a flattened
+/// (servers, domains) pair let the server list be narrowed while the whole
+/// merged search list stayed, which expanded a short name with a private
+/// suffix from a source whose resolver was never selected and asked the
+/// resolver that was.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolverGroup {
+    pub servers: Vec<String>,
+    pub search_domains: Vec<String>,
+}
+
+/// Each source's usable servers paired with its search domains.
 ///
-/// Unioned rather than taken from the first contributing source, for the same
-/// reason the nameservers are unioned: the guest is handed every contributing
-/// source's servers, so it must be able to complete short names for each of
-/// them.
-pub fn search_domains_from_sources(sources: &[ResolvSource]) -> Vec<String> {
+/// A source that named no usable server is dropped, so it cannot contribute a
+/// search domain either: that is the #875 rule, held here by construction
+/// rather than by a separate check.
+pub fn resolver_groups(sources: &[ResolvSource]) -> Vec<ResolverGroup> {
+    sources
+        .iter()
+        .filter_map(|source| {
+            let servers = source.usable_nameservers();
+            if servers.is_empty() {
+                return None;
+            }
+            Some(ResolverGroup {
+                servers,
+                search_domains: source.search_domains(),
+            })
+        })
+        .collect()
+}
+
+/// The search domains of the groups that still carry a resolver, in order,
+/// de-duplicated with the first occurrence winning.
+///
+/// Groups with no server contribute nothing, so narrowing a guest's resolvers
+/// to a subset of the groups narrows its search list with them. That filter is
+/// a second guard rather than the only one: [`resolver_groups`] already drops
+/// a source that named no usable server, and a narrowing mode drops the whole
+/// group. It holds the same rule for a group built by hand.
+pub fn search_domains_of(groups: &[ResolverGroup]) -> Vec<String> {
     let mut domains: Vec<String> = Vec::new();
-    for source in sources {
-        if source.usable_nameservers().is_empty() {
-            continue;
-        }
-        for domain in source.search_domains() {
-            if !domains.contains(&domain) {
-                domains.push(domain);
+    for group in groups.iter().filter(|g| !g.servers.is_empty()) {
+        for domain in &group.search_domains {
+            if !domains.contains(domain) {
+                domains.push(domain.clone());
             }
         }
     }
@@ -585,7 +613,7 @@ mod tests {
             "the usable server comes from /etc/resolv.conf"
         );
         assert_eq!(
-            search_domains_from_sources(&sources),
+            search_domains_of(&resolver_groups(&sources)),
             vec!["corp.example"],
             "the stub-only run file supplied no resolver, so it does not decide what the guest searches"
         );
@@ -608,7 +636,7 @@ mod tests {
         ];
 
         assert_eq!(
-            search_domains_from_sources(&sources),
+            search_domains_of(&resolver_groups(&sources)),
             vec!["corp.example", "internal", "other.example"],
             "the run file's domains come first and a domain named twice appears once"
         );
