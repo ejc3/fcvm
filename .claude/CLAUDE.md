@@ -563,6 +563,19 @@ The ordering below matters; each step's trap is noted inline.
 # 1. KVM access (new login session required after; a live ssh master keeps old groups)
 sudo usermod -aG kvm $USER
 
+# 1b. Unprivileged user namespaces. Ubuntu 24.04 ships
+#     kernel.apparmor_restrict_unprivileged_userns=1, which makes rootless
+#     podman and skopeo fail: `unshare -U -r true` reports "write failed
+#     /proc/self/uid_map: Operation not permitted" and the first image export
+#     dies with "Error during unshare(...): Operation not permitted". Every
+#     long-lived fcvm box gets this from terraform (dev-user-data.tf), so the
+#     requirement was invisible to anyone following these steps by hand.
+sudo tee /etc/sysctl.d/99-fcvm.conf >/dev/null <<'SYSCTL'
+kernel.unprivileged_userns_clone=1
+kernel.apparmor_restrict_unprivileged_userns=0
+SYSCTL
+sudo sysctl -p /etc/sysctl.d/99-fcvm.conf
+
 # 2. Packages (Ubuntu 24.04). btrfs-progs is needed by the very next step;
 #    bc/bison/flex/libelf-dev are the kernel fallback build's dependencies —
 #    setup builds a kernel locally whenever a profile's release artifact is
