@@ -13,12 +13,19 @@ The block under test is lifted out of the shipped entry.sh and run under sh
 that records its argv NUL-separated, so an empty element or a split one is
 visible. The cwd holds files so an unquoted `*` would glob.
 
+The rule text itself is judged by running it through `rewrite_host` below, a
+model of net/base/host_mapping_rules.cc: a rule Chromium cannot parse is
+dropped with only a LOG(ERROR), so a flag that reads correctly to a human can
+leave the browser resolving through live DNS. Asserting on the mapping the
+rule produces catches that; asserting on the flag's spelling does not.
+
 Watched red 2026-08-28 against entry.sh at 13cb9543; the failure text is
 quoted on each test.
 
 Run: python3 -m unittest test_entry_flags -v
 """
 
+import fnmatch
 import os
 import re
 import subprocess
@@ -27,8 +34,82 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(HERE, "entry.sh")
-RULE = "--host-resolver-rules=MAP * 10.0.2.2"
+FLAG = "--host-resolver-rules="
 SHELLS = ("sh", "bash")
+
+
+def parse_host_and_port(value):
+    """net::ParseHostAndPort, the parser HostMappingRules puts a MAP rule's
+    replacement through. Returns (host, port) with the host exactly as the
+    hostname component spells it (brackets kept), port None when the
+    replacement carries none, or (None, None) when the rule is unparseable
+    and AddRuleFromString drops it.
+
+    url::ParseServerInfo splits host from port at the LAST colon, unless that
+    colon precedes the last `]`. So `fd00::2` is not an address to this
+    parser: it is the host `fd00:` on port 2.
+    """
+    if not value or "@" in value:
+        return None, None
+    ipv6_terminator = len(value) if value[0] == "[" else -1
+    colon = -1
+    for index, char in enumerate(value):
+        if char == "]":
+            ipv6_terminator = index
+        elif char == ":":
+            colon = index
+    if colon > ipv6_terminator:
+        host, port_text = value[:colon], value[colon + 1:]
+    else:
+        host, port_text = value, ""
+    if not host:
+        return None, None
+    port = None
+    if port_text:
+        if not port_text.isdigit() or not 0 <= int(port_text) <= 65535:
+            return None, None
+        port = int(port_text)
+    return host, port
+
+
+def parse_rules(rule_string):
+    """net::HostMappingRules::SetRulesFromString. Returns (exclusions, maps).
+
+    Rules are comma or semicolon separated. `EXCLUDE <pattern>` and
+    `MAP <pattern> <replacement>` are the only two shapes; anything else is
+    logged and dropped, which is why an unparseable rule is silent.
+    """
+    exclusions, maps = [], []
+    for raw in re.split(r"[,;]", rule_string):
+        parts = raw.split()
+        if len(parts) == 2 and parts[0].lower() == "exclude":
+            exclusions.append(parts[1].lower())
+        elif len(parts) == 3 and parts[0].lower() == "map":
+            host, port = parse_host_and_port(parts[2])
+            if host is not None:
+                maps.append((parts[1].lower(), host, port))
+    return exclusions, maps
+
+
+def rewrite_host(rule_string, host, port):
+    """net::HostMappingRules::RewriteHost: exclusions first, then the first
+    matching MAP rule. Returns the (host, port) Chromium would resolve."""
+    exclusions, maps = parse_rules(rule_string)
+    for pattern in exclusions:
+        if fnmatch.fnmatchcase(host.lower(), pattern):
+            return host, port
+    for pattern, replacement, replacement_port in maps:
+        if fnmatch.fnmatchcase(host.lower(), pattern) or fnmatch.fnmatchcase(
+                f"{host}:{port}".lower(), pattern):
+            return replacement, port if replacement_port is None else replacement_port
+    return host, port
+
+
+def rule_of(argv):
+    """The one --host-resolver-rules element of an argv, or None."""
+    rules = [a for a in argv or [] if a.startswith(FLAG)]
+    assert len(rules) <= 1, f"more than one resolver rule reached chromium: {argv}"
+    return rules[0][len(FLAG):] if rules else None
 
 
 def flag_block() -> str:
@@ -85,13 +166,17 @@ class EntryResolverRule(unittest.TestCase):
                     shell, {"BENCH_RESOLVE_ALL_TO": "10.0.2.2"})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIsNotNone(argv, "chromium was never invoked")
-                self.assertEqual(argv.count(RULE), 1, argv)
-                self.assertLess(argv.index(RULE), argv.index("about:blank"),
+                element = [a for a in argv if a.startswith(FLAG)]
+                self.assertEqual(len(element), 1, argv)
+                self.assertLess(argv.index(element[0]), argv.index("about:blank"),
                                 "the rule landed after the URL")
-                split = [a for a in argv if a in ("MAP", "*", "10.0.2.2")
+                split = [a for a in argv if a in ("MAP", "EXCLUDE", "*", "10.0.2.2")
                          or a in ("a.txt", "b.txt")]
                 self.assertEqual(split, [], f"the rule was word-split or globbed: {argv}")
                 self.assertNotIn("", argv, "an empty argv element reached chromium")
+                self.assertEqual(rewrite_host(rule_of(argv), "example.com", 443),
+                                 ("10.0.2.2", 443),
+                                 "the rule does not map a corpus host to the knob")
 
     def test_unset_leaves_the_argv_unchanged(self):
         """The unset argv is the set argv minus exactly the rule element.
@@ -105,17 +190,17 @@ class EntryResolverRule(unittest.TestCase):
             with self.subTest(shell=shell):
                 _with, argv_with = self._run(
                     shell, {"BENCH_RESOLVE_ALL_TO": "10.0.2.2"})
-                self.assertIn(RULE, argv_with or [],
-                              "the set case emitted no rule, so this comparison "
-                              "proves nothing")
+                self.assertIsNotNone(rule_of(argv_with),
+                                     "the set case emitted no rule, so this "
+                                     "comparison proves nothing")
                 result, argv = self._run(shell, {})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIsNotNone(argv, "chromium was never invoked")
                 self.assertEqual(
-                    [a for a in argv if a.startswith("--host-resolver-rules")], [],
+                    [a for a in argv if a.startswith(FLAG)], [],
                     f"a resolver rule was emitted with the knob unset: {argv}")
                 self.assertNotIn("", argv, "an empty argv element reached chromium")
-                self.assertEqual(argv, [a for a in argv_with if a != RULE],
+                self.assertEqual(argv, [a for a in argv_with if not a.startswith(FLAG)],
                                  "the knob changed more than the one element")
                 empty, argv_empty = self._run(shell, {"BENCH_RESOLVE_ALL_TO": ""})
                 self.assertEqual(empty.returncode, 0, empty.stderr)
@@ -157,9 +242,40 @@ class EntryResolverRule(unittest.TestCase):
             with self.subTest(shell=shell, value="fd00::2"):
                 result, argv = self._run(shell, {"BENCH_RESOLVE_ALL_TO": "fd00::2"})
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(rule_of(argv),
+                                 "EXCLUDE localhost, EXCLUDE 127.0.0.1, "
+                                 "EXCLUDE ::1, MAP * fd00::2")
+
+
+    def test_loopback_and_localhost_are_never_mapped(self):
+        """The knob maps every host Chromium resolves, and the browser
+        resolves its own warmup page: entry.sh navigates
+        http://127.0.0.1:$HTTP_PORT/warmup.html before it writes the ready
+        marker. With `MAP * 10.0.2.2` and nothing listening on 10.0.2.2:8000
+        that navigation fails, `set -e` exits the script, and the container
+        never becomes healthy. The rule must exclude the loopback names.
+
+        Red on entry.sh at 96664d74:
+        `AssertionError: Tuples differ: ('10.0.2.2', 8000) != ('127.0.0.1', 8000)`
+        `: the warmup host is mapped away from the page server`
+        """
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                _result, argv = self._run(
+                    shell, {"BENCH_RESOLVE_ALL_TO": "10.0.2.2"})
+                rule = rule_of(argv)
+                self.assertIsNotNone(rule, "chromium was launched with no rule")
                 self.assertEqual(
-                    [a for a in (argv or []) if a.startswith("--host-resolver-rules")],
-                    ["--host-resolver-rules=MAP * fd00::2"])
+                    rewrite_host(rule, "127.0.0.1", 8000), ("127.0.0.1", 8000),
+                    "the warmup host is mapped away from the page server")
+                for host in ("localhost", "LocalHost", "::1"):
+                    self.assertEqual(
+                        rewrite_host(rule, host, 8000), (host, 8000),
+                        f"{host} is mapped away from the page server")
+                self.assertEqual(
+                    rewrite_host(rule, "example.com", 443), ("10.0.2.2", 443),
+                    "excluding the loopback also stopped the corpus mapping")
+
 
 
 if __name__ == "__main__":

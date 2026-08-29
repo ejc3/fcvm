@@ -132,8 +132,9 @@ if [ "${CB_SITE_ISOLATION:-on}" = "off" ]; then
     echo "chromium-bench: site isolation DISABLED (--disable-site-isolation-trials)"
 fi
 
-# BENCH_RESOLVE_ALL_TO=<ip> maps every hostname Chromium resolves to that IP:
-# one argv element, `--host-resolver-rules=MAP * <ip>`, assembled here. It is
+# BENCH_RESOLVE_ALL_TO=<ip> maps every hostname Chromium resolves to that IP,
+# except the loopback names the warmup uses: one argv element,
+# `--host-resolver-rules=EXCLUDE ... , MAP * <ip>`, assembled here. It is
 # the resolver-rule arm of the corpus A/B; the other arm resolves through the
 # guest's resolv.conf (reqbench.sh GUEST_DNS). The knob carries the IP alone
 # because the rule holds a space: the whole flag once travelled through
@@ -153,8 +154,16 @@ if [ -n "${BENCH_RESOLVE_ALL_TO:-}" ]; then
         echo "ERROR: BENCH_RESOLVE_ALL_TO must be one IP literal, got '$BENCH_RESOLVE_ALL_TO'" >&2
         exit 2
     fi
-    set -- "--host-resolver-rules=MAP * $BENCH_RESOLVE_ALL_TO"
-    echo "chromium-bench: every host resolves to $BENCH_RESOLVE_ALL_TO (--host-resolver-rules)"
+    # The loopback names stay off the map. This script navigates its own
+    # warmup page at http://127.0.0.1:$HTTP_PORT/warmup.html below, and
+    # Chromium applies the mapping before it resolves anything, so a bare
+    # `MAP *` sends that navigation to $BENCH_RESOLVE_ALL_TO:8000, where the
+    # campaign has nothing listening. render.py then fails, `set -e` exits,
+    # and the container never writes the ready marker the health gate waits
+    # for. net::HostMappingRules::RewriteHost checks every EXCLUDE before any
+    # MAP, so the order inside the string does not matter.
+    set -- "--host-resolver-rules=EXCLUDE localhost, EXCLUDE 127.0.0.1, EXCLUDE ::1, MAP * $BENCH_RESOLVE_ALL_TO"
+    echo "chromium-bench: every host except localhost/127.0.0.1/::1 resolves to $BENCH_RESOLVE_ALL_TO (--host-resolver-rules)"
 fi
 
 # --no-sandbox           : no user namespaces inside the guest container

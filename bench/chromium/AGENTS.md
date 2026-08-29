@@ -49,9 +49,14 @@ like a baked resolver: a run with a non-empty `guest_env` needs its
 `diag/summary.json` to be indexed. The
 resolver-rule A/B is the one use today:
 `make bench-chromium-request-golden TAG=cb-req-golden-resolve GUEST_ENV=BENCH_RESOLVE_ALL_TO=10.0.2.2`
-makes `entry.sh` launch Chromium with `--host-resolver-rules=MAP * 10.0.2.2`
+makes `entry.sh` launch Chromium with
+`--host-resolver-rules=EXCLUDE localhost, EXCLUDE 127.0.0.1, EXCLUDE ::1, MAP * 10.0.2.2`
 as one argv element (the knob is the IP alone because the rule holds a space,
 which the container env word-split when the whole flag was passed). The
+exclusions keep the container's own warmup page, which entry.sh navigates at
+`http://127.0.0.1:8000/warmup.html` before it writes the ready marker, off
+the map: Chromium maps before it resolves, so without them that navigation
+goes to `10.0.2.2:8000` and the container never becomes healthy. The
 entries change what the snapshot does, so such a golden needs its own `TAG=`.
 The host control takes the same variable directly:
 `make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
