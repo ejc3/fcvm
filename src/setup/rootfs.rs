@@ -2573,6 +2573,59 @@ fn path_to_str(path: &Path) -> Result<&str> {
 mod tests {
     use super::*;
 
+    /// Puts one process-global environment variable back the way it was.
+    ///
+    /// A test that mutates PATH or FCVM_FIRECRACKER_BIN and restores it on
+    /// its last line restores nothing when an assertion fires first, and a
+    /// test that removes a variable it did not record cannot put it back at
+    /// all. Both are the same bug: the restore has to be tied to the scope,
+    /// not to reaching the end of it.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        /// Record the current value, then set this one.
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::set_var(key, value);
+            guard
+        }
+
+        /// Record the current value, then unset the variable.
+        fn unset(key: &'static str) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::remove_var(key);
+            guard
+        }
+
+        /// Another value for the same variable, still restored by this guard.
+        fn set_to(&self, value: impl AsRef<std::ffi::OsStr>) {
+            std::env::set_var(self.key, value);
+        }
+
+        /// Unset the variable, still restored by this guard.
+        fn unset_now(&self) {
+            std::env::remove_var(self.key);
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn firecracker_commit_pins_deserialize_for_global_and_profile_configs() {
         let global: FirecrackerConfig = toml::from_str(
@@ -2646,12 +2699,14 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
         std::fs::write(&built, b"#!/bin/sh\nexit 0\n").expect("write stub");
 
         // An empty PATH removes whatever system-wide Firecracker this box may
-        // have, so the assertions below observe the profile arm.
-        let prev_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", "");
+        // have, so the assertions below observe the profile arm. Both
+        // variables are held by a guard: an assertion below fires before the
+        // end of the test, and the process must not be left with an empty
+        // PATH or without the FCVM_FIRECRACKER_BIN it was started with.
+        let _path = EnvVarGuard::set("PATH", "");
+        let firecracker_bin = EnvVarGuard::set("FCVM_FIRECRACKER_BIN", &real);
 
         // Set and existing: returned as-is, ahead of the profile's binary.
-        std::env::set_var("FCVM_FIRECRACKER_BIN", &real);
         assert_eq!(
             setup_vm_firecracker_bin_from(Some(built.clone())).unwrap(),
             real
@@ -2659,7 +2714,7 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
 
         // Set and missing: the error names the variable, so the reader knows
         // which knob is wrong instead of getting a bare ENOENT.
-        std::env::set_var("FCVM_FIRECRACKER_BIN", "/nonexistent/firecracker");
+        firecracker_bin.set_to("/nonexistent/firecracker");
         let err = setup_vm_firecracker_bin_from(Some(built.clone()))
             .unwrap_err()
             .to_string();
@@ -2670,7 +2725,7 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
 
         // Unset, a Firecracker built for the profile, nothing on PATH: the
         // built binary is used rather than the setup failing.
-        std::env::remove_var("FCVM_FIRECRACKER_BIN");
+        firecracker_bin.unset_now();
         assert_eq!(
             setup_vm_firecracker_bin_from(Some(built.clone()))
                 .expect("the Firecracker fcvm built must satisfy the setup VM"),
@@ -2684,8 +2739,48 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
             err.contains("FCVM_FIRECRACKER_BIN"),
             "error should name the override, got: {err}"
         );
+    }
 
-        std::env::set_var("PATH", prev_path);
+    /// The guard has to survive the case it exists for: an assertion that
+    /// fires while the variable is held at a test value.
+    ///
+    /// RED BEFORE THE FIX (the guard without its Drop): `PATH was left at the
+    /// test's value after a panic: left: Err(NotPresent), right: Ok("before")`
+    /// -- the guard recorded the previous value and never put it back, which
+    /// is what the hand-written save/restore in the test above did whenever an
+    /// assertion fired first.
+    #[test]
+    fn an_env_var_guard_restores_its_variable_through_a_panic() {
+        const KEY: &str = "FCVM_ENV_GUARD_PROBE";
+
+        // A variable that was set keeps its value.
+        std::env::set_var(KEY, "before");
+        let panicked = std::panic::catch_unwind(|| {
+            let guard = EnvVarGuard::set(KEY, "during");
+            assert_eq!(std::env::var(KEY).as_deref(), Ok("during"));
+            guard.unset_now();
+            panic!("the assertion this stands in for");
+        });
+        assert!(panicked.is_err(), "the probe did not panic");
+        assert_eq!(
+            std::env::var(KEY).as_deref(),
+            Ok("before"),
+            "PATH was left at the test's value after a panic"
+        );
+
+        // A variable that was not set stays unset.
+        std::env::remove_var(KEY);
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = EnvVarGuard::unset(KEY);
+            let _also = EnvVarGuard::set(KEY, "during");
+            panic!("the assertion this stands in for");
+        });
+        assert!(panicked.is_err(), "the probe did not panic");
+        assert_eq!(
+            std::env::var_os(KEY),
+            None,
+            "a variable the test invented outlived it"
+        );
     }
 
     /// A --config path that does not exist must fail, not quietly fall back to
