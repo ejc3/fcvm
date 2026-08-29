@@ -2700,9 +2700,9 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
 
         // An empty PATH removes whatever system-wide Firecracker this box may
         // have, so the assertions below observe the profile arm. Both
-        // variables are held by a guard: an assertion below fires before the
-        // end of the test, and the process must not be left with an empty
-        // PATH or without the FCVM_FIRECRACKER_BIN it was started with.
+        // variables are held by a guard: any assertion below can end the test
+        // early, and the process must not be left with an empty PATH or
+        // without the FCVM_FIRECRACKER_BIN it was started with.
         let _path = EnvVarGuard::set("PATH", "");
         let firecracker_bin = EnvVarGuard::set("FCVM_FIRECRACKER_BIN", &real);
 
