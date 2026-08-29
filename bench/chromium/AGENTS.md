@@ -132,6 +132,12 @@ and any IP-literal URL host; a run whose records name no address cannot hold
 a diag to anything and is refused), on WebKit it must be `null`,
 `limits.max_load_ms` must be a positive integer no larger than the run's
 `stall_gate.max_ms`, and every measured URL must have rendered `reps` times.
+An armed `DIAG_EXPECT_IPS` holds EVERY traced HTTP(S) request to an allowed
+address, not just one of them: a rep with an allowed main document and a
+subresource that failed, or that was still open when the 5 s post-load drain
+ended, used to pass on `addressed > 0`. The only exemption is a row the trace
+marks `from_cache` or `from_service_worker`, which had no network hop to name
+an address for.
 
 `verify`, `diag` and `run` deliberately have NO build dependency: reqbench.sh
 seals fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and

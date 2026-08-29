@@ -1787,6 +1787,7 @@ for i in range(0, len(pairs), 2):
         pending = 0
         foreign = {}
         unresolved = []
+        unaddressed = []
         addressed = 0
         for row in rows:
             if not isinstance(row, dict):
@@ -1797,6 +1798,13 @@ for i in range(0, len(pairs), 2):
                 remote_ips[ip] += 1
                 if expect_ips is not None and ip not in expect_ips:
                     foreign.setdefault(ip, []).append(row.get("url", ""))
+            elif str(row.get("url", "")).split(":", 1)[0].lower() in ("http", "https") \
+                    and not row.get("from_cache") and not row.get("from_service_worker"):
+                # No address and nothing that explains one: the request
+                # failed, or was still open when the post-load drain ended.
+                # Either way the trace does not say where it went, which is
+                # the question the expectation asks of every request.
+                unaddressed.append(row.get("url", ""))
             if row.get("failed"):
                 text = row.get("error_text") or "<no errorText>"
                 errors[text] += 1
@@ -1812,6 +1820,16 @@ for i in range(0, len(pairs), 2):
             # came from; an expectation nothing was held to is not met.
             violation("no_remote_ip",
                       f"none of the {len(rows)} traced request(s) names a remote address")
+        elif expect_ips is not None and unaddressed:
+            # `addressed > 0` cleared the whole rep on one request: an
+            # allowed main document plus a subresource that failed, or that
+            # was still open when the drain ended, met the expectation
+            # without either being held to it. A cache or service-worker hit
+            # names no address either and had no network hop to name one;
+            # the trace marks those rows and they are the only exemption.
+            violation("no_remote_ip",
+                      f"{len(unaddressed)} of {len(rows)} traced request(s) name no "
+                      f"remote address, first {unaddressed[0]}")
         if unresolved:
             violation("name_not_resolved",
                       f"{len(unresolved)} request(s) failed to resolve, first {unresolved[0]}")

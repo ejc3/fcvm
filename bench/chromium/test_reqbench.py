@@ -5110,6 +5110,20 @@ if error:
     rows.append({"request_id": "r4", "url": "https://cdn.example/x.js", "remote_ip": "",
                  "status": None, "failed": True, "pending_at_load": True,
                  "error_text": error})
+# STUB_UNADDRESSED=1: a request that never received a response, so the trace
+# names no address for it. STUB_CACHED=1: one the cache answered and one a
+# service worker answered, which carry no address either and say why.
+if os.environ.get("STUB_UNADDRESSED") == "1":
+    rows.append({"request_id": "r5", "url": url + "late.js", "remote_ip": "",
+                 "status": None, "failed": False, "pending_at_load": True,
+                 "error_text": "", "from_cache": False, "from_service_worker": False})
+if os.environ.get("STUB_CACHED") == "1":
+    rows.append({"request_id": "r6", "url": url + "logo.png", "remote_ip": "",
+                 "status": 200, "failed": False, "pending_at_load": False,
+                 "error_text": "", "from_cache": True, "from_service_worker": False})
+    rows.append({"request_id": "r7", "url": url + "sw.js", "remote_ip": "",
+                 "status": 200, "failed": False, "pending_at_load": False,
+                 "error_text": "", "from_cache": False, "from_service_worker": True})
 summary = {"n_requests": len(rows), "n_failed": sum(r["failed"] for r in rows),
            "n_pending_at_load": sum(r["pending_at_load"] for r in rows),
            "remote_ips": {ip: sum(1 for r in rows if r["remote_ip"] == ip)},
@@ -5326,12 +5340,64 @@ exec __PYTHON__ "$@"
             self.assertNotEqual(result.returncode, 0, result.stdout)
             summary = self._diag_summary(env)
             self.assertIs(summary["passed"], False)
+            # The failed row names no address either, and a request the diag
+            # cannot place is its own finding: both violations stand.
             self.assertEqual({v["kind"] for v in summary["violations"]},
-                             {"name_not_resolved"}, summary["violations"])
-            self.assertIn("cdn.example", summary["violations"][0]["detail"])
+                             {"name_not_resolved", "no_remote_ip"}, summary["violations"])
+            for kind in ("name_not_resolved", "no_remote_ip"):
+                detail = next(v["detail"] for v in summary["violations"]
+                              if v["kind"] == kind)
+                self.assertIn("cdn.example", detail)
             for data in summary["urls"].values():
                 self.assertEqual(data["errors"], {"net::ERR_NAME_NOT_RESOLVED": 2})
                 self.assertEqual(data["max_pending_at_load"], 3)
+
+    def test_a_traced_request_with_no_allowed_address_is_a_violation(self):
+        """DIAG_EXPECT_IPS passed on `addressed > 0`: one request with an
+        allowed address cleared the whole rep, however many others named no
+        address at all. A subresource that failed, or that was still open
+        when the 5 s post-load drain ended, is exactly the request the
+        expectation exists to judge, and it went unjudged. Every traced
+        HTTP(S) request must now name an allowed address.
+
+        A cache or service-worker hit names none either, and there was no
+        network hop for it to name: those rows say so in the trace
+        (test_net_trace.py) and are exempt. They are the only exemption; a
+        row with no address and no explanation is a request the diag cannot
+        say anything about.
+
+        RED BEFORE THE FIX: `AssertionError: 0 != 0 : a request that never
+        received a response passed DIAG_EXPECT_IPS` (exit 0, passed true, no
+        violations).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_UNADDRESSED="1")
+            result = self._diag(env)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a request that never received a response passed DIAG_EXPECT_IPS\n"
+                + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"no_remote_ip"},
+                             summary["violations"])
+            self.assertEqual(len(summary["violations"]), 2)
+            self.assertIn("late.js", summary["violations"][0]["detail"])
+        # A cache or service-worker hit is not a request that went anywhere.
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_CACHED="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"a cache hit failed the diag: {result.stdout}"
+                             f"\n{result.stderr[-2000:]}")
+            self.assertIs(self._diag_summary(env)["passed"], True)
+        # With no expectation armed there is nothing to hold a row to.
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, reps="1", expect_ips="", STUB_UNADDRESSED="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIs(self._diag_summary(env)["passed"], True)
 
     def test_a_load_event_over_the_limit_is_a_stall_and_no_limit_is_no_gate(self):
         with tempfile.TemporaryDirectory() as d:
