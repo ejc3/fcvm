@@ -750,6 +750,11 @@ say "replay server up: DNS -> 10.0.2.2, HTTPS 200"
 # error page, which is a perfectly plausible-looking fast number rather than an
 # error. Cheap: 14 local requests against a server already proven up.
 missing=""
+# Counted here rather than re-derived for the pass line below: a count taken
+# from the list a second time can disagree with the loop, and did. `printf
+# '%s'` writes no trailing newline, so the `wc -l` that reported this counted
+# the separators and every run announced 13 URLs for the 14 it had fetched.
+checked=0
 for url in $(printf '%s\n' "$URLS" | tr ',' ' '); do
     host=$(printf '%s' "$url" | sed -E 's#^https?://([^/]+).*#\1#')
     ucode=$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 10 \
@@ -758,6 +763,7 @@ for url in $(printf '%s\n' "$URLS" | tr ',' ' '); do
     200 | 30[1278]) ;;
     *) missing="$missing\n  $ucode  $url" ;;
     esac
+    checked=$((checked + 1))
 done
 if [ -n "$missing" ]; then
     # shellcheck disable=SC2059
@@ -765,7 +771,7 @@ if [ -n "$missing" ]; then
     echo "A partial corpus measures error pages as renders. Re-record the corpus." >&2
     exit 3
 fi
-say "corpus complete: all $(printf '%s' "$URLS" | tr ',' '\n' | wc -l) URLs replay locally"
+say "corpus complete: all $checked URLs replay locally"
 say "fcvm binary $FCVM_BIN sha256=$FCVM_SHA (recorded per run in cell.fcvm_sha256)"
 
 # --- golden ----------------------------------------------------------------

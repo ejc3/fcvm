@@ -275,6 +275,45 @@ class PartialCorpus(unittest.TestCase):
                          "this refused because nothing was reachable rather "
                          "than because the corpus is partial")
 
+    def test_the_pass_line_counts_every_url_it_probed(self):
+        """The line that reports the probe's result has to name the number of
+        URLs the probe actually checked.
+
+        `printf '%s'` writes no trailing newline, so `wc -l` counted the
+        separators rather than the fields and the campaign announced 13 URLs
+        for the 14 it had just fetched, in every run:
+
+            === corpus complete: all 13 URLs replay locally
+
+        Red: `'2' != '1' : the pass line reports 1 URLs after probing 2`.
+        """
+        block = re.search(r"(missing=\"\"\n.*?\nfi)\n", campaign(), re.S)
+        self.assertIsNotNone(block, "the corpus completeness probe is gone")
+        line = re.search(r'^say "corpus complete: .*$', campaign(), re.M)
+        self.assertIsNotNone(line, "the corpus completeness pass line is gone")
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.OnlyOne)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        probe = self.retarget(block.group(1), server.server_port)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as script:
+            script.write('set -u\nsay() { printf "%s\\n" "$*"; }\n'
+                         'URLS="http://x/served,http://x/served"\n'
+                         f'{probe}\n{line.group(0)}\n')
+            path = script.name
+        self.addCleanup(os.unlink, path)
+        result = subprocess.run(["bash", path], capture_output=True, text=True,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0,
+                         f"{result.stdout}{result.stderr}")
+        reported = re.search(r"corpus complete: all (\d+) URLs", result.stdout)
+        self.assertIsNotNone(reported, f"no pass line printed\n{result.stdout}")
+        self.assertEqual(reported.group(1), "2",
+                         f"the pass line reports {reported.group(1)} URLs "
+                         f"after probing 2")
+
     def test_a_complete_corpus_passes(self):
         """The guard must not refuse a corpus that IS complete."""
         block = re.search(r"(missing=\"\"\n.*?\nfi)\n", campaign(), re.S)
