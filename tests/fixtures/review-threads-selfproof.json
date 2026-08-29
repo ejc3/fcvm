@@ -47,6 +47,7 @@
           },
           "nodes": [
             {
+              "id": "PRRT_fixture_selfproof_0",
               "isResolved": true,
               "isOutdated": false,
               "comments": {
