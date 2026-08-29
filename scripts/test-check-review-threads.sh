@@ -1103,6 +1103,48 @@ edit_case "two identical thread reads still reach a verdict" 0 "CLEAR"
 COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS1=paged \
   edit_case "two identical paged thread reads still reach a verdict" 0 "CLEAR"
 
+echo "== finding 41: an acknowledgement is not a new obligation =="
+# A PR-level REVIEW body from the PR author was claimable like everyone else's, so the answer
+# this gate itself asks for ("Post a review on the PR OPENING with one of RED-VERIFIED: /
+# NOT-A-DEFECT: / DISAGREE:") became a NEW claim the moment it did not open with one of those
+# three words. Every round left one more unanswered body behind, and the count only grew:
+# #874 was carrying 4 of them and #872 5, all the author's own acks, drowning the bot findings
+# that genuinely had no answer. A review from the author is an answer to this PR, not a
+# finding against it, and the head-coverage rule already discounts the author for the same
+# reason. Everyone else's review body is claimable exactly as before, and the vocabulary is
+# unchanged: REVIEW-ACK is still not a disposition and still answers nothing, it merely stops
+# being a claim itself.
+AUTHOR_ACK='{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-05T00:00:00Z","body":"REVIEW-ACK: round 3, three findings closed in abc1234"}'
+BOT_CLAIM='{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"P1: this drops the last row"}'
+AUTHOR_DISP='{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"RED-VERIFIED: tests/row.rs"}'
+run_case "an author review body with no disposition does not block" \
+  "$(wrap '[]' "[$AUTHOR_ACK]")" 0 "CLEAR"
+run_case "an author ack posted after the last disposition does not re-block" \
+  "$(wrap '[]' "[$BOT_CLAIM,$AUTHOR_DISP,$AUTHOR_ACK]")" 0 "CLEAR"
+# Guards, green before and after: nobody else is exempt, an author disposition still answers
+# the claims that came before it, and the exemption belongs to the author's login, so it
+# cannot be worn by a review that names no author, nor by anyone at all on a payload that
+# names no author. (GitHub logins are unique across accounts, so no bot can hold the author's
+# login; what IS reachable is an empty or absent one, and matching "" against "" would exempt
+# every unattributed body on such a payload.)
+run_case "a non-author review body with no disposition still blocks" \
+  "$(wrap '[]' '[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-05T00:00:00Z","body":"REVIEW-ACK: round 3, three findings closed in abc1234"}]')" \
+  1 "carry no disposition"
+run_case "an author disposition still answers a claim dated before it" \
+  "$(wrap '[]' "[$BOT_CLAIM,$AUTHOR_DISP]")" 0 "CLEAR"
+run_case "a review naming no author is not the author's" \
+  "$(wrap '[]' '[{"author":null,"state":"COMMENTED","submittedAt":"2026-01-05T00:00:00Z","body":"P1: this drops the last row"}]')" \
+  1 "carry no disposition"
+run_case "a payload naming no author exempts nobody" \
+  "$(printf '{"data":{"repository":{"pullRequest":{"author":{"login":""},"headRefOid":"deadbeef","reviewThreads":{"nodes":[]},"reviews":{"nodes":[%s,{"author":null,"state":"COMMENTED","submittedAt":"2026-01-05T00:00:00Z","body":"P1: this drops the last row"}]}}}}}' "$COVER")" \
+  1 "carry no disposition"
+# And the author's TOP-LEVEL COMMENT stays claimable: that is where a self-reported defect
+# lands, and finding 17 pins it. Only the review body, which is the channel this gate names
+# for answering, is an answer by construction.
+run_case "the author's own top-level comment is still claimable" \
+  "$(wrap4 me '[]' '[]' "[$(cmt me User 2026-01-05T00:00:00Z '"P1: this drops records"')]")" \
+  1 "carry no disposition"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

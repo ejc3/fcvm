@@ -491,10 +491,22 @@ fi
 #
 #   - REVIEWS carry a state. GitHub's own APPROVED means "I am not asking for changes";
 #     that is a semantic fact, not a guess about the prose. COMMENTED and
-#     CHANGES_REQUESTED carry findings and need answers — from anyone, author included.
+#     CHANGES_REQUESTED carry findings and need answers — from anyone EXCEPT the PR author.
+#     A review body from the author is the answer this gate asks for two paragraphs below
+#     ("Post a review on the PR OPENING with one of ..."), so counting it as a claim made
+#     every acknowledgement create the obligation it was posted to discharge, and the count
+#     grew by one each round: #874 carried 4 such bodies and #872 5, all the author's own
+#     acks, burying the bot findings that really had no answer. The head-coverage rule
+#     discounts the author for the same reason. This does NOT re-admit REVIEW-ACK as a
+#     disposition: it answers nothing, it merely stops being a claim itself. And the
+#     exemption belongs to a LOGIN, which is unique across GitHub accounts, so nobody else
+#     can wear it; an empty or absent author matches nothing, because on a payload that
+#     names no author "" == "" would exempt every unattributed body on it.
 #   - TOP-LEVEL COMMENTS have no state, so everything counts unless it is on a short,
 #     documented ignore list: bot logins that only ever post notifications, and the
-#     literal trigger phrases this skill tells you to post. An unknown bot counts.
+#     literal trigger phrases this skill tells you to post. An unknown bot counts, and so
+#     does the AUTHOR: a comment is where a self-reported defect lands, and a review is
+#     where an answer does. That asymmetry is the whole rule.
 #
 # Add to IGNORED_COMMENT_AUTHORS deliberately, and never a bot that reviews.
 IGNORED_COMMENT_AUTHORS=${IGNORED_COMMENT_AUTHORS:-vercel,vercel[bot],dependabot,dependabot[bot],github-actions,github-actions[bot],codecov,codecov[bot]}
@@ -711,11 +723,12 @@ fi
 # The coverage check below asks only whether some row names the head and postdates its
 # arrival, so a comment carrying several results is judged row by row.
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
-   --arg codex "$CODEX_LOGIN" \
+   --arg codex "$CODEX_LOGIN" --arg me "$prauthor" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
   | ($bots | split(",")) as $botlogins
   | (.[0] | map({author, state, body, at: .submittedAt,
-                 claimable: ((.state // "COMMENTED") != "APPROVED")}))
+                 claimable: (((.state // "COMMENTED") != "APPROVED")
+                             and (($me == "") or ((.author.login // "") != $me)))}))
   + (.[1] | map(. as $c
       | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))) as $listed
       | ($listed and ($c.body | is_verdict)) as $v

@@ -168,8 +168,9 @@ branch logged 0 times across 137 runs, a `grep '^ *FAIL'` blind to nextest's `TR
 Every one of them was green for its whole life.
 
 Enforcement: `scripts/check-review-threads.sh <pr>` fails while any review thread is
-unresolved, and while any finding — inline OR in a PR-level review body — carries no
-disposition. One vocabulary for both:
+unresolved, and while any finding carries no disposition, whether it arrived inline, in a
+PR-level review body from anyone but the PR author, or in a top-level PR comment. One
+vocabulary for all of them:
 
 A head that no reviewer has anything to say about is still reviewed: the gate counts a
 listed review bot's (`VERDICT_BOTS`) no-findings result as coverage of the head when the
@@ -212,9 +213,17 @@ Three rules the gate enforces, each of them a hole it once had:
   or a plain top-level PR comment (`gh pr comment`). The last of those was invisible to the
   gate for a while, which meant a claim posted exactly the way the docs suggested could sit
   on a PR reporting CLEAR.
-- **But not everything is a claim.** The PR author's own words, and a bot's top-level
-  notification, are not findings. Treating every non-empty body as one blocked PRs that had
-  no findings at all — including on `@codex review`, the command the docs tell you to post.
+- **But not everything is a claim.** An APPROVED review is GitHub saying the reviewer is
+  not asking for changes. A listed notification bot's comment is not a finding, nor is a
+  documented trigger command (`@codex review`, `@coderabbitai review`). Nor is a REVIEW BODY
+  FROM THE PR AUTHOR: a review is the channel this gate names for answering, so counting the
+  author's own review as a claim made every acknowledgement create the obligation it was
+  posted to discharge, and the count grew by one each round (#874 was carrying 4 such bodies,
+  #872 five). The author's TOP-LEVEL COMMENT is still a claim, because that is where a
+  self-reported defect lands. None of this re-admits `REVIEW-ACK:` as a disposition; it
+  answers nothing, it has simply stopped being a question. Treating every non-empty body as a
+  finding blocked PRs that had none at all, `@codex review` included, which is the command
+  the docs tell you to post.
 - **The head commit must have been reviewed.** Answering every finding proves nothing if
   nobody reviewed the code you are merging. This gate shipped with five open findings that
   way: the branch was pushed, the prior round was answered, the gate went CLEAR, and it

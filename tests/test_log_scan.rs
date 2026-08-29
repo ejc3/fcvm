@@ -758,6 +758,79 @@ fn malformed_thread_data_blocks_instead_of_clearing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The answer this gate asks for must not become a new question.
+///
+/// A PR-level review body from the PR author was claimable like anyone else's, so the review
+/// the gate tells you to post ("Post a review on the PR OPENING with one of RED-VERIFIED: /
+/// NOT-A-DEFECT: / DISAGREE:") became a fresh unanswered claim whenever it opened with
+/// anything else, and the count grew by one every round: #874 carried 4 such bodies and #872
+/// 5, all the author's own acks, burying the bot findings that really had no answer. A review
+/// from the author is an answer to this PR, not a finding against it, and the head-coverage
+/// rule already discounts the author for the same reason. Everyone else stays claimable, and
+/// the three-token vocabulary is unchanged: REVIEW-ACK answers nothing, it just stops being a
+/// claim itself.
+///
+/// The shell harness (scripts/test-check-review-threads.sh, "finding 41") carries the full
+/// matrix, including the author's top-level COMMENT staying claimable; this one runs in CI.
+#[test]
+fn an_authors_review_body_is_an_answer_not_a_new_claim() {
+    require_jq();
+    let payload = |ack_author: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{
+        "author":{{"login":"me"}},
+        "headRefOid":"deadbeef",
+        "commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z",
+          "checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},
+        "reviewThreads":{{"nodes":[]}},
+        "comments":{{"nodes":[]}},
+        "reviews":{{"nodes":[
+          {{"author":{{"login":"reviewer"}},"state":"APPROVED","submittedAt":"2026-01-02T01:00:00Z",
+           "body":"","commit":{{"oid":"deadbeef"}}}},
+          {{"author":{{"login":"{ack_author}"}},"state":"COMMENTED",
+           "submittedAt":"2026-01-03T00:00:00Z",
+           "body":"REVIEW-ACK: round 3, three findings closed in abc1234"}}]}}
+      }}}}}}}}"#
+        )
+    };
+
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-ack-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |name: &str, body: String| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        let out = Command::new("bash")
+            .arg(repo_root().join("scripts/check-review-threads.sh"))
+            .arg("--from-file")
+            .arg(&f)
+            .output()
+            .expect("check-review-threads.sh must be runnable");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.code().unwrap_or(-1))
+    };
+
+    let (out, code) = run("author-ack.json", payload("me"));
+    assert_eq!(
+        code, 0,
+        "the PR author's own review body is an answer, not a claim. Counting it as one \
+         makes every acknowledgement create the obligation it was posted to discharge.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
+
+    let (out, code) = run("stranger-ack.json", payload("reviewer"));
+    assert_eq!(
+        code, 1,
+        "the same body from anyone else is a PR-level statement that still needs one of \
+         RED-VERIFIED / NOT-A-DEFECT / DISAGREE.\n{out}"
+    );
+    assert!(out.contains("carry no disposition"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A timestamp comparison must be between INSTANTS, not between strings.
 ///
 /// The gate's timestamps do not all arrive in one shape. Check-suite and comment
