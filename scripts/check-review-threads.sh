@@ -19,8 +19,9 @@
 # handled. `isResolved` is the only field that means resolved.
 #
 # Usage:
-#   check-review-threads.sh <pr-number>          # query GitHub
-#   check-review-threads.sh --from-file <json>   # parse a saved response (tests)
+#   check-review-threads.sh <pr-number>            # query GitHub
+#   check-review-threads.sh --from-file <json>     # parse a saved response (tests)
+#   check-review-threads.sh --dump-payload <pr>    # print that response, for fixtures
 set -uo pipefail
 
 # A GATE MUST FAIL CLOSED. Without this check the script degraded silently when `jq`
@@ -50,6 +51,35 @@ COMMENTS_PAGE_SIZE=${COMMENTS_PAGE_SIZE:-100}
 # instead of one with 100+ submitted reviews.
 REVIEWS_PAGE_SIZE=${REVIEWS_PAGE_SIZE:-100}
 
+# Ordering timestamps. GitHub does not return them all in one shape: check-suite and
+# comment timestamps are whole-second ("2026-01-02T00:30:00Z"), while the datetime Codex
+# writes into a review-summary row carries a fraction ("2026-01-02T00:30:00.123456Z").
+# Compared as strings, "." sorts before "Z", so a result recorded in the SAME SECOND as the
+# head check suite reads as earlier than the head arrived, and the head stays uncovered for
+# as long as that result is its only coverage. String order also ranks values that are not
+# timestamps at all: "a while ago" sorts after every digit, so an unparsable date postdated
+# everything and granted coverage.
+#
+# `ts` parses an ISO-8601 instant to epoch seconds, with the fraction optional and the zone
+# either Z or a +HH:MM offset, and yields null for anything else. Every comparison below is
+# between parsed instants. A null orders against nothing: it grants no coverage and answers
+# no claim, and where the field is one the gate validates, the gate says so and exits 2.
+TS_JQ='def ts:
+  if type != "string" then null
+  else (capture("^(?<y>[0-9]{4})-(?<mo>[0-9]{2})-(?<d>[0-9]{2})[Tt](?<h>[0-9]{2}):(?<mi>[0-9]{2}):(?<s>[0-9]{2})(\\.(?<frac>[0-9]+))?([Zz]|(?<zsign>[+-])(?<zh>[0-9]{2}):?(?<zm>[0-9]{2}))$") // null) as $c
+  | if $c == null then null
+    else ($c.mo | tonumber) as $mo | ($c.d | tonumber) as $dd
+       | ($c.h | tonumber) as $hh | ($c.mi | tonumber) as $mm | ($c.s | tonumber) as $ss
+       | (($c.zh // "0") | tonumber) as $zh | (($c.zm // "0") | tonumber) as $zm
+       | if $mo < 1 or $mo > 12 or $dd < 1 or $dd > 31 or $hh > 23 or $mm > 59 or $ss > 60
+            or $zh > 23 or $zm > 59 then null
+         else ([($c.y | tonumber), $mo - 1, $dd, $hh, $mm, $ss, 0, 0] | mktime)
+              + (if $c.frac then ("0." + $c.frac | tonumber) else 0 end)
+              - (if $c.zsign == "-" then -1 else 1 end) * ($zh * 3600 + $zm)
+         end
+    end
+  end;'
+
 fetch_payload() {
   local pr=$1 cursor=null threads='[]' reviews='[]' prcomments='[]' prauthor='' headoid=''
 
@@ -66,6 +96,7 @@ fetch_payload() {
           pullRequest(number: $pr) {
             author { login }
             headRefOid
+            commits(last: 1) { nodes { commit { committedDate checkSuites(first: 10) { nodes { createdAt } } } } }
             reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
               pageInfo { hasNextPage endCursor }
               nodes { author { login } state body submittedAt commit { oid } }
@@ -79,6 +110,8 @@ fetch_payload() {
           <(echo "$reviews") <(echo "$rresp"))
     prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$rresp")
     headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$rresp")
+    headdate=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.committedDate // ""' <<<"$rresp")
+    headsuites=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes // []' <<<"$rresp")
     [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
     rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
   done
@@ -95,7 +128,7 @@ fetch_payload() {
           pullRequest(number: $pr) {
             comments(first: $REVIEWS_PAGE_SIZE$cafter) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login __typename } body createdAt }
+              nodes { author { login __typename } body createdAt updatedAt }
             } } } }" 2>/dev/null) || return 1
     prcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
           <(echo "$prcomments") <(echo "$cresp2"))
@@ -185,6 +218,30 @@ fetch_payload() {
       'map(if .id == $id then .comments.nodes = $c[0] else . end)' <<<"$threads")
   done
 
+  # Re-read the COMMENTS after all paging, for the same reason the head is re-read below —
+  # and it is not the same check. Two of the three coverage signals live in comments that
+  # their bot EDITS IN PLACE: CodeRabbit's walkthrough and Codex's review summary. Both were
+  # captured at the start of a run that then spent minutes paging threads, and both can go
+  # from a clean result to a failed, rate-limited or in-progress one without the head moving
+  # an inch. The head recheck cannot see that. This second read is compared against the
+  # first below, and any difference blocks: the gate would otherwise grant coverage from a
+  # comment that no longer says what it said when it was read.
+  local rc2cursor=null rc2after="" rc2resp recheckcomments='[]'
+  while :; do
+    [ "$rc2cursor" != "null" ] && rc2after=", after: \"$rc2cursor\""
+    rc2resp=$(gh api graphql -f query="
+      { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $pr) {
+            comments(first: $REVIEWS_PAGE_SIZE$rc2after) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login __typename } body createdAt updatedAt }
+            } } } }" 2>/dev/null) || return 1
+    recheckcomments=$(jq -s '.[0] + (.[1].data.repository.pullRequest.comments.nodes // [])' \
+          <(echo "$recheckcomments") <(echo "$rc2resp"))
+    [ "$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage' <<<"$rc2resp")" = "true" ] || break
+    rc2cursor=$(jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor' <<<"$rc2resp")
+  done
+
   # Re-read the head AFTER all paging. A push landing mid-evaluation would otherwise leave
   # $headoid describing the commit captured by the first query, and the coverage check
   # would happily certify a SHA the PR no longer points at.
@@ -207,11 +264,23 @@ fetch_payload() {
   jq -n --slurpfile t <(printf '%s' "$threads") \
         --slurpfile r <(printf '%s' "$reviews") \
         --slurpfile c <(printf '%s' "$prcomments") \
-        --arg a "$prauthor" --arg h "$headoid" \
+        --slurpfile rc <(printf '%s' "$recheckcomments") \
+        --arg a "$prauthor" --arg h "$headoid" --arg d "$headdate" --argjson cs "${headsuites:-[]}" \
      '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
+                                      commits:{nodes:[{commit:{committedDate:$d, checkSuites:{nodes:$cs}}}]},
                                       reviewThreads:{nodes:$t[0]}, reviews:{nodes:$r[0]},
-                                      comments:{nodes:$c[0]}}}}}'
+                                      comments:{nodes:$c[0]},
+                                      recheck:{comments:{nodes:$rc[0]}}}}}}'
 }
+
+# A fixture must be the payload the gate actually consumes, not a hand-written guess at
+# it. One already drifted: it carried two comments per thread while the query asked for
+# `comments(first: 1)`, so a test passed against data the code could never return. Dumping
+# from fetch_payload keeps the fixtures and the query the same thing by construction.
+if [ "${1:-}" = "--dump-payload" ]; then
+  fetch_payload "${2:?usage: check-review-threads.sh --dump-payload <pr-number>}" || exit 2
+  exit 0
+fi
 
 if [ "${1:-}" = "--from-file" ]; then
   payload=$(cat "${2:?need a json file}")
@@ -257,20 +326,29 @@ if ! jq -e 'all(((.body // "") | type) == "string")' >/dev/null 2>&1 <<<"$review
   echo "verdict: BLOCKED — a review body is not text; refusing to judge it." >&2
   exit 2
 fi
-if ! jq -e 'all(((.body // "") | test("[^[:space:]]") | not) or ((.submittedAt | type) == "string"))' \
+if ! jq -e "$TS_JQ"'all(((.body // "") | test("[^[:space:]]") | not) or ((.submittedAt | ts) != null))' \
      >/dev/null 2>&1 <<<"$reviews"; then
-  echo "verdict: BLOCKED — a non-empty review body has no submittedAt timestamp, so this" >&2
-  echo "gate cannot tell whether the answer came before or after the claim." >&2
+  echo "verdict: BLOCKED — a non-empty review body has no parsable submittedAt timestamp, so" >&2
+  echo "this gate cannot tell whether the answer came before or after the claim." >&2
   exit 2
 fi
 if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$prcomments"; then
   echo "verdict: BLOCKED — top-level PR comment data is not an array." >&2
   exit 2
 fi
-if ! jq -e 'all(((.body // "") | type) == "string"
-                and (((.body // "") | test("[^[:space:]]") | not) or ((.createdAt | type) == "string")))' \
+if ! jq -e "$TS_JQ"'all(((.body // "") | type) == "string"
+                and (((.body // "") | test("[^[:space:]]") | not) or ((.createdAt | ts) != null)))' \
      >/dev/null 2>&1 <<<"$prcomments"; then
-  echo "verdict: BLOCKED — a top-level PR comment has a non-text body or no createdAt." >&2
+  echo "verdict: BLOCKED — a top-level PR comment has a non-text body or no parsable createdAt." >&2
+  exit 2
+fi
+# The coverage check below certifies that the HEAD was reviewed, so a payload that names
+# no head is one it cannot judge. This used to skip the check instead, which made "no
+# head" and "no reviews" both read as CLEAR: nothing to answer is not nothing reviewed.
+headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$payload" 2>/dev/null)
+if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -z "$headoid" ]; then
+  echo "verdict: BLOCKED — the payload names no head commit, so this gate cannot tell" >&2
+  echo "whether the code being merged was reviewed. Re-run, or re-capture the fixture." >&2
   exit 2
 fi
 
@@ -303,20 +381,200 @@ fi
 #
 # Add to IGNORED_COMMENT_AUTHORS deliberately, and never a bot that reviews.
 IGNORED_COMMENT_AUTHORS=${IGNORED_COMMENT_AUTHORS:-vercel,vercel[bot],dependabot,dependabot[bot],github-actions,github-actions[bot],codecov,codecov[bot]}
-# Comments that are ONLY a trigger, e.g. "@codex review". Anchored and whole-body: a
-# finding that merely mentions @codex still counts.
-TRIGGER_RE='\A[[:space:]]*@[A-Za-z0-9_-]+([[:space:]]+[A-Za-z-]+)?[[:space:]]*\z'
+# Comments that are ONLY a documented bot command: "@codex review", "@codex security
+# review", or "@coderabbitai" followed by one of review, full review, resume, pause,
+# ignore, resolve, summary, help, configuration. The handles are the mention names of the
+# bots in VERDICT_BOTS and the commands are the ones each bot documents (Codex in its
+# About block, CodeRabbit in its command reference). Case-insensitive, because GitHub
+# logins are. Any other comment that opens with a mention is a finding and stays
+# claimable: "@me drops records" and "@codex drops records" both need a disposition. An
+# earlier version exempted any mention plus up to two words, which exempted exactly those.
+TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coderabbitai[[:space:]]+(full[[:space:]]+review|review|resume|pause|ignore|resolve|summary|help|configuration))[[:space:]]*\z'
+# A reviewer with nothing to say posts no review object. Codex answers with a plain
+# comment: "Codex Review: Didn't find any major issues." plus one of a few short
+# sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
+# block. A CodeRabbit review that produces no comments replies "Full review finished."
+# (or "Review finished." for an incremental one) folded under "Action performed". Those
+# are verdicts, not findings: they need no disposition. Codex's also covers the commit it
+# names; CodeRabbit's names nothing, and its coverage comes from the walkthrough comment
+# instead (walkthrough_sha below, and the coverage check for how a result is bound to
+# the head).
+#
+# walkthrough_sha is the last commit of a review that RAN CLEAN, or "". CodeRabbit edits
+# one walkthrough comment in place, and its recent-review block names the range it
+# reviewed after a failed review too: on #853 and #792 the range ended at the head under
+# a "Review failed" caution, with no review object on the head, and the range alone read
+# as coverage. So three things must hold, each failing closed: the block says "No
+# actionable comments were generated" (CodeRabbit adds that line only after a review that
+# finished with nothing to post); the summarize marker is the comment's ONLY
+# auto-generated-comment marker (the failure, rate-limit, skip, pause and in-progress
+# notices each add their own, and so would a notice this script has never seen); and the
+# comment carries no blockquoted heading, which is how every notice renders its title
+# (Review failed / skipped / limit reached, Reviews paused). A rate-limit or pause notice
+# beside a clean block at the head (#869) also declines: the comment is in a mixed state
+# from two runs, and which run wrote which block is not something this gate can read.
+#
+# Codex's SECOND no-findings shape, and since 2026-08-28 the only one it has posted here:
+# one comment per PR carrying "<!-- codex-pull-request-review-summary -->", opened when a
+# review STARTS and edited in place as reviews finish. Its table holds one row per review:
+#   | Code Review | Completed <relative-time datetime="..."> | `9ebed54` | Manual request |
+# The comment is a notice, never a finding. A row covers the head when it says Completed,
+# names a prefix of the head, and its own datetime postdates the head's arrival. Neither
+# timestamp on the comment can date a row: createdAt is written before any result exists
+# (on #867, created 22:11:32Z for a review it reported at 22:15:13Z), and updatedAt only
+# says when the last of them was published.
+#
+# summary_rows returns the {sha, at} of every row, or [] for the whole comment when
+# anything in the table is not a finished review: a row still in progress, a status this
+# gate has never seen, a row it cannot split into the table's four cells. A table holding a
+# review that is still running is a review that has not finished, whatever sits beside it.
+# A Completed row whose commit or datetime will not parse names nothing and binds nothing.
+#
+# The verdict must be the WHOLE comment. After dropping HTML comments, blank lines, the
+# About Codex block and the one blockquote line CodeRabbit's incremental reply carries
+# (matched whole; it is the only blockquote line that bot's replies on this repo have
+# ever contained), the remaining lines must be exactly one of the shapes below; anything
+# else is a finding and stays claimable. Dropping every line that starts with ">" was a
+# hole: a bot quoting its finding, "> P1: this drops records", had posted a verdict. The
+# Codex sign-off is matched against the list of ones Codex has posted on this repo, because
+# an open-ended tail would accept "Didn't find any major issues. P1: drops data" as a
+# verdict. An unlisted sign-off is not a verdict, so the gate blocks until someone reads
+# the comment, which is the right direction; extend the list when Codex says something
+# new. Only the About Codex block is stripped, and only under that exact summary text:
+# a details block with any other summary is where a bot folds its findings.
+VERDICT_JQ='def cr_note: "> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.";
+def verdict_lines:
+  ((. // "") | gsub("<!--(.|\n)*?-->"; "")
+    | gsub("<details> <summary>ℹ️ About Codex in GitHub</summary>(.|\n)*?</details>"; "")
+    | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+    | map(select(length > 0 and . != cr_note)));
+def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| 👍)?$";
+def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
+def is_verdict:
+  verdict_lines as $l
+  | ($l == ["<details>", "<summary>✅ Action performed</summary>", "Full review finished.", "</details>"])
+    or ($l == ["<details>", "<summary>✅ Action performed</summary>", "Review finished.", "</details>"])
+    or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)));
+def verdict_sha:
+  verdict_lines as $l
+  | if ($l | length) == 2 and ($l[1] | test(reviewed_re)) then ($l[1] | capture(reviewed_re) | .sha) else "" end;
+def codex_summary_marker: "<!-- codex-pull-request-review-summary -->";
+def is_codex_summary: ((. // "") | contains(codex_summary_marker));
+def summary_cells:
+  split("|") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+  | (if (.[0] // "") == "" then .[1:] else . end)
+  | (if (.[-1] // "") == "" then .[:-1] else . end);
+def summary_rows:
+  [ (. // "") | split("\n")[] | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+    | select(startswith("|")) | summary_cells ]
+  | map(select((((.[0] // "") == "Review") and ((.[1] // "") == "Status")) | not))
+  | map(select(((length > 0) and all(.[]; test("^:?-{3,}:?$"))) | not))
+  | . as $rows
+  | if ($rows | length) == 0 then []
+    elif ($rows | any(length != 4)) then []
+    elif ($rows | any((([.[1] | capture("\\*\\*(?<s>[^*]+)\\*\\*").s] | first) // "")
+                      | gsub("^[[:space:]]+|[[:space:]]+$"; "") | . != "Completed")) then []
+    else [ $rows[]
+           | { sha: (([.[2] | capture("^`(?<x>[0-9a-f]{7,40})`$").x] | first) // ""),
+               at: (([.[1] | capture("datetime=\"(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z)\"").d] | first) // "") } ]
+    end;
+def cr_range_re: "Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and (?<sha>[0-9a-f]{40})\\.";
+def cr_marker_re: "<!-- This is an auto-generated comment: [^>]*-->";
+def cr_summarize_marker: "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->";
+def walkthrough_sha:
+  ([ (. // "")
+     | select([scan(cr_marker_re)] == [cr_summarize_marker])
+     | select(test("(?m)^>[[:space:]]*##") | not)
+     | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r
+     | select(test("No actionable comments were generated in the recent review"))
+     | capture(cr_range_re) | .sha ] | first) // "";'
+# Only these bots issue verdicts, and only from the account GitHub types as a Bot.
+# Anyone else posting the same words has written an ordinary comment: claimable like
+# any other, never coverage. Entries are logins; their mention handles (@codex,
+# @coderabbitai) are the ones TRIGGER_RE accepts.
+VERDICT_BOTS=${VERDICT_BOTS:-chatgpt-codex-connector,coderabbitai}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
-bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" \
-   '($ignore | split(",")) as $skip
+#
+# Each top-level comment also records `reviewed_rows`: every {sha, at} pair by which a
+# listed bot says it reviewed a commit, and when it said so. There are three sources, and
+# each dates itself differently, which is the whole difficulty:
+#   - Codex's legacy verdict names one commit and is posted once, so its createdAt is the
+#     time of the result.
+#   - Codex's review-summary comment names one commit per table row and is edited in place,
+#     so only a row's own datetime dates that row.
+#   - CodeRabbit's walkthrough names the range it reviewed and is edited in place, so its
+#     updatedAt is the time of the result.
+# The coverage check below asks only whether some row names the head and postdates its
+# arrival, so a comment carrying several results is judged row by row.
+bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
+   "$VERDICT_JQ"'($ignore | split(",")) as $skip
+  | ($bots | split(",")) as $botlogins
   | (.[0] | map({author, state, body, at: .submittedAt,
                  claimable: ((.state // "COMMENTED") != "APPROVED")}))
-  + (.[1] | map({author, state: "COMMENT", body, at: .createdAt,
-                 claimable: ((.author.login | IN($skip[]) | not)
-                             and ((.body // "") | test($trig) | not))}))' \
+  + (.[1] | map(. as $c
+      | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))) as $listed
+      | ($listed and ($c.body | is_verdict)) as $v
+      | ($listed and ($c.body | is_codex_summary)) as $sum
+      | {author, state: "COMMENT", body, at: .createdAt,
+         verdict: ($v or $sum),
+         reviewed_rows: ((if $v then [{sha: ($c.body | verdict_sha), at: .createdAt}]
+                          elif $sum then ($c.body | summary_rows)
+                          elif $listed then [{sha: ($c.body | walkthrough_sha), at: (.updatedAt // "")}]
+                          else [] end)
+                         | map(select((.sha // "") != "" and (.at // "") != ""))),
+         claimable: ((.author.login | IN($skip[]) | not)
+                     and ((.body // "") | test($trig; "i") | not)
+                     and (($v or $sum) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
+
+# A coverage-bearing comment must still say, at the END of the run, what it said at the
+# start. `bodies` above was built from the FIRST read of the comments; the walkthrough and
+# the review summary are edited in place by their bots, so a clean result captured at
+# 22:11 can be a "Review failed" notice by 22:15 with the head never moving. Comparing the
+# two reads is the only way to notice, and the gate must block rather than certify a head
+# from a comment it can no longer quote. Every path compares, including --from-file: the
+# payload carries the second read under `recheck`, which is what fetch_payload fills, so a
+# fixture exercises the same code the live run does.
+#
+# The sort_by here is the one place a timestamp is not parsed, deliberately: it puts the two
+# fingerprints in one canonical order so they can be compared for EQUALITY, and never decides
+# which of two instants came first. A timestamp that differs between the reads, in value or in
+# shape, makes the fingerprints differ, which blocks.
+COVERAGE_FP_JQ="$VERDICT_JQ"'($bots | split(",")) as $botlogins
+  | [ .[] | select(((.author.__typename // "") == "Bot") and (.author.login | IN($botlogins[])))
+          | select(((.body // "") | is_verdict) or ((.body // "") | is_codex_summary)
+                   or ((.body // "") | contains(cr_summarize_marker)))
+          | {login: .author.login, createdAt: (.createdAt // ""),
+             updatedAt: (.updatedAt // ""), body: (.body // "")} ]
+  | sort_by([.createdAt, .login, .body])'
+capturedfp=$(jq -c --arg bots "$VERDICT_BOTS" "$COVERAGE_FP_JQ" <<<"$prcomments") || {
+  echo "verdict: BLOCKED — could not read the coverage-bearing comments." >&2; exit 2; }
+if [ "$capturedfp" != "[]" ]; then
+  recheckcomments=$(jq -c '.data.repository.pullRequest.recheck.comments.nodes // "absent"' \
+    <<<"$payload" 2>/dev/null)
+  if [ "$recheckcomments" = '"absent"' ] || [ -z "$recheckcomments" ]; then
+    echo "verdict: BLOCKED — this PR carries a comment that can grant head coverage, and the" >&2
+    echo "payload has no second read of it to compare against. Those comments are edited in" >&2
+    echo "place, so one read cannot show what they said when the run ended. Re-run the gate," >&2
+    echo "or regenerate the fixture with --dump-payload." >&2
+    exit 2
+  fi
+  if ! jq -e 'type == "array" and all(((.body // "") | type) == "string")' \
+       >/dev/null 2>&1 <<<"$recheckcomments"; then
+    echo "verdict: BLOCKED — the second read of the PR comments is not an array of comments." >&2
+    exit 2
+  fi
+  recheckfp=$(jq -c --arg bots "$VERDICT_BOTS" "$COVERAGE_FP_JQ" <<<"$recheckcomments") || {
+    echo "verdict: BLOCKED — could not read the re-fetched coverage-bearing comments." >&2; exit 2; }
+  if [ "$capturedfp" != "$recheckfp" ]; then
+    echo "verdict: BLOCKED — a comment that can grant head coverage changed under us while" >&2
+    echo "this gate was reading the PR. Whatever it says now, the reading below was taken" >&2
+    echo "from what it said before. Re-run against a PR that is holding still." >&2
+    exit 2
+  fi
+fi
 
 # Observability seam for the probe. Paging is about what was FETCHED, and the verdict is a
 # poor proxy for that — the probe authors everything it posts, and the author-exclusion rule
@@ -413,27 +671,30 @@ fi
 # And an answer only answers what came BEFORE it. Counting dispositions in aggregate ("any
 # disposition exists => nothing outstanding") meant a finding posted after an earlier round
 # was closed was silently treated as answered. Each claim needs a disposition NEWER than
-# itself; ISO-8601 timestamps compare lexicographically, and the validation above
-# guarantees every non-empty body has one.
-unanswered=$(jq -r --arg re "$disposition_re" '
-  [ .[] | select((.body // "") | test($re)) | .at ] as $answers
+# itself, compared as instants (`ts`): as strings, an answer posted 0.1s BEFORE a claim in
+# the same second sorted after it, because "Z" sorts after ".". An answer whose timestamp
+# will not parse is dropped, and a claim whose timestamp will not parse cannot be shown to
+# have been answered, so it stays outstanding; the validation above blocks both shapes
+# first, and this keeps the comparison itself fail-closed rather than resting on that.
+unanswered=$(jq -r --arg re "$disposition_re" "$TS_JQ"'
+  [ .[] | select((.body // "") | test($re)) | (.at | ts) | select(. != null) ] as $answers
   | [ .[] | select(.claimable)
           | select((.body // "") | test("[^[:space:]]"))
           | select(((.body // "") | test($re)) | not)
-          | . as $claim
-          | select([ $answers[] | select(. > $claim.at) ] | length == 0) ]
+          | (.at | ts) as $cat
+          | select($cat == null or ([ $answers[] | select(. > $cat) ] | length == 0)) ]
   | length' <<<"$bodies") || {
   echo "verdict: BLOCKED — could not evaluate PR-level bodies." >&2; exit 2; }
 
 if [ "${unanswered:-0}" -gt 0 ]; then
   echo
-  jq -r --arg re "$disposition_re" '
-    [ .[] | select((.body // "") | test($re)) | .at ] as $answers
+  jq -r --arg re "$disposition_re" "$TS_JQ"'
+    [ .[] | select((.body // "") | test($re)) | (.at | ts) | select(. != null) ] as $answers
     | .[] | select(.claimable)
     | select((.body // "") | test("[^[:space:]]"))
     | select(((.body // "") | test($re)) | not)
-    | . as $claim
-    | select([ $answers[] | select(. > $claim.at) ] | length == 0)
+    | (.at | ts) as $cat
+    | select($cat == null or ([ $answers[] | select(. > $cat) ] | length == 0))
     | "  UNANSWERED \(.author.login) (\(.state))\n    \(.body | split("\n")[0][0:150])"' <<<"$bodies"
   echo
   echo "verdict: BLOCKED — $unanswered PR-level review body/bodies carry no disposition."
@@ -449,11 +710,13 @@ fi
 # later — while the reviewer was still working. Its findings arrived five minutes after the
 # squash. Nothing was bypassed; the gate simply had no notion of review COVERAGE.
 #
-# Skipped when REQUIRE_REVIEWED_HEAD=0, and when no review has ever been submitted (a PR
-# nobody has reviewed at all is a different conversation, and the required-checks ruleset
-# is the right place for that policy).
-headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$payload" 2>/dev/null)
-if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
+# Skipped only when REQUIRE_REVIEWED_HEAD=0. It used to skip as well when no review
+# object had ever been submitted, on the theory that a PR nobody has reviewed is the
+# required-checks ruleset's business. That was the fail-open: a no-findings verdict
+# leaves no review object, so a PR whose only review ever was a clean Codex pass on an
+# OLDER commit had no review objects at all, and after a push it went CLEAR with nothing
+# reviewing the head. The head must be covered whether or not any review object exists.
+if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   # Only SOMEONE ELSE's review is coverage. Counting any review on the head meant the
   # author's own `gh pr review --comment` disposition — posted after the push, as the
   # workflow requires — marked the commit reviewed. The check certified precisely the
@@ -462,14 +725,74 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ] && [ -n "$headoid" ]; then
              '[ .[] | select((.commit.oid // "") == $h) | select(.author.login != $me) ] | length' \
              <<<"$reviews") || {
     echo "verdict: BLOCKED — could not evaluate head-commit review coverage." >&2; exit 2; }
-  # No `|| echo 0`. That fallback turned "jq died" into "no reviews exist", which skips
-  # this block entirely and prints CLEAR — the fail-open shape this gate exists to refuse.
-  anyreview=$(jq -r --arg me "$prauthor" '[ .[] | select(.author.login != $me) ] | length' \
-              <<<"$reviews") || {
-    echo "verdict: BLOCKED — could not count reviews." >&2; exit 2; }
-  if [ "${anyreview:-0}" -gt 0 ] && [ "${reviewed:-0}" -eq 0 ]; then
+  # A no-findings result leaves no review object (see VERDICT_JQ), so it carries no commit
+  # of its own. It counts for THIS head only when the bot itself names the head. A result
+  # merely dated after the head arrived is not bound: a review of the old head that
+  # finishes after the push is dated the same way. What names the head, per bot:
+  #   - Codex writes the commit it reviewed into the verdict. That sha must be a prefix
+  #     of the head. A verdict naming an older commit was issued for that commit and is
+  #     ignored here (it still needs no disposition).
+  #   - Codex's review-summary comment (the shape it has posted since 2026-08-28) names a
+  #     commit per table row, and a row counts when it says Completed, names a prefix of
+  #     the head, and its own datetime postdates arrival. A table holding any row that is
+  #     not a finished Completed review covers nothing at all, because a review still
+  #     running is one whose findings have not landed. When Codex does have findings it
+  #     posts a review object, which `reviewed` counts, and those findings answer to
+  #     dispositions exactly as they did before.
+  #   - CodeRabbit's "Full review finished." reply names nothing, so it never covers a
+  #     head on its own: it is a notice, exempt from dispositions and nothing more. What
+  #     names the head is the walkthrough comment CodeRabbit edits in place. After a
+  #     review that finished with no comments it carries, between "<!-- recent_review_start -->"
+  #     and "<!-- recent_review_end -->", the line "No actionable comments were generated"
+  #     and the line "Reviewing files that changed from the base of the PR and between
+  #     <sha> and <sha>". The second sha is the last commit reviewed and must be the head,
+  #     and the comment's updatedAt must postdate the head's arrival. (A review that did
+  #     produce comments leaves a review object on the head, which `reviewed` counts.)
+  #     Only that block, in a comment carrying no notice, counts (walkthrough_sha): the
+  #     same comment quotes an identical range line inside its "Review limit reached"
+  #     notice for a review that did NOT run (on #872 that notice named head 181fcbbb,
+  #     which no CodeRabbit review ever covered), and after a FAILED review the block
+  #     itself names the range under a "Review failed" caution (#853, #792).
+  # An earlier version bound CodeRabbit's reply to the latest review request posted after
+  # arrival. That is timestamp ordering, not binding: a review of the old head that
+  # finished after a new request was counted as that request's answer. Withdrawn.
+  # Arrival is the creation of the head's earliest check suite, not committedDate: a
+  # commit made locally before an older head's verdict and pushed afterwards would
+  # otherwise read as covered. Without a check suite nothing can be dated after arrival
+  # and the head stays uncovered. Earliest is by INSTANT: as strings, a whole-second
+  # timestamp sorts after a fractional one in the same second, so the string minimum can
+  # name a later suite than the one that actually created first. And an arrival that will
+  # not parse dates nothing, which is a block: as a string it still ranked against every
+  # verdict, and one sorting below them certified the head.
+  suitetimes=$(jq -c '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[]?.createdAt // empty]' \
+    <<<"$payload" 2>/dev/null) || {
+    echo "verdict: BLOCKED — could not read the head commit's check suites." >&2; exit 2; }
+  if ! jq -e "$TS_JQ"'type == "array" and all(ts != null)' >/dev/null 2>&1 <<<"$suitetimes"; then
+    echo "verdict: BLOCKED — a check-suite timestamp on the head will not parse, so this gate" >&2
+    echo "cannot tell when the head arrived, and cannot date any review result against it." >&2
+    exit 2
+  fi
+  arrived=$(jq -r "$TS_JQ"'min_by(ts) // ""' <<<"$suitetimes") || {
+    echo "verdict: BLOCKED — could not date the head's arrival." >&2; exit 2; }
+  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" --arg h "$headoid" "$TS_JQ"'
+    ($hd | ts) as $hat
+    | [ .[] | select(.state == "COMMENT" and .author.login != $me)
+        | select(any(.reviewed_rows[]?; . as $row
+                     | ($row.at | ts) as $rat
+                     | ($row.sha // "") != "" and ($h | startswith($row.sha))
+                     and $hat != null and $rat != null and $rat > $hat)) ]
+    | length' <<<"$bodies") || {
+    echo "verdict: BLOCKED — could not evaluate no-findings verdicts." >&2; exit 2; }
+  # A head is covered by a review object on it from someone other than the author, or by
+  # a verdict bound to it. Nothing else counts, and in particular the existence of review
+  # objects on OTHER commits does not: the blocking branch used to require one, so a PR
+  # with no review objects and an unbound verdict printed neither line and went CLEAR.
+  if [ "${reviewed:-0}" -eq 0 ] && [ "${verdicts:-0}" -gt 0 ]; then
     echo
-    echo "  UNREVIEWED HEAD  ${headoid:0:9} — reviews exist, none of them cover this commit"
+    echo "  HEAD COVERED  ${headoid:0:9}: no review object, but $verdicts no-findings verdict(s) bound to it (arrived $arrived)"
+  elif [ "${reviewed:-0}" -eq 0 ]; then
+    echo
+    echo "  UNREVIEWED HEAD  ${headoid:0:9} — no review object on this commit from anyone but the author, and no no-findings verdict bound to it"
     echo
     echo "verdict: BLOCKED — the head commit has not been reviewed."
     echo "Every finding raised so far is answered, but the code being merged is not the code"

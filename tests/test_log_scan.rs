@@ -239,6 +239,12 @@ fn require_jq() {
     );
 }
 
+/// Every review-thread fixture carries the PR-level fields the gate reads: the head
+/// commit, a check suite dating its arrival, and a stranger's APPROVED review of that
+/// head. Without them the gate blocks on an unreviewed head — correctly — and each of
+/// these tests would then pass for the wrong reason, testing coverage instead of the
+/// rule it is named for. An APPROVED review is not a finding, so it adds nothing to
+/// answer; it only says the head was looked at.
 fn run_threads(fixture: &str) -> (String, i32) {
     require_jq();
     let out = Command::new("bash")
@@ -357,19 +363,22 @@ fn the_gate_blocks_when_it_cannot_run_at_all() {
 /// This exists because a hand-written fixture lied. It carried two comments per thread
 /// while the query asked for `comments(first: 1)`, so the "a RED-VERIFIED reply satisfies
 /// the gate" test passed against a response the code could never produce — green, and
-/// proving nothing. `scripts/capture-review-threads-fixture.sh` regenerates this file
-/// straight from a live PR so the shape cannot drift from the query again.
+/// proving nothing. `scripts/capture-review-threads-fixture.sh` now dumps what the gate
+/// itself assembles (`--dump-payload`), so a fixture cannot drift from the query, and
+/// cannot omit a field the gate later starts reading — which is how the previous capture,
+/// taken before the gate read the head at all, ended up blocking every test that used it.
 ///
-/// Captured from PR #748 (the PR that added this gate), which at capture time had 10
-/// threads, 9 unresolved.
+/// Captured from PR #867 on 2026-08-28 at 22:43Z: head 9ebed542, 18 threads with 3
+/// unresolved, 44 reviews, 17 top-level comments. It replaces a capture of PR #748, whose
+/// threads have all been resolved since, leaving nothing unresolved to parse.
 #[test]
 fn the_gate_handles_a_real_captured_pr_response() {
-    let (out, code) = run_threads("review-threads-live-748.json");
+    let (out, code) = run_threads("review-threads-live-867.json");
 
     assert_ne!(code, 0, "a PR with unresolved threads must block:\n{out}");
     assert!(
-        out.contains("10 total, 9 unresolved"),
-        "the captured response has 10 threads with 9 unresolved; if this count moved, \
+        out.contains("18 total, 3 unresolved"),
+        "the captured response has 18 threads with 3 unresolved; if this count moved, \
          re-capture with scripts/capture-review-threads-fixture.sh and check WHY.\n{out}"
     );
     // Real bodies are markdown with badges, HTML comments and embedded shell blocks —
@@ -385,6 +394,11 @@ fn the_gate_handles_a_real_captured_pr_response() {
 #[test]
 fn every_fixture_matches_the_shape_the_query_returns() {
     const REQUIRED: [&str; 5] = ["author", "body", "line", "originalLine", "path"];
+    // The gate reads these too, and a fixture without them is judged under a rule it
+    // cannot satisfy: no head means "this gate cannot tell whether the code being merged
+    // was reviewed", which is a BLOCK, so every test using such a fixture fails for a
+    // reason that has nothing to do with what it asserts.
+    const REQUIRED_PR_LEVEL: [&str; 4] = ["headRefOid", "checkSuites", "reviews", "comments"];
     let dir = repo_root().join("tests/fixtures");
     let mut checked = 0;
 
@@ -401,6 +415,14 @@ fn every_fixture_matches_the_shape_the_query_returns() {
                 "fixture {name} is missing the `{field}` field that the live query selects. \
                  A fixture that does not match the query lets a test pass against data the \
                  code can never receive."
+            );
+        }
+        for field in REQUIRED_PR_LEVEL {
+            assert!(
+                text.contains(&format!("\"{field}\"")),
+                "fixture {name} is missing the `{field}` field the gate reads at PR level. \
+                 Regenerate it with scripts/capture-review-threads-fixture.sh, or add the \
+                 field by hand; a fixture the gate cannot judge blocks on its own shape."
             );
         }
         assert!(
@@ -542,5 +564,83 @@ fn malformed_thread_data_blocks_instead_of_clearing() {
         "unparseable thread data must not produce a passing verdict.\n{combined}"
     );
     assert!(combined.contains("BLOCKED"), "{combined}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A timestamp comparison must be between INSTANTS, not between strings.
+///
+/// The gate's timestamps do not all arrive in one shape. Check-suite and comment
+/// timestamps come back whole-second ("2026-01-02T00:30:00Z"); the datetime Codex writes
+/// into a review-summary row carries a fraction ("2026-01-02T00:30:00.123456Z"). Compared
+/// as strings, "." sorts before "Z", so a result recorded in the same second as the head's
+/// check suite reads as EARLIER than the head arrived, and the head is reported unreviewed
+/// for as long as that result is its only coverage. String order also ranks anything that
+/// is not a timestamp: "a while ago" sorts after every digit, so an unparsable date used to
+/// postdate everything and grant coverage. A date the gate cannot parse orders against
+/// nothing and must block.
+///
+/// The shell harness (scripts/test-check-review-threads.sh, "finding 32") carries the full
+/// matrix; these two run in CI.
+#[test]
+fn review_gate_orders_timestamps_as_instants_not_as_strings() {
+    require_jq();
+    // Codex's no-findings comment as posted: the phrase, the reviewed commit, and the
+    // folded About Codex block.
+    const VERDICT: &str = r#""Codex Review: Didn't find any major issues. Bravo.\n\n**Reviewed commit:** `deadbeef`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n</details>""#;
+    let payload = |suite: &str, posted: &str| {
+        let comments = format!(
+            r#"[{{"author":{{"login":"chatgpt-codex-connector","__typename":"Bot"}},"createdAt":"{posted}","updatedAt":"{posted}","body":{VERDICT}}}]"#
+        );
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"{suite}"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[]}},"comments":{{"nodes":{comments}}},"recheck":{{"comments":{{"nodes":{comments}}}}}}}}}}}}}"#
+        )
+    };
+
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-ts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |name: &str, body: String| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        let out = Command::new("bash")
+            .arg(repo_root().join("scripts/check-review-threads.sh"))
+            .arg("--from-file")
+            .arg(&f)
+            .output()
+            .expect("check-review-threads.sh must be runnable");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.code().unwrap_or(-1))
+    };
+
+    // The verdict lands 100ms after the head's check suite, so it covers the head.
+    let (out, code) = run(
+        "same-second.json",
+        payload("2026-01-02T00:30:00Z", "2026-01-02T00:30:00.100Z"),
+    );
+    assert_eq!(
+        code, 0,
+        "a result recorded 100ms after the head arrived covers it; comparing the two as \
+         strings puts the fractional one first and leaves the head uncovered forever.\n{out}"
+    );
+    assert!(out.contains("HEAD COVERED"), "{out}");
+
+    // An arrival the gate cannot parse dates nothing, so nothing can be shown to postdate
+    // it. As a string it ranked below the verdict and granted coverage.
+    let (out, code) = run(
+        "unparsable-arrival.json",
+        payload("2026-01-02T00:30", "2026-01-02T01:00:00Z"),
+    );
+    assert_eq!(
+        code, 2,
+        "an unparsable check-suite timestamp must block, not certify the head.\n{out}"
+    );
+    assert!(out.contains("BLOCKED"), "{out}");
+    assert!(
+        !out.contains("HEAD COVERED"),
+        "coverage was granted from a timestamp the gate could not read.\n{out}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

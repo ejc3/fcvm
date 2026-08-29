@@ -171,6 +171,28 @@ Enforcement: `scripts/check-review-threads.sh <pr>` fails while any review threa
 unresolved, and while any finding — inline OR in a PR-level review body — carries no
 disposition. One vocabulary for both:
 
+A head that no reviewer has anything to say about is still reviewed: the gate counts a
+listed review bot's (`VERDICT_BOTS`) no-findings result as coverage of the head when the
+bot names the head. Codex names the commit it reviewed in two shapes, and both count:
+the "Didn't find any major issues" comment, and the review-summary comment it edits in
+place, whose table row must say Completed, name the head, and carry a datetime after the
+head arrived. That comment is created before any review has finished, so neither of its
+own timestamps dates a result, and a table holding any row that is not a finished review
+covers nothing. Every one of those datings is a comparison of parsed instants, not of
+strings: the row datetimes carry fractional seconds and the check-suite timestamps do
+not, and as text a fraction sorts before the "Z" it replaces. A timestamp the gate
+cannot parse dates nothing, so it covers nothing and answers nothing. CodeRabbit's "Full
+review finished." reply names nothing and never covers on its own; what names the head
+is the walkthrough comment CodeRabbit edits in place, whose recent-review block says
+which commit range it reviewed. That block must say no actionable comments were
+generated, the comment must carry no CodeRabbit notice (failed, skipped, paused, rate
+limited, in progress), the range must end at the head, and the edit must postdate the
+head's arrival at GitHub. Both of those signals live in a comment its bot edits in
+place, so the gate re-reads the PR comments after all its paging and blocks when one of
+them changed while it was reading: the head standing still does not mean a clean
+walkthrough is still clean. Both bots' no-findings replies need no disposition. A PR
+with no review result of any kind is an unreviewed head, not a clear one.
+
 | `RED-VERIFIED: <test>` | a defect claim, closed by a test watched failing without the fix |
 | `NOT-A-DEFECT: <reason>` | naming, docs, style |
 | `DISAGREE: <reason>` | a defect claim you are rejecting, with reasoning |
