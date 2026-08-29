@@ -36,8 +36,10 @@ Every rule here exists because of a defect listed in bench/chromium/AGENTS.md:
     `guest_dns` (the resolver in the guest's resolv.conf) or a
     BENCH_RESOLVE_ALL_TO entry in `guest_env` (the rule baked into
     Chromium's own resolver, which the resolver-rule arm uses with
-    guest_dns null). A corpus run that records neither had its hostnames
-    answered by something the record does not say, so it is refused. IP
+    guest_dns null; only entry.sh reads that variable, so recording it
+    under any other engine is itself a refusal). A corpus run that records
+    neither had its hostnames answered by something the record does not
+    say, so it is refused. IP
     literals and localhost need none. `engine`, `guest_dns` and `guest_env`
     are cell fields: runs that differ in any of them never pool.
   * A load event that takes tens of seconds is a stall, not a slow page. With
@@ -564,15 +566,24 @@ def _resolver_rule_address(meta, label, errors):
     """The address a baked BENCH_RESOLVE_ALL_TO rule answers every host with.
 
     A golden built with GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> resolves names
-    inside Chromium (`--host-resolver-rules=MAP * <ip>`) and asks nothing of
-    resolv.conf, so its guest_dns is null while the record still names what
-    answered the corpus. Returns None when no rule is recorded. A rule whose
-    value entry.sh would have refused is a metadata error and returns None,
-    so the URL check still refuses the run.
+    inside Chromium (`--host-resolver-rules=EXCLUDE ..., MAP * <ip>`) and
+    asks nothing of resolv.conf, so its guest_dns is null while the record
+    still names what answered the corpus. Returns None when no rule is
+    recorded. A rule whose value entry.sh would have refused is a metadata
+    error and returns None, so the URL check still refuses the run.
+
+    Only entry.sh reads the variable, and only Chromium takes the flag it
+    builds; entry-webkit.sh never mentions it. A WebKit run carrying the
+    rule resolved its hostnames through whatever resolv.conf pointed at, so
+    the rule is not that run's resolver and is refused outright: crediting
+    it made a WebKit run with guest_dns null publishable on ambient DNS, and
+    a WebKit render carries no network trace for the diag to contradict it
+    with.
     """
     guest_env = meta.get("guest_env", [])
     if not isinstance(guest_env, list):
         return None
+    engine = meta.get("engine") or "chromium"
     address = None
     for entry in guest_env:
         if not isinstance(entry, str):
@@ -580,6 +591,13 @@ def _resolver_rule_address(meta, label, errors):
         key, separator, value = entry.partition("=")
         if not separator or key != "BENCH_RESOLVE_ALL_TO":
             continue
+        if engine != "chromium":
+            errors.append(
+                f"{label} metadata records a BENCH_RESOLVE_ALL_TO rule under "
+                f"engine {engine!r}, which never reads it; that run's hostnames "
+                "were answered by something else"
+            )
+            return None
         try:
             address = str(ipaddress.ip_address(value))
         except ValueError:

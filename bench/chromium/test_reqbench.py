@@ -8644,6 +8644,78 @@ class AnalyzerResolverGate(unittest.TestCase):
                     f"the refusal must name the unreadable rule: {errors}",
                 )
 
+    @staticmethod
+    def write_webkit_multi_url(path, urls, **overrides):
+        """The multi-URL fixture as a WebKit run: WebDriver classic renders,
+        whose navigate call returns at the load event."""
+        AnalyzerResolverGate.write_multi_url(path, urls, engine="webkit", **overrides)
+
+        def reshape(row):
+            render = row.get("render")
+            if not isinstance(render, dict):
+                return
+            row["render"] = {
+                "ok": True, "url": render["url"], "format": render["format"],
+                "engine": "webkit", "wd_host": row["endpoint"],
+                "session_prewired": True,
+                "stages": {
+                    "resolve_ms": 0.1, "connect_total_ms": 0.4,
+                    "navigate_ms": 180.0, "screenshot_ms": 1.0,
+                    "total_ms": render["stages"]["total_ms"],
+                },
+                "image_bytes": 1024, "image_sha256": "9" * 64,
+            }
+
+        _rewrite_records(path, reshape)
+
+    def test_a_resolver_rule_is_credited_only_to_the_engine_that_reads_it(self):
+        """`--host-resolver-rules` is a Chromium flag. entry.sh builds it from
+        BENCH_RESOLVE_ALL_TO; entry-webkit.sh never reads the variable, so a
+        WebKit golden carrying it resolved its hostnames through whatever the
+        guest's resolv.conf pointed at. Crediting the rule for every engine
+        made such a run publishable with guest_dns null, and its diag carries
+        no network trace to contradict it (reqbench refuses an IP
+        expectation on WebKit). The rule counts as the recorded resolver only
+        on Chromium, and a run that records it under another engine is
+        refused: its arm label does not describe what resolved the corpus.
+
+        RED BEFORE THE FIX: `AssertionError: True is not False` on the
+        rule-only WebKit run (rc 0, cell guest_dns null), which is the
+        publishable run this finding is about.
+        """
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        # Control: the same WebKit fixture with a resolver it does read is
+        # publishable, so the refusals below are the rule and nothing else.
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_webkit_multi_url(
+                    src, self.CORPUS, guest_dns="10.0.2.2"),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(out["cell"]["engine"], "webkit")
+        for extra in ({}, {"guest_dns": "10.0.2.2"}):
+            with self.subTest(extra=extra):
+                with tempfile.TemporaryDirectory() as d:
+                    rc, out = self._analyze(
+                        d, lambda src: self.write_webkit_multi_url(
+                            src, self.CORPUS, guest_env=rule, **extra),
+                    )
+                self.assertIs(out["publishable"], False)
+                self.assertEqual(rc, 5)
+                errors = out["gate"]["backend_metadata"]["errors"]
+                self.assertTrue(
+                    any("BENCH_RESOLVE_ALL_TO" in error and "webkit" in error
+                        for error in errors),
+                    f"the refusal must name the rule and the engine: {errors}",
+                )
+        # The same rule on the engine that reads it still publishes.
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_env=rule),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+
     def test_corpus_hostnames_with_guest_dns_are_publishable(self):
         with tempfile.TemporaryDirectory() as d:
             rc, out = self._analyze(
