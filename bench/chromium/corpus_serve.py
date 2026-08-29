@@ -13,6 +13,11 @@ Resolution order for a request URL u:
   2. match ignoring the query string (analytics beacons carry per-view ids)
   3. 404, counted in /––misses (read by the checker for the report)
 
+GET, HEAD and POST all resolve that way; OPTIONS is answered as a preflight.
+Every reply carries the CORS headers, the 404 included, because a reply the
+browser blocks is a reply the network trace cannot attribute to this server
+(see Handler.end_headers).
+
 Two optional logs, one JSON object per line, flushed per line so a log left
 behind by a killed process is complete up to its last answered request:
   --dns-log PATH     {ts, peer, qname, qtype, answer} per DNS query; answer is
@@ -100,6 +105,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     access_log = None
     _log_status = None
     _log_bytes = 0
+    # Set per request in handle_one_request; end_headers sends the CORS
+    # headers once, on whichever reply the request gets.
+    _cors_sent = False
 
     def handle_one_request(self):
         # One access line per parsed request, written after the response has
@@ -111,6 +119,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         t0 = time.monotonic()
         self._log_status = None
         self._log_bytes = 0
+        self._cors_sent = False
         try:
             super().handle_one_request()
         finally:
@@ -149,18 +158,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
         super().send_header(keyword, value)
 
-    def _serve(self):
+    def end_headers(self):
+        """Add the CORS headers to whatever reply is being sent, then close
+        the header block.
+
+        Every reply goes through here: a replayed body, a replayed redirect,
+        the 404 for a url the corpus does not hold, and the base class's
+        error replies. They all need the headers, for one reason.
+
+        Cross-origin subresources (fonts, module scripts, manifests) are CORS
+        requests; the real CDNs send ACAO and dropping it turned every such
+        fetch into net::ERR_FAILED on replay (Guardian, 2026-08-13). Echo the
+        Origin rather than "*": credentialed fetches (CMP/geo APIs) reject
+        the wildcard, and those gate consent overlays the pixel check sees.
+
+        A miss needs them as much as a hit does. Without them the browser
+        blocks the 404 before the renderer sees it, reports net::ERR_FAILED,
+        and receives no response, so the trace records no remote address and
+        cannot say the request was answered here rather than off the box.
+        Measured 2026-08-29 over a 42-render diag: 32 traced rows carried no
+        remote address, every one of them cross-origin and every one answered
+        by this server (27 GET 404, 2 POST 404, 3 HEAD 501). The status is
+        unchanged, so a url the corpus does not hold still says so, in the
+        status, in the access log and in /––misses.
+        """
+        if not self._cors_sent:
+            self._cors_sent = True
+            # A request line the parser rejected has no headers to read.
+            headers = getattr(self, "headers", None)
+            origin = headers.get("Origin") if headers is not None else None
+            self.send_header("Access-Control-Allow-Origin", origin or "*")
+            if origin:
+                self.send_header("Access-Control-Allow-Credentials", "true")
+                self.send_header("Vary", "Origin")
+        super().end_headers()
+
+    def _serve(self, body=True):
         host = (self.headers.get("Host") or "").split(":")[0]
         u = urllib.parse.urlparse(self.path)
         entry = self.exact.get((host, u.path, u.query)) or \
             self.noquery.get((host, u.path))
         if self.path == "/––misses":
-            body = json.dumps(self.misses).encode()
+            payload = json.dumps(self.misses).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(body)
+            if body:
+                self.wfile.write(payload)
             return
         if entry is None:
             r = self.redirects.get((host, u.path, u.query)) or \
@@ -202,33 +247,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        # Cross-origin subresources (fonts, module scripts, manifests) are CORS
-        # requests; the real CDNs send ACAO and dropping it turned every such
-        # fetch into net::ERR_FAILED on replay (Guardian, 2026-08-13). Echo the
-        # Origin rather than "*": credentialed fetches (CMP/geo APIs) reject
-        # the wildcard, and those gate consent overlays the pixel check sees.
-        origin = self.headers.get("Origin")
-        self.send_header("Access-Control-Allow-Origin", origin or "*")
-        if origin:
-            self.send_header("Access-Control-Allow-Credentials", "true")
-            self.send_header("Vary", "Origin")
         self.end_headers()
-        self.wfile.write(data)
+        if body:
+            self.wfile.write(data)
 
     def do_OPTIONS(self):
         # CORS preflight for credentialed fetches (CMP/geo chains): without
         # this the base handler answers 501 and the chain dies before any
         # ACAO header is ever consulted.
-        origin = self.headers.get("Origin") or "*"
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", origin)
-        self.send_header("Access-Control-Allow-Credentials", "true")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
         self.send_header(
             "Access-Control-Allow-Headers",
             self.headers.get("Access-Control-Request-Headers") or "*",
         )
         self.end_headers()
+
+    def do_HEAD(self):
+        # The same lookup as GET, headers only. Left to the base class every
+        # HEAD is a 501, which for a recorded url is not the status the
+        # origin gave (www.rtp.pt/rtp-sensor, in the corpus, answered 501 on
+        # 2026-08-29) and for any url is an answer keyed on the method rather
+        # than on what the corpus holds.
+        self._serve(body=False)
 
     do_GET = _serve
     do_POST = _serve  # beacons POST; replay their captured (or 404) response
