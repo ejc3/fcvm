@@ -7879,6 +7879,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
     def _evidence(run_dir, verdict):
         """dns-evidence.json plus every file it names, as the campaign leaves them."""
         verify_files = []
+        verify_hashes = {}
         for stage in ("pre", "before-run", "after-run"):
             path = os.path.join(run_dir, f"verify-dns-{stage}.json")
             with open(path, "w") as handle:
@@ -7892,6 +7893,9 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                     "timestamp": "2026-08-28T00:00:00Z", "passed": True,
                 }, handle)
             verify_files.append(path)
+            with open(path, "rb") as handle:
+                verify_hashes[f"verify-dns-{stage}.json"] = hashlib.sha256(
+                    handle.read()).hexdigest()
         hashes = {}
         for name in ("corpus-dns.log", "corpus-access.log"):
             path = os.path.join(run_dir, name)
@@ -7912,6 +7916,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
             "owner_log": os.path.join(run_dir, "dns-owner.log"),
             "first_mismatch": None,
             "verify_files": verify_files,
+            "verify_file_sha256": verify_hashes,
             "corpus_dns_log_sha256": hashes["corpus-dns.log"],
             "corpus_access_log_sha256": hashes["corpus-access.log"],
             "corpus_serve_exit_status": 0,

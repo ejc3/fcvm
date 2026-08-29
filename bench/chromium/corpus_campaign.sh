@@ -91,8 +91,9 @@ say() { printf '\n=== %s\n' "$*"; }
 #      1-min load every DNS_SAMPLE_INTERVAL seconds while the run is in
 #      flight ($RESULTS/dns-owner.log). The quiet gate reads the load once,
 #      before the run; the samples are what says it stayed quiet.
-#   3. $RESULTS/dns-evidence.json ties them together with the replay server's
-#      own DNS and access logs (sha256), its exit status
+#   3. $RESULTS/dns-evidence.json ties them together with each bracket's
+#      sha256 (verify_file_sha256), the replay server's own DNS and access
+#      logs (sha256), its exit status
 #      (corpus_serve_exit_status, from $RESULTS/corpus-serve.status), the
 #      maximum 1-min load over the samples (load_max_1min), and a verdict:
 #      "clean" only when all three brackets are present and passed, every
@@ -269,10 +270,26 @@ write_dns_evidence() {
         verdict=unclean; reason="${reason:-dnsmasq is $after_state after the clone restores, not inactive}"
     fi
     local -a files=()
+    # Each bracket is pinned by the sha256 of the bytes this verdict read.
+    # The bracket file is the only record that a restored clone resolved the
+    # corpus through the replay server, and nothing else hashes it, so
+    # without this a file edited after the campaign is indistinguishable from
+    # the one the verdict accepted. A failed jq assigns empty output, which
+    # --argjson would refuse, so the map goes back to {} and the verdict is
+    # unclean.
+    local verify_sha='{}' sha
     for f in pre before-run after-run; do
         if [ -f "$RESULTS/verify-dns-$f.json" ]; then files+=("$RESULTS/verify-dns-$f.json"); fi
         if ! jq -e '.passed == true' "$RESULTS/verify-dns-$f.json" >/dev/null 2>&1; then
             verdict=unclean; reason="${reason:-the $f verify bracket is missing or did not pass}"
+        fi
+        sha=$(sha256_or_empty "$RESULTS/verify-dns-$f.json")
+        if [ -z "$sha" ]; then
+            verdict=unclean; reason="${reason:-the $f verify bracket cannot be read to hash it}"
+        elif ! verify_sha=$(jq -c --arg n "verify-dns-$f.json" --arg s "$sha" \
+                '.[$n] = $s' <<<"$verify_sha"); then
+            verdict=unclean; reason="${reason:-cannot record the sha256 of the $f verify bracket}"
+            verify_sha='{}'
         fi
     done
     for f in corpus-dns.log corpus-access.log; do
@@ -304,6 +321,7 @@ write_dns_evidence() {
         --arg dns_sha "$(sha256_or_empty "$RESULTS/corpus-dns.log")" \
         --arg access_sha "$(sha256_or_empty "$RESULTS/corpus-access.log")" \
         --argjson serve_status "$serve_status_json" \
+        --argjson verify_sha "$verify_sha" \
         --arg verdict "$verdict" --args \
         '{serve_pid: $serve_pid, dnsmasq_was_active_before: $before,
           dnsmasq_active_after_restore: $after,
@@ -313,6 +331,7 @@ write_dns_evidence() {
           load_max_1min: $load_max, load_samples: $load_samples,
           first_mismatch: (if $first == "" then null else $first end),
           verify_files: $ARGS.positional,
+          verify_file_sha256: $verify_sha,
           corpus_dns_log_sha256: (if $dns_sha == "" then null else $dns_sha end),
           corpus_access_log_sha256: (if $access_sha == "" then null else $access_sha end),
           corpus_serve_exit_status: $serve_status,

@@ -999,6 +999,25 @@ wait_sampler_gone() {
                 self.assertEqual(evidence[key],
                                  hashlib.sha256((name + "\n").encode()).hexdigest())
 
+    def test_the_evidence_pins_each_bracket_by_hash(self):
+        """The bracket files are the only record that a restored clone
+        resolved the corpus through the replay server, and nothing else
+        hashes them. The verdict records each bracket's sha256 so a reader of
+        the run directory can tell the file the verdict read from one edited
+        after it.
+
+        RED BEFORE THE FIX: KeyError: 'verify_file_sha256'.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            evidence, _ = self._sample(env, results)
+            want = {}
+            for stage in self.BRACKETS:
+                name = f"verify-dns-{stage}.json"
+                with open(os.path.join(results, name), "rb") as handle:
+                    want[name] = hashlib.sha256(handle.read()).hexdigest()
+            self.assertEqual(evidence["verify_file_sha256"], want)
+
     def test_a_missing_or_failed_bracket_is_unclean(self):
         """Three brackets run; a verdict built from fewer is a verdict over a
         run whose resolver went unproven on one side.

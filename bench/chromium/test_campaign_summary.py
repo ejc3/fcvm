@@ -139,18 +139,24 @@ SEAL = {
 }
 
 
-def write_verify(path, passed=True):
-    """One HOP D evidence file in reqbench.sh's shape."""
+def write_verify(path, passed=True, **overrides):
+    """One HOP D evidence file in reqbench.sh's shape; overrides rewrite
+    fields on top of a bracket that resolved every corpus host and URL
+    through the replay resolver with the proxy variables ignored."""
+    record = {
+        "dns_server": "10.0.2.2",
+        "resolv_conf_vm": "nameserver 10.0.2.2\n",
+        "resolv_conf_container": "nameserver 10.0.2.2\n",
+        "hosts": {"example.com": {"answer": "10.0.2.2", "ok": passed}},
+        "urls": {"https://example.com/": {"status": 200, "ok": passed,
+                                          "proxy_env_ignored": []}},
+        "proxies_disabled": True,
+        "timestamp": "2026-08-28T00:00:00Z",
+        "passed": passed,
+    }
+    record.update(overrides)
     with open(path, "w") as handle:
-        json.dump({
-            "dns_server": "10.0.2.2",
-            "resolv_conf_vm": "nameserver 10.0.2.2\n",
-            "resolv_conf_container": "nameserver 10.0.2.2\n",
-            "hosts": {"example.com": {"answer": "10.0.2.2", "ok": passed}},
-            "urls": {"https://example.com/": {"status": 200, "ok": passed}},
-            "timestamp": "2026-08-28T00:00:00Z",
-            "passed": passed,
-        }, handle)
+        json.dump(record, handle)
 
 
 def write_run(
@@ -167,6 +173,8 @@ def write_run(
     samples=12,
     load_max_1min=0.42,
     evidence_overrides=None,
+    verify_overrides=None,
+    verify_stage_overrides=None,
     cell_overrides=None,
     analysis_overrides=None,
     withdrawn=None,
@@ -176,9 +184,12 @@ def write_run(
     dns_verdict=None omits dns-evidence.json and everything it names; diag=None
     omits diag/summary.json. stall_max_ms=None is what reqanalyze writes when
     it ran without --stall-max-ms (passed true, evaluated 0). The evidence
-    names three passing verify brackets, an owner log with `samples` lines
-    and the two replay logs with their real sha256, the way
-    corpus_campaign.sh writes them; evidence_overrides rewrites fields on top.
+    names three passing verify brackets with their real sha256, an owner log
+    with `samples` lines and the two replay logs with their real sha256, the
+    way corpus_campaign.sh writes them; evidence_overrides rewrites evidence
+    fields on top, verify_overrides rewrites bracket fields on every bracket
+    before they are hashed, and verify_stage_overrides rewrites them on one
+    named stage.
     load_max_1min is the 1-min load the campaign's sampler recorded, carried
     on every owner line and reported in the evidence; None writes an owner
     log and evidence from before the sampler recorded it.
@@ -234,11 +245,15 @@ def write_run(
             handle.write(f"{withdrawn}\nsecond line: detail the refusal need not quote\n")
     if dns_verdict is not None:
         verify_files = []
+        verify_hashes = {}
         for stage in VERIFY_STAGES:
             verify_path = os.path.join(run_dir, f"verify-dns-{stage}.json")
-            write_verify(verify_path)
+            overrides = dict(verify_overrides or {})
+            overrides.update((verify_stage_overrides or {}).get(stage, {}))
+            write_verify(verify_path, **overrides)
             paths[f"verify-{stage}"] = verify_path
             verify_files.append(verify_path)
+            verify_hashes[f"verify-dns-{stage}.json"] = sha256_file(verify_path)
         hashes = {}
         for name in CORPUS_LOGS:
             log_path = os.path.join(run_dir, name)
@@ -265,6 +280,7 @@ def write_run(
             "owner_log": owner_log,
             "first_mismatch": None,
             "verify_files": verify_files,
+            "verify_file_sha256": verify_hashes,
             "corpus_dns_log_sha256": hashes["corpus-dns.log"],
             "corpus_access_log_sha256": hashes["corpus-access.log"],
             "corpus_serve_exit_status": 0,
@@ -539,6 +555,108 @@ class CampaignSummary(unittest.TestCase):
                 ]},
             )
             self.assertIn("before-run", text)
+
+    def test_a_verify_bracket_rewritten_after_the_verdict_refuses(self):
+        """The bracket file is the whole record that a restored clone
+        resolved the corpus through the replay server, and it is a plain file
+        in the run directory. A bracket saying the clone resolved through
+        8.8.8.8, with the proxy probes disabled=false and no host or URL
+        checked at all, still carried passed=true and was indexed clean.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            write_verify(paths["verify-before-run"], dns_server="8.8.8.8",
+                         proxies_disabled=False, hosts={}, urls={})
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("verify-dns-before-run.json", text)
+
+    def test_evidence_that_does_not_pin_its_brackets_refuses(self):
+        """Fail closed: evidence written before the verdict hashed its
+        brackets cannot say whether the files beside it are the ones it read,
+        so it is not evidence the index can revalidate.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            with open(paths["dns_evidence"]) as handle:
+                evidence = json.load(handle)
+            del evidence["verify_file_sha256"]
+            with open(paths["dns_evidence"], "w") as handle:
+                json.dump(evidence, handle)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("verify_file_sha256", text)
+
+    # Each shape is a bracket the campaign would have refused at the verdict,
+    # written with its own hash so only the index-time revalidation can catch
+    # it: the resolver under test, the proxy state of the URL probes, and
+    # that anything was checked at all.
+    BRACKETS_THAT_PROVE_NOTHING = (
+        ({"hosts": {}}, "no resolved host"),
+        ({"urls": {}}, "no fetched URL"),
+        ({"proxies_disabled": False}, "proxies_disabled"),
+        ({"dns_server": "8.8.8.8",
+          "hosts": {"example.com": {"answer": "8.8.8.8", "ok": True}}}, "8.8.8.8"),
+        ({"hosts": {"example.com": {"answer": "93.184.216.34", "ok": True}}},
+         "93.184.216.34"),
+        ({"urls": {"https://example.com/": {"status": 500, "ok": True,
+                                            "proxy_env_ignored": []}}}, "500"),
+        ({"urls": {"https://example.com/": {"status": 200, "ok": True,
+                                            "proxy_env_ignored": None}}},
+         "proxy variables"),
+    )
+
+    def test_a_bracket_that_proves_nothing_refuses(self):
+        """passed=true is also what HOP D writes when it was given nothing to
+        check, so the index holds every bracket to what the campaign asserted
+        when it ran it.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s), on all seven shapes.
+        """
+        for overrides, expected in self.BRACKETS_THAT_PROVE_NOTHING:
+            with self.subTest(bracket=overrides), tempfile.TemporaryDirectory() as d:
+                _paths, text = self._refused(d, verify_overrides=overrides)
+                self.assertIn("verify-dns-", text)
+                self.assertIn(expected, text)
+
+    def test_brackets_that_disagree_on_the_resolver_refuse(self):
+        """A cell with no guest_dns has no resolver to hold the brackets to,
+        so the first bracket's is the reference and the other two are held to
+        it: three brackets naming three resolvers describe three different
+        runs. Each bracket carries its own sha256, so only the index-time
+        revalidation can see this. The agreeing run is the control.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s)
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, guest_dns=None)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(d, guest_dns=None, verify_stage_overrides={
+                "after-run": {
+                    "dns_server": "8.8.8.8",
+                    "hosts": {"example.com": {"answer": "8.8.8.8", "ok": True}},
+                },
+            })
+            self.assertIn("verify-dns-after-run.json", text)
+            self.assertIn("8.8.8.8", text)
 
     def test_clean_evidence_whose_replay_log_changed_refuses(self):
         """The sha256 in the evidence pins the replay logs; a log that no

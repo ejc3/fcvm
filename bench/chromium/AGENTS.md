@@ -70,7 +70,7 @@ campaign's startup probes through the three verify brackets and every rep of
 every arm of the measured run, so it is the biggest record in the directory
 and a short one means the server was not serving the whole run.
 
-The evidence is only as good as the checks behind it, and three of them are
+The evidence is only as good as the checks behind it, and four of them are
 easy to get wrong:
 
 - The server's exit status. `corpus_serve.py` exits 1 when a log line could
@@ -93,6 +93,13 @@ easy to get wrong:
   variable first, and reports what it ignored; `verify-dns.json` carries
   `proxies_disabled` and `run_verify` refuses a bracket without it. Any new
   in-guest probe that opens a URL needs the same treatment.
+- The verify brackets themselves. `passed: true` is also what HOP D writes
+  when it was given nothing to check, and a bracket is a plain file in the
+  run directory. `write_dns_evidence` records each bracket's sha256 as
+  `verify_file_sha256`; `campaign_summary.py` rereads each bracket, refuses
+  one whose hash moved since the verdict, and holds its contents to the
+  run's resolver, `proxies_disabled`, and every host and URL answered
+  through that resolver. Evidence carrying no bracket hashes is refused.
 
 ## Six methodology defects — do not reintroduce
 

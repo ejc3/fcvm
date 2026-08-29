@@ -9,10 +9,12 @@ record, since an unarmed gate reports passed=true having evaluated nothing),
 dns-evidence.json (required when the cell's guest_dns names a baked resolver,
 optional otherwise; when present its verdict must be "clean", it must carry
 the replay server's exit status 0, every file it cites must be present and
-agree with it, and every sample in dns-owner.log must name its serve_pid as
-the owner of 127.0.0.1:53 with dnsmasq inactive and a load the evidence
-accounts for) and diag/summary.json (optional). The
-index names every file it was generated from with its sha256, and carries one
+agree with the sha256 it recorded, each verify bracket must record the run's
+resolver with the URL probes run under no proxy and every host and URL
+answered through it, and every sample in dns-owner.log must name its
+serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive and a load the
+evidence accounts for) and diag/summary.json (optional). The index names
+every file it was generated from with its sha256, and carries one
 cell per run: engine, cpu, memory_mib, guest_dns, the seal identity,
 publishable, stall_gate_passed, dns_verdict, load_max_1min (the maximum 1-min
 load the campaign's sampler saw during the measured run, when the evidence
@@ -150,6 +152,14 @@ def positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def is_sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
 def withdrawal_reason(marker):
     """The first line of a WITHDRAWN marker; a marker that cannot be read
     still withdraws the run."""
@@ -215,7 +225,73 @@ def check_owner_log(run_dir, evidence, owner_bytes):
         )
 
 
-def check_evidence(run_dir, evidence, sources):
+def check_verify_bracket(run_dir, name, verify, resolver):
+    """Hold one HOP D bracket to what the campaign asserted when it ran it:
+    the clone resolved through `resolver` (None takes the bracket's own, so
+    the remaining brackets are held to the first), the URL probes ran with
+    no proxy, and every corpus host and URL answered through that resolver.
+    Returns the resolver the bracket names.
+
+    passed=true is also what HOP D writes when it was given nothing to check,
+    so it is not on its own a bracket."""
+    if not isinstance(verify, dict):
+        raise RunError(f"{run_dir}: {name} is not a JSON object")
+    if verify.get("passed") is not True:
+        raise RunError(f"{run_dir}: {name} does not record passed=true")
+    dns_server = verify.get("dns_server")
+    if not isinstance(dns_server, str) or not dns_server:
+        raise RunError(
+            f"{run_dir}: {name} records dns_server={dns_server!r}; the bracket "
+            "names no resolver to have resolved through"
+        )
+    if resolver is not None and dns_server != resolver:
+        raise RunError(
+            f"{run_dir}: {name} records dns_server {dns_server!r}, not the "
+            f"{resolver!r} this run was measured through"
+        )
+    if verify.get("proxies_disabled") is not True:
+        raise RunError(
+            f"{run_dir}: {name} records proxies_disabled="
+            f"{verify.get('proxies_disabled')!r}; a URL probe that honoured the "
+            "exec's proxy fetched the live site, not the replay server"
+        )
+    hosts = verify.get("hosts")
+    if not isinstance(hosts, dict) or not hosts:
+        raise RunError(
+            f"{run_dir}: {name} records no resolved host; a bracket that "
+            "checked nothing proves nothing"
+        )
+    for host, record in sorted(hosts.items()):
+        if not isinstance(record, dict) or record.get("ok") is not True:
+            raise RunError(f"{run_dir}: {name} records {host} as {record!r}, not resolved")
+        if record.get("answer") != dns_server:
+            raise RunError(
+                f"{run_dir}: {name} records {host} answering "
+                f"{record.get('answer')!r}, not the replay address {dns_server!r}"
+            )
+    urls = verify.get("urls")
+    if not isinstance(urls, dict) or not urls:
+        raise RunError(
+            f"{run_dir}: {name} records no fetched URL; a bracket that "
+            "checked nothing proves nothing"
+        )
+    for url, record in sorted(urls.items()):
+        if not isinstance(record, dict) or record.get("ok") is not True:
+            raise RunError(f"{run_dir}: {name} records {url} as {record!r}, not fetched")
+        status = record.get("status")
+        if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 399:
+            raise RunError(
+                f"{run_dir}: {name} records {url} returning {status!r}, not a 2xx or 3xx"
+            )
+        if not isinstance(record.get("proxy_env_ignored"), list):
+            raise RunError(
+                f"{run_dir}: {name} does not record which proxy variables the "
+                f"{url} probe ignored, so nothing says the request left through none"
+            )
+    return dns_server
+
+
+def check_evidence(run_dir, evidence, sources, guest_dns):
     """Hold a clean verdict to the files it cites; raise RunError otherwise."""
     if not isinstance(evidence, dict):
         # Valid JSON that is not an object ([] for one) has no verdict to
@@ -267,13 +343,24 @@ def check_evidence(run_dir, evidence, sources):
             f"{run_dir}: dns-evidence.json records corpus_serve exit status "
             f"{serve_status!r}, not 0; the replay logs it hashed may be short"
         )
-    # The brackets: every stage the campaign runs, each present and passed.
+    # The brackets: every stage the campaign runs, each present, holding the
+    # bytes the verdict hashed, and asserting what the campaign asserted.
     # Basenames are resolved inside run_dir so a relocated run directory
     # still indexes; the evidence's own absolute paths are not trusted.
+    # Evidence that pins no bracket is refused rather than read: it cannot
+    # say whether the files beside it are the ones its verdict was formed on.
     verify_files = evidence.get("verify_files")
     if not isinstance(verify_files, list) or not all(isinstance(p, str) for p in verify_files):
         raise RunError(f"{run_dir}: dns-evidence.json has no verify_files list")
+    recorded = evidence.get("verify_file_sha256")
+    if not isinstance(recorded, dict):
+        raise RunError(
+            f"{run_dir}: dns-evidence.json has no verify_file_sha256 map; its "
+            "brackets are unpinned, so an edited one cannot be told from the "
+            "file the verdict read"
+        )
     cited = {os.path.basename(p) for p in verify_files}
+    resolver = guest_dns if isinstance(guest_dns, str) and guest_dns else None
     for stage in VERIFY_STAGES:
         name = f"verify-dns-{stage}.json"
         if name not in cited:
@@ -281,26 +368,29 @@ def check_evidence(run_dir, evidence, sources):
         path = os.path.join(run_dir, name)
         if not os.path.isfile(path):
             raise RunError(f"{run_dir}: {name} cited by dns-evidence.json is missing")
-        verify = sources.read_json(path)
-        if not isinstance(verify, dict) or verify.get("passed") is not True:
-            raise RunError(f"{run_dir}: {name} does not record passed=true")
+        want = recorded.get(name)
+        if not is_sha256(want):
+            raise RunError(f"{run_dir}: dns-evidence.json has no sha256 for {name}")
+        data, digest = sources.read_hashed(path)
+        if digest != want:
+            raise RunError(
+                f"{run_dir}: {name} sha256 {digest} does not match the {want} "
+                "dns-evidence.json recorded at the verdict"
+            )
+        resolver = check_verify_bracket(run_dir, name, parse_json(data, path), resolver)
     # The replay server's own logs, pinned by hash at the verdict.
     for field, name in REPLAY_LOGS.items():
-        recorded = evidence.get(field)
-        if (
-            not isinstance(recorded, str)
-            or len(recorded) != 64
-            or any(c not in "0123456789abcdef" for c in recorded)
-        ):
+        want = evidence.get(field)
+        if not is_sha256(want):
             raise RunError(f"{run_dir}: dns-evidence.json has no sha256 for {name} ({field})")
         path = os.path.join(run_dir, name)
         if not os.path.isfile(path):
             raise RunError(f"{run_dir}: {name} cited by dns-evidence.json is missing")
         _data, digest = sources.read_hashed(path)
-        if digest != recorded:
+        if digest != want:
             raise RunError(
                 f"{run_dir}: {name} sha256 {digest} does not match the "
-                f"{recorded} dns-evidence.json recorded at the verdict"
+                f"{want} dns-evidence.json recorded at the verdict"
             )
 
 
@@ -378,7 +468,7 @@ def load_cell(run_dir):
     evidence_path = os.path.join(run_dir, "dns-evidence.json")
     if os.path.isfile(evidence_path):
         evidence = sources.read_json(evidence_path)
-        check_evidence(run_dir, evidence, sources)
+        check_evidence(run_dir, evidence, sources, cell["guest_dns"])
         dns_verdict = evidence["verdict"]
         # Reported, not gated: the run driver refused a busy box at the
         # start, and evidence from before the sampler carried the load
