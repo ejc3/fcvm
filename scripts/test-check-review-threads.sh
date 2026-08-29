@@ -622,6 +622,53 @@ else
   fail=$((fail+1))
 fi
 
+echo "== finding 32: timestamps are ordered as instants, not as strings =="
+# Every ordering decision here compares two GitHub timestamps, and they do not all arrive
+# in one shape. Check-suite and comment timestamps come back whole-second
+# ("2026-01-02T00:30:00Z"); the datetime Codex writes into a review-summary row carries a
+# fraction ("2026-01-02T00:30:00.123456Z"). Compared as strings, "." sorts before "Z", so a
+# row completed in the same second as the head's check suite reads as EARLIER than it and
+# the head stays uncovered for as long as that row is the only coverage. String order also
+# accepts anything that is not a timestamp at all: "a while ago" sorts after every digit, so
+# a walkthrough or an answer with an unparsable date used to postdate everything.
+run_case "a summary row completed in the same second as the head arrival covers it" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T00:30:00.100Z deadbee)")" 2026-01-02T00:30:05Z)")" \
+  0 "HEAD COVERED"
+run_case "a disposition posted in the same second as the claim answers it" \
+  "$(wrap4 me '[]' '[]' "[$(cmt codex Bot 2026-01-02T00:30:00Z '"P1: this drops the last row"'),$(cmt me User 2026-01-02T00:30:00.100Z '"RED-VERIFIED: tests/row.rs"')]")" \
+  0 "CLEAR"
+run_case "a disposition 0.1s BEFORE the claim does not answer it" \
+  "$(wrap4 me '[]' '[]' "[$(cmt codex Bot 2026-01-02T00:30:00.100Z '"P1: this drops the last row"'),$(cmt me User 2026-01-02T00:30:00Z '"RED-VERIFIED: tests/row.rs"')]")" \
+  1 "carry no disposition"
+run_case "a verdict timestamped in a non-UTC offset is ordered as the instant it names" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00+01:00 "$(codex_body ' Bravo.' deadbeef)")")" \
+  1 "UNREVIEWED HEAD"
+run_case "arrival is the earliest check suite by instant, not by string" \
+  "$(wrap8 '[{"createdAt":"2026-01-02T00:30:00.900Z"},{"createdAt":"2026-01-02T00:30:00Z"}]' "$(cmt "$CODEX" Bot 2026-01-02T00:30:00.500Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  0 "HEAD COVERED"
+# An unparsable timestamp orders against nothing, so it grants no coverage and answers no
+# claim. Where the gate validates the field it says so and exits 2; where it does not
+# (updatedAt), the comment simply binds nothing.
+run_case "a check-suite timestamp that will not parse blocks" \
+  "$(wrap8 '[{"createdAt":"2026-01-02T00:30"}]' "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  2 "check-suite timestamp"
+run_case "a review body whose timestamp will not parse blocks" \
+  "$(wrap '[]' '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"a while ago","body":"P1: this drops the last row"}]')" \
+  2 "no parsable submittedAt"
+run_case "an answer whose timestamp will not parse answers nothing" \
+  "$(wrap4 me '[]' '[]' "[$(cmt codex Bot 2026-01-02T00:30:00Z '"P1: this drops the last row"'),$(cmt me User yesterday '"RED-VERIFIED: tests/row.rs"')]")" \
+  2 "no parsable createdAt"
+run_case "a walkthrough whose updatedAt will not parse is not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk none clean "$BASE40" "$HEAD40")" 'a while ago'),$ANSWER]")" \
+  1 "UNREVIEWED HEAD"
+# Guard: the parse is UTC (jq mktime is timegm), so a verdict must not depend on where the
+# runner sits. The same fixture under a non-UTC zone reaches the same verdict.
+export TZ=America/New_York
+run_case "the same-second verdict holds under a non-UTC host timezone" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T00:30:00.100Z deadbee)")" 2026-01-02T00:30:05Z)")" \
+  0 "HEAD COVERED"
+unset TZ
+
 echo "== regression: the original behaviours still hold =="
 run_case "unresolved thread blocks" \
   "$(wrap '[{"isResolved":false,"comments":{"nodes":[{"author":{"login":"x"},"path":"a.ts","line":1,"body":"something"}]}}]')" \

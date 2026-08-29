@@ -51,6 +51,35 @@ COMMENTS_PAGE_SIZE=${COMMENTS_PAGE_SIZE:-100}
 # instead of one with 100+ submitted reviews.
 REVIEWS_PAGE_SIZE=${REVIEWS_PAGE_SIZE:-100}
 
+# Ordering timestamps. GitHub does not return them all in one shape: check-suite and
+# comment timestamps are whole-second ("2026-01-02T00:30:00Z"), while the datetime Codex
+# writes into a review-summary row carries a fraction ("2026-01-02T00:30:00.123456Z").
+# Compared as strings, "." sorts before "Z", so a result recorded in the SAME SECOND as the
+# head check suite reads as earlier than the head arrived, and the head stays uncovered for
+# as long as that result is its only coverage. String order also ranks values that are not
+# timestamps at all: "a while ago" sorts after every digit, so an unparsable date postdated
+# everything and granted coverage.
+#
+# `ts` parses an ISO-8601 instant to epoch seconds, with the fraction optional and the zone
+# either Z or a +HH:MM offset, and yields null for anything else. Every comparison below is
+# between parsed instants. A null orders against nothing: it grants no coverage and answers
+# no claim, and where the field is one the gate validates, the gate says so and exits 2.
+TS_JQ='def ts:
+  if type != "string" then null
+  else (capture("^(?<y>[0-9]{4})-(?<mo>[0-9]{2})-(?<d>[0-9]{2})[Tt](?<h>[0-9]{2}):(?<mi>[0-9]{2}):(?<s>[0-9]{2})(\\.(?<frac>[0-9]+))?([Zz]|(?<zsign>[+-])(?<zh>[0-9]{2}):?(?<zm>[0-9]{2}))$") // null) as $c
+  | if $c == null then null
+    else ($c.mo | tonumber) as $mo | ($c.d | tonumber) as $dd
+       | ($c.h | tonumber) as $hh | ($c.mi | tonumber) as $mm | ($c.s | tonumber) as $ss
+       | (($c.zh // "0") | tonumber) as $zh | (($c.zm // "0") | tonumber) as $zm
+       | if $mo < 1 or $mo > 12 or $dd < 1 or $dd > 31 or $hh > 23 or $mm > 59 or $ss > 60
+            or $zh > 23 or $zm > 59 then null
+         else ([($c.y | tonumber), $mo - 1, $dd, $hh, $mm, $ss, 0, 0] | mktime)
+              + (if $c.frac then ("0." + $c.frac | tonumber) else 0 end)
+              - (if $c.zsign == "-" then -1 else 1 end) * ($zh * 3600 + $zm)
+         end
+    end
+  end;'
+
 fetch_payload() {
   local pr=$1 cursor=null threads='[]' reviews='[]' prcomments='[]' prauthor='' headoid=''
 
@@ -297,20 +326,20 @@ if ! jq -e 'all(((.body // "") | type) == "string")' >/dev/null 2>&1 <<<"$review
   echo "verdict: BLOCKED — a review body is not text; refusing to judge it." >&2
   exit 2
 fi
-if ! jq -e 'all(((.body // "") | test("[^[:space:]]") | not) or ((.submittedAt | type) == "string"))' \
+if ! jq -e "$TS_JQ"'all(((.body // "") | test("[^[:space:]]") | not) or ((.submittedAt | ts) != null))' \
      >/dev/null 2>&1 <<<"$reviews"; then
-  echo "verdict: BLOCKED — a non-empty review body has no submittedAt timestamp, so this" >&2
-  echo "gate cannot tell whether the answer came before or after the claim." >&2
+  echo "verdict: BLOCKED — a non-empty review body has no parsable submittedAt timestamp, so" >&2
+  echo "this gate cannot tell whether the answer came before or after the claim." >&2
   exit 2
 fi
 if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$prcomments"; then
   echo "verdict: BLOCKED — top-level PR comment data is not an array." >&2
   exit 2
 fi
-if ! jq -e 'all(((.body // "") | type) == "string"
-                and (((.body // "") | test("[^[:space:]]") | not) or ((.createdAt | type) == "string")))' \
+if ! jq -e "$TS_JQ"'all(((.body // "") | type) == "string"
+                and (((.body // "") | test("[^[:space:]]") | not) or ((.createdAt | ts) != null)))' \
      >/dev/null 2>&1 <<<"$prcomments"; then
-  echo "verdict: BLOCKED — a top-level PR comment has a non-text body or no createdAt." >&2
+  echo "verdict: BLOCKED — a top-level PR comment has a non-text body or no parsable createdAt." >&2
   exit 2
 fi
 # The coverage check below certifies that the HEAD was reviewed, so a payload that names
@@ -508,6 +537,11 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
 # from a comment it can no longer quote. Every path compares, including --from-file: the
 # payload carries the second read under `recheck`, which is what fetch_payload fills, so a
 # fixture exercises the same code the live run does.
+#
+# The sort_by here is the one place a timestamp is not parsed, deliberately: it puts the two
+# fingerprints in one canonical order so they can be compared for EQUALITY, and never decides
+# which of two instants came first. A timestamp that differs between the reads, in value or in
+# shape, makes the fingerprints differ, which blocks.
 COVERAGE_FP_JQ="$VERDICT_JQ"'($bots | split(",")) as $botlogins
   | [ .[] | select(((.author.__typename // "") == "Bot") and (.author.login | IN($botlogins[])))
           | select(((.body // "") | is_verdict) or ((.body // "") | is_codex_summary)
@@ -637,27 +671,30 @@ fi
 # And an answer only answers what came BEFORE it. Counting dispositions in aggregate ("any
 # disposition exists => nothing outstanding") meant a finding posted after an earlier round
 # was closed was silently treated as answered. Each claim needs a disposition NEWER than
-# itself; ISO-8601 timestamps compare lexicographically, and the validation above
-# guarantees every non-empty body has one.
-unanswered=$(jq -r --arg re "$disposition_re" '
-  [ .[] | select((.body // "") | test($re)) | .at ] as $answers
+# itself, compared as instants (`ts`): as strings, an answer posted 0.1s BEFORE a claim in
+# the same second sorted after it, because "Z" sorts after ".". An answer whose timestamp
+# will not parse is dropped, and a claim whose timestamp will not parse cannot be shown to
+# have been answered, so it stays outstanding; the validation above blocks both shapes
+# first, and this keeps the comparison itself fail-closed rather than resting on that.
+unanswered=$(jq -r --arg re "$disposition_re" "$TS_JQ"'
+  [ .[] | select((.body // "") | test($re)) | (.at | ts) | select(. != null) ] as $answers
   | [ .[] | select(.claimable)
           | select((.body // "") | test("[^[:space:]]"))
           | select(((.body // "") | test($re)) | not)
-          | . as $claim
-          | select([ $answers[] | select(. > $claim.at) ] | length == 0) ]
+          | (.at | ts) as $cat
+          | select($cat == null or ([ $answers[] | select(. > $cat) ] | length == 0)) ]
   | length' <<<"$bodies") || {
   echo "verdict: BLOCKED — could not evaluate PR-level bodies." >&2; exit 2; }
 
 if [ "${unanswered:-0}" -gt 0 ]; then
   echo
-  jq -r --arg re "$disposition_re" '
-    [ .[] | select((.body // "") | test($re)) | .at ] as $answers
+  jq -r --arg re "$disposition_re" "$TS_JQ"'
+    [ .[] | select((.body // "") | test($re)) | (.at | ts) | select(. != null) ] as $answers
     | .[] | select(.claimable)
     | select((.body // "") | test("[^[:space:]]"))
     | select(((.body // "") | test($re)) | not)
-    | . as $claim
-    | select([ $answers[] | select(. > $claim.at) ] | length == 0)
+    | (.at | ts) as $cat
+    | select($cat == null or ([ $answers[] | select(. > $cat) ] | length == 0))
     | "  UNANSWERED \(.author.login) (\(.state))\n    \(.body | split("\n")[0][0:150])"' <<<"$bodies"
   echo
   echo "verdict: BLOCKED — $unanswered PR-level review body/bodies carry no disposition."
@@ -722,13 +759,28 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   # Arrival is the creation of the head's earliest check suite, not committedDate: a
   # commit made locally before an older head's verdict and pushed afterwards would
   # otherwise read as covered. Without a check suite nothing can be dated after arrival
-  # and the head stays uncovered.
-  arrived=$(jq -r '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[]?.createdAt // empty] | min // ""' <<<"$payload" 2>/dev/null)
-  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" --arg h "$headoid" '
-    [ .[] | select(.state == "COMMENT" and .author.login != $me)
+  # and the head stays uncovered. Earliest is by INSTANT: as strings, a whole-second
+  # timestamp sorts after a fractional one in the same second, so the string minimum can
+  # name a later suite than the one that actually created first. And an arrival that will
+  # not parse dates nothing, which is a block: as a string it still ranked against every
+  # verdict, and one sorting below them certified the head.
+  suitetimes=$(jq -c '[.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes[]?.createdAt // empty]' \
+    <<<"$payload" 2>/dev/null) || {
+    echo "verdict: BLOCKED — could not read the head commit's check suites." >&2; exit 2; }
+  if ! jq -e "$TS_JQ"'type == "array" and all(ts != null)' >/dev/null 2>&1 <<<"$suitetimes"; then
+    echo "verdict: BLOCKED — a check-suite timestamp on the head will not parse, so this gate" >&2
+    echo "cannot tell when the head arrived, and cannot date any review result against it." >&2
+    exit 2
+  fi
+  arrived=$(jq -r "$TS_JQ"'min_by(ts) // ""' <<<"$suitetimes") || {
+    echo "verdict: BLOCKED — could not date the head's arrival." >&2; exit 2; }
+  verdicts=$(jq -r --arg me "$prauthor" --arg hd "$arrived" --arg h "$headoid" "$TS_JQ"'
+    ($hd | ts) as $hat
+    | [ .[] | select(.state == "COMMENT" and .author.login != $me)
         | select(any(.reviewed_rows[]?; . as $row
+                     | ($row.at | ts) as $rat
                      | ($row.sha // "") != "" and ($h | startswith($row.sha))
-                     and $hd != "" and (($row.at // "") > $hd))) ]
+                     and $hat != null and $rat != null and $rat > $hat)) ]
     | length' <<<"$bodies") || {
     echo "verdict: BLOCKED — could not evaluate no-findings verdicts." >&2; exit 2; }
   # A head is covered by a review object on it from someone other than the author, or by
