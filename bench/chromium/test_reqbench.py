@@ -8717,6 +8717,51 @@ class AnalyzerResolverGate(unittest.TestCase):
             )
         self.assertIs(out["publishable"], True, out["gate"]["reasons"])
 
+    def test_a_url_whose_authority_the_browser_reads_differently_is_refused(self):
+        """`http://evil.example\\@127.0.0.1/` is host 127.0.0.1 to urlsplit,
+        an IP literal that needs no resolver. Chromium follows the URL
+        Standard, which maps a backslash to a slash in a special scheme, so
+        the authority ends at `evil.example` and that is the name it
+        resolves. Reading the URL one way while the browser reads it another
+        turns the resolver gate off: the run publishes with guest_dns null
+        while the corpus was answered by ambient DNS. Userinfo moves the host
+        the same way, so a measured http(s) URL must carry a plain
+        host[:port] authority or it is not a URL this analyzer can judge.
+
+        RED BEFORE THE FIX: `AssertionError: True is not False` on the
+        backslash URL with no resolver recorded (rc 0).
+        """
+        # Control: an IP-literal fixture URL needs no resolver and publishes.
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, ["http://127.0.0.1:8000/a.html"]),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        unreadable = (
+            "http://evil.example\\@127.0.0.1/",
+            "https://evil.example\\@127.0.0.1/",
+            "http://user@127.0.0.1/",
+        )
+        for url in unreadable:
+            # Refused with a resolver too: the analyzer cannot say which host
+            # was answered, so naming one proves nothing.
+            for extra in ({}, {"guest_dns": "10.0.2.2"}):
+                with self.subTest(url=url, extra=extra):
+                    with tempfile.TemporaryDirectory() as d:
+                        rc, out = self._analyze(
+                            d, lambda src: self.write_multi_url(
+                                src, [url], **extra),
+                        )
+                    self.assertIs(out["publishable"], False)
+                    self.assertEqual(rc, 5)
+                    errors = out["gate"]["backend_metadata"]["errors"]
+                    self.assertTrue(
+                        any("evil.example" in error or "user@" in error
+                            for error in errors),
+                        f"the refusal must quote the URL it could not read: {errors}",
+                    )
+
     def test_corpus_hostnames_with_guest_dns_are_publishable(self):
         with tempfile.TemporaryDirectory() as d:
             rc, out = self._analyze(

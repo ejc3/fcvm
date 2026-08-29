@@ -221,16 +221,40 @@ def declared_urls(meta):
     return []
 
 
+# The authority of a measured http(s) URL, as both this analyzer and the
+# browser read it: host[:port], where host is a name, an IPv4 literal or a
+# bracketed IPv6 literal. Anything else is refused rather than judged, because
+# urlsplit and the URL Standard Chromium implements stop reading the authority
+# in different places.
+HTTP_AUTHORITY = re.compile(
+    r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$"
+)
+
+
 def url_needs_resolver(url):
     """Whether a URL's host is a name only a resolver can answer.
 
-    False for an IP literal or localhost, None when the URL has no host.
+    False for an IP literal or localhost, None when the URL has no host this
+    analyzer reads the same way the browser does.
+
+    `http://evil.example\\@127.0.0.1/` is that second case. urlsplit reads
+    the authority as `evil.example\\@127.0.0.1` and reports the host
+    127.0.0.1, an IP literal that needs no resolver; Chromium follows the URL
+    Standard, which maps a backslash to a slash in a special scheme, so the
+    authority ends at `evil.example` and that is the name it resolves. The
+    run would publish with guest_dns null while ambient DNS answered its
+    corpus. Userinfo moves the host in the same way, and a non-ASCII host is
+    refused too: urlsplit does not apply IDNA, so the name this function
+    would judge is not the name the browser resolved.
     """
     try:
-        host = urlsplit(url).hostname
+        parts = urlsplit(url)
     except ValueError:
         return None
+    host = parts.hostname
     if not host:
+        return None
+    if parts.scheme in ("http", "https") and not HTTP_AUTHORITY.match(parts.netloc):
         return None
     if host == "localhost":
         return False
@@ -629,7 +653,10 @@ def _validate_resolver(meta, label, errors):
     for url in declared_urls(meta):
         needs_resolver = url_needs_resolver(url)
         if needs_resolver is None:
-            errors.append(f"{label} metadata declares URL {url!r} without a hostname")
+            errors.append(
+                f"{label} metadata declares URL {url!r}, which names no host "
+                "this analyzer reads the same way the browser does"
+            )
         elif needs_resolver and resolver is None:
             errors.append(
                 f"{label} metadata declares URL {url!r} whose hostname needs "
