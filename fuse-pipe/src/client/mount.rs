@@ -666,18 +666,24 @@ mod tests {
     /// assertion reports the first.
     #[test]
     fn the_quickstart_guard_accepts_exactly_what_this_mount_accepts() {
-        let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../.claude/CLAUDE.md");
+        let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.claude/CLAUDE.md");
         let text = std::fs::read_to_string(&doc)
             .unwrap_or_else(|e| panic!("BLOCKED: cannot read {}: {e}", doc.display()));
         let line = text
             .lines()
             .find(|l| l.starts_with("grep") && l.contains("user_allow_other"))
             .unwrap_or_else(|| {
-                panic!("the quickstart's /etc/fuse.conf guard is gone from {}", doc.display())
+                panic!(
+                    "the quickstart's /etc/fuse.conf guard is gone from {}",
+                    doc.display()
+                )
             });
         // The guard is the test half of `<guard> || <append>`.
-        let guard = line.split("||").next().expect("a guard before the append").trim();
+        let guard = line
+            .split("||")
+            .next()
+            .expect("a guard before the append")
+            .trim();
         assert!(
             guard.contains("/etc/fuse.conf"),
             "the documented guard does not read /etc/fuse.conf: {guard}"
@@ -707,7 +713,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("BLOCKED: cannot run the documented guard: {e}"));
             // grep answers 0 (matched) or 1 (did not). Anything else is a
             // guard that could not evaluate the file, which says nothing.
-            let code = status.code().unwrap_or_else(|| panic!("BLOCKED: {command} was signalled"));
+            let code = status
+                .code()
+                .unwrap_or_else(|| panic!("BLOCKED: {command} was signalled"));
             assert!(
                 code == 0 || code == 1,
                 "BLOCKED: the documented guard exited {code} on {case:?}, so it evaluated nothing"
@@ -717,8 +725,16 @@ mod tests {
                 fuse_conf_allows_other(case),
                 "the quickstart's guard and this mount disagree about {case:?}: \
                  the guard says {}, the mount says {}",
-                if code == 0 { "configured" } else { "not configured" },
-                if fuse_conf_allows_other(case) { "configured" } else { "not configured" },
+                if code == 0 {
+                    "configured"
+                } else {
+                    "not configured"
+                },
+                if fuse_conf_allows_other(case) {
+                    "configured"
+                } else {
+                    "not configured"
+                },
             );
         }
     }

@@ -26,12 +26,23 @@ fn require_tools() {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(found, "BLOCKED: '{tool}' is missing; this test cannot evaluate anything");
+        assert!(
+            found,
+            "BLOCKED: '{tool}' is missing; this test cannot evaluate anything"
+        );
     }
     // The probe's own namespace. Without unprivileged user namespaces it
     // cannot start at all, and neither can rootless fcvm.
     let status = Command::new("unshare")
-        .args(["--user", "--map-root-user", "--net", "--mount", "--fork", "--", "true"])
+        .args([
+            "--user",
+            "--map-root-user",
+            "--net",
+            "--mount",
+            "--fork",
+            "--",
+            "true",
+        ])
         .status()
         .expect("run unshare");
     assert!(
@@ -86,7 +97,11 @@ fn processes_matching(needle: &str) -> Vec<String> {
 fn the_probe_leaves_no_dns_responder_behind() {
     require_tools();
     let script = repo_root().join("scripts/probe-pasta-dns-gateway.sh");
-    assert!(script.is_file(), "the probe is gone from {}", script.display());
+    assert!(
+        script.is_file(),
+        "the probe is gone from {}",
+        script.display()
+    );
 
     let tmp = tempfile::tempdir().expect("temp dir");
     let bin = tmp.path().join("bin");
