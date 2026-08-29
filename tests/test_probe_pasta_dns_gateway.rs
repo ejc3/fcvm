@@ -139,6 +139,20 @@ fn the_probe_leaves_no_dns_responder_behind() {
         .output()
         .expect("run the probe");
 
+    // A probe that never got as far as starting the responders leaves nothing
+    // behind for a reason that says nothing about reaping, so the assertion
+    // below would pass vacuously. Both OK lines mean it ran to its normal end.
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success()
+            && stdout.contains("OK   with -D none")
+            && stdout.contains("OK   without it"),
+        "BLOCKED: the probe did not reach its normal end, so this says nothing \
+         about reaping. status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+
     let needle = work_root.to_string_lossy().to_string();
     // The kernel tears the subtree down as the namespace's init exits; give it
     // a moment rather than racing the exit.
@@ -156,11 +170,9 @@ fn the_probe_leaves_no_dns_responder_behind() {
     }
     assert!(
         alive.is_empty(),
-        "the probe left {} process(es) alive after exiting with {}:\n{}\nstdout:\n{}\nstderr:\n{}",
+        "the probe left {} process(es) alive after exiting with {}:\n{}\nstdout:\n{stdout}",
         alive.len(),
         output.status,
         alive.join("\n"),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
     );
 }
