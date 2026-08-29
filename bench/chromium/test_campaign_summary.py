@@ -888,7 +888,12 @@ class CampaignSummary(unittest.TestCase):
         address gives the index nothing to hold expect_ips to, and its diag
         is refused rather than trusted; a passing bracket whose host was not
         ok, or whose answer is not an address, is refused as a record the
-        index cannot read an answer from.
+        index cannot read an answer from, and one that checked no host is
+        refused earlier still, as a bracket that proves nothing.
+
+        A bracket is held to the resolver it names, so a run whose brackets
+        answered another address is written naming that address throughout:
+        the cell's guest_dns, the bracket's dns_server, and the answer.
 
         Watched red 2026-08-28 at 51527021: every refused case was indexed
         (`AssertionError: 0 == 0`).
@@ -898,15 +903,26 @@ class CampaignSummary(unittest.TestCase):
             summary["limits"]["expect_ips"] = ips
             return summary
 
-        def brackets(host):
-            return {"hosts": {"example.com": host}}
+        def brackets(host, resolver=None):
+            """One bracket's hosts map. resolver also moves the bracket's own
+            dns_server and the resolv.conf it recorded, since every host in a
+            bracket is held to answering through the resolver that bracket
+            names."""
+            record = {"hosts": {"example.com": host}}
+            if resolver is not None:
+                record["dns_server"] = resolver
+                record["resolv_conf_vm"] = f"nameserver {resolver}\n"
+                record["resolv_conf_container"] = f"nameserver {resolver}\n"
+            return record
 
         rule = ("BENCH_RESOLVE_ALL_TO=10.0.2.7",)
         fixture_url = "http://127.0.0.1:8000/medium.html"
         fixture = {"url": fixture_url}
         accepted = (
             ("brackets that answered 10.0.2.9",
-             dict(verify_overrides=brackets({"answer": "10.0.2.9", "ok": True}),
+             dict(guest_dns="10.0.2.9",
+                  verify_overrides=brackets({"answer": "10.0.2.9", "ok": True},
+                                            resolver="10.0.2.9"),
                   diag=diag_for(["10.0.2.9"]))),
             ("a resolver rule naming 10.0.2.7",
              dict(dns_verdict=None, guest_dns=None, guest_env=rule,
@@ -924,7 +940,9 @@ class CampaignSummary(unittest.TestCase):
                 self.assertEqual(rc, 0, f"{label}: {text}")
         refused = (
             ("the replay answer where the brackets answered 10.0.2.9",
-             dict(verify_overrides=brackets({"answer": "10.0.2.9", "ok": True}),
+             dict(guest_dns="10.0.2.9",
+                  verify_overrides=brackets({"answer": "10.0.2.9", "ok": True},
+                                            resolver="10.0.2.9"),
                   diag=diag_for(["10.0.2.2"])), "10.0.2.9"),
             ("the replay answer where the rule names 10.0.2.7",
              dict(dns_verdict=None, guest_dns=None, guest_env=rule,
@@ -937,7 +955,7 @@ class CampaignSummary(unittest.TestCase):
              "no address"),
             ("brackets that checked no host",
              dict(verify_overrides={"hosts": {}}, diag=diag_for(["10.0.2.2"])),
-             "no address"),
+             "no resolved host"),
             ("a bracket host that was not ok under passed=true",
              dict(verify_overrides=brackets({"answer": "10.0.2.2", "ok": False}),
                   diag=diag_for(["10.0.2.2"])), "ok"),
