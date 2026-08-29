@@ -566,10 +566,12 @@ sudo usermod -aG kvm $USER
 # 2. Packages (Ubuntu 24.04). btrfs-progs is needed by the very next step;
 #    bc/bison/flex/libelf-dev are the kernel fallback build's dependencies —
 #    setup builds a kernel locally whenever a profile's release artifact is
-#    absent, and a fresh box hits that path.
+#    absent, and a fresh box hits that path. libseccomp-dev is the firecracker
+#    fork's: setup builds it from source and the link fails with
+#    "cannot find -lseccomp" without the headers.
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
-    btrfs-progs bc bison flex libelf-dev
+    btrfs-progs bc bison flex libelf-dev libseccomp-dev
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
