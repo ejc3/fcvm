@@ -292,6 +292,45 @@ pub fn resolver_groups(sources: &[ResolvSource]) -> Vec<ResolverGroup> {
         .collect()
 }
 
+/// The first IPv6 nameserver any group names, in source order.
+///
+/// Routed mode gives the guest exactly this server when a source names one: an
+/// IPv4 resolver is unreachable from a routed guest without MASQUERADE, so
+/// `RoutedNetwork::setup` picks the first IPv6 one. That choice reads only the
+/// resolv.conf sources, so it can be made before the launch config exists, and
+/// both the selection and the search-domain narrowing call this one function
+/// rather than each spelling the rule out.
+///
+/// Every server in a group is already a parsed, non-loopback address, so
+/// "is IPv6" and the older "contains a colon" test select the same entry.
+pub fn first_ipv6_nameserver(groups: &[ResolverGroup]) -> Option<String> {
+    groups
+        .iter()
+        .flat_map(|group| group.servers.iter())
+        .find(|server| {
+            server
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_ipv6())
+        })
+        .cloned()
+}
+
+/// The groups narrowed to one server: those that named it, carrying only it.
+///
+/// What a mode that forwards a single resolver applies. Dropping the other
+/// servers takes their search domains with them, because a domain lives in the
+/// same value as the servers it belongs to.
+pub fn narrowed_to(groups: Vec<ResolverGroup>, server: &str) -> Vec<ResolverGroup> {
+    groups
+        .into_iter()
+        .filter(|group| group.servers.iter().any(|s| s == server))
+        .map(|group| ResolverGroup {
+            servers: vec![server.to_string()],
+            search_domains: group.search_domains,
+        })
+        .collect()
+}
+
 /// The search domains of the groups that still carry a resolver, in order,
 /// de-duplicated with the first occurrence winning.
 ///
@@ -591,6 +630,59 @@ mod tests {
             .is_err(),
             "a lookalike directive and a bare `nameserver` name no server"
         );
+    }
+
+    /// The routed selection moved out of detect_ipv6_dns so that the narrowing
+    /// and the selection cannot drift. This holds the move behaviour-preserving
+    /// against the expression it replaced.
+    #[test]
+    fn first_ipv6_nameserver_selects_what_routed_selected_before() {
+        fn previous(sources: &[ResolvSource]) -> Option<String> {
+            nameservers_from_sources(sources)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|server| server.contains(':'))
+        }
+
+        for (run_body, etc_body) in [
+            ("nameserver 10.1.0.2\n", "nameserver 2001:db8::53\n"),
+            ("nameserver 2001:db8::53\n", "nameserver 10.1.0.2\n"),
+            ("nameserver 10.1.0.2\n", "nameserver 192.0.2.53\n"),
+            ("nameserver ::1\n", "nameserver 2001:db8::53\n"),
+            ("nameserver 2001:db8::53\n", "nameserver 2001:db8::53\n"),
+            ("search .\n", "nameserver fd00:ec2::253\n"),
+        ] {
+            let sources = [
+                readable(RESOLV_CONF_SOURCES[0], run_body),
+                readable(ETC_RESOLV_CONF, etc_body),
+            ];
+            assert_eq!(
+                first_ipv6_nameserver(&resolver_groups(&sources)),
+                previous(&sources),
+                "run={run_body:?} etc={etc_body:?}"
+            );
+        }
+    }
+
+    /// Narrowing to a server keeps the groups that named it, carrying only it,
+    /// and takes the other groups' search domains with them.
+    #[test]
+    fn narrowing_to_a_server_drops_the_other_groups_domains() {
+        let groups = resolver_groups(&[
+            readable(
+                RESOLV_CONF_SOURCES[0],
+                "nameserver 10.1.0.2\nsearch corp.example\n",
+            ),
+            readable(
+                ETC_RESOLV_CONF,
+                "nameserver 2001:db8::53\nnameserver 8.8.8.8\nsearch lab.example\n",
+            ),
+        ]);
+
+        let narrowed = narrowed_to(groups, "2001:db8::53");
+        assert_eq!(narrowed.len(), 1, "only the group that named it survives");
+        assert_eq!(narrowed[0].servers, vec!["2001:db8::53"]);
+        assert_eq!(search_domains_of(&narrowed), vec!["lab.example"]);
     }
 
     /// The other half of #875: the search list and the nameserver list have to

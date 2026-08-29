@@ -2873,6 +2873,53 @@ mod tests {
         );
     }
 
+    /// Routed forwards one resolver as well: the first IPv6 nameserver the
+    /// sources name (src/network/routed.rs, detect_ipv6_dns). An IPv4
+    /// secondary never reaches a routed guest, so it must not key; the
+    /// selected IPv6 server does reach it, so it must.
+    ///
+    /// This narrowed what routed hashes, so a routed snapshot key computed
+    /// before it changes value once and those cached snapshots are rebuilt.
+    /// The steady state shares more: hosts differing only in a resolver the
+    /// routed guest never sees now hit the same key.
+    #[test]
+    fn routed_mode_keys_only_the_emitted_dns() {
+        let routed = |groups: Vec<crate::network::ResolverGroup>| {
+            let mut args = test_args();
+            args.network = NetworkMode::Routed;
+            key_for(
+                &args,
+                GuestBootInputs {
+                    dns: groups,
+                    ..Default::default()
+                },
+            )
+        };
+        let two = |ipv6: &str, ipv4: &str| {
+            vec![
+                crate::network::ResolverGroup {
+                    servers: vec![ipv4.to_string()],
+                    search_domains: vec!["corp.example".to_string()],
+                },
+                crate::network::ResolverGroup {
+                    servers: vec![ipv6.to_string()],
+                    search_domains: vec!["lab.example".to_string()],
+                },
+            ]
+        };
+
+        assert_eq!(
+            routed(two("2001:db8::53", "10.1.0.2")),
+            routed(two("2001:db8::53", "192.0.2.53")),
+            "an IPv4 resolver never reaches a routed guest and must not change its key"
+        );
+        assert_ne!(
+            routed(two("2001:db8::53", "10.1.0.2")),
+            routed(two("2001:db8::54", "10.1.0.2")),
+            "the selected IPv6 resolver IS emitted and must change the key"
+        );
+    }
+
     /// #863: with no --map, fc-agent never calls mount_fuse_volumes
     /// (fc-agent/src/agent.rs gates it on plan.volumes, and the four knobs are
     /// read only inside fc-agent/src/fuse/mod.rs's mount path), so the knobs

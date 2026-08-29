@@ -1102,12 +1102,13 @@ impl GuestBootInputs {
     ///   build_runtime_boot_args emits the whole host_dns list and every
     ///   source's resolver reaches the guest. Its groups are left alone and
     ///   the guest keeps every source's search domains.
-    /// * Routed mode forwards a single resolver too, but it picks it inside
-    ///   RoutedNetwork::setup (detect_ipv6_dns) after this config and its
-    ///   snapshot key already exist, so the choice is not visible here and its
-    ///   groups are left whole. Narrowing them needs that choice threaded into
-    ///   the config the way #863 threaded bridged's; guessing the rule here
-    ///   would drop the suffixes the probe fallback's resolver does serve.
+    /// * Routed mode forwards a single resolver too: the first IPv6 nameserver
+    ///   the sources name, because an IPv4 resolver is unreachable from a
+    ///   routed guest. detect_ipv6_dns reads only the host's resolv.conf for
+    ///   that, so the same selector runs here and the groups narrow to it.
+    ///   Its probe fallback (fd00:ec2::253) belongs to no source and leaves
+    ///   the groups whole, since that resolver does serve the VPC suffix the
+    ///   host carries and emptying the list would break it: see #886.
     /// * The four FUSE knobs are read only inside fc-agent's FUSE mount path
     ///   (fc-agent/src/fuse/mod.rs), and mount_fuse_volumes runs only when
     ///   the boot plan carries volumes (fc-agent/src/agent.rs), so a
@@ -1125,16 +1126,29 @@ impl GuestBootInputs {
             let selected = self.host_dns().into_iter().next();
             let groups = std::mem::take(&mut self.dns);
             self.dns = match selected {
-                Some(server) => groups
-                    .into_iter()
-                    .filter(|group| group.servers.contains(&server))
-                    .map(|group| crate::network::ResolverGroup {
-                        servers: vec![server.clone()],
-                        search_domains: group.search_domains,
-                    })
-                    .collect(),
+                Some(server) => crate::network::narrowed_to(groups, &server),
                 None => Vec::new(),
             };
+        }
+        if matches!(network_mode, crate::firecracker::FcNetworkMode::Routed) {
+            // Routed forwards one resolver too, and an IPv4 one is unreachable
+            // from a routed guest, so RoutedNetwork::setup gives it the first
+            // IPv6 nameserver the sources name. That read is a pure function of
+            // the same sources, with no dependency on anything setup creates,
+            // so it is made here from the shared selector and the groups narrow
+            // to it exactly as bridged's do.
+            //
+            // When no source names an IPv6 server, detect_ipv6_dns falls back
+            // to probing the AWS VPC resolver at fd00:ec2::253, which belongs
+            // to no source and so has no group to narrow to. The groups are
+            // left whole there rather than emptied: that resolver does serve
+            // the VPC suffix the host's resolv.conf carries, and dropping it
+            // would break short-name resolution that works today. A suffix
+            // from an unrelated source still reaches it, which is #886.
+            if let Some(server) = crate::network::first_ipv6_nameserver(&self.dns) {
+                let groups = std::mem::take(&mut self.dns);
+                self.dns = crate::network::narrowed_to(groups, &server);
+            }
         }
         if !has_fuse_volumes {
             self.fuse_readers = None;
@@ -2027,6 +2041,81 @@ mod tests {
         assert!(
             boot_args.contains("fcvm_dns_search=corp.example"),
             "the selected resolver's suffix still has to reach the guest: {boot_args:?}"
+        );
+    }
+
+    /// Routed forwards ONE resolver, and an IPv4 one is unreachable from a
+    /// routed guest, so it takes the first IPv6 nameserver the sources name.
+    /// The guest must see only that resolver's suffixes; keeping the merged
+    /// list sends a private suffix from the IPv4 source to the IPv6 resolver
+    /// that was selected (CWE-200).
+    #[test]
+    fn routed_forwards_only_the_search_domains_of_the_ipv6_resolver_it_selects() {
+        let sources = [
+            resolv_source(
+                crate::network::RESOLV_CONF_SOURCES[0],
+                "nameserver 10.1.0.2\nsearch corp.example\n",
+            ),
+            resolv_source(
+                crate::network::ETC_RESOLV_CONF,
+                "nameserver 2001:db8::53\nsearch lab.example\n",
+            ),
+        ];
+
+        let inputs = GuestBootInputs::from_sources(None, &sources, &no_runtime_knobs())
+            .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+
+        assert_eq!(
+            inputs.host_dns(),
+            vec!["2001:db8::53"],
+            "routed forwards the first IPv6 resolver only"
+        );
+        assert_eq!(
+            inputs.dns_search(),
+            vec!["lab.example"],
+            "the IPv4 source's suffix must not travel to the IPv6 resolver"
+        );
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
+            ..Default::default()
+        };
+        // What RoutedNetwork::setup puts in the network config for this host.
+        let network_config = crate::network::NetworkConfig {
+            dns_server: Some("2001:db8::53".to_string()),
+            ..Default::default()
+        };
+
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        assert!(
+            !boot_args.contains("corp.example"),
+            "the unselected source's suffix must not be emitted: {boot_args:?}"
+        );
+        assert!(
+            boot_args.contains("fcvm_dns_search=lab.example"),
+            "the selected resolver's suffix still reaches the guest: {boot_args:?}"
+        );
+    }
+
+    /// The probe fallback: no source names an IPv6 server, so detect_ipv6_dns
+    /// probes the AWS VPC resolver at fd00:ec2::253, which belongs to no
+    /// source and has no group to narrow to. The list is left whole on purpose
+    /// rather than emptied, because that resolver does serve the VPC suffix
+    /// the host's resolv.conf carries and emptying it would break short-name
+    /// resolution that works today. A suffix from an unrelated source still
+    /// reaches that resolver: #886 tracks closing that, and this test exists so
+    /// the decision is deliberate rather than an oversight.
+    #[test]
+    fn routed_without_an_ipv6_source_keeps_the_search_list() {
+        let inputs = GuestBootInputs::from_sources(None, &two_source_host(), &no_runtime_knobs())
+            .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+
+        assert_eq!(inputs.host_dns(), vec!["10.1.0.2", "192.0.2.53"]);
+        assert_eq!(
+            inputs.dns_search(),
+            vec!["corp.example", "lab.example"],
+            "nothing was selected, so nothing is narrowed away"
         );
     }
 

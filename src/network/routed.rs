@@ -1163,12 +1163,13 @@ async fn detect_ipv6_dns() -> Option<String> {
     // stub-only /run/systemd/resolve/resolv.conf must not hide an IPv6 server
     // named in /etc/resolv.conf (#875). Loopback entries are dropped for the
     // same reason as in bridged mode, so ::1 falls through to the probe below.
+    // The selection itself lives in network::first_ipv6_nameserver, which
+    // GuestBootInputs::for_launch also calls to narrow this guest's search
+    // domains to this server. Two copies of the rule could drift, and the
+    // drift would be silent: the guest would get one resolver and another
+    // source's suffixes.
     let sources = super::RESOLV_CONF_SOURCES.map(super::ResolvSource::read);
-    if let Some(server) = super::nameservers_from_sources(&sources)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|server| server.contains(':'))
-    {
+    if let Some(server) = super::first_ipv6_nameserver(&super::resolver_groups(&sources)) {
         return Some(server);
     }
 
