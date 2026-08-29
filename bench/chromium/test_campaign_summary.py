@@ -326,6 +326,7 @@ def write_run(
             )
         paths["owner_log"] = owner_log
         evidence = {
+            "run_id": analysis["run_id"],
             "serve_pid": 4242,
             "dnsmasq_was_active_before": True,
             "dnsmasq_active_after_restore": False,
@@ -1356,6 +1357,33 @@ class CampaignSummary(unittest.TestCase):
             })
             self.assertIn("verify-dns-after-run.json", text)
             self.assertIn("8.8.8.8", text)
+
+    def test_evidence_that_names_another_run_refuses(self):
+        """The evidence bundle is files beside the records, pinned to each
+        other by hash and to nothing else, so a clean bundle from run A
+        dropped into run B passed every check the index had: the brackets
+        hashed correctly, the resolver matched, and the verdict was clean.
+        corpus_campaign.sh records the run_id of the analysis its measured
+        run produced, and the index holds it to the analysis.json it is
+        indexing.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s), on all three shapes.
+        """
+        cases = (
+            ({"run_id": "1" * 32}, "1" * 32),
+            ({"run_id": None}, "run_id"),
+            ({"run_id": 17}, "run_id"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(evidence=overrides), tempfile.TemporaryDirectory() as d:
+                _paths, text = self._refused(d, evidence_overrides=overrides)
+                self.assertIn("dns-evidence.json", text)
+                self.assertIn(expected, text)
+        # An analysis with no run_id has nothing to bind the evidence to.
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(d, analysis_overrides={"run_id": None})
+            self.assertIn("run_id", text)
 
     def test_clean_evidence_whose_replay_log_changed_refuses(self):
         """The sha256 in the evidence pins the replay logs; a log that no

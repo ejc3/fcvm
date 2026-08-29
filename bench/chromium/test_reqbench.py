@@ -9335,7 +9335,11 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         """dns-evidence.json plus every file it names, as the campaign leaves
         them. corpus_campaign.sh hands HOP D the same URL list it measures on
         (VERIFY_DNS_URLS="$URLS") and the hostnames it derives from it, so
-        every bracket covers the whole corpus."""
+        every bracket covers the whole corpus, and it reads the run_id out of
+        the analysis.json the measured run's publication gate wrote, which is
+        what binds the bundle to this run."""
+        with open(os.path.join(run_dir, "analysis.json")) as handle:
+            run_id = json.load(handle)["run_id"]
         hosts = {urlsplit(url).netloc: {"answer": "10.0.2.2", "ok": True}
                  for url in cls.CORPUS}
         urls = {url: {"status": 200, "ok": True, "proxy_env_ignored": []}
@@ -9367,6 +9371,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         with open(os.path.join(run_dir, "dns-owner.log"), "w") as handle:
             handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n" * 12)
         return {
+            "run_id": run_id,
             "serve_pid": 4242,
             "dnsmasq_was_active_before": True,
             "dnsmasq_active_after_restore": False,

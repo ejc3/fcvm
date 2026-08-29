@@ -334,6 +334,23 @@ write_dns_evidence() {
     local out="$RESULTS/dns-evidence.json"
     local samples=0 first_mismatch="" before=false after=false after_state f
     local sampler_alive=false load_stats load_samples=0 load_max=null
+    # The run this bundle is evidence for. Every file in it (the brackets,
+    # the owner samples, the replay logs) sits beside the records and is
+    # pinned to the others by hash, and none of them names the run, so a
+    # clean bundle from one campaign copied into another campaign's run
+    # directory passes every check it has. The run_id comes from the
+    # analysis.json the measured run's publication gate wrote here minutes
+    # ago; reqbench.py stamps that id into every record, so it survives a
+    # re-analysis, which a hash of analysis.json would not.
+    local run_id=""
+    if [ -f "$RESULTS/analysis.json" ]; then
+        run_id=$(jq -r 'select((.run_id | type) == "string" and (.run_id | length) > 0)
+                        | .run_id' "$RESULTS/analysis.json" 2>/dev/null) || run_id=""
+    fi
+    if [ -z "$run_id" ]; then
+        verdict=unclean
+        reason="${reason:-$RESULTS/analysis.json names no run_id, so this evidence is bound to no measured run}"
+    fi
     [ "$DNSMASQ_WAS_ACTIVE" = yes ] && before=true
     [ "$SAMPLER_ALIVE_AT_STOP" = yes ] && sampler_alive=true
     if [ -s "$log" ]; then
@@ -405,7 +422,8 @@ write_dns_evidence() {
     else
         verdict=unclean; reason="${reason:-corpus_serve left no exit status in $status_file}"
     fi
-    if ! jq -n --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
+    if ! jq -n --arg run_id "$run_id" \
+        --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
         --arg after_state "$after_state" --argjson sampler_alive "$sampler_alive" \
         --argjson samples "$samples" --argjson interval "$DNS_SAMPLE_INTERVAL" \
         --argjson load_max "$load_max" --argjson load_samples "$load_samples" \
@@ -415,7 +433,8 @@ write_dns_evidence() {
         --argjson serve_status "$serve_status_json" \
         --argjson verify_sha "$verify_sha" \
         --arg verdict "$verdict" --args \
-        '{serve_pid: $serve_pid, dnsmasq_was_active_before: $before,
+        '{run_id: (if $run_id == "" then null else $run_id end),
+          serve_pid: $serve_pid, dnsmasq_was_active_before: $before,
           dnsmasq_active_after_restore: $after,
           dnsmasq_state_after_restore: $after_state,
           sampler_alive_at_stop: $sampler_alive, samples: $samples,

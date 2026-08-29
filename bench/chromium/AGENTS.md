@@ -193,8 +193,18 @@ easy to get wrong:
   run directory. `write_dns_evidence` records each bracket's sha256 as
   `verify_file_sha256`; `campaign_summary.py` rereads each bracket, refuses
   one whose hash moved since the verdict, and holds its contents to the
-  run's resolver, `proxies_disabled`, and every host and URL answered
-  through that resolver. Evidence carrying no bracket hashes is refused.
+  run's resolver, both captured `/etc/resolv.conf` views (each must name that
+  resolver and no other, since glibc walks the whole nameserver list),
+  `proxies_disabled`, and exactly the hostnames and URLs the cell measured.
+  Evidence carrying no bracket hashes is refused.
+- Which run the bundle is evidence for. Every file in it is pinned to the
+  others by hash and to nothing else, so a clean bundle from one campaign
+  copied into another campaign's run directory passes each of those checks.
+  `write_dns_evidence` records the `run_id` of the `analysis.json` the
+  measured run's publication gate left beside it, and `campaign_summary.py`
+  refuses evidence naming any other run. The id comes from the records
+  themselves, so it survives a re-analysis; a hash of `analysis.json` would
+  not.
 
 ## Six methodology defects — do not reintroduce
 

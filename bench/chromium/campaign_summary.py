@@ -7,7 +7,8 @@ Each run directory holds reqanalyze's analysis.json (required; its stall_gate
 must have been armed with --stall-max-ms and must have evaluated at least one
 record, since an unarmed gate reports passed=true having evaluated nothing),
 dns-evidence.json (required when the cell's guest_dns names a baked resolver,
-optional otherwise; when present its verdict must be "clean", it must carry
+optional otherwise; when present its verdict must be "clean", it must name
+the run_id of the analysis it sits beside, it must carry
 the replay server's exit status 0, every file it cites must be present and
 agree with the sha256 it recorded, each verify bracket must record the run's
 resolver in both captured /etc/resolv.conf views and nowhere else, with the
@@ -414,13 +415,19 @@ def check_verify_bracket(run_dir, name, verify, resolver, measured_urls, measure
     return dns_server
 
 
-def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls):
+def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id):
     """Hold a clean verdict to the files it cites; raise RunError otherwise.
 
     measured_urls is the cell's own URL list, what every bracket has to have
-    covered. Returns the set of addresses the verify brackets' resolver
-    answered, the run's own record of where its pages came from.
+    covered, and run_id the analysis this evidence has to be about. Returns
+    the set of addresses the verify brackets' resolver answered, the run's
+    own record of where its pages came from.
     """
+    if not isinstance(run_id, str) or not run_id:
+        raise RunError(
+            f"{run_dir}: analysis.json records run_id={run_id!r}, so its "
+            "dns-evidence.json can be bound to no run; re-run reqanalyze"
+        )
     if not measured_urls:
         raise RunError(
             f"{run_dir}: analysis.json cell names no url, so nothing says which "
@@ -433,6 +440,18 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls):
     verdict = evidence.get("verdict")
     if verdict != "clean":
         raise RunError(f"{run_dir}: dns-evidence.json verdict is {verdict!r}, not 'clean'")
+    # Every file in the bundle is pinned to the others by hash and to nothing
+    # else, so a clean bundle from another campaign copied in here passes each
+    # of those checks. corpus_campaign.sh records the run_id of the
+    # analysis.json its measured run produced; this is where that binding is
+    # read.
+    evidence_run = evidence.get("run_id")
+    if evidence_run != run_id:
+        raise RunError(
+            f"{run_dir}: dns-evidence.json records run_id={evidence_run!r}, not the "
+            f"{run_id!r} of the analysis it sits beside; that evidence was written "
+            "for another run"
+        )
     if not positive_int(evidence.get("samples")):
         raise RunError(
             f"{run_dir}: dns-evidence.json records samples={evidence.get('samples')!r}; "
@@ -874,7 +893,10 @@ def load_cell(run_dir):
     evidence_path = os.path.join(run_dir, "dns-evidence.json")
     if os.path.isfile(evidence_path):
         evidence = sources.read_json(evidence_path)
-        answers = check_evidence(run_dir, evidence, sources, cell["guest_dns"], measured)
+        answers = check_evidence(
+            run_dir, evidence, sources, cell["guest_dns"], measured,
+            analysis.get("run_id"),
+        )
         dns_verdict = evidence["verdict"]
         # Reported, not gated: the run driver refused a busy box at the
         # start, and evidence from before the sampler carried the load

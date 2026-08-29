@@ -995,11 +995,20 @@ read -r _ < "$GO"
     BRACKETS = ("pre", "before-run", "after-run")
     REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log")
 
+    RUN_ID = "20260828-000000-corpus"
+
     def _leave_files(self, results, brackets=BRACKETS, logs=REPLAY_LOGS,
-                     bracket_passed=True, serve_status="0"):
+                     bracket_passed=True, serve_status="0", analysis=RUN_ID):
         """What the campaign leaves in $RESULTS before write_dns_evidence:
         the bracket files, the replay logs and corpus-serve.status, the exit
-        status the server's wrapper writes once it is gone (None: no file)."""
+        status the server's wrapper writes once it is gone (None: no file),
+        and analysis.json, which the measured run's publication gate wrote
+        before this point (analysis=None: no file, the shape a run that never
+        reached its gate leaves; analysis="": the file with no run_id)."""
+        if analysis is not None:
+            body = {"run_id": analysis} if analysis else {"publishable": False}
+            with open(os.path.join(results, "analysis.json"), "w") as handle:
+                json.dump(body, handle)
         for stage in brackets:
             with open(os.path.join(results, f"verify-dns-{stage}.json"), "w") as handle:
                 handle.write(json.dumps({"passed": bracket_passed}) + "\n")
@@ -1057,13 +1066,13 @@ wait_sampler_gone() {
 """
 
     def _sample(self, env, results, verdict_in="clean", rows=1, mid_run="",
-                files=True):
+                files=True, **leave):
         """Sample until dns-owner.log carries `rows` rows, run `mid_run`,
         stop, write the evidence. `rows` is what the caller's assertions
         need, and mid_run has the SYNC helpers to wait for anything it
-        causes."""
+        causes. Extra keywords go to _leave_files."""
         if files:
-            self._leave_files(results)
+            self._leave_files(results, **leave)
         script = (f'set -u\n{self._helpers()}\n{self.SYNC}\n'
                   f'RESULTS="{results}"\nSERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\n'
                   'DNS_SAMPLE_INTERVAL=0.05\nstart_dns_sampler\n'
@@ -1073,6 +1082,49 @@ wait_sampler_gone() {
         self.assertEqual(result.returncode, 0, result.stderr)
         with open(os.path.join(results, "dns-evidence.json")) as handle:
             return json.load(handle), result
+
+    def test_the_evidence_names_the_run_it_was_written_beside(self):
+        """Nothing in the evidence bundle names the run. The brackets, the
+        owner samples and the replay logs are all files beside the records,
+        pinned to each other by hash, so a clean bundle from one campaign
+        copied into another campaign's run directory passes every check it
+        has. The evidence records the run_id of the analysis.json the
+        measured run's publication gate left beside it, which the index holds
+        to the run it is indexing.
+
+        The run_id is stamped into every record by reqbench.py, so it
+        survives a re-analysis; a hash of analysis.json would not, and would
+        invalidate the evidence whenever the run was re-analyzed.
+
+        RED BEFORE THE FIX: KeyError: 'run_id' on the clean case, and the
+        three missing-identity cases wrote verdict "clean".
+        """
+        with self.subTest(case="the run's own analysis"), \
+                tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            evidence, _ = self._sample(env, results)
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            self.assertIn("run_id", evidence, "the evidence names no run")
+            self.assertEqual(evidence["run_id"], self.RUN_ID)
+        for label, leave in (("no analysis.json", {"analysis": None}),
+                             ("an analysis.json with no run_id", {"analysis": ""})):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                evidence, _ = self._sample(env, results, **leave)
+                self.assertEqual(
+                    evidence["verdict"], "unclean",
+                    f"{label}: the evidence is bound to no run and is clean: {evidence}")
+                self.assertIsNone(evidence["run_id"])
+                self.assertIn("run_id", evidence["reason"])
+        with self.subTest(case="an unparseable analysis.json"), \
+                tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results)
+            with open(os.path.join(results, "analysis.json"), "w") as handle:
+                handle.write("{not json")
+            evidence, _ = self._sample(env, results, files=False)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIsNone(evidence["run_id"])
 
     def test_a_port_owner_change_mid_run_is_unclean(self):
         """The owner changes from the third sample on, so the case only
@@ -1251,8 +1303,8 @@ wait_sampler_gone() {
                 self.assertIn("cannot write", result.stderr,
                               f"the failed {tool} was not what made the verdict unclean")
                 self.assertEqual(sorted(os.listdir(results)),
-                                 sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log",
-                                         "corpus-serve.status"]
+                                 sorted(["analysis.json", "dns-owner.log", "corpus-dns.log",
+                                         "corpus-access.log", "corpus-serve.status"]
                                         + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
                                  "a partial evidence file or temp file was left behind")
 
