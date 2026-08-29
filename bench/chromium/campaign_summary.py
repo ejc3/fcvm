@@ -41,7 +41,9 @@ count and slowest load event per URL.
 
 The publication rule (REVIEW.md) is to quote only from sealed runs that passed
 their gates and were never withdrawn, and publishable=true alone proves none
-of that. The seal is the cell's identity, SEAL_FIELDS below: the runtime
+of that; the run's own gate object has to say passed=true with no reasons,
+and to agree with publishable. The seal is the cell's identity, SEAL_FIELDS
+below: the runtime
 bundle reqbench.sh sealed, the fcvm binary and harness sources hashed into
 it, the source revision, and the image and snapshot generation measured. A
 cell missing any of them is not a sealed run. A run is withdrawn by a file
@@ -785,9 +787,38 @@ def load_cell(run_dir):
             f"{run_dir}: withdrawn: analysis.json records "
             f"withdrawn={analysis.get('withdrawn')!r}"
         )
-    if analysis.get("publishable") is not True:
-        reasons = (analysis.get("gate") or {}).get("reasons") or []
+    # reqanalyze writes publishable, gate.passed and gate.reasons from one
+    # value (`publishable = not overall_reasons`), so the three always agree.
+    # Reading publishable alone let an analysis.json claiming publishable=true
+    # over a failed gate be indexed on the claim, and reading the gate only to
+    # quote a refusal's reasons raised AttributeError on a truthy non-object
+    # gate: no refusal, no exit 5, and any stale index left in place. The gate
+    # is read first, and a shape reqanalyze never writes is a refusal.
+    gate = analysis.get("gate")
+    if not isinstance(gate, dict):
+        raise RunError(
+            f"{run_dir}: analysis.json has no gate object (gate={gate!r}); "
+            "re-run reqanalyze"
+        )
+    passed = gate.get("passed")
+    reasons = gate.get("reasons")
+    if not isinstance(passed, bool) or not isinstance(reasons, list):
+        raise RunError(
+            f"{run_dir}: analysis.json gate records passed={passed!r} and "
+            f"reasons={reasons!r}; re-run reqanalyze"
+        )
+    publishable = analysis.get("publishable")
+    if not isinstance(publishable, bool) or publishable != passed:
+        raise RunError(
+            f"{run_dir}: analysis.json records publishable={publishable!r} over a "
+            f"gate that records passed={passed!r}: {reasons}"
+        )
+    if not publishable:
         raise RunError(f"{run_dir}: analysis.json is not publishable: {reasons}")
+    if reasons:
+        raise RunError(
+            f"{run_dir}: analysis.json passed its gate carrying reasons: {reasons}"
+        )
     cell = analysis.get("cell")
     if not isinstance(cell, dict):
         raise RunError(

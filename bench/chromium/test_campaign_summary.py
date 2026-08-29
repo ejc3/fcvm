@@ -451,6 +451,48 @@ class CampaignSummary(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
             self.assertIn("publishable", text)
 
+    def test_the_publication_gate_is_read_whatever_publishable_says(self):
+        """reqanalyze writes publishable and gate.passed from one value and
+        gate.reasons beside them, so the three always agree. The index read
+        publishable alone and looked at the gate only to quote reasons from a
+        refusal, so an analysis.json claiming publishable=true over a failed
+        or noisy gate was indexed on the claim, and a truthy non-object gate
+        under publishable=false raised AttributeError out of main_with: no
+        refusal, no exit 5, and the stale index left in place. The gate is now
+        read first, and a shape reqanalyze never writes is a refusal.
+
+        RED BEFORE THE FIX: the first two shapes were indexed
+        (`AssertionError: 0 == 0 : wrote .../campaign-x-summary.json:
+        1 cell(s)`) and the last three raised
+        `AttributeError: 'str' object has no attribute 'get'` /
+        `'NoneType' object has no attribute 'get'` out of the summarizer,
+        leaving the earlier index on disk.
+        """
+        shapes = (
+            ({"publishable": True,
+              "gate": {"passed": False, "reasons": ["cdp arm failed 3/200"]}},
+             "cdp arm failed"),
+            ({"publishable": True, "gate": {"passed": True, "reasons": ["drift"]}},
+             "drift"),
+            ({"publishable": False, "gate": "clean"}, "gate"),
+            ({"publishable": True, "gate": None}, "gate"),
+            ({"publishable": True, "gate": {"passed": "yes", "reasons": []}}, "gate"),
+            ({"publishable": True, "gate": {"passed": True, "reasons": "none"}}, "gate"),
+        )
+        for overrides, expected in shapes:
+            with self.subTest(analysis=overrides), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, analysis_overrides=overrides)
+                out = os.path.join(d, "campaign-x-summary.json")
+                # An index from an earlier campaign: a refusal removes it, and
+                # a crash out of the summarizer would leave it standing.
+                with open(out, "w") as handle:
+                    handle.write('{"cells": []}\n')
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, text)
+                self.assertFalse(os.path.exists(out), "the stale index survived")
+                self.assertIn(expected, text)
+
     def test_a_failed_stall_gate_refuses_even_if_marked_publishable(self):
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "run")
