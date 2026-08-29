@@ -1148,8 +1148,8 @@ run_case "the author's own top-level comment is still claimable" \
 echo "== finding 42: a page this gate cannot read is not an empty page =="
 # Every paging loop folded each page in with `<connection>.nodes // []` and then read
 # hasNextPage from the same page. Both readings turn a response the loop CANNOT READ into
-# "this connection is empty and it is finished": a null `pullRequest` — a wrong number, a
-# renamed repo, a token that cannot see the PR, a partial GraphQL result — contributes no
+# "this connection is empty and it is finished": a null `pullRequest` (a wrong number, a
+# renamed repo, a token that cannot see the PR, a partial GraphQL result) contributes no
 # nodes, and hasNextPage evaluates to null rather than "true", so the loop stops holding [].
 # `[]` is indistinguishable from a connection that is genuinely empty, which is the gate's
 # recurring fail-open shape: a check that could not evaluate anything reporting that it
@@ -1169,6 +1169,13 @@ printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasN
 # page 1, one more comment on page 2. With COMMENTS_PAGE_SIZE=2 the gate pages it.
 printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"isOutdated":false,"comments":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"originalLine":1,"body":"this drops the last row"},{"author":{"login":"me"},"path":"a.ts","line":1,"originalLine":1,"body":"NOT-A-DEFECT: renamed only, no behaviour change"}]}}]}}}}}' > "$TMP/pagedthreads.json"
 printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"onlooker"},"path":"a.ts","line":1,"originalLine":1,"body":"discussion"}]}}}}' > "$TMP/threadpage.json"
+# The same comments page, claiming a page after it and naming no cursor to fetch that page
+# with. Folded in and read for hasNextPage, it ends the loop on a thread nobody finished.
+printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[{"author":{"login":"onlooker"},"path":"a.ts","line":1,"originalLine":1,"body":"discussion"}]}}}}' > "$TMP/nodenocursor.json"
+# A resolved thread of 3 comments whose FIRST page (the one that arrives with the thread
+# list) already says another page follows and names no cursor. The disposition is on the
+# page nobody can ask for, so a run that skips the paging judges the thread undisposed.
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"isOutdated":false,"comments":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"originalLine":1,"body":"this drops the last row"},{"author":{"login":"onlooker"},"path":"a.ts","line":1,"originalLine":1,"body":"discussion"}]}}]}}}}}' > "$TMP/pagednocursor.json"
 printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":"","commit":{"oid":"deadbeef"}}]}}}}}' > "$TMP/reviews.json"
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[%s]}}}}}' "$CLAIM42" > "$TMP/comments.json"
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/nocomments.json"
@@ -1180,22 +1187,31 @@ cat > "$TMP/bin/gh" <<'SHIM'
 # every other read is answered normally. Connections read twice take a 1 or a 2.
 nth() { local f=$GATE_TEST_DIR/$1.count n; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$f"; printf '%s' "$n"; }
 which_read() { printf '%s%d' "$1" "$(( $(nth "$1") >= 2 ? 2 : 1 ))"; }
-bad() { cat "$GATE_TEST_DIR/${GATE_TEST_BAD:-nullpr}.json"; }
+# $1 names the connection being read, which the nocursor page has to carry.
+# GATE_TEST_BAD=nocursor answers with a page of that connection claiming another page
+# follows while naming no cursor to fetch it with; GATE_TEST_CURSOR holds the JSON for
+# endCursor, null by default and "" for the empty-string shape.
+bad() {
+  if [ "${GATE_TEST_BAD:-nullpr}" = nocursor ]; then
+    printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","%s":{"totalCount":1,"pageInfo":{"hasNextPage":true,"endCursor":%s},"nodes":[]}}}}}' \
+      "$1" "${GATE_TEST_CURSOR:-null}"
+  else cat "$GATE_TEST_DIR/${GATE_TEST_BAD:-nullpr}.json"; fi
+}
 case "$*" in
   *"commits(first"*)
-    if [ "${GATE_TEST_NULL:-}" = commits ]; then bad
+    if [ "${GATE_TEST_NULL:-}" = commits ]; then bad commits
     else cat "$GATE_TEST_DIR/prcommits.json"; fi ;;
   *"node(id"*)
-    if [ "${GATE_TEST_NULL:-}" = node ]; then cat "$GATE_TEST_DIR/nullnode.json"
+    if [ "${GATE_TEST_NULL:-}" = node ]; then cat "$GATE_TEST_DIR/${GATE_TEST_NODEBAD:-nullnode}.json"
     else cat "$GATE_TEST_DIR/threadpage.json"; fi ;;
   *reviewThreads*)
-    if [ "${GATE_TEST_NULL:-}" = "$(which_read threads)" ]; then bad
+    if [ "${GATE_TEST_NULL:-}" = "$(which_read threads)" ]; then bad reviewThreads
     else cat "$GATE_TEST_DIR/${GATE_TEST_THREADS:-threads}.json"; fi ;;
   *"reviews(first"*)
-    if [ "${GATE_TEST_NULL:-}" = "$(which_read reviews)" ]; then bad
+    if [ "${GATE_TEST_NULL:-}" = "$(which_read reviews)" ]; then bad reviews
     else cat "$GATE_TEST_DIR/reviews.json"; fi ;;
   *"comments(first"*)
-    if [ "${GATE_TEST_NULL:-}" = "$(which_read comments)" ]; then bad
+    if [ "${GATE_TEST_NULL:-}" = "$(which_read comments)" ]; then bad comments
     else cat "$GATE_TEST_DIR/${GATE_TEST_COMMENTS:-comments}.json"; fi ;;
   *headRefOid*)
     # gh --jq prints an empty line when the filter lands on a null pullRequest.
@@ -1207,7 +1223,9 @@ chmod +x "$TMP/bin/gh"
 page_case() {
   local name=$1 want_rc=$2 want_txt=$3 out rc
   rm -f "$TMP"/threads.count "$TMP"/reviews.count "$TMP"/comments.count
-  out=$(GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+  # `timeout`, because a loop that omits `after` and re-requests the first page never
+  # returns. The run has to end in a FAIL naming the case, not in a hung harness.
+  out=$(GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" timeout 20 bash "$GATE" 1 2>&1); rc=$?
   if [ "$rc" = "$want_rc" ] && grep -qF "$want_txt" <<<"$out"; then
     echo "  PASS  $name"; pass=$((pass+1))
   else
@@ -1232,12 +1250,38 @@ COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS=pagedthreads GATE_TEST_COMMENTS=nocomment
   page_case "a thread comment page with a null node blocks instead of truncating" 2 "comments page for thread"
 # Guards, green before and after: the first thread page already blocked on a null
 # pullRequest and still does, pages that can all be read still reach a verdict, and the
-# fixture without the claim still reaches CLEAR — which is what the red above reported.
+# fixture without the claim still reaches CLEAR, which is what the red above reported.
 GATE_TEST_NULL=threads1 \
   page_case "the first thread page with a null pullRequest still blocks" 2 "no pull request"
 page_case "every page readable reaches a verdict on the claim" 1 "carry no disposition"
 GATE_TEST_COMMENTS=nocomments \
   page_case "every page readable and no claim still clears" 0 "CLEAR"
+
+echo "== finding 43: a page saying more follows must name the cursor to fetch it with =="
+# require_page validated hasNextPage and not endCursor, so a page could say "another page
+# follows" and name nothing to fetch it with. Both readings of that page are wrong in the
+# gate's usual direction. In the outer loops `jq -r` renders a null endCursor as the STRING
+# "null", which is the loops' own "no cursor yet" sentinel, so the next request omits
+# `after` and asks for the FIRST page again: the same page answers, forever. An empty-string
+# cursor sends `after: ""` and, on a source that ignores it, loops the same way. In the
+# oversized-thread loop the cursor is instead tested for "null"/empty as the exit condition,
+# so the loop ENDS and the thread is judged from the pages fetched so far, which is the
+# truncation the transient-failure branch beside it already refuses to accept.
+GATE_TEST_NULL=comments2 GATE_TEST_BAD=nocursor \
+  page_case "a recheck comment page with hasNextPage and no cursor blocks" 2 "names no cursor"
+GATE_TEST_NULL=comments2 GATE_TEST_BAD=nocursor GATE_TEST_CURSOR='""' \
+  page_case "a recheck comment page with an empty-string cursor blocks" 2 "names no cursor"
+GATE_TEST_NULL=threads1 GATE_TEST_BAD=nocursor \
+  page_case "a thread page with hasNextPage and no cursor blocks" 2 "names no cursor"
+COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS=pagedthreads GATE_TEST_COMMENTS=nocomments \
+  GATE_TEST_NULL=node GATE_TEST_NODEBAD=nodenocursor \
+  page_case "a thread comment page with no cursor blocks instead of truncating" 2 "names no cursor"
+COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS=pagednocursor GATE_TEST_COMMENTS=nocomments \
+  page_case "an oversized thread whose first page names no cursor blocks" 2 "thread T1"
+# Guard, green before and after: hasNextPage false with a null endCursor is what the LAST
+# page of every connection looks like, and it has to keep reaching a verdict. Every fixture
+# above ends that way, so a rule written as "endCursor must be a string" would fail here.
+page_case "a last page with hasNextPage false and a null cursor still reaches a verdict" 1 "carry no disposition"
 
 echo
 echo "passed=$pass failed=$fail"

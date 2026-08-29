@@ -128,10 +128,24 @@ require_page() {
          | type == "object" and (.nodes | type) == "array"
          and (.pageInfo.hasNextPage | type) == "boolean"' >/dev/null 2>&1 <<<"$resp"; then
     why="the page carries no nodes array and no boolean hasNextPage"
+  # hasNextPage without a cursor is the same hole one field over: the page says another
+  # page follows and names nothing to fetch it with. `jq -r` renders a null endCursor as
+  # the STRING "null", which is the outer loops' own "no cursor yet" sentinel, so the next
+  # request omits `after` and asks for the FIRST page again, and the same page answers
+  # forever. An empty cursor sends `after: ""`. The oversized-thread loop tests the cursor
+  # for "null"/empty as its exit condition instead, so it ENDS and the thread is judged
+  # from the pages that did arrive. A literal "null" is rejected for the same reason a null
+  # is: the call sites cannot tell it apart from the sentinel.
+  elif ! jq -e --arg p "$path" 'getpath($p | split("."))
+         | .pageInfo.hasNextPage == false
+           or ((.pageInfo.endCursor | type) == "string"
+               and (.pageInfo.endCursor | length) > 0
+               and .pageInfo.endCursor != "null")' >/dev/null 2>&1 <<<"$resp"; then
+    why="the page says another page follows and names no cursor to fetch it with"
   else
     return 0
   fi
-  echo "verdict: BLOCKED — could not read $what: $why." >&2
+  echo "verdict: BLOCKED. Could not read $what: $why." >&2
   echo "A page this gate could not read is not an empty page. Folding one in as [] is" >&2
   echo "indistinguishable from a connection that is genuinely empty, so this run refuses" >&2
   echo "to report a verdict computed from a list nobody fetched." >&2
@@ -195,6 +209,17 @@ fetch_threads() {
       '.[] | select(.id == $id) | .comments.pageInfo.endCursor // "null"' <<<"$threads")
     all_comments=$(jq -c --arg id "$tid" \
       '.[] | select(.id == $id) | .comments.nodes' <<<"$threads")
+    # require_page checked the reviewThreads page; this cursor comes from a comments
+    # connection nested INSIDE one of its nodes, which that check does not reach. The
+    # thread is here because it holds more comments than one page, so a cursor the loop
+    # cannot use means the tail can never be asked for, and the loop below would simply
+    # not run.
+    if [ "$ccursor" = "null" ] || [ -z "$ccursor" ]; then
+      echo "verdict: BLOCKED. Cannot page thread $tid: it holds more comments than one" >&2
+      echo "page and its first page names no cursor to fetch the rest with. A thread judged" >&2
+      echo "from the comments that did arrive is a thread nobody finished reading." >&2
+      return 2
+    fi
     while [ "$ccursor" != "null" ] && [ -n "$ccursor" ]; do
       cresp=$(gh api graphql -f query="
         { node(id: \"$tid\") { ... on PullRequestReviewThread {
@@ -394,7 +419,7 @@ fetch_payload() {
   # used to skip on an empty result: the one read that exists to catch a push landing
   # mid-run was disabled by precisely the response that says the gate could not see the PR.
   if [ -z "$headnow" ] || [ "$headnow" = "null" ]; then
-    echo "verdict: BLOCKED — the re-read of the head named no commit, so this gate cannot" >&2
+    echo "verdict: BLOCKED. The re-read of the head named no commit, so this gate cannot" >&2
     echo "tell whether a push landed while it was reading the PR. Re-run against a PR this" >&2
     echo "token can see." >&2
     return 2
