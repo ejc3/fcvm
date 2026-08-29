@@ -998,9 +998,10 @@ impl GuestBootInputs {
     /// Read the host state and env knobs that shape the guest at boot.
     ///
     /// `dns_override` is --dns: when set it wins outright (hashed via
-    /// FirecrackerConfig.dns_server), the host fallback is never emitted, and
-    /// hashing the host list anyway would only fragment cache keys between
-    /// hosts whose guests boot identically.
+    /// FirecrackerConfig.dns_server), no host-derived resolv.conf value is
+    /// emitted (neither the nameservers nor the search list), and hashing the
+    /// host state anyway would only fragment cache keys between hosts whose
+    /// guests boot identically.
     pub(crate) fn resolve(
         dns_override: Option<&str>,
         runtime_config: &crate::commands::common::RuntimeConfig,
@@ -1009,19 +1010,46 @@ impl GuestBootInputs {
         // the search domains from that one snapshot: two reads could disagree
         // mid-launch, and the key hashes what this launch saw (#821).
         let sources = crate::network::RESOLV_CONF_SOURCES.map(crate::network::ResolvSource::read);
-        let host_dns = if dns_override.is_some() {
-            Vec::new()
+        Self::from_sources(dns_override, &sources, runtime_config)
+    }
+
+    /// The resolution above, over a named set of sources.
+    ///
+    /// Split out so the --dns rule can be checked against host state a test
+    /// states rather than whatever this machine's resolv.conf holds. A test
+    /// that reads the real files passes vacuously on a host with no search
+    /// domains, which is a check that cannot fail.
+    fn from_sources(
+        dns_override: Option<&str>,
+        sources: &[crate::network::ResolvSource],
+        runtime_config: &crate::commands::common::RuntimeConfig,
+    ) -> Self {
+        // --dns names the guest's resolver outright, so nothing read from the
+        // host's resolv.conf reaches the guest. The search list goes with the
+        // nameservers: a short private name completed with a host suffix would
+        // be queried at the override resolver, which the caller may have
+        // pointed at a public server, disclosing the internal name to it
+        // (CWE-200). It is also the last host-derived resolv.conf value that
+        // could reach the guest under an override, since
+        // network_config.dns_server is replaced by --dns for every mode
+        // (src/commands/podman/mod.rs), including routed mode's
+        // detect_ipv6_dns result.
+        let (host_dns, dns_search) = if dns_override.is_some() {
+            (Vec::new(), Vec::new())
         } else {
-            crate::network::nameservers_from_sources(&sources).unwrap_or_else(|e| {
+            let host_dns = crate::network::nameservers_from_sources(sources).unwrap_or_else(|e| {
                 // Bridged mode turns an empty list into a launch failure and the
                 // other modes degrade to the gateway, so either way the reason
                 // belongs in the log. Discarding it is what left #875 reporting
                 // only that there was no usable host DNS.
                 warn!("{e:#}");
                 Vec::new()
-            })
+            });
+            (
+                host_dns,
+                crate::network::search_domains_from_sources(sources),
+            )
         };
-        let dns_search = crate::network::search_domains_from_sources(&sources);
         Self {
             host_dns,
             dns_search,
@@ -1797,6 +1825,97 @@ mod tests {
         assert!(
             inputs.host_dns.is_empty(),
             "--dns wins outright, so the host fallback must not fragment the key"
+        );
+    }
+
+    fn resolv_source(path: &str, content: &str) -> crate::network::ResolvSource {
+        crate::network::ResolvSource {
+            path: path.to_string(),
+            content: Ok(content.to_string()),
+        }
+    }
+
+    fn no_runtime_knobs() -> crate::commands::common::RuntimeConfig {
+        crate::commands::common::RuntimeConfig {
+            firecracker_bin: None,
+            firecracker_args: None,
+            boot_args: None,
+            fuse_readers: None,
+        }
+    }
+
+    /// --dns names the resolver, so nothing the host's resolv.conf said may
+    /// reach the guest. Forwarding the host's search list expands a short
+    /// private name with a host suffix and sends that query to the override
+    /// resolver, which the caller may have pointed at a public server: the
+    /// internal name is disclosed to it (CWE-200).
+    #[test]
+    fn dns_override_forwards_no_host_search_domains() {
+        let sources = [resolv_source(
+            crate::network::ETC_RESOLV_CONF,
+            "nameserver 10.1.0.2\nsearch corp.example\n",
+        )];
+
+        let inputs = GuestBootInputs::from_sources(Some("8.8.8.8"), &sources, &no_runtime_knobs());
+        assert!(
+            inputs.host_dns.is_empty(),
+            "the host resolver is already dropped on override"
+        );
+        assert!(
+            inputs.dns_search.is_empty(),
+            "the host search list must be dropped with it, got {:?}",
+            inputs.dns_search
+        );
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns.clone(),
+            dns_search: inputs.dns_search.clone(),
+            ..Default::default()
+        };
+        let network_config = crate::network::NetworkConfig {
+            dns_server: Some("8.8.8.8".to_string()),
+            ..Default::default()
+        };
+
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        assert!(
+            !boot_args.contains("fcvm_dns_search"),
+            "no search list may be emitted under --dns: {boot_args:?}"
+        );
+        assert!(
+            !boot_args.contains("corp.example"),
+            "the host's private suffix must not reach the guest: {boot_args:?}"
+        );
+        assert!(
+            boot_args.contains("fcvm_dns=8.8.8.8"),
+            "the named resolver is what the guest gets: {boot_args:?}"
+        );
+    }
+
+    /// The other side of the rule, so the fix cannot be "never forward a
+    /// search list". Without --dns the guest resolves through the host's own
+    /// resolver, and the host's search list is what makes short names work
+    /// there.
+    #[test]
+    fn without_dns_override_the_host_search_list_reaches_the_guest() {
+        let sources = [resolv_source(
+            crate::network::ETC_RESOLV_CONF,
+            "nameserver 10.1.0.2\nsearch corp.example\n",
+        )];
+
+        let inputs = GuestBootInputs::from_sources(None, &sources, &no_runtime_knobs());
+        assert_eq!(inputs.host_dns, vec!["10.1.0.2"]);
+        assert_eq!(inputs.dns_search, vec!["corp.example"]);
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns.clone(),
+            dns_search: inputs.dns_search.clone(),
+            ..Default::default()
+        };
+        let boot_args = build_runtime_boot_args(&crate::network::NetworkConfig::default(), &config);
+        assert!(
+            boot_args.contains("fcvm_dns_search=corp.example"),
+            "boot args: {boot_args:?}"
         );
     }
 

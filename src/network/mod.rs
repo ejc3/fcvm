@@ -183,14 +183,25 @@ impl ResolvSource {
     }
 
     /// The domains on this source's first `search` line.
+    ///
+    /// Tokenised on whitespace, not on a literal `"search "`: resolv.conf(5)
+    /// separates a directive from its arguments with spaces or tabs, and
+    /// matching the space alone silently dropped every tab-separated search
+    /// list. A `search` line naming nothing is still the first search line and
+    /// still decides, which is how an empty search list is expressed.
     fn search_domains(&self) -> Vec<String> {
         let Ok(content) = &self.content else {
             return Vec::new();
         };
         content
             .lines()
-            .find_map(|line| line.trim().strip_prefix("search "))
-            .map(|list| list.split_whitespace().map(str::to_string).collect())
+            .find_map(|line| {
+                let mut parts = line.split_whitespace();
+                if parts.next() != Some("search") {
+                    return None;
+                }
+                Some(parts.map(str::to_string).collect())
+            })
             .unwrap_or_default()
     }
 
@@ -479,6 +490,79 @@ mod tests {
         assert!(readable("/etc/resolv.conf", "nameserver 192.0.2.1\n")
             .search_domains()
             .is_empty());
+    }
+
+    /// resolv.conf(5) separates a directive from its arguments with spaces or
+    /// tabs. Matching a literal "search " dropped every tab-separated search
+    /// list, and a guest that gets no search list cannot resolve short names.
+    #[test]
+    fn search_domains_accept_any_whitespace_after_the_directive() {
+        assert_eq!(
+            readable("/etc/resolv.conf", "search\tcorp.example\n").search_domains(),
+            vec!["corp.example"],
+            "a tab separates the directive from its arguments"
+        );
+        assert_eq!(
+            readable(
+                "/etc/resolv.conf",
+                "search \t corp.example\t\tinternal  other.example\n"
+            )
+            .search_domains(),
+            vec!["corp.example", "internal", "other.example"],
+            "runs of mixed spaces and tabs separate the domains too"
+        );
+        assert_eq!(
+            readable("/etc/resolv.conf", "  search corp.example  \t\n").search_domains(),
+            vec!["corp.example"],
+            "whitespace before the directive and after the last domain is not a domain"
+        );
+        assert!(
+            readable("/etc/resolv.conf", "searchdomain corp.example\n")
+                .search_domains()
+                .is_empty(),
+            "a directive that merely starts with `search` is a different directive"
+        );
+    }
+
+    /// A `search` naming nothing is still the first search line, and under the
+    /// first-line rule it decides. Skipping it to reach a later line would
+    /// make an empty search list unreachable.
+    #[test]
+    fn a_search_line_with_no_domains_yields_no_domains() {
+        assert!(
+            readable("/etc/resolv.conf", "search\nsearch other.example\n")
+                .search_domains()
+                .is_empty(),
+            "the first search line names nothing, so nothing is searched"
+        );
+        assert!(
+            readable("/etc/resolv.conf", "search   \t\n")
+                .search_domains()
+                .is_empty(),
+            "trailing whitespace is not a domain"
+        );
+    }
+
+    /// The `nameserver` directive is read on the same path. It already splits
+    /// on whitespace rather than matching a literal space, so it was not
+    /// narrow in the way `search` was; this holds that.
+    #[test]
+    fn nameservers_accept_any_whitespace_after_the_directive() {
+        let servers = nameservers_from_sources(&[readable(
+            "/etc/resolv.conf",
+            "nameserver\t10.1.0.2\n  nameserver \t 8.8.8.8  \n",
+        )])
+        .expect("both lines name a usable server");
+        assert_eq!(servers, vec!["10.1.0.2", "8.8.8.8"]);
+
+        assert!(
+            nameservers_from_sources(&[readable(
+                "/etc/resolv.conf",
+                "nameserverfoo 10.1.0.2\nnameserver\n"
+            )])
+            .is_err(),
+            "a lookalike directive and a bare `nameserver` name no server"
+        );
     }
 
     /// The other half of #875: the search list and the nameserver list have to
