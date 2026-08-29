@@ -54,6 +54,53 @@ must not kill the run, and "the log stopped growing" is not a completion
 signal. Fresh-box prerequisites (packages, NVMe store, sibling checkouts) are
 in the repo-root AGENTS.md quickstart.
 
+To withdraw a run after the fact, add a file named `WITHDRAWN` to its results
+directory whose first line is the reason; `campaign_summary.py` refuses the run
+and quotes that line, and refuses an `analysis.json` carrying `"withdrawn":
+true` the same way. The marker is tracked (`!results/**/WITHDRAWN` in
+`bench/chromium/.gitignore`) and is never removed, because a withdrawn run
+stays unquotable (REVIEW.md).
+
+A corpus campaign's run directory also keeps the replay server's two logs,
+`corpus-dns.log` and `corpus-access.log`, tracked because `dns-evidence.json`
+records their sha256 and `campaign_summary.py` refuses the run unless both are
+present and match. Expect them to be large: the DNS log has one line per query
+and the access log one line per HTTP request the server answered, from the
+campaign's startup probes through the three verify brackets and every rep of
+every arm of the measured run, so it is the biggest record in the directory
+and a short one means the server was not serving the whole run.
+
+The evidence is only as good as the checks behind it, and four of them are
+easy to get wrong:
+
+- The server's exit status. `corpus_serve.py` exits 1 when a log line could
+  not be written, after the response bytes went out, and `sudo -b` discards
+  that status. The launch wrapper waits for the server and writes the status
+  to `corpus-serve.status` in the run directory; `stop_corpus_serve` waits
+  for the file, `write_dns_evidence` records it as `corpus_serve_exit_status`
+  and is unclean unless it is 0, and `campaign_summary.py` refuses evidence
+  that does not carry 0. A liveness poll cannot see this case.
+- The owner samples. `campaign_summary.py` parses every `dns-owner.log` line
+  and holds it to the rule the campaign applied at the verdict (owner is
+  `serve_pid`, dnsmasq inactive, the load column adds up to `load_samples`
+  and `load_max_1min`). The evidence's `first_mismatch: null` is a claim
+  about those lines, not proof of them.
+- Proxies in the container exec. fc-agent runs every `fcvm exec -c` under
+  the host's saved `HTTP_PROXY`/`HTTPS_PROXY`, and `urllib` honours them by
+  default, so HOP D's URL probe would fetch the live site through the proxy
+  while the hostname check beside it resolved through the replay resolver.
+  The probe installs an empty `ProxyHandler`, clears every `*_proxy`
+  variable first, and reports what it ignored; `verify-dns.json` carries
+  `proxies_disabled` and `run_verify` refuses a bracket without it. Any new
+  in-guest probe that opens a URL needs the same treatment.
+- The verify brackets themselves. `passed: true` is also what HOP D writes
+  when it was given nothing to check, and a bracket is a plain file in the
+  run directory. `write_dns_evidence` records each bracket's sha256 as
+  `verify_file_sha256`; `campaign_summary.py` rereads each bracket, refuses
+  one whose hash moved since the verdict, and holds its contents to the
+  run's resolver, `proxies_disabled`, and every host and URL answered
+  through that resolver. Evidence carrying no bracket hashes is refused.
+
 ## Six methodology defects — do not reintroduce
 
 1. **Matched accounting basis.** Sum memory over the SAME process set for every

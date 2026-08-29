@@ -1033,7 +1033,7 @@ bench-chromium-fault: build setup-default
 analyze-chromium-request:
 	@test -f "$(RESULTS)/reqbench.jsonl" || { echo "ERROR: no $(RESULTS)/reqbench.jsonl" >&2; exit 2; }
 	@python3 bench/chromium/reqanalyze.py --json-out "$(RESULTS)/analysis.json" \
-		"$(RESULTS)/reqbench.jsonl"
+		$(if $(STALL_MAX_MS),--stall-max-ms $(STALL_MAX_MS),) "$(RESULTS)/reqbench.jsonl"
 
 # What CI runs (ci.yml globs test_*.py). The per-harness targets below are
 # narrower dev conveniences; run THIS before pushing, because a new test file is

@@ -672,12 +672,12 @@ cmd_golden() {
         "$prepared_generation" "$prepared_digest" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
-        "${REQBENCH_SOURCE_REVISION:-}" <<'PY'
+        "${REQBENCH_SOURCE_REVISION:-}" "$GUEST_DNS" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
     image_cache_key, built_image_id, prepared_generation, prepared_digest,
-    fcvm_sha256, runtime_bundle_sha256, source_revision,
+    fcvm_sha256, runtime_bundle_sha256, source_revision, guest_dns,
 ) = sys.argv[1:]
 lock = open(lock_path, "a+")
 fcntl.flock(lock, fcntl.LOCK_SH)
@@ -720,7 +720,20 @@ if config_sha256 != prepared_digest:
         f"snapshot config digest {config_sha256!r} does not match prepare's "
         f"({prepared_digest!r}); the generation changed in place"
     )
+# --dns is a request; metadata.network_config.dns_server is what fc-agent
+# wrote to the guest's resolv.conf. A golden whose snapshot records another
+# resolver would carry provenance claiming a replay wiring it does not have.
+# Only checked when GUEST_DNS was given: without it fcvm fills dns_server
+# from the host resolver, so the recorded null means "not requested".
+baked_dns = (metadata.get("network_config") or {}).get("dns_server")
+if guest_dns and baked_dns != guest_dns:
+    raise SystemExit(
+        f"GUEST_DNS={guest_dns!r} was requested but the snapshot's "
+        f"metadata.network_config.dns_server is {baked_dns!r}; the guest did not "
+        "bake the resolver this golden claims"
+    )
 record = {
+    "guest_dns": guest_dns or None,
     "snapshot_generation_id": generation_id,
     "snapshot_config_sha256": config_sha256,
     "snapshot_created_at": config.get("created_at"),
@@ -832,6 +845,170 @@ wd_session_id() {
         | tr -d '[:space:]' || true
 }
 
+# HOP D: the baked resolver, asked of the restored clone itself.
+#
+# The corpus campaign bakes GUEST_DNS into the golden so every corpus hostname
+# resolves to the pasta gateway and lands on the host replay server. HOPs A-C
+# reach the clone by IP and prove nothing about that: a clone whose resolv.conf
+# came back pointing at a real resolver renders the live site and records a
+# plausible number. This hop reads the resolver the snapshot recorded, then
+# checks the clone against it from inside the container, where Chromium runs.
+#
+# VERIFY_DNS_HOSTS  comma-separated hostnames; each must resolve to
+#                   VERIFY_DNS_ANSWER inside the container.
+# VERIFY_DNS_URLS   comma-separated URLs; each in-container GET must return a
+#                   2xx or 3xx status through the resolver under test.
+# With both unset only the recorded resolver is written and no assertion is
+# made, so the default golden (no GUEST_DNS) verifies as before. Either one
+# set requires a baked resolver and checks both resolv.conf views.
+# Evidence lands in $RESULTS/verify-dns.json either way.
+VERIFY_DNS_HOSTS="${VERIFY_DNS_HOSTS:-}"
+VERIFY_DNS_ANSWER="${VERIFY_DNS_ANSWER:-10.0.2.2}"
+VERIFY_DNS_URLS="${VERIFY_DNS_URLS:-}"
+# In-container GET with an unverified TLS context: the replay server's
+# certificate is self-signed and the resolver is the thing under test. The
+# error processor is replaced so every status comes back as a number instead
+# of an exception; redirects are therefore not followed, and a 3xx counts as
+# the request having reached the replay server. Both bench images ship python3.
+#
+# No proxy, whatever the environment says. fc-agent runs every container exec
+# under the host's saved HTTP_PROXY/HTTPS_PROXY/no_proxy/NO_PROXY
+# (fc-agent/src/exec.rs, read_proxy_settings), and build_opener() installs a
+# ProxyHandler from the environment by default, so the request would go to
+# the proxy and come back with the live site's status while the hostname
+# check next to it resolved through the replay resolver. The empty
+# ProxyHandler replaces the default one and every *_proxy variable is
+# removed before the request, so the only place it can go is the host the
+# resolver under test names. The probe prints the status and the proxy
+# variables it found and ignored (comma-separated, or "none"); the evidence
+# records both.
+VERIFY_DNS_URL_PROBE='import os,ssl,sys,urllib.request as u
+p=sorted(k for k in os.environ if k.lower().endswith("_proxy"))
+for k in p: del os.environ[k]
+c=ssl._create_unverified_context()
+H=type("H",(u.HTTPErrorProcessor,),{"http_response":lambda s,q,r:r,"https_response":lambda s,q,r:r})
+r=u.build_opener(u.ProxyHandler({}),u.HTTPSHandler(context=c),H).open(u.Request(sys.argv[1]),timeout=30)
+print(r.status,",".join(p) or "none")'
+
+verify_guest_dns() {
+    local cpid="$1" cfg="$DATA_ROOT/snapshots/$TAG/config.json"
+    local out="$RESULTS/verify-dns.json" errlog="$RESULTS/logs/verify-dns.log"
+    local dns_server
+    # jq's exit status is the readability test: a missing binary, a missing or
+    # unreadable file and invalid JSON all land here. BLOCKED rather than
+    # FAILED, and no evidence file: nothing was evaluated, so nothing can be
+    # reported, passing or failing.
+    dns_server=$($SUDO jq -r '.metadata.network_config.dns_server | if type == "string" then . else "" end' \
+        "$cfg" 2>>"$errlog") \
+        || { echo "HOP D BLOCKED: cannot read metadata.network_config.dns_server from $cfg (jq missing, or config.json unreadable)" >&2; return 1; }
+    local -a hosts=() urls=()
+    [ -z "$VERIFY_DNS_HOSTS" ] || IFS=',' read -ra hosts <<<"$VERIFY_DNS_HOSTS"
+    [ -z "$VERIFY_DNS_URLS" ] || IFS=',' read -ra urls <<<"$VERIFY_DNS_URLS"
+    echo "--- HOP D: baked resolver INSIDE the restored clone (dns_server=${dns_server:-null}, ${#hosts[@]} host(s), ${#urls[@]} url(s)) ---"
+    local failed=0 resolv_vm="" resolv_container="" hosts_json='{}' urls_json='{}'
+    if [ -z "$VERIFY_DNS_HOSTS" ] && [ -z "$VERIFY_DNS_URLS" ]; then
+        echo "  VERIFY_DNS_HOSTS and VERIFY_DNS_URLS unset: recording the snapshot's resolver, asserting nothing"
+    elif [ -z "$dns_server" ]; then
+        failed=1
+        echo "HOP D FAILED: corpus verify requires a baked resolver, but metadata.network_config.dns_server is null (golden made without GUEST_DNS?)" >&2
+    else
+        local want="nameserver $dns_server" view
+        # Both views: fc-agent writes the VM's resolv.conf from the boot plan
+        # and podman derives the container's from it. Chromium reads the
+        # second, so the first being right is not enough. The exec status is
+        # kept: output from an exec that did not complete proves nothing.
+        local rc_vm=0 rc_container=0
+        resolv_vm=$($SUDO "$FCVM" exec --pid "$cpid" --vm -- cat /etc/resolv.conf 2>>"$errlog") \
+            || rc_vm=$?
+        resolv_container=$($SUDO "$FCVM" exec --pid "$cpid" -c -- cat /etc/resolv.conf 2>>"$errlog") \
+            || rc_container=$?
+        for view in vm container; do
+            local text="$resolv_vm" rc="$rc_vm" others=""
+            [ "$view" = vm ] || { text="$resolv_container"; rc="$rc_container"; }
+            if [ "$rc" -ne 0 ]; then
+                failed=1
+                echo "HOP D FAILED: reading $view /etc/resolv.conf exited $rc (got: $(tr '\n' '|' <<<"$text"))" >&2
+            elif ! grep -qx -- "$want" <<<"$text"; then
+                failed=1
+                echo "HOP D FAILED: $view /etc/resolv.conf has no '$want' line (got: $(tr '\n' '|' <<<"$text"))" >&2
+            else
+                # glibc walks the whole nameserver list, so a second entry
+                # answers the moment the replay server misses a query.
+                others=$(grep -E '^[[:space:]]*nameserver[[:space:]]' <<<"$text" | grep -vx -- "$want" || true)
+                if [ -n "$others" ]; then
+                    failed=1
+                    echo "HOP D FAILED: $view /etc/resolv.conf also names a fallback resolver ($(tr '\n' '|' <<<"$others")), which would answer whenever $dns_server does not" >&2
+                else
+                    echo "  $view /etc/resolv.conf names $dns_server and nothing else"
+                fi
+            fi
+        done
+        local host answer ok
+        for host in "${hosts[@]}"; do
+            [ -n "$host" ] || continue
+            answer=$($SUDO "$FCVM" exec --pid "$cpid" -c -- python3 -c \
+                'import socket,sys;print(socket.gethostbyname(sys.argv[1]))' "$host" 2>>"$errlog") \
+                || answer="${answer:-}<exec rc=$?>"
+            if [ "$answer" = "$VERIFY_DNS_ANSWER" ]; then
+                ok=true
+            else
+                ok=false; failed=1
+                echo "HOP D FAILED: $host resolved to '$answer' inside the clone, want $VERIFY_DNS_ANSWER" >&2
+            fi
+            echo "  $host -> $answer ($ok)"
+            hosts_json=$(jq -c --arg h "$host" --arg a "$answer" --argjson ok "$ok" \
+                '.[$h] = {answer: $a, ok: $ok}' <<<"$hosts_json")
+        done
+        local url line status proxy_env rc
+        for url in "${urls[@]}"; do
+            [ -n "$url" ] || continue
+            rc=0
+            line=$($SUDO "$FCVM" exec --pid "$cpid" -c -- python3 -c "$VERIFY_DNS_URL_PROBE" "$url" 2>>"$errlog") \
+                || rc=$?
+            # "<status> <ignored proxy variables|none>". A line without the
+            # second field did not come from the probe above and proves
+            # nothing about where the request went.
+            status=${line%% *}
+            proxy_env=""
+            [ "$line" = "$status" ] || proxy_env=${line#* }
+            [ "$rc" -eq 0 ] || status="${line:-}<exec rc=$rc>"
+            if [ "$rc" -eq 0 ] && [ -n "$proxy_env" ] && [[ "$status" =~ ^[0-9]+$ ]] \
+                && [ "$status" -ge 200 ] && [ "$status" -le 399 ]; then
+                ok=true
+            else
+                ok=false; failed=1
+                if [ "$rc" -eq 0 ] && [ -z "$proxy_env" ]; then
+                    echo "HOP D FAILED: GET $url inside the clone printed '$line', not the probe's '<status> <ignored proxies>'" >&2
+                else
+                    echo "HOP D FAILED: GET $url inside the clone returned '$status', want 200-399" >&2
+                fi
+            fi
+            echo "  GET $url -> $status ($ok)${proxy_env:+ proxy_env_ignored=$proxy_env}"
+            urls_json=$(jq -c --arg u "$url" --arg s "$status" --argjson ok "$ok" --arg p "$proxy_env" \
+                '.[$u] = {status: (if ($s | test("^[0-9]+$")) then ($s | tonumber) else null end), ok: $ok,
+                          proxy_env_ignored: (if $p == "" then null elif $p == "none" then [] else ($p | split(",")) end)}' \
+                <<<"$urls_json")
+        done
+    fi
+    local passed=true
+    [ "$failed" -eq 0 ] || passed=false
+    # proxies_disabled: every URL probe reported the proxy variables it
+    # ignored, so none of the requests can have left through a proxy; null
+    # when no URL was probed.
+    jq -n --arg dns "$dns_server" --arg rv "$resolv_vm" --arg rc "$resolv_container" \
+        --argjson hosts "$hosts_json" --argjson urls "$urls_json" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson passed "$passed" \
+        '{dns_server: (if $dns == "" then null else $dns end), resolv_conf_vm: $rv,
+          resolv_conf_container: $rc, hosts: $hosts, urls: $urls,
+          proxies_disabled: (if ($urls | length) == 0 then null
+                             else ($urls | to_entries | all(.value.proxy_env_ignored != null)) end),
+          timestamp: $ts, passed: $passed}' \
+        >"$out.tmp" && mv "$out.tmp" "$out" \
+        || { echo "HOP D BLOCKED: cannot write $out" >&2; return 1; }
+    [ "$failed" -eq 0 ] || return 1
+    echo "  OK evidence in $out"
+}
+
 cmd_verify() {
     # Every hop feeds this counter and the function RETURNS it. Each hop used to
     # be `... || echo "HOP X FAILED"`, which makes the compound command SUCCEED —
@@ -882,6 +1059,8 @@ cmd_verify() {
     [ "$ENGINE" = webkit ] && health_probe=wd_health.py
     $SUDO "$FCVM" exec --pid "$cpid" -c -- python3 "/opt/bench/$health_probe" \
         || { echo "HOP A FAILED (in-container $ENGINE health round trip)"; fail=1; }
+
+    verify_guest_dns "$cpid" || fail=1
 
     if [ "$ENGINE" = webkit ]; then
         echo "--- HOP B: GET /status from the HOST against $ip:$CDP_PORT ---"
@@ -1014,6 +1193,10 @@ HUGEPAGES="${HUGEPAGES:-0}"
 # corpus replay arm sets GUEST_DNS=10.0.2.2 so every corpus hostname
 # resolves through the host-loopback replay server via the pasta gateway.
 GUEST_DNS="${GUEST_DNS:-}"
+# Arms the analyzer's stall gate (reqanalyze --stall-max-ms). Empty leaves the
+# gate unarmed, which campaign_summary refuses to index; the corpus campaign
+# sets it.
+STALL_MAX_MS="${STALL_MAX_MS:-}"
 # Overridable for unit tests only; production is the real kernel knob.
 HUGEPAGE_POOL_FILE="${HUGEPAGE_POOL_FILE:-/proc/sys/vm/nr_hugepages}"
 
@@ -1271,11 +1454,17 @@ cmd_run() {
     # the run contract and propagate its gate status.
     if [ "$rc" -eq 0 ]; then
         log "run: applying publication gates"
-        $SUDO python3 "$HERE/reqanalyze.py" --json-out "$RESULTS/analysis.json" \
-            "$RESULTS/reqbench.jsonl" || rc=$?
+        apply_publication_gates || rc=$?
     fi
     log "run: results in $RESULTS (backend=$BACKEND, gated run exit $rc)"
     return $rc
+}
+
+apply_publication_gates() {
+    local -a stall_args=()
+    [ -z "$STALL_MAX_MS" ] || stall_args=(--stall-max-ms "$STALL_MAX_MS")
+    $SUDO python3 "$HERE/reqanalyze.py" --json-out "$RESULTS/analysis.json" \
+        "${stall_args[@]}" "$RESULTS/reqbench.jsonl"
 }
 
 # Only dispatch when EXECUTED. Sourcing the file makes its helpers unit-testable

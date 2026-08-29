@@ -32,6 +32,19 @@ Every rule here exists because of a defect listed in bench/chromium/AGENTS.md:
     median and taking the median of {firecracker 110 ms, holder 0, pasta 0}
     publishes 0 — it medians the straggler away, which is the opposite of the
     thing being measured.
+  * A URL whose host is a name needs a resolver, and the meta must name it
+    (`guest_dns`). A corpus run that records no resolver had its hostnames
+    answered by something the record does not say, so it is refused. IP
+    literals and localhost need none. `engine` and `guest_dns` are cell
+    fields: runs that differ in either never pool.
+  * A load event that takes tens of seconds is a stall, not a slow page. With
+    `--stall-max-ms N` every record whose navigate_load_event_ms (navigate_ms
+    for webkit, whose WebDriver navigate returns at the load event) exceeds N,
+    is negative, or is missing from a successful render is listed under
+    `stall_gate` and the run is refused. `per_url` reports each URL of a
+    multi-URL run on its own so a pooled median cannot hide one page; its
+    load-completing summary is keyed by the same engine-selected stage, which
+    every entry names in `load_stage`.
 """
 
 import argparse
@@ -46,9 +59,11 @@ import statistics
 import sys
 import tempfile
 import uuid
+from urllib.parse import urlsplit
 
 
 MIN_CDP_ATTEMPTS_PER_BACKEND = 200
+SUPPORTED_ENGINES = ("chromium", "webkit")
 
 
 def is_cdp_class(arm):
@@ -64,7 +79,7 @@ def is_cdp_class(arm):
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
-ANALYZER_SCHEMA_VERSION = 4
+ANALYZER_SCHEMA_VERSION = 5
 SEALED_ANALYZER_FD_ENV = "REQANALYZE_SEALED_FD"
 ANALYZER_SOURCE_PATH_ENV = "REQANALYZE_SOURCE_PATH"
 
@@ -76,6 +91,8 @@ CELL_FIELDS = (
     "uffd_mode",
     "arms",
     "url",
+    "engine",
+    "guest_dns",
     "format",
     "quality",
     "image",
@@ -180,6 +197,72 @@ def clopper_pearson(k: int, n: int, conf: float = 0.95):
     return lo, hi
 
 
+def declared_urls(meta):
+    """The URL set a meta declares: `urls` when present, else `url` split on commas."""
+    urls = meta.get("urls")
+    if (
+        isinstance(urls, list)
+        and urls
+        and all(isinstance(url, str) and url.strip() for url in urls)
+    ):
+        return [url.strip() for url in urls]
+    url = meta.get("url")
+    if isinstance(url, str):
+        return [part.strip() for part in url.split(",") if part.strip()]
+    return []
+
+
+def url_needs_resolver(url):
+    """Whether a URL's host is a name only a resolver can answer.
+
+    False for an IP literal or localhost, None when the URL has no host.
+    """
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if host == "localhost":
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return False
+
+
+def record_url(record):
+    """The URL a record rendered: its own stamp, else the render's."""
+    url = record.get("url")
+    if isinstance(url, str) and url:
+        return url
+    render = record.get("render")
+    if isinstance(render, dict):
+        url = render.get("url")
+        if isinstance(url, str) and url:
+            return url
+    return None
+
+
+def render_stage(record, key):
+    """One finite render.stages timing, or None when the record lacks it."""
+    render = record.get("render")
+    if not isinstance(render, dict):
+        return None
+    stages = render.get("stages")
+    if not isinstance(stages, dict):
+        return None
+    value = stages.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        return None
+    return value
+
+
 def _cell_from_meta(meta, source):
     errors = []
     cell = {}
@@ -234,6 +317,24 @@ def _cell_from_meta(meta, source):
             )
         elif field in ("ws_url_prewired", "allow_busy"):
             valid = isinstance(value, bool)
+        elif field == "engine":
+            # The harness stamps the engine once per run; an absent stamp is
+            # chromium, the same reading _validate_schedule gives it.
+            value = meta.get("engine") or "chromium"
+            valid = value in SUPPORTED_ENGINES
+        elif field == "guest_dns":
+            # null: the guest used the host resolvers (fixture runs). A string
+            # must be the canonical IP literal fcvm baked into resolv.conf.
+            if value is None:
+                valid = True
+            else:
+                try:
+                    valid = (
+                        isinstance(value, str)
+                        and str(ipaddress.ip_address(value)) == value
+                    )
+                except ValueError:
+                    valid = False
         else:
             valid = (
                 isinstance(value, str) and bool(value.strip())
@@ -257,6 +358,21 @@ def _cell_from_meta(meta, source):
                 else value.strip() if isinstance(value, str)
                 else value
             )
+    if "url" in cell:
+        declared = meta.get("urls")
+        if declared is not None:
+            split = [part.strip() for part in cell["url"].split(",") if part.strip()]
+            if not (
+                isinstance(declared, list)
+                and declared
+                and all(isinstance(url, str) and url.strip() for url in declared)
+            ):
+                errors.append(f"{source} metadata urls is not a list of URLs")
+            elif [url.strip() for url in declared] != split:
+                errors.append(
+                    f"{source} metadata urls {declared!r} do not match url "
+                    f"{cell['url']!r}"
+                )
     if cell.get("backend") not in (None, "file", "uffd"):
         errors.append(f"{source} metadata has unsupported backend {cell['backend']!r}")
     if cell.get("uffd_mode") not in (None, "file", "copy", "minor"):
@@ -425,6 +541,25 @@ def _validate_arms(arms, label, errors):
         errors.append(
             f"{label} publication schedule requires noop and a CDP arm"
         )
+
+
+def _validate_resolver(meta, label, errors):
+    """A URL whose host is a name needs the resolver the meta records.
+
+    Appended after the record checks rather than raised as a cell error: a
+    cell error stops schedule validation, and a corpus run without guest_dns
+    still has to have every one of its records judged.
+    """
+    guest_dns = meta.get("guest_dns")
+    for url in declared_urls(meta):
+        needs_resolver = url_needs_resolver(url)
+        if needs_resolver is None:
+            errors.append(f"{label} metadata declares URL {url!r} without a hostname")
+        elif needs_resolver and guest_dns is None:
+            errors.append(
+                f"{label} metadata declares URL {url!r} whose hostname needs "
+                "a resolver but records no guest_dns"
+            )
 
 
 def _validate_schedule(dataset):
@@ -740,6 +875,13 @@ def _validate_schedule(dataset):
                                 f"{rlabel} CDP render {field}={render.get(field)!r} "
                                 f"does not match {expected_value!r}"
                             )
+                    # per_url buckets by the record's own url stamp, so the
+                    # stamp is held to the schedule as strictly as render.url.
+                    if "url" in record and record.get("url") != expected_url:
+                        errors.append(
+                            f"{rlabel} record url {record.get('url')!r} does not "
+                            f"match the scheduled {expected_url!r}"
+                        )
                     if engine != "webkit" and render.get("idle_timeout") != 0:
                         errors.append(
                             f"{rlabel} CDP render did not complete its declared idle policy"
@@ -1112,6 +1254,7 @@ def _validate_schedule(dataset):
             f"{label} record order does not match seed {seed}; first mismatch "
             f"at ordinal {mismatch[0]} expected={mismatch[1]} observed={mismatch[2]}"
         )
+    _validate_resolver(meta, label, errors)
     dataset["run_id"] = run_id
 
 
@@ -1476,7 +1619,7 @@ def failure_class(r: dict) -> str:
 
 def analyze_backend(
     recs, metas, backend, cell, cell_id, run_id, sources,
-    source_artifacts, metadata_errors,
+    source_artifacts, metadata_errors, stall_max_ms=None,
 ):
     live = [r for r in recs if not r.get("warmup")]
     warm = [r for r in recs if r.get("warmup")]
@@ -1788,6 +1931,118 @@ def analyze_backend(
                 by["exec"], lambda r: r.get("render_total_ms")
             )
 
+    # ---- 4b. per-URL breakdown. A pooled corpus median hides the page that
+    # stalled; each URL gets its own medians, load-completing time and count of
+    # distinct screenshots (an error page renders to the same bytes every time).
+    engine = next((m.get("engine") or "chromium" for m in metas), "chromium")
+    # cdpdrive times the load event on every successful render. WebDriver
+    # classic exposes no such stage, but its navigate call returns at the
+    # load event, so for webkit the load-completing duration is navigate_ms.
+    # per_url and the stall gate (4c) read this one stage: reading
+    # navigate_load_event_ms for every engine left every webkit URL at n=0
+    # with a null median, and an armed gate that skipped webkit records
+    # passed having evaluated nothing. Each per_url entry names the stage in
+    # load_stage and carries its summary under that stage's own name.
+    load_stage = "navigate_ms" if engine == "webkit" else "navigate_load_event_ms"
+    urls = []
+    for m in metas:
+        for url in declared_urls(m):
+            if url not in urls:
+                urls.append(url)
+    for r in live:
+        url = record_url(r)
+        if url is not None and url not in urls:
+            urls.append(url)
+    out["per_url"] = {}
+    for url in urls:
+        out["per_url"][url] = {}
+        for a in arms:
+            rows = [r for r in by[a] if record_url(r) == url]
+            out["per_url"][url][a] = {
+                "n": len(rows),
+                "blocking_ms": metric_summary(rows, lambda r: r.get("blocking_ms")),
+                "load_stage": load_stage,
+                load_stage: metric_summary(
+                    rows, lambda r: render_stage(r, load_stage)
+                ),
+                "total_ms": metric_summary(
+                    rows, lambda r: render_stage(r, "total_ms")
+                ),
+                "distinct_image_sha256": len({
+                    r["render"]["image_sha256"]
+                    for r in rows
+                    if isinstance(r.get("render"), dict)
+                    and isinstance(r["render"].get("image_sha256"), str)
+                }),
+            }
+    if len(urls) > 1:
+        print("\n" + "-" * 78)
+        print(f"PER URL (measured successes: blocking, {load_stage}, distinct screenshots)")
+        print("-" * 78)
+        for url in urls:
+            print(f"  {url}")
+            for a in arms:
+                per = out["per_url"][url][a]
+                if not per["n"]:
+                    continue
+                blocking = per["blocking_ms"]
+                load = per[load_stage]
+                print(
+                    f"    {a:9s} n={per['n']:<4d} blocking "
+                    f"{fmt(blocking['median'], blocking['lo'], blocking['hi'])}  "
+                    f"{load_stage} "
+                    f"{fmt(load['median'], load['lo'], load['hi'])}  "
+                    f"images {per['distinct_image_sha256']}"
+                )
+
+    # ---- 4c. stall gate. A load event that takes tens of seconds is the guest
+    # waiting on something other than the page (a resolver that never answers,
+    # for one), and one such record inside a pooled median is invisible. The
+    # gate reads the engine-selected load_stage chosen above 4b.
+    violations = []
+    evaluated = 0
+    if stall_max_ms is not None:
+        for r in recs:
+            arm = r.get("arm")
+            value = render_stage(r, load_stage)
+            # A success without the stage has not shown it did not stall.
+            must_carry = r.get("ok") is True and is_cdp_class(arm)
+            if value is None and not must_carry:
+                continue
+            if value is not None:
+                evaluated += 1
+            # A negative duration was not timed either.
+            if value is None or value < 0 or value > stall_max_ms:
+                violations.append({
+                    "url": record_url(r),
+                    "arm": arm,
+                    "stage": load_stage,
+                    load_stage: value,
+                    "rep": r.get("rep"),
+                    "warmup": bool(r.get("warmup")),
+                    "record_id": r.get("record_id"),
+                })
+    out["stall_gate"] = {
+        "max_ms": stall_max_ms,
+        "passed": not violations,
+        "evaluated": evaluated,
+        "violations": violations,
+    }
+    print("\n" + "-" * 78)
+    print(f"STALL GATE (render.stages.{load_stage}, every record incl. warmup)")
+    print("-" * 78)
+    if stall_max_ms is None:
+        print("  not evaluated (no --stall-max-ms)")
+    else:
+        print(f"  limit {stall_max_ms:g} ms  evaluated {evaluated}  "
+              f"violations {len(violations)}  "
+              + ("PASS" if not violations else "FAIL -- do not publish"))
+        for violation in violations:
+            print(f"    {violation['arm']:9s} rep={violation['rep']}"
+                  f"{' [warmup]' if violation['warmup'] else ''} "
+                  f"{load_stage}={violation[load_stage]!r} "
+                  f"url={violation['url']}")
+
     # ---- 5. teardown, three separate numbers, never one
     print("\n" + "-" * 78)
     print("TEARDOWN -- three numbers, deliberately not summed into one")
@@ -2024,6 +2279,11 @@ def analyze_backend(
         reasons.append("one or more teardowns were not confirmed gone")
     if any_unverified_disk_cleanup:
         reasons.append("one or more clone teardowns did not confirm on-disk cleanup")
+    if not out["stall_gate"]["passed"]:
+        reasons.append(
+            f"stall_gate: {len(violations)} record(s) exceed or lack "
+            f"{load_stage} under the {stall_max_ms:g} ms limit"
+        )
 
     out["gate"] = {
         "passed": not reasons,
@@ -2046,6 +2306,7 @@ def analyze_backend(
         },
         "cdp_sample_size": out["cdp_sample_size"],
         "baseline_drift": out["drift"],
+        "stall_gate": out["stall_gate"],
         "teardown": {
             "passed": not any_unconfirmed_teardown and not any_unverified_disk_cleanup,
             "unconfirmed": unconfirmed_teardowns,
@@ -2068,7 +2329,14 @@ def main_with(argv=None):
     ap.add_argument("--json-out", default="")
     ap.add_argument("--no-gate", action="store_true",
                     help="exit 0 even when this run is unpublishable (exploratory only)")
+    ap.add_argument("--stall-max-ms", type=float, default=None,
+                    help="refuse publication when any record's navigate_load_event_ms "
+                         "exceeds this many milliseconds (default: no stall gate)")
     args = ap.parse_args(argv)
+    if args.stall_max_ms is not None and not (
+        math.isfinite(args.stall_max_ms) and args.stall_max_ms > 0
+    ):
+        ap.error("--stall-max-ms must be a positive number of milliseconds")
     analyzer_artifact = read_source_artifact(__file__)
 
     # Valid metadata segments with the exact same cell can contribute to one
@@ -2129,6 +2397,7 @@ def main_with(argv=None):
             group.get("cell"), group.get("cell_id"), group.get("run_id"), group["sources"],
             group.get("source_artifacts", []),
             group["metadata_errors"],
+            stall_max_ms=args.stall_max_ms,
         )
 
     overall_reasons = [
@@ -2196,6 +2465,22 @@ def main_with(argv=None):
                 "passed": publishable,
                 "reasons": overall_reasons,
                 "exit_code_overridden": exit_code_overridden,
+            },
+            "stall_gate": {
+                "max_ms": args.stall_max_ms,
+                "passed": all(
+                    backend["stall_gate"]["passed"]
+                    for backend in backend_results.values()
+                ),
+                "evaluated": sum(
+                    backend["stall_gate"]["evaluated"]
+                    for backend in backend_results.values()
+                ),
+                "violations": [
+                    violation
+                    for backend in backend_results.values()
+                    for violation in backend["stall_gate"]["violations"]
+                ],
             },
         }
 

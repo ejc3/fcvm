@@ -31,11 +31,12 @@ import time
 import types
 import unittest
 import urllib.request
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import campaign_summary  # noqa: E402
 import reqanalyze  # noqa: E402
 import reqbench  # noqa: E402
 
@@ -2187,6 +2188,7 @@ class SnapshotGenerationIdentity(unittest.TestCase):
             "creator_fcvm_sha256": "c" * 64,
             "creator_runtime_bundle_sha256": "d" * 64,
             "source_revision": "e" * 40,
+            "guest_dns": None,
         }
         with open(
             os.path.join(snapshot_dir, "reqbench-provenance.json"), "w"
@@ -2508,7 +2510,7 @@ class AnalyzerAvailability(unittest.TestCase):
             "kind": "meta", "run_id": run_id, "seed": seed, "backend": backend,
             "uffd_mode": "file" if backend == "file" else "copy",
             "arms": arms, "reps": measured, "warmup": warmup,
-            "url": "http://fixture/medium.html", "format": "jpeg", "quality": 80,
+            "url": "http://127.0.0.1:8000/medium.html", "format": "jpeg", "quality": 80,
             "image": "localhost/chromium-bench-req",
             "image_id": "sha256:" + "d" * 64, "snapshot": f"snapshot-{backend}",
             "snapshot_generation_id": (
@@ -2585,6 +2587,8 @@ class AnalyzerAvailability(unittest.TestCase):
                             "resolve_ms": 0.1, "tcp_ms": 0.08,
                             "upgrade_ms": 0.1, "enable_ms": 0.1,
                             "connect_total_ms": 0.4, "navigate_ms": 1.0,
+                            "navigate_command_ms": 0.2,
+                            "navigate_load_event_ms": 0.8,
                             "idle_ms": 0.0, "screenshot_ms": 1.0,
                             "decode_ms": 0.1, "nav_timing_ms": 0.1,
                             "total_ms": value,
@@ -7212,3 +7216,1035 @@ class PerRequestPrivateDirty(unittest.TestCase):
             302_048,
             "a complete sample must still total",
         )
+
+
+class SnapshotGenerationDns(unittest.TestCase):
+    """snapshot_generation returns the golden's recorded guest resolver.
+
+    The corpus arm bakes GUEST_DNS into the golden (`fcvm podman prepare
+    --dns`), which fcvm records as metadata.network_config.dns_server in the
+    snapshot's config.json. The run meta has to carry that value so the
+    analyzer can refuse a corpus run whose hostnames were resolved by nothing
+    the record names.
+
+    RED BEFORE THE FIX: KeyError: 'dns_server' for the override case,
+    `'dns_server' not found in {'generation_id': ...}` for the null and
+    absent cases, and `RuntimeError not raised` for the rejected resolver.
+    """
+
+    SNAPSHOT = SnapshotGenerationIdentity.SNAPSHOT
+    GENERATION_ID = "11111111-1111-4111-8111-111111111111"
+
+    @classmethod
+    def write_generation(cls, data_root, network_config, guest_dns=None,
+                         drop_guest_dns=False):
+        """The identity fixture plus a network_config block (None omits it).
+
+        guest_dns is what the golden's provenance records as the requested
+        resolver (reqbench.sh GUEST_DNS, null when none was requested);
+        drop_guest_dns removes the key, the shape of a pre-feature golden.
+        """
+        config_path, _digest = SnapshotGenerationIdentity._write_generation(
+            data_root, cls.GENERATION_ID,
+        )
+        provenance_path = os.path.join(
+            data_root, "snapshots", cls.SNAPSHOT, "reqbench-provenance.json",
+        )
+        with open(provenance_path) as source:
+            provenance = json.load(source)
+        if network_config is not None:
+            with open(config_path) as source:
+                config = json.load(source)
+            config["metadata"]["network_config"] = network_config
+            config_json = (
+                json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            with open(config_path, "wb") as target:
+                target.write(config_json)
+            provenance["snapshot_config_sha256"] = hashlib.sha256(config_json).hexdigest()
+        provenance["guest_dns"] = guest_dns
+        if drop_guest_dns:
+            del provenance["guest_dns"]
+        with open(provenance_path, "w") as target:
+            json.dump(provenance, target)
+
+    def test_a_dns_override_is_returned_as_dns_server(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": "10.0.2.2"}, guest_dns="10.0.2.2",
+            )
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertEqual(generation["dns_server"], "10.0.2.2")
+            self.assertEqual(generation["guest_dns"], "10.0.2.2")
+
+    def test_a_host_filled_resolver_without_an_override_is_not_a_guest_dns(self):
+        """Bridged goldens carry the host's first resolver in dns_server
+        when no --dns was given (src/commands/podman/mod.rs,
+        with_dns_server(host_dns.first())). That resolver was recorded as
+        guest_dns, so a run that resolved its hostnames on the live
+        internet satisfied the analyzer's "names its resolver" gate.
+
+        RED BEFORE THE FIX: KeyError: 'guest_dns'.
+        """
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": "192.168.94.1"}, guest_dns=None,
+            )
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertEqual(generation["dns_server"], "192.168.94.1")
+            self.assertIsNone(generation["guest_dns"])
+
+    def test_a_provenance_without_guest_dns_is_refused(self):
+        """A golden made before the field existed cannot say whether its
+        resolver was requested; it is re-recorded, not guessed at.
+
+        RED BEFORE THE FIX: RuntimeError not raised.
+        """
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": "10.0.2.2"}, drop_guest_dns=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "guest_dns"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_an_override_the_snapshot_did_not_bake_is_refused(self):
+        """RED BEFORE THE FIX: RuntimeError not raised."""
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": "10.0.2.3"}, guest_dns="10.0.2.2",
+            )
+            with self.assertRaisesRegex(RuntimeError, "10.0.2.2"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_no_override_is_returned_as_none(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(
+                data_root, {"dns_server": None, "tap_device": "tap0"},
+            )
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertIn("dns_server", generation)
+            self.assertIsNone(generation["dns_server"])
+
+    def test_an_absent_network_config_is_none(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(data_root, None)
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertIn("dns_server", generation)
+            self.assertIsNone(generation["dns_server"])
+
+    def test_a_resolver_that_is_not_an_ip_literal_is_rejected(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(data_root, {"dns_server": "resolver.local"})
+            with self.assertRaisesRegex(RuntimeError, "dns_server"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+
+class RunMetaGuestDns(unittest.TestCase):
+    """reqbench.main stamps the golden's resolver and the engine into the meta.
+
+    Drives the real `main` against stubbed arms, the same way
+    SnapshotGenerationIdentity does, so the field is observed in the record
+    the analyzer reads rather than asserted about the source.
+
+    RED BEFORE THE FIX: KeyError: 'guest_dns' for the override case and
+    `'guest_dns' not found in {'kind': 'meta', ...}` for the null case.
+    """
+
+    SNAPSHOT = SnapshotGenerationIdentity.SNAPSHOT
+
+    def _drive_main(self, data_root, network_config, guest_dns=None):
+        SnapshotGenerationDns.write_generation(
+            data_root, network_config, guest_dns=guest_dns,
+        )
+        runtime_bundle = os.path.join(data_root, "runtime")
+        os.makedirs(runtime_bundle)
+        manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+        with open(manifest_path, "w") as target:
+            target.write("sealed runtime fixture\n")
+        fcvm = os.path.join(runtime_bundle, "fcvm")
+        with open(fcvm, "w") as target:
+            target.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fcvm, 0o755)
+        exact_hashes = {
+            os.path.realpath(fcvm): "c" * 64,
+            os.path.realpath(manifest_path): "d" * 64,
+        }
+
+        def record(arm, rep):
+            return {
+                "arm": arm, "rep": rep, "ok": True,
+                "blocking_ms": 1.0, "wall_ms": 1.0, "teardown": {},
+            }
+
+        saved = {
+            "HERE": reqbench.HERE,
+            "run_noop_request": reqbench.run_noop_request,
+            "run_cdp_request": reqbench.run_cdp_request,
+            "sha256_file": reqbench.sha256_file,
+            "harness_sha256": reqbench.harness_sha256,
+            "command_text": reqbench.command_text,
+            "pending_signal": reqbench._pending_harness_signal,
+            "argv": sys.argv,
+            "sigint": signal.getsignal(signal.SIGINT),
+            "sigterm": signal.getsignal(signal.SIGTERM),
+        }
+        env_updates = {
+            "REQBENCH_RUNTIME_BUNDLE": runtime_bundle,
+            "REQBENCH_SOURCE_REVISION": "e" * 40,
+            "REQBENCH_GUARD_LOADAVG1": "0.1",
+            "REQBENCH_GUARD_VM_PROCESSES": "0",
+            "REQBENCH_QUIET_LOADAVG1_LIMIT": "2.0",
+            "REQBENCH_QUIET_GUARD": "1",
+            "ALLOW_BUSY": "0",
+        }
+        saved_env = {key: os.environ.get(key) for key in env_updates}
+        out_dir = os.path.join(data_root, "results")
+        try:
+            os.environ.update(env_updates)
+            reqbench.HERE = runtime_bundle
+            reqbench.run_noop_request = lambda _args, rep: record("noop", rep)
+            reqbench.run_cdp_request = (
+                lambda _args, rep, fast, probe=None:
+                record("cdp-fast" if fast else "cdp", rep)
+            )
+            reqbench.sha256_file = (
+                lambda path: exact_hashes[os.path.realpath(path)]
+            )
+            reqbench.harness_sha256 = lambda: "f" * 64
+            reqbench.command_text = lambda _argv: "fcvm fixture"
+            reqbench._pending_harness_signal = 0
+            sys.argv = [
+                "reqbench.py",
+                "--snapshot-tag", self.SNAPSHOT,
+                "--snapshot-name", self.SNAPSHOT,
+                "--url", "http://127.0.0.1:8000/medium.html",
+                "--arms", "noop,cdp",
+                "--reps", "1",
+                "--warmup", "0",
+                "--image", "localhost/chromium-bench-req",
+                "--image-id", "sha256:" + "b" * 64,
+                "--network-mode", "rootless",
+                "--cpu", "2",
+                "--memory-mib", "1024",
+                "--fcvm", fcvm,
+                "--data-root", data_root,
+                "--out-dir", out_dir,
+                "--run-id", "2" * 32,
+            ]
+            with redirect_stdout(io.StringIO()):
+                rc = reqbench.main()
+        finally:
+            reqbench.HERE = saved["HERE"]
+            reqbench.run_noop_request = saved["run_noop_request"]
+            reqbench.run_cdp_request = saved["run_cdp_request"]
+            reqbench.sha256_file = saved["sha256_file"]
+            reqbench.harness_sha256 = saved["harness_sha256"]
+            reqbench.command_text = saved["command_text"]
+            reqbench._pending_harness_signal = saved["pending_signal"]
+            sys.argv = saved["argv"]
+            signal.signal(signal.SIGINT, saved["sigint"])
+            signal.signal(signal.SIGTERM, saved["sigterm"])
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(rc, 0)
+        with open(os.path.join(out_dir, "reqbench.jsonl")) as source:
+            meta = json.loads(source.readline())
+        self.assertEqual(meta["kind"], "meta")
+        return meta
+
+    def test_the_resolver_override_is_recorded(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            meta = self._drive_main(
+                data_root, {"dns_server": "10.0.2.2"}, guest_dns="10.0.2.2",
+            )
+        self.assertEqual(meta["guest_dns"], "10.0.2.2")
+        self.assertEqual(meta["engine"], "chromium")
+
+    def test_no_override_is_recorded_as_null(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            meta = self._drive_main(data_root, {"dns_server": None})
+        self.assertIn("guest_dns", meta)
+        self.assertIsNone(meta["guest_dns"])
+
+    def test_a_host_filled_resolver_is_recorded_as_null(self):
+        """The meta's guest_dns is the resolver the golden REQUESTED, from
+        its provenance; the effective dns_server a bridged guest inherits
+        from the host is not a controlled resolver.
+
+        RED BEFORE THE FIX: AssertionError: '192.168.94.1' is not None.
+        """
+        with tempfile.TemporaryDirectory() as data_root:
+            meta = self._drive_main(data_root, {"dns_server": "192.168.94.1"})
+        self.assertIsNone(meta["guest_dns"])
+
+
+def _run_analyzer_fast(argv):
+    """main_with under the fast median/shift stubs, stdout captured.
+
+    Same substitution AnalyzerAvailability._run_gate_fixture makes: these
+    tests target gate truth and output shape, not the bootstrap.
+    """
+    from unittest import mock
+    with (
+        mock.patch.object(
+            reqanalyze, "median_ci", AnalyzerAvailability._fast_median_ci,
+        ),
+        mock.patch.object(
+            reqanalyze, "hodges_lehmann_shift", AnalyzerAvailability._fast_shift,
+        ),
+        redirect_stdout(io.StringIO()),
+    ):
+        return reqanalyze.main_with(argv)
+
+
+def _rewrite_records(path, mutate):
+    """Apply `mutate(row)` to every non-meta row of a jsonl fixture in place."""
+    with open(path) as source:
+        rows = [json.loads(line) for line in source]
+    for row in rows:
+        if row.get("kind") != "meta":
+            mutate(row)
+    with open(path, "w") as target:
+        for row in rows:
+            target.write(json.dumps(row) + "\n")
+
+
+class AnalyzerResolverGate(unittest.TestCase):
+    """A run whose URLs need a resolver must name the resolver in its meta.
+
+    The corpus arm answers every corpus hostname from a replay server the
+    guest reaches through GUEST_DNS. A run that declares hostnames but records
+    no guest_dns resolved them somewhere the record does not say, so its
+    numbers cannot be defended and the analyzer refuses them. Fixture runs
+    address the page server by IP literal (or localhost) and need no
+    resolver, so they publish without one.
+
+    RED BEFORE THE FIX: the corpus-without-guest_dns, bad-guest_dns and
+    bad-engine metas all published (`AssertionError: True is not False`),
+    and the cell carried no guest_dns (KeyError: 'guest_dns').
+    """
+
+    CORPUS = ["https://example.com/", "https://developer.mozilla.org/en-US/"]
+
+    @staticmethod
+    def write_multi_url(path, urls, **overrides):
+        """A clean 200-rep backend whose records cycle through `urls`."""
+        AnalyzerAvailability._write_clean_backend(
+            path, "file", 200, 384.0,
+            url=",".join(urls), urls=list(urls), **overrides,
+        )
+
+        def cycle(row):
+            url = urls[row["rep"] % len(urls)]
+            row["url"] = url
+            if isinstance(row.get("render"), dict):
+                row["render"]["url"] = url
+
+        _rewrite_records(path, cycle)
+
+    def _analyze(self, d, write):
+        src = os.path.join(d, "r.jsonl")
+        dst = os.path.join(d, "r.json")
+        write(src)
+        rc = _run_analyzer_fast(["--json-out", dst, src])
+        with open(dst) as source:
+            return rc, json.load(source)
+
+    def test_corpus_hostnames_without_guest_dns_are_not_publishable(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(src, self.CORPUS),
+            )
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(
+            any("guest_dns" in error for error in errors),
+            f"the refusal must name the missing resolver: {errors}",
+        )
+        self.assertTrue(
+            any("guest_dns" in error and "example.com" in error for error in errors),
+            f"the refusal must name a hostname that needed it: {errors}",
+        )
+
+    def test_corpus_hostnames_with_guest_dns_are_publishable(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d,
+                lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_dns="10.0.2.2",
+                ),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["cell"]["guest_dns"], "10.0.2.2")
+        self.assertEqual(out["cell"]["engine"], "chromium")
+
+    def test_a_fixture_url_without_guest_dns_is_publishable(self):
+        """Positive control for the gate: an IP-literal host needs no resolver.
+
+        Cannot go red against the unfixed analyzer on its own (it published
+        everything). It was watched red against a deliberate over-strict
+        gate that demanded guest_dns for every URL, which is the mistake it
+        guards against.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d,
+                lambda src: AnalyzerAvailability._write_clean_backend(
+                    src, "file", 200, 384.0,
+                ),
+            )
+        self.assertEqual(
+            out["cell"]["url"], "http://127.0.0.1:8000/medium.html",
+        )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+        self.assertIn("guest_dns", out["cell"])
+        self.assertIsNone(out["cell"]["guest_dns"])
+        self.assertEqual(out["cell"]["engine"], "chromium")
+
+    def test_localhost_without_guest_dns_is_publishable(self):
+        """Positive control, like the fixture-URL case above: red only against
+        the over-strict gate."""
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d,
+                lambda src: AnalyzerAvailability._write_clean_backend(
+                    src, "file", 200, 384.0,
+                    url="http://localhost:8000/medium.html",
+                ),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+
+    def test_a_guest_dns_that_is_not_an_ip_literal_is_a_metadata_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d,
+                lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_dns="resolver.local",
+                ),
+            )
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(any("guest_dns" in error for error in errors), errors)
+
+    def test_an_unsupported_engine_is_a_metadata_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d,
+                lambda src: AnalyzerAvailability._write_clean_backend(
+                    src, "file", 200, 384.0, engine="gecko",
+                ),
+            )
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        # The CELL must reject it. The render-engine mismatch check already
+        # mentions "engine", so a looser assertion passed on the unfixed tree.
+        self.assertIsNone(out["cell"])
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(any("no valid engine" in error for error in errors), errors)
+
+    def test_a_url_set_that_contradicts_url_is_a_metadata_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d,
+                lambda src: AnalyzerAvailability._write_clean_backend(
+                    src, "file", 200, 384.0,
+                    urls=["http://127.0.0.1:8000/other.html"],
+                ),
+            )
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(any("urls" in error for error in errors), errors)
+
+    def test_runs_with_different_guest_dns_never_pool(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.jsonl")
+            b = os.path.join(d, "b.jsonl")
+            dst = os.path.join(d, "r.json")
+            self.write_multi_url(a, self.CORPUS, guest_dns="10.0.2.2")
+            self.write_multi_url(b, self.CORPUS, guest_dns="10.0.2.3")
+            rc = _run_analyzer_fast(["--json-out", dst, a, b])
+            with open(dst) as source:
+                result = json.load(source)
+        # Two complete cells, analyzed side by side, never as one sample: each
+        # is publishable on its own (200 measured attempts), so the exit is 0.
+        self.assertEqual(len(result["backends"]), 2)
+        self.assertEqual(
+            {cell["cell"]["guest_dns"] for cell in result["backends"].values()},
+            {"10.0.2.2", "10.0.2.3"},
+        )
+        self.assertEqual(
+            len({cell["cell_id"] for cell in result["backends"].values()}), 2,
+        )
+        self.assertTrue(
+            all(cell["publishable"] for cell in result["backends"].values()),
+            result["gate"]["reasons"],
+        )
+        self.assertEqual(rc, 0)
+
+
+class AnalyzerPerUrl(unittest.TestCase):
+    """A multi-URL run reports every URL on its own.
+
+    A corpus median hides the one page that stalled; the corpus campaign
+    needs the per-page medians, load-event times and the count of distinct
+    screenshots (an error page renders to the same bytes every time).
+
+    RED BEFORE THE FIX: KeyError: 'per_url'.
+    """
+
+    URLS = ["http://127.0.0.1:8000/a.html", "http://127.0.0.1:8000/b.html"]
+    BLOCKING = {URLS[0]: 300.0, URLS[1]: 500.0}
+    LOAD_EVENT = {URLS[0]: 120.0, URLS[1]: 240.0}
+
+    @classmethod
+    def write(cls, path):
+        AnalyzerResolverGate.write_multi_url(path, cls.URLS)
+
+        def shape(row):
+            url = row["url"]
+            if row["arm"] == "noop":
+                return
+            row["blocking_ms"] = cls.BLOCKING[url]
+            row["wall_ms"] = cls.BLOCKING[url] + 1.0
+            render = row.get("render")
+            if not isinstance(render, dict):
+                return
+            render["stages"]["navigate_load_event_ms"] = cls.LOAD_EVENT[url]
+            render["stages"]["total_ms"] = cls.BLOCKING[url]
+            if url == cls.URLS[0]:
+                render["image_sha256"] = "a" * 64
+            else:
+                # Two distinct renders of the second page.
+                render["image_sha256"] = ("b" if row["rep"] % 4 == 1 else "c") * 64
+
+        _rewrite_records(path, shape)
+
+    def test_per_url_medians_are_split_by_url(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self.write(src)
+            rc = _run_analyzer_fast(["--json-out", dst, src])
+            with open(dst) as source:
+                out = json.load(source)
+        self.assertEqual(rc, 0, out["gate"]["reasons"])
+        self.assertEqual(list(out["per_url"]), self.URLS)
+        for url in self.URLS:
+            for arm in ("cdp", "cdp-fast"):
+                cell = out["per_url"][url][arm]
+                self.assertEqual(cell["n"], 100, (url, arm))
+                self.assertEqual(cell["blocking_ms"]["median"], self.BLOCKING[url])
+                self.assertEqual(cell["blocking_ms"]["n"], 100)
+                self.assertIn("lo", cell["blocking_ms"])
+                self.assertIn("hi", cell["blocking_ms"])
+                self.assertEqual(
+                    cell["navigate_load_event_ms"]["median"], self.LOAD_EVENT[url],
+                )
+                self.assertEqual(cell["total_ms"]["median"], self.BLOCKING[url])
+            noop = out["per_url"][url]["noop"]
+            self.assertEqual(noop["n"], 100)
+            self.assertEqual(noop["blocking_ms"]["median"], 50.0)
+            self.assertEqual(noop["navigate_load_event_ms"]["n"], 0)
+            self.assertEqual(noop["distinct_image_sha256"], 0)
+        self.assertEqual(out["per_url"][self.URLS[0]]["cdp"]["distinct_image_sha256"], 1)
+        self.assertEqual(out["per_url"][self.URLS[1]]["cdp"]["distinct_image_sha256"], 2)
+        # The pooled figures the existing consumers read are unchanged.
+        self.assertEqual(out["arms"]["cdp"]["blocking_ms"]["median"], 400.0)
+        self.assertEqual(out["arms"]["cdp"]["blocking_ms"]["n"], 200)
+        for url in self.URLS:
+            for arm in ("cdp", "cdp-fast", "noop"):
+                self.assertEqual(
+                    out["per_url"][url][arm]["load_stage"], "navigate_load_event_ms",
+                )
+
+    NAVIGATE = {URLS[0]: 180.0, URLS[1]: 360.0}
+
+    @classmethod
+    def write_webkit(cls, path):
+        """The multi-URL fixture reshaped into a webkit run. WebDriver
+        classic exposes no load-event stage; its navigate call returns at
+        the load event, so the load-completing duration is navigate_ms."""
+        AnalyzerResolverGate.write_multi_url(path, cls.URLS, engine="webkit")
+
+        def reshape(row):
+            render = row.get("render")
+            if not isinstance(render, dict):
+                return
+            row["render"] = {
+                "ok": True, "url": render["url"], "format": render["format"],
+                "engine": "webkit", "wd_host": row["endpoint"],
+                "session_prewired": True,
+                "stages": {
+                    "resolve_ms": 0.1, "connect_total_ms": 0.4,
+                    "navigate_ms": cls.NAVIGATE[row["url"]], "screenshot_ms": 1.0,
+                    "total_ms": render["stages"]["total_ms"],
+                },
+                "image_bytes": 1024, "image_sha256": "9" * 64,
+            }
+
+        _rewrite_records(path, reshape)
+
+    def test_a_webkit_run_reports_its_navigate_round_trip_per_url(self):
+        """per_url read navigate_load_event_ms for every engine, so a webkit
+        URL reported n=0 and a null median while its records carried the
+        load-completing duration as navigate_ms, the stage the stall gate
+        already selects by engine. The block now reads that stage and names
+        it in load_stage.
+
+        RED BEFORE THE FIX: KeyError: 'load_stage'; on the same fixture the
+        block's navigate_load_event_ms summary read
+        {"median": null, "lo": null, "hi": null, "n": 0} for every webkit URL.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self.write_webkit(src)
+            rc = _run_analyzer_fast(["--json-out", dst, src])
+            with open(dst) as source:
+                out = json.load(source)
+        self.assertEqual(rc, 0, out["gate"]["reasons"])
+        self.assertEqual(list(out["per_url"]), self.URLS)
+        for url in self.URLS:
+            for arm in ("cdp", "cdp-fast"):
+                cell = out["per_url"][url][arm]
+                self.assertEqual(cell["load_stage"], "navigate_ms", (url, arm))
+                self.assertNotIn("navigate_load_event_ms", cell)
+                self.assertEqual(cell["n"], 100, (url, arm))
+                self.assertEqual(cell["navigate_ms"]["n"], 100, (url, arm))
+                self.assertEqual(cell["navigate_ms"]["median"], self.NAVIGATE[url])
+            noop = out["per_url"][url]["noop"]
+            self.assertEqual(noop["load_stage"], "navigate_ms")
+            self.assertEqual(noop["navigate_ms"]["n"], 0)
+
+    def test_a_single_url_run_reports_its_one_url(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            AnalyzerAvailability._write_clean_backend(src, "file", 200, 384.0)
+            rc = _run_analyzer_fast(["--json-out", dst, src])
+            with open(dst) as source:
+                out = json.load(source)
+        self.assertEqual(rc, 0, out["gate"]["reasons"])
+        self.assertEqual(list(out["per_url"]), ["http://127.0.0.1:8000/medium.html"])
+        self.assertEqual(
+            out["per_url"]["http://127.0.0.1:8000/medium.html"]["cdp"]["n"], 200,
+        )
+
+    def test_a_record_url_that_contradicts_its_render_is_a_schedule_error(self):
+        """per_url buckets by the record's own url stamp. The schedule check
+        validated only render.url, so a record could sit in one URL's
+        bucket while its render proves it rendered another, and the run
+        stayed publishable."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self.write(src)
+
+            def cross(record):
+                self.assertEqual(record["url"], self.URLS[0])
+                record["url"] = self.URLS[1]  # render.url stays URLS[0]
+
+            AnalyzerAvailability._mutate_record(src, "cdp", cross)
+            rc = _run_analyzer_fast(["--json-out", dst, src])
+            with open(dst) as source:
+                out = json.load(source)
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(
+            any("url" in error and self.URLS[1] in error for error in errors),
+            errors,
+        )
+
+
+class AnalyzerStallGate(unittest.TestCase):
+    """A load event that takes tens of seconds is a stall, not a slow page.
+
+    A resolver that never answers turns a navigation into a ~30 s wait that
+    a pooled median absorbs. With --stall-max-ms the analyzer lists every
+    such record and refuses to publish the run.
+
+    RED BEFORE THE FIX: `error: unrecognized arguments: --stall-max-ms 15000`
+    (argparse SystemExit 2) for every test that passes the flag, and
+    KeyError: 'stall_gate' for the inert case.
+    """
+
+    URL = "http://127.0.0.1:8000/medium.html"
+
+    @staticmethod
+    def _write(path, load_event_ms, *, warmup=False, drop_stage=False):
+        AnalyzerAvailability._write_clean_backend(path, "file", 200, 384.0)
+
+        def mutate(record):
+            stages = record["render"]["stages"]
+            if drop_stage:
+                del stages["navigate_load_event_ms"]
+            else:
+                stages["navigate_load_event_ms"] = load_event_ms
+
+        AnalyzerAvailability._mutate_record(path, "cdp", mutate, warmup=warmup)
+
+    def _analyze(self, d, extra_argv):
+        src = os.path.join(d, "r.jsonl")
+        dst = os.path.join(d, "r.json")
+        rc = _run_analyzer_fast(extra_argv + ["--json-out", dst, src])
+        with open(dst) as source:
+            return rc, json.load(source)
+
+    def test_a_31s_load_event_fails_the_gate_and_publication(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "r.jsonl"), 31000.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        gate = out["stall_gate"]
+        self.assertEqual(gate["max_ms"], 15000)
+        self.assertIs(gate["passed"], False)
+        self.assertEqual(len(gate["violations"]), 1, gate)
+        violation = gate["violations"][0]
+        self.assertEqual(violation["url"], self.URL)
+        self.assertEqual(violation["arm"], "cdp")
+        self.assertEqual(violation["navigate_load_event_ms"], 31000.0)
+        self.assertIs(out["publishable"], False)
+        self.assertIn("stall_gate", " ".join(out["gate"]["reasons"]))
+        self.assertIs(out["gate"]["stall_gate"]["passed"], False)
+        self.assertEqual(rc, 5)
+
+    def test_a_load_event_within_the_limit_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "r.jsonl"), 14999.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        self.assertIs(out["stall_gate"]["passed"], True)
+        self.assertEqual(out["stall_gate"]["violations"], [])
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+
+    def test_without_a_limit_the_gate_is_inert(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "r.jsonl"), 31000.0)
+            rc, out = self._analyze(d, [])
+        self.assertEqual(
+            out["stall_gate"],
+            {"max_ms": None, "passed": True, "evaluated": 0, "violations": []},
+        )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+
+    def test_a_warmup_stall_is_still_a_violation(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "r.jsonl"), 31000.0, warmup=True)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        self.assertIs(out["stall_gate"]["passed"], False)
+        self.assertIs(out["stall_gate"]["violations"][0]["warmup"], True)
+        self.assertEqual(rc, 5)
+
+    def test_a_successful_render_without_the_stage_cannot_pass(self):
+        """A record that never timed its load event has not shown it did not stall."""
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "r.jsonl"), None, drop_stage=True)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        self.assertIs(out["stall_gate"]["passed"], False)
+        self.assertIsNone(out["stall_gate"]["violations"][0]["navigate_load_event_ms"])
+        self.assertEqual(rc, 5)
+
+    def test_a_non_positive_limit_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            AnalyzerAvailability._write_clean_backend(src, "file", 200, 384.0)
+            from contextlib import redirect_stderr
+            stderr = io.StringIO()
+            with self.assertRaises(SystemExit) as raised:
+                with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                    reqanalyze.main_with(["--stall-max-ms", "0", src])
+            self.assertEqual(raised.exception.code, 2)
+            # An unknown flag also exits 2, which let this pass before the
+            # flag existed; the refusal has to be the range check.
+            self.assertIn("positive", stderr.getvalue())
+
+    def test_a_negative_load_event_is_a_violation(self):
+        """A stage that ran backwards was not timed; it cannot prove the
+        render did not stall, and the gate treated it as within the limit."""
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "r.jsonl"), -1.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        gate = out["stall_gate"]
+        self.assertIs(gate["passed"], False, gate)
+        self.assertEqual(len(gate["violations"]), 1, gate)
+        self.assertEqual(gate["violations"][0]["navigate_load_event_ms"], -1.0)
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+
+    @staticmethod
+    def _webkit(path, navigate_ms):
+        """The chromium fixture reshaped into a webkit run.
+
+        WebDriver classic exposes no load-event stage; its navigate call
+        returns at the load event, so a stall lands in navigate_ms.
+        """
+        AnalyzerAvailability._write_clean_backend(
+            path, "file", 200, 384.0, engine="webkit",
+        )
+
+        def reshape(row):
+            render = row.get("render")
+            if not isinstance(render, dict):
+                return
+            row["render"] = {
+                "ok": True, "url": render["url"], "format": render["format"],
+                "engine": "webkit", "wd_host": row["endpoint"],
+                "session_prewired": True,
+                "stages": {
+                    "resolve_ms": 0.1, "connect_total_ms": 0.4,
+                    "navigate_ms": navigate_ms, "screenshot_ms": 1.0,
+                    "total_ms": render["stages"]["total_ms"],
+                },
+                "image_bytes": 1024, "image_sha256": "9" * 64,
+            }
+
+        _rewrite_records(path, reshape)
+
+    def test_a_webkit_run_is_gated_on_its_navigate_round_trip(self):
+        """An armed gate that skipped every webkit record reported
+        passed=true having evaluated nothing, so a webkit stall of any
+        length published."""
+        with tempfile.TemporaryDirectory() as d:
+            self._webkit(os.path.join(d, "r.jsonl"), 1.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+        self.assertIs(out["stall_gate"]["passed"], True)
+        self.assertEqual(out["stall_gate"]["evaluated"], 404)
+        with tempfile.TemporaryDirectory() as d:
+            self._webkit(os.path.join(d, "r.jsonl"), 31000.0)
+            rc, out = self._analyze(d, ["--stall-max-ms", "15000"])
+        self.assertIs(out["stall_gate"]["passed"], False, out["stall_gate"])
+        self.assertEqual(rc, 5)
+        violation = out["stall_gate"]["violations"][0]
+        self.assertEqual(violation["stage"], "navigate_ms")
+        self.assertEqual(violation["navigate_ms"], 31000.0)
+
+
+class PublicationGateInvocation(unittest.TestCase):
+    """`reqbench.sh run` arms the analyzer's stall gate from STALL_MAX_MS.
+
+    reqanalyze grew --stall-max-ms and campaign_summary refuses an analysis
+    whose gate was never armed, but nothing passed the flag: every run the
+    campaign produced was un-indexable by construction. The analyzer call
+    is a function so it can be driven here with a python3 stub on PATH, the
+    way HugepageGuards drives the pool helpers.
+
+    RED BEFORE THE FIX: bash: line 1: apply_publication_gates: command not
+    found (the call was inline in cmd_run), and `make -n` printed the
+    analyze recipe without --stall-max-ms.
+    """
+
+    SH = os.path.join(HERE, "reqbench.sh")
+    REPO = os.path.dirname(os.path.dirname(HERE))
+
+    def _gate(self, env_extra):
+        d = tempfile.mkdtemp(prefix="pubgate-")
+        self.addCleanup(shutil.rmtree, d)
+        binx = os.path.join(d, "bin")
+        os.makedirs(binx)
+        argv_log = os.path.join(d, "python3-argv")
+        for name, body in (
+            ("sudo", '#!/bin/bash\nexec "$@"\n'),
+            ("python3", f'#!/bin/bash\nprintf "%s\\n" "$@" > "{argv_log}"\nexit 0\n'),
+        ):
+            with open(os.path.join(binx, name), "w") as handle:
+                handle.write(body)
+            os.chmod(os.path.join(binx, name), 0o755)
+        results = os.path.join(d, "results")
+        os.makedirs(results)
+        env = dict(os.environ)
+        env.pop("STALL_MAX_MS", None)
+        env.update(
+            PATH=binx + os.pathsep + env["PATH"],
+            TAG="tag-under-test",
+            STATE_DIR=os.path.join(d, "state"),
+            RESULTS=results,
+        )
+        env.update(env_extra)
+        result = subprocess.run(
+            ["bash", "-c", f'source "{self.SH}" && apply_publication_gates'],
+            capture_output=True, text=True, env=env, timeout=60)
+        argv = []
+        if os.path.exists(argv_log):
+            with open(argv_log) as handle:
+                argv = handle.read().splitlines()
+        return result, argv, results
+
+    def test_stall_max_ms_reaches_the_analyzer(self):
+        result, argv, results = self._gate({"STALL_MAX_MS": "15000"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(argv and argv[0].endswith("reqanalyze.py"), argv)
+        self.assertIn("--stall-max-ms", argv)
+        self.assertEqual(argv[argv.index("--stall-max-ms") + 1], "15000")
+        self.assertEqual(argv[argv.index("--json-out") + 1],
+                         os.path.join(results, "analysis.json"))
+        self.assertEqual(argv[-1], os.path.join(results, "reqbench.jsonl"))
+
+    def test_an_unset_knob_leaves_the_gate_unarmed(self):
+        """The fixture runs (medium.html) keep their existing behaviour."""
+        result, argv, _results = self._gate({})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(argv and argv[0].endswith("reqanalyze.py"), argv)
+        self.assertNotIn("--stall-max-ms", argv)
+
+    def test_the_make_analyze_target_passes_the_knob(self):
+        """`make analyze-chromium-request` calls reqanalyze directly and has
+        to arm the gate the same way."""
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "reqbench.jsonl"), "w") as handle:
+                handle.write("{}\n")
+            armed = subprocess.run(
+                ["make", "-n", "-C", self.REPO, "analyze-chromium-request",
+                 f"RESULTS={d}", "STALL_MAX_MS=15000"],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(armed.returncode, 0, armed.stderr[-2000:])
+            self.assertIn("reqanalyze.py", armed.stdout)
+            self.assertIn("--stall-max-ms 15000", armed.stdout)
+            unarmed = subprocess.run(
+                ["make", "-n", "-C", self.REPO, "analyze-chromium-request",
+                 f"RESULTS={d}"],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(unarmed.returncode, 0, unarmed.stderr[-2000:])
+            self.assertIn("reqanalyze.py", unarmed.stdout)
+            self.assertNotIn("--stall-max-ms", unarmed.stdout)
+
+
+class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
+    """campaign_summary.py reads what reqanalyze.py actually writes.
+
+    test_campaign_summary.py drives the index from hand-written analysis.json
+    fixtures, so a field the analyzer spells differently, or a gate the
+    analyzer leaves unarmed, would pass both modules' own tests and fail only
+    on a real campaign. This runs the analyzer on a corpus-shaped run (two
+    hostnames, guest_dns set) and hands its analysis.json, plus a
+    dns-evidence.json in corpus_campaign.sh's shape, to the index.
+
+    RED BEFORE THE FIX: without --stall-max-ms the analyzer writes stall_gate
+    {max_ms: null, passed: true, evaluated: 0} and the index accepted it:
+    AssertionError: 0 == 0 : wrote .../campaign-x-summary.json: 1 cell(s).
+    The armed case is the positive control.
+    """
+
+    CORPUS = ["https://example.com/", "https://developer.mozilla.org/en-US/"]
+
+    @staticmethod
+    def _evidence(run_dir, verdict):
+        """dns-evidence.json plus every file it names, as the campaign leaves them."""
+        verify_files = []
+        verify_hashes = {}
+        for stage in ("pre", "before-run", "after-run"):
+            path = os.path.join(run_dir, f"verify-dns-{stage}.json")
+            with open(path, "w") as handle:
+                json.dump({
+                    "dns_server": "10.0.2.2", "resolv_conf_vm": "nameserver 10.0.2.2\n",
+                    "resolv_conf_container": "nameserver 10.0.2.2\n",
+                    "hosts": {"example.com": {"answer": "10.0.2.2", "ok": True}},
+                    "urls": {"https://example.com/": {"status": 200, "ok": True,
+                                                      "proxy_env_ignored": []}},
+                    "proxies_disabled": True,
+                    "timestamp": "2026-08-28T00:00:00Z", "passed": True,
+                }, handle)
+            verify_files.append(path)
+            with open(path, "rb") as handle:
+                verify_hashes[f"verify-dns-{stage}.json"] = hashlib.sha256(
+                    handle.read()).hexdigest()
+        hashes = {}
+        for name in ("corpus-dns.log", "corpus-access.log"):
+            path = os.path.join(run_dir, name)
+            with open(path, "w") as handle:
+                handle.write('{"ts": 1.0}\n')
+            with open(path, "rb") as handle:
+                hashes[name] = hashlib.sha256(handle.read()).hexdigest()
+        with open(os.path.join(run_dir, "dns-owner.log"), "w") as handle:
+            handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n" * 12)
+        return {
+            "serve_pid": 4242,
+            "dnsmasq_was_active_before": True,
+            "dnsmasq_active_after_restore": False,
+            "dnsmasq_state_after_restore": "inactive",
+            "sampler_alive_at_stop": True,
+            "samples": 12,
+            "sample_interval_s": 10,
+            "owner_log": os.path.join(run_dir, "dns-owner.log"),
+            "first_mismatch": None,
+            "verify_files": verify_files,
+            "verify_file_sha256": verify_hashes,
+            "corpus_dns_log_sha256": hashes["corpus-dns.log"],
+            "corpus_access_log_sha256": hashes["corpus-access.log"],
+            "corpus_serve_exit_status": 0,
+            "reason": None,
+            "verdict": verdict,
+        }
+
+    def _run_dir(self, d, analyzer_argv):
+        run_dir = os.path.join(d, "reqbench-20260828-000000-corpus")
+        os.makedirs(run_dir)
+        src = os.path.join(run_dir, "reqbench.jsonl")
+        AnalyzerResolverGate.write_multi_url(src, self.CORPUS, guest_dns="10.0.2.2")
+        analysis = os.path.join(run_dir, "analysis.json")
+        rc = _run_analyzer_fast(analyzer_argv + ["--json-out", analysis, src])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(run_dir, "dns-evidence.json"), "w") as handle:
+            json.dump(self._evidence(run_dir, "clean"), handle)
+        return run_dir
+
+    @staticmethod
+    def _summarize(out, run_dirs):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = campaign_summary.main_with(["--out", out] + list(run_dirs))
+        return rc, stdout.getvalue() + stderr.getvalue()
+
+    def test_an_analysis_without_a_stall_limit_is_not_indexed(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = self._run_dir(d, [])
+            with open(os.path.join(run_dir, "analysis.json")) as source:
+                gate = json.load(source)["stall_gate"]
+            self.assertIsNone(gate["max_ms"])
+            self.assertEqual(gate["evaluated"], 0)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("--stall-max-ms", text)
+
+    def test_a_gated_analysis_with_clean_evidence_is_indexed(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = self._run_dir(d, ["--stall-max-ms", "15000"])
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as source:
+                index = json.load(source)
+        self.assertEqual(len(index["cells"]), 1)
+        cell = index["cells"][0]
+        self.assertEqual(cell["engine"], "chromium")
+        self.assertEqual(cell["cpu"], 2)
+        self.assertEqual(cell["memory_mib"], 1024)
+        self.assertEqual(cell["guest_dns"], "10.0.2.2")
+        self.assertEqual(cell["backend"], "file")
+        self.assertEqual(cell["uffd_mode"], "file")
+        self.assertIs(cell["stall_gate_passed"], True)
+        self.assertEqual(cell["dns_verdict"], "clean")
+        self.assertEqual(cell["headline"]["cdp"]["blocking_ms"], 384.0)
+        self.assertEqual(cell["headline"]["cdp"]["n"], 200)
+        self.assertEqual(
+            {os.path.basename(entry["path"]) for entry in index["generated_from"]},
+            {
+                "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
+                "verify-dns-before-run.json", "verify-dns-after-run.json",
+                "dns-owner.log", "corpus-dns.log", "corpus-access.log",
+            },
+        )
+
