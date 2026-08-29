@@ -103,6 +103,7 @@ import json
 import os
 import platform
 import random
+import re
 import select
 import shlex
 import shutil
@@ -1325,6 +1326,21 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
                 f"snapshot provenance {provenance_path} requested guest_dns "
                 f"{guest_dns!r} but the snapshot baked dns_server {dns_server!r}"
             )
+    # guest_env is the container environment the golden baked (reqbench.sh
+    # GUEST_ENV), KEY=VALUE entries in order, [] when none. The resolver-rule
+    # arm (BENCH_RESOLVE_ALL_TO) lives here with guest_dns null, and the meta
+    # has to carry it or that arm reads as a fixture run.
+    if "guest_env" not in provenance:
+        raise RuntimeError(
+            f"snapshot provenance {provenance_path} records no guest_env; "
+            "recreate the golden snapshot with reqbench.sh golden"
+        )
+    guest_env = provenance["guest_env"]
+    if not valid_guest_env(guest_env):
+        raise RuntimeError(
+            f"snapshot provenance {provenance_path} has invalid guest_env "
+            f"{guest_env!r}: expected a list of KEY=VALUE strings"
+        )
     image_disk_path = metadata.get("image_disk_path")
     if (
         not isinstance(image_disk_path, str)
@@ -1370,7 +1386,18 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         "port_mappings": port_mappings,
         "dns_server": dns_server,
         "guest_dns": guest_dns,
+        "guest_env": list(guest_env),
     }
+
+
+GUEST_ENV_ENTRY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def valid_guest_env(value) -> bool:
+    """A list of KEY=VALUE strings (possibly empty), the shape the golden records."""
+    return isinstance(value, list) and all(
+        isinstance(entry, str) and GUEST_ENV_ENTRY.match(entry) for entry in value
+    )
 
 
 def serve_uffd_mode(state_dir: str, serve_pid: int, snapshot_name: str) -> str:
@@ -4212,6 +4239,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "warmup": args.warmup, "url": args.url, "urls": args.urls, "format": args.format,
             "engine": args.engine,
             "guest_dns": snapshot["guest_dns"],
+            "guest_env": snapshot["guest_env"],
             "quality": args.quality,
             "source_revision": current_source_revision,
             "fcvm_path": args.fcvm,

@@ -168,13 +168,21 @@ def request_will_be_sent(rid, url, ts):
                        "request": {"url": url, "method": "GET"}}}
 
 
-def response_received(rid, ts, ip, port, protocol, status, dns=(-1, -1)):
+def response_received(rid, ts, ip, port, protocol, status, dns=(-1, -1),
+                      from_disk_cache=False, from_service_worker=False):
     return {"method": "Network.responseReceived",
             "params": {"requestId": rid, "loaderId": "L1", "timestamp": ts,
                        "response": {"url": "", "status": status, "protocol": protocol,
                                     "remoteIPAddress": ip, "remotePort": port,
+                                    "fromDiskCache": from_disk_cache,
+                                    "fromServiceWorker": from_service_worker,
                                     "timing": {"requestTime": ts, "dnsStart": dns[0],
                                                "dnsEnd": dns[1]}}}}
+
+
+def request_served_from_cache(rid, ts):
+    return {"method": "Network.requestServedFromCache",
+            "params": {"requestId": rid, "timestamp": ts}}
 
 
 def loading_finished(rid, ts):
@@ -347,6 +355,48 @@ class NetTraceRecorded(unittest.TestCase):
         self.assertEqual(summary["pending_at_load"],
                          [{"url": "http://hang.test/open", "start_ms": 10.0}])
         self.assertEqual(summary["n_pending_at_load"], 1)
+
+    def test_a_row_says_whether_a_cache_or_a_worker_answered_it(self):
+        """A request the memory cache, the disk cache or a service worker
+        answered carries no remoteIPAddress, exactly like one that never got
+        a response. The diag holds every traced HTTP(S) request to an allowed
+        address, so a row with no address has to say whether there was a
+        network hop to name one, or the two cases cannot be told apart.
+
+        Red: KeyError: 'from_cache' (the rows carried neither field).
+        """
+        events = [
+            request_will_be_sent("r1", "http://replay.test/doc", 1000.000),
+            response_received("r1", 1000.010, "10.0.2.2", 80, "http/1.1", 200),
+            loading_finished("r1", 1000.020),
+            request_will_be_sent("r2", "http://replay.test/logo.png", 1000.030),
+            request_served_from_cache("r2", 1000.031),
+            response_received("r2", 1000.032, "", None, "http/1.1", 200),
+            loading_finished("r2", 1000.033),
+            request_will_be_sent("r3", "http://replay.test/app.js", 1000.040),
+            response_received("r3", 1000.050, "", None, "http/1.1", 200,
+                              from_service_worker=True),
+            loading_finished("r3", 1000.060),
+            request_will_be_sent("r4", "http://replay.test/img.png", 1000.070),
+            response_received("r4", 1000.080, "", None, "", 200, from_disk_cache=True),
+            loading_finished("r4", 1000.090),
+            request_will_be_sent("r5", "http://replay.test/open", 1000.095),
+            load_event_fired(1000.200),
+        ]
+        trace = cdpdrive.reduce_net_trace(events, 1000.200, 100.0)
+        rows = {row["url"]: row for row in trace["requests"]}
+        self.assertEqual(
+            {url: (row["remote_ip"], row["from_cache"], row["from_service_worker"])
+             for url, row in rows.items()},
+            {
+                "http://replay.test/doc": ("10.0.2.2", False, False),
+                "http://replay.test/logo.png": ("", True, False),
+                "http://replay.test/app.js": ("", False, True),
+                "http://replay.test/img.png": ("", True, False),
+                # No response at all: no address and nothing that explains it.
+                "http://replay.test/open": ("", False, False),
+            },
+        )
 
     def test_pending_at_load_lists_at_most_ten_rows_in_start_order(self):
         """Twelve requests open at the load event: the list names the ten

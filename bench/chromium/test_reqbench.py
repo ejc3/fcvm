@@ -31,6 +31,7 @@ import time
 import types
 import unittest
 import urllib.request
+from urllib.parse import urlsplit
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2189,6 +2190,7 @@ class SnapshotGenerationIdentity(unittest.TestCase):
             "creator_runtime_bundle_sha256": "d" * 64,
             "source_revision": "e" * 40,
             "guest_dns": None,
+            "guest_env": [],
         }
         with open(
             os.path.join(snapshot_dir, "reqbench-provenance.json"), "w"
@@ -4038,8 +4040,11 @@ exit 1
         )
 
     def _golden_image_identity_fixture(self, d, snapshot_cache_key,
-                                       built_image_id=None):
+                                       built_image_id=None, env_extra=None):
         env, binx = self._env(d, DATA_ROOT=d)
+        # The developer's shell must not decide what the golden bakes.
+        env.pop("GUEST_ENV", None)
+        env.update(env_extra or {})
         if built_image_id is not None:
             os.makedirs(os.path.join(d, "reqbench-locks"), exist_ok=True)
             with open(self._built_id_path(d), "w") as f:
@@ -4294,6 +4299,68 @@ exit 1
             )) as source:
                 provenance = json.load(source)
             self.assertEqual(provenance["built_image_id"], recorded)
+
+    def _golden_provenance(self, d):
+        with open(os.path.join(
+            d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
+        )) as source:
+            return json.load(source)
+
+    def test_golden_forwards_guest_env_to_prepare_and_records_it(self):
+        """GUEST_ENV=A=1,B=2 is one `--env` per entry on prepare, and the
+        record names them as guest_env so the A/B's two goldens are told
+        apart by their provenance rather than by their tag alone.
+
+        Watched red 2026-08-28 at 13cb9543: `AssertionError: ' --env A=1
+        --env B=2 ' not found in 'podman prepare --tag cb-req-golden --force
+        --name cb-req-g-... localhost/chromium-bench-req'`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, env_extra={"GUEST_ENV": "A=1,B=2"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            prepare_line = next(
+                line for line in argv.splitlines() if line.startswith("podman prepare ")
+            )
+            self.assertIn(" --env A=1 --env B=2 ", prepare_line)
+            self.assertEqual(self._golden_provenance(d)["guest_env"], ["A=1", "B=2"])
+
+    def test_golden_without_guest_env_passes_no_env_and_records_an_empty_list(self):
+        """Watched red 2026-08-28 at 13cb9543: `KeyError: 'guest_env'`; a
+        golden made without the knob carried no field a reader could compare
+        against the A/B arm's."""
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            prepare_line = next(
+                line for line in argv.splitlines() if line.startswith("podman prepare ")
+            )
+            self.assertNotIn("--env", prepare_line)
+            self.assertEqual(self._golden_provenance(d)["guest_env"], [])
+
+    def test_golden_refuses_a_guest_env_entry_that_is_not_key_value(self):
+        """An entry without `KEY=` would reach fcvm as `--env notakv` and be
+        baked into the snapshot as whatever fcvm makes of it; the golden
+        refuses before prepare runs, naming the entry.
+
+        Watched red 2026-08-28 at 13cb9543: `AssertionError: 0 == 0 : golden
+        accepted GUEST_ENV=A=1,notakv`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, env_extra={"GUEST_ENV": "A=1,notakv"},
+            )
+            self.assertNotEqual(result.returncode, 0,
+                                "golden accepted GUEST_ENV=A=1,notakv")
+            self.assertNotIn("podman prepare", argv,
+                             "prepare ran before the entry was checked")
+            self.assertIn("notakv", result.stderr, "the refusal does not name the entry")
+            self.assertFalse(os.path.exists(os.path.join(
+                d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
+            )), "a refused golden still wrote provenance")
 
     def test_golden_consumes_the_build_record(self):
         """The record is one build-to-golden handshake, not a standing fact.
@@ -4940,6 +5007,865 @@ exit 1
                                    capture_output=True, text=True, timeout=120)
             self.assertEqual(r.stdout.strip(), "ABC123",
                              f"stdout={r.stdout!r} stderr={r.stderr[-800:]}")
+
+    # --- diag: what holds a page's load event inside a restored clone -----
+
+    # Stands in for fcvm. `snapshot serve` and every `snapshot run` clone
+    # publish a state file the way the real ones do and log their own
+    # teardown to $STUB_TEARDOWN_LOG when SIGTERM reaches them, so a test can
+    # prove each clone was stopped rather than infer it from an empty state
+    # directory alone.
+    DIAG_FCVM_STUB = r'''#!/bin/bash
+echo "$*" >> "$STUB_ARGV"
+case "$1 $2" in
+  "snapshot serve")
+      # The real server's working-set contract (src/uffd/server.rs): with
+      # --uffd-prefetch off it opens no store and writes nothing; otherwise
+      # (on, or the flag absent, which the binary defaults to on) it
+      # publishes the union of its clones' faults to memory.bin.working-set
+      # beside the snapshot it serves ($3).
+      prefetch=on; prev=""
+      for a in "$@"; do [ "$prev" = --uffd-prefetch ] && prefetch="$a"; prev="$a"; done
+      [ "$prefetch" = off ] || : > "$(dirname "$STATE_DIR")/snapshots/$3/memory.bin.working-set"
+      echo "Serve PID: $$"; echo "Waiting for VMs"
+      sleep 30 & sl=$!
+      trap 'echo "torn down serve" >> "$STUB_TEARDOWN_LOG"; kill $sl 2>/dev/null; exit 0' TERM
+      wait $sl; exit 0 ;;
+  "snapshot run")
+      name=""; prev=""
+      for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
+      vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
+      state="$STATE_DIR/$vm_id.json"
+      read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
+      printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \
+          "$vm_id" "$name" "$$" "${f[19]}" > "$state"
+      sleep 30 & sl=$!
+      trap 'echo "torn down $name" >> "$STUB_TEARDOWN_LOG"; kill $sl 2>/dev/null; rm -f "$state"; exit 0' TERM
+      wait $sl; rm -f "$state"; exit 0 ;;
+  "ls --json")
+      pid=""; [ "${3:-}" = --pid ] && pid="$4"
+      "$STUB_PYTHON" - "$STATE_DIR" "$pid" <<'PY'
+import glob, json, os, sys
+rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vm-*.json"))]
+if sys.argv[2]:
+    rows = [r for r in rows if str(r["pid"]) == sys.argv[2]]
+print(json.dumps(rows))
+PY
+      ;;
+  "exec --pid")
+      shift 3; view="$1"; shift; shift
+      case "$view $*" in
+        "-c cat /run/bench-session-id") echo SESSION-1 ;;
+        *) exit 0 ;;
+      esac ;;
+  *) exit 0 ;;
+esac
+'''
+
+    # Stands in for the host python3. A cdpdrive.py invocation writes the
+    # trace the diag asked for and prints the record cdpdrive prints, both
+    # shaped from STUB_* variables; the webkit render (`python3 - wddrive`)
+    # writes its record to the path it was given. Everything else, the
+    # `-c` one-liners that parse `fcvm ls --json` and the `-` heredoc that
+    # writes summary.json, runs the real interpreter.
+    DIAG_PYTHON_STUB = r'''#!/bin/bash
+case "$1 ${2:-}" in
+  *cdpdrive.py*)
+      printf '%s\n' "$*" >> "$STUB_DRIVER_ARGV"
+      # STUB_BARRIER: park inside the render until the test releases it, so a
+      # second invocation meets this one holding what it holds.
+      if [ -n "${STUB_BARRIER:-}" ]; then
+          touch "$STUB_BARRIER/rendering"
+          deadline=$((SECONDS + 120))
+          while [ ! -e "$STUB_BARRIER/release" ] && [ "$SECONDS" -lt "$deadline" ]; do
+              sleep 0.05
+          done
+      fi
+      exec __PYTHON__ - "$@" <<'PY'
+import json, os, sys
+argv = sys.argv[2:]
+host, url = argv[0], argv[1]
+trace = None
+for i, a in enumerate(argv):
+    if a == "--net-trace":
+        trace = argv[i + 1]
+ip = os.environ.get("STUB_REMOTE_IP", "10.0.2.2")
+load = float(os.environ.get("STUB_LOAD_MS", "812.5"))
+error = os.environ.get("STUB_ERROR_TEXT", "")
+rc = int(os.environ.get("STUB_DRIVER_RC", "0"))
+# STUB_OK_DESPITE_RC=1: the record says ok whatever the exit status (the
+# shape cdpdrive has when only the trace write failed). STUB_NO_LOAD=1: the
+# record has no navigate_load_event_ms. STUB_RECORD_URL: the record's url.
+ok = rc == 0 or os.environ.get("STUB_OK_DESPITE_RC") == "1"
+record_url = os.environ.get("STUB_RECORD_URL") or url
+rows = [
+    {"request_id": "r1", "url": url, "remote_ip": ip, "status": 200, "failed": False,
+     "pending_at_load": False, "error_text": ""},
+    {"request_id": "r2", "url": url + "asset.js", "remote_ip": ip, "status": 200,
+     "failed": False, "pending_at_load": True, "error_text": ""},
+    {"request_id": "r3", "url": url + "beacon", "remote_ip": ip, "status": 200,
+     "failed": False, "pending_at_load": True, "error_text": ""},
+]
+if error:
+    rows.append({"request_id": "r4", "url": "https://cdn.example/x.js", "remote_ip": "",
+                 "status": None, "failed": True, "pending_at_load": True,
+                 "error_text": error})
+# STUB_UNADDRESSED=1: a request that never received a response, so the trace
+# names no address for it. STUB_CACHED=1: one the cache answered and one a
+# service worker answered, which carry no address either and say why.
+if os.environ.get("STUB_UNADDRESSED") == "1":
+    rows.append({"request_id": "r5", "url": url + "late.js", "remote_ip": "",
+                 "status": None, "failed": False, "pending_at_load": True,
+                 "error_text": "", "from_cache": False, "from_service_worker": False})
+if os.environ.get("STUB_CACHED") == "1":
+    rows.append({"request_id": "r6", "url": url + "logo.png", "remote_ip": "",
+                 "status": 200, "failed": False, "pending_at_load": False,
+                 "error_text": "", "from_cache": True, "from_service_worker": False})
+    rows.append({"request_id": "r7", "url": url + "sw.js", "remote_ip": "",
+                 "status": 200, "failed": False, "pending_at_load": False,
+                 "error_text": "", "from_cache": False, "from_service_worker": True})
+summary = {"n_requests": len(rows), "n_failed": sum(r["failed"] for r in rows),
+           "n_pending_at_load": sum(r["pending_at_load"] for r in rows),
+           "remote_ips": {ip: sum(1 for r in rows if r["remote_ip"] == ip)},
+           "errors": {error: 1} if error else {}, "load_event_ms": load}
+if trace and os.environ.get("STUB_NO_TRACE", "0") != "1":
+    with open(trace, "w") as f:
+        json.dump({"requests": rows, "summary": summary}, f)
+record = {"ok": ok, "cdp_host": host, "url": record_url, "format": "jpeg",
+          "stages": {"resolve_ms": 1.0}}
+if ok:
+    record["stages"].update({"navigate_command_ms": 40.0, "navigate_load_event_ms": load,
+                             "navigate_ms": load + 40.0, "total_ms": load + 200.0})
+    if os.environ.get("STUB_NO_LOAD") == "1":
+        del record["stages"]["navigate_load_event_ms"]
+    record["net_trace"] = summary
+else:
+    record["error"] = "RuntimeError: navigation failed: net::ERR_CONNECTION_REFUSED"
+    record["stage"] = "navigate-command-response"
+print(json.dumps(record))
+sys.exit(rc)
+PY
+      ;;
+  "- wddrive")
+      # reqbench.sh's own heredoc (stdin) runs unchanged; only wddrive.drive
+      # is replaced, through sys.modules, which the heredoc's import finds
+      # before the real module on its sys.path. The fake echoes the argparse
+      # namespace it was handed so a test can hold the heredoc to its argv.
+      printf '%s\n' "$*" >> "$STUB_DRIVER_ARGV"
+      shift
+      shim=$(cat <<'SHIM'
+import os as _os, sys as _sys, types as _types
+_fake = _types.ModuleType("wddrive")
+def _drive(args):
+    load = float(_os.environ.get("STUB_LOAD_MS", "812.5"))
+    out = {"ok": True, "engine": "webkit", "wd_host": args.cdp_host, "url": args.url,
+           "session_id": args.session_id, "timeout": args.timeout,
+           "out_prefix": args.out_prefix,
+           "stages": {"resolve_ms": 1.0, "navigate_ms": load, "total_ms": load + 100.0}}
+    if _os.environ.get("STUB_NO_LOAD") == "1":
+        del out["stages"]["navigate_ms"]
+    return out
+_fake.drive = _drive
+_sys.modules["wddrive"] = _fake
+SHIM
+)
+      { printf '%s\n' "$shim"; cat; } | __PYTHON__ - "$@"
+      exit $? ;;
+esac
+exec __PYTHON__ "$@"
+'''
+
+    DIAG_URLS = "https://example.com/,https://blog.cloudflare.com/"
+
+    def _diag_fixture(self, d, engine="chromium", urls=DIAG_URLS, reps="2",
+                      expect_ips="10.0.2.2", max_load_ms="", backend="uffd",
+                      **stub_env):
+        data = os.path.join(d, "data")
+        state_dir = os.path.join(data, "state")
+        snap = os.path.join(data, "snapshots", "tag-under-test")
+        os.makedirs(state_dir)
+        os.makedirs(snap)
+        with open(os.path.join(snap, "config.json"), "w") as handle:
+            json.dump({"generation_id": "12345678-1234-4234-8234-123456789abc",
+                       "metadata": {"hugepages": False, "memory_mib": 1024}}, handle)
+        binx = os.path.join(d, "bin")
+        os.makedirs(binx)
+        self._write(os.path.join(binx, "python3"),
+                    self.DIAG_PYTHON_STUB.replace("__PYTHON__", sys.executable))
+        fcvm = os.path.join(d, "fcvm")
+        self._write(fcvm, self.DIAG_FCVM_STUB)
+        self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
+        env = dict(os.environ)
+        # The developer's shell must not decide what the diag renders.
+        for key in ("DIAG_URLS", "DIAG_REPS", "DIAG_EXPECT_IPS", "DIAG_MAX_LOAD_MS",
+                    "BACKEND", "UFFD_MODE", "UFFD_PREFETCH", "ENGINE", "URL",
+                    "REQBENCH_RUNTIME_BUNDLE"):
+            env.pop(key, None)
+        env.update(
+            PATH=binx + os.pathsep + env["PATH"],
+            TAG="tag-under-test",
+            STATE_DIR=state_dir,
+            RESULTS=os.path.join(d, "results"),
+            RUNID=self.RUN_ID,
+            FCVM=fcvm,
+            FC_AGENT=os.path.join(d, "fc-agent"),
+            ENGINE=engine,
+            BACKEND=backend,
+            UFFD_MODE="minor",
+            DIAG_REPS=reps,
+            DIAG_EXPECT_IPS=expect_ips,
+            DIAG_MAX_LOAD_MS=max_load_ms,
+            STUB_PYTHON=sys.executable,
+            STUB_ARGV=os.path.join(d, "argv.log"),
+            STUB_DRIVER_ARGV=os.path.join(d, "driver-argv.log"),
+            STUB_TEARDOWN_LOG=os.path.join(d, "teardown.log"),
+        )
+        if urls is not None:
+            env["DIAG_URLS"] = urls
+        env.update(stub_env)
+        return env, state_dir
+
+    def _diag(self, env):
+        return subprocess.run(
+            ["bash", "-c", f'source "{self.SH}" && cmd_diag'],
+            env=env, capture_output=True, text=True, timeout=180)
+
+    def _diag_summary(self, env):
+        path = os.path.join(env["RESULTS"], "diag", "summary.json")
+        self.assertTrue(os.path.exists(path), f"no {path} was written")
+        with open(path) as handle:
+            return json.load(handle)
+
+    def _diag_teardowns(self, env):
+        return self._read_if_exists(env["STUB_TEARDOWN_LOG"]).splitlines()
+
+    def _diag_sidecar(self, env):
+        """Where the fcvm stub's serve publishes a working set for the
+        snapshot under test, as the real server would beside the golden."""
+        return os.path.join(os.path.dirname(env["STATE_DIR"]), "snapshots",
+                            "tag-under-test", "memory.bin.working-set")
+
+    def test_diag_renders_each_url_on_its_own_clone_and_summarises_the_traces(self):
+        """One clone per (URL, rep), one traced render each, torn down each
+        time, summarised per URL with the remote IPs the trace saw.
+
+        Watched red 2026-08-28 at 55d6fb7d: `bash: line 1: cmd_diag:
+        command not found`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], True)
+            self.assertEqual(summary["violations"], [])
+            self.assertEqual(summary["engine"], "chromium")
+            self.assertEqual(summary["tag"], "tag-under-test")
+            self.assertEqual(summary["limits"],
+                             {"expect_ips": ["10.0.2.2"], "max_load_ms": None})
+            self.assertEqual(set(summary["urls"]), set(self.DIAG_URLS.split(",")))
+            for data in summary["urls"].values():
+                self.assertEqual(data["reps"], 2)
+                self.assertEqual(data["renders_ok"], 2)
+                self.assertEqual(data["max_load_ms"], 812.5)
+                self.assertEqual(data["max_pending_at_load"], 2)
+                self.assertEqual(data["remote_ips"], {"10.0.2.2": 6})
+                self.assertEqual(data["errors"], {})
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            stems = ["example.com-1", "example.com-2",
+                     "blog.cloudflare.com-1", "blog.cloudflare.com-2"]
+            for stem in stems:
+                with open(os.path.join(diag_dir, stem + ".json")) as handle:
+                    self.assertIs(json.load(handle)["ok"], True, stem)
+                self.assertTrue(os.path.exists(os.path.join(diag_dir, stem + ".trace.json")),
+                                f"{stem}: no trace was written")
+            argv = self._read_if_exists(env["STUB_ARGV"])
+            self.assertIn("snapshot serve tag-under-test --uffd-mode minor --uffd-prefetch off",
+                          argv, "the serve did not carry the run's UFFD mode with replay off")
+            self.assertEqual(argv.count("snapshot run --pid "), 4, argv)
+            driver = self._read_if_exists(env["STUB_DRIVER_ARGV"]).splitlines()
+            self.assertEqual(len(driver), 4, driver)
+            for line, stem, url in zip(driver, stems, ["https://example.com/"] * 2
+                                       + ["https://blog.cloudflare.com/"] * 2):
+                self.assertIn(" --timeout 120 ", line)
+                self.assertIn(f" --net-trace {diag_dir}/{stem}.trace.json", line)
+                self.assertIn(f" {url} ", line, "the driver was not asked for this url")
+            self.assertEqual(sorted(self._diag_teardowns(env)),
+                             sorted([f"torn down cb-req-diag-{n}-{self.RUN_ID}"
+                                     for n in range(1, 5)] + ["torn down serve"]))
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_diag_defaults_to_the_run_url_three_times_and_needs_no_expected_ips(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, urls=None, reps="", expect_ips="")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            summary = self._diag_summary(env)
+            self.assertEqual(list(summary["urls"]), ["http://127.0.0.1:8000/medium.html"])
+            self.assertEqual(summary["urls"]["http://127.0.0.1:8000/medium.html"]["reps"], 3)
+            self.assertEqual(summary["limits"]["expect_ips"], None)
+            self.assertEqual(len(self._read_if_exists(env["STUB_DRIVER_ARGV"]).splitlines()), 3)
+            self.assertTrue(os.path.exists(os.path.join(
+                env["RESULTS"], "diag", "127.0.0.1-8000-medium.html-3.trace.json")))
+
+    def test_a_remote_ip_outside_the_expected_set_is_a_violation(self):
+        """The trace shows a request that reached the live internet: the
+        clone rendered a real site, not the replay."""
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d, STUB_REMOTE_IP="93.184.216.34")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0,
+                                "diag passed a render that talked to 93.184.216.34\n"
+                                + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            kinds = {v["kind"] for v in summary["violations"]}
+            self.assertEqual(kinds, {"remote_ip"}, summary["violations"])
+            self.assertEqual(len(summary["violations"]), 4)
+            first = summary["violations"][0]
+            self.assertEqual(first["url"], "https://example.com/")
+            self.assertEqual(first["rep"], 1)
+            self.assertIn("93.184.216.34", first["detail"])
+            for data in summary["urls"].values():
+                self.assertEqual(data["remote_ips"], {"93.184.216.34": 6})
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_a_name_that_did_not_resolve_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, STUB_ERROR_TEXT="net::ERR_NAME_NOT_RESOLVED")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            # The failed row names no address either, and a request the diag
+            # cannot place is its own finding: both violations stand.
+            self.assertEqual({v["kind"] for v in summary["violations"]},
+                             {"name_not_resolved", "no_remote_ip"}, summary["violations"])
+            for kind in ("name_not_resolved", "no_remote_ip"):
+                detail = next(v["detail"] for v in summary["violations"]
+                              if v["kind"] == kind)
+                self.assertIn("cdn.example", detail)
+            for data in summary["urls"].values():
+                self.assertEqual(data["errors"], {"net::ERR_NAME_NOT_RESOLVED": 2})
+                self.assertEqual(data["max_pending_at_load"], 3)
+
+    def test_a_traced_request_with_no_allowed_address_is_a_violation(self):
+        """DIAG_EXPECT_IPS passed on `addressed > 0`: one request with an
+        allowed address cleared the whole rep, however many others named no
+        address at all. A subresource that failed, or that was still open
+        when the 5 s post-load drain ended, is exactly the request the
+        expectation exists to judge, and it went unjudged. Every traced
+        HTTP(S) request must now name an allowed address.
+
+        A cache or service-worker hit names none either, and there was no
+        network hop for it to name: those rows say so in the trace
+        (test_net_trace.py) and are exempt. They are the only exemption; a
+        row with no address and no explanation is a request the diag cannot
+        say anything about.
+
+        RED BEFORE THE FIX: `AssertionError: 0 != 0 : a request that never
+        received a response passed DIAG_EXPECT_IPS` (exit 0, passed true, no
+        violations).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_UNADDRESSED="1")
+            result = self._diag(env)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a request that never received a response passed DIAG_EXPECT_IPS\n"
+                + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"no_remote_ip"},
+                             summary["violations"])
+            self.assertEqual(len(summary["violations"]), 2)
+            self.assertIn("late.js", summary["violations"][0]["detail"])
+        # A cache or service-worker hit is not a request that went anywhere.
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_CACHED="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"a cache hit failed the diag: {result.stdout}"
+                             f"\n{result.stderr[-2000:]}")
+            self.assertIs(self._diag_summary(env)["passed"], True)
+        # With no expectation armed there is nothing to hold a row to.
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, reps="1", expect_ips="", STUB_UNADDRESSED="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIs(self._diag_summary(env)["passed"], True)
+
+    def test_a_load_event_over_the_limit_is_a_stall_and_no_limit_is_no_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, max_load_ms="15000", STUB_LOAD_MS="31000")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0,
+                                "a 31 s load event passed a 15 s limit\n" + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"stall"})
+            self.assertIn("31000", summary["violations"][0]["detail"])
+            self.assertIn("15000", summary["violations"][0]["detail"])
+            self.assertEqual(summary["limits"]["max_load_ms"], 15000)
+            for data in summary["urls"].values():
+                self.assertEqual(data["max_load_ms"], 31000.0)
+                self.assertEqual(data["renders_ok"], 2)
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, STUB_LOAD_MS="31000")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"an unset DIAG_MAX_LOAD_MS gated: {result.stderr[-2000:]}")
+            self.assertIs(self._diag_summary(env)["passed"], True)
+
+    def test_a_failed_render_is_a_violation_and_its_clone_is_still_torn_down(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d, STUB_DRIVER_RC="1")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"render_failed"})
+            self.assertEqual(len(summary["violations"]), 4)
+            self.assertIn("ERR_CONNECTION_REFUSED", summary["violations"][0]["detail"])
+            for data in summary["urls"].values():
+                self.assertEqual(data["renders_ok"], 0)
+                self.assertIsNone(data["max_load_ms"])
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            with open(os.path.join(diag_dir, "example.com-1.json")) as handle:
+                self.assertIs(json.load(handle)["ok"], False)
+            # Every clone, and the serve, were stopped through the stub's
+            # SIGTERM handler; nothing waited for the exit trap.
+            self.assertEqual(sorted(self._diag_teardowns(env)),
+                             sorted([f"torn down cb-req-diag-{n}-{self.RUN_ID}"
+                                     for n in range(1, 5)] + ["torn down serve"]))
+            self.assertEqual(os.listdir(state_dir), [],
+                             "a failed render skipped the clone teardown")
+
+    def test_a_missing_trace_is_a_failed_render(self):
+        """cdpdrive exits 1 with net_trace_error when it could not write the
+        trace; a record that says ok while the trace is absent is a render
+        the diag could not observe."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_NO_TRACE="1")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"render_failed"})
+            self.assertIn("trace", summary["violations"][0]["detail"])
+
+    def test_diag_on_webkit_reads_navigate_ms_and_needs_no_trace(self):
+        with tempfile.TemporaryDirectory() as d:
+            # No IP expectation: the webkit render carries no trace to hold
+            # one to, and reqbench refuses the knob on webkit.
+            env, state_dir = self._diag_fixture(d, engine="webkit", reps="1",
+                                                expect_ips="", STUB_LOAD_MS="640.25")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], True)
+            self.assertEqual(summary["engine"], "webkit")
+            for data in summary["urls"].values():
+                self.assertEqual(data["renders_ok"], 1)
+                self.assertEqual(data["max_load_ms"], 640.25)
+                self.assertIsNone(data["max_pending_at_load"])
+                self.assertEqual(data["remote_ips"], {})
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            self.assertEqual(
+                sorted(name for name in os.listdir(diag_dir) if name.endswith(".trace.json")),
+                [], "a webkit diag wrote traces it has no way to fill")
+            with open(os.path.join(diag_dir, "example.com-1.json")) as handle:
+                record = json.load(handle)
+            # Written by reqbench.sh's own heredoc through a fake wddrive.drive
+            # that echoes its namespace: the session, host, url, timeout and
+            # out_prefix are the heredoc's argv handling, not the stub's.
+            self.assertEqual(record["session_id"], "SESSION-1")
+            self.assertEqual(record["wd_host"], "127.0.0.1:9515")
+            self.assertEqual(record["url"], "https://example.com/")
+            self.assertEqual(record["timeout"], 120.0)
+            self.assertEqual(record["out_prefix"], "")
+            self.assertEqual(record["driver_status"], 0)
+            driver = self._read_if_exists(env["STUB_DRIVER_ARGV"]).splitlines()
+            self.assertEqual(len(driver), 2)
+            self.assertTrue(all(line.startswith("- wddrive 127.0.0.1:9515 ") for line in driver),
+                            driver)
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_diag_on_the_file_backend_restores_without_a_serve(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, state_dir = self._diag_fixture(d, backend="file", reps="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            argv = self._read_if_exists(env["STUB_ARGV"])
+            self.assertNotIn("snapshot serve", argv)
+            self.assertEqual(argv.count("snapshot run --snapshot tag-under-test "), 2, argv)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], True)
+            self.assertEqual(summary["backend"], "file")
+            # "file" is what reqbench.py records as the run meta's uffd_mode
+            # on this backend; campaign_summary binds the two on it.
+            self.assertEqual(summary["uffd_mode"], "file")
+            self.assertIsNone(summary["uffd_prefetch"])
+            self.assertEqual(os.listdir(state_dir), [])
+
+    def test_diag_serves_with_working_set_replay_off_and_leaves_no_sidecar(self):
+        """The diag's clones fault the golden's pages. Served with replay on,
+        the UFFD server records those faults and publishes their union to
+        memory.bin.working-set beside the golden; the measured run that
+        follows replays that file, so it would restore the working set of the
+        diag's renders instead of the golden's own, and a fresh golden would
+        measure like a reused one. The diag serves with --uffd-prefetch off,
+        which opens no store (src/uffd/server.rs, Prefetch::Off: nothing
+        recorded, nothing replayed, no file), and records "off" in its
+        summary for campaign_summary to hold it to.
+
+        The sidecar check is at the harness level: the fcvm stub writes the
+        sidecar whenever its serve line does not say off, as the real server
+        does, so an absent sidecar here proves the flag the diag put on the
+        serve line, not the server. The end-to-end proof needs a live serve:
+        on a bench box with a golden that has no sidecar yet, `make
+        bench-chromium-request-diag DIAG_REPS=1`, then
+        `test ! -e /mnt/fcvm-btrfs/snapshots/<TAG>/memory.bin.working-set`.
+
+        Watched red 2026-08-28 at 8cd77713: the serve line said
+        `--uffd-prefetch on` (reqbench.sh's run default), the summary
+        recorded "on", and the stub's sidecar existed after the phase.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            self.assertNotIn("UFFD_PREFETCH", env)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            argv = self._read_if_exists(env["STUB_ARGV"])
+            self.assertIn("snapshot serve tag-under-test --uffd-mode minor --uffd-prefetch off",
+                          argv)
+            self.assertNotIn("--uffd-prefetch on", argv)
+            self.assertEqual(self._diag_summary(env)["uffd_prefetch"], "off")
+            self.assertFalse(os.path.exists(self._diag_sidecar(env)),
+                             "the diag's serve recorded a working set beside the golden")
+
+    def test_diag_refuses_a_request_to_serve_with_working_set_replay_on(self):
+        """UFFD_PREFETCH is a run knob; the diag's serve is always off. A
+        request for anything else is refused before the serve, the generation
+        lock and the hugepage pool, not served with a different knob than the
+        one asked for; an explicit off is accepted.
+
+        Watched red 2026-08-28 at 8cd77713: `AssertionError: 0 != 2`, the
+        diag served with `--uffd-prefetch on` and passed.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", UFFD_PREFETCH="on")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("UFFD_PREFETCH", result.stderr)
+            self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]),
+                             "the serve started before the knob was refused")
+            self.assertFalse(os.path.exists(
+                os.path.join(env["RESULTS"], "diag", "summary.json")))
+            self.assertFalse(os.path.exists(self._diag_sidecar(env)))
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", UFFD_PREFETCH="off")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0,
+                             f"{result.stdout}\n{result.stderr[-3000:]}")
+            self.assertIn("--uffd-prefetch off", self._read_if_exists(env["STUB_ARGV"]))
+            self.assertEqual(self._diag_summary(env)["uffd_prefetch"], "off")
+            self.assertFalse(os.path.exists(self._diag_sidecar(env)))
+
+    def test_diag_refuses_a_rep_count_or_limit_that_is_not_a_positive_integer(self):
+        for knob, value in (("DIAG_REPS", "0"), ("DIAG_REPS", "two"),
+                            ("DIAG_MAX_LOAD_MS", "15s")):
+            with self.subTest(knob=knob, value=value), tempfile.TemporaryDirectory() as d:
+                env, _state_dir = self._diag_fixture(d)
+                env[knob] = value
+                result = self._diag(env)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(knob, result.stderr)
+                self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]),
+                                 "the serve started before the knobs were checked")
+
+    def test_diag_refuses_two_urls_that_would_share_a_record_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, urls="https://example.com/a/b,https://example.com/a-b")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("example.com-a-b", result.stderr)
+            self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]))
+
+    def test_a_second_diag_over_one_results_directory_refuses_while_the_first_holds_it(self):
+        """Records, traces, temporary files and summary.json are named from
+        $RESULTS and the URL alone, so two diags over one RESULTS write the
+        same paths. The generation lock does not serialize them: different
+        TAGs are different locks. The second must not remove and rewrite what
+        the first is rendering into, or a summary naming its own generation
+        counts the other's records.
+
+        The first parks inside its render (STUB_BARRIER), so the second runs
+        while it demonstrably holds the phase.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            first, _state_dir = self._diag_fixture(d, reps="1", urls="https://example.com/")
+            barrier = os.path.join(d, "barrier")
+            os.makedirs(barrier)
+            first["STUB_BARRIER"] = barrier
+            snapshots = os.path.join(d, "data", "snapshots")
+            shutil.copytree(os.path.join(snapshots, "tag-under-test"),
+                            os.path.join(snapshots, "other-tag"))
+            second = dict(first, TAG="other-tag", RUNID="1" * 32, DIAG_LOCK_WAIT="2",
+                          STUB_ARGV=os.path.join(d, "argv-second.log"),
+                          STUB_DRIVER_ARGV=os.path.join(d, "driver-argv-second.log"))
+            del second["STUB_BARRIER"]
+            running = subprocess.Popen(
+                ["bash", "-c", f'source "{self.SH}" && cmd_diag'], env=first,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.time() + 120
+                while not os.path.exists(os.path.join(barrier, "rendering")):
+                    self.assertIsNone(running.poll(), "the first diag exited before rendering")
+                    self.assertLess(time.time(), deadline, "the first diag never rendered")
+                    time.sleep(0.05)
+                blocked = self._diag(second)
+                self.assertNotEqual(blocked.returncode, 0,
+                                    blocked.stdout + blocked.stderr)
+                self.assertIn(os.path.join(second["RESULTS"], "diag"), blocked.stderr)
+                self.assertNotIn("snapshot serve",
+                                 self._read_if_exists(second["STUB_ARGV"]),
+                                 "the second diag started a serve in the first's directory")
+                self.assertEqual(self._read_if_exists(second["STUB_DRIVER_ARGV"]), "",
+                                 "the second diag rendered into the first's directory")
+            finally:
+                open(os.path.join(barrier, "release"), "w").close()
+                _out, err = running.communicate(timeout=180)
+            self.assertEqual(running.returncode, 0, err[-3000:])
+            summary = self._diag_summary(first)
+            self.assertEqual(summary["tag"], "tag-under-test")
+            self.assertIs(summary["passed"], True)
+            self.assertEqual(summary["urls"]["https://example.com/"]["renders_ok"], 1)
+
+    def test_a_diag_sweeps_the_temporary_records_an_earlier_invocation_left(self):
+        """A diag killed mid-render leaves <stem>-<rep>.json.tmp and its
+        .status sibling behind, and diag_render promotes a .tmp that parses
+        as an object into the record. An abandoned one is therefore a record
+        waiting to be adopted; they go at the start of the phase, under the
+        output lock, before anything can read them.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", urls="https://example.com/")
+            diag_dir = os.path.join(env["RESULTS"], "diag")
+            os.makedirs(diag_dir)
+            leftovers = [os.path.join(diag_dir, name) for name in (
+                "example.com-1.json.tmp", "example.com-1.json.tmp.status",
+                "elsewhere.example-1.json.tmp")]
+            for path in leftovers:
+                with open(path, "w") as handle:
+                    json.dump({"ok": True, "url": "https://elsewhere.example/",
+                               "stages": {"navigate_load_event_ms": 1.0}}, handle)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            for path in leftovers:
+                self.assertFalse(os.path.exists(path), f"{path} outlived the diag")
+            self.assertIs(self._diag_summary(env)["passed"], True)
+
+    def test_a_summary_from_an_earlier_diag_does_not_outlive_a_diag_that_wrote_none(self):
+        """summary.json in RESULTS/diag is the verdict of the latest diag over
+        that RESULTS. A diag that ends before writing its own (a refused knob
+        here; a serve or clone that never came up in practice) must not leave
+        an earlier passed=true summary standing where campaign_summary would
+        read it as this diag's.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d)
+            stale = os.path.join(env["RESULTS"], "diag", "summary.json")
+            os.makedirs(os.path.dirname(stale))
+            with open(stale, "w") as handle:
+                json.dump({"passed": True, "violations": [], "urls": {}}, handle)
+            env["DIAG_REPS"] = "two"
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertFalse(os.path.exists(stale),
+                             "a refused diag left an earlier summary.json saying passed=true")
+
+    def test_a_diag_on_webkit_refuses_an_ip_expectation_it_cannot_check(self):
+        """WebKit renders carry no network trace, so DIAG_EXPECT_IPS has
+        nothing to hold them to; a knob the phase cannot enforce is refused,
+        not ignored."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, engine="webkit", reps="1",
+                                                 expect_ips="10.0.2.2")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("DIAG_EXPECT_IPS", result.stderr)
+            self.assertNotIn("snapshot serve", self._read_if_exists(env["STUB_ARGV"]))
+            self.assertFalse(os.path.exists(
+                os.path.join(env["RESULTS"], "diag", "summary.json")))
+
+    def test_a_trace_with_no_remote_address_cannot_satisfy_an_ip_expectation(self):
+        """Rows without a remote_ip prove nothing about where the page came
+        from; with DIAG_EXPECT_IPS set, a rep that observed no address is a
+        violation. Without the expectation the same trace passes."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_REMOTE_IP="")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0,
+                                "a trace with no remote address satisfied an IP expectation\n"
+                                + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"no_remote_ip"},
+                             summary["violations"])
+            for data in summary["urls"].values():
+                self.assertEqual(data["remote_ips"], {})
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", expect_ips="",
+                                                 STUB_REMOTE_IP="")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertIs(self._diag_summary(env)["passed"], True)
+
+    def test_a_render_without_a_load_event_timing_is_a_failed_render(self):
+        """A record that says ok but carries no load event timing is a render
+        the diag cannot place under DIAG_MAX_LOAD_MS; it fails rather than
+        passing with max_load_ms null."""
+        for engine in ("chromium", "webkit"):
+            with self.subTest(engine=engine), tempfile.TemporaryDirectory() as d:
+                env, _state_dir = self._diag_fixture(d, engine=engine, reps="1",
+                                                     expect_ips="", max_load_ms="15000",
+                                                     STUB_NO_LOAD="1")
+                result = self._diag(env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                summary = self._diag_summary(env)
+                self.assertIs(summary["passed"], False)
+                self.assertEqual({v["kind"] for v in summary["violations"]},
+                                 {"render_failed"}, summary["violations"])
+                key = "navigate_ms" if engine == "webkit" else "navigate_load_event_ms"
+                self.assertIn(key, summary["violations"][0]["detail"])
+                for data in summary["urls"].values():
+                    self.assertEqual(data["renders_ok"], 0)
+                    self.assertIsNone(data["max_load_ms"])
+
+    def test_a_driver_that_exits_nonzero_is_a_failed_render_whatever_its_record_says(self):
+        """cdpdrive exits 1 with a record saying ok when only the trace
+        write failed; the diag holds the exit status, not the record's
+        opinion, and the record keeps the status it was written under."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_DRIVER_RC="1",
+                                                 STUB_OK_DESPITE_RC="1")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0,
+                                "a driver exit of 1 passed because its record said ok\n"
+                                + result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"render_failed"},
+                             summary["violations"])
+            self.assertIn("exited 1", summary["violations"][0]["detail"])
+            with open(os.path.join(env["RESULTS"], "diag", "example.com-1.json")) as handle:
+                record = json.load(handle)
+            self.assertIs(record["ok"], True, "the driver's record is kept as written")
+            self.assertEqual(record["driver_status"], 1)
+            for data in summary["urls"].values():
+                self.assertEqual(data["renders_ok"], 0)
+
+    def test_a_record_for_another_url_is_a_failed_render(self):
+        """The summary keys on the URL it asked for; a record whose url is
+        another page's is not evidence about this one."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(
+                d, reps="1", STUB_RECORD_URL="https://elsewhere.example/")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"render_failed"},
+                             summary["violations"])
+            self.assertIn("https://elsewhere.example/", summary["violations"][0]["detail"])
+
+    def test_a_changed_runtime_bundle_fails_the_diag_in_its_summary(self):
+        """The sealed bundle changing under the phase already fails the exit
+        status; the summary must say so too, or a consumer reading only
+        summary.json indexes a diag the phase itself refused."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            bundle = os.path.join(d, "bundle")
+            os.makedirs(bundle)
+            with open(os.path.join(bundle, "fcvm"), "w") as handle:
+                handle.write("changed after sealing\n")
+            with open(os.path.join(bundle, "MANIFEST.sha256"), "w") as handle:
+                handle.write("0" * 64 + "  fcvm\n")
+            env["REQBENCH_RUNTIME_BUNDLE"] = bundle
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertIs(summary["passed"], False)
+            self.assertIs(summary["runtime_bundle_intact"], False)
+            self.assertEqual(summary["violations"], [],
+                             "the renders themselves were fine; the bundle was not")
+
+    def test_the_summary_names_the_snapshot_generation_it_diagnosed(self):
+        """campaign_summary binds a diag to the cell it sits beside through
+        the snapshot generation; the summary must carry the identity the
+        run's provenance carries."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            config = os.path.join(d, "data", "snapshots", "tag-under-test", "config.json")
+            with open(config, "rb") as handle:
+                config_sha256 = hashlib.sha256(handle.read()).hexdigest()
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            summary = self._diag_summary(env)
+            self.assertEqual(summary["snapshot_generation_id"],
+                             "12345678-1234-4234-8234-123456789abc")
+            self.assertEqual(summary["snapshot_config_sha256"], config_sha256)
+            self.assertIs(summary["runtime_bundle_intact"], True)
+
+    def test_the_summary_names_the_sealed_runtime_it_ran_from(self):
+        """A diag is evidence about a run only when it executed that run's
+        sealed code. campaign_summary binds the two on the bundle hash the
+        run records (reqbench.py's meta runtime_bundle_sha256, the sha256 of
+        the staged bundle's MANIFEST.sha256), so the summary has to carry the
+        same value under the same name. runtime_bundle_intact says only that
+        the bundle did not change under the phase, not which bundle it was.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            bundle = os.path.join(d, "bundle")
+            os.makedirs(bundle)
+            sealed = os.path.join(bundle, "reqbench.sh")
+            with open(sealed, "w") as handle:
+                handle.write("# the sealed copy this phase ran from\n")
+            with open(sealed, "rb") as handle:
+                sealed_sha256 = hashlib.sha256(handle.read()).hexdigest()
+            manifest = os.path.join(bundle, "MANIFEST.sha256")
+            with open(manifest, "w") as handle:
+                handle.write(f"{sealed_sha256}  reqbench.sh\n")
+            with open(manifest, "rb") as handle:
+                bundle_sha256 = hashlib.sha256(handle.read()).hexdigest()
+            env["REQBENCH_RUNTIME_BUNDLE"] = bundle
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            summary = self._diag_summary(env)
+            self.assertIs(summary["runtime_bundle_intact"], True)
+            self.assertEqual(summary["runtime_bundle_sha256"], bundle_sha256)
+
+    def test_a_diag_that_ran_outside_a_staged_bundle_names_no_runtime(self):
+        """No staged bundle, no bundle identity: the summary records null
+        rather than a hash it does not have, and campaign_summary refuses a
+        diag that names none instead of reading it as the run's."""
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1")
+            self.assertNotIn("REQBENCH_RUNTIME_BUNDLE", env)
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            summary = self._diag_summary(env)
+            self.assertIn("runtime_bundle_sha256", summary)
+            self.assertIsNone(summary["runtime_bundle_sha256"])
 
 
 class HostCdpQuietGate(unittest.TestCase):
@@ -6271,7 +7197,8 @@ class MakefileBenchGraph(unittest.TestCase):
         # build, so these targets must not rebuild anything — TRANSITIVELY:
         # a direct-only check passes `run: bench-chromium-request-build`,
         # which rebuilds through its own deps (codex P2, 2026-08-14).
-        for t in ("bench-chromium-request-run", "bench-chromium-request-verify"):
+        for t in ("bench-chromium-request-run", "bench-chromium-request-verify",
+                  "bench-chromium-request-diag", "bench-webkit-request-diag"):
             c = self.closure(t)
             for forbidden in ("build", "setup-default", "cargo-target-link"):
                 self.assertNotIn(forbidden, c,
@@ -6283,7 +7210,8 @@ class MakefileBenchGraph(unittest.TestCase):
         for t in ("bench-chromium-request-build", "bench-chromium-request-golden",
                "bench-chromium-request-verify", "bench-chromium-request-run",
                "bench-chromium-request-all", "bench-chromium-hostcdp",
-               "bench-chromium-fault"):
+               "bench-chromium-fault", "bench-chromium-request-diag",
+               "bench-webkit-request-diag"):
             self.assertIn(t, self.phony, f"{t} missing from .PHONY")
 
     def test_webkit_run_forwards_the_measurement_knobs(self):
@@ -6346,6 +7274,70 @@ class MakefileBenchGraph(unittest.TestCase):
                       if "bench-chromium-request-run" in ln]
         self.assertTrue(help_lines, "run target missing from help")
         self.assertIn("TAG=", help_lines[0])
+
+    def test_diag_targets_are_sealed_phases_that_forward_their_knobs(self):
+        """The diag runs on the golden the run uses, under the same seal:
+        no build dependency, its knobs forwarded the way run forwards
+        BACKEND and RESULTS (a Makefile default is not exported to the
+        recipe on its own), a help line naming TAG= and DIAG_URLS=.
+
+        Watched red 2026-08-28 at 55d6fb7d: `bench-chromium-request-diag
+        not found in make database`.
+        """
+        for t in ("bench-chromium-request-diag", "bench-webkit-request-diag"):
+            self.assertEqual(self.prereqs(t), set(), f"{t} has prerequisites")
+            c = self.closure(t)
+            for forbidden in ("build", "setup-default", "cargo-target-link"):
+                self.assertNotIn(forbidden, c, f"{t} transitively reaches {forbidden}")
+            self.assertIn(t, self.phony, f"{t} missing from .PHONY")
+            recipe = "\n".join(self.recipes.get(t, []))
+            self.assertIn("reqbench.sh diag", recipe)
+            for knob in ("BACKEND", "DIAG_URLS", "DIAG_REPS", "DIAG_EXPECT_IPS",
+                         "DIAG_MAX_LOAD_MS", "RESULTS"):
+                self.assertIn(f'{knob}="$({knob})"', recipe,
+                              f"{t} does not forward {knob}")
+            help_lines = [ln for ln in self.recipes.get("help", []) if t in ln]
+            self.assertTrue(help_lines, f"{t} missing from help")
+            for knob in ("TAG=", "DIAG_URLS=", "DIAG_EXPECT_IPS=", "DIAG_MAX_LOAD_MS="):
+                self.assertIn(knob, help_lines[0], f"{t} help line lacks {knob}")
+        webkit = "\n".join(self.recipes.get("bench-webkit-request-diag", []))
+        self.assertIn("ENGINE=webkit", webkit)
+        self.assertIn("cb-req-webkit", webkit, "the webkit diag does not default to the webkit tag")
+
+    def test_the_webkit_diag_recipe_reaches_reqbench_under_a_tag_holding_shell_syntax(self):
+        """`make bench-webkit-request-diag 'TAG=x #'` expanded TAG unquoted:
+        bash saw `TAG=x # ... bash bench/chromium/reqbench.sh diag`, an
+        assignment followed by a comment, and the target exited 0 having run
+        nothing. reqbench.sh is what refuses a bad TAG; it has to be reached.
+        A bash stub on PATH stands in for the recipe's `bash`; make's own
+        SHELL is /bin/bash by absolute path and is not intercepted.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            binx = os.path.join(d, "bin")
+            os.makedirs(binx)
+            log = os.path.join(d, "bash-argv")
+            stub = os.path.join(binx, "bash")
+            with open(stub, "w") as handle:
+                handle.write('#!/bin/sh\nprintf \'%s\\n\' "TAG=$TAG" "ENGINE=$ENGINE" "$@" '
+                             '> "$STUB_BASH_LOG"\n')
+            os.chmod(stub, 0o755)
+            env = dict(os.environ)
+            for key in ("TAG", "ENGINE", "RESULTS", "BACKEND", "DIAG_URLS", "DIAG_REPS",
+                        "DIAG_EXPECT_IPS", "DIAG_MAX_LOAD_MS"):
+                env.pop(key, None)
+            env.update(PATH=binx + os.pathsep + env["PATH"], STUB_BASH_LOG=log)
+            out = subprocess.run(
+                ["make", "-C", self.REPO, "bench-webkit-request-diag", "TAG=x #",
+                 f"RESULTS={d}/results"],
+                env=env, capture_output=True, text=True, timeout=120)
+            self.assertTrue(os.path.exists(log),
+                            f"reqbench.sh was never reached (make rc={out.returncode}):\n"
+                            f"{out.stdout}\n{out.stderr}")
+            with open(log) as handle:
+                lines = handle.read().splitlines()
+            self.assertEqual(lines[0], "TAG=x #", lines)
+            self.assertEqual(lines[1], "ENGINE=webkit", lines)
+            self.assertEqual(lines[-2:], ["bench/chromium/reqbench.sh", "diag"], lines)
 
     def test_full_chain_and_companion_benches(self):
         p = self.prereqs("bench-chromium-request-all")
@@ -6450,6 +7442,23 @@ class HugepageGuards(unittest.TestCase):
         r, _ = self._bash("BACKEND=file cmd_run")
         self.assertEqual(r.returncode, 2, f"stdout={r.stdout} stderr={r.stderr}")
         self.assertIn("BACKEND=uffd", r.stdout + r.stderr)
+
+    def test_cmd_diag_rejects_its_knobs_before_touching_the_pool(self):
+        """A refused DIAG_REPS must not first reserve gigabytes of hugepages
+        (the fixture snapshot is huge and would size the pool to 8192)."""
+        for knobs in ({"DIAG_REPS": "0"}, {"DIAG_MAX_LOAD_MS": "15s"},
+                      {"BACKEND": "typo"}):
+            with self.subTest(knobs=knobs):
+                r, pool = self._bash("cmd_diag", knobs)
+                self.assertEqual(r.returncode, 2, f"stdout={r.stdout} stderr={r.stderr}")
+                self.assertEqual(open(pool).read().strip(), "100",
+                                 "the pool was grown before the knobs were checked")
+
+    def test_cmd_diag_fails_closed_on_unknown_state(self):
+        r, pool = self._bash("TAG=missing-tag cmd_diag", {"BACKEND": "uffd"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("hugepage state", r.stdout + r.stderr)
+        self.assertEqual(open(pool).read().strip(), "100")
 
 
 class HugepageGuardsRound2(unittest.TestCase):
@@ -7237,12 +8246,14 @@ class SnapshotGenerationDns(unittest.TestCase):
 
     @classmethod
     def write_generation(cls, data_root, network_config, guest_dns=None,
-                         drop_guest_dns=False):
+                         drop_guest_dns=False, guest_env=(), drop_guest_env=False):
         """The identity fixture plus a network_config block (None omits it).
 
         guest_dns is what the golden's provenance records as the requested
         resolver (reqbench.sh GUEST_DNS, null when none was requested);
         drop_guest_dns removes the key, the shape of a pre-feature golden.
+        guest_env is the baked container environment (reqbench.sh
+        GUEST_ENV), a list of KEY=VALUE entries; drop_guest_env removes it.
         """
         config_path, _digest = SnapshotGenerationIdentity._write_generation(
             data_root, cls.GENERATION_ID,
@@ -7265,6 +8276,9 @@ class SnapshotGenerationDns(unittest.TestCase):
         provenance["guest_dns"] = guest_dns
         if drop_guest_dns:
             del provenance["guest_dns"]
+        provenance["guest_env"] = list(guest_env)
+        if drop_guest_env:
+            del provenance["guest_env"]
         with open(provenance_path, "w") as target:
             json.dump(provenance, target)
 
@@ -7293,6 +8307,37 @@ class SnapshotGenerationDns(unittest.TestCase):
             generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
             self.assertEqual(generation["dns_server"], "192.168.94.1")
             self.assertIsNone(generation["guest_dns"])
+
+    def test_the_baked_environment_is_returned_as_guest_env(self):
+        """GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> makes a golden that resolves
+        through Chromium's rule with guest_dns null; the run meta needs the
+        entries to tell that arm from a fixture run."""
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(data_root, {"dns_server": None}, guest_env=rule)
+            generation = reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+            self.assertEqual(generation["guest_env"], rule)
+            self.assertIsNone(generation["guest_dns"])
+
+    def test_a_provenance_without_guest_env_is_refused(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            self.write_generation(data_root, {"dns_server": None}, drop_guest_env=True)
+            with self.assertRaisesRegex(RuntimeError, "guest_env"):
+                reqbench.snapshot_generation(data_root, self.SNAPSHOT)
+
+    def test_a_guest_env_entry_that_is_not_key_value_is_refused(self):
+        for bad in (["notakv"], ["=1"], "BENCH_RESOLVE_ALL_TO=10.0.2.2", [1]):
+            with self.subTest(guest_env=bad), tempfile.TemporaryDirectory() as data_root:
+                self.write_generation(data_root, {"dns_server": None})
+                provenance_path = os.path.join(
+                    data_root, "snapshots", self.SNAPSHOT, "reqbench-provenance.json")
+                with open(provenance_path) as source:
+                    provenance = json.load(source)
+                provenance["guest_env"] = bad
+                with open(provenance_path, "w") as target:
+                    json.dump(provenance, target)
+                with self.assertRaisesRegex(RuntimeError, "guest_env"):
+                    reqbench.snapshot_generation(data_root, self.SNAPSHOT)
 
     def test_a_provenance_without_guest_dns_is_refused(self):
         """A golden made before the field existed cannot say whether its
@@ -7352,9 +8397,9 @@ class RunMetaGuestDns(unittest.TestCase):
 
     SNAPSHOT = SnapshotGenerationIdentity.SNAPSHOT
 
-    def _drive_main(self, data_root, network_config, guest_dns=None):
+    def _drive_main(self, data_root, network_config, guest_dns=None, guest_env=()):
         SnapshotGenerationDns.write_generation(
-            data_root, network_config, guest_dns=guest_dns,
+            data_root, network_config, guest_dns=guest_dns, guest_env=guest_env,
         )
         runtime_bundle = os.path.join(data_root, "runtime")
         os.makedirs(runtime_bundle)
@@ -7469,6 +8514,16 @@ class RunMetaGuestDns(unittest.TestCase):
         self.assertIn("guest_dns", meta)
         self.assertIsNone(meta["guest_dns"])
 
+    def test_the_baked_environment_is_recorded(self):
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        with tempfile.TemporaryDirectory() as data_root:
+            meta = self._drive_main(data_root, {"dns_server": None}, guest_env=rule)
+        self.assertEqual(meta["guest_env"], rule)
+        self.assertIsNone(meta["guest_dns"])
+        with tempfile.TemporaryDirectory() as data_root:
+            meta = self._drive_main(data_root, {"dns_server": None})
+        self.assertEqual(meta["guest_env"], [])
+
     def test_a_host_filled_resolver_is_recorded_as_null(self):
         """The meta's guest_dns is the resolver the golden REQUESTED, from
         its provenance; the effective dns_server a bridged guest inherits
@@ -7569,6 +8624,209 @@ class AnalyzerResolverGate(unittest.TestCase):
             any("guest_dns" in error and "example.com" in error for error in errors),
             f"the refusal must name a hostname that needed it: {errors}",
         )
+
+    def test_the_cell_carries_the_baked_environment(self):
+        """guest_env is a cell field: a resolver-rule run and a plain run are
+        different populations, and campaign_summary keys the diag
+        requirement on it. Absent in the meta means none was baked (the
+        meta writer of this revision always records it); an entry that is
+        not KEY=VALUE is not publishable."""
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_dns="10.0.2.2", guest_env=rule),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(out["cell"]["guest_env"], rule)
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(src, self.CORPUS, guest_dns="10.0.2.2"),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(out["cell"]["guest_env"], [])
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_dns="10.0.2.2", guest_env=["notakv"]),
+            )
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(any("guest_env" in error for error in errors), errors)
+
+    def test_a_baked_resolver_rule_is_the_recorded_resolver(self):
+        """GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> is a recorded resolver.
+
+        That golden answers every hostname inside Chromium's own resolver
+        (`--host-resolver-rules=MAP * <ip>`), so nothing is asked of
+        resolv.conf and guest_dns is null. The record still names what
+        resolved the corpus, so the gate publishes it.
+        """
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_env=rule),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(out["cell"]["guest_dns"])
+        self.assertEqual(out["cell"]["guest_env"], rule)
+
+    def test_a_baked_environment_that_is_not_a_resolver_rule_is_refused(self):
+        """Only BENCH_RESOLVE_ALL_TO answers hostnames. A golden that baked
+        some other variable and no guest_dns resolved its corpus somewhere
+        the record does not say."""
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_env=["CB_SITE_ISOLATION=off"]),
+            )
+        self.assertIs(out["publishable"], False)
+        self.assertEqual(rc, 5)
+        errors = out["gate"]["backend_metadata"]["errors"]
+        self.assertTrue(
+            any("guest_dns" in error and "example.com" in error for error in errors),
+            f"the refusal must name the missing resolver and a hostname: {errors}",
+        )
+
+    def test_a_resolver_rule_whose_value_is_not_an_address_is_refused(self):
+        """entry.sh refuses a BENCH_RESOLVE_ALL_TO that is not one IP
+        literal, so a record carrying one is a record that cannot be read.
+        It is refused whether or not a guest_dns is also recorded."""
+        for extra in ({}, {"guest_dns": "10.0.2.2"}):
+            with self.subTest(extra=extra):
+                with tempfile.TemporaryDirectory() as d:
+                    rc, out = self._analyze(
+                        d, lambda src: self.write_multi_url(
+                            src, self.CORPUS,
+                            guest_env=["BENCH_RESOLVE_ALL_TO=notanip"], **extra),
+                    )
+                self.assertIs(out["publishable"], False)
+                self.assertEqual(rc, 5)
+                errors = out["gate"]["backend_metadata"]["errors"]
+                self.assertTrue(
+                    any("BENCH_RESOLVE_ALL_TO" in error for error in errors),
+                    f"the refusal must name the unreadable rule: {errors}",
+                )
+
+    @staticmethod
+    def write_webkit_multi_url(path, urls, **overrides):
+        """The multi-URL fixture as a WebKit run: WebDriver classic renders,
+        whose navigate call returns at the load event."""
+        AnalyzerResolverGate.write_multi_url(path, urls, engine="webkit", **overrides)
+
+        def reshape(row):
+            render = row.get("render")
+            if not isinstance(render, dict):
+                return
+            row["render"] = {
+                "ok": True, "url": render["url"], "format": render["format"],
+                "engine": "webkit", "wd_host": row["endpoint"],
+                "session_prewired": True,
+                "stages": {
+                    "resolve_ms": 0.1, "connect_total_ms": 0.4,
+                    "navigate_ms": 180.0, "screenshot_ms": 1.0,
+                    "total_ms": render["stages"]["total_ms"],
+                },
+                "image_bytes": 1024, "image_sha256": "9" * 64,
+            }
+
+        _rewrite_records(path, reshape)
+
+    def test_a_resolver_rule_is_credited_only_to_the_engine_that_reads_it(self):
+        """`--host-resolver-rules` is a Chromium flag. entry.sh builds it from
+        BENCH_RESOLVE_ALL_TO; entry-webkit.sh never reads the variable, so a
+        WebKit golden carrying it resolved its hostnames through whatever the
+        guest's resolv.conf pointed at. Crediting the rule for every engine
+        made such a run publishable with guest_dns null, and its diag carries
+        no network trace to contradict it (reqbench refuses an IP
+        expectation on WebKit). The rule counts as the recorded resolver only
+        on Chromium, and a run that records it under another engine is
+        refused: its arm label does not describe what resolved the corpus.
+
+        RED BEFORE THE FIX: `AssertionError: True is not False` on the
+        rule-only WebKit run (rc 0, cell guest_dns null), which is the
+        publishable run this finding is about.
+        """
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        # Control: the same WebKit fixture with a resolver it does read is
+        # publishable, so the refusals below are the rule and nothing else.
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_webkit_multi_url(
+                    src, self.CORPUS, guest_dns="10.0.2.2"),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        self.assertEqual(out["cell"]["engine"], "webkit")
+        for extra in ({}, {"guest_dns": "10.0.2.2"}):
+            with self.subTest(extra=extra):
+                with tempfile.TemporaryDirectory() as d:
+                    rc, out = self._analyze(
+                        d, lambda src: self.write_webkit_multi_url(
+                            src, self.CORPUS, guest_env=rule, **extra),
+                    )
+                self.assertIs(out["publishable"], False)
+                self.assertEqual(rc, 5)
+                errors = out["gate"]["backend_metadata"]["errors"]
+                self.assertTrue(
+                    any("BENCH_RESOLVE_ALL_TO" in error and "webkit" in error
+                        for error in errors),
+                    f"the refusal must name the rule and the engine: {errors}",
+                )
+        # The same rule on the engine that reads it still publishes.
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, self.CORPUS, guest_env=rule),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+
+    def test_a_url_whose_authority_the_browser_reads_differently_is_refused(self):
+        """`http://evil.example\\@127.0.0.1/` is host 127.0.0.1 to urlsplit,
+        an IP literal that needs no resolver. Chromium follows the URL
+        Standard, which maps a backslash to a slash in a special scheme, so
+        the authority ends at `evil.example` and that is the name it
+        resolves. Reading the URL one way while the browser reads it another
+        turns the resolver gate off: the run publishes with guest_dns null
+        while the corpus was answered by ambient DNS. Userinfo moves the host
+        the same way, so a measured http(s) URL must carry a plain
+        host[:port] authority or it is not a URL this analyzer can judge.
+
+        RED BEFORE THE FIX: `AssertionError: True is not False` on the
+        backslash URL with no resolver recorded (rc 0).
+        """
+        # Control: an IP-literal fixture URL needs no resolver and publishes.
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self._analyze(
+                d, lambda src: self.write_multi_url(
+                    src, ["http://127.0.0.1:8000/a.html"]),
+            )
+        self.assertIs(out["publishable"], True, out["gate"]["reasons"])
+        unreadable = (
+            "http://evil.example\\@127.0.0.1/",
+            "https://evil.example\\@127.0.0.1/",
+            "http://user@127.0.0.1/",
+        )
+        for url in unreadable:
+            # Refused with a resolver too: the analyzer cannot say which host
+            # was answered, so naming one proves nothing.
+            for extra in ({}, {"guest_dns": "10.0.2.2"}):
+                with self.subTest(url=url, extra=extra):
+                    with tempfile.TemporaryDirectory() as d:
+                        rc, out = self._analyze(
+                            d, lambda src: self.write_multi_url(
+                                src, [url], **extra),
+                        )
+                    self.assertIs(out["publishable"], False)
+                    self.assertEqual(rc, 5)
+                    errors = out["gate"]["backend_metadata"]["errors"]
+                    self.assertTrue(
+                        any("evil.example" in error or "user@" in error
+                            for error in errors),
+                        f"the refusal must quote the URL it could not read: {errors}",
+                    )
 
     def test_corpus_hostnames_with_guest_dns_are_publishable(self):
         with tempfile.TemporaryDirectory() as d:
@@ -8138,9 +9396,20 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
 
     CORPUS = ["https://example.com/", "https://developer.mozilla.org/en-US/"]
 
-    @staticmethod
-    def _evidence(run_dir, verdict):
-        """dns-evidence.json plus every file it names, as the campaign leaves them."""
+    @classmethod
+    def _evidence(cls, run_dir, verdict):
+        """dns-evidence.json plus every file it names, as the campaign leaves
+        them. corpus_campaign.sh hands HOP D the same URL list it measures on
+        (VERIFY_DNS_URLS="$URLS") and the hostnames it derives from it, so
+        every bracket covers the whole corpus, and it reads the run_id out of
+        the analysis.json the measured run's publication gate wrote, which is
+        what binds the bundle to this run."""
+        with open(os.path.join(run_dir, "analysis.json")) as handle:
+            run_id = json.load(handle)["run_id"]
+        hosts = {urlsplit(url).netloc: {"answer": "10.0.2.2", "ok": True}
+                 for url in cls.CORPUS}
+        urls = {url: {"status": 200, "ok": True, "proxy_env_ignored": []}
+                for url in cls.CORPUS}
         verify_files = []
         verify_hashes = {}
         for stage in ("pre", "before-run", "after-run"):
@@ -8149,9 +9418,8 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 json.dump({
                     "dns_server": "10.0.2.2", "resolv_conf_vm": "nameserver 10.0.2.2\n",
                     "resolv_conf_container": "nameserver 10.0.2.2\n",
-                    "hosts": {"example.com": {"answer": "10.0.2.2", "ok": True}},
-                    "urls": {"https://example.com/": {"status": 200, "ok": True,
-                                                      "proxy_env_ignored": []}},
+                    "hosts": hosts,
+                    "urls": urls,
                     "proxies_disabled": True,
                     "timestamp": "2026-08-28T00:00:00Z", "passed": True,
                 }, handle)
@@ -8169,6 +9437,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         with open(os.path.join(run_dir, "dns-owner.log"), "w") as handle:
             handle.write("2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive\n" * 12)
         return {
+            "run_id": run_id,
             "serve_pid": 4242,
             "dnsmasq_was_active_before": True,
             "dnsmasq_active_after_restore": False,
@@ -8197,6 +9466,31 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(rc, 0)
         with open(os.path.join(run_dir, "dns-evidence.json"), "w") as handle:
             json.dump(self._evidence(run_dir, "clean"), handle)
+        # The diag summary reqbench.sh diag leaves beside a corpus run; the
+        # index refuses a resolver run without one, and binds the one it
+        # finds to the analyzer's cell (snapshot generation and config, tag,
+        # engine, backend, UFFD mode, sealed runtime bundle), so the identity
+        # comes from the analysis the analyzer just wrote, spelled the way it
+        # spells it.
+        with open(analysis) as handle:
+            cell = json.load(handle)["cell"]
+        os.makedirs(os.path.join(run_dir, "diag"))
+        with open(os.path.join(run_dir, "diag", "summary.json"), "w") as handle:
+            json.dump({
+                "engine": cell["engine"], "tag": cell["snapshot"],
+                "backend": cell["backend"], "uffd_mode": cell["uffd_mode"],
+                "uffd_prefetch": None,
+                "snapshot_generation_id": cell["snapshot_generation_id"],
+                "snapshot_config_sha256": cell["snapshot_config_sha256"],
+                "runtime_bundle_intact": True,
+                "runtime_bundle_sha256": cell["runtime_bundle_sha256"],
+                "reps": 3,
+                "urls": {url: {"reps": 3, "renders_ok": 3, "max_load_ms": 812.5,
+                               "max_pending_at_load": 2, "remote_ips": {"10.0.2.2": 9},
+                               "errors": {}} for url in self.CORPUS},
+                "violations": [], "teardown_failures": 0, "passed": True,
+                "limits": {"expect_ips": ["10.0.2.2"], "max_load_ms": 15000},
+            }, handle)
         return run_dir
 
     @staticmethod
@@ -8239,12 +9533,17 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(cell["dns_verdict"], "clean")
         self.assertEqual(cell["headline"]["cdp"]["blocking_ms"], 384.0)
         self.assertEqual(cell["headline"]["cdp"]["n"], 200)
+        self.assertEqual(cell["diag"], {
+            "diag_passed": True, "violations_count": 0,
+            "max_load_ms": {url: 812.5 for url in self.CORPUS},
+        })
         self.assertEqual(
             {os.path.basename(entry["path"]) for entry in index["generated_from"]},
             {
                 "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
                 "verify-dns-before-run.json", "verify-dns-after-run.json",
                 "dns-owner.log", "corpus-dns.log", "corpus-access.log",
+                "summary.json",
             },
         )
 

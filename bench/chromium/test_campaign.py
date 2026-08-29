@@ -445,6 +445,7 @@ class DnsBrackets(unittest.TestCase):
 env > "$MAKE_ENV_DUMP"
 echo "$*" > "$MAKE_ARGV"
 [ -z "${MAKE_VERIFY_JSON:-}" ] || printf '%s\\n' "$MAKE_VERIFY_JSON" > "$RESULTS/verify-dns.json"
+[ -z "${MAKE_DIAG_JSON:-}" ] || { mkdir -p "$RESULTS/diag"; printf '%s\\n' "$MAKE_DIAG_JSON" > "$RESULTS/diag/summary.json"; }
 exit "${MAKE_RC:-0}"
 """
     # Decoy :53 listeners with OTHER pids, as on the bench host itself:
@@ -717,18 +718,137 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-run", handle.read())
 
-    # The rm may continue over backslash-newlines; the block runs whole.
+    # From `mkdir -p "$RESULTS"` to the end of the rm, which may continue over
+    # backslash-newlines, plus the lock release that closes the block. The
+    # whole thing runs, so the lock the removal takes runs with it.
     START_CLEANUP = re.compile(
-        r'(mkdir -p "\$RESULTS"\n(?:#[^\n]*\n)*rm -f (?:[^\n]*\\\n)*[^\n]*\n)')
+        r'(mkdir -p "\$RESULTS"\n.*?rm -f (?:[^\n]*\\\n)*[^\n]*\n'
+        r'(?:release_diag_lock\n)?)', re.S)
 
-    def _run_start_cleanup(self, results: str):
-        """Execute the block after `mkdir -p "$RESULTS"` that clears an
-        earlier campaign's evidence, against a pre-filled RESULTS."""
+    def _start_cleanup_script(self, results: str) -> str:
+        """The shipped start-cleanup block, ready to run against `results`."""
         block = self.START_CLEANUP.search(campaign())
         self.assertIsNotNone(block, "the campaign does not clear stale evidence at start")
+        return f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'
+
+    def _run_start_cleanup(self, results: str, env=None, timeout=30, tail=""):
+        """Execute the block after `mkdir -p "$RESULTS"` that clears an
+        earlier campaign's evidence, against a pre-filled RESULTS."""
         return subprocess.run(
-            ["bash", "-c", f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'],
-            capture_output=True, text=True, timeout=30)
+            ["bash", "-c", self._start_cleanup_script(results) + tail],
+            capture_output=True, text=True, timeout=timeout,
+            env=None if env is None else dict(os.environ, **env))
+
+    # A process that takes $RESULTS/diag/.lock exactly as reqbench.sh's
+    # cmd_diag does, announces that it holds it, and holds until told to let
+    # go. The announcement and the release are FIFO reads and writes, so the
+    # test orders itself against the lock rather than against the clock.
+    LOCK_HOLDER = """set -euo pipefail
+exec {fd}<>"$LOCK"
+flock -x "$fd"
+echo held > "$READY"
+read -r _ < "$GO"
+"""
+
+    class _DiagLockHolder:
+        """Holds the diag output lock for the body of a `with` block."""
+
+        def __init__(self, test, results):
+            self.test, self.results = test, results
+            self.lock = os.path.join(results, "diag", ".lock")
+
+        def __enter__(self):
+            os.makedirs(os.path.dirname(self.lock), exist_ok=True)
+            open(self.lock, "a").close()
+            self.ready = self.lock + ".ready"
+            self.go = self.lock + ".go"
+            for fifo in (self.ready, self.go):
+                os.mkfifo(fifo)
+            self.proc = subprocess.Popen(
+                ["bash", "-c", DnsBrackets.LOCK_HOLDER],
+                env=dict(os.environ, LOCK=self.lock, READY=self.ready, GO=self.go),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Blocks until the holder has the lock: opening a FIFO for reading
+            # returns when a writer opens it, and the holder redirects to it
+            # only after flock returns.
+            with open(self.ready) as ready:
+                self.test.assertEqual(ready.read().strip(), "held")
+            return self
+
+        def release(self):
+            if self.proc.poll() is None:
+                with open(self.go, "w") as go:
+                    go.write("go\n")
+            self.test.assertEqual(self.proc.wait(timeout=30), 0,
+                                  self.proc.stderr.read())
+
+        def __exit__(self, *exc):
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait(timeout=30)
+            return False
+
+    def test_a_diag_holding_its_lock_blocks_the_start_cleanup(self):
+        """diag/summary.json belongs to reqbench's diag phase, which owns
+        $RESULTS/diag under $RESULTS/diag/.lock from before its first removal
+        to past the atomic rename that publishes the summary. A campaign
+        start that removes the summary without that lock can take it out of
+        a diag's hands after the rename and before the release, leaving the
+        diag to exit 0 over a summary that is gone. The start takes the same
+        lock, waits DIAG_LOCK_WAIT seconds for it, and refuses rather than
+        deleting.
+
+        RED BEFORE THE FIX: `AssertionError: 0 != 0 : the start deleted
+        diag/summary.json while a diag held the lock`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            with self._DiagLockHolder(self, results) as holder:
+                summary = os.path.join(results, "diag", "summary.json")
+                with open(summary, "w") as handle:
+                    handle.write('{"passed": true}\n')
+                blocked = self._run_start_cleanup(
+                    results, env={"DIAG_LOCK_WAIT": "1"})
+                self.assertTrue(os.path.exists(summary),
+                                "the start deleted diag/summary.json while a "
+                                "diag held the lock")
+                self.assertNotEqual(
+                    blocked.returncode, 0,
+                    f"the start reported success without the lock: {blocked.stdout}")
+                self.assertIn("diag", blocked.stderr.lower(),
+                              f"the refusal does not name the lock: {blocked.stderr}")
+                holder.release()
+            # The lock is the only thing that held it back: once the diag has
+            # let go, the same start clears the same summary.
+            cleared = self._run_start_cleanup(results, env={"DIAG_LOCK_WAIT": "1"})
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            self.assertFalse(os.path.exists(summary),
+                             "the start left an earlier campaign's diag summary")
+
+    def test_the_start_cleanup_releases_the_diag_lock(self):
+        """The campaign's own diag phase takes this lock in a sub-make, from
+        its own process. A start that kept the lock for the campaign's
+        lifetime would refuse every diag it launches.
+
+        Positive control: it cannot go red against the unfixed campaign,
+        which takes no lock at all. It was watched red against a fix that
+        acquired the lock and never released it (`released=1`).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(os.path.join(results, "diag"))
+            with open(os.path.join(results, "diag", "summary.json"), "w") as handle:
+                handle.write('{"passed": true}\n')
+            # A fresh open of the lock file: flock is per open file
+            # description, so this fails while the start still holds its own.
+            done = self._run_start_cleanup(
+                results,
+                tail=f'\nif flock -x -n "{results}/diag/.lock" -c true; '
+                     'then echo "released=0"; else echo "released=$?"; fi\n')
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn("released=0", done.stdout,
+                          f"the start still holds the diag lock: {done.stdout}")
 
     def test_stale_evidence_from_an_earlier_campaign_is_cleared_at_start(self):
         """An explicit RESULTS can be reused. A clean dns-evidence.json left
@@ -742,7 +862,9 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             results = os.path.join(tmp, "results")
             os.makedirs(results)
             stale = ["dns-evidence.json", "verify-dns-after-run.json",
-                     "verify-dns.json", "dns-owner.log", "corpus-serve.status"]
+                     "verify-dns.json", "dns-owner.log", "corpus-serve.status",
+                     "diag/summary.json"]
+            os.makedirs(os.path.join(results, "diag"))
             for name in stale:
                 with open(os.path.join(results, name), "w") as handle:
                     handle.write('{"verdict": "clean", "passed": true}\n')
@@ -873,11 +995,20 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
     BRACKETS = ("pre", "before-run", "after-run")
     REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log")
 
+    RUN_ID = "20260828-000000-corpus"
+
     def _leave_files(self, results, brackets=BRACKETS, logs=REPLAY_LOGS,
-                     bracket_passed=True, serve_status="0"):
+                     bracket_passed=True, serve_status="0", analysis=RUN_ID):
         """What the campaign leaves in $RESULTS before write_dns_evidence:
         the bracket files, the replay logs and corpus-serve.status, the exit
-        status the server's wrapper writes once it is gone (None: no file)."""
+        status the server's wrapper writes once it is gone (None: no file),
+        and analysis.json, which the measured run's publication gate wrote
+        before this point (analysis=None: no file, the shape a run that never
+        reached its gate leaves; analysis="": the file with no run_id)."""
+        if analysis is not None:
+            body = {"run_id": analysis} if analysis else {"publishable": False}
+            with open(os.path.join(results, "analysis.json"), "w") as handle:
+                json.dump(body, handle)
         for stage in brackets:
             with open(os.path.join(results, f"verify-dns-{stage}.json"), "w") as handle:
                 handle.write(json.dumps({"passed": bracket_passed}) + "\n")
@@ -935,13 +1066,13 @@ wait_sampler_gone() {
 """
 
     def _sample(self, env, results, verdict_in="clean", rows=1, mid_run="",
-                files=True):
+                files=True, **leave):
         """Sample until dns-owner.log carries `rows` rows, run `mid_run`,
         stop, write the evidence. `rows` is what the caller's assertions
         need, and mid_run has the SYNC helpers to wait for anything it
-        causes."""
+        causes. Extra keywords go to _leave_files."""
         if files:
-            self._leave_files(results)
+            self._leave_files(results, **leave)
         script = (f'set -u\n{self._helpers()}\n{self.SYNC}\n'
                   f'RESULTS="{results}"\nSERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=yes\n'
                   'DNS_SAMPLE_INTERVAL=0.05\nstart_dns_sampler\n'
@@ -951,6 +1082,49 @@ wait_sampler_gone() {
         self.assertEqual(result.returncode, 0, result.stderr)
         with open(os.path.join(results, "dns-evidence.json")) as handle:
             return json.load(handle), result
+
+    def test_the_evidence_names_the_run_it_was_written_beside(self):
+        """Nothing in the evidence bundle names the run. The brackets, the
+        owner samples and the replay logs are all files beside the records,
+        pinned to each other by hash, so a clean bundle from one campaign
+        copied into another campaign's run directory passes every check it
+        has. The evidence records the run_id of the analysis.json the
+        measured run's publication gate left beside it, which the index holds
+        to the run it is indexing.
+
+        The run_id is stamped into every record by reqbench.py, so it
+        survives a re-analysis; a hash of analysis.json would not, and would
+        invalidate the evidence whenever the run was re-analyzed.
+
+        RED BEFORE THE FIX: KeyError: 'run_id' on the clean case, and the
+        three missing-identity cases wrote verdict "clean".
+        """
+        with self.subTest(case="the run's own analysis"), \
+                tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            evidence, _ = self._sample(env, results)
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            self.assertIn("run_id", evidence, "the evidence names no run")
+            self.assertEqual(evidence["run_id"], self.RUN_ID)
+        for label, leave in (("no analysis.json", {"analysis": None}),
+                             ("an analysis.json with no run_id", {"analysis": ""})):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                evidence, _ = self._sample(env, results, **leave)
+                self.assertEqual(
+                    evidence["verdict"], "unclean",
+                    f"{label}: the evidence is bound to no run and is clean: {evidence}")
+                self.assertIsNone(evidence["run_id"])
+                self.assertIn("run_id", evidence["reason"])
+        with self.subTest(case="an unparseable analysis.json"), \
+                tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._leave_files(results)
+            with open(os.path.join(results, "analysis.json"), "w") as handle:
+                handle.write("{not json")
+            evidence, _ = self._sample(env, results, files=False)
+            self.assertEqual(evidence["verdict"], "unclean", evidence)
+            self.assertIsNone(evidence["run_id"])
 
     def test_a_port_owner_change_mid_run_is_unclean(self):
         """The owner changes from the third sample on, so the case only
@@ -1129,8 +1303,8 @@ wait_sampler_gone() {
                 self.assertIn("cannot write", result.stderr,
                               f"the failed {tool} was not what made the verdict unclean")
                 self.assertEqual(sorted(os.listdir(results)),
-                                 sorted(["dns-owner.log", "corpus-dns.log", "corpus-access.log",
-                                         "corpus-serve.status"]
+                                 sorted(["analysis.json", "dns-owner.log", "corpus-dns.log",
+                                         "corpus-access.log", "corpus-serve.status"]
                                         + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
                                  "a partial evidence file or temp file was left behind")
 
@@ -1427,6 +1601,287 @@ while True:
         self.assertIn("--access-log", inner)
         self.assertIn('"$RESULTS/corpus-dns.log"', args)
         self.assertIn('"$RESULTS/corpus-access.log"', args)
+
+
+class DiagPhase(unittest.TestCase):
+    """The diag runs on the golden's clones after its verify and before anything
+    is measured: one traced render per corpus URL and rep, inside a restored
+    clone, holding every remote IP to the replay's, every name to resolved,
+    every load event under DIAG_MAX_LOAD_MS. A failed diag ends the campaign
+    before the measured run; DIAG_ONLY=1 ends it after the diag whatever the
+    result, for the throwaway golden round.
+
+    Borrows DnsBrackets' fakes and helper lifting, as HugepageGuardsRound2
+    borrows _bash in test_reqbench.py.
+    """
+
+    HELPERS = DnsBrackets.HELPERS
+    URL_LINE = DnsBrackets.URL_LINE
+    FAKE_MAKE = DnsBrackets.FAKE_MAKE
+    FAKE_SS = DnsBrackets.FAKE_SS
+    FAKE_SYSTEMCTL = DnsBrackets.FAKE_SYSTEMCTL
+    FAKE_SUDO = DnsBrackets.FAKE_SUDO
+    _fakes = DnsBrackets._fakes
+    _set_load = staticmethod(DnsBrackets._set_load)
+    _make_env = DnsBrackets._make_env
+    _run = DnsBrackets._run
+    _helpers = DnsBrackets._helpers
+    _urls = DnsBrackets._urls
+
+    DIAG_BLOCK = re.compile(
+        r'(run_diag \|\| campaign_fail[^\n]*\n'
+        r'if \[ "\$DIAG_ONLY" = 1 \]; then\n.*?\nfi\n)', re.S)
+
+    def _diag_summary(self, urls, passed=True):
+        return json.dumps({
+            "engine": "chromium", "tag": "cb-req-corpus", "passed": passed,
+            "urls": {u: {"reps": 3, "renders_ok": 3, "max_load_ms": 812.5}
+                     for u in urls.split(",")},
+            "violations": [] if passed else [
+                {"url": urls.split(",")[0], "rep": 1, "kind": "remote_ip",
+                 "detail": "93.184.216.34 served 1 request(s)"}],
+            "limits": {"expect_ips": ["10.0.2.2"], "max_load_ms": 15000},
+        })
+
+    def _knob_defaults(self):
+        body = campaign()
+        limit = re.search(r'^DIAG_MAX_LOAD_MS="\$\{DIAG_MAX_LOAD_MS:-(\d+)\}"$', body, re.M)
+        self.assertIsNotNone(limit, "the campaign sets no DIAG_MAX_LOAD_MS default")
+        self.assertEqual(limit.group(1), "15000")
+        only = re.search(r'^DIAG_ONLY="\$\{DIAG_ONLY:-0\}"$', body, re.M)
+        self.assertIsNotNone(only, "the campaign has no DIAG_ONLY knob")
+        return limit.group(0) + "\n" + only.group(0) + "\n"
+
+    def _prelude(self, urls):
+        return ('set -euo pipefail\nsay() { echo "=== $*"; }\n'
+                f'URLS="{urls}"\nBACKEND=uffd\nUFFD_MODE=minor\nUFFD_PREFETCH=on\n'
+                'SERVE_PID=4242\nDNSMASQ_WAS_ACTIVE=no\nSAMPLER_ALIVE_AT_STOP=""\n'
+                'DNS_SAMPLE_INTERVAL=10\n'
+                + self._knob_defaults() + self._helpers() + "\n")
+
+    def test_run_diag_hands_the_corpus_and_the_replay_answer_to_the_diag_target(self):
+        """Every corpus URL, the replay's answer as the only expected remote
+        IP, the 15 s limit, this run's RESULTS and the run's backend and
+        UFFD mode, to the engine's diag target; the summary it leaves must
+        say passed.
+
+        Watched red 2026-08-28 at 55d6fb7d: `bash: line N: run_diag: command
+        not found` (the helpers block has no run_diag) after the knob
+        defaults were found missing.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS"):
+                env.pop(key, None)
+            env["MAKE_DIAG_JSON"] = self._diag_summary(urls)
+            result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("DIAGNOSED", result.stdout)
+            seen = self._make_env(env)
+            self.assertEqual(seen.get("DIAG_URLS"), urls, "diag was not told the corpus")
+            self.assertEqual(seen.get("DIAG_EXPECT_IPS"), "10.0.2.2")
+            self.assertEqual(seen.get("DIAG_MAX_LOAD_MS"), "15000")
+            self.assertEqual(seen.get("RESULTS"), results,
+                             "the diag's records land outside the run directory")
+            self.assertEqual(seen.get("TAG"), "cb-req-corpus")
+            self.assertEqual(seen.get("ENGINE"), "chromium")
+            for knob, want in (("BACKEND", "uffd"), ("UFFD_MODE", "minor")):
+                self.assertEqual(seen.get(knob), want,
+                                 f"the diag does not run on the measured run's {knob}")
+            with open(env["MAKE_ARGV"]) as handle:
+                self.assertIn("bench-chromium-request-diag", handle.read())
+
+    RUN_BLOCK = re.compile(r'(TAG="\$TAG" URL="\$URLS" BACKEND=.*?\|\| run_rc=\$\?)', re.S)
+
+    def test_the_diag_serves_with_working_set_replay_off_whatever_the_run_will_use(self):
+        """A UFFD serve with working-set replay on records every clone's
+        faults into memory.bin.working-set beside the golden, and the measured
+        run replays that file. The diag renders every corpus URL on DIAG_REPS
+        clones each, so a diag served with replay on would leave the run
+        replaying the diag's working set rather than the golden's own, and a
+        fresh golden would measure like a reused one. --uffd-prefetch off opens
+        no working-set store (src/uffd/server.rs, Prefetch::Off): nothing
+        recorded, nothing replayed, no file. run_diag hands the diag target
+        UFFD_PREFETCH=off whatever the campaign was started with, as the shell
+        variable and in the exported environment a sub-make would otherwise
+        inherit, while the measured run's sub-make still receives the
+        campaign's value.
+
+        Watched red 2026-08-28 at 8cd77713: the diag's make saw
+        UFFD_PREFETCH=on.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _results = self._fakes(tmp)
+            for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS", "STALL_MAX_MS"):
+                env.pop(key, None)
+            # As `UFFD_PREFETCH=on make bench-chromium-corpus` leaves it:
+            # exported, so a sub-make inherits it unless the call overrides.
+            env["UFFD_PREFETCH"] = "on"
+            env["MAKE_DIAG_JSON"] = self._diag_summary(urls)
+            result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("DIAGNOSED", result.stdout)
+            seen = self._make_env(env)
+            self.assertEqual(seen.get("UFFD_PREFETCH"), "off",
+                             "the diag's serve would record its renders into the "
+                             "golden's working set")
+            self.assertEqual(seen.get("BACKEND"), "uffd")
+            self.assertEqual(seen.get("UFFD_MODE"), "minor")
+            body = campaign()
+            run = self.RUN_BLOCK.search(body)
+            self.assertIsNotNone(run, "the measured run invocation is gone")
+            stall = re.search(r'^STALL_MAX_MS="\$\{STALL_MAX_MS:-\d+\}"$', body, re.M)
+            self.assertIsNotNone(stall, "the campaign sets no STALL_MAX_MS default")
+            script = (self._prelude(urls) + "ARMS=noop,cdp\nREPS=1\nWARMUP=1\n"
+                      f"{stall.group(0)}\nrun_rc=0\n{run.group(1)}\n"
+                      'echo "run_rc=$run_rc"\n')
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("run_rc=0", result.stdout)
+            self.assertEqual(self._make_env(env).get("UFFD_PREFETCH"), "on",
+                             "the diag's pin leaked into the measured run")
+
+    def test_the_webkit_diag_is_not_asked_for_addresses_it_cannot_see(self):
+        """WebKit renders carry no network trace, and reqbench refuses a
+        DIAG_EXPECT_IPS it cannot enforce; the campaign passes the
+        expectation to the Chromium diag only, and the verify brackets keep
+        the resolver evidence for both engines."""
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _results = self._fakes(tmp)
+            env["ENGINE"] = "webkit"
+            for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS", "DIAG_EXPECT_IPS"):
+                env.pop(key, None)
+            env["MAKE_DIAG_JSON"] = self._diag_summary(urls)
+            result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            seen = self._make_env(env)
+            self.assertFalse(seen.get("DIAG_EXPECT_IPS"),
+                             "the webkit diag was handed an IP expectation it cannot check")
+            self.assertEqual(seen.get("DIAG_URLS"), urls)
+            self.assertEqual(seen.get("DIAG_MAX_LOAD_MS"), "15000")
+            with open(env["MAKE_ARGV"]) as handle:
+                self.assertIn("bench-webkit-request-diag", handle.read())
+
+    def test_a_failed_or_missing_diag_refuses_to_measure(self):
+        urls = self._urls()
+        cases = {
+            "make failed": {"MAKE_RC": "1", "MAKE_DIAG_JSON": self._diag_summary(urls)},
+            "summary says failed": {"MAKE_DIAG_JSON": self._diag_summary(urls, passed=False)},
+            "no summary": {},
+        }
+        for label, extra in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS"):
+                    env.pop(key, None)
+                env.update(extra)
+                result = self._run(self._prelude(urls) + "run_diag\necho DIAGNOSED\n", env)
+                self.assertNotEqual(result.returncode, 0, f"{label}: accepted\n{result.stdout}")
+                self.assertNotIn("DIAGNOSED", result.stdout)
+                self.assertIn("diag", result.stderr, label)
+
+    def test_diag_only_stops_after_the_diag_and_a_failed_diag_stops_before_measuring(self):
+        """The block between the golden's verify and the settle wait, run
+        with the fake make: DIAG_ONLY=1 exits 0 without reaching what
+        follows; a failed diag exits non-zero without reaching it; the
+        default reaches it.
+        """
+        urls = self._urls()
+        block = self.DIAG_BLOCK.search(campaign())
+        self.assertIsNotNone(block, "the diag call and the DIAG_ONLY stop are gone")
+        cases = (
+            ("DIAG_ONLY=1", {"DIAG_ONLY": "1"}, True, 0, False),
+            ("default", {}, True, 0, True),
+            ("diag failed", {"DIAG_ONLY": "1", "MAKE_RC": "1"}, False, 1, False),
+        )
+        for label, extra, diag_ok, want_rc, measured in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                for key in ("DIAG_MAX_LOAD_MS", "DIAG_ONLY", "DIAG_REPS"):
+                    env.pop(key, None)
+                env["MAKE_DIAG_JSON"] = self._diag_summary(urls, passed=diag_ok)
+                env.update(extra)
+                script = self._prelude(urls) + block.group(1) + "echo MEASURED\n"
+                result = self._run(script, env)
+                self.assertEqual(result.returncode, want_rc,
+                                 f"{label}: {result.stdout}{result.stderr}")
+                self.assertEqual("MEASURED" in result.stdout, measured,
+                                 f"{label}: {result.stdout}{result.stderr}")
+                if label == "DIAG_ONLY=1":
+                    self.assertIn("DIAG_ONLY", result.stdout,
+                                  "the stop does not say why the campaign ended")
+
+    KNOBS = re.compile(
+        r'^(STALL_MAX_MS="\$\{STALL_MAX_MS:-\d+\}"\n.*?^DIAG_ONLY="\$\{DIAG_ONLY:-0\}"\n)',
+        re.S | re.M)
+
+    def test_the_campaign_refuses_a_diag_ceiling_above_the_run_s_stall_gate(self):
+        """campaign_summary holds the diag's max_load_ms to the run's stall
+        gate, so a campaign started with DIAG_MAX_LOAD_MS above STALL_MAX_MS
+        would spend its golden on a run the index refuses. The knob block
+        refuses that before anything is built, and a limit that is not a
+        positive integer of milliseconds with it. The block is lifted out of
+        the shipped script and run against each environment; the diag make
+        line's own DIAG_EXPECT_IPS and DIAG_MAX_LOAD_MS are pinned by
+        test_run_diag_hands_the_corpus_and_the_replay_answer_to_the_diag_target.
+
+        Watched red 2026-08-28 at 51527021: DIAG_MAX_LOAD_MS=20000 over
+        STALL_MAX_MS=15000 ran through (`AssertionError: 0 != 2`).
+        """
+        block = self.KNOBS.search(campaign())
+        self.assertIsNotNone(block, "the STALL_MAX_MS .. DIAG_ONLY knob block is gone")
+        cases = (
+            ("defaults", {}, 0),
+            ("equal", {"STALL_MAX_MS": "15000", "DIAG_MAX_LOAD_MS": "15000"}, 0),
+            ("diag stricter", {"STALL_MAX_MS": "20000", "DIAG_MAX_LOAD_MS": "15000"}, 0),
+            ("empty falls back to the default", {"DIAG_MAX_LOAD_MS": ""}, 0),
+            ("diag above the gate", {"STALL_MAX_MS": "15000", "DIAG_MAX_LOAD_MS": "20000"}, 2),
+            ("diag one over the default gate", {"DIAG_MAX_LOAD_MS": "15001"}, 2),
+            ("diag not a number", {"DIAG_MAX_LOAD_MS": "abc"}, 2),
+            ("gate zero", {"STALL_MAX_MS": "0"}, 2),
+            ("gate negative", {"STALL_MAX_MS": "-15000"}, 2),
+        )
+        for label, knobs, want in cases:
+            with self.subTest(case=label):
+                env = dict(os.environ)
+                for key in ("STALL_MAX_MS", "DIAG_MAX_LOAD_MS", "DIAG_ONLY"):
+                    env.pop(key, None)
+                env.update(knobs)
+                result = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + block.group(1) + "echo KNOBS_OK\n"],
+                    env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, want, result.stdout + result.stderr)
+                if want == 0:
+                    self.assertIn("KNOBS_OK", result.stdout)
+                else:
+                    self.assertIn("BLOCKED", result.stderr)
+                    self.assertNotIn("KNOBS_OK", result.stdout)
+
+    def test_the_diag_follows_the_golden_verify_in_both_phases_and_precedes_the_settle(self):
+        """Ordering in the main flow, which cannot run without a VM."""
+        body = campaign()
+        phases = re.search(r'if \[ "\$PHASE" = all \]; then\n(.*?)\nelse\n(.*?)\nfi\n',
+                           body, re.S)
+        self.assertIsNotNone(phases, "the PHASE branch is gone")
+        for branch in (phases.group(1), phases.group(2)):
+            self.assertIn("run_verify pre", branch)
+            self.assertNotIn("run_diag", branch,
+                             "the diag is called inside one phase branch; it runs once, "
+                             "after whichever golden the phase settled on")
+        self.assertEqual(body.count("run_diag ||"), 1)
+        diag = body.index("run_diag ||")
+        self.assertLess(phases.end(), diag, "the diag runs before the golden's verify")
+        stop = body.index('if [ "$DIAG_ONLY" = 1 ]; then', diag)
+        settle = body.index("settle_deadline=")
+        self.assertLess(stop, settle, "the DIAG_ONLY stop comes after the settle wait")
+        self.assertLess(diag, body.index("run_verify before-run"))
+        self.assertLess(diag, body.index("engine_target run)"))
+        self.assertIn("campaign_fail", body[diag:body.index("\n", diag)],
+                      "a failed diag does not end the campaign")
+
 
 if __name__ == "__main__":
     unittest.main()

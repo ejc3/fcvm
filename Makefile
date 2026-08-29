@@ -233,6 +233,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
+	bench-chromium-request-diag bench-webkit-request-diag \
 	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
 	bench-quick bench-throughput bench-operations bench-protocol \
@@ -295,13 +296,15 @@ help:
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
 	@echo "  bench-chromium-request-build   Build the request-bench container image"
 	@echo "  bench-webkit-request-build     Build the WebKit request-bench container image"
-	@echo "  bench-chromium-request-golden  Create golden snapshot (TAG=, HUGEPAGES=1, NETMODE=)"
+	@echo "  bench-chromium-request-golden  Create golden snapshot (TAG=, HUGEPAGES=1, NETMODE=, GUEST_ENV=)"
 	@echo "  bench-chromium-request-verify  Prove CDP hops on a restored clone (TAG=)"
 	@echo "  bench-chromium-request-run     Measured run (TAG=, BACKEND=, UFFD_MODE=, UFFD_PREFETCH=, REPS=, WARMUP=, ARMS=, RESULTS=)"
 	@echo "  bench-chromium-request-all     Full chain: image, golden, verify, run"
+	@echo "  bench-chromium-request-diag    In-guest load diagnostics, one traced render per clone, serve always --uffd-prefetch off (TAG=, BACKEND=, UFFD_MODE=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
+	@echo "  bench-webkit-request-diag      WebKit twin of bench-chromium-request-diag (TAG=, BACKEND=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
 	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=)"
 	@echo "  bench-stop                    Stop all bench processes, reap stray VMs, restore dnsmasq"
-	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM)"
+	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM; BENCH_RESOLVE_ALL_TO=)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
 	@echo "  test-chromium          Run ALL bench unit tests (what CI runs)"
@@ -832,6 +835,16 @@ bench-webkit-request-run:
 		BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
 		bash bench/chromium/reqbench.sh run
 
+# TAG is quoted: unquoted, `TAG='x #'` left bash an assignment followed by a
+# comment and the target exited 0 having run nothing; reqbench.sh is what
+# refuses a bad tag and has to be reached.
+bench-webkit-request-diag:
+	@echo "==> Diagnosing page loads on restored WebKit clones ($(BACKEND), $(if $(DIAG_REPS),$(DIAG_REPS),3) clone(s) per URL)..."
+	@ENGINE=webkit TAG="$(if $(TAG),$(TAG),cb-req-webkit)" \
+		BACKEND="$(BACKEND)" DIAG_URLS="$(DIAG_URLS)" DIAG_REPS="$(DIAG_REPS)" \
+		DIAG_EXPECT_IPS="$(DIAG_EXPECT_IPS)" DIAG_MAX_LOAD_MS="$(DIAG_MAX_LOAD_MS)" \
+		RESULTS="$(RESULTS)" bash bench/chromium/reqbench.sh diag
+
 bench-chromium-request-golden: bench-chromium-request-build setup-default
 	@echo "==> Creating golden snapshot (TAG=$(if $(TAG),$(TAG),cb-req-golden), HUGEPAGES=$(if $(HUGEPAGES),$(HUGEPAGES),0))..."
 	@bash bench/chromium/reqbench.sh golden
@@ -844,6 +857,18 @@ bench-chromium-request-run:
 	@echo "==> Running gated Chromium request benchmark ($(BACKEND), $(REPS) measured attempts per arm)..."
 	@BACKEND="$(BACKEND)" REPS="$(REPS)" WARMUP="$(WARMUP)" RESULTS="$(RESULTS)" \
 		bash bench/chromium/reqbench.sh run
+
+# In-guest load diagnostics on the golden the run uses: one clone per (URL,
+# rep), one render each with cdpdrive's --net-trace (Network.* rows the
+# measured arms never ask for), and a summary naming every remote IP, name
+# that did not resolve, stall and failed render. Same seal rule as verify and
+# run: no build dependency. The DIAG_* knobs are forwarded the way run
+# forwards BACKEND and RESULTS; reqbench.sh holds their defaults.
+bench-chromium-request-diag:
+	@echo "==> Diagnosing page loads on restored clones ($(BACKEND), $(if $(DIAG_REPS),$(DIAG_REPS),3) clone(s) per URL)..."
+	@BACKEND="$(BACKEND)" DIAG_URLS="$(DIAG_URLS)" DIAG_REPS="$(DIAG_REPS)" \
+		DIAG_EXPECT_IPS="$(DIAG_EXPECT_IPS)" DIAG_MAX_LOAD_MS="$(DIAG_MAX_LOAD_MS)" \
+		RESULTS="$(RESULTS)" bash bench/chromium/reqbench.sh diag
 
 bench-chromium-request-all: build setup-default
 	@echo "==> Full request-bench chain (image, golden, verify, measured run) under one seal..."

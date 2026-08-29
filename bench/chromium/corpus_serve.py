@@ -414,7 +414,9 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
     space-containing --host-resolver-rules value cannot survive the container
     env word-split, which is how the flag approach died (2026-08-13).
 
-    With `log`, one line per answered query: {ts, peer, qname, qtype, answer}.
+    With `log`, one line per answered query: {ts, peer, qname, qtype, answer},
+    written and flushed before the answer is sent, so an answered query is on
+    disk by the time anyone can act on the answer.
     Returns when the socket is closed under it; every other error on a query
     is dropped so one malformed packet cannot stop the replay. A log line that
     cannot be written is the one exception: an answered, unlogged query is a
@@ -457,9 +459,11 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
             else:  # empty NOERROR (esp. AAAA -> fall back to A)
                 resp = txid + flags + struct.pack(">HHHH", 1, 0, 0, 0) + question
                 answered = ""
-            sock.sendto(resp, peer)
         except Exception:  # noqa: BLE001 - a malformed query must not kill the server
             continue
+        # The line goes to disk before the answer goes out, so an answered
+        # query is always logged: a reader that acts on the answer (the
+        # campaign's evidence, a test) never finds the line still unwritten.
         if log is not None:
             try:
                 log.write({
@@ -474,6 +478,10 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
                 if server is not None:
                     server.fail_closed(exc, "dns")
                 raise
+        try:
+            sock.sendto(resp, peer)
+        except OSError:
+            continue
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -48,6 +48,24 @@ BACKEND="${BACKEND:-uffd}"
 # the two, and campaign_summary refuses an analysis whose gate was never
 # armed, so an unset value here would make every run un-indexable.
 STALL_MAX_MS="${STALL_MAX_MS:-15000}"
+# The diag phase's load-event limit (reqbench diag, DIAG_MAX_LOAD_MS): the
+# same 15 s, for the same reason. DIAG_REPS reaches the diag target through
+# the environment when set.
+DIAG_MAX_LOAD_MS="${DIAG_MAX_LOAD_MS:-15000}"
+# campaign_summary holds the diag's limit to the run's stall gate and
+# refuses a diag that was allowed more than the measured run, so a campaign
+# that would leave an un-indexable diag stops here, before the golden. Both
+# are positive integers of milliseconds; reqanalyze and reqbench check their
+# own copies later, but a bad value must not cost a golden first.
+for knob in STALL_MAX_MS DIAG_MAX_LOAD_MS; do
+    [[ "${!knob}" =~ ^[1-9][0-9]*$ ]] \
+        || { echo "BLOCKED: $knob must be a positive integer of milliseconds (got '${!knob}')" >&2; exit 2; }
+done
+[ "$DIAG_MAX_LOAD_MS" -le "$STALL_MAX_MS" ] \
+    || { echo "BLOCKED: DIAG_MAX_LOAD_MS=$DIAG_MAX_LOAD_MS exceeds STALL_MAX_MS=$STALL_MAX_MS; campaign_summary refuses a diag allowed more than the run's stall gate" >&2; exit 2; }
+# DIAG_ONLY=1 ends the campaign after golden, verify and diag: no measured
+# run, no analysis. For the throwaway golden round.
+DIAG_ONLY="${DIAG_ONLY:-0}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULTS="${RESULTS:-$REPO/bench/chromium/results/reqbench-$STAMP-corpus}"
 LOGDIR="${LOGDIR:-/tmp/corpus-campaign-$STAMP}"
@@ -55,6 +73,37 @@ mkdir -p "$LOGDIR"
 # Created here, not left to reqbench: the replay server's logs and the resolver
 # evidence below are written into it before any reqbench phase runs.
 mkdir -p "$RESULTS"
+# $RESULTS/diag is reqbench's diag phase's output directory, and its cmd_diag
+# owns it exclusively under $RESULTS/diag/.lock from before its first removal
+# to past the atomic rename that publishes its summary. The cleanup below
+# removes that summary, so it takes the same lock, with the same bounded wait
+# and refusal: unlocked, the removal lands inside a diag's critical section,
+# after the rename and before the release, and that diag exits reporting a
+# summary that no longer exists. Held for the removal alone; the campaign's
+# own diag phase takes the lock again, from the sub-make's own process.
+CAMPAIGN_DIAG_LOCK_FD=""
+acquire_diag_lock() {
+    local lock="$RESULTS/diag/.lock" wait_s="${DIAG_LOCK_WAIT:-${HUGEPAGE_POOL_LOCK_WAIT:-60}}"
+    mkdir -p "$RESULTS/diag" || { echo "BLOCKED: cannot create $RESULTS/diag" >&2; return 1; }
+    touch "$lock" 2>/dev/null || true
+    exec {CAMPAIGN_DIAG_LOCK_FD}<>"$lock" || true
+    if [ -z "$CAMPAIGN_DIAG_LOCK_FD" ]; then
+        echo "BLOCKED: diag output lock unavailable at $lock" >&2
+        return 1
+    fi
+    if ! flock -x -w "$wait_s" "$CAMPAIGN_DIAG_LOCK_FD"; then
+        echo "BLOCKED: a diag owns $RESULTS/diag (waited ${wait_s}s); its summary is published under this lock, so this campaign refuses to clear the directory rather than removing a record out from under it" >&2
+        return 1
+    fi
+}
+
+release_diag_lock() {
+    [ -n "$CAMPAIGN_DIAG_LOCK_FD" ] || return 0
+    exec {CAMPAIGN_DIAG_LOCK_FD}>&-
+    CAMPAIGN_DIAG_LOCK_FD=""
+}
+
+acquire_diag_lock || exit 2
 # An explicit RESULTS can be reused. Evidence an earlier campaign left there
 # must not outlive this one's start: a clean verdict beside a run this
 # campaign never finished would be indexed as if it were this run's, and
@@ -63,12 +112,15 @@ mkdir -p "$RESULTS"
 # record goes too: reqbench.py appends to reqbench.jsonl, so a retry would
 # carry two run_ids and reqanalyze would emit a pooled analysis with no
 # top-level cell, and a retry that fails before its own analysis would leave
-# the earlier analysis.json beside this attempt's fresh evidence. The
-# content-addressed runtime bundles under runtime/ and the phase logs under
-# logs/ are not the record and stay.
+# the earlier analysis.json beside this attempt's fresh evidence. The diag
+# summary goes for the same reason: run_diag reads it back after the
+# sub-make, and an earlier campaign's passed=true must not answer for this
+# one. The content-addressed runtime bundles under runtime/ and the phase
+# logs under logs/ are not the record and stay.
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
     "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-serve.status \
-    "$RESULTS"/reqbench.jsonl "$RESULTS"/analysis.json
+    "$RESULTS"/reqbench.jsonl "$RESULTS"/analysis.json "$RESULTS"/diag/summary.json
+release_diag_lock
 
 # The 14 URLs, in the order the sealed 2026-08-14 run cycled them. Order is part
 # of the schedule: reqanalyze re-derives the expected URL per record from it, so
@@ -86,7 +138,12 @@ say() { printf '\n=== %s\n' "$*"; }
 #      container, that every corpus host resolves to 10.0.2.2 and that every
 #      corpus URL fetches through that resolver: once before the settle wait,
 #      once immediately before the measured run, once after it. Each bracket
-#      keeps its evidence as $RESULTS/verify-dns-<stage>.json.
+#      keeps its evidence as $RESULTS/verify-dns-<stage>.json. After the
+#      first bracket, reqbench's diag renders every corpus URL on its own
+#      clone with a network trace and refuses the campaign when any request
+#      reached an address other than 10.0.2.2, any name did not resolve, or
+#      any load event took longer than DIAG_MAX_LOAD_MS
+#      ($RESULTS/diag/summary.json).
 #   2. a sampler names the owner of 127.0.0.1:53, the dnsmasq state and the
 #      1-min load every DNS_SAMPLE_INTERVAL seconds while the run is in
 #      flight ($RESULTS/dns-owner.log). The quiet gate reads the load once,
@@ -102,7 +159,7 @@ say() { printf '\n=== %s\n' "$*"; }
 #      exited 0 (its logs are complete only then), and dnsmasq is inactive
 #      after the clone restores.
 engine_target() {
-    # $1 = golden | verify | run
+    # $1 = golden | verify | diag | run
     printf 'bench-%s-request-%s' "$([ "$ENGINE" = webkit ] && echo webkit || echo chromium)" "$1"
 }
 
@@ -149,6 +206,41 @@ run_verify() {
         and all($hosts | split(",")[]; . as $h | $e.hosts[$h].ok == true)
         and all($urls | split(",")[]; . as $u | $e.urls[$u].ok == true)' "$copy" >/dev/null \
         || { echo "FAILED: verify ($stage): $copy does not record passed=true through 10.0.2.2 with proxies disabled for every corpus host and URL" >&2; return 1; }
+}
+
+run_diag() {
+    # What holds each corpus page's load event, asked of restored clones of
+    # the golden the run will use, on the run's backend, before anything is
+    # measured. Every request must reach the replay (10.0.2.2), every name
+    # must resolve, every load event must land inside DIAG_MAX_LOAD_MS. The
+    # sub-make must exit 0 AND the summary it leaves must say passed=true:
+    # a stale summary from an earlier campaign is removed at start.
+    local out="$RESULTS/diag/summary.json" expect=10.0.2.2
+    # Only Chromium's render carries a network trace; reqbench refuses an
+    # IP expectation it cannot enforce, so the WebKit diag is asked for
+    # load events and render success alone, and the verify brackets hold
+    # the resolver evidence for both engines.
+    [ "$ENGINE" = webkit ] && expect=""
+    # The diag's serve runs with working-set replay off, whatever the
+    # measured run will use. With it on, the UFFD server records every
+    # clone's faults into memory.bin.working-set beside the golden, and the
+    # run would replay the working set of the diag's renders (every corpus
+    # URL, DIAG_REPS clones each) instead of the golden's own: a fresh golden
+    # would measure like a reused one, and the PHASE comparison below would
+    # be two warmed sidecars. off records nothing and writes no file;
+    # reqbench refuses anything else for the diag, and campaign_summary
+    # refuses a diag summary that does not say off. Set on the make line so
+    # it also beats a UFFD_PREFETCH exported into this campaign's environment.
+    say "diag: one traced render per corpus URL on restored clones of $TAG, replay off (limit ${DIAG_MAX_LOAD_MS} ms, expect ${expect:-<no trace>})"
+    if ! DIAG_URLS="$URLS" DIAG_EXPECT_IPS="$expect" DIAG_MAX_LOAD_MS="$DIAG_MAX_LOAD_MS" \
+        TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" BACKEND="$BACKEND" \
+        UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH=off \
+        make -C "$REPO" "$(engine_target diag)" 2>&1 | tee "$LOGDIR/diag.log"; then
+        echo "FAILED: diag did not pass; see $LOGDIR/diag.log and $out" >&2
+        return 1
+    fi
+    jq -e '.passed == true' "$out" >/dev/null 2>&1 \
+        || { echo "FAILED: diag left no $out saying passed=true" >&2; return 1; }
 }
 
 DNS_SAMPLE_INTERVAL="${DNS_SAMPLE_INTERVAL:-10}"
@@ -242,6 +334,23 @@ write_dns_evidence() {
     local out="$RESULTS/dns-evidence.json"
     local samples=0 first_mismatch="" before=false after=false after_state f
     local sampler_alive=false load_stats load_samples=0 load_max=null
+    # The run this bundle is evidence for. Every file in it (the brackets,
+    # the owner samples, the replay logs) sits beside the records and is
+    # pinned to the others by hash, and none of them names the run, so a
+    # clean bundle from one campaign copied into another campaign's run
+    # directory passes every check it has. The run_id comes from the
+    # analysis.json the measured run's publication gate wrote here minutes
+    # ago; reqbench.py stamps that id into every record, so it survives a
+    # re-analysis, which a hash of analysis.json would not.
+    local run_id=""
+    if [ -f "$RESULTS/analysis.json" ]; then
+        run_id=$(jq -r 'select((.run_id | type) == "string" and (.run_id | length) > 0)
+                        | .run_id' "$RESULTS/analysis.json" 2>/dev/null) || run_id=""
+    fi
+    if [ -z "$run_id" ]; then
+        verdict=unclean
+        reason="${reason:-$RESULTS/analysis.json names no run_id, so this evidence is bound to no measured run}"
+    fi
     [ "$DNSMASQ_WAS_ACTIVE" = yes ] && before=true
     [ "$SAMPLER_ALIVE_AT_STOP" = yes ] && sampler_alive=true
     if [ -s "$log" ]; then
@@ -313,7 +422,8 @@ write_dns_evidence() {
     else
         verdict=unclean; reason="${reason:-corpus_serve left no exit status in $status_file}"
     fi
-    if ! jq -n --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
+    if ! jq -n --arg run_id "$run_id" \
+        --argjson serve_pid "${SERVE_PID:-null}" --argjson before "$before" --argjson after "$after" \
         --arg after_state "$after_state" --argjson sampler_alive "$sampler_alive" \
         --argjson samples "$samples" --argjson interval "$DNS_SAMPLE_INTERVAL" \
         --argjson load_max "$load_max" --argjson load_samples "$load_samples" \
@@ -323,7 +433,8 @@ write_dns_evidence() {
         --argjson serve_status "$serve_status_json" \
         --argjson verify_sha "$verify_sha" \
         --arg verdict "$verdict" --args \
-        '{serve_pid: $serve_pid, dnsmasq_was_active_before: $before,
+        '{run_id: (if $run_id == "" then null else $run_id end),
+          serve_pid: $serve_pid, dnsmasq_was_active_before: $before,
           dnsmasq_active_after_restore: $after,
           dnsmasq_state_after_restore: $after_state,
           sampler_alive_at_stop: $sampler_alive, samples: $samples,
@@ -579,7 +690,9 @@ say "fcvm binary $FCVM_BIN sha256=$FCVM_SHA (recorded per run in cell.fcvm_sha25
 # PHASE=run reuses the installed golden. The working-set sidecar beside the
 # snapshot is the reason that is worth doing separately: a freshly created
 # golden has none, so the first measured run pays cold-working-set costs that
-# every later run does not. Comparing the two is a one-variable experiment.
+# every later run does not. Comparing the two is a one-variable experiment;
+# the diag between golden and run serves with replay off (run_diag), so it
+# leaves that sidecar as it found it.
 PHASE="${PHASE:-all}"
 CORPUS_HOSTS=$(corpus_hosts)
 if [ "$PHASE" = all ]; then
@@ -599,6 +712,16 @@ else
     # A reused golden is only as good as its resolver still is: the snapshot
     # may predate a corpus change, or have been made without GUEST_DNS.
     run_verify pre || campaign_fail "verify (pre) failed on the reused golden"
+fi
+
+# --- diag --------------------------------------------------------------------
+# Whichever golden the phase settled on, diagnose it before spending the
+# settle wait and the measured run on it. A page that stalls or reaches the
+# live internet is a defect of the golden or the replay, not a number.
+run_diag || campaign_fail "diag failed on golden $TAG; not measuring"
+if [ "$DIAG_ONLY" = 1 ]; then
+    say "DIAG_ONLY=1: golden, verify and diag done for $TAG; no measured run ($RESULTS/diag/summary.json)"
+    exit 0
 fi
 
 # --- settle -----------------------------------------------------------------

@@ -34,10 +34,11 @@ silently invalidate the A/B. Only the connect path is reimplemented here, to tim
 its two halves separately.
 
 `--net-trace PATH` is a diagnostic, not a measurement. It sends `Network.enable`
-before the navigate, collects requestWillBeSent / responseReceived /
-loadingFinished / loadingFailed until Page.loadEventFired, keeps draining for
-`--net-trace-drain-ms` (default 5000) so requests still open at the load event
-show how they end, and writes PATH whole (temp file, then rename) as
+before the navigate, collects requestWillBeSent / requestServedFromCache /
+responseReceived / loadingFinished / loadingFailed until Page.loadEventFired,
+keeps draining for `--net-trace-drain-ms` (default 5000) so requests still
+open at the load event show how they end, and writes PATH whole (temp file,
+then rename) as
 {"requests": [...], "summary": {...}}. The record gains a "net_trace" key
 holding the summary; a PATH that could not be written puts "net_trace_error"
 on the record and exits 1. Without the flag not one extra CDP message is
@@ -369,6 +370,12 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
                     "canceled": False,
                     "error_text": "",
                     "redirects": 0,
+                    # Why a row can have no remote address: a cache or a
+                    # service worker answered it, so there was no network hop
+                    # to name one. Without these the diag cannot tell such a
+                    # row from a request that never got a response.
+                    "from_cache": False,
+                    "from_service_worker": False,
                 }
                 order.append(rid)
             else:
@@ -376,7 +383,11 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
             continue
         if row is None:
             continue  # announced before Network.enable; nothing to attach to
-        if method == "Network.responseReceived":
+        if method == "Network.requestServedFromCache":
+            # The memory cache. It arrives before the response, which then
+            # carries fromDiskCache false and no remote address.
+            row["from_cache"] = True
+        elif method == "Network.responseReceived":
             response = params.get("response", {})
             row.update(
                 remote_ip=response.get("remoteIPAddress", ""),
@@ -384,6 +395,12 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
                 protocol=response.get("protocol", ""),
                 status=response.get("status"),
                 timing=response.get("timing"),
+                from_cache=(
+                    row["from_cache"]
+                    or bool(response.get("fromDiskCache"))
+                    or bool(response.get("fromPrefetchCache"))
+                ),
+                from_service_worker=bool(response.get("fromServiceWorker")),
             )
         elif method == "Network.loadingFinished":
             if row["end_ts"] is None:
@@ -430,6 +447,8 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
             "duration_ms": duration_ms,
             "remote_ip": r["remote_ip"],
             "remote_port": r["remote_port"],
+            "from_cache": r["from_cache"],
+            "from_service_worker": r["from_service_worker"],
             "protocol": r["protocol"],
             "status": r["status"],
             "finished_before_load": finished_before_load,

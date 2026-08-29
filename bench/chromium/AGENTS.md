@@ -26,21 +26,122 @@ and is how goldens died on half-set-up boxes (2026-08-13, twice in one day):
 cd ~/src/fcvm
 make bench-chromium-request-golden       # deps: fcvm build -> image build -> setup-default -> golden
 make bench-chromium-request-verify       # prove all three hops on a RESTORED clone before measuring
+make bench-chromium-request-diag DIAG_EXPECT_IPS=127.0.0.1 DIAG_MAX_LOAD_MS=15000   # what holds the load event, per clone
 make bench-chromium-request-run BACKEND=uffd REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-uffd-200
 make bench-chromium-request-run BACKEND=file REPS=200 RESULTS=/mnt/fcvm-btrfs/reqbench-file-200
 ```
 
 Knobs pass as make command-line variables (make exports them to the recipe
 environment): `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `UFFD_MODE=`,
-`UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=`. Hugepage goldens
+`UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=`, and for the diag
+`DIAG_URLS=`, `DIAG_REPS=`, `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`. Hugepage goldens
 are part of the snapshot identity — give them their own tag
 (`make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`;
 the same `TAG=` must then be passed to `-verify` and `-run`, or they select
 the default snapshot).
 
-`verify` and `run` deliberately have NO build dependency: reqbench.sh seals
-fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and the
-run refuses a golden whose provenance records a different bundle hash.
+`GUEST_ENV=` (golden only) bakes extra container environment into the
+snapshot: comma-separated `KEY=VALUE` entries, one `fcvm podman prepare
+--env` each, recorded as `guest_env` in `reqbench-provenance.json`, carried
+into every run's meta and analysis cell (a golden whose provenance lacks it
+is refused, like one without `guest_dns`), and treated by campaign_summary
+like a baked resolver: a run with a non-empty `guest_env` needs its
+`diag/summary.json` to be indexed. The
+resolver-rule A/B is the one use today:
+`make bench-chromium-request-golden TAG=cb-req-golden-resolve GUEST_ENV=BENCH_RESOLVE_ALL_TO=10.0.2.2`
+makes `entry.sh` launch Chromium with
+`--host-resolver-rules=EXCLUDE localhost, EXCLUDE 127.0.0.1, EXCLUDE ::1, MAP * 10.0.2.2`
+as one argv element (the knob is the IP alone because the rule holds a space,
+which the container env word-split when the whole flag was passed). The
+exclusions keep the container's own warmup page, which entry.sh navigates at
+`http://127.0.0.1:8000/warmup.html` before it writes the ready marker, off
+the map: Chromium maps before it resolves, so without them that navigation
+goes to `10.0.2.2:8000` and the container never becomes healthy. An IPv6
+knob is emitted bracketed (`MAP * [fd00::2]`), the only spelling Chromium's
+rule parser reads as an address, and a scoped address (`fe80::1%eth0`) is
+refused at the knob. The
+entries change what the snapshot does, so such a golden needs its own `TAG=`.
+The host control takes the same variable directly:
+`make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
+`resolve_all_to` in its `run.json` (null when unset).
+
+`bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
+answers what holds a page's load event inside a restored clone, on the
+golden the run uses, on the run's backend and UFFD mode (`BACKEND=`,
+`UFFD_MODE=`, `TAG=`), without a measured arm. Its serve always runs
+`--uffd-prefetch off`, and a `UFFD_PREFETCH=` set to anything else is
+refused: with replay on, the server would record the diag's renders into
+`memory.bin.working-set` beside the golden, the file the measured run
+replays, so the run would restore the diag's working set instead of the
+golden's own. One clone per URL in
+`DIAG_URLS=` (comma-separated; default the run's URL) times `DIAG_REPS=`
+(default 3): clone, one render, teardown. On Chromium the render is
+cdpdrive.py with `--net-trace`, which the measured arms never send; WebKit
+renders through wddrive without a trace. Each render's record and trace land
+under `$RESULTS/diag/`, and `summary.json` there carries, per URL, the render
+count, the slowest load event, the most requests still open at the load
+event, every remote IP with its request count and every failure text, plus a
+violations list, `passed`, `runtime_bundle_intact`, `uffd_prefetch` (`"off"`;
+`null` on the file backend, which has no serve), the
+`snapshot_generation_id` and `snapshot_config_sha256` of the snapshot it
+diagnosed, and `runtime_bundle_sha256`, the sealed runtime it rendered from
+(the hash the measured run records; `null` when the phase ran outside a
+staged bundle). The phase exits non-zero, and `passed` is false, on any remote IP
+outside `DIAG_EXPECT_IPS=` (comma-separated, when set), a trace naming no
+remote address at all while it is set, any `net::ERR_NAME_NOT_RESOLVED` in a
+trace, any load event over `DIAG_MAX_LOAD_MS=` (when set), any failed render
+(a record for another URL, one not saying ok, one written under a non-zero
+driver exit status, or one without a load event timing), any clone whose
+teardown was not clean, and a sealed bundle that changed during the phase.
+Each render record keeps the driver's exit status as `driver_status`. One
+diag owns `$RESULTS/diag` at a time: the phase takes an exclusive lock on
+`$RESULTS/diag/.lock` before it removes anything and holds it past the
+summary's rename, and a second invocation over the same `RESULTS` waits
+`DIAG_LOCK_WAIT` seconds (default 60) and then refuses with exit 3 rather
+than interleaving records with the holder. The generation lock does not
+serialize them: two `TAG`s are two different locks over one output
+directory. Stale `.tmp` records from an invocation that died mid-render are
+swept under that lock, since diag_render adopts a `.tmp` that parses as an
+object. A knob is checked before the generation lock and the hugepage pool
+are touched, and the webkit diag refuses `DIAG_EXPECT_IPS=` because its render
+has no trace to hold it to. The corpus campaign (`make bench-chromium-corpus`)
+runs it after the verify that follows the golden, with every corpus URL,
+`DIAG_EXPECT_IPS=10.0.2.2` on Chromium and `DIAG_MAX_LOAD_MS` defaulting to
+15000 (the campaign refuses a `DIAG_MAX_LOAD_MS` above `STALL_MAX_MS` before
+building anything, since the index refuses the diag that would produce),
+and refuses to measure when it fails; `DIAG_ONLY=1` stops the
+campaign after golden, verify and diag, for a throwaway golden round, and
+`DIAG_REPS=` passes through to the diag. The campaign hands the diag
+`UFFD_PREFETCH=off` whatever the measured run's setting, so the diag's
+renders (every corpus URL, three clones each) do not warm the sidecar the run
+replays and a fresh golden still measures as one. campaign_summary.py
+refuses a corpus run without its `diag/summary.json`, a summary that names
+another snapshot generation, config, tag, engine, backend or UFFD mode than
+the run's analysis cell, one whose `runtime_bundle_sha256` is not the run's
+sealed bundle or is absent (a standalone diag staged from edited sources
+leaves a summary that is intact and matches every snapshot field, and it
+rendered with other code), one whose `uffd_prefetch` is not `"off"` (`null`
+on the file backend), including a summary from before the field existed,
+and one whose `limits` were not armed for the run: `passed` is true when
+nothing the diag was asked to check went wrong, and a standalone diag over
+the same `RESULTS` with the knobs unset replaces the campaign's summary with
+one that allowed every remote address and held no load event to a limit. So
+on Chromium `limits.expect_ips` must be exactly the address set the run's
+records name (the verify brackets' resolver answers, `BENCH_RESOLVE_ALL_TO`,
+and any IP-literal URL host; a run whose records name no address cannot hold
+a diag to anything and is refused), on WebKit it must be `null`,
+`limits.max_load_ms` must be a positive integer no larger than the run's
+`stall_gate.max_ms`, and every measured URL must have rendered `reps` times.
+An armed `DIAG_EXPECT_IPS` holds EVERY traced HTTP(S) request to an allowed
+address, not just one of them: a rep with an allowed main document and a
+subresource that failed, or that was still open when the 5 s post-load drain
+ended, used to pass on `addressed > 0`. The only exemption is a row the trace
+marks `from_cache` or `from_service_worker`, which had no network hop to name
+an address for.
+
+`verify`, `diag` and `run` deliberately have NO build dependency: reqbench.sh
+seals fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and
+the run refuses a golden whose provenance records a different bundle hash.
 Rebuilding — or editing any sealed file — between golden and run therefore
 invalidates the chain; regolden instead of fighting the seal. The structural
 pin for all of this is `MakefileBenchGraph` in `test_reqbench.py`
@@ -98,8 +199,18 @@ easy to get wrong:
   run directory. `write_dns_evidence` records each bracket's sha256 as
   `verify_file_sha256`; `campaign_summary.py` rereads each bracket, refuses
   one whose hash moved since the verdict, and holds its contents to the
-  run's resolver, `proxies_disabled`, and every host and URL answered
-  through that resolver. Evidence carrying no bracket hashes is refused.
+  run's resolver, both captured `/etc/resolv.conf` views (each must name that
+  resolver and no other, since glibc walks the whole nameserver list),
+  `proxies_disabled`, and exactly the hostnames and URLs the cell measured.
+  Evidence carrying no bracket hashes is refused.
+- Which run the bundle is evidence for. Every file in it is pinned to the
+  others by hash and to nothing else, so a clean bundle from one campaign
+  copied into another campaign's run directory passes each of those checks.
+  `write_dns_evidence` records the `run_id` of the `analysis.json` the
+  measured run's publication gate left beside it, and `campaign_summary.py`
+  refuses evidence naming any other run. The id comes from the records
+  themselves, so it survives a re-analysis; a hash of `analysis.json` would
+  not.
 
 ## Six methodology defects — do not reintroduce
 

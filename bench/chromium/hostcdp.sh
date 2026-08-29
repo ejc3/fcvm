@@ -63,8 +63,20 @@ done
 cleanup() { podman rm -f "$CNAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# BENCH_RESOLVE_ALL_TO=<ip> is the resolver rule the VM arm bakes into its
+# golden through reqbench.sh GUEST_ENV; the same variable goes to this
+# container with -e (entry.sh assembles the Chromium flag from it), so the
+# host control runs under the A/B's one variable too. Recorded in run.json as
+# resolve_all_to, null when unset.
+resolve_env=()
+if [ -n "${BENCH_RESOLVE_ALL_TO:-}" ]; then
+    resolve_env=(-e "BENCH_RESOLVE_ALL_TO=$BENCH_RESOLVE_ALL_TO")
+fi
+resolve_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' \
+    "${BENCH_RESOLVE_ALL_TO:-}")
+
 log "starting host container ($IMAGE) with CDP on $CDP_PORT"
-podman run -d --name "$CNAME" --network host "$IMAGE" >/dev/null
+podman run -d --name "$CNAME" --network host "${resolve_env[@]}" "$IMAGE" >/dev/null
 
 # Ready = the same two conditions the VM golden gates on: warm marker file AND
 # a live CDP round trip that finds a page target (cdp_health inside the image).
@@ -80,6 +92,7 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps ($WARMUP warm
     echo "{\"image\": \"$IMAGE\", \"image_id\": \"$(podman inspect --format '{{.Image}}' "$CNAME")\","
     echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
     echo " \"driver\": \"cdpdrive.py\", \"network\": \"host (no VM, no DNAT)\","
+    echo " \"resolve_all_to\": $resolve_json,"
     echo " \"host_kernel\": \"$(uname -r)\", \"loadavg_at_start\": \"$la\"}"
 } > "$RESULTS/run.json"
 

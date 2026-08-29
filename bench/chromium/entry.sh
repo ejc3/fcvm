@@ -132,6 +132,56 @@ if [ "${CB_SITE_ISOLATION:-on}" = "off" ]; then
     echo "chromium-bench: site isolation DISABLED (--disable-site-isolation-trials)"
 fi
 
+# BENCH_RESOLVE_ALL_TO=<ip> maps every hostname Chromium resolves to that IP,
+# except the loopback names the warmup uses: one argv element,
+# `--host-resolver-rules=EXCLUDE ... , MAP * <ip>`, assembled here. It is
+# the resolver-rule arm of the corpus A/B; the other arm resolves through the
+# guest's resolv.conf (reqbench.sh GUEST_DNS). The knob carries the IP alone
+# because the rule holds a space: the whole flag once travelled through
+# CHROMIUM_EXTRA_FLAGS and the container env word-split it into two elements
+# (2026-08-13). The VM arm bakes the variable in at golden time through
+# reqbench.sh GUEST_ENV; hostcdp.sh hands it to the host control with -e.
+# The positional parameters carry the element, so an unset or empty knob
+# leaves the argv exactly as it was (no empty element either).
+set --
+if [ -n "${BENCH_RESOLVE_ALL_TO:-}" ]; then
+    # One IPv4 or IPv6 address, parsed as such: a character whitelist let
+    # `deadbeef`, `1.2.3.999` and `:::` through to Chromium, where every
+    # request then failed far from the knob. python3 is in the image (the
+    # readiness probe above uses it).
+    #
+    # The same parse prints the replacement token, because the address is not
+    # the token. net::HostMappingRules puts a MAP rule's replacement through
+    # url::ParseServerInfo, which splits host from port at the last colon
+    # unless a `]` follows it: `MAP * fd00::2` is the host `fd00:` on port 2,
+    # not an address, and every request goes somewhere that does not exist
+    # while the run's metadata still records a controlled resolver. An IPv6
+    # replacement must be bracketed
+    # (net/base/host_mapping_rules_unittest.cc). A scope id (`fe80::1%eth0`)
+    # parses as an address here and cannot travel in a resolver rule at all,
+    # so it is refused at the knob instead of mapped.
+    if ! resolve_to=$(python3 -c '
+import ipaddress, sys
+address = ipaddress.ip_address(sys.argv[1])
+if getattr(address, "scope_id", None) is not None:
+    raise SystemExit(1)
+print(f"[{address}]" if address.version == 6 else str(address))
+' "$BENCH_RESOLVE_ALL_TO" 2>/dev/null); then
+        echo "ERROR: BENCH_RESOLVE_ALL_TO must be one unscoped IP literal, got '$BENCH_RESOLVE_ALL_TO'" >&2
+        exit 2
+    fi
+    # The loopback names stay off the map. This script navigates its own
+    # warmup page at http://127.0.0.1:$HTTP_PORT/warmup.html below, and
+    # Chromium applies the mapping before it resolves anything, so a bare
+    # `MAP *` sends that navigation to $BENCH_RESOLVE_ALL_TO:8000, where the
+    # campaign has nothing listening. render.py then fails, `set -e` exits,
+    # and the container never writes the ready marker the health gate waits
+    # for. net::HostMappingRules::RewriteHost checks every EXCLUDE before any
+    # MAP, so the order inside the string does not matter.
+    set -- "--host-resolver-rules=EXCLUDE localhost, EXCLUDE 127.0.0.1, EXCLUDE ::1, MAP * $resolve_to"
+    echo "chromium-bench: every host except localhost/127.0.0.1/::1 resolves to $resolve_to (--host-resolver-rules)"
+fi
+
 # --no-sandbox           : no user namespaces inside the guest container
 # --remote-debugging-address=0.0.0.0 : IGNORED BY THIS CHROMIUM. Kept deliberately.
 #                          MEASURED 2026-08-08 on chromium 151.0.7922.71 (Debian bookworm
@@ -181,6 +231,8 @@ fi
 #                          flags, e.g. --host-resolver-rules="MAP * 127.0.0.1" for
 #                          the corpus replay arm. Empty by default; NEVER baked
 #                          into a golden.
+# "$@"                   : the BENCH_RESOLVE_ALL_TO resolver rule built above, or
+#                          nothing
 HOME=/tmp chromium \
     --headless=new \
     --no-sandbox \
@@ -201,6 +253,7 @@ HOME=/tmp chromium \
     --user-data-dir=/dev/shm/ud/chrome-profile \
     $SITE_ISO_FLAGS \
     ${CHROMIUM_EXTRA_FLAGS:-} \
+    "$@" \
     about:blank &
 CHROME_PID=$!
 wait_http "http://127.0.0.1:$CDP_PORT/json/version" 300 chromium-cdp

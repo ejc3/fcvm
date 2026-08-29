@@ -32,11 +32,16 @@ Every rule here exists because of a defect listed in bench/chromium/AGENTS.md:
     median and taking the median of {firecracker 110 ms, holder 0, pasta 0}
     publishes 0 — it medians the straggler away, which is the opposite of the
     thing being measured.
-  * A URL whose host is a name needs a resolver, and the meta must name it
-    (`guest_dns`). A corpus run that records no resolver had its hostnames
-    answered by something the record does not say, so it is refused. IP
-    literals and localhost need none. `engine` and `guest_dns` are cell
-    fields: runs that differ in either never pool.
+  * A URL whose host is a name needs a resolver, and the meta must name it:
+    `guest_dns` (the resolver in the guest's resolv.conf) or a
+    BENCH_RESOLVE_ALL_TO entry in `guest_env` (the rule baked into
+    Chromium's own resolver, which the resolver-rule arm uses with
+    guest_dns null; only entry.sh reads that variable, so recording it
+    under any other engine is itself a refusal). A corpus run that records
+    neither had its hostnames answered by something the record does not
+    say, so it is refused. IP
+    literals and localhost need none. `engine`, `guest_dns` and `guest_env`
+    are cell fields: runs that differ in any of them never pool.
   * A load event that takes tens of seconds is a stall, not a slow page. With
     `--stall-max-ms N` every record whose navigate_load_event_ms (navigate_ms
     for webkit, whose WebDriver navigate returns at the load event) exceeds N,
@@ -55,6 +60,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import sys
 import tempfile
@@ -79,7 +85,9 @@ def is_cdp_class(arm):
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
-ANALYZER_SCHEMA_VERSION = 5
+ANALYZER_SCHEMA_VERSION = 6
+# One baked container environment entry, as reqbench.sh GUEST_ENV records it.
+GUEST_ENV_ENTRY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 SEALED_ANALYZER_FD_ENV = "REQANALYZE_SEALED_FD"
 ANALYZER_SOURCE_PATH_ENV = "REQANALYZE_SOURCE_PATH"
 
@@ -93,6 +101,7 @@ CELL_FIELDS = (
     "url",
     "engine",
     "guest_dns",
+    "guest_env",
     "format",
     "quality",
     "image",
@@ -212,16 +221,40 @@ def declared_urls(meta):
     return []
 
 
+# The authority of a measured http(s) URL, as both this analyzer and the
+# browser read it: host[:port], where host is a name, an IPv4 literal or a
+# bracketed IPv6 literal. Anything else is refused rather than judged, because
+# urlsplit and the URL Standard Chromium implements stop reading the authority
+# in different places.
+HTTP_AUTHORITY = re.compile(
+    r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$"
+)
+
+
 def url_needs_resolver(url):
     """Whether a URL's host is a name only a resolver can answer.
 
-    False for an IP literal or localhost, None when the URL has no host.
+    False for an IP literal or localhost, None when the URL has no host this
+    analyzer reads the same way the browser does.
+
+    `http://evil.example\\@127.0.0.1/` is that second case. urlsplit reads
+    the authority as `evil.example\\@127.0.0.1` and reports the host
+    127.0.0.1, an IP literal that needs no resolver; Chromium follows the URL
+    Standard, which maps a backslash to a slash in a special scheme, so the
+    authority ends at `evil.example` and that is the name it resolves. The
+    run would publish with guest_dns null while ambient DNS answered its
+    corpus. Userinfo moves the host in the same way, and a non-ASCII host is
+    refused too: urlsplit does not apply IDNA, so the name this function
+    would judge is not the name the browser resolved.
     """
     try:
-        host = urlsplit(url).hostname
+        parts = urlsplit(url)
     except ValueError:
         return None
+    host = parts.hostname
     if not host:
+        return None
+    if parts.scheme in ("http", "https") and not HTTP_AUTHORITY.match(parts.netloc):
         return None
     if host == "localhost":
         return False
@@ -322,6 +355,16 @@ def _cell_from_meta(meta, source):
             # chromium, the same reading _validate_schedule gives it.
             value = meta.get("engine") or "chromium"
             valid = value in SUPPORTED_ENGINES
+        elif field == "guest_env":
+            # The container environment the golden baked (reqbench.sh
+            # GUEST_ENV): KEY=VALUE entries, [] when none. Absent means none,
+            # the same reading `engine` gets; a resolver-rule arm
+            # (BENCH_RESOLVE_ALL_TO) is a different population from a plain
+            # run and campaign_summary keys its diag requirement on this.
+            value = meta.get("guest_env", [])
+            valid = isinstance(value, list) and all(
+                isinstance(entry, str) and GUEST_ENV_ENTRY.match(entry) for entry in value
+            )
         elif field == "guest_dns":
             # null: the guest used the host resolvers (fixture runs). A string
             # must be the canonical IP literal fcvm baked into resolv.conf.
@@ -543,22 +586,82 @@ def _validate_arms(arms, label, errors):
         )
 
 
+def _resolver_rule_address(meta, label, errors):
+    """The address a baked BENCH_RESOLVE_ALL_TO rule answers every host with.
+
+    A golden built with GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> resolves names
+    inside Chromium (`--host-resolver-rules=EXCLUDE ..., MAP * <ip>`) and
+    asks nothing of resolv.conf, so its guest_dns is null while the record
+    still names what answered the corpus. Returns None when no rule is
+    recorded. A rule whose value entry.sh would have refused is a metadata
+    error and returns None, so the URL check still refuses the run.
+
+    Only entry.sh reads the variable, and only Chromium takes the flag it
+    builds; entry-webkit.sh never mentions it. A WebKit run carrying the
+    rule resolved its hostnames through whatever resolv.conf pointed at, so
+    the rule is not that run's resolver and is refused outright: crediting
+    it made a WebKit run with guest_dns null publishable on ambient DNS, and
+    a WebKit render carries no network trace for the diag to contradict it
+    with.
+    """
+    guest_env = meta.get("guest_env", [])
+    if not isinstance(guest_env, list):
+        return None
+    engine = meta.get("engine") or "chromium"
+    address = None
+    for entry in guest_env:
+        if not isinstance(entry, str):
+            continue
+        key, separator, value = entry.partition("=")
+        if not separator or key != "BENCH_RESOLVE_ALL_TO":
+            continue
+        if engine != "chromium":
+            errors.append(
+                f"{label} metadata records a BENCH_RESOLVE_ALL_TO rule under "
+                f"engine {engine!r}, which never reads it; that run's hostnames "
+                "were answered by something else"
+            )
+            return None
+        try:
+            address = str(ipaddress.ip_address(value))
+        except ValueError:
+            errors.append(
+                f"{label} metadata guest_env names {entry!r}, whose "
+                "BENCH_RESOLVE_ALL_TO value is not an IP literal"
+            )
+            address = None
+    return address
+
+
 def _validate_resolver(meta, label, errors):
     """A URL whose host is a name needs the resolver the meta records.
 
+    Two records name one: guest_dns, the resolver fcvm baked into the
+    guest's resolv.conf, and a BENCH_RESOLVE_ALL_TO entry in guest_env, the
+    rule the golden baked into Chromium. Either one answers the corpus
+    hostnames; a run with neither resolved them somewhere the record does
+    not say.
+
     Appended after the record checks rather than raised as a cell error: a
-    cell error stops schedule validation, and a corpus run without guest_dns
-    still has to have every one of its records judged.
+    cell error stops schedule validation, and a corpus run without a
+    resolver still has to have every one of its records judged.
     """
-    guest_dns = meta.get("guest_dns")
+    rule = _resolver_rule_address(meta, label, errors)
+    resolver = meta.get("guest_dns")
+    if resolver is None:
+        resolver = rule
     for url in declared_urls(meta):
         needs_resolver = url_needs_resolver(url)
         if needs_resolver is None:
-            errors.append(f"{label} metadata declares URL {url!r} without a hostname")
-        elif needs_resolver and guest_dns is None:
+            errors.append(
+                f"{label} metadata declares URL {url!r}, which names no host "
+                "this analyzer reads the same way the browser does"
+            )
+        elif needs_resolver and resolver is None:
             errors.append(
                 f"{label} metadata declares URL {url!r} whose hostname needs "
-                "a resolver but records no guest_dns"
+                "a resolver but records neither guest_dns nor a "
+                "BENCH_RESOLVE_ALL_TO rule"
             )
 
 
