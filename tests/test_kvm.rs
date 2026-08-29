@@ -236,6 +236,84 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     Ok(())
 }
 
+/// Read one file inside a VM. `Err` carries what the guest said about the
+/// failure, so an unreadable file is distinguishable from an empty one.
+#[cfg(target_arch = "aarch64")]
+async fn read_file_in_vm(
+    fcvm_path: &std::path::Path,
+    pid: u32,
+    path: &str,
+) -> Result<Result<String, String>> {
+    let output = tokio::process::Command::new(fcvm_path)
+        .args(["exec", "--pid", &pid.to_string(), "--vm", "--", "cat", path])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("exec cat {path} in VM {pid}"))?;
+
+    if output.status.success() {
+        return Ok(Ok(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+
+    // The exec's stderr carries fcvm's own log lines as well as the guest's,
+    // and the guest's complaint is the last of them.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(200).collect::<String>())
+        .unwrap_or_else(|| format!("exec exited with {}", output.status));
+    Ok(Err(reason))
+}
+
+/// Fail unless L1 names a nameserver the inner fcvm can hand to L2.
+///
+/// The verdict comes from the same function the inner fcvm's own launch uses
+/// (`nameservers_from_sources`), so this cannot pass an L1 the inner fcvm would
+/// reject, or reject one it would accept. On failure it prints the L1 state
+/// that produced the verdict: both resolv.conf sources and the command line
+/// fc-agent configured them from.
+#[cfg(target_arch = "aarch64")]
+async fn assert_l1_dns_is_usable(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
+    let mut sources = Vec::new();
+    for path in fcvm::network::RESOLV_CONF_SOURCES {
+        sources.push(fcvm::network::ResolvSource {
+            path: path.to_string(),
+            content: read_file_in_vm(fcvm_path, pid, path).await?,
+        });
+    }
+
+    match fcvm::network::nameservers_from_sources(&sources) {
+        Ok(servers) => {
+            println!("   ✓ L1 nameservers usable by the inner fcvm: {servers:?}");
+            Ok(())
+        }
+        Err(verdict) => {
+            let cmdline = read_file_in_vm(fcvm_path, pid, "/proc/cmdline").await?;
+            let mut state = String::new();
+            for source in &sources {
+                state.push_str(&format!("--- {} ---\n", source.path));
+                match &source.content {
+                    Ok(body) => state.push_str(body),
+                    Err(reason) => state.push_str(&format!("<unreadable: {reason}>\n")),
+                }
+            }
+            state.push_str("--- /proc/cmdline ---\n");
+            match &cmdline {
+                Ok(body) => state.push_str(body),
+                Err(reason) => state.push_str(&format!("<unreadable: {reason}>\n")),
+            }
+            bail!(
+                "L1 reports healthy with no nameserver the inner fcvm can use: {verdict:#}\n\
+                 L1 state:\n{state}"
+            )
+        }
+    }
+}
+
 /// Test running fcvm inside an fcvm VM (single level nesting)
 ///
 /// This test:
@@ -297,6 +375,15 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
         return Err(e.context("outer VM failed to become healthy"));
     }
     println!("   ✓ Outer VM is healthy!");
+
+    // The inner fcvm picks the L2 guest's resolver by reading L1's resolv.conf
+    // sources, so a healthy L1 that has no usable nameserver fails the inner
+    // run with an error about the host's DNS, naming nothing about L1 (#875).
+    // Assert the invariant here, where the state that decided it can be shown.
+    if let Err(e) = assert_l1_dns_is_usable(&fcvm_path, outer_pid).await {
+        common::kill_process(outer_pid).await;
+        return Err(e);
+    }
 
     // 2. Verify mounts and /dev/kvm inside outer VM
     println!("\n2. Verifying mounts inside outer VM...");

@@ -1159,18 +1159,17 @@ async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
 /// 1. Checking host resolv.conf for existing IPv6 nameservers
 /// 2. Probing known cloud IPv6 DNS endpoints (e.g. AWS fd00:ec2::253)
 async fn detect_ipv6_dns() -> Option<String> {
-    // Check host DNS config for IPv6 nameservers
-    let resolv = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
-        .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
-        .ok()?;
-
-    for line in resolv.lines() {
-        if let Some(server) = line.strip_prefix("nameserver ") {
-            let server = server.trim();
-            if server.contains(':') {
-                return Some(server.to_string());
-            }
-        }
+    // Check host DNS config for IPv6 nameservers. Every source is read: a
+    // stub-only /run/systemd/resolve/resolv.conf must not hide an IPv6 server
+    // named in /etc/resolv.conf (#875). Loopback entries are dropped for the
+    // same reason as in bridged mode, so ::1 falls through to the probe below.
+    let sources = super::RESOLV_CONF_SOURCES.map(super::ResolvSource::read);
+    if let Some(server) = super::nameservers_from_sources(&sources)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|server| server.contains(':'))
+    {
+        return Some(server);
     }
 
     // No IPv6 nameserver in resolv.conf. Probe known cloud IPv6 DNS endpoints.

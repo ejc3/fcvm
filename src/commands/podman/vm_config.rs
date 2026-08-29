@@ -1005,14 +1005,27 @@ impl GuestBootInputs {
         dns_override: Option<&str>,
         runtime_config: &crate::commands::common::RuntimeConfig,
     ) -> Self {
+        // Read each resolv.conf source once and derive both the nameservers and
+        // the search domains from that one snapshot: two reads could disagree
+        // mid-launch, and the key hashes what this launch saw (#821).
+        let sources = crate::network::RESOLV_CONF_SOURCES.map(crate::network::ResolvSource::read);
         let host_dns = if dns_override.is_some() {
             Vec::new()
         } else {
-            crate::network::get_host_dns_servers().unwrap_or_default()
+            crate::network::nameservers_from_sources(&sources).unwrap_or_else(|e| {
+                // Bridged mode turns an empty list into a launch failure and the
+                // other modes degrade to the gateway, so either way the reason
+                // belongs in the log. Discarding it is what left #875 reporting
+                // only that there was no usable host DNS.
+                warn!("{e:#}");
+                Vec::new()
+            })
         };
-        let dns_search = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
-            .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
-            .map(|content| parse_search_domains(&content))
+        let dns_search = sources
+            .iter()
+            .filter_map(|source| source.content.as_ref().ok())
+            .map(|content| parse_search_domains(content))
+            .find(|domains| !domains.is_empty())
             .unwrap_or_default();
         Self {
             host_dns,

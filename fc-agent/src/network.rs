@@ -279,85 +279,110 @@ pub fn refresh_gateway_arp() {
     }
 }
 
-/// Configure DNS from kernel ip= boot parameter.
+/// Configure DNS from the kernel command line.
+///
+/// Writes `/etc/resolv.conf` on every path, including the paths that find no
+/// resolver to write. The rootfs ships a placeholder resolv.conf naming
+/// 127.0.0.53, and nothing in the guest listens there because systemd-resolved
+/// is not enabled: leaving it in place would present a resolver that cannot
+/// answer, and the guest would boot healthy carrying it (#875).
 pub fn configure_dns_from_cmdline() {
     eprintln!("[fc-agent] configuring DNS from kernel cmdline");
 
     let cmdline = match std::fs::read_to_string("/proc/cmdline") {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to read /proc/cmdline: {}", e);
+            let reason = format!("/proc/cmdline unreadable: {e}");
+            eprintln!("[fc-agent] ERROR: no DNS configured: {reason}");
+            write_resolv_conf(&unconfigured_resolv_conf(&reason));
             return;
         }
     };
     eprintln!("[fc-agent] cmdline: {}", cmdline.trim());
 
-    let ip_param = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("ip="))
-        .map(|s| s.trim_start_matches("ip="));
-
-    let ip_param = match ip_param {
-        Some(p) => p,
-        None => {
-            eprintln!("[fc-agent] WARNING: no ip= parameter in cmdline, skipping DNS config");
-            return;
+    match resolv_conf_from_cmdline(&cmdline) {
+        Ok(body) => write_resolv_conf(&body),
+        Err(reason) => {
+            eprintln!(
+                "[fc-agent] ERROR: no DNS configured: {reason}. The guest gets a \
+                 resolv.conf with no nameserver; name one with --dns."
+            );
+            write_resolv_conf(&unconfigured_resolv_conf(&reason));
         }
+    }
+}
+
+/// Replace `/etc/resolv.conf` and report the body on one console line.
+///
+/// One line matters: multi-line console messages reach the captured job log
+/// with their first line only, so reporting the body verbatim printed the
+/// label and none of the nameservers under it.
+fn write_resolv_conf(body: &str) {
+    match std::fs::write("/etc/resolv.conf", body) {
+        Ok(()) => eprintln!(
+            "[fc-agent] wrote /etc/resolv.conf: {}",
+            body.trim().replace('\n', " ; ")
+        ),
+        Err(e) => eprintln!(
+            "[fc-agent] ERROR: failed to write /etc/resolv.conf: {e}. The rootfs \
+             placeholder naming 127.0.0.53 stays in place and cannot answer."
+        ),
+    }
+}
+
+/// The resolv.conf body a kernel command line calls for.
+///
+/// `fcvm_dns=` carries the servers fcvm resolved and wins outright; it is the
+/// only source that can carry more than one, or an IPv6 address. The `ip=`
+/// parameter is the fallback: field 7 is the DNS server the kernel's own
+/// configurator would use, and field 2 is the gateway, which in every fcvm
+/// network mode also forwards DNS.
+///
+/// `Err` names why no resolver could be derived.
+fn resolv_conf_from_cmdline(cmdline: &str) -> Result<String, String> {
+    let token = |prefix: &str| -> Option<String> {
+        cmdline
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix(prefix))
+            .map(str::to_string)
     };
-    eprintln!("[fc-agent] ip param: {}", ip_param);
 
-    let fields: Vec<&str> = ip_param.split(':').collect();
-    eprintln!("[fc-agent] ip fields: {:?}", fields);
-
-    let gateway = fields.get(2).copied().unwrap_or("");
-    let dns = fields.get(7).copied().unwrap_or("");
-
-    eprintln!("[fc-agent] gateway={}, dns={}", gateway, dns);
-
-    let nameserver = if !dns.is_empty() {
-        dns
-    } else if !gateway.is_empty() {
-        gateway
-    } else {
-        eprintln!("[fc-agent] WARNING: no DNS or gateway found, skipping DNS config");
-        return;
-    };
-
-    let nameservers: Vec<String> = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("fcvm_dns="))
-        .map(|s| {
-            s.trim_start_matches("fcvm_dns=")
-                .split('|')
-                .map(|ns| ns.to_string())
+    let mut nameservers: Vec<String> = token("fcvm_dns=")
+        .map(|v| {
+            v.split('|')
+                .filter(|ns| !ns.is_empty())
+                .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_else(|| vec![nameserver.to_string()]);
+        .unwrap_or_default();
 
-    let search_domains: Option<String> = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("fcvm_dns_search="))
-        .map(|s| s.trim_start_matches("fcvm_dns_search=").replace('|', " "));
+    if nameservers.is_empty() {
+        let ip_param = token("ip=")
+            .ok_or_else(|| "no fcvm_dns= or ip= on the kernel command line".to_string())?;
+        let fields: Vec<&str> = ip_param.split(':').collect();
+        let dns = fields.get(7).copied().unwrap_or("");
+        let gateway = fields.get(2).copied().unwrap_or("");
+        let fallback = [dns, gateway]
+            .into_iter()
+            .find(|field| !field.is_empty())
+            .ok_or_else(|| format!("ip={ip_param} names neither a DNS server nor a gateway"))?;
+        nameservers.push(fallback.to_string());
+    }
 
-    let mut resolv_conf = String::new();
-    if let Some(ref search) = search_domains {
-        resolv_conf.push_str(&format!("search {}\n", search));
+    let mut body = String::new();
+    if let Some(search) = token("fcvm_dns_search=") {
+        body.push_str(&format!("search {}\n", search.replace('|', " ")));
     }
     for ns in &nameservers {
-        resolv_conf.push_str(&format!("nameserver {}\n", ns));
+        body.push_str(&format!("nameserver {ns}\n"));
     }
+    Ok(body)
+}
 
-    match std::fs::write("/etc/resolv.conf", &resolv_conf) {
-        Ok(_) => {
-            eprintln!("[fc-agent] configured DNS: {}", resolv_conf.trim());
-        }
-        Err(e) => {
-            eprintln!(
-                "[fc-agent] WARNING: failed to write /etc/resolv.conf: {}",
-                e
-            );
-        }
-    }
+/// The body written when the command line named no resolver: the reason, and
+/// no nameserver line. A comment cannot be mistaken for configuration.
+fn unconfigured_resolv_conf(reason: &str) -> String {
+    format!("# fc-agent configured no DNS: {reason}\n")
 }
 
 /// Configure IPv6 from kernel ipv6= boot parameter.
@@ -1069,6 +1094,100 @@ mod loopback_publish_tests {
             ]),
             vec![9222],
             "the real selection path must keep ordinary ports and exclude the egress proxy"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolv_conf_tests {
+    use super::*;
+
+    #[test]
+    fn fcvm_dns_names_every_server_in_order() {
+        let body = resolv_conf_from_cmdline(
+            "console=ttyS0 ip=10.1.0.3::10.1.0.2:255.255.255.0::eth0:off:10.1.0.2 \
+             fcvm_dns=10.1.0.2|2001:4860:4860::8888 root=/dev/vda",
+        )
+        .expect("fcvm_dns names two servers");
+
+        assert_eq!(
+            body, "nameserver 10.1.0.2\nnameserver 2001:4860:4860::8888\n",
+            "fcvm_dns is the only source that can carry more than one server or an \
+             IPv6 address, so it wins over the ip= fields"
+        );
+    }
+
+    #[test]
+    fn fcvm_dns_is_read_without_an_ip_parameter() {
+        let body = resolv_conf_from_cmdline("console=ttyS0 fcvm_dns=10.1.0.2")
+            .expect("fcvm_dns alone configures a resolver");
+        assert_eq!(body, "nameserver 10.1.0.2\n");
+    }
+
+    #[test]
+    fn search_domains_precede_the_nameservers() {
+        let body =
+            resolv_conf_from_cmdline("fcvm_dns=10.1.0.2 fcvm_dns_search=corp.example|example")
+                .expect("a search list and a server");
+        assert_eq!(body, "search corp.example example\nnameserver 10.1.0.2\n");
+    }
+
+    #[test]
+    fn ip_parameter_supplies_the_fallback_server() {
+        let dns_field =
+            resolv_conf_from_cmdline("ip=172.30.1.2::172.30.1.1:255.255.255.0::eth0:off:8.8.8.8")
+                .expect("field 7 is the DNS server");
+        assert_eq!(dns_field, "nameserver 8.8.8.8\n");
+
+        let gateway_only =
+            resolv_conf_from_cmdline("ip=172.30.1.2::172.30.1.1:255.255.255.0::eth0:off")
+                .expect("the gateway forwards DNS in every fcvm network mode");
+        assert_eq!(gateway_only, "nameserver 172.30.1.1\n");
+    }
+
+    #[test]
+    fn an_empty_fcvm_dns_falls_back_instead_of_writing_a_bare_nameserver_line() {
+        let body = resolv_conf_from_cmdline(
+            "ip=172.30.1.2::172.30.1.1:255.255.255.0::eth0:off:8.8.8.8 fcvm_dns=",
+        )
+        .expect("an empty list is no list");
+        assert_eq!(body, "nameserver 8.8.8.8\n");
+    }
+
+    #[test]
+    fn a_command_line_with_no_resolver_is_an_error_that_names_why() {
+        let no_params = resolv_conf_from_cmdline("console=ttyS0 root=/dev/vda")
+            .expect_err("nothing on this command line names a resolver");
+        assert!(
+            no_params.contains("no fcvm_dns= or ip="),
+            "the reason must name what was missing: {no_params}"
+        );
+
+        let empty_fields = resolv_conf_from_cmdline("ip=172.30.1.2:::255.255.255.0::eth0:off")
+            .expect_err("neither a DNS field nor a gateway");
+        assert!(
+            empty_fields.contains("neither a DNS server nor a gateway"),
+            "the reason must name what was missing: {empty_fields}"
+        );
+    }
+
+    /// The placeholder in the rootfs (`nameserver 127.0.0.53`) is a resolver
+    /// no fcvm guest runs. Every path that configures nothing must replace it
+    /// with a file that claims nothing.
+    #[test]
+    fn the_unconfigured_body_carries_no_nameserver() {
+        let body = unconfigured_resolv_conf("no fcvm_dns= or ip= on the kernel command line");
+        assert!(
+            !body.contains("nameserver"),
+            "an unconfigured resolv.conf must not name a server: {body}"
+        );
+        assert!(
+            body.contains("no fcvm_dns= or ip="),
+            "it must say why DNS is unconfigured: {body}"
+        );
+        assert!(
+            body.starts_with('#') && body.ends_with('\n'),
+            "the reason belongs in a comment, on its own line: {body}"
         );
     }
 }

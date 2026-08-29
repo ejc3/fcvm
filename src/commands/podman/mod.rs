@@ -1467,9 +1467,10 @@ async fn prepare_vm_for_lifecycle(
             // a real resolver, and --dns is the override.
             if args.dns.is_none() && boot_inputs.host_dns.is_empty() {
                 bail!(
-                    "no usable host DNS server for bridged mode (VMs cannot use a \
-                     loopback stub resolver; on systemd-resolved hosts mount \
-                     /run/systemd/resolve). Pass --dns to override."
+                    "no usable host DNS server for bridged mode: neither {} named a \
+                     nameserver this guest can reach (the warning above says what each \
+                     source held). Pass --dns to name one.",
+                    crate::network::RESOLV_CONF_SOURCES.join(" nor ")
                 );
             }
             Box::new(

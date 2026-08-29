@@ -712,11 +712,17 @@ mod tests {
             .find("async fn cleanup")
             .expect("cleanup still follows setup")
             + start;
-        assert!(
-            !src[start..end].contains("get_host_dns_servers"),
-            "BridgedNetwork::setup reads host DNS itself; thread the launch config's \
-             hashed value via with_dns_server instead"
-        );
+        for reader in [
+            "RESOLV_CONF_SOURCES",
+            "nameservers_from_sources",
+            "ResolvSource",
+        ] {
+            assert!(
+                !src[start..end].contains(reader),
+                "BridgedNetwork::setup reads host DNS itself ({reader}); thread the \
+                 launch config's hashed value via with_dns_server instead"
+            );
+        }
     }
 
     #[test]
