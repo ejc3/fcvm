@@ -1145,6 +1145,100 @@ run_case "the author's own top-level comment is still claimable" \
   "$(wrap4 me '[]' '[]' "[$(cmt me User 2026-01-05T00:00:00Z '"P1: this drops records"')]")" \
   1 "carry no disposition"
 
+echo "== finding 42: a page this gate cannot read is not an empty page =="
+# Every paging loop folded each page in with `<connection>.nodes // []` and then read
+# hasNextPage from the same page. Both readings turn a response the loop CANNOT READ into
+# "this connection is empty and it is finished": a null `pullRequest` — a wrong number, a
+# renamed repo, a token that cannot see the PR, a partial GraphQL result — contributes no
+# nodes, and hasNextPage evaluates to null rather than "true", so the loop stops holding [].
+# `[]` is indistinguishable from a connection that is genuinely empty, which is the gate's
+# recurring fail-open shape: a check that could not evaluate anything reporting that it
+# found nothing. On the recheck comments loop it dropped every top-level claim.
+#
+# All of these are properties of the fetch, so they go through a gh shim. The fixture below
+# carries an unanswered claim in the top-level comments and a stranger's review of the head,
+# so a run that reads every page reports the claim and a run that silently empties a page
+# reports CLEAR.
+mkdir -p "$TMP/bin"
+CLAIM42=$(cmt reviewer User 2026-01-02T01:00:00Z '"P1: this drops the last row"')
+printf '{"data":{"repository":{"pullRequest":null}}}' > "$TMP/nullpr.json"
+printf '{"data":{"repository":{"pullRequest":{}}}}' > "$TMP/noconn.json"
+printf '{"data":{"node":null}}' > "$TMP/nullnode.json"
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/threads.json"
+# One resolved thread whose comments do not fit a page: the finding and its disposition on
+# page 1, one more comment on page 2. With COMMENTS_PAGE_SIZE=2 the gate pages it.
+printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"isOutdated":false,"comments":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"originalLine":1,"body":"this drops the last row"},{"author":{"login":"me"},"path":"a.ts","line":1,"originalLine":1,"body":"NOT-A-DEFECT: renamed only, no behaviour change"}]}}]}}}}}' > "$TMP/pagedthreads.json"
+printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"onlooker"},"path":"a.ts","line":1,"originalLine":1,"body":"discussion"}]}}}}' > "$TMP/threadpage.json"
+printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":"","commit":{"oid":"deadbeef"}}]}}}}}' > "$TMP/reviews.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[%s]}}}}}' "$CLAIM42" > "$TMP/comments.json"
+printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/nocomments.json"
+printf '%s' "$PRCOMMITS_LIVE" > "$TMP/prcommits.json"
+cat > "$TMP/bin/gh" <<'SHIM'
+#!/bin/bash
+# GATE_TEST_NULL names the ONE read answered with a page the gate cannot use
+# (nullpr.json, or GATE_TEST_BAD=noconn for a pullRequest with no connection on it);
+# every other read is answered normally. Connections read twice take a 1 or a 2.
+nth() { local f=$GATE_TEST_DIR/$1.count n; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$f"; printf '%s' "$n"; }
+which_read() { printf '%s%d' "$1" "$(( $(nth "$1") >= 2 ? 2 : 1 ))"; }
+bad() { cat "$GATE_TEST_DIR/${GATE_TEST_BAD:-nullpr}.json"; }
+case "$*" in
+  *"commits(first"*)
+    if [ "${GATE_TEST_NULL:-}" = commits ]; then bad
+    else cat "$GATE_TEST_DIR/prcommits.json"; fi ;;
+  *"node(id"*)
+    if [ "${GATE_TEST_NULL:-}" = node ]; then cat "$GATE_TEST_DIR/nullnode.json"
+    else cat "$GATE_TEST_DIR/threadpage.json"; fi ;;
+  *reviewThreads*)
+    if [ "${GATE_TEST_NULL:-}" = "$(which_read threads)" ]; then bad
+    else cat "$GATE_TEST_DIR/${GATE_TEST_THREADS:-threads}.json"; fi ;;
+  *"reviews(first"*)
+    if [ "${GATE_TEST_NULL:-}" = "$(which_read reviews)" ]; then bad
+    else cat "$GATE_TEST_DIR/reviews.json"; fi ;;
+  *"comments(first"*)
+    if [ "${GATE_TEST_NULL:-}" = "$(which_read comments)" ]; then bad
+    else cat "$GATE_TEST_DIR/${GATE_TEST_COMMENTS:-comments}.json"; fi ;;
+  *headRefOid*)
+    # gh --jq prints an empty line when the filter lands on a null pullRequest.
+    if [ "${GATE_TEST_NULL:-}" = headread ]; then printf '\n'
+    else printf 'deadbeef\n'; fi ;;
+esac
+SHIM
+chmod +x "$TMP/bin/gh"
+page_case() {
+  local name=$1 want_rc=$2 want_txt=$3 out rc
+  rm -f "$TMP"/threads.count "$TMP"/reviews.count "$TMP"/comments.count
+  out=$(GATE_TEST_DIR="$TMP" PATH="$TMP/bin:$PATH" bash "$GATE" 1 2>&1); rc=$?
+  if [ "$rc" = "$want_rc" ] && grep -qF "$want_txt" <<<"$out"; then
+    echo "  PASS  $name"; pass=$((pass+1))
+  else
+    echo "  FAIL  $name (rc=$rc want=$want_rc)"; sed 's/^/          /' <<<"$out" | head -4; fail=$((fail+1))
+  fi
+}
+# The reported defect: the second read of the comments, which is the read the verdict is
+# computed from. Emptied, it takes every top-level claim with it and the run reports CLEAR.
+GATE_TEST_NULL=comments2 \
+  page_case "a recheck comment page with a null pullRequest blocks" 2 "no pull request"
+GATE_TEST_NULL=comments2 GATE_TEST_BAD=noconn \
+  page_case "a recheck comment page with no comments connection blocks" 2 "no nodes array"
+GATE_TEST_NULL=comments1 \
+  page_case "the first comment page with a null pullRequest blocks" 2 "no pull request"
+GATE_TEST_NULL=reviews2 \
+  page_case "a reviews recheck page with a null pullRequest blocks as unread" 2 "no pull request"
+GATE_TEST_NULL=commits \
+  page_case "a commit page with a null pullRequest blocks as unread" 2 "no pull request"
+GATE_TEST_NULL=headread \
+  page_case "a head re-read naming no commit blocks" 2 "re-read of the head"
+COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS=pagedthreads GATE_TEST_COMMENTS=nocomments GATE_TEST_NULL=node \
+  page_case "a thread comment page with a null node blocks instead of truncating" 2 "comments page for thread"
+# Guards, green before and after: the first thread page already blocked on a null
+# pullRequest and still does, pages that can all be read still reach a verdict, and the
+# fixture without the claim still reaches CLEAR — which is what the red above reported.
+GATE_TEST_NULL=threads1 \
+  page_case "the first thread page with a null pullRequest still blocks" 2 "no pull request"
+page_case "every page readable reaches a verdict on the claim" 1 "carry no disposition"
+GATE_TEST_COMMENTS=nocomments \
+  page_case "every page readable and no claim still clears" 0 "CLEAR"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
