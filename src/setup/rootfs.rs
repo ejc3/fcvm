@@ -967,17 +967,68 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
 
 /// Resolve the Firecracker binary for the rootfs setup VM.
 ///
-/// FCVM_FIRECRACKER_BIN first, then PATH. Without this the setup VM shelled out
-/// to a bare "firecracker", so a host that has never installed one system-wide
-/// failed with a plain "No such file or directory" even though fcvm had just
-/// built a Firecracker of its own under the assets directory.
-fn setup_vm_firecracker_bin() -> Result<PathBuf> {
+/// Order: `FCVM_FIRECRACKER_BIN`, then the Firecracker fcvm built for this
+/// kernel profile, then PATH. The environment variable is a deliberate
+/// override, so it wins. The profile's binary is the one fcvm goes on to run
+/// VMs with, so it beats an unrelated system-wide Firecracker of a different
+/// version. PATH is the last resort, and used to be the only one after the
+/// override: `fcvm setup` on a host that has never installed Firecracker
+/// system-wide failed with "firecracker not found in PATH" immediately after
+/// printing the path of the Firecracker it had just built for the profile.
+async fn setup_vm_firecracker_bin(profile_name: &str) -> Result<PathBuf> {
+    // Resolving a profile's Firecracker reads the config and fails when the
+    // profile names a build this host has not made. An override wins outright,
+    // so it must not be able to trip over that work.
+    let profile_firecracker = if std::env::var_os("FCVM_FIRECRACKER_BIN").is_some() {
+        None
+    } else {
+        profile_firecracker_for_setup_vm(profile_name).await?
+    };
+    setup_vm_firecracker_bin_from(profile_firecracker)
+}
+
+/// The Firecracker `fcvm setup` built for the setup VM's kernel profile.
+///
+/// A profile that configures no Firecracker of its own (the btrfs profile, for
+/// one) falls back to the default profile, which config loading hands the
+/// global `[firecracker]` build. `podman run` picks a profile's Firecracker the
+/// same way, in `runtime_config_from_kernel_profiles`.
+async fn profile_firecracker_for_setup_vm(profile_name: &str) -> Result<Option<PathBuf>> {
+    let mut names = vec![profile_name];
+    if profile_name != "default" {
+        names.push("default");
+    }
+    for name in names {
+        let Some(profile) = get_kernel_profile(name)? else {
+            continue;
+        };
+        if let Some(path) =
+            crate::setup::kernel::get_configured_firecracker_for_profile(&profile, name).await?
+        {
+            info!(
+                firecracker_bin = %path.display(),
+                profile = %name,
+                "setup VM uses the Firecracker built for this profile"
+            );
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// The resolution order itself, with the profile's Firecracker already looked
+/// up. Split out from [`setup_vm_firecracker_bin`] so the order is asserted
+/// without a config file or an assets directory.
+fn setup_vm_firecracker_bin_from(profile_firecracker: Option<PathBuf>) -> Result<PathBuf> {
     if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
         let p = PathBuf::from(&path);
         if !p.exists() {
             bail!("FCVM_FIRECRACKER_BIN={} does not exist", path);
         }
         return Ok(p);
+    }
+    if let Some(path) = profile_firecracker {
+        return Ok(path);
     }
     which::which("firecracker").context(
         "firecracker not found in PATH; set FCVM_FIRECRACKER_BIN to the binary \
@@ -2322,7 +2373,7 @@ async fn boot_vm_for_setup(
         "starting Firecracker for Layer 2 setup (serial output: {})",
         serial_path.display()
     );
-    let firecracker_bin = setup_vm_firecracker_bin()?;
+    let firecracker_bin = setup_vm_firecracker_bin(kernel_profile_name).await?;
     let mut fc_cmd = Command::new(&firecracker_bin);
     fc_cmd
         .args([
@@ -2576,25 +2627,65 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
         }
     }
 
-    /// FCVM_FIRECRACKER_BIN is a process-global, so these run in one test.
+    /// FCVM_FIRECRACKER_BIN and PATH are both process-globals, so the whole
+    /// resolution order is asserted in one test rather than racing across
+    /// several.
+    ///
+    /// The profile arm is the one a fresh host depends on. `fcvm setup` builds
+    /// a Firecracker under the assets directory and then boots the rootfs setup
+    /// VM, so consulting PATH alone failed with "firecracker not found in PATH"
+    /// on a box with no system-wide Firecracker, immediately after printing the
+    /// path of the binary it had just built.
     #[test]
-    fn setup_vm_firecracker_bin_honors_env_var() {
+    fn setup_vm_firecracker_bin_prefers_env_then_profile_then_path() {
         let real = std::env::current_exe().expect("test binary path");
+        // Stands in for <assets_dir>/firecracker/firecracker-default-<sha>.bin,
+        // the binary `fcvm setup` builds just before booting the setup VM.
+        let assets = tempfile::tempdir().expect("temp assets dir");
+        let built = assets.path().join("firecracker-default-0123456789ab.bin");
+        std::fs::write(&built, b"#!/bin/sh\nexit 0\n").expect("write stub");
 
-        // Set and existing: returned as-is, rather than searching PATH.
+        // An empty PATH removes whatever system-wide Firecracker this box may
+        // have, so the assertions below observe the profile arm.
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "");
+
+        // Set and existing: returned as-is, ahead of the profile's binary.
         std::env::set_var("FCVM_FIRECRACKER_BIN", &real);
-        assert_eq!(setup_vm_firecracker_bin().unwrap(), real);
+        assert_eq!(
+            setup_vm_firecracker_bin_from(Some(built.clone())).unwrap(),
+            real
+        );
 
         // Set and missing: the error names the variable, so the reader knows
         // which knob is wrong instead of getting a bare ENOENT.
         std::env::set_var("FCVM_FIRECRACKER_BIN", "/nonexistent/firecracker");
-        let err = setup_vm_firecracker_bin().unwrap_err().to_string();
+        let err = setup_vm_firecracker_bin_from(Some(built.clone()))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("FCVM_FIRECRACKER_BIN"),
             "error should name the variable, got: {err}"
         );
 
+        // Unset, a Firecracker built for the profile, nothing on PATH: the
+        // built binary is used rather than the setup failing.
         std::env::remove_var("FCVM_FIRECRACKER_BIN");
+        assert_eq!(
+            setup_vm_firecracker_bin_from(Some(built.clone()))
+                .expect("the Firecracker fcvm built must satisfy the setup VM"),
+            built
+        );
+
+        // Unset, nothing built, nothing on PATH: still an error, and it names
+        // the override so the reader has somewhere to go.
+        let err = setup_vm_firecracker_bin_from(None).unwrap_err().to_string();
+        assert!(
+            err.contains("FCVM_FIRECRACKER_BIN"),
+            "error should name the override, got: {err}"
+        );
+
+        std::env::set_var("PATH", prev_path);
     }
 
     /// A --config path that does not exist must fail, not quietly fall back to
