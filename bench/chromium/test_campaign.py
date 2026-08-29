@@ -700,6 +700,45 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                               f"{label}: the refusal does not say what was "
                               f"missing\n{result.stderr}")
 
+    def test_a_bracket_with_no_corpus_names_is_refused(self):
+        """Every check in the bracket is a claim about a list of names, and
+        every one of them is vacuously true when that list is empty: jq's
+        `all` over an empty array is true, and "the replay answered for every
+        corpus host" holds when there are no corpus hosts. A bracket left in
+        that state renders a verdict it cannot support, the same shape as a
+        gate reporting CLEAR because its tooling was missing.
+
+        The corpus URL list is a literal in the script today, so this state is
+        not reachable by configuration; it is one edit away, and the edit
+        would land as a passing campaign rather than a failing one.
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, against a corpus-dns.log the
+        bracket never saw a single line written to.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            env["MAKE_VERIFY_JSON"] = json.dumps({
+                "dns_server": "10.0.2.2", "hosts": {}, "urls": {},
+                "proxies_disabled": True, "passed": True,
+            })
+            env["MAKE_DNS_QNAMES"] = ""
+            # The second and third brackets always meet a log the first
+            # bracket filled, so the empty-log guard above them cannot stand
+            # in for this one. One line from an earlier bracket is enough.
+            with open(os.path.join(results, "corpus-dns.log"), "w") as handle:
+                handle.write(json.dumps({
+                    "ts": 1755000000.0, "peer": "127.0.0.1:41552",
+                    "qname": "example.com", "qtype": 1, "answer": "10.0.2.2",
+                }) + "\n")
+            script = ('set -euo pipefail\nsay() { :; }\nURLS=""\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(result.returncode, 0,
+                                f"an empty corpus was accepted\n{result.stdout}")
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("names no hosts", result.stderr, result.stderr)
+
     def test_an_earlier_campaigns_queries_cannot_answer_for_this_bracket(self):
         """The replay log is append-only across a campaign, so "the log
         mentions this host" is not evidence: the queries have to fall inside

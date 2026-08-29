@@ -244,6 +244,16 @@ run_verify() {
     # this second. `date +%s` truncates, so the window can only open early,
     # which cannot admit a query from a later bracket.
     started=$(date +%s)
+    # Every check below is a claim about a list of names, and every one of
+    # them is vacuously true when the list is empty: jq's `all` over an empty
+    # array is true, and "the replay answered for every corpus host" holds
+    # when there are no corpus hosts. A bracket in that state prints a pass it
+    # has no basis for, the same shape as a gate reporting CLEAR because its
+    # tooling was missing. The empty-log guard in
+    # verify_replay_answered_the_guest does not cover it: the second and third
+    # brackets always meet a log the first one filled.
+    [ -n "$CORPUS_HOSTS" ] && [ -n "$URLS" ] \
+        || { echo "FAILED: verify ($stage): the corpus names no hosts or no URLs, so every check in this bracket would pass without evaluating anything" >&2; return 1; }
     say "verify ($stage): render hops + baked resolver on a restored clone"
     # Both removed first: this function runs as `run_verify X || ...`, where
     # bash keeps errexit off, so an unchecked cp that failed would leave the
