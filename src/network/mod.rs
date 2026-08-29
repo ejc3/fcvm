@@ -126,7 +126,16 @@ pub(crate) static PATH_IP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 /// not enabled, the run file can exist while carrying no nameserver at all.
 /// Any one of them can be the file with a usable server, so all are read and
 /// their nameservers unioned.
-pub const RESOLV_CONF_SOURCES: [&str; 2] = ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"];
+pub const RESOLV_CONF_SOURCES: [&str; 2] = ["/run/systemd/resolve/resolv.conf", ETC_RESOLV_CONF];
+
+/// The conventional resolver configuration file: one of the host sources
+/// above, and the file fc-agent writes inside a guest.
+///
+/// Named here so nothing else in the crate spells the path, and the source
+/// guard in this module's tests can stay an exact literal scan. A test that
+/// inspects a guest's resolv.conf is not choosing the host's resolvers, but it
+/// writes the same path, and a scan cannot tell the two apart.
+pub const ETC_RESOLV_CONF: &str = "/etc/resolv.conf";
 
 /// One resolv.conf source and what reading it produced.
 #[derive(Debug, Clone)]
@@ -171,6 +180,18 @@ impl ResolvSource {
             .filter(|addr| is_usable_nameserver(addr))
             .map(str::to_string)
             .collect()
+    }
+
+    /// The domains on this source's first `search` line.
+    fn search_domains(&self) -> Vec<String> {
+        let Ok(content) = &self.content else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("search "))
+            .map(|list| list.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
     }
 
     /// One clause naming what this source contributed, for the error.
@@ -221,6 +242,35 @@ pub fn nameservers_from_sources(sources: &[ResolvSource]) -> anyhow::Result<Vec<
     }
 
     Ok(servers)
+}
+
+/// The search domains named by the sources that supplied a usable nameserver,
+/// in source order, de-duplicated with the first occurrence winning.
+///
+/// A short name is completed against a search domain and then asked of a
+/// server, so the search list has to describe the same resolvers the guest is
+/// given. Only a source that contributed to [`nameservers_from_sources`] gets
+/// a say: #875's stub-only run file holds `search .` and no usable server,
+/// and taking its list left the guest searching the root domain while
+/// `/etc/resolv.conf` supplied both the resolver and `search corp.example`.
+///
+/// Unioned rather than taken from the first contributing source, for the same
+/// reason the nameservers are unioned: the guest is handed every contributing
+/// source's servers, so it must be able to complete short names for each of
+/// them.
+pub fn search_domains_from_sources(sources: &[ResolvSource]) -> Vec<String> {
+    let mut domains: Vec<String> = Vec::new();
+    for source in sources {
+        if source.usable_nameservers().is_empty() {
+            continue;
+        }
+        for domain in source.search_domains() {
+            if !domains.contains(&domain) {
+                domains.push(domain);
+            }
+        }
+    }
+    domains
 }
 
 /// A nameserver a VM can route to: an IP address that is not loopback.
@@ -412,6 +462,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn search_domains_take_the_first_search_line() {
+        assert_eq!(
+            readable(
+                "/etc/resolv.conf",
+                "nameserver 192.0.2.1\nsearch corp.example internal\n"
+            )
+            .search_domains(),
+            vec!["corp.example", "internal"]
+        );
+        assert_eq!(
+            readable("/etc/resolv.conf", "search a.example\nsearch b.example\n").search_domains(),
+            vec!["a.example"]
+        );
+        assert!(readable("/etc/resolv.conf", "nameserver 192.0.2.1\n")
+            .search_domains()
+            .is_empty());
+    }
+
+    /// The other half of #875: the search list and the nameserver list have to
+    /// describe the same resolvers. A short name is completed against a search
+    /// domain and then asked of a server, so a domain from a source whose
+    /// servers the guest never receives cannot resolve.
+    #[test]
+    fn search_domains_come_only_from_sources_that_supplied_a_server() {
+        let sources = [
+            readable("/run/systemd/resolve/resolv.conf", "search .\n"),
+            readable(
+                "/etc/resolv.conf",
+                "nameserver 10.1.0.2\nsearch corp.example\n",
+            ),
+        ];
+
+        assert_eq!(
+            nameservers_from_sources(&sources).unwrap(),
+            vec!["10.1.0.2"],
+            "the usable server comes from /etc/resolv.conf"
+        );
+        assert_eq!(
+            search_domains_from_sources(&sources),
+            vec!["corp.example"],
+            "the stub-only run file supplied no resolver, so it does not decide what the guest searches"
+        );
+    }
+
+    /// Unioned for the same reason the nameservers are: the guest is handed
+    /// every contributing source's servers, so it must be able to complete
+    /// short names for each of them.
+    #[test]
+    fn search_domains_union_every_contributing_source() {
+        let sources = [
+            readable(
+                "/run/systemd/resolve/resolv.conf",
+                "nameserver 10.1.0.2\nsearch corp.example internal\n",
+            ),
+            readable(
+                "/etc/resolv.conf",
+                "nameserver 8.8.8.8\nsearch internal other.example\n",
+            ),
+        ];
+
+        assert_eq!(
+            search_domains_from_sources(&sources),
+            vec!["corp.example", "internal", "other.example"],
+            "the run file's domains come first and a domain named twice appears once"
+        );
+    }
+
     /// The L1 state `test_nested_run_fcvm_inside_vm` gates on, evaluated with
     /// the same predicate the inner fcvm uses. A guest whose fc-agent wrote a
     /// real nameserver into /etc/resolv.conf must pass the gate even though
@@ -446,6 +564,11 @@ mod tests {
     /// a resolv.conf path itself can reintroduce that, silently, so every read
     /// in this crate goes through [`RESOLV_CONF_SOURCES`] and this module is
     /// the only place the paths appear.
+    ///
+    /// The integration tests are scanned too. A test that picks its own source
+    /// reaches a different verdict than the launch path it is checking, so in
+    /// the exact #875 state it skips instead of exercising the fix, and the
+    /// end-to-end regression it exists to catch stays invisible.
     #[test]
     fn only_the_shared_source_list_names_a_resolv_conf_path() {
         fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
@@ -479,10 +602,10 @@ mod tests {
         }
 
         let mut offenders = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut offenders,
-        );
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for dir in ["src", "tests"] {
+            walk(&crate_root.join(dir), &mut offenders);
+        }
 
         assert!(
             offenders.is_empty(),

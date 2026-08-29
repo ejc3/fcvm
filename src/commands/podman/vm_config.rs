@@ -1021,12 +1021,7 @@ impl GuestBootInputs {
                 Vec::new()
             })
         };
-        let dns_search = sources
-            .iter()
-            .filter_map(|source| source.content.as_ref().ok())
-            .map(|content| parse_search_domains(content))
-            .find(|domains| !domains.is_empty())
-            .unwrap_or_default();
+        let dns_search = crate::network::search_domains_from_sources(&sources);
         Self {
             host_dns,
             dns_search,
@@ -1067,16 +1062,6 @@ impl GuestBootInputs {
         }
         self
     }
-}
-
-/// The first `search` line of a resolv.conf, split into domains.
-fn parse_search_domains(resolv: &str) -> Vec<String> {
-    resolv
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("search "))
-        .next()
-        .map(|s| s.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default()
 }
 
 /// Build the FirecrackerConfig used to cold-boot a VM from a disk.
@@ -1813,19 +1798,6 @@ mod tests {
             inputs.host_dns.is_empty(),
             "--dns wins outright, so the host fallback must not fragment the key"
         );
-    }
-
-    #[test]
-    fn parse_search_domains_takes_first_search_line() {
-        assert_eq!(
-            parse_search_domains("nameserver 192.0.2.1\nsearch corp.example internal\n"),
-            vec!["corp.example", "internal"]
-        );
-        assert_eq!(
-            parse_search_domains("search a.example\nsearch b.example\n"),
-            vec!["a.example"]
-        );
-        assert!(parse_search_domains("nameserver 192.0.2.1\n").is_empty());
     }
 
     #[test]
