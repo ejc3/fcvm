@@ -559,9 +559,8 @@ fn cargo_target_link_fails_loudly_on_a_non_directory_target() {
 /// the logic inline) nothing else here would notice.
 ///
 /// This reads the recipe's COMMAND lines only, not the whole file: a match
-/// anywhere in the Makefile would also be satisfied by a comment mentioning the
-/// script, which is the failure mode that made an earlier version of the AMI-hash
-/// test pass with its subject deleted.
+/// anywhere in the Makefile is also satisfied by a comment mentioning the
+/// script, which would pass with the recipe deleted.
 #[test]
 fn makefile_delegates_to_the_script() {
     let mk = std::fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
@@ -591,10 +590,10 @@ fn makefile_delegates_to_the_script() {
     );
 }
 
-/// The disk preflight used to glob `cargo-target*`, which selected the parent
-/// `cargo-target/` directory instead of its per-worktree children.  One idle
-/// sibling could therefore never be reclaimed independently, and deleting the
-/// parent left every checkout's target symlink dangling.
+/// The disk preflight selects per-worktree children, never the parent
+/// `cargo-target/` directory. A glob that matches the parent makes an idle
+/// sibling unreclaimable on its own, and removing the parent leaves every
+/// checkout's target symlink dangling.
 ///
 /// This also exercises the lease rather than merely inspecting shell text: an
 /// old-looking target stays intact while a fake Cargo process holds the shared
@@ -2708,9 +2707,9 @@ fn nix_geteuid_is_root() -> bool {
 /// `mkdir -p` is idempotent: on an existing directory it succeeds without
 /// creating anything, so a writability probe built on it alone selects the
 /// managed branch and publishes a symlink to a directory Cargo cannot write --
-/// exit 0, then an opaque failure several steps later. Raised by Codex on #867.
-/// Ownership changes and read-only remounts both produce this state. The probe
-/// has to CREATE an entry inside the directory, not merely confirm the directory.
+/// exit 0, then an opaque failure several steps later. Ownership changes and
+/// read-only remounts both produce this state. The probe has to CREATE an entry
+/// inside the directory, not merely confirm the directory.
 ///
 /// Root cannot be stopped by mode bits, so the root branch remounts the volume
 /// read-only through a bind mount and gets EROFS instead.
@@ -2733,11 +2732,10 @@ fn cargo_target_link_falls_back_when_the_existing_worktree_dir_is_unwritable() {
     );
 }
 
-/// "Is a directory" is not "is writable" (codex on #867). Every path that leaves
-/// target/ as a plain local directory used to end on a `-d` test, so a target/
-/// nothing could write was reported as a successful fallback and cargo failed
-/// several steps later with its own error. The script now runs one probe,
-/// `require_writable_local_target`, at each of those exits. Two of the three are
+/// "Is a directory" is not "is writable". A `-d` test alone reports a target/
+/// nothing can write as a successful fallback, and cargo fails several steps
+/// later with its own error, so every path that leaves target/ as a plain local
+/// directory runs `require_writable_local_target`. Two of the three exits are
 /// driven here through the fixture every uid can use: target/ pointing at
 /// /proc/self, a directory root itself cannot create in. The third (retaining an
 /// unmanaged REAL directory) cannot be staged for uid 0 without a mount or
@@ -2803,7 +2801,7 @@ fn cargo_target_link_refuses_an_unwritable_local_target_on_managed_fallback() {
 }
 
 /// A managed link is DROPPED, never probed through, when its generation cannot
-/// be leased (codex on #867).
+/// be leased.
 ///
 /// The unusable-volume path (the volume exists but `$WT_TARGET` cannot be
 /// created) never opens a generation lease, yet `target/` can still resolve
@@ -2863,11 +2861,11 @@ fn cargo_target_link_drops_a_managed_link_it_cannot_lease() {
     );
 }
 
-/// An existing `$WT_TARGET` that cannot be OPENED falls back too (codex on
-/// #867). Losing read permission as well as write (an ownership change that
-/// leaves a fresh checkout's directory 0700, say) passes `mkdir -p`, but the
-/// generation-lease open `exec {fd}<"$candidate"` fails, and under `set -e`
-/// the script died there instead of creating the promised local target/.
+/// An existing `$WT_TARGET` that cannot be OPENED falls back too. Losing read
+/// permission as well as write (an ownership change that leaves a fresh
+/// checkout's directory 0700, say) passes `mkdir -p`, but the generation-lease
+/// open `exec {fd}<"$candidate"` fails; under `set -e` that ends the script
+/// instead of creating the promised local target/.
 /// Root can open any directory, so when the tests are root the script runs as
 /// uid 65534 through `setpriv`, from a copy of scripts/ that uid can read, over
 /// tempdirs handed to that uid.
@@ -2958,9 +2956,9 @@ fn run_link_with(dir: &Path, btrfs_root: &Path, args: &[&str]) -> (bool, String)
     (out.status.success(), text)
 }
 
-/// The PUBLISHED generation that cannot be opened FAILS CLOSED (codex on #867,
-/// reversing an earlier fallback). Without that generation's lease the script
-/// cannot know whether a Cargo wrapper still holds it shared, and a generation
+/// The PUBLISHED generation that cannot be opened FAILS CLOSED; it does not
+/// fall back. Without that generation's lease the script cannot know whether a
+/// Cargo wrapper still holds it shared, and a generation
 /// that lost only read permission (0333) is one Cargo can still create entries
 /// in; replacing `target/` under such a build would split it across two trees.
 /// Same unprivileged stand-in as the candidate case.
@@ -2994,12 +2992,12 @@ fn cargo_target_link_refuses_to_replace_a_published_generation_it_cannot_lease()
     );
 }
 
-/// `--rotate` must not report a clean it did not perform (codex on #867).
+/// `--rotate` must not report a clean it did not perform.
 ///
 /// With an UNMANAGED `target/` link and a managed candidate that cannot be
-/// written, `fallback_to_local` used to retain the link and exit 0, so `make
-/// clean` reported success while the linked directory's payload survived. The
-/// unusable-volume branch already refused this; the fallback now does too.
+/// written, retaining the link and exiting 0 reports `make clean` as done while
+/// the linked directory's payload survives. Both the unusable-volume branch and
+/// the fallback refuse instead.
 #[test]
 fn cargo_target_link_rotate_refuses_to_retain_an_unmanaged_link() {
     let checkout = tempfile::tempdir().expect("checkout tempdir");
@@ -3028,10 +3026,9 @@ fn cargo_target_link_rotate_refuses_to_retain_an_unmanaged_link() {
     );
 }
 
-/// A dangling UNMANAGED link is replaced on the fallback path, not tripped over
-/// (CodeRabbit on #867): `[ -e target ] || mkdir -p target` saw the dangling
-/// link as absent, and `mkdir -p` then failed with EEXIST under `set -e`,
-/// before the diagnostic that follows it.
+/// A dangling UNMANAGED link is replaced on the fallback path, not tripped
+/// over. It is absent to `[ -e target ]` and EEXIST to `mkdir -p target`, which
+/// under `set -e` ends the script before the diagnostic that follows.
 #[test]
 fn cargo_target_link_replaces_a_dangling_unmanaged_link_on_fallback() {
     let checkout = tempfile::tempdir().expect("checkout tempdir");
@@ -3050,13 +3047,11 @@ fn cargo_target_link_replaces_a_dangling_unmanaged_link_on_fallback() {
 }
 
 /// A RETIRED generation that is readable but no longer writable rotates to a
-/// fresh one (codex on #867). The candidate write probe used to run before the
-/// retirement check, so `fallback_to_local` dropped the managed link and every
-/// later run retained the real local target/ it had created, putting all Cargo
-/// artifacts on the root filesystem for good. The probe now runs only when the
-/// candidate is REUSED; a retired candidate goes to `new_generation`, which
-/// needs only its parent writable. Unprivileged stand-in as elsewhere: root
-/// writes anything.
+/// fresh one. The candidate write probe runs only when the candidate is REUSED:
+/// probing a retired one first sends the script to `fallback_to_local`, which
+/// drops the managed link and leaves every later run on the root filesystem,
+/// while `new_generation` needs only the parent writable. Unprivileged
+/// stand-in as elsewhere: root writes anything.
 #[test]
 fn cargo_target_link_rotates_a_retired_generation_it_cannot_write() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -3103,12 +3098,12 @@ fn cargo_target_link_rotates_a_retired_generation_it_cannot_write() {
     assert_target_usable(checkout.path(), "rotated to a fresh generation");
 }
 
-/// Dropping a published managed link waits for the build that holds it
-/// (codex on #867). On the unusable-volume path the script used to unlink
-/// `target/` with no lease on the generation it published; a Cargo wrapper
-/// holding that generation SHARED would then resolve later `target/...` paths
-/// into a different tree. The script must take the generation's exclusive
-/// lease first: with a shared holder present it blocks, and the link stays.
+/// Dropping a published managed link waits for the build that holds it.
+/// Unlinking `target/` on the unusable-volume path with no lease on the
+/// generation it published lets a Cargo wrapper holding that generation SHARED
+/// resolve later `target/...` paths into a different tree. The script takes the
+/// generation's exclusive lease first: with a shared holder present it blocks,
+/// and the link stays.
 #[test]
 fn cargo_target_link_waits_for_a_shared_holder_before_dropping_a_managed_link() {
     use std::os::unix::io::AsRawFd as _;
@@ -3288,10 +3283,9 @@ fn assert_local_fallback_link(checkout: &Path, btrfs_root: &Path, ctx: &str) -> 
 /// opens, and the write probe inside the lease fails -- exactly the
 /// ownership-change / read-only-remount state, staged with a symlink.
 ///
-/// Replaces an earlier fixture that chmod'ed as a user and bind-remounted
-/// read-only as root: as UID 0 WITHOUT CAP_SYS_ADMIN (an unprivileged
-/// container) the mount was refused and the test failed before reaching the
-/// script (Codex on #867).
+/// A chmod as the invoking user does not stop root, and a read-only bind
+/// remount is refused for UID 0 WITHOUT CAP_SYS_ADMIN (an unprivileged
+/// container), which fails the test before it reaches the script.
 fn unwritable_managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
     let wt = managed_worktree_dir(checkout, btrfs_root);
     std::fs::create_dir_all(wt.parent().unwrap()).expect("cargo-target parent");
@@ -3309,13 +3303,12 @@ fn unwritable_managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBu
 
 /// A managed symlink whose directory has become unwritable must be REPLACED.
 ///
-/// Codex on #867 (P2): with `target` already pointing at the managed directory,
-/// the probe correctly notices the directory is unwritable, warns, and then
-/// leaves the symlink in place. The link still resolves, so the dangling-link
-/// repair is skipped and the final `-d target` check passes: exit 0 with a
-/// target Cargo cannot create files in. The fallback has to repoint an existing
-/// managed link at the local fallback -- under the generation lease it already
-/// holds for exactly this kind of replacement.
+/// With `target` already pointing at the managed directory, noticing that the
+/// directory is unwritable and warning is not enough: the link still resolves,
+/// so the dangling-link repair is skipped and the final `-d target` check
+/// passes, which is exit 0 with a target Cargo cannot create files in. The
+/// fallback repoints the existing managed link at the local payload, under the
+/// generation lease it already holds for that replacement.
 #[test]
 fn cargo_target_link_replaces_a_managed_link_to_an_unwritable_dir() {
     let checkout = tempfile::tempdir().expect("checkout tempdir");
@@ -3335,12 +3328,12 @@ fn cargo_target_link_replaces_a_managed_link_to_an_unwritable_dir() {
 
 /// The write probe must happen INSIDE the generation lease, never before it.
 ///
-/// Codex on #867 (P1): `prune-cargo-target.sh` takes LOCK_EX on a generation,
-/// takes a census of its entries, then rewalks the locked tree. A probe entry
-/// created before the script has leased the generation appears after the census
-/// with no record, and one removed during the rewalk raises
-/// "target entry disappeared during reclaim" -- so an ordinary concurrent `make`
-/// aborts the hourly preflight and its job. AGENTS.md: ZERO RACE CONDITIONS.
+/// `prune-cargo-target.sh` takes LOCK_EX on a generation, takes a census of its
+/// entries, then rewalks the locked tree. A probe entry created before the
+/// script has leased the generation appears after the census with no record,
+/// and one removed during the rewalk raises "target entry disappeared during
+/// reclaim", so an ordinary concurrent `make` aborts the hourly preflight and
+/// its job.
 ///
 /// The test IS the pruner: it holds LOCK_EX on the worktree directory and runs
 /// the script under a timeout. Correct behaviour is to block at the lease
@@ -3405,15 +3398,13 @@ fn cargo_target_link_does_not_touch_a_generation_it_has_not_leased() {
 
 /// A fallback the script created must not outlive the outage that caused it.
 ///
-/// Codex on #867 (P2): with the volume unavailable and no target/ present, the
-/// fallback created a REAL target/ directory. The next run with the volume back
-/// took the pre-protocol branch, which retains any real target/ as unmanaged, so
-/// the checkout never returned to the btrfs cache and every later build landed
-/// on the root filesystem until the disk guard quarantined the runner. The
-/// fallback now lives behind a link to a checkout-local payload, which the
-/// recovered run replaces under the same lease as any other published link.
-/// Nothing enumerates that payload, so nothing reclaims it: it stays in place
-/// and its path is printed so a human can remove it.
+/// A REAL target/ directory created while the volume is unavailable sends the
+/// next run with the volume back down the pre-protocol branch, which retains
+/// any real target/ as unmanaged: the checkout never returns to the btrfs cache
+/// and every later build lands on the root filesystem until the disk guard
+/// quarantines the runner. The fallback is a link to a checkout-local payload,
+/// which the recovered run replaces under the same lease as any other published
+/// link, and reclaims once it publishes nothing.
 #[test]
 fn cargo_target_link_returns_to_btrfs_after_a_volume_outage() {
     let checkout = tempfile::tempdir().expect("checkout tempdir");
