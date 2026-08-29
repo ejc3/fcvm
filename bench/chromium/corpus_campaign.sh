@@ -19,6 +19,17 @@
 # why this needs 127.0.0.1:53 specifically. Ubuntu's dnsmasq owns that socket,
 # so the campaign stops it and restarts it on the way out. Host name resolution
 # is unaffected: /etc/resolv.conf points at systemd-resolved on 127.0.0.53.
+#
+# Port 53 arrives at the loopback only because fcvm hands pasta `-D none` for a
+# guest whose resolver is the gateway (resolver_is_pasta_gateway,
+# src/network/pasta.rs). Without it pasta redirects the guest's port 53 to the
+# host's OWN resolver whenever /etc/resolv.conf names a loopback address, and
+# the replay never sees the query: on a dnsmasq box that resolver is 127.0.0.1,
+# which is where corpus_serve happens to be, so the campaign appeared to work;
+# on a systemd-resolved box it is 127.0.0.53 and the guest resolved against the
+# live internet. dnsmasq is stopped here for the socket, not for that.
+# scripts/probe-pasta-dns-gateway.sh asks the pinned pasta binary which server
+# answers, with the flag and without it, in a few seconds and without a VM.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,6 +129,7 @@ acquire_diag_lock || exit 2
 # one. The content-addressed runtime bundles under runtime/ and the phase
 # logs under logs/ are not the record and stay.
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
+    "$RESULTS"/replay-queries.log \
     "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-serve.status \
     "$RESULTS"/reqbench.jsonl "$RESULTS"/analysis.json "$RESULTS"/diag/summary.json
 release_diag_lock
@@ -144,6 +156,17 @@ say() { printf '\n=== %s\n' "$*"; }
 #      reached an address other than 10.0.2.2, any name did not resolve, or
 #      any load event took longer than DIAG_MAX_LOAD_MS
 #      ($RESULTS/diag/summary.json).
+#   1b. every bracket then requires this campaign's corpus_serve to have
+#      LOGGED a query for every corpus host while the bracket ran
+#      ($RESULTS/replay-queries.log). HOP D reads the answer; this reads the
+#      other end of the same query, so an answer that came from anywhere else
+#      (a corpus_serve leaked from an earlier campaign, an /etc/hosts baked
+#      into the golden, a resolver cache in the clone) fails the bracket. The
+#      peer address cannot carry that evidence: pasta translates the guest's
+#      source to host loopback for a loopback destination (fwd_nat_from_tap,
+#      fwd.c), so every guest query is logged from 127.0.0.1, with only the
+#      guest's UDP source port preserved. The bracket's time window and the
+#      set of names are what tie the queries to the clone.
 #   2. a sampler names the owner of 127.0.0.1:53, the dnsmasq state and the
 #      1-min load every DNS_SAMPLE_INTERVAL seconds while the run is in
 #      flight ($RESULTS/dns-owner.log). The quiet gate reads the load once,
@@ -169,12 +192,58 @@ corpus_hosts() {
         | awk 'NF && !seen[$0]++' | paste -sd, -
 }
 
+# The other end of HOP D's query. HOP D reads what the clone RESOLVED; this
+# reads what this campaign's replay server was ASKED, so a bracket only passes
+# when the two are the same event. A leaked corpus_serve from an earlier
+# campaign, an /etc/hosts baked into the golden, or a resolver cache in the
+# clone all answer 10.0.2.2 without this server ever being consulted.
+#
+# The peer address cannot say who asked: pasta translates a guest's source
+# address to host loopback whenever the destination is loopback
+# (fwd_nat_from_tap in fwd.c), so guest queries and the campaign's own host-side
+# dig are both logged from 127.0.0.1. What ties a query to the bracket is the
+# window it arrived in and the name it asked for.
+#
+# $1 = stage, $2 = epoch seconds captured before the bracket ran.
+verify_replay_answered_the_guest() {
+    local stage="$1" since="$2" log="$RESULTS/corpus-dns.log"
+    local seen missing queries wanted
+    wanted=$(printf '%s\n' "$CORPUS_HOSTS" | tr ',' '\n' | awk 'NF' | sort -u)
+    if [ ! -s "$log" ]; then
+        echo "FAILED: verify ($stage): $log holds no queries, so this campaign's replay server answered nothing; HOP D's answers came from somewhere else" >&2
+        return 1
+    fi
+    # A jq that cannot read the log fails the bracket rather than reporting an
+    # empty query set, which would read as "nothing asked" either way.
+    seen=$(jq -r --argjson since "$since" \
+            'select((.ts | type) == "number" and .ts >= $since) | .qname' "$log" 2>/dev/null | sort -u) \
+        || { echo "FAILED: verify ($stage): cannot read the replay DNS log $log" >&2; return 1; }
+    queries=$(jq -r --argjson since "$since" \
+            'select((.ts | type) == "number" and .ts >= $since) | .qname' "$log" 2>/dev/null | wc -l) \
+        || queries=0
+    missing=$(comm -23 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | paste -sd, -)
+    printf '%s since=%s queries=%s hosts_seen=%s/%s missing=%s\n' \
+        "$stage" "$since" "$queries" \
+        "$(comm -12 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | wc -l)" \
+        "$(printf '%s\n' "$wanted" | wc -l)" "${missing:-none}" \
+        >>"$RESULTS/replay-queries.log"
+    if [ -n "$missing" ]; then
+        echo "FAILED: verify ($stage): this campaign's replay server logged no query for $missing since $since, so the clone's answers for those names did not come from it" >&2
+        return 1
+    fi
+    say "verify ($stage): replay served $queries queries covering every corpus host"
+}
+
 run_verify() {
     # $1 = pre | before-run | after-run. reqbench overwrites verify-dns.json
     # and its verify logs on every call, so each bracket copies its own out
     # under the stage name. A bracket passes only when the sub-make exits 0
     # AND the evidence it left says passed=true.
-    local stage="$1" copy="$RESULTS/verify-dns-$1.json" f
+    local stage="$1" copy="$RESULTS/verify-dns-$1.json" f started
+    # Before the sub-make: every query the bracket provokes lands at or after
+    # this second. `date +%s` truncates, so the window can only open early,
+    # which cannot admit a query from a later bracket.
+    started=$(date +%s)
     say "verify ($stage): render hops + baked resolver on a restored clone"
     # Both removed first: this function runs as `run_verify X || ...`, where
     # bash keeps errexit off, so an unchecked cp that failed would leave the
@@ -206,6 +275,7 @@ run_verify() {
         and all($hosts | split(",")[]; . as $h | $e.hosts[$h].ok == true)
         and all($urls | split(",")[]; . as $u | $e.urls[$u].ok == true)' "$copy" >/dev/null \
         || { echo "FAILED: verify ($stage): $copy does not record passed=true through 10.0.2.2 with proxies disabled for every corpus host and URL" >&2; return 1; }
+    verify_replay_answered_the_guest "$stage" "$started" || return 1
 }
 
 run_diag() {
@@ -429,6 +499,7 @@ write_dns_evidence() {
         --argjson load_max "$load_max" --argjson load_samples "$load_samples" \
         --arg first "$first_mismatch" --arg reason "$reason" --arg owner_log "$log" \
         --arg dns_sha "$(sha256_or_empty "$RESULTS/corpus-dns.log")" \
+        --arg replay_queries_sha "$(sha256_or_empty "$RESULTS/replay-queries.log")" \
         --arg access_sha "$(sha256_or_empty "$RESULTS/corpus-access.log")" \
         --argjson serve_status "$serve_status_json" \
         --argjson verify_sha "$verify_sha" \
@@ -444,6 +515,7 @@ write_dns_evidence() {
           verify_files: $ARGS.positional,
           verify_file_sha256: $verify_sha,
           corpus_dns_log_sha256: (if $dns_sha == "" then null else $dns_sha end),
+          replay_queries_log_sha256: (if $replay_queries_sha == "" then null else $replay_queries_sha end),
           corpus_access_log_sha256: (if $access_sha == "" then null else $access_sha end),
           corpus_serve_exit_status: $serve_status,
           reason: (if $reason == "" then null else $reason end),
