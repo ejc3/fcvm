@@ -37,7 +37,14 @@ if [ "${1:-}" != "--inside" ]; then
     PASTA_BIN="${PASTA_BIN:-$(ls -t /mnt/fcvm-btrfs/pasta/pasta-*.bin 2>/dev/null | head -1 || true)}"
     [ -x "${PASTA_BIN:-}" ] \
         || { echo "BLOCKED: no pasta binary; set PASTA_BIN or run 'make setup-fcvm'" >&2; exit 2; }
-    unshare --user --map-root-user --net --mount --fork -- \
+    # --pid --mount-proc makes the --inside shell init of a PID namespace, and
+    # --kill-child ties that shell's life to this one. The two DNS responders
+    # below never return on their own: each loops on recvfrom forever, and a
+    # non-interactive shell exits without reaping its background jobs, so
+    # without a PID namespace every run left both of them holding the private
+    # net and mount namespaces open. PID 1 exiting is what ends them, on the
+    # success path, on a failed expectation, and on a kill.
+    unshare --user --map-root-user --net --mount --pid --mount-proc --kill-child --fork -- \
         "$0" --inside "$PASTA_BIN" "$(mktemp -d)" \
         || exit $?
     exit 0
