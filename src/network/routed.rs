@@ -51,6 +51,9 @@ pub struct RoutedNetwork {
     ipv6_prefix: Option<String>,
     /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost).
     forward_localhost: Vec<u16>,
+    /// The IPv6 resolver the launch's resolv.conf snapshot selected, threaded
+    /// in by the caller. None means the snapshot named no IPv6 server.
+    ipv6_dns: Option<String>,
 
     // Network state (populated during setup)
     namespace_id: Option<String>,
@@ -69,6 +72,7 @@ impl RoutedNetwork {
             loopback_ip: None,
             ipv6_prefix: None,
             forward_localhost: Vec::new(),
+            ipv6_dns: None,
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
@@ -86,6 +90,16 @@ impl RoutedNetwork {
     ///
     /// fc-agent relays guest 127.0.0.1:<port> to 10.0.2.2:<port>; setup() makes the
     /// namespace own 10.0.2.2 and relays each connection to the host's loopback.
+    /// The IPv6 resolver chosen from the launch's single resolv.conf snapshot.
+    ///
+    /// The same snapshot the snapshot key and the guest's search domains come
+    /// from (GuestBootInputs). Reading the host again here would let the guest
+    /// get one resolver while its search list and its key describe another.
+    pub fn with_ipv6_dns(mut self, server: Option<String>) -> Self {
+        self.ipv6_dns = server;
+        self
+    }
+
     pub fn with_forward_localhost(mut self, ports: Vec<u16>) -> Self {
         self.forward_localhost = ports;
         self
@@ -862,7 +876,7 @@ impl NetworkManager for RoutedNetwork {
             },
             // IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable without MASQUERADE.
             // Detect an IPv6 DNS server reachable via native routed IPv6.
-            dns_server: detect_ipv6_dns().await,
+            dns_server: detect_ipv6_dns(self.ipv6_dns.clone()).await,
             // Include /128 prefix so fc-agent uses a host route instead of /64 on-link.
             // With /64, the VM would try NDP for other addresses in the host's subnet
             // directly on eth0, which fails (they're behind the veth + physical network).
@@ -1152,28 +1166,26 @@ async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
     None
 }
 
-/// Find a DNS server reachable over IPv6 for routed mode.
+/// The DNS server a routed guest reaches over IPv6.
 ///
 /// IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable from the VM without MASQUERADE.
-/// This function discovers an IPv6 DNS server by:
-/// 1. Checking host resolv.conf for existing IPv6 nameservers
-/// 2. Probing known cloud IPv6 DNS endpoints (e.g. AWS fd00:ec2::253)
-async fn detect_ipv6_dns() -> Option<String> {
-    // Check host DNS config for IPv6 nameservers
-    let resolv = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
-        .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
-        .ok()?;
-
-    for line in resolv.lines() {
-        if let Some(server) = line.strip_prefix("nameserver ") {
-            let server = server.trim();
-            if server.contains(':') {
-                return Some(server.to_string());
-            }
-        }
+/// The server is either:
+/// 1. `selected`, the IPv6 nameserver the launch's resolv.conf snapshot named
+/// 2. a probe of known cloud IPv6 DNS endpoints (AWS fd00:ec2::253), which runs
+///    only when that snapshot named no IPv6 server
+async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
+    // `selected` is network::first_ipv6_nameserver applied to the launch's one
+    // resolv.conf snapshot, the same snapshot GuestBootInputs::for_launch
+    // narrows this guest's search domains with and the snapshot key is
+    // computed from. Reading the sources again here would be a second
+    // snapshot: a resolv.conf change between the two reads would give the
+    // guest one resolver while its search list and its key describe another,
+    // and a cached snapshot would preserve the mismatch.
+    if let Some(server) = selected {
+        return Some(server);
     }
 
-    // No IPv6 nameserver in resolv.conf. Probe known cloud IPv6 DNS endpoints.
+    // The snapshot named no IPv6 nameserver. Probe known cloud IPv6 endpoints.
     // AWS VPCs provide dual-stack DNS at fd00:ec2::253.
     let probe = tokio::process::Command::new("dig")
         .args([
@@ -1414,5 +1426,39 @@ mod tests {
         assert_eq!(addr, "2600:1f1c:0494:0201::abcd");
         // Prefix is normalized through Ipv6Addr parsing (leading zeros stripped)
         assert_eq!(prefix, "2600:1f1c:494:201");
+    }
+
+    /// A launch takes ONE resolv.conf snapshot. Selecting the routed resolver
+    /// from a second read at setup time lets the guest receive resolver B while
+    /// its search domains and its snapshot key describe resolver A, and a
+    /// cached snapshot then preserves that mismatch.
+    ///
+    /// 2001:db8::53 is the documentation range (RFC 3849). No host's
+    /// resolv.conf names it, and the probe fallback can only return
+    /// fd00:ec2::253 or None, so a second read of THIS machine cannot produce
+    /// it. Returning it is therefore proof that the launch snapshot decided.
+    /// Before the snapshot was threaded through, this returned whatever the
+    /// host named at setup time (or None), never the argument.
+    #[tokio::test]
+    async fn routed_uses_the_launch_snapshot_resolver_not_a_second_read() {
+        let from_snapshot = Some("2001:db8::53".to_string());
+        assert_eq!(
+            detect_ipv6_dns(from_snapshot.clone()).await,
+            from_snapshot,
+            "the resolver must come from the launch snapshot, not a fresh read"
+        );
+    }
+
+    /// The probe fallback still runs, but only when the shared snapshot named
+    /// no IPv6 resolver. Its result is whatever this host answers, so only the
+    /// shape is asserted: it never invents a server the snapshot ruled out.
+    #[tokio::test]
+    async fn routed_probes_only_when_the_snapshot_named_no_ipv6_resolver() {
+        let probed = detect_ipv6_dns(None).await;
+        assert!(
+            probed.is_none() || probed.as_deref() == Some("fd00:ec2::253"),
+            "with no snapshot resolver the only outcomes are the AWS VPC probe \
+             or nothing, got {probed:?}"
+        );
     }
 }

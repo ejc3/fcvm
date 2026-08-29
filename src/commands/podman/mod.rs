@@ -1465,16 +1465,17 @@ async fn prepare_vm_for_lifecycle(
             // of re-read inside setup() (#863). Fail closed like the old
             // in-setup read did: a bridged guest NATs straight out and needs
             // a real resolver, and --dns is the override.
-            if args.dns.is_none() && boot_inputs.host_dns.is_empty() {
+            if args.dns.is_none() && boot_inputs.host_dns().is_empty() {
                 bail!(
-                    "no usable host DNS server for bridged mode (VMs cannot use a \
-                     loopback stub resolver; on systemd-resolved hosts mount \
-                     /run/systemd/resolve). Pass --dns to override."
+                    "no usable host DNS server for bridged mode: neither {} named a \
+                     nameserver this guest can reach (the warning above says what each \
+                     source held). Pass --dns to name one.",
+                    crate::network::RESOLV_CONF_SOURCES.join(" nor ")
                 );
             }
             Box::new(
                 BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_dns_server(boot_inputs.host_dns.first().cloned()),
+                    .with_dns_server(boot_inputs.host_dns().first().cloned()),
             )
         }
         NetworkMode::Routed => {
@@ -1483,6 +1484,12 @@ async fn prepare_vm_for_lifecycle(
             if let Some(ref prefix) = args.ipv6_prefix {
                 net = net.with_ipv6_prefix(prefix.clone());
             }
+            // The IPv6 resolver comes from the launch's single resolv.conf
+            // snapshot, the same one the snapshot key and the guest's search
+            // domains are derived from. Letting routed read the host again
+            // would give the guest one resolver while its search list and its
+            // key describe another.
+            net = net.with_ipv6_dns(crate::network::first_ipv6_nameserver(&boot_inputs.dns));
             if !args.forward_localhost.is_empty() {
                 net = net.with_forward_localhost(args.forward_localhost.clone());
             }
@@ -2829,6 +2836,19 @@ mod tests {
         key_for(&test_args(), inputs)
     }
 
+    /// One resolv.conf source's contribution: the servers it named and the
+    /// search domains that belong to them. Grouped, because a narrowing mode
+    /// drops a server together with its domains.
+    fn resolvers(servers: &[&str], search: &[&str]) -> GuestBootInputs {
+        GuestBootInputs {
+            dns: vec![crate::network::ResolverGroup {
+                servers: servers.iter().map(|s| s.to_string()).collect(),
+                search_domains: search.iter().map(|s| s.to_string()).collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
     /// #863: bridged mode forwards exactly one resolver to the guest
     /// (network_config.dns_server is the first host entry), so the key must
     /// hash exactly that. Keying the whole host list cold-boots a guest whose
@@ -2836,10 +2856,7 @@ mod tests {
     /// mode emits the whole list, so every entry must keep keying there.
     #[test]
     fn bridged_mode_keys_only_the_emitted_dns() {
-        let dns = |servers: &[&str]| GuestBootInputs {
-            host_dns: servers.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        };
+        let dns = |servers: &[&str]| resolvers(servers, &[]);
         let bridged = |servers: &[&str]| {
             let mut args = test_args();
             args.network = NetworkMode::Bridged;
@@ -2859,6 +2876,53 @@ mod tests {
             boot_inputs_key(dns(&["1.1.1.1", "8.8.8.8"])),
             boot_inputs_key(dns(&["1.1.1.1", "9.9.9.9"])),
             "rootless mode emits the whole list, so a secondary change must still key"
+        );
+    }
+
+    /// Routed forwards one resolver as well: the first IPv6 nameserver the
+    /// sources name (src/network/routed.rs, detect_ipv6_dns). An IPv4
+    /// secondary never reaches a routed guest, so it must not key; the
+    /// selected IPv6 server does reach it, so it must.
+    ///
+    /// This narrowed what routed hashes, so a routed snapshot key computed
+    /// before it changes value once and those cached snapshots are rebuilt.
+    /// The steady state shares more: hosts differing only in a resolver the
+    /// routed guest never sees now hit the same key.
+    #[test]
+    fn routed_mode_keys_only_the_emitted_dns() {
+        let routed = |groups: Vec<crate::network::ResolverGroup>| {
+            let mut args = test_args();
+            args.network = NetworkMode::Routed;
+            key_for(
+                &args,
+                GuestBootInputs {
+                    dns: groups,
+                    ..Default::default()
+                },
+            )
+        };
+        let two = |ipv6: &str, ipv4: &str| {
+            vec![
+                crate::network::ResolverGroup {
+                    servers: vec![ipv4.to_string()],
+                    search_domains: vec!["corp.example".to_string()],
+                },
+                crate::network::ResolverGroup {
+                    servers: vec![ipv6.to_string()],
+                    search_domains: vec!["lab.example".to_string()],
+                },
+            ]
+        };
+
+        assert_eq!(
+            routed(two("2001:db8::53", "10.1.0.2")),
+            routed(two("2001:db8::53", "192.0.2.53")),
+            "an IPv4 resolver never reaches a routed guest and must not change its key"
+        );
+        assert_ne!(
+            routed(two("2001:db8::53", "10.1.0.2")),
+            routed(two("2001:db8::54", "10.1.0.2")),
+            "the selected IPv6 resolver IS emitted and must change the key"
         );
     }
 
@@ -2897,10 +2961,7 @@ mod tests {
 
     #[test]
     fn host_dns_fallback_changes_snapshot_key() {
-        let dns = |servers: &[&str]| GuestBootInputs {
-            host_dns: servers.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        };
+        let dns = |servers: &[&str]| resolvers(servers, &[]);
         assert_ne!(
             boot_inputs_key(GuestBootInputs::default()),
             boot_inputs_key(dns(&["1.1.1.1"])),
@@ -2915,12 +2976,11 @@ mod tests {
 
     #[test]
     fn dns_search_changes_snapshot_key() {
+        // Same resolver on both sides, so only the search domains vary and the
+        // assertion cannot pass on a difference in the server list.
         assert_ne!(
-            boot_inputs_key(GuestBootInputs::default()),
-            boot_inputs_key(GuestBootInputs {
-                dns_search: vec!["corp.example".to_string()],
-                ..Default::default()
-            }),
+            boot_inputs_key(resolvers(&["1.1.1.1"], &[])),
+            boot_inputs_key(resolvers(&["1.1.1.1"], &["corp.example"])),
             "DNS search domains must change the key"
         );
     }

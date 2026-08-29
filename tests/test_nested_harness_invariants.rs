@@ -55,6 +55,52 @@ fn simple_nested_smoke_test_propagates_the_snapshot_mode_into_l2() {
     );
 }
 
+/// #875: an L1 whose resolv.conf sources name only a loopback stub fails the
+/// inner fcvm with an error about the host's DNS, naming nothing about L1. The
+/// smoke test must reach its own verdict on L1 before the inner run.
+#[test]
+fn simple_nested_smoke_test_gates_on_l1_dns_before_the_inner_run() {
+    let source = nested_smoke_test_source();
+
+    let gate = source
+        .find("assert_l1_dns_is_usable")
+        .expect("the smoke test must check L1's nameservers itself");
+    let inner_run = source
+        .find("timeout 600 fcvm podman run")
+        .expect("the inner fcvm run is still the bounded exec");
+
+    assert!(
+        gate < inner_run,
+        "the DNS gate must run before the inner fcvm, or the failure it explains          has already happened"
+    );
+}
+
+/// The gate is only worth having if it decides the way the inner fcvm decides,
+/// and if it shows the L1 state behind its verdict.
+#[test]
+fn l1_dns_gate_reuses_the_predicate_the_inner_fcvm_uses() {
+    let source = nested_test_source();
+
+    assert!(
+        source.contains("fcvm::network::nameservers_from_sources"),
+        "the gate must use the production predicate; a re-implementation can accept          an L1 the inner fcvm rejects"
+    );
+    assert!(
+        source.contains("fcvm::network::RESOLV_CONF_SOURCES"),
+        "the gate must read the same files the inner fcvm reads"
+    );
+    for evidence in [
+        "--- {} ---",
+        "--- /proc/cmdline ---",
+        "L1 reports healthy with no nameserver the inner fcvm can use",
+    ] {
+        assert!(
+            source.contains(evidence),
+            "a firing gate must print the L1 state that produced its verdict,              missing: {evidence}"
+        );
+    }
+}
+
 #[test]
 fn test_recipes_use_an_exact_worktree_local_config() {
     let makefile = makefile_source();

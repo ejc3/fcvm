@@ -10,6 +10,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use fcvm::network::{nameservers_from_sources, ResolvSource, ETC_RESOLV_CONF, RESOLV_CONF_SOURCES};
 
 /// Verify the guest gets the host's real DNS servers (not the default 10.0.2.3)
 /// and can resolve hostnames directly through them.
@@ -18,23 +19,29 @@ async fn test_guest_has_host_dns_servers() -> Result<()> {
     println!("\nTest host DNS servers passed to guest");
     println!("======================================");
 
-    // Read host's DNS servers for comparison
-    let host_resolv = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
-        .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
-        .context("reading host resolv.conf")?;
-
-    let host_nameservers: Vec<&str> = host_resolv
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("nameserver "))
-        .filter(|s| !s.starts_with("127."))
-        .collect();
+    // Read the host's resolvers through the same sources the launch path
+    // reads. Committing to the first readable file here is what #875 was:
+    // a stub-only /run/systemd/resolve/resolv.conf hides the usable
+    // /etc/resolv.conf, this test skips, and the bridged path it exists to
+    // cover goes unexercised.
+    let sources = RESOLV_CONF_SOURCES.map(ResolvSource::read);
+    let host_nameservers = match nameservers_from_sources(&sources) {
+        Ok(servers) => servers,
+        Err(e) => {
+            // No source names a server a VM could reach, so a bridged launch
+            // has nothing to forward and fails before the guest boots. Nothing
+            // about the guest is under test on such a host.
+            println!("  SKIP: {e:#}");
+            return Ok(());
+        }
+    };
 
     println!("  Host nameservers: {:?}", host_nameservers);
 
-    if host_nameservers.is_empty() {
-        println!("  SKIP: no non-localhost nameservers on host");
-        return Ok(());
-    }
+    // Bridged mode forwards one resolver to the guest: GuestBootInputs::for_launch
+    // truncates host_dns to the first entry, which network_config.dns_server
+    // carries onto the cmdline. Assert on that entry, not the whole list.
+    let forwarded = &host_nameservers[0];
 
     let (vm_name, _, _, _) = common::unique_names("host-dns");
 
@@ -55,7 +62,7 @@ async fn test_guest_has_host_dns_servers() -> Result<()> {
     println!("  VM healthy");
 
     // Check guest's resolv.conf
-    let guest_resolv = common::exec_in_vm(pid, &["cat", "/etc/resolv.conf"]).await?;
+    let guest_resolv = common::exec_in_vm(pid, &["cat", ETC_RESOLV_CONF]).await?;
     println!("  Guest resolv.conf:\n{}", guest_resolv.trim());
 
     // Verify guest has the host's nameservers (not 10.0.2.3)
@@ -64,13 +71,12 @@ async fn test_guest_has_host_dns_servers() -> Result<()> {
         "Guest should have host DNS servers, not the default 10.0.2.3"
     );
 
-    for ns in &host_nameservers {
-        assert!(
-            guest_resolv.contains(ns),
-            "Guest resolv.conf missing host nameserver: {}",
-            ns
-        );
-    }
+    assert!(
+        guest_resolv.contains(forwarded),
+        "Guest resolv.conf missing the host nameserver bridged forwards ({}): {}",
+        forwarded,
+        guest_resolv.trim()
+    );
 
     // Verify DNS actually works by resolving a hostname
     let result = common::exec_in_vm(pid, &["nslookup", "facebook.com"]).await;
