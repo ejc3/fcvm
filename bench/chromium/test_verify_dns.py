@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SH = os.path.join(HERE, "reqbench.sh")
@@ -148,7 +149,13 @@ class VerifyDnsHop(unittest.TestCase):
         fcvm = os.path.join(d, "fcvm")
         write_exec(fcvm, FCVM_STUB)
         write_exec(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
-        env = dict(os.environ)
+        # The probe under test reports every *_proxy variable it found and
+        # ignored, and the assertions name exactly the ones the stub exec
+        # installs, so the fixture environment must carry none of its own. A
+        # box exporting YARN_HTTPS_PROXY or npm_config_http_proxy would
+        # otherwise add names no test installed.
+        env = {k: v for k, v in os.environ.items()
+               if not k.lower().endswith("_proxy")}
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG=TAG,
@@ -207,28 +214,11 @@ class VerifyDnsHop(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return server.server_port, Stub.seen
 
-    def test_the_url_probe_ignores_the_proxy_the_exec_environment_carries(self):
-        """fc-agent runs every container exec under the host's saved
-        HTTP_PROXY and HTTPS_PROXY (fc-agent/src/exec.rs, read_proxy_settings),
-        and urllib.request.build_opener() installs a ProxyHandler from the
-        environment. The hostname check resolved through the baked resolver
-        while each URL request went to the proxy: a working proxy fetched the
-        live site, the status came back 200 and HOP D passed without the
-        replay server having answered one URL.
-
-        The stub exec runs the shipped probe text under that environment.
-        The proxy variables name a local stub that answers 200 to anything
-        (the live site through a working proxy); the URLs name a second stub
-        standing in for the replay server. A control sends a default urllib
-        request through the same environment and requires the proxy stub to
-        answer it, so a pass here cannot come from an environment the probe
-        never saw. The evidence must say the probe ran with proxies disabled
-        and which variables it ignored.
-
-        RED BEFORE THE FIX: the proxy stub answered both URLs
-        (['http://127.0.0.1:P/one', 'http://127.0.0.1:P/two']) and the replay
-        stub answered none.
-        """
+    def _probe_under_the_exec_proxy_environment(self):
+        """The URL probe, run for real under the proxy variables the stub
+        exec installs, with a control proving that environment reaches a
+        proxy. Every request must land on the replay stub, and the evidence
+        must name exactly the four variables the exec installed."""
         replay_port, replay_seen = self._http_stub()
         proxy_port, proxy_seen = self._http_stub()
         proxy = f"http://127.0.0.1:{proxy_port}"
@@ -268,6 +258,46 @@ class VerifyDnsHop(unittest.TestCase):
                     "proxy_env_ignored": ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "no_proxy"],
                 })
             self.assertEqual(os.listdir(state_dir), [])
+
+    def test_the_url_probe_ignores_the_proxy_the_exec_environment_carries(self):
+        """fc-agent runs every container exec under the host's saved
+        HTTP_PROXY and HTTPS_PROXY (fc-agent/src/exec.rs, read_proxy_settings),
+        and urllib.request.build_opener() installs a ProxyHandler from the
+        environment. The hostname check resolved through the baked resolver
+        while each URL request went to the proxy: a working proxy fetched the
+        live site, the status came back 200 and HOP D passed without the
+        replay server having answered one URL.
+
+        The stub exec runs the shipped probe text under that environment.
+        The proxy variables name a local stub that answers 200 to anything
+        (the live site through a working proxy); the URLs name a second stub
+        standing in for the replay server. A control sends a default urllib
+        request through the same environment and requires the proxy stub to
+        answer it, so a pass here cannot come from an environment the probe
+        never saw. The evidence must say the probe ran with proxies disabled
+        and which variables it ignored.
+
+        RED BEFORE THE FIX: the proxy stub answered both URLs
+        (['http://127.0.0.1:P/one', 'http://127.0.0.1:P/two']) and the replay
+        stub answered none.
+        """
+        self._probe_under_the_exec_proxy_environment()
+
+    def test_ambient_proxy_variables_do_not_change_the_probe_evidence(self):
+        """proxy_env_ignored names the variables the probe found in the exec
+        environment, so the fixture must install that environment rather than
+        inherit the box's. Development boxes export proxy names beyond the
+        four the exec installs (YARN_HTTPS_PROXY, npm_config_http_proxy from
+        node tooling), and an inherited one lands in the evidence.
+
+        RED WITHOUT THE FIX: proxy_env_ignored came back
+        ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'YARN_HTTPS_PROXY',
+        'no_proxy', 'npm_config_http_proxy'].
+        """
+        with mock.patch.dict(os.environ, {
+                "YARN_HTTPS_PROXY": "http://127.0.0.1:9/",
+                "npm_config_http_proxy": "http://127.0.0.1:9/"}):
+            self._probe_under_the_exec_proxy_environment()
 
     def test_a_clone_answering_the_real_address_fails_hop_d(self):
         """The failure the hop exists for: the guest resolves example.com to
