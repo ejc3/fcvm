@@ -242,9 +242,8 @@ class EntryResolverRule(unittest.TestCase):
             with self.subTest(shell=shell, value="fd00::2"):
                 result, argv = self._run(shell, {"BENCH_RESOLVE_ALL_TO": "fd00::2"})
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(rule_of(argv),
-                                 "EXCLUDE localhost, EXCLUDE 127.0.0.1, "
-                                 "EXCLUDE ::1, MAP * fd00::2")
+                host, port = rewrite_host(rule_of(argv), "example.com", 443)
+                self.assertEqual((host.strip("[]"), port), ("fd00::2", 443))
 
 
     def test_loopback_and_localhost_are_never_mapped(self):
@@ -276,6 +275,48 @@ class EntryResolverRule(unittest.TestCase):
                     rewrite_host(rule, "example.com", 443), ("10.0.2.2", 443),
                     "excluding the loopback also stopped the corpus mapping")
 
+
+    def test_a_scoped_ipv6_address_is_refused(self):
+        """`ipaddress.ip_address` accepts a scope id (`fe80::1%eth0`), and no
+        Chromium resolver rule can carry one: the zone travels with the
+        address only inside a sockaddr. Emitting it produces a rule that
+        resolves nothing, so the value is refused at the knob.
+
+        Red on entry.sh at 96664d74: `AssertionError: 0 != 0 : chromium was
+        launched with BENCH_RESOLVE_ALL_TO='fe80::1%eth0'`.
+        """
+        for shell in SHELLS:
+            for bad in ("fe80::1%eth0", "fe80::1%1"):
+                with self.subTest(shell=shell, value=bad):
+                    result, argv = self._run(shell, {"BENCH_RESOLVE_ALL_TO": bad})
+                    self.assertNotEqual(
+                        result.returncode, 0,
+                        f"chromium was launched with BENCH_RESOLVE_ALL_TO={bad!r}: {argv}")
+                    self.assertIsNone(argv, "chromium was launched before the refusal")
+                    self.assertIn("BENCH_RESOLVE_ALL_TO", result.stderr)
+
+    def test_an_ipv6_target_reaches_chromium_in_the_form_it_parses(self):
+        """`MAP * fd00::2` is not the rule it reads as. url::ParseServerInfo
+        splits at the last colon, so Chromium stores the host `fd00:` on port
+        2 and every request goes somewhere that does not exist, while the
+        metadata records a controlled resolver. The replacement must be
+        bracketed.
+
+        Red on entry.sh at 96664d74:
+        `AssertionError: Tuples differ: ('fd00:', 2) != ('fd00::2', 443)`
+        """
+        for shell in SHELLS:
+            for value, expected in (("fd00::2", "fd00::2"),
+                                    ("FD00::2", "fd00::2"),
+                                    ("::1", "::1")):
+                with self.subTest(shell=shell, value=value):
+                    result, argv = self._run(
+                        shell, {"BENCH_RESOLVE_ALL_TO": value})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    rule = rule_of(argv)
+                    self.assertIsNotNone(rule, "chromium was launched with no rule")
+                    host, port = rewrite_host(rule, "example.com", 443)
+                    self.assertEqual((host.strip("[]"), port), (expected, 443))
 
 
 if __name__ == "__main__":

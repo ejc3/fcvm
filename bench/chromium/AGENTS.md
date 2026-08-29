@@ -56,7 +56,10 @@ which the container env word-split when the whole flag was passed). The
 exclusions keep the container's own warmup page, which entry.sh navigates at
 `http://127.0.0.1:8000/warmup.html` before it writes the ready marker, off
 the map: Chromium maps before it resolves, so without them that navigation
-goes to `10.0.2.2:8000` and the container never becomes healthy. The
+goes to `10.0.2.2:8000` and the container never becomes healthy. An IPv6
+knob is emitted bracketed (`MAP * [fd00::2]`), the only spelling Chromium's
+rule parser reads as an address, and a scoped address (`fe80::1%eth0`) is
+refused at the knob. The
 entries change what the snapshot does, so such a golden needs its own `TAG=`.
 The host control takes the same variable directly:
 `make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
