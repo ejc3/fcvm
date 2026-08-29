@@ -1484,6 +1484,12 @@ async fn prepare_vm_for_lifecycle(
             if let Some(ref prefix) = args.ipv6_prefix {
                 net = net.with_ipv6_prefix(prefix.clone());
             }
+            // The IPv6 resolver comes from the launch's single resolv.conf
+            // snapshot, the same one the snapshot key and the guest's search
+            // domains are derived from. Letting routed read the host again
+            // would give the guest one resolver while its search list and its
+            // key describe another.
+            net = net.with_ipv6_dns(crate::network::first_ipv6_nameserver(&boot_inputs.dns));
             if !args.forward_localhost.is_empty() {
                 net = net.with_forward_localhost(args.forward_localhost.clone());
             }

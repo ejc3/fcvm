@@ -818,6 +818,61 @@ mod tests {
         );
     }
 
+    /// A launch reads the resolv.conf sources ONCE, and every later decision
+    /// uses that snapshot. A second read elsewhere in the launch path lets the
+    /// guest receive one resolver while its search domains and its snapshot
+    /// key describe another, which a cached snapshot then preserves (#885).
+    ///
+    /// Routed mode did exactly that: it re-read the sources at setup time to
+    /// pick its IPv6 resolver. The selection is now threaded in from
+    /// GuestBootInputs, and this keeps the single read single.
+    #[test]
+    fn only_guest_boot_inputs_reads_the_resolv_conf_sources() {
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            {
+                let path = entry.expect("readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, hits);
+                    continue;
+                }
+                // This module defines the reader and exercises it in its own
+                // tests, so it is not a launch-path caller.
+                if path.extension().is_none_or(|ext| ext != "rs")
+                    || path.ends_with("network/mod.rs")
+                {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                for line in body.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                    if line.contains("ResolvSource::read") {
+                        hits.push(format!("{}: {}", path.display(), line.trim()));
+                    }
+                }
+            }
+        }
+
+        let mut hits = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut hits,
+        );
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "the launch must read the sources exactly once, in \
+             GuestBootInputs::resolve, and thread the result to everything that \
+             needs it; found: {hits:?}"
+        );
+        assert!(
+            hits[0].contains("commands/podman/vm_config.rs"),
+            "the single read belongs to GuestBootInputs::resolve: {hits:?}"
+        );
+    }
+
     /// The read path against this host's real files. Whether it finds a server
     /// depends on the host, but anything it returns must be usable.
     #[test]
