@@ -31,6 +31,17 @@ fn join_with_timeout<T>(thread: JoinHandle<T>, timeout: Duration) -> bool {
     true
 }
 
+/// Does this /etc/fuse.conf let a non-root user mount with allow_other?
+///
+/// libfuse reads the file line by line and takes a line as the directive only
+/// when it IS the directive: `user_allow_other # comment`, `user_allow_others`
+/// and a commented-out line all leave allow_other unavailable, and a mount
+/// that asks for it anyway falls back to SessionACL::Owner. Surrounding
+/// whitespace is not part of the directive.
+pub fn fuse_conf_allows_other(contents: &str) -> bool {
+    contents.lines().any(|l| l.trim() == "user_allow_other")
+}
+
 /// Maximum retries for Session::new when kernel resources not yet released.
 const SESSION_NEW_MAX_RETRIES: u32 = 5;
 /// Delay between Session::new retries.
@@ -332,7 +343,7 @@ fn mount_internal<P: AsRef<Path>>(
     // Root can always use it; non-root needs user_allow_other in /etc/fuse.conf
     let is_root = unsafe { libc::geteuid() } == 0;
     let fuse_conf_allows = std::fs::read_to_string("/etc/fuse.conf")
-        .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
+        .map(|s| fuse_conf_allows_other(&s))
         .unwrap_or(false);
 
     let acl = if is_root || fuse_conf_allows {
@@ -572,7 +583,7 @@ fn mount_fuse_session<P: AsRef<Path>>(
     // Root can always use it; non-root needs user_allow_other in /etc/fuse.conf
     let is_root = unsafe { libc::geteuid() } == 0;
     let fuse_conf_allows = std::fs::read_to_string("/etc/fuse.conf")
-        .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
+        .map(|s| fuse_conf_allows_other(&s))
         .unwrap_or(false);
 
     let acl = if is_root || fuse_conf_allows {
@@ -635,4 +646,80 @@ fn mount_fuse_session<P: AsRef<Path>>(
 
     debug!(target: "fuse-pipe::client", "FUSE session exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuse_conf_allows_other;
+
+    /// The fresh-box quickstart tells a reader to add user_allow_other to
+    /// /etc/fuse.conf when a grep says it is absent, and names `make
+    /// test-unit` as what fails without it. If that grep accepts a file this
+    /// mount does not, the reader is told the box is configured while every
+    /// mount here still takes SessionACL::Owner, and the test the quickstart
+    /// cites keeps failing with nothing to change.
+    ///
+    /// RED BEFORE THE FIX: the documented `grep -q '^user_allow_other'`
+    /// accepted `user_allow_other # comment` and `user_allow_otherwise`,
+    /// which this file rejects, and rejected the two indented spellings,
+    /// which it accepts. Four of the ten cases below disagreed; the
+    /// assertion reports the first.
+    #[test]
+    fn the_quickstart_guard_accepts_exactly_what_this_mount_accepts() {
+        let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../.claude/CLAUDE.md");
+        let text = std::fs::read_to_string(&doc)
+            .unwrap_or_else(|e| panic!("BLOCKED: cannot read {}: {e}", doc.display()));
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("grep") && l.contains("user_allow_other"))
+            .unwrap_or_else(|| {
+                panic!("the quickstart's /etc/fuse.conf guard is gone from {}", doc.display())
+            });
+        // The guard is the test half of `<guard> || <append>`.
+        let guard = line.split("||").next().expect("a guard before the append").trim();
+        assert!(
+            guard.contains("/etc/fuse.conf"),
+            "the documented guard does not read /etc/fuse.conf: {guard}"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = dir.path().join("fuse.conf");
+        let cases = [
+            "user_allow_other\n",
+            "  user_allow_other  \n",
+            "\tuser_allow_other\n",
+            "user_allow_other # comment\n",
+            "user_allow_otherwise\n",
+            "#user_allow_other\n",
+            "# user_allow_other\n",
+            "mount_max = 1000\nuser_allow_other\n",
+            "mount_max = 1000\n",
+            "",
+        ];
+        for case in cases {
+            std::fs::write(&conf, case).expect("write fuse.conf");
+            let command = guard.replace("/etc/fuse.conf", conf.to_str().expect("utf-8 path"));
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .status()
+                .unwrap_or_else(|e| panic!("BLOCKED: cannot run the documented guard: {e}"));
+            // grep answers 0 (matched) or 1 (did not). Anything else is a
+            // guard that could not evaluate the file, which says nothing.
+            let code = status.code().unwrap_or_else(|| panic!("BLOCKED: {command} was signalled"));
+            assert!(
+                code == 0 || code == 1,
+                "BLOCKED: the documented guard exited {code} on {case:?}, so it evaluated nothing"
+            );
+            assert_eq!(
+                code == 0,
+                fuse_conf_allows_other(case),
+                "the quickstart's guard and this mount disagree about {case:?}: \
+                 the guard says {}, the mount says {}",
+                if code == 0 { "configured" } else { "not configured" },
+                if fuse_conf_allows_other(case) { "configured" } else { "not configured" },
+            );
+        }
+    }
 }

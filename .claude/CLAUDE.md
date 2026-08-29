@@ -570,6 +570,17 @@ sudo usermod -aG kvm $USER
 #     dies with "Error during unshare(...): Operation not permitted". Every
 #     long-lived fcvm box gets this from terraform (dev-user-data.tf), so the
 #     requirement was invisible to anyone following these steps by hand.
+#
+#     THIS IS FOR A DEDICATED fcvm OR CI BOX, and host isolation is the
+#     precondition for the whole quickstart. The two settings are host-wide:
+#     they let ANY local user create a user namespace and hold root inside it,
+#     which is what AppArmor's restriction exists to withhold, and they widen
+#     the kernel surface an unprivileged local account can reach (every
+#     CAP_SYS_ADMIN-gated interface a namespace makes available, and the
+#     userns-reachable bug classes behind them). On a box other people log in
+#     to, that is a boundary you are removing for them too. fcvm cannot run
+#     rootless without it, so the answer for a shared host is a separate box,
+#     not a narrower sysctl.
 sudo tee /etc/sysctl.d/99-fcvm.conf >/dev/null <<'SYSCTL'
 kernel.unprivileged_userns_clone=1
 kernel.apparmor_restrict_unprivileged_userns=0
@@ -582,7 +593,17 @@ sudo sysctl -p /etc/sysctl.d/99-fcvm.conf
 #     test_allow_other_with_fuse_conf, "Test requires user_allow_other in
 #     /etc/fuse.conf". CI and both test Containerfiles set it, so only a
 #     hand-built box is missing it.
-grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+#
+#     This is also host-wide: it lets any local user mount a FUSE filesystem
+#     other UIDs can read, which is the point here (pjdfstest switches uid
+#     across a fuse-pipe mount) and is another reason step 1b's dedicated box
+#     is the precondition.
+#
+#     The guard matches the directive and nothing else, because that is what
+#     fuse-pipe accepts (`l.trim() == "user_allow_other"`, mount.rs). A prefix
+#     match calls `user_allow_other # comment` configured while every mount
+#     still takes SessionACL::Owner and the test above keeps failing.
+grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
 
 # 2. Packages (Ubuntu 24.04). btrfs-progs is needed by the very next step;
 #    bc/bison/flex/libelf-dev are the kernel fallback build's dependencies —
