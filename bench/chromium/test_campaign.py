@@ -21,6 +21,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -803,6 +804,64 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                                 f"a stale replay log was accepted\n{result.stdout}")
             self.assertNotIn("VERIFIED", result.stdout)
 
+    def _pin_the_clock(self, tmp, epoch: str) -> None:
+        """A `date` on PATH that answers `+%s` with one fixed second.
+
+        The bracket boundary and the queries around it are a sub-second
+        apart in the real thing, which no test can schedule. Pinning the
+        second the campaign sees makes "the preceding phase's query landed
+        in the second this bracket opened" an exact input rather than a
+        race. Every other `date` call reaches the real binary.
+        """
+        real = shutil.which("date")
+        self.assertIsNotNone(real, "date is missing; this test cannot evaluate anything")
+        path = os.path.join(tmp, "bin", "date")
+        with open(path, "w") as handle:
+            handle.write('#!/bin/bash\n'
+                         'if [ "${1:-}" = +%s ]; then echo "$FAKE_EPOCH"; exit 0; fi\n'
+                         f'exec {real} "$@"\n')
+        os.chmod(path, 0o755)
+
+    def test_a_query_from_the_phase_before_the_bracket_cannot_answer_for_it(self):
+        """The boundary has to separate the two ends of one second.
+
+        `date +%s` truncates, so a query the preceding phase made 0.4 s
+        before the bracket opened carries a ts at or above the second the
+        bracket recorded, and satisfied it. The settle wait, the golden and
+        the diag all render the same corpus names immediately before a
+        bracket runs, so this is the ordinary case, not a contrived one.
+        The boundary is the replay log's own length instead: everything this
+        bracket provoked is appended after it.
+
+        RED BEFORE THE FIX: `a query from the phase before the bracket was
+        accepted` -- exit 0 and VERIFIED, against a log whose every line was
+        written before run_verify was called.
+        """
+        urls = self._urls()
+        epoch = "1755000000"
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._pin_the_clock(tmp, epoch)
+            env["FAKE_EPOCH"] = epoch
+            with open(os.path.join(results, "corpus-dns.log"), "w") as handle:
+                for host in self._hosts_of(urls):
+                    handle.write(json.dumps({
+                        "ts": float(epoch) + 0.4, "peer": "127.0.0.1:41552",
+                        "qname": host, "qtype": 1, "answer": "10.0.2.2"}) + "\n")
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            # The clone this bracket stands for asked the replay server
+            # nothing at all.
+            env["MAKE_DNS_QNAMES"] = ""
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a query from the phase before the bracket was accepted\n"
+                + result.stdout)
+            self.assertNotIn("VERIFIED", result.stdout)
+
     def test_a_passing_bracket_records_what_the_replay_served(self):
         """The count is the record that the two ends of the query met. Without
         a file saying so, a later reader has HOP D's answer and nothing that
@@ -1161,7 +1220,9 @@ read -r _ < "$GO"
                       "a campaign that dies mid-run leaks the replay server")
 
     BRACKETS = ("pre", "before-run", "after-run")
-    REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log")
+    # The two logs the replay server writes, and the campaign's own record of
+    # what each bracket saw it serve. dns-evidence.json hashes all three.
+    REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log", "replay-queries.log")
 
     RUN_ID = "20260828-000000-corpus"
 
@@ -1383,23 +1444,35 @@ wait_sampler_gone() {
     def test_a_missing_or_empty_replay_log_is_unclean(self):
         """The replay server's own logs are the other half of the evidence;
         a null hash was recorded without lowering the verdict.
+        replay-queries.log is held to the same rule: it is the only record
+        tying each bracket's window to the queries this server received, and
+        campaign_summary refuses a run that cannot produce it, so a verdict
+        written without it names a run that can never be published.
 
         RED BEFORE THE FIX: verdict clean with corpus_dns_log_sha256 null.
+
+        RED BEFORE THE SECOND FIX (replay-queries.log): `'clean' != 'unclean'`
+        for both the missing and the empty case.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            env, results = self._fakes(tmp)
-            self._leave_files(results, logs=("corpus-access.log",))
-            evidence, _ = self._sample(env, results, files=False)
-            self.assertEqual(evidence["verdict"], "unclean", evidence)
-            self.assertIsNone(evidence["corpus_dns_log_sha256"])
-            self.assertIn("corpus-dns.log", evidence["reason"])
-        with tempfile.TemporaryDirectory() as tmp:
-            env, results = self._fakes(tmp)
-            self._leave_files(results)
-            open(os.path.join(results, "corpus-access.log"), "w").close()
-            evidence, _ = self._sample(env, results, files=False)
-            self.assertEqual(evidence["verdict"], "unclean", evidence)
-            self.assertIn("corpus-access.log", evidence["reason"])
+        for name in self.REPLAY_LOGS:
+            field = name.rsplit(".", 1)[0].replace("-", "_") + "_log_sha256"
+            with self.subTest(log=name, state="missing"), \
+                    tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                self._leave_files(
+                    results, logs=[o for o in self.REPLAY_LOGS if o != name])
+                evidence, _ = self._sample(env, results, files=False)
+                self.assertEqual(evidence["verdict"], "unclean", evidence)
+                self.assertIsNone(evidence[field])
+                self.assertIn(name, evidence["reason"])
+            with self.subTest(log=name, state="empty"), \
+                    tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                self._leave_files(results)
+                open(os.path.join(results, name), "w").close()
+                evidence, _ = self._sample(env, results, files=False)
+                self.assertEqual(evidence["verdict"], "unclean", evidence)
+                self.assertIn(name, evidence["reason"])
 
     def test_a_sampler_that_died_mid_run_is_unclean(self):
         """One clean sample followed by a dead sampler was accepted: the
@@ -1471,8 +1544,9 @@ wait_sampler_gone() {
                 self.assertIn("cannot write", result.stderr,
                               f"the failed {tool} was not what made the verdict unclean")
                 self.assertEqual(sorted(os.listdir(results)),
-                                 sorted(["analysis.json", "dns-owner.log", "corpus-dns.log",
-                                         "corpus-access.log", "corpus-serve.status"]
+                                 sorted(["analysis.json", "dns-owner.log",
+                                         "corpus-serve.status"]
+                                        + list(self.REPLAY_LOGS)
                                         + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
                                  "a partial evidence file or temp file was left behind")
 

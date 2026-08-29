@@ -157,28 +157,29 @@ say() { printf '\n=== %s\n' "$*"; }
 #      any load event took longer than DIAG_MAX_LOAD_MS
 #      ($RESULTS/diag/summary.json).
 #   1b. every bracket then requires this campaign's corpus_serve to have
-#      LOGGED a query for every corpus host while the bracket ran
-#      ($RESULTS/replay-queries.log). HOP D reads the answer; this reads the
-#      other end of the same query, so an answer that came from anywhere else
-#      (a corpus_serve leaked from an earlier campaign, an /etc/hosts baked
-#      into the golden, a resolver cache in the clone) fails the bracket. The
-#      peer address cannot carry that evidence: pasta translates the guest's
-#      source to host loopback for a loopback destination (fwd_nat_from_tap,
-#      fwd.c), so every guest query is logged from 127.0.0.1, with only the
-#      guest's UDP source port preserved. The bracket's time window and the
-#      set of names are what tie the queries to the clone.
+#      LOGGED a query for every corpus host in the rows its DNS log grew by
+#      while the bracket ran ($RESULTS/replay-queries.log). HOP D reads the
+#      answer; this reads the other end of the same query, so an answer that
+#      came from anywhere else (a corpus_serve leaked from an earlier
+#      campaign, an /etc/hosts baked into the golden, a resolver cache in the
+#      clone) fails the bracket. The peer address cannot carry that evidence:
+#      pasta translates the guest's source to host loopback for a loopback
+#      destination (fwd_nat_from_tap, fwd.c), so every guest query is logged
+#      from 127.0.0.1, with only the guest's UDP source port preserved. The
+#      rows the bracket added and the set of names are what tie the queries
+#      to the clone.
 #   2. a sampler names the owner of 127.0.0.1:53, the dnsmasq state and the
 #      1-min load every DNS_SAMPLE_INTERVAL seconds while the run is in
 #      flight ($RESULTS/dns-owner.log). The quiet gate reads the load once,
 #      before the run; the samples are what says it stayed quiet.
 #   3. $RESULTS/dns-evidence.json ties them together with each bracket's
 #      sha256 (verify_file_sha256), the replay server's own DNS and access
-#      logs (sha256), its exit status
+#      logs and the per-bracket replay-queries.log (sha256), its exit status
 #      (corpus_serve_exit_status, from $RESULTS/corpus-serve.status), the
 #      maximum 1-min load over the samples (load_max_1min), and a verdict:
 #      "clean" only when all three brackets are present and passed, every
 #      sample names this campaign's corpus_serve with dnsmasq inactive, the
-#      sampler lived until the run ended, both replay logs exist, the server
+#      sampler lived until the run ended, all three replay logs exist, the server
 #      exited 0 (its logs are complete only then), and dnsmasq is inactive
 #      after the clone restores.
 engine_target() {
@@ -202,9 +203,15 @@ corpus_hosts() {
 # address to host loopback whenever the destination is loopback
 # (fwd_nat_from_tap in fwd.c), so guest queries and the campaign's own host-side
 # dig are both logged from 127.0.0.1. What ties a query to the bracket is the
-# window it arrived in and the name it asked for.
+# rows the log grew by while it ran, and the names those rows asked for.
 #
-# $1 = stage, $2 = epoch seconds captured before the bracket ran.
+# The boundary is the log's length, not a clock reading. `date +%s` truncates,
+# so a query the preceding phase made a fraction of a second before the bracket
+# opened carries a ts at or above the second the bracket would record, and
+# answers for it. The settle wait, the golden and the diag all render these
+# same names immediately before a bracket runs.
+#
+# $1 = stage, $2 = rows the log held when the bracket opened.
 verify_replay_answered_the_guest() {
     local stage="$1" since="$2" log="$RESULTS/corpus-dns.log"
     local seen missing queries wanted
@@ -215,23 +222,34 @@ verify_replay_answered_the_guest() {
     fi
     # A jq that cannot read the log fails the bracket rather than reporting an
     # empty query set, which would read as "nothing asked" either way.
-    seen=$(jq -r --argjson since "$since" \
-            'select((.ts | type) == "number" and .ts >= $since) | .qname' "$log" 2>/dev/null | sort -u) \
+    seen=$(replay_qnames_since "$log" "$since" | sort -u) \
         || { echo "FAILED: verify ($stage): cannot read the replay DNS log $log" >&2; return 1; }
-    queries=$(jq -r --argjson since "$since" \
-            'select((.ts | type) == "number" and .ts >= $since) | .qname' "$log" 2>/dev/null | wc -l) \
-        || queries=0
+    queries=$(replay_qnames_since "$log" "$since" | wc -l) || queries=0
     missing=$(comm -23 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | paste -sd, -)
-    printf '%s since=%s queries=%s hosts_seen=%s/%s missing=%s\n' \
+    printf '%s since_row=%s queries=%s hosts_seen=%s/%s missing=%s\n' \
         "$stage" "$since" "$queries" \
         "$(comm -12 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | wc -l)" \
         "$(printf '%s\n' "$wanted" | wc -l)" "${missing:-none}" \
         >>"$RESULTS/replay-queries.log"
     if [ -n "$missing" ]; then
-        echo "FAILED: verify ($stage): this campaign's replay server logged no query for $missing since $since, so the clone's answers for those names did not come from it" >&2
+        echo "FAILED: verify ($stage): this campaign's replay server logged no query for $missing after row $since, so the clone's answers for those names did not come from it" >&2
         return 1
     fi
     say "verify ($stage): replay served $queries queries covering every corpus host"
+}
+
+replay_log_rows() {
+    # The replay DNS log's length now. corpus_serve writes each row with one
+    # flushed write under a lock (JsonlLog), so this counts whole rows.
+    local log="$RESULTS/corpus-dns.log" n=0
+    if [ -f "$log" ]; then n=$(wc -l <"$log"); fi
+    printf '%s' "$((n))"
+}
+
+replay_qnames_since() {
+    # $1 = the replay DNS log, $2 = rows to skip. A row jq cannot parse fails
+    # the pipeline, and so the bracket.
+    tail -n +"$(($2 + 1))" "$1" | jq -r 'select((.qname | type) == "string") | .qname' 2>/dev/null
 }
 
 run_verify() {
@@ -239,11 +257,11 @@ run_verify() {
     # and its verify logs on every call, so each bracket copies its own out
     # under the stage name. A bracket passes only when the sub-make exits 0
     # AND the evidence it left says passed=true.
-    local stage="$1" copy="$RESULTS/verify-dns-$1.json" f started
-    # Before the sub-make: every query the bracket provokes lands at or after
-    # this second. `date +%s` truncates, so the window can only open early,
-    # which cannot admit a query from a later bracket.
-    started=$(date +%s)
+    local stage="$1" copy="$RESULTS/verify-dns-$1.json" f since_row
+    # Before the sub-make: the replay log's length. Every query the bracket
+    # provokes is appended after this row, and nothing an earlier phase asked
+    # for is.
+    since_row=$(replay_log_rows)
     # Every check below is a claim about a list of names, and every one of
     # them is vacuously true when the list is empty: jq's `all` over an empty
     # array is true, and "the replay answered for every corpus host" holds
@@ -285,7 +303,7 @@ run_verify() {
         and all($hosts | split(",")[]; . as $h | $e.hosts[$h].ok == true)
         and all($urls | split(",")[]; . as $u | $e.urls[$u].ok == true)' "$copy" >/dev/null \
         || { echo "FAILED: verify ($stage): $copy does not record passed=true through 10.0.2.2 with proxies disabled for every corpus host and URL" >&2; return 1; }
-    verify_replay_answered_the_guest "$stage" "$started" || return 1
+    verify_replay_answered_the_guest "$stage" "$since_row" || return 1
 }
 
 run_diag() {
@@ -481,7 +499,11 @@ write_dns_evidence() {
             verify_sha='{}'
         fi
     done
-    for f in corpus-dns.log corpus-access.log; do
+    # The two logs the replay server writes, and this campaign's record of what
+    # each bracket saw it serve. campaign_summary refuses a run that cannot
+    # produce all three, so a verdict written without one names a run that can
+    # never be published.
+    for f in corpus-dns.log corpus-access.log replay-queries.log; do
         if [ ! -s "$RESULTS/$f" ]; then
             verdict=unclean; reason="${reason:-replay log $f is missing or empty}"
         fi

@@ -99,9 +99,15 @@ SEAL_FIELDS = (
     "snapshot_config_sha256",
 )
 WITHDRAWN_MARKER = "WITHDRAWN"
+# The replay evidence a run must still carry to be indexable: the two logs the
+# replay server writes, and the campaign's own per-bracket record of what it
+# was asked for. That third file is the only thing tying each bracket's window
+# to the queries this server received, so a run that lost it cannot be read
+# back to check the brackets against.
 REPLAY_LOGS = {
     "corpus_dns_log_sha256": "corpus-dns.log",
     "corpus_access_log_sha256": "corpus-access.log",
+    "replay_queries_log_sha256": "replay-queries.log",
 }
 
 

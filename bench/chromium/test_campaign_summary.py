@@ -65,6 +65,7 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "!results/**/dns-owner.log",
         "!results/**/corpus-dns.log",
         "!results/**/corpus-access.log",
+        "!results/**/replay-queries.log",
         "!results/**/campaign-*-summary.json",
         "!results/**/WITHDRAWN",
     )
@@ -78,6 +79,7 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "results/run-x/dns-owner.log",
         "results/run-x/corpus-dns.log",
         "results/run-x/corpus-access.log",
+        "results/run-x/replay-queries.log",
         "results/campaign-x-summary.json",
         "results/campaign-x/campaign-x-summary.json",
         "results/run-x/WITHDRAWN",
@@ -123,7 +125,13 @@ class EvidenceIgnoreRules(unittest.TestCase):
 
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
-CORPUS_LOGS = ("corpus-dns.log", "corpus-access.log")
+# The replay server's own logs plus the campaign's per-bracket record of what
+# it served, with the line each carries in a run directory.
+CORPUS_LOGS = {
+    "corpus-dns.log": '{"ts": 1.0, "qname": "example.com"}\n',
+    "corpus-access.log": '{"ts": 1.0, "path": "/", "status": 200}\n',
+    "replay-queries.log": "pre since_row=0 queries=14 hosts_seen=14/14 missing=none\n",
+}
 # The seal identity reqbench.py stamps into every record's meta and
 # reqanalyze carries into the cell: the runtime bundle reqbench.sh sealed,
 # the binaries and sources hashed into it, the source revision, and the
@@ -311,10 +319,10 @@ def write_run(
             verify_files.append(verify_path)
             verify_hashes[f"verify-dns-{stage}.json"] = sha256_file(verify_path)
         hashes = {}
-        for name in CORPUS_LOGS:
+        for name, line in CORPUS_LOGS.items():
             log_path = os.path.join(run_dir, name)
             with open(log_path, "w") as handle:
-                handle.write('{"ts": 1.0, "qname": "example.com"}\n')
+                handle.write(line)
             paths[name] = log_path
             hashes[name] = sha256_file(log_path)
         owner_log = os.path.join(run_dir, "dns-owner.log")
@@ -340,6 +348,7 @@ def write_run(
             "verify_file_sha256": verify_hashes,
             "corpus_dns_log_sha256": hashes["corpus-dns.log"],
             "corpus_access_log_sha256": hashes["corpus-access.log"],
+            "replay_queries_log_sha256": hashes["replay-queries.log"],
             "corpus_serve_exit_status": 0,
             "reason": None,
             "verdict": dns_verdict,
@@ -1393,18 +1402,47 @@ class CampaignSummary(unittest.TestCase):
         """The sha256 in the evidence pins the replay logs; a log that no
         longer matches is a log something appended to after the verdict.
 
+        replay-queries.log is one of them. It is the only record tying each
+        bracket's window to the queries this replay server received, so a run
+        that lost it or grew it after the verdict must not be indexable.
+
         RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote ...: 1 cell(s)
+
+        RED BEFORE THE SECOND FIX (replay-queries.log): the same, plus
+        `replay-queries.log is missing` never refused anything.
         """
-        with tempfile.TemporaryDirectory() as d:
-            run_dir = os.path.join(d, "run")
-            paths = write_run(run_dir)
-            with open(paths["corpus-dns.log"], "a") as handle:
-                handle.write('{"ts": 2.0, "qname": "late.example"}\n')
-            out = os.path.join(d, "campaign-x-summary.json")
-            rc, text = self._summarize(out, [run_dir])
-            self.assertNotEqual(rc, 0, text)
-            self.assertFalse(os.path.exists(out))
-            self.assertIn("corpus-dns.log", text)
+        for name in CORPUS_LOGS:
+            with self.subTest(log=name, change="appended"), \
+                    tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                paths = write_run(run_dir)
+                with open(paths[name], "a") as handle:
+                    handle.write("after the verdict\n")
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, text)
+                self.assertFalse(os.path.exists(out))
+                self.assertIn(name, text)
+            with self.subTest(log=name, change="removed"), \
+                    tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                paths = write_run(run_dir)
+                os.remove(paths[name])
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, text)
+                self.assertFalse(os.path.exists(out))
+                self.assertIn(name, text)
+            with self.subTest(log=name, change="unhashed"), \
+                    tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                field = "%s_log_sha256" % name.rsplit(".", 1)[0].replace("-", "_")
+                write_run(run_dir, evidence_overrides={field: None})
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, text)
+                self.assertFalse(os.path.exists(out))
+                self.assertIn(name, text)
 
     def test_clean_evidence_without_samples_or_a_live_sampler_refuses(self):
         """RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote ...: 1 cell(s) (x4)"""
