@@ -339,6 +339,27 @@ help:
 cargo-target-link:
 	@BTRFS_ROOT="$(BTRFS_ROOT)" "$(MAKEFILE_DIR)scripts/cargo-target-link.sh"
 
+# One lease per RECIPE, for the recipes that reach through target/ outside
+# Cargo.
+#
+# cargo-target-run.sh leases the published generation for the length of one
+# Cargo process. A concurrent make waiting to republish target/ is granted the
+# exclusive lease the moment that process exits, so a recipe that writes a file
+# through the link and then reads it back can read a generation its own build
+# never wrote. make runs a recipe line as `$(SHELL) $(.SHELLFLAGS) "<line>"`,
+# so naming the wrapper as a target-specific SHELL puts the whole line inside
+# one shared lease; each such line names the targets below, and
+# makefile_leases_every_raw_target_access pins that no raw target/ access is
+# left outside one.
+#
+# `private` keeps the wrapper off the prerequisites, whose recipes run before
+# target/ exists (cargo-target-link is what creates it). It is deliberately NOT
+# the Makefile-wide SHELL: that also governs parse-time $(shell ...) and every
+# recipe of every target, including in the scratch checkouts that
+# tests/test_dep_provenance.rs stages with a partial scripts/ directory, where
+# every recipe line then dies with `Error 127`.
+TARGET_LEASE_SHELL := $(MAKEFILE_DIR)scripts/cargo-target-run.sh
+
 # Disk space check - fails if either root or btrfs is too full
 # Requires 10GB free on root (for cargo target) and 15GB on btrfs (for VMs)
 check-disk: cargo-target-link
@@ -395,6 +416,7 @@ check-disk: cargo-target-link
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
+clean-test-data: private SHELL := $(TARGET_LEASE_SHELL)
 clean-test-data: build
 	@echo "==> Killing stale VM processes from previous runs..."
 	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
@@ -468,6 +490,14 @@ dep-provenance:
 # build targets therefore snapshot the provenance before their cargo
 # commands, re-derive it after, and fail on any difference instead of
 # logging a line about a tree cargo never saw.
+#
+# The cargo commands, the copy that reads their output back through target/,
+# and the config sync that runs the binary they produced are one recipe line,
+# so one lease covers all of it. The sync is best-effort (the config is
+# embedded at compile time and only needs pushing to the user config dir), so
+# `test -x` is what states that the binary must exist; `|| true` on the sync
+# would otherwise let `make build` report success with no target/release/fcvm.
+build: private SHELL := $(TARGET_LEASE_SHELL)
 build: cargo-target-link dep-provenance
 	@echo "==> Building..."
 	@set -e; \
@@ -480,9 +510,9 @@ build: cargo-target-link dep-provenance
 	if [ "$$before" != "$$after" ]; then \
 		printf 'ERROR: dependency provenance changed during the build\nbefore:\n%s\nafter:\n%s\n' "$$before" "$$after" >&2; \
 		exit 1; \
-	fi
-	@# Sync embedded config to user config dir (config is embedded at compile time)
-	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
+	fi; \
+	test -x target/release/fcvm; \
+	./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
 # Host-native tools used by the kernel-builder AMI/workflow. Unlike `build`,
 # this does not require a musl Rust target for the guest agent.
@@ -497,6 +527,7 @@ build-host-tools: cargo-target-link dep-provenance
 		exit 1; \
 	fi
 
+build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-mock
@@ -505,6 +536,7 @@ build-fc-mock: cargo-target-link
 	sudo install -m 755 target/release/fc-mock /usr/local/bin/fc-mock
 
 # Test that the release binary works without source tree (simulates cargo install)
+test-packaging: private SHELL := $(TARGET_LEASE_SHELL)
 test-packaging: build
 	@echo "==> Testing packaging (simulates cargo install)..."
 	./scripts/test-packaging.sh target/release/fcvm
@@ -529,6 +561,7 @@ _test-all: cargo-target-link
 	RUST_LOG="$(TEST_LOG)" \
 	$(TEST_CONFIG_WRAPPER) ./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
+_test-root: private SHELL := $(TARGET_LEASE_SHELL)
 _test-root: cargo-target-link
 	@if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
 		echo "==> WARNING: root-owned files in target/ (from sudo cargo?). Fixing ownership..."; \
@@ -697,6 +730,7 @@ setup-btrfs:
 	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks}
 	@sudo chown -R $$(id -un):$$(id -gn) $(CONTAINER_DATA_DIR)
 
+setup-default: private SHELL := $(TARGET_LEASE_SHELL)
 setup-default: build setup-btrfs
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$FREE_GB" ] && [ "$$FREE_GB" -lt 15 ]; then \
@@ -722,12 +756,14 @@ setup-default: build setup-btrfs
 # download) downloads it again and the job republishes the exact artifact the
 # operator asked to replace. A post-run existence check cannot catch that, since
 # a download leaves the same file. KERNEL_FILE names the artifact to assert on.
+release-default-kernel: private SHELL := $(TARGET_LEASE_SHELL)
 release-default-kernel: build setup-btrfs
 	@if [ "$(FORCE)" = "1" ] && [ -z "$(KERNEL_FILE)" ]; then 		echo "ERROR: FORCE=1 needs KERNEL_FILE=<vmlinux-...bin> to assert the rebuild produced it"; 		exit 1; 	fi
 	sudo ./target/release/fcvm setup --generate-config --force
 	@if [ "$(FORCE)" = "1" ]; then 		echo "==> FORCE: rebuilding from source, bypassing the published release"; 		sudo ./target/release/fcvm setup --kernel-profile default --force-build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	else 		sudo ./target/release/fcvm setup --kernel-profile default --build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	fi
 	@if [ -n "$(KERNEL_FILE)" ] && [ ! -f "/mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)" ]; then 		echo "ERROR: setup finished without producing /mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)"; 		ls -la /mnt/fcvm-btrfs/kernels/; 		exit 1; 	fi
 
+setup-fcvm: private SHELL := $(TARGET_LEASE_SHELL)
 setup-fcvm: setup-default
 	@echo "==> Running fcvm setup --kernel-profile nested..."
 	./target/release/fcvm setup --kernel-profile nested --build-kernels
@@ -736,6 +772,7 @@ setup-fcvm: setup-default
 
 # Build and install host kernel with all patches from kernel/patches/
 # Requires reboot to activate the new kernel
+install-host-kernel: private SHELL := $(TARGET_LEASE_SHELL)
 install-host-kernel: build setup-btrfs
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
@@ -747,6 +784,7 @@ container-setup-fcvm: container-build setup-btrfs
 	@sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/firecracker 2>/dev/null || true
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _setup-fcvm
 
+_setup-fcvm: private SHELL := $(TARGET_LEASE_SHELL)
 _setup-fcvm:
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$FREE_GB" ] && [ "$$FREE_GB" -lt 15 ]; then \
@@ -978,6 +1016,7 @@ require-clean-tree:
 		exit 2; \
 	fi
 
+bench-chromium-corpus: private SHELL := $(TARGET_LEASE_SHELL)
 bench-chromium-corpus: require-clean-tree build setup-default
 	@mkdir -p "$(dir $(CORPUS_RUN_DIR))"
 	@# Reserve, do not reuse: plain mkdir FAILS on collision. `mkdir -p` would
@@ -1089,6 +1128,7 @@ test-chromium-fault:
 #
 # Every cell and every publication gate is required: an accidental benchmark is
 # worse than no benchmark, so there are no defaults to fall back on.
+bench-chromium-scale: private SHELL := $(TARGET_LEASE_SHELL)
 bench-chromium-scale: build
 	@test -n "$(SCALE_RATES)" || (echo "ERROR: SCALE_RATES required (for example 2,4,8)"; exit 1)
 	@test -n "$(SCALE_BURSTS)" || (echo "ERROR: SCALE_BURSTS required (must be at least 5)"; exit 1)

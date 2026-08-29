@@ -119,24 +119,241 @@ any_fallback_payload() {
 # unpublished payload is unreachable (nothing but target/ ever names one) and
 # it sits on the root filesystem this indirection exists to keep free, while
 # nothing else reclaims it: the pruner enumerates a checkout's target/ and the
-# btrfs generations, never a checkout's other entries. A payload another
-# build still leases is kept, and stays unreachable.
+# btrfs generations, never a checkout's other entries. A payload another build
+# still leases is kept, and stays unreachable.
+#
+# Removal is destructive, so the walk is fd-relative and bounded. openat2 with
+# RESOLVE_BENEATH|NO_XDEV|NO_SYMLINKS refuses to leave the payload and refuses
+# to descend into a mount; a payload sits in the checkout for the length of an
+# outage, and the dentry of a mount placed under it can be the only reference
+# another namespace has to that data. A child whose device differs is the same
+# refusal for a file bind mount, which opens like an ordinary file.
+#
+# A payload owned by another uid is never removed. The container lane runs as
+# root against the same bind-mounted checkout, so a root-owned payload beside a
+# user-owned one is an ordinary state, and root is not stopped by permissions.
+#
+# Ownership is decided on a stat of a name and the removal runs on a descriptor
+# opened from that same name, which is a second resolution. Both decisions are
+# therefore remade on the descriptor before anything is unlinked: its uid must
+# be this identity and its (st_dev, st_ino) must be the pair the check ran on.
+# Without that, a rename in between hands the walk a directory nothing checked,
+# and the comparison before the rmdir proves only that the name still resolves
+# to the replacement, so the foreign-owner guard is defeated and another
+# identity loses a tree.
+#
+# Every outcome is named. Failing the run is reserved for a payload this
+# identity owns and could not reclaim: nothing else enumerates it and its name
+# is never published again, so no later run clears it either, and each outage
+# cycle would leave one more tree on the root filesystem.
 discard_unpublished_fallbacks() {
-	local keep="${1:-}" entry lease_fd
-	for entry in "$LOCAL_TARGET_PREFIX".generation-*; do
-		[ -d "$entry" ] || continue
-		[ "$entry" != "$keep" ] || continue
-		exec {lease_fd}<"$entry" || continue
-		if ! flock -x -n "$lease_fd"; then
-			echo "==> WARNING: $entry is leased by another build and is not reclaimed" >&2
-		elif rm -rf -- "$entry"; then
-			echo "==> Reclaimed the unpublished fallback payload $entry" >&2
-		else
-			# Another uid's leftovers, say. It stays unreachable either way.
-			echo "==> WARNING: $entry cannot be removed and is not reclaimed" >&2
-		fi
-		exec {lease_fd}<&-
-	done
+	local keep="${1:-}"
+	/usr/bin/python3 -c '
+import ctypes
+import errno
+import fcntl
+import os
+import stat
+import sys
+
+checkout, prefix, keep = sys.argv[1:4]
+
+RESOLVE_NO_XDEV = 0x01
+RESOLVE_NO_MAGICLINKS = 0x02
+RESOLVE_NO_SYMLINKS = 0x04
+RESOLVE_BENEATH = 0x08
+SYS_OPENAT2 = 437
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+
+
+class OpenHow(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
+
+
+class MountBoundary(RuntimeError):
+    pass
+
+
+def open_beneath(parent_fd, name):
+    how = OpenHow(
+        flags=DIR_FLAGS,
+        mode=0,
+        resolve=(
+            RESOLVE_NO_XDEV
+            | RESOLVE_NO_MAGICLINKS
+            | RESOLVE_NO_SYMLINKS
+            | RESOLVE_BENEATH
+        ),
+    )
+    fd = libc.syscall(
+        ctypes.c_long(SYS_OPENAT2),
+        ctypes.c_int(parent_fd),
+        ctypes.c_char_p(os.fsencode(name)),
+        ctypes.byref(how),
+        ctypes.sizeof(how),
+    )
+    if fd >= 0:
+        return fd
+    code = ctypes.get_errno()
+    if code == errno.EXDEV:
+        raise MountBoundary(f"{name} is a mount point")
+    if code == errno.ENOSYS:
+        raise RuntimeError("openat2 is unavailable; refusing an unbounded removal")
+    raise OSError(code, os.strerror(code), name)
+
+
+def remove_directory(directory_fd, name, decided):
+    # rmdir takes a name, not a descriptor, so the identity behind the name is
+    # checked once more against the stat the removal was decided on.
+    final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (final.st_dev, final.st_ino) != (decided.st_dev, decided.st_ino):
+        raise RuntimeError(f"{name} changed identity while it was being reclaimed")
+    os.rmdir(name, dir_fd=directory_fd)
+
+
+def prune(directory_fd, device):
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if info.st_dev != device:
+            raise MountBoundary(f"{name} crosses a mount boundary")
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = open_beneath(directory_fd, name)
+            try:
+                # The name was resolved a second time to open it. Descend only
+                # into the directory the checks above were made about.
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise RuntimeError(
+                        f"{name} changed identity while it was being reclaimed"
+                    )
+                prune(child_fd, device)
+            finally:
+                os.close(child_fd)
+            remove_directory(directory_fd, name, info)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def report(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+failed = False
+checkout_fd = os.open(checkout, DIR_FLAGS)
+try:
+    for name in sorted(os.listdir(checkout_fd)):
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(checkout, name)
+        if path == keep:
+            continue
+        try:
+            info = os.stat(name, dir_fd=checkout_fd, follow_symlinks=False)
+        except OSError as error:
+            report(f"==> ERROR: cannot stat the fallback payload {path}: {error.strerror}")
+            failed = True
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            report(f"==> ERROR: the fallback payload {path} is not a directory; not reclaimed")
+            failed = True
+            continue
+        if info.st_uid != os.geteuid():
+            report(
+                f"==> WARNING: the fallback payload {path} is owned by uid {info.st_uid}, not "
+                f"{os.geteuid()}; it is not this identity to reclaim and stays on the root "
+                f"filesystem"
+            )
+            continue
+        try:
+            payload_fd = open_beneath(checkout_fd, name)
+        except MountBoundary as error:
+            report(f"==> ERROR: refusing to reclaim the fallback payload {path}: {error}")
+            failed = True
+            continue
+        except OSError as error:
+            report(
+                f"==> ERROR: cannot open the fallback payload {path} to reclaim it: "
+                f"{error.strerror}"
+            )
+            failed = True
+            continue
+        try:
+            # The ownership check above and the open are two resolutions of one
+            # name, and everything below acts on the descriptor. Remake both
+            # decisions on it: a rename in that window otherwise hands the walk
+            # a directory nothing checked, and the comparison before the rmdir
+            # would only prove the name still resolves to that replacement.
+            opened = os.fstat(payload_fd)
+            if opened.st_uid != os.geteuid():
+                report(
+                    f"==> ERROR: the fallback payload {path} is owned by uid {opened.st_uid} "
+                    f"once opened, not {os.geteuid()}; it changed identity between its "
+                    f"ownership check and the open and is not reclaimed"
+                )
+                failed = True
+                continue
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                report(
+                    f"==> ERROR: the fallback payload {path} changed identity between its "
+                    f"ownership check and the open ({info.st_dev}:{info.st_ino} is now "
+                    f"{opened.st_dev}:{opened.st_ino}); it is not reclaimed"
+                )
+                failed = True
+                continue
+            try:
+                fcntl.flock(payload_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                report(f"==> WARNING: {path} is leased by another build and is not reclaimed")
+                continue
+            prune(payload_fd, opened.st_dev)
+            remove_directory(checkout_fd, name, opened)
+        except (MountBoundary, OSError, RuntimeError) as error:
+            report(f"==> ERROR: cannot reclaim the fallback payload {path}: {error}")
+            failed = True
+        else:
+            report(f"==> Reclaimed the unpublished fallback payload {path}")
+        finally:
+            os.close(payload_fd)
+finally:
+    os.close(checkout_fd)
+raise SystemExit(1 if failed else 0)
+' "$p" "$(basename -- "$LOCAL_TARGET_PREFIX").generation-" "$keep"
+}
+
+# What does `target` resolve to, with the errno preserved? `[ -d target ]`
+# reports the same false for "nothing is published there" and for "resolving it
+# was refused", and only the first makes replacing the link safe: a build past
+# the checkout lock holds nothing but its generation lease, so dropping the
+# pathname without taking that lease splits it across two trees. Exit 0 is a
+# directory, 3 is proven absent (ENOENT/ENOTDIR), and every other status is a
+# resolution failure the caller must refuse on.
+target_resolution_state() {
+	local rc=0
+	/usr/bin/python3 -c '
+import errno
+import os
+import stat
+import sys
+
+try:
+    metadata = os.stat(sys.argv[1])
+except OSError as error:
+    if error.errno in (errno.ENOENT, errno.ENOTDIR):
+        raise SystemExit(3)
+    print(f"cannot resolve {sys.argv[1]}: {os.strerror(error.errno)}", file=sys.stderr)
+    raise SystemExit(4)
+if not stat.S_ISDIR(metadata.st_mode):
+    print(f"{sys.argv[1]} resolves to a non-directory", file=sys.stderr)
+    raise SystemExit(5)
+' "$1" || rc=$?
+	return "$rc"
 }
 
 publish_target_link() {
@@ -199,7 +416,12 @@ require_writable_local_target() {
 		exit 1
 	fi
 	rm -f -- "$probe"
-	discard_unpublished_fallbacks "$payload"
+	if ! discard_unpublished_fallbacks "$payload"; then
+		echo "ERROR: a fallback payload this run owns could not be reclaimed; nothing else \
+enumerates it and its name is never published again, so it stays on the root filesystem until \
+it is removed by hand" >&2
+		exit 1
+	fi
 }
 
 # Drops the checkout's managed target/ link; the generation stays for the
@@ -219,12 +441,23 @@ drop_managed_link() {
 		"$BTRFS_ROOT"/cargo-target/* | "$LOCAL_TARGET_PREFIX".generation-*) ;;
 		*) return 0 ;;
 	esac
-	if [[ -z ${old_target_lease_fd:-} ]] && [ -d target ]; then
-		if ! exec {old_target_lease_fd}<target; then
-			echo "ERROR: cannot open the published directory $linked to lease it; a running build may still hold it, refusing to replace target/" >&2
-			exit 1
-		fi
-		flock -x "$old_target_lease_fd"
+	if [[ -z ${old_target_lease_fd:-} ]]; then
+		local resolution=0
+		target_resolution_state target || resolution=$?
+		case "$resolution" in
+			0)
+				if ! exec {old_target_lease_fd}<target; then
+					echo "ERROR: cannot open the published directory $linked to lease it; a running build may still hold it, refusing to replace target/" >&2
+					exit 1
+				fi
+				flock -x "$old_target_lease_fd"
+				;;
+			3) ;;
+			*)
+				echo "ERROR: cannot tell whether target/ → $linked still publishes a directory (rc=$resolution); a running build may hold it, refusing to replace target/" >&2
+				exit 1
+				;;
+		esac
 	fi
 	case "$linked" in
 		"$LOCAL_TARGET_PREFIX".generation-*) return 0 ;;
@@ -233,15 +466,57 @@ drop_managed_link() {
 	rm -f -- target
 }
 
-fallback_to_local() {
-	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
-	drop_managed_link
-	# `--rotate` promises a clean target/; a retained link or directory, or a
-	# republished fallback payload, would report one while its payload survives.
-	if ((FORCE_ROTATE)) && { [ -L target ] || [ -d target ] || any_fallback_payload; }; then
+# True while every generation this checkout could publish is durably retired
+# or proven absent. Dropping a link is not a clean: the generation keeps its
+# payload, and the next run reuses an unretired one and republishes every byte
+# the clean reported gone. A generation whose state cannot be read is refused
+# for the same reason.
+managed_namespace_is_retired() {
+	local entry state fd rc
+	for entry in "$WT_TARGET" "$WT_TARGET".generation-*; do
+		state=0
+		target_resolution_state "$entry" || state=$?
+		case "$state" in
+			3) continue ;;
+			0) ;;
+			*)
+				echo "ERROR: cannot tell whether $entry still holds a payload (rc=$state)" >&2
+				return 1
+				;;
+		esac
+		if ! exec {fd}<"$entry"; then
+			echo "ERROR: cannot open $entry to read its retirement state" >&2
+			return 1
+		fi
+		rc=0
+		target_is_retired "$fd" || rc=$?
+		exec {fd}<&-
+		case "$rc" in
+			0) ;;
+			*)
+				echo "ERROR: $entry keeps its payload and is not retired (rc=$rc)" >&2
+				return 1
+				;;
+		esac
+	done
+	return 0
+}
+
+# `--rotate` promises a clean target/. A retained link or directory, a
+# republished fallback payload, or a managed generation that was never retired
+# would each report one while its payload survives.
+refuse_unsafe_rotation() {
+	((FORCE_ROTATE)) || return 0
+	if [ -L target ] || [ -d target ] || any_fallback_payload || ! managed_namespace_is_retired; then
 		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
 		exit 1
 	fi
+}
+
+fallback_to_local() {
+	echo "==> WARNING: $1; build artifacts stay on the root filesystem" >&2
+	drop_managed_link
+	refuse_unsafe_rotation
 	require_writable_local_target
 	exit 0
 }
@@ -363,21 +638,34 @@ if [ -e target ] && ! [ -L target ]; then
 fi
 
 candidate="$WT_TARGET"
-if [ -L target ] && [ -d target ]; then
+if [ -L target ]; then
 	linked="$(readlink target)"
 	# target/ is replaced only under an exclusive lease on the generation it
 	# publishes: a cargo wrapper past the checkout→target lock handoff holds
 	# only that lease, shared, and the flock below blocks until it is done. A
 	# generation that cannot be opened cannot be leased, so replacing it is
-	# refused; a 0333 generation still accepts cargo's writes.
-	if ! exec {old_target_lease_fd}<target; then
-		echo "ERROR: cannot open the published generation $linked to lease it; a running build may still hold it, refusing to replace target/" >&2
-		exit 1
-	fi
-	flock -x "$old_target_lease_fd"
-	case "$linked" in
-		"$WT_TARGET"|"$WT_TARGET".generation-*)
-			candidate="$linked"
+	# refused; a 0333 generation still accepts cargo's writes. A link that does
+	# not resolve publishes nothing and needs no lease, but only a PROVEN absent
+	# destination says so; a refused resolution is not the same answer.
+	resolution=0
+	target_resolution_state target || resolution=$?
+	case "$resolution" in
+		0)
+			if ! exec {old_target_lease_fd}<target; then
+				echo "ERROR: cannot open the published generation $linked to lease it; a running build may still hold it, refusing to replace target/" >&2
+				exit 1
+			fi
+			flock -x "$old_target_lease_fd"
+			case "$linked" in
+				"$WT_TARGET"|"$WT_TARGET".generation-*)
+					candidate="$linked"
+					;;
+			esac
+			;;
+		3) ;;
+		*)
+			echo "ERROR: cannot tell whether target/ → $linked still publishes a directory (rc=$resolution); a running build may hold it, refusing to replace target/" >&2
+			exit 1
 			;;
 	esac
 fi
@@ -460,10 +748,7 @@ if [[ -n ${candidate_lease_fd:-} && $candidate_lease_fd != "$final_lease_fd" ]];
 	exec {candidate_lease_fd}<&-
 fi
 else
-	if ((FORCE_ROTATE)) && { [ -d target ] || any_fallback_payload; }; then
-		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
-		exit 1
-	fi
+	refuse_unsafe_rotation
 	if ! [ -d "$BTRFS_ROOT" ]; then
 		echo "==> NOTE: $BTRFS_ROOT is not a directory; build artifacts stay on the root filesystem"
 	fi

@@ -2660,7 +2660,18 @@ fn persistent_runner_entrypoints_route_cargo_through_the_lease() {
 fn cargo_target_link_keeps_a_bind_mounted_target_when_btrfs_is_unwritable() {
     let checkout = tempfile::tempdir().expect("checkout tempdir");
     // The bind-mounted target/: a real directory that already exists.
-    std::fs::create_dir(checkout.path().join("target")).expect("pre-existing target/");
+    let target = checkout.path().join("target");
+    std::fs::create_dir(&target).expect("pre-existing target/");
+    // Retention is about THIS dentry. A run that deletes it and creates
+    // another writable directory in its place satisfies "target/ is a real
+    // directory" while the bind mount it carried is gone, so the identity and
+    // the contents are what the assertions read. Both are needed: a
+    // delete-and-recreate here reuses the same inode number, so it is the
+    // sentinel that catches it.
+    let sentinel = target.join("carried-by-the-mount");
+    std::fs::write(&sentinel, b"data only reachable through the mounted dentry")
+        .expect("write sentinel into the pre-existing target/");
+    let before = std::fs::symlink_metadata(&target).expect("stat the pre-existing target/");
 
     let unwritable_tmp = tempfile::tempdir().expect("btrfs stand-in");
     let btrfs_root: PathBuf = if nix_geteuid_is_root() {
@@ -2687,12 +2698,23 @@ fn cargo_target_link_keeps_a_bind_mounted_target_when_btrfs_is_unwritable() {
         "the recipe failed instead of keeping the existing target/ when the btrfs \
          volume is present but unwritable:\n{out}"
     );
-    let target = checkout.path().join("target");
     assert!(
         target.is_dir() && !target.is_symlink(),
         "target/ should have been kept as the real (bind-mounted) directory it was; \
          it is now {:?}\n{out}",
         std::fs::symlink_metadata(&target).map(|m| m.file_type())
+    );
+    let after = std::fs::symlink_metadata(&target).expect("stat the retained target/");
+    assert_eq!(
+        (before.dev(), before.ino()),
+        (after.dev(), after.ino()),
+        "target/ is a directory again but not the SAME one: dev/ino changed, so the dentry the \
+         bind mount was attached to was unlinked and replaced:\n{out}"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).ok().as_deref(),
+        Some(b"data only reachable through the mounted dentry".as_slice()),
+        "the retained target/ lost the contents it came in with:\n{out}"
     );
     assert_target_usable(checkout.path(), "unwritable btrfs volume");
 }
@@ -2899,44 +2921,7 @@ fn cargo_target_link_falls_back_when_the_managed_dir_cannot_be_opened() {
 /// cannot. Both tempdirs are handed to that uid, and scripts/ is copied where it
 /// can read them (the script sources cargo-target-lib.sh next to itself).
 fn run_link_unprivileged(dir: &Path, btrfs_root: &Path) -> (bool, String) {
-    use std::os::unix::fs::PermissionsExt as _;
-    if unsafe { libc::geteuid() } != 0 {
-        return run_link(dir, btrfs_root);
-    }
-    let tools = tempfile::tempdir().expect("tools tempdir");
-    std::fs::set_permissions(tools.path(), std::fs::Permissions::from_mode(0o755)).expect("0755");
-    let scripts = tools.path().join("scripts");
-    std::fs::create_dir(&scripts).expect("scripts dir");
-    for name in ["cargo-target-link.sh", "cargo-target-lib.sh"] {
-        std::fs::copy(repo_root().join("scripts").join(name), scripts.join(name)).expect(name);
-    }
-    std::fs::set_permissions(
-        scripts.join("cargo-target-link.sh"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .expect("0755");
-    for owned in [dir, btrfs_root] {
-        let chowned = Command::new("chown")
-            .args(["-R", "65534:65534"])
-            .arg(owned)
-            .status()
-            .expect("chown -R");
-        assert!(chowned.success(), "hand {} to uid 65534", owned.display());
-    }
-    let out = Command::new("setpriv")
-        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
-        .arg(scripts.join("cargo-target-link.sh"))
-        .env("BTRFS_ROOT", btrfs_root)
-        .env_remove("CARGO_TARGET_LINK_LOCKED")
-        .current_dir(dir)
-        .output()
-        .expect("run scripts/cargo-target-link.sh as uid 65534");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.success(), text)
+    run_link_unprivileged_with(dir, btrfs_root, &[])
 }
 
 /// `run_link` with extra script arguments (`--rotate`).
@@ -3587,5 +3572,1127 @@ fn cargo_target_link_publishes_a_fresh_fallback_after_a_clean() {
     assert_ne!(
         republished, first_payload,
         "run 4 reused an earlier outage's payload instead of publishing a fresh one:\n{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reclaiming a fallback payload, and dropping a link, are destructive acts.
+// ---------------------------------------------------------------------------
+
+/// `run_link_with`, but as uid 65534 when the tests are root: root can open and
+/// write any directory, so a fixture about permissions must run as someone who
+/// cannot. Both tempdirs are handed to that uid, and scripts/ is copied where
+/// it can read them (the script sources cargo-target-lib.sh next to itself). A
+/// btrfs root that does not exist is the volume-is-gone fixture and is left
+/// alone.
+fn run_link_unprivileged_with(dir: &Path, btrfs_root: &Path, args: &[&str]) -> (bool, String) {
+    if unsafe { libc::geteuid() } != 0 {
+        return run_link_with(dir, btrfs_root, args);
+    }
+    let tools = tempfile::tempdir().expect("tools tempdir");
+    std::fs::set_permissions(tools.path(), std::fs::Permissions::from_mode(0o755)).expect("0755");
+    let scripts = tools.path().join("scripts");
+    std::fs::create_dir(&scripts).expect("scripts dir");
+    for name in ["cargo-target-link.sh", "cargo-target-lib.sh"] {
+        std::fs::copy(repo_root().join("scripts").join(name), scripts.join(name)).expect(name);
+    }
+    std::fs::set_permissions(
+        scripts.join("cargo-target-link.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("0755");
+    for owned in [dir, btrfs_root] {
+        if !owned.exists() {
+            continue;
+        }
+        let chowned = Command::new("chown")
+            .args(["-R", "65534:65534"])
+            .arg(owned)
+            .status()
+            .expect("chown -R");
+        assert!(chowned.success(), "hand {} to uid 65534", owned.display());
+    }
+    let out = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg(scripts.join("cargo-target-link.sh"))
+        .args(args)
+        .env("BTRFS_ROOT", btrfs_root)
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(dir)
+        .output()
+        .expect("run scripts/cargo-target-link.sh as uid 65534");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// Stage a checkout that has been through a volume outage: `target/` publishes
+/// a checkout-local fallback payload. Returns that payload.
+#[cfg(feature = "privileged-tests")]
+fn stage_outage_fallback(checkout: &Path, absent_volume: &Path) -> PathBuf {
+    let (ok, out) = run_link(checkout, absent_volume);
+    assert!(ok, "the outage run failed:\n{out}");
+    assert_local_fallback_link(checkout, absent_volume, "volume down")
+}
+
+/// Reclaiming an unpublished payload must not cross a mount boundary.
+///
+/// `rm -rf` descends into whatever is mounted underneath and unlinks it. A
+/// payload sits in the checkout for the life of an outage, which is exactly
+/// when a bind mount can be placed under it; the data behind that mount belongs
+/// to someone else and its dentry may be the only reference another mount
+/// namespace has. The reclaim must refuse to descend and say so.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn cargo_target_link_refuses_to_reclaim_a_payload_across_a_mount_boundary() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let payload = stage_outage_fallback(checkout.path(), &btrfs);
+
+    let source = tempfile::tempdir().expect("bind source");
+    let sentinel = source.path().join("must-survive");
+    std::fs::write(&sentinel, b"mounted data").expect("write mounted sentinel");
+    let mountpoint = payload.join("mounted-source");
+    std::fs::create_dir_all(&mountpoint).expect("mountpoint inside the payload");
+    let status = Command::new("mount")
+        .args([
+            std::ffi::OsStr::new("--bind"),
+            source.path().as_os_str(),
+            mountpoint.as_os_str(),
+        ])
+        .status()
+        .expect("run bind mount");
+    assert!(status.success(), "bind mount failed: {status:?}");
+    let mount = BindMountGuard(mountpoint.clone());
+
+    std::fs::create_dir_all(&btrfs).expect("the volume comes back");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+
+    assert!(
+        sentinel.exists(),
+        "reclaiming {payload:?} crossed the bind mount at {mountpoint:?} and deleted unrelated \
+         mounted data:\n{out}"
+    );
+    assert!(
+        !ok,
+        "a payload the run could not reclaim was reported as a successful setup; it stays on \
+         the root filesystem this indirection exists to keep free:\n{out}"
+    );
+    assert!(
+        out.contains(&payload.display().to_string()),
+        "the refusal does not name the payload that was left behind:\n{out}"
+    );
+    mount.unmount();
+}
+
+/// A payload owned by another uid is never reclaimed, and never silently.
+///
+/// The container lane runs as root against a bind-mounted checkout, so a
+/// payload written there is root-owned on the host. Removing another identity's
+/// tree is not this script's business, and root can do it without noticing.
+/// Refusing is right; refusing without a word is what lets payloads accumulate.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn cargo_target_link_refuses_to_reclaim_a_payload_owned_by_another_user() {
+    assert!(
+        nix_geteuid_is_root(),
+        "BLOCKED: this fixture needs root to create a payload owned by another uid"
+    );
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let ours = stage_outage_fallback(checkout.path(), &btrfs);
+
+    let foreign = checkout
+        .path()
+        .join(".cargo-target-local.generation-foreign");
+    std::fs::create_dir(&foreign).expect("foreign payload");
+    let sentinel = foreign.join("must-survive");
+    std::fs::write(&sentinel, b"another identity's build").expect("write foreign sentinel");
+    let chowned = Command::new("chown")
+        .args(["-R", "65534:65534"])
+        .arg(&foreign)
+        .status()
+        .expect("chown -R");
+    assert!(chowned.success(), "hand the foreign payload to uid 65534");
+
+    std::fs::create_dir_all(&btrfs).expect("the volume comes back");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+
+    assert!(
+        sentinel.exists(),
+        "the reclaim removed a payload owned by uid 65534:\n{out}"
+    );
+    assert!(
+        out.contains(&foreign.display().to_string()),
+        "a payload that cannot be reclaimed was passed over without a word, so nothing tells an \
+         operator why the root filesystem keeps filling:\n{out}"
+    );
+    assert!(
+        ok,
+        "a foreign-owned payload failed the run; a checkout shared by the host user and the \
+         container root would then never build again:\n{out}"
+    );
+    assert!(
+        !ours.exists(),
+        "our own unpublished payload {ours:?} was left behind:\n{out}"
+    );
+}
+
+/// Run the script with the reclaim's ownership check and its open of `victim`
+/// separated by a rename, so the descriptor the reclaim goes on to prune is
+/// never the directory that check approved.
+///
+/// The interleave is by construction, not by timing: the swap runs inside the
+/// `os.stat` call whose result the ownership check reads, so the open that
+/// follows can only ever see the replacement. The hook is a `sitecustomize`
+/// module on `PYTHONPATH`, which CPython imports before it runs the reclaim, so
+/// the script, its walk and its removal are the real ones.
+fn run_link_with_payload_swapped_after_its_check(
+    dir: &Path,
+    btrfs_root: &Path,
+    victim: &str,
+    replacement: &Path,
+) -> (bool, String) {
+    let hook_dir = tempfile::tempdir().expect("hook tempdir");
+    std::fs::set_permissions(hook_dir.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("0755");
+    let checkout = dir.to_string_lossy().into_owned();
+    let replacement_path = replacement.to_string_lossy().into_owned();
+    let program = format!(
+        r#"import os
+
+_real_stat = os.stat
+_checkout = {checkout:?}
+_victim = {victim:?}
+_replacement = {replacement_path:?}
+_moved_aside = os.path.join(_checkout, "payload-moved-aside")
+_marker = os.path.join(_checkout, "swap-performed")
+
+
+def _stat(path, *args, dir_fd=None, follow_symlinks=True, **kwargs):
+    info = _real_stat(path, *args, dir_fd=dir_fd, follow_symlinks=follow_symlinks, **kwargs)
+    if dir_fd is not None and path == _victim and not os.path.lexists(_marker):
+        os.rename(os.path.join(_checkout, _victim), _moved_aside)
+        os.rename(_replacement, os.path.join(_checkout, _victim))
+        with open(_marker, "w") as handle:
+            handle.write("swapped\n")
+    return info
+
+
+os.stat = _stat
+"#
+    );
+    std::fs::write(hook_dir.path().join("sitecustomize.py"), program).expect("write the hook");
+    let out = Command::new(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs_root)
+        .env("PYTHONPATH", hook_dir.path())
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(dir)
+        .output()
+        .expect("run scripts/cargo-target-link.sh");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// Assert the swapped-in tree came through the run whole.
+fn assert_bystander_survived(swapped: &Path, before: &std::fs::Metadata, out: &str) {
+    assert!(
+        swapped.is_dir(),
+        "the reclaim removed {swapped:?}, the tree renamed onto the payload name after the \
+         ownership check approved a different directory:\n{out}"
+    );
+    let sentinel = swapped.join("must-survive");
+    let contents = std::fs::read(&sentinel).unwrap_or_else(|error| {
+        panic!(
+            "the reclaim pruned {sentinel:?}, so a tree its ownership check never saw was \
+             erased: {error}\n{out}"
+        )
+    });
+    assert_eq!(
+        contents, b"a tree the reclaim never checked",
+        "the reclaim rewrote the contents of a tree its ownership check never saw:\n{out}"
+    );
+    let after = std::fs::symlink_metadata(swapped).expect("stat the swapped-in tree");
+    assert_eq!(
+        (after.dev(), after.ino()),
+        (before.dev(), before.ino()),
+        "the swapped-in tree was removed and something else took its name; the reclaim acted \
+         on it under a check made about a different inode:\n{out}"
+    );
+}
+
+/// A payload's ownership check and the open that follows are two separate
+/// resolutions of one pathname. A rename in between hands the reclaim a
+/// descriptor for a directory nothing checked, and the comparison further down
+/// only proves the pathname still names that replacement, so its tree is pruned
+/// and removed on the strength of a check made about a different inode.
+#[test]
+fn cargo_target_link_refuses_a_payload_whose_identity_changed_before_it_was_opened() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let victim_name = ".cargo-target-local.generation-victim";
+    std::fs::create_dir(checkout.path().join(victim_name)).expect("unpublished payload");
+    let bystander = checkout.path().join("bystander");
+    std::fs::create_dir(&bystander).expect("bystander tree");
+    std::fs::write(
+        bystander.join("must-survive"),
+        b"a tree the reclaim never checked",
+    )
+    .expect("write the bystander sentinel");
+    let before = std::fs::symlink_metadata(&bystander).expect("stat the bystander");
+
+    let (ok, out) = run_link_with_payload_swapped_after_its_check(
+        checkout.path(),
+        btrfs.path(),
+        victim_name,
+        &bystander,
+    );
+
+    assert!(
+        checkout.path().join("swap-performed").is_file(),
+        "the swap never happened, so this run says nothing about the window it is about:\n{out}"
+    );
+    let swapped = checkout.path().join(victim_name);
+    assert_bystander_survived(&swapped, &before, &out);
+    assert!(
+        out.contains(&swapped.display().to_string()),
+        "a payload the reclaim refused was passed over without naming it:\n{out}"
+    );
+    assert!(
+        out.contains("changed identity"),
+        "the refusal does not say why the payload was left alone:\n{out}"
+    );
+    assert!(
+        !ok,
+        "the run reported success while a payload it owns went unreclaimed; nothing else \
+         enumerates it and its name is never published again:\n{out}"
+    );
+}
+
+/// The same window, defeating the guard it exists for. A payload owned by
+/// another uid is never removed, and the container lane runs as root against
+/// the same bind-mounted checkout, so root is not stopped by permissions once
+/// the check has been made about a different inode.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn cargo_target_link_refuses_a_payload_swapped_for_another_users_tree() {
+    assert!(
+        nix_geteuid_is_root(),
+        "BLOCKED: this fixture needs root to stage a tree owned by another uid"
+    );
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let victim_name = ".cargo-target-local.generation-victim";
+    std::fs::create_dir(checkout.path().join(victim_name)).expect("unpublished payload");
+    let foreign = checkout.path().join("another-identitys-tree");
+    std::fs::create_dir(&foreign).expect("foreign tree");
+    std::fs::write(
+        foreign.join("must-survive"),
+        b"a tree the reclaim never checked",
+    )
+    .expect("write the foreign sentinel");
+    let chowned = Command::new("chown")
+        .args(["-R", "65534:65534"])
+        .arg(&foreign)
+        .status()
+        .expect("chown -R");
+    assert!(chowned.success(), "hand the foreign tree to uid 65534");
+    let before = std::fs::symlink_metadata(&foreign).expect("stat the foreign tree");
+
+    let (ok, out) = run_link_with_payload_swapped_after_its_check(
+        checkout.path(),
+        btrfs.path(),
+        victim_name,
+        &foreign,
+    );
+
+    assert!(
+        checkout.path().join("swap-performed").is_file(),
+        "the swap never happened, so this run says nothing about the window it is about:\n{out}"
+    );
+    let swapped = checkout.path().join(victim_name);
+    assert_bystander_survived(&swapped, &before, &out);
+    assert!(
+        out.contains(&swapped.display().to_string()) && out.contains("65534"),
+        "the run erased or passed over another identity's tree without naming it and the uid \
+         that owns it:\n{out}"
+    );
+    assert!(
+        !ok,
+        "the run reported success while a payload it owns went unreclaimed; nothing else \
+         enumerates it and its name is never published again:\n{out}"
+    );
+}
+
+/// A payload this identity owns and cannot reclaim fails the run.
+///
+/// It is on the root filesystem, nothing else enumerates it, and its name is
+/// never published again, so no later run reclaims it either. Passing over it
+/// turns one directory into one tree per outage cycle.
+#[test]
+fn cargo_target_link_fails_closed_on_a_payload_it_cannot_reclaim() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let (ok, out) = run_link_unprivileged(checkout.path(), &btrfs);
+    assert!(ok, "the outage run failed:\n{out}");
+
+    let stuck = checkout.path().join(".cargo-target-local.generation-stuck");
+    std::fs::create_dir(&stuck).expect("second payload");
+    std::fs::write(stuck.join("artifact"), b"unreachable").expect("write into it");
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    std::fs::create_dir_all(&btrfs).expect("the volume comes back");
+    let (ok, out) = run_link_unprivileged(checkout.path(), &btrfs);
+
+    let restored = std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        out.contains(&stuck.display().to_string()),
+        "the run passed over a payload it could not open without naming it:\n{out}"
+    );
+    assert!(
+        !ok,
+        "the run reported success while leaving a payload it owns and cannot reclaim on the \
+         root filesystem:\n{out}"
+    );
+    restored.expect("restore mode for cleanup");
+}
+
+/// `[ -d target ]` is false both when the link dangles and when resolving it is
+/// refused. Only the first proves nothing is published there. A build past the
+/// checkout lock holds nothing but the generation's shared lease, so replacing
+/// `target/` without taking that lease splits it across two trees; a resolution
+/// error must fail closed instead.
+#[test]
+fn cargo_target_link_refuses_to_drop_a_link_it_cannot_resolve() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let cargo_target = btrfs.path().join("cargo-target");
+    let blocked = cargo_target.join("blocked");
+    let generation = blocked.join("held-generation");
+    std::fs::create_dir_all(&generation).expect("published generation");
+    std::fs::write(generation.join("artifact"), b"a running build's output").expect("artifact");
+    let target = checkout.path().join("target");
+    std::os::unix::fs::symlink(&generation, &target).expect("managed link");
+
+    if unsafe { libc::geteuid() } == 0 {
+        let chowned = Command::new("chown")
+            .args(["-R", "65534:65534"])
+            .arg(checkout.path())
+            .arg(btrfs.path())
+            .status()
+            .expect("chown -R");
+        assert!(chowned.success(), "hand the fixture to uid 65534");
+    }
+    // Search denied on an ancestor: the destination exists, resolving it does
+    // not. 0555 on cargo-target also makes `mkdir -p $WT_TARGET` fail, which is
+    // what sends the run down the unusable-volume path.
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    std::fs::set_permissions(&cargo_target, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod 555");
+
+    let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
+
+    let restored = (
+        std::fs::set_permissions(&cargo_target, std::fs::Permissions::from_mode(0o755)),
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)),
+    );
+    let still_linked = std::fs::read_link(&target);
+    assert_eq!(
+        still_linked.as_deref().ok(),
+        Some(generation.as_path()),
+        "target/ was repointed away from a generation whose lease could not be taken, so a \
+         build still resolving through it now writes into a different tree:\n{out}"
+    );
+    assert!(
+        !ok,
+        "a resolution failure was treated as a dangling link and the run reported success:\n{out}"
+    );
+    restored.0.expect("restore cargo-target mode");
+    restored.1.expect("restore blocked mode");
+}
+
+/// `--rotate` promises a clean namespace. A candidate that cannot be written
+/// cannot be retired, so the fallback must refuse rather than report a clean
+/// while the generation keeps every byte the clean said was gone: the next run
+/// finds it unretired and republishes it.
+#[test]
+fn cargo_target_link_rotate_refuses_an_unretired_generation_it_cannot_write() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let worktree_dir = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&worktree_dir).expect("managed worktree dir");
+    let artifact = worktree_dir.join("cargo-cache-entry");
+    std::fs::write(&artifact, b"payload the clean claims to remove").expect("artifact");
+    if unsafe { libc::geteuid() } == 0 {
+        let chowned = Command::new("chown")
+            .args(["-R", "65534:65534"])
+            .arg(checkout.path())
+            .arg(btrfs.path())
+            .status()
+            .expect("chown -R");
+        assert!(chowned.success(), "hand the fixture to uid 65534");
+    }
+    // Readable and searchable, not writable: the lease opens, the retirement
+    // marker cannot be written, so the candidate cannot be retired.
+    std::fs::set_permissions(&worktree_dir, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod 555");
+
+    let (ok, out) = run_link_unprivileged_with(checkout.path(), btrfs.path(), &["--rotate"]);
+
+    let restored = std::fs::set_permissions(&worktree_dir, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        artifact.exists(),
+        "control failed: the fixture's payload disappeared, so the assertion below proves \
+         nothing:\n{out}"
+    );
+    assert!(
+        !ok,
+        "--rotate reported a clean target while {worktree_dir:?} kept its payload unretired; \
+         the next run reuses it and republishes everything the clean said was gone:\n{out}"
+    );
+    restored.expect("restore worktree dir mode");
+}
+
+// ---------------------------------------------------------------------------
+// One lease per RECIPE, not per Cargo process.
+// ---------------------------------------------------------------------------
+
+/// Mark a generation retired exactly as `retire_target` does.
+fn retire_generation(generation: &Path) {
+    let marked = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import os, sys; os.setxattr(sys.argv[1], b'user.fcvm.retired', b'v1')",
+        ])
+        .arg(generation)
+        .status()
+        .expect("python3");
+    assert!(
+        marked.success(),
+        "set the retirement xattr on {} (user xattrs must be supported there)",
+        generation.display()
+    );
+}
+
+/// Is `path`'s flock free for the given mode? `flock -n` exits 42 on contention.
+fn lease_is_available(path: &Path, mode: &str) -> bool {
+    let status = Command::new("flock")
+        .args([mode, "-n", "-E", "42"])
+        .arg(path)
+        .arg("/bin/true")
+        .status()
+        .expect("probe the generation lease");
+    match status.code() {
+        Some(0) => true,
+        Some(42) => false,
+        other => panic!("lease probe on {path:?} failed for another reason: {other:?}"),
+    }
+}
+
+/// Run one recipe line through the wrapper exactly as make would (`SHELL -c
+/// '<line>'`) and hold it there. The line reports through a FIFO rather than
+/// stdout, which also carries the rotation notice from the link script.
+fn spawn_leased_recipe_line(checkout: &Path, btrfs_root: &Path, ready: &Path) -> ChildGuard {
+    ChildGuard(Some(
+        Command::new(repo_root().join("scripts/cargo-target-run.sh"))
+            .args(["-c", "printf R >\"$READY\"; IFS= read -r _"])
+            .env("BTRFS_ROOT", btrfs_root)
+            .env("CARGO_TARGET_DIR", "target")
+            .env("READY", ready)
+            .current_dir(checkout)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("run a recipe line through the target lease wrapper"),
+    ))
+}
+
+/// The wrapper has to be usable as a recipe's `SHELL`, because that is the only
+/// way one lease covers a whole recipe line: make runs `$(SHELL) -c '<line>'`.
+/// The lease it holds must be SHARED, or every concurrent reader of the same
+/// generation stalls for the length of the recipe.
+#[test]
+fn cargo_target_run_wrapper_leases_a_recipe_line_shared() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+    assert!(ok, "publishing the initial generation failed:\n{out}");
+    let generation =
+        std::fs::read_link(checkout.path().join("target")).expect("published generation");
+
+    let signals = tempfile::tempdir().expect("signal directory");
+    let ready = open_fifo(&signals.path().join("recipe-line-ready"));
+    let mut child = spawn_leased_recipe_line(
+        checkout.path(),
+        btrfs.path(),
+        &signals.path().join("recipe-line-ready"),
+    );
+    assert_eq!(
+        read_marker_with_timeout(ready, "the recipe line the wrapper was given"),
+        b'R',
+        "the wrapper did not run the recipe line make hands to a SHELL"
+    );
+    assert!(
+        !lease_is_available(&generation, "-x"),
+        "no lease is held while the recipe line runs, so a concurrent make can republish \
+         target/ between one command in the recipe and the next"
+    );
+    assert!(
+        lease_is_available(&generation, "-s"),
+        "the recipe line holds the generation EXCLUSIVELY; every other reader of the same \
+         generation stalls until the line ends"
+    );
+
+    child
+        .child_mut()
+        .stdin
+        .take()
+        .expect("wrapper stdin")
+        .write_all(b"release\n")
+        .expect("release the recipe line");
+    let status = child.wait().expect("reap the wrapper");
+    assert!(status.success(), "the wrapper failed: {status:?}");
+}
+
+/// A recipe line that arrives on a retired generation rotates first and then
+/// holds the FRESH one, still shared. Handing the line an exclusive lease, or
+/// none at all, are the two ways the rotation path breaks the contract.
+#[test]
+fn cargo_target_run_wrapper_leases_a_rotated_generation_shared() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+    assert!(ok, "publishing the initial generation failed:\n{out}");
+    let retired = std::fs::read_link(checkout.path().join("target")).expect("published generation");
+    retire_generation(&retired);
+
+    let signals = tempfile::tempdir().expect("signal directory");
+    let ready = open_fifo(&signals.path().join("recipe-line-ready"));
+    let mut child = spawn_leased_recipe_line(
+        checkout.path(),
+        btrfs.path(),
+        &signals.path().join("recipe-line-ready"),
+    );
+    assert_eq!(
+        read_marker_with_timeout(ready, "the recipe line after a rotation"),
+        b'R',
+        "the wrapper did not run the recipe line after rotating a retired generation"
+    );
+    let fresh =
+        std::fs::read_link(checkout.path().join("target")).expect("read the rotated target link");
+    assert_ne!(
+        fresh, retired,
+        "the recipe line ran against the retired generation the pruner is about to empty"
+    );
+    assert!(
+        !lease_is_available(&fresh, "-x"),
+        "the rotated generation is not leased, so the rest of the recipe can be republished \
+         out from under it"
+    );
+    assert!(
+        lease_is_available(&fresh, "-s"),
+        "the rotation left the recipe line holding the fresh generation exclusively"
+    );
+
+    child
+        .child_mut()
+        .stdin
+        .take()
+        .expect("wrapper stdin")
+        .write_all(b"release\n")
+        .expect("release the recipe line");
+    let status = child.wait().expect("reap the wrapper");
+    assert!(status.success(), "the wrapper failed: {status:?}");
+}
+
+/// Logical recipe lines per target (backslash continuations joined), plus the
+/// targets whose recipe runs under the lease wrapper.
+fn makefile_recipes(makefile: &str) -> (Vec<(String, String)>, HashSet<String>) {
+    let mut recipes: Vec<(String, String)> = Vec::new();
+    let mut leased: HashSet<String> = HashSet::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in makefile.lines() {
+        if let Some(rest) = line.strip_prefix('\t') {
+            pending.push_str(rest);
+            if rest.trim_end().ends_with('\\') {
+                pending.push('\n');
+                continue;
+            }
+            for target in &current {
+                recipes.push((target.clone(), pending.clone()));
+            }
+            pending.clear();
+            continue;
+        }
+        if !pending.is_empty() {
+            for target in &current {
+                recipes.push((target.clone(), pending.clone()));
+            }
+            pending.clear();
+        }
+        let Some((names, rest)) = line.split_once(':') else {
+            current.clear();
+            continue;
+        };
+        if rest.starts_with('=') || names.starts_with(['#', ' ', '\t', '.']) {
+            current.clear();
+            continue;
+        }
+        let targets: Vec<String> = names.split_whitespace().map(str::to_owned).collect();
+        if rest.trim_start().starts_with("private SHELL") {
+            leased.extend(targets);
+            current.clear();
+            continue;
+        }
+        current = targets;
+    }
+    (recipes, leased)
+}
+
+/// Does this recipe command read or write through the `target/` symlink itself?
+///
+/// `CARGO_TARGET_DIR=target` names no path component, and `cargo-target-run.sh`
+/// is a script name, so only a `target/` preceded by a separator counts.
+fn touches_raw_target(command: &str) -> bool {
+    let body = command
+        .trim_start()
+        .trim_start_matches(['@', '-', '+'])
+        .trim_start();
+    if body.starts_with('#') {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    body.match_indices("target/").any(|(at, _)| match at {
+        0 => true,
+        _ => matches!(bytes[at - 1], b' ' | b'\t' | b'/' | b'"' | b'\'' | b'='),
+    })
+}
+
+/// Every recipe line that reaches through `target/` outside Cargo must hold the
+/// generation lease while it runs.
+///
+/// `cargo-target-run.sh` leases only for the length of one Cargo process, so a
+/// concurrent `make` republishes `target/` in the gaps. `build` writes
+/// `fc-agent` through the link, copies it back through the link, and then runs
+/// the binary it just produced; a repoint in between sends the read into a
+/// generation the write never reached, and the last step is masked by
+/// `|| true`, so the recipe can report success with no `target/release/fcvm`.
+#[test]
+fn makefile_leases_every_raw_target_access() {
+    let makefile = std::fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
+    let (recipes, leased) = makefile_recipes(&makefile);
+
+    // Positive control: the parser must find recipe lines that are known to be
+    // there, or its emptiness proves nothing.
+    assert!(
+        recipes
+            .iter()
+            .any(|(target, command)| target == "build" && command.contains("-p fcvm")),
+        "the Makefile parser found no `build` recipe; it is not reading the rules it thinks it is"
+    );
+    assert!(
+        touches_raw_target("\tcp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent")
+            && touches_raw_target("\t@./target/release/fcvm setup")
+            && !touches_raw_target("\t@# Symlink ~/.cargo and target/ to btrfs")
+            && !touches_raw_target("\tCARGO_TARGET_DIR=target $(CARGO) build")
+            && !touches_raw_target("\t@\"$(MAKEFILE_DIR)scripts/cargo-target-run.sh\" cargo build"),
+        "the raw-target detector does not classify the known cases correctly"
+    );
+
+    let unleased: Vec<String> = recipes
+        .iter()
+        .filter(|(target, command)| touches_raw_target(command) && !leased.contains(target))
+        .map(|(target, command)| format!("{target}: {}", command.lines().next().unwrap_or("")))
+        .collect();
+    assert!(
+        unleased.is_empty(),
+        "these recipe lines reach through target/ without holding the generation lease, so a \
+         concurrent make can repoint the link underneath them: {unleased:#?}"
+    );
+
+    assert!(
+        makefile.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("TARGET_LEASE_SHELL")
+                && trimmed.contains("scripts/cargo-target-run.sh")
+        }),
+        "TARGET_LEASE_SHELL must be scripts/cargo-target-run.sh: it is the script that already \
+         implements the lease, and the one a scratch checkout that runs any cargo-bearing target \
+         already stages, so no recipe can die with `Error 127` for a shell it cannot resolve"
+    );
+    for line in makefile.lines() {
+        if let Some((_, rest)) = line.split_once(':') {
+            if rest.trim_start().starts_with("private SHELL") {
+                assert!(
+                    rest.contains("$(TARGET_LEASE_SHELL)"),
+                    "a target-specific SHELL names something other than TARGET_LEASE_SHELL: {line}"
+                );
+            }
+        }
+    }
+    let global_shell: Vec<&str> = makefile
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("SHELL=")
+                || trimmed.starts_with("SHELL =")
+                || trimmed.starts_with("SHELL :=")
+                || trimmed.starts_with("SHELL::=")
+        })
+        .filter(|line| {
+            let value = line.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            !matches!(value, "/bin/bash" | "/bin/sh")
+        })
+        .collect();
+    assert!(
+        global_shell.is_empty(),
+        "the Makefile-wide SHELL is something other than a plain shell. A wrapper there runs \
+         for every recipe line and every parse-time $(shell ...), including cargo-target-link \
+         itself, whose script then blocks forever on the generation lease the wrapper is \
+         already holding; and every scratch checkout that stages a partial scripts/ dies with \
+         `Error 127`: {global_shell:#?}"
+    );
+
+    let build_body = recipes
+        .iter()
+        .find(|(target, command)| target == "build" && command.contains("-p fc-agent"))
+        .map(|(_, command)| command.clone())
+        .expect("`build` has no recipe line that builds fc-agent");
+    for needed in [
+        "cp target/$(MUSL_TARGET)/release/fc-agent",
+        "./target/release/fcvm setup",
+    ] {
+        assert!(
+            build_body.contains(needed),
+            "`{needed}` is not in the same recipe line as the cargo commands that produce what \
+             it reads. One recipe line is one shell and one lease; a separate line takes a new \
+             lease, and the link can be repointed in between:\n{build_body}"
+        );
+    }
+}
+
+/// The identity `make` must run as when this binary is root: the Makefile
+/// refuses root on the host, so the privileged lane hands its children back to
+/// the user sudo recorded. Same constraint as tests/test_dep_provenance.rs.
+fn make_child_identity() -> Option<(u32, u32)> {
+    if unsafe { libc::geteuid() } != 0
+        || Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
+    {
+        return None;
+    }
+    let parse = |key: &str| -> Option<u32> { std::env::var(key).ok()?.parse().ok() };
+    match (parse("SUDO_UID"), parse("SUDO_GID")) {
+        (Some(uid), Some(gid)) => Some((uid, gid)),
+        _ => panic!(
+            "BLOCKED: running as root on a host with no SUDO_UID/SUDO_GID; the Makefile refuses \
+             root and this test has no user to hand make to"
+        ),
+    }
+}
+
+fn hand_tree_to_make_child(root: &Path) {
+    let Some((uid, gid)) = make_child_identity() else {
+        return;
+    };
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+            .unwrap_or_else(|error| panic!("chown {}: {error}", path.display()));
+        if path.is_dir() && !path.is_symlink() {
+            for entry in std::fs::read_dir(&path).expect("read scratch dir") {
+                stack.push(entry.expect("scratch entry").path());
+            }
+        }
+    }
+}
+
+fn scratch_make(fcvm_dir: &Path, btrfs_root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("make");
+    command
+        .arg("-C")
+        .arg(fcvm_dir)
+        .args(args)
+        .env("BTRFS_ROOT", btrfs_root)
+        .env_remove("MAKEFLAGS")
+        .env_remove("MFLAGS")
+        .env_remove("CARGO_TARGET_LINK_LOCKED");
+    if let Some((uid, gid)) = make_child_identity() {
+        use std::os::unix::process::CommandExt;
+        command.uid(uid).gid(gid);
+    }
+    command
+}
+
+fn write_script(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+}
+
+fn open_fifo(path: &Path) -> std::fs::File {
+    let status = Command::new("mkfifo").arg(path).status().expect("mkfifo");
+    assert!(status.success(), "mkfifo {path:?} failed: {status:?}");
+    // Read+write so neither end blocks on open and a write outlives its reader.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|error| panic!("open {path:?}: {error}"))
+}
+
+/// `build` produces `fc-agent` through the link, copies it back through the
+/// link, and runs the binary it just built. One shared lease has to cover all
+/// of that: `cargo-target-run.sh` releases when each Cargo process exits, and a
+/// concurrent `make` waiting to republish `target/` is granted the exclusive
+/// lease in that gap. The copy then reads a generation the build never wrote,
+/// and `2>/dev/null || true` on the last step turns the missing binary into a
+/// successful `make build`.
+///
+/// The lease is observed, not inferred: a helper blocks on the exclusive lease
+/// from the moment the first Cargo process is about to exit, and must still be
+/// blocked when the recipe reaches its last raw `target/` access. The final
+/// assertion that it acquires once `make` returns is the control -- without it
+/// a helper that never ran would pass.
+#[test]
+fn make_build_holds_one_generation_lease_across_the_whole_recipe() {
+    assert!(
+        Command::new("make").arg("--version").output().is_ok(),
+        "BLOCKED: `make` is not runnable, so this test cannot evaluate the recipe it guards"
+    );
+    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod 755");
+    let fcvm_dir = scratch.path().join("fcvm");
+    let btrfs = scratch.path().join("btrfs");
+    let signals = scratch.path().join("signals");
+    let tools = scratch.path().join("tools");
+    for directory in [&fcvm_dir.join("scripts"), &btrfs, &signals, &tools] {
+        std::fs::create_dir_all(directory).expect("scratch layout");
+    }
+    std::fs::copy(repo_root().join("Makefile"), fcvm_dir.join("Makefile")).expect("Makefile");
+    for name in [
+        "cargo-target-link.sh",
+        "cargo-target-run.sh",
+        "cargo-target-lib.sh",
+    ] {
+        let destination = fcvm_dir.join("scripts").join(name);
+        std::fs::copy(repo_root().join("scripts").join(name), &destination).expect(name);
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755");
+    }
+
+    let cargo_ready_path = signals.join("cargo-ready");
+    let cargo_release_path = signals.join("cargo-release");
+    let fcvm_ready_path = signals.join("fcvm-ready");
+    let fcvm_release_path = signals.join("fcvm-release");
+    let cargo_ready = open_fifo(&cargo_ready_path);
+    let mut cargo_release = open_fifo(&cargo_release_path);
+    let fcvm_ready = open_fifo(&fcvm_ready_path);
+    let mut fcvm_release = open_fifo(&fcvm_release_path);
+    let marker = signals.join("exclusive-lease-was-granted");
+
+    let stub_fcvm = tools.join("fcvm-stub");
+    write_script(
+        &stub_fcvm,
+        "#!/usr/bin/env bash\n\
+         printf F >\"$FCVM_READY\"\n\
+         IFS= read -r _ <\"$FCVM_RELEASE\"\n",
+    );
+    let stub_cargo = tools.join("cargo-stub");
+    write_script(
+        &stub_cargo,
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         dir=\"${CARGO_TARGET_DIR:-target}\"\n\
+         package=\"\"; triple=\"\"; previous=\"\"\n\
+         for argument in \"$@\"; do\n\
+           case \"$previous\" in\n\
+             -p) package=\"$argument\" ;;\n\
+             --target) triple=\"$argument\" ;;\n\
+           esac\n\
+           previous=\"$argument\"\n\
+         done\n\
+         out=\"$dir/release\"\n\
+         [ -z \"$triple\" ] || out=\"$dir/$triple/release\"\n\
+         mkdir -p \"$out\"\n\
+         if [ \"$package\" = fcvm ]; then\n\
+           cp \"$STUB_FCVM\" \"$out/fcvm\"\n\
+           chmod 755 \"$out/fcvm\"\n\
+           printf C >\"$CARGO_READY\"\n\
+           IFS= read -r _ <\"$CARGO_RELEASE\"\n\
+         else\n\
+           printf agent >\"$out/$package\"\n\
+         fi\n",
+    );
+
+    hand_tree_to_make_child(scratch.path());
+    let published = scratch_make(&fcvm_dir, &btrfs, &["cargo-target-link"])
+        .output()
+        .expect("publish the generation");
+    assert!(
+        published.status.success(),
+        "make cargo-target-link failed in the scratch checkout:\n{}{}",
+        String::from_utf8_lossy(&published.stdout),
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let generation =
+        std::fs::read_link(fcvm_dir.join("target")).expect("the scratch checkout has no link");
+
+    hand_tree_to_make_child(scratch.path());
+    let build_log = scratch.path().join("make-build.log");
+    let build = ChildGuard(Some(
+        scratch_make(&fcvm_dir, &btrfs, &["build"])
+            .env("CARGO_BIN", &stub_cargo)
+            .env("STUB_FCVM", &stub_fcvm)
+            .env("CARGO_READY", &cargo_ready_path)
+            .env("CARGO_RELEASE", &cargo_release_path)
+            .env("FCVM_READY", &fcvm_ready_path)
+            .env("FCVM_RELEASE", &fcvm_release_path)
+            .stdout(std::fs::File::create(&build_log).expect("build log"))
+            .stderr(
+                std::fs::File::options()
+                    .append(true)
+                    .open(&build_log)
+                    .expect("build log"),
+            )
+            .spawn()
+            .expect("spawn make build"),
+    ));
+    let log = || std::fs::read_to_string(&build_log).unwrap_or_default();
+
+    assert_eq!(
+        read_marker_with_timeout(cargo_ready, "the first Cargo process"),
+        b'C',
+        "make build never reached its first cargo command:\n{}",
+        log()
+    );
+    let mut waiter = ChildGuard(Some(
+        Command::new("/bin/bash")
+            .args([
+                "-c",
+                "exec {fd}<\"$1\"; printf W; flock -x \"$fd\"; : >\"$2\"",
+                "lease-waiter",
+            ])
+            .arg(&generation)
+            .arg(&marker)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the exclusive-lease waiter"),
+    ));
+    let waiter_stdout = waiter.child_mut().stdout.take().expect("waiter stdout");
+    assert_eq!(
+        read_marker_with_timeout(waiter_stdout, "the exclusive-lease waiter"),
+        b'W',
+        "the waiter never reached its blocking flock, so it proves nothing"
+    );
+
+    cargo_release
+        .write_all(b"go\n")
+        .expect("release the first cargo command");
+    assert_eq!(
+        read_marker_with_timeout(fcvm_ready, "the binary the recipe just built"),
+        b'F',
+        "make build never ran the binary its own recipe produced:\n{}",
+        log()
+    );
+    assert!(
+        !marker.exists(),
+        "the generation lease was released between the recipe's cargo commands and its last \
+         raw target/ access, so a concurrent make can repoint target/ in that window and the \
+         recipe reads a tree its own build never wrote:\n{}",
+        log()
+    );
+    fcvm_release
+        .write_all(b"go\n")
+        .expect("release the recipe's last step");
+
+    let status = build.wait().expect("reap make build");
+    assert!(status.success(), "make build failed:\n{}", log());
+    assert_eq!(
+        std::fs::read(generation.join("release/fc-agent"))
+            .ok()
+            .as_deref(),
+        Some(b"agent".as_slice()),
+        "the recipe did not leave fc-agent in the generation it held:\n{}",
+        log()
+    );
+    // Control: the waiter was genuinely blocked on the lease, not broken.
+    wait_for_path(&marker);
+    let status = waiter.wait().expect("reap the lease waiter");
+    assert!(status.success(), "the lease waiter failed: {status:?}");
+}
+
+/// The lease wrapper must not become a requirement of recipes that scratch
+/// checkouts run.
+///
+/// tests/test_dep_provenance.rs stages a checkout holding the Makefile and at
+/// most two scripts. A Makefile-wide `SHELL` pointed at a wrapper script kills
+/// every recipe line in such a tree with `Error 127`, including targets that
+/// never touch `target/`. This is the same staging, run from this binary, so a
+/// filtered run of these tests cannot miss it.
+#[test]
+fn scratch_checkouts_still_run_the_targets_that_stage_no_scripts() {
+    assert!(
+        Command::new("make").arg("--version").output().is_ok(),
+        "BLOCKED: `make` is not runnable, so this test cannot evaluate the recipes it guards"
+    );
+    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod 755");
+    let fcvm_dir = scratch.path().join("fcvm");
+    let btrfs = scratch.path().join("btrfs");
+    std::fs::create_dir_all(fcvm_dir.join("scripts")).expect("scratch layout");
+    std::fs::create_dir_all(&btrfs).expect("btrfs stand-in");
+    std::fs::copy(repo_root().join("Makefile"), fcvm_dir.join("Makefile")).expect("Makefile");
+    hand_tree_to_make_child(scratch.path());
+
+    // Exactly what dep_provenance_reports_describe_lock_source_and_missing
+    // stages: the Makefile and nothing else.
+    let out = scratch_make(&fcvm_dir, &btrfs, &["dep-provenance"])
+        .output()
+        .expect("run make dep-provenance");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && text.contains("fuse-backend-rs: "),
+        "make dep-provenance needs a script this checkout does not stage:\n{text}"
+    );
+
+    // And what mid_build_dependency_change_fails_the_build stages: two stubs,
+    // one of which stands in for every cargo command.
+    write_script(
+        &fcvm_dir.join("scripts/cargo-target-link.sh"),
+        "#!/usr/bin/env bash\nexit 0\n",
+    );
+    write_script(
+        &fcvm_dir.join("scripts/cargo-target-run.sh"),
+        "#!/usr/bin/env bash\necho \"stub cargo: $*\"\n",
+    );
+    hand_tree_to_make_child(scratch.path());
+    let out = scratch_make(&fcvm_dir, &btrfs, &["build-host-tools"])
+        .output()
+        .expect("run make build-host-tools");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && text.contains("stub cargo: "),
+        "make build-host-tools needs a script this checkout does not stage:\n{text}"
     );
 }

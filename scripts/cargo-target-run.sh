@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
-# Run one Cargo command while holding this worktree target's shared lease.
+# Run one command while holding this worktree target's shared lease.
 #
 # runner-disk-preflight.sh locks the same physical generation exclusively
 # before reclaiming idle payload. It retires that inode before changing cache
 # bytes; this wrapper then asks cargo-target-link.sh to publish a fresh sibling
 # generation. Physical target dentries are never deleted or renamed.
+#
+# Two callers, one lease. `$(CARGO)` prefixes every Cargo command with this
+# script, and a recipe whose raw `target/` accesses must all resolve to one
+# generation names it as that recipe's SHELL, which make invokes as
+# `$(SHELL) -c "<recipe line>"`. The lease is taken before the line runs and
+# released when it ends, so nothing can republish `target/` in the middle of a
+# recipe that writes a file through the link and then reads it back.
 set -euo pipefail
 
 if (($# == 0)); then
-	echo "usage: $0 <cargo> [args...]" >&2
+	echo "usage: $0 <command> [args...]   |   $0 -c <recipe line>" >&2
 	exit 2
+fi
+
+# make hands a SHELL the recipe line after `-c`. `exec` would read that as its
+# own empty-environment flag and then try to execute the line as a filename.
+if [[ $1 == -c ]]; then
+	set -- /bin/bash "$@"
 fi
 
 if ! command -v flock >/dev/null 2>&1; then
