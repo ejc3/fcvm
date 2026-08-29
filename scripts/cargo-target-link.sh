@@ -26,12 +26,15 @@
 #    2026-08-08. `~/.cargo` in the Makefile's check-disk target already
 #    self-heals for exactly this reason; target/ did not.
 #
-# 3. A FALLBACK MUST BE REVERSIBLE. A real target/ the script did not create is
-#    retained for good (its dentry may carry a mount visible only in another
-#    mount namespace), so a fallback shaped as a real target/ would keep every
-#    later build on the root filesystem after the volume returned. The fallback
-#    is a symlink to a checkout-local payload, replaced like any other published
-#    link once the volume is usable again.
+# 3. A FALLBACK MUST BE REVERSIBLE, AND MUST NOT SURVIVE ITS OUTAGE. A real
+#    target/ the script did not create is retained for good (its dentry may
+#    carry a mount visible only in another mount namespace), so a fallback
+#    shaped as a real target/ would keep every later build on the root
+#    filesystem after the volume returned. The fallback is a symlink to a
+#    checkout-local payload, replaced like any other published link once the
+#    volume is usable again. Each activation publishes its OWN payload: a name
+#    the script stops publishing is never chosen again, so a later outage
+#    cannot resurrect a cargo cache that a `--rotate` in between reported gone.
 #
 # Everything below runs under an exclusive flock on the checkout directory,
 # because more than one `make` can run in one checkout (several CI entry points
@@ -86,9 +89,55 @@ p="$(pwd -P)"
 name="$(printf '%s' "$(basename "$p")" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 hash="$(printf '%s' "$p" | sha256sum | cut -c1-8)"
 WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
-# The fallback payload, published through target/ as a symlink and never as a
-# real target/ dentry.
-LOCAL_TARGET="$p/.cargo-target-local"
+# Fallback payloads sit beside the checkout and are published through target/
+# as a symlink, never as a real target/ dentry. mktemp names each one, so a
+# payload is reachable only while target/ names it.
+LOCAL_TARGET_PREFIX="$p/.cargo-target-local"
+
+# The fallback payload target/ publishes right now, on stdout. Non-zero when
+# target/ publishes something else.
+published_fallback() {
+	[ -L target ] || return 1
+	local linked
+	linked="$(readlink target)"
+	case "$linked" in
+		"$LOCAL_TARGET_PREFIX".generation-*) printf '%s' "$linked" ;;
+		*) return 1 ;;
+	esac
+}
+
+# True while any fallback payload exists, published or not.
+any_fallback_payload() {
+	local entry
+	for entry in "$LOCAL_TARGET_PREFIX".generation-*; do
+		[ -e "$entry" ] && return 0
+	done
+	return 1
+}
+
+# Reclaim every fallback payload except the one target/ publishes. An
+# unpublished payload is unreachable (nothing but target/ ever names one) and
+# it sits on the root filesystem this indirection exists to keep free, while
+# nothing else reclaims it: the pruner enumerates a checkout's target/ and the
+# btrfs generations, never a checkout's other entries. A payload another
+# build still leases is kept, and stays unreachable.
+discard_unpublished_fallbacks() {
+	local keep="${1:-}" entry lease_fd
+	for entry in "$LOCAL_TARGET_PREFIX".generation-*; do
+		[ -d "$entry" ] || continue
+		[ "$entry" != "$keep" ] || continue
+		exec {lease_fd}<"$entry" || continue
+		if ! flock -x -n "$lease_fd"; then
+			echo "==> WARNING: $entry is leased by another build and is not reclaimed" >&2
+		elif rm -rf -- "$entry"; then
+			echo "==> Reclaimed the unpublished fallback payload $entry" >&2
+		else
+			# Another uid's leftovers, say. It stays unreachable either way.
+			echo "==> WARNING: $entry cannot be removed and is not reclaimed" >&2
+		fi
+		exec {lease_fd}<&-
+	done
+}
 
 publish_target_link() {
 	local destination="$1" staging
@@ -106,25 +155,36 @@ publish_target_link() {
 # directory. `-w` is no better for root, which passes access(W_OK) on a
 # directory it still cannot create entries in. Creating an entry is the
 # operation cargo needs, and the only test of it. When nothing is published,
-# the fallback is a link to $LOCAL_TARGET; a real target/ dentry is never
-# created here, because every later run would retain it as unmanaged.
+# the fallback is a link to a payload created here; a real target/ dentry is
+# never created, because every later run would retain it as unmanaged.
 require_writable_local_target() {
-	# A managed link was already dropped by the caller under its lease. An
-	# unmanaged dangling link is dropped here; a dangling fallback link keeps
-	# its name and gets its payload back.
-	if [ -L target ] && ! [ -e target ] && [ "$(readlink target)" != "$LOCAL_TARGET" ]; then
-		echo "==> WARNING: dropping dangling target/ → $(readlink target); the local fallback takes its place" >&2
-		rm -f -- target
-	fi
-	if ! [ -e target ]; then
-		if ! mkdir -p -- "$LOCAL_TARGET"; then
-			echo "ERROR: cannot create the local fallback $LOCAL_TARGET:" >&2
-			ls -ld -- "$LOCAL_TARGET" "$p" >&2 2>/dev/null || true
+	local payload
+	payload="$(published_fallback)" || payload=""
+	if [ -n "$payload" ]; then
+		# A fallback link whose payload was removed keeps its name and gets an
+		# empty payload back.
+		if ! mkdir -p -- "$payload"; then
+			echo "ERROR: cannot recreate the published fallback payload $payload:" >&2
+			ls -ld -- "$payload" "$p" >&2 2>/dev/null || true
 			exit 1
 		fi
-		if ! [ -L target ]; then
-			publish_target_link "$LOCAL_TARGET"
-			echo "==> Symlinked target/ → $LOCAL_TARGET (local fallback)" >&2
+	else
+		# A managed link was already dropped by the caller under its lease. An
+		# unmanaged dangling link is dropped here.
+		if [ -L target ] && ! [ -e target ]; then
+			echo "==> WARNING: dropping dangling target/ → $(readlink target); the local fallback takes its place" >&2
+			rm -f -- target
+		fi
+		if ! [ -e target ]; then
+			# A fresh payload, never one an earlier activation published: that
+			# one holds artifacts a `--rotate` in between reported gone.
+			if ! payload="$(mktemp -d -- "$LOCAL_TARGET_PREFIX.generation-XXXXXXXX")"; then
+				echo "ERROR: cannot create a local fallback payload beside $LOCAL_TARGET_PREFIX:" >&2
+				ls -ld -- "$p" >&2 2>/dev/null || true
+				exit 1
+			fi
+			publish_target_link "$payload"
+			echo "==> Symlinked target/ → $payload (local fallback)" >&2
 		fi
 	fi
 	if [ ! -d target ]; then
@@ -139,6 +199,7 @@ require_writable_local_target() {
 		exit 1
 	fi
 	rm -f -- "$probe"
+	discard_unpublished_fallbacks "$payload"
 }
 
 # Drops the checkout's managed target/ link; the generation stays for the
@@ -155,7 +216,7 @@ drop_managed_link() {
 	local linked
 	linked="$(readlink target)"
 	case "$linked" in
-		"$BTRFS_ROOT"/cargo-target/* | "$LOCAL_TARGET") ;;
+		"$BTRFS_ROOT"/cargo-target/* | "$LOCAL_TARGET_PREFIX".generation-*) ;;
 		*) return 0 ;;
 	esac
 	if [[ -z ${old_target_lease_fd:-} ]] && [ -d target ]; then
@@ -165,7 +226,9 @@ drop_managed_link() {
 		fi
 		flock -x "$old_target_lease_fd"
 	fi
-	[ "$linked" != "$LOCAL_TARGET" ] || return 0
+	case "$linked" in
+		"$LOCAL_TARGET_PREFIX".generation-*) return 0 ;;
+	esac
 	echo "==> WARNING: dropping target/ → $linked; its volume cannot be used" >&2
 	rm -f -- target
 }
@@ -175,7 +238,7 @@ fallback_to_local() {
 	drop_managed_link
 	# `--rotate` promises a clean target/; a retained link or directory, or a
 	# republished fallback payload, would report one while its payload survives.
-	if ((FORCE_ROTATE)) && { [ -L target ] || [ -d target ] || [ -e "$LOCAL_TARGET" ]; }; then
+	if ((FORCE_ROTATE)) && { [ -L target ] || [ -d target ] || any_fallback_payload; }; then
 		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
 		exit 1
 	fi
@@ -383,10 +446,6 @@ case "$retired_rc" in
 esac
 
 if ! [ -L target ] || [ "$(readlink target)" != "$candidate" ]; then
-	if [ "${linked:-}" = "$LOCAL_TARGET" ]; then
-		# Nothing enumerates this path, so nothing reclaims it.
-		echo "==> WARNING: $BTRFS_ROOT is usable again; the fallback payload $LOCAL_TARGET is no longer published and is not reclaimed, remove it by hand" >&2
-	fi
 	publish_target_link "$candidate"
 	echo "==> Symlinked target/ → $candidate"
 fi
@@ -401,7 +460,7 @@ if [[ -n ${candidate_lease_fd:-} && $candidate_lease_fd != "$final_lease_fd" ]];
 	exec {candidate_lease_fd}<&-
 fi
 else
-	if ((FORCE_ROTATE)) && { [ -d target ] || [ -e "$LOCAL_TARGET" ]; }; then
+	if ((FORCE_ROTATE)) && { [ -d target ] || any_fallback_payload; }; then
 		echo "ERROR: local target/ cannot be atomically rotated without the managed btrfs namespace; refusing unsafe clean" >&2
 		exit 1
 	fi
@@ -416,7 +475,7 @@ fi
 # Self-heal a dangling link. `[ -d target ]` follows the symlink, so this is
 # false exactly when it does not resolve. A dangling fallback link is left for
 # require_writable_local_target, which recreates its payload.
-if [ -L target ] && ! [ -d target ] && [ "$(readlink target)" != "$LOCAL_TARGET" ]; then
+if [ -L target ] && ! [ -d target ] && ! published_fallback >/dev/null; then
 	TGT="$(readlink target)"
 	if ! [ -d "$BTRFS_ROOT" ]; then
 		# The VOLUME is gone, not just our directory on it. Recreating the path

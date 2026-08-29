@@ -1,6 +1,6 @@
 target
 target/
-.cargo-target-local/
+.cargo-target-local*/
 target-root/
 target-sudo/
 artifacts/

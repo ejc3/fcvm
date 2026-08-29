@@ -3237,11 +3237,23 @@ fn managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
         .join(format!("{base}-{}", &digest[..8]))
 }
 
-/// Helper: this checkout's fallback payload, exactly as the script names it.
-fn local_fallback_dir(checkout: &Path) -> PathBuf {
-    std::fs::canonicalize(checkout)
-        .expect("canonical checkout path")
-        .join(".cargo-target-local")
+/// Helper: every fallback payload this checkout holds, published or not,
+/// sorted. Each activation names its own, so more than one means an earlier
+/// payload was neither published nor reclaimed.
+fn local_fallback_payloads(checkout: &Path) -> Vec<PathBuf> {
+    let checkout = std::fs::canonicalize(checkout).expect("canonical checkout path");
+    let mut payloads: Vec<PathBuf> = std::fs::read_dir(&checkout)
+        .unwrap_or_else(|error| panic!("read {checkout:?}: {error}"))
+        .map(|entry| entry.expect("checkout entry").path())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".cargo-target-local.generation-"))
+        })
+        .collect();
+    payloads.sort();
+    payloads
 }
 
 /// The script's own fallback: `target` is a link to the checkout-local payload,
@@ -3262,9 +3274,9 @@ fn assert_local_fallback_link(checkout: &Path, btrfs_root: &Path, ctx: &str) -> 
         "{ctx}: target/ -> {link:?} points into the btrfs root {btrfs_root:?}"
     );
     assert_eq!(
-        link,
-        local_fallback_dir(checkout),
-        "{ctx}: target/ does not point at the checkout-local fallback payload"
+        local_fallback_payloads(checkout),
+        vec![link.clone()],
+        "{ctx}: target/ must publish the checkout's one fallback payload"
     );
     assert_target_usable(checkout, ctx);
     link
@@ -3437,20 +3449,18 @@ fn cargo_target_link_returns_to_btrfs_after_a_volume_outage() {
         "run 2: target/ -> {link:?} is not under the recovered volume:\n{out}"
     );
     assert_target_usable(checkout.path(), "run 2, volume back");
-    assert_eq!(
-        std::fs::read(payload.join("built-during-outage")).unwrap_or_else(|error| panic!(
-            "the outage payload {payload:?} was destroyed: {error}"
-        )),
-        b"built while the volume was down",
-        "the outage payload was modified"
-    );
     assert!(
         !target.join("built-during-outage").exists(),
         "the outage payload is still published through target/"
     );
     assert!(
+        local_fallback_payloads(checkout.path()).is_empty(),
+        "the outage payload is unreachable and sits on the root filesystem this indirection \
+         keeps free; nothing else enumerates it:\n{out}"
+    );
+    assert!(
         out.contains(payload.to_str().expect("utf-8 payload path")),
-        "run 2 must print the orphaned payload path {payload:?} so a human can remove it:\n{out}"
+        "run 2 must name the payload {payload:?} it reclaimed:\n{out}"
     );
 }
 
@@ -3494,7 +3504,7 @@ fn cargo_target_link_retains_a_real_target_it_did_not_create() {
             "{ctx}: the retained payload changed"
         );
         assert!(
-            !local_fallback_dir(checkout.path()).exists(),
+            local_fallback_payloads(checkout.path()).is_empty(),
             "{ctx}: a fallback payload was created beside a retained real target/:\n{out}"
         );
         assert_target_usable(checkout.path(), ctx);
@@ -3539,5 +3549,52 @@ fn cargo_target_link_rotate_refuses_the_local_fallback_while_the_volume_is_down(
     assert_eq!(
         std::fs::read(payload.join("artifact")).expect("read the surviving payload"),
         b"survives"
+    );
+}
+
+/// A clean the volume outlived must not leave a payload a later outage can
+/// republish.
+///
+/// The volume is absent, so a fallback payload is published and built into; the
+/// volume returns and the next run publishes a btrfs generation; `--rotate`
+/// (the `clean` recipe) reports a clean; the volume goes away again. The
+/// fallback published by the last run must be empty. Anything the first outage
+/// left in it is cargo cache and build-script output that the clean reported
+/// gone.
+#[test]
+fn cargo_target_link_publishes_a_fresh_fallback_after_a_clean() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let target = checkout.path().join("target");
+
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 1 (volume absent) failed:\n{out}");
+    let first_payload = std::fs::read_link(&target).expect("run 1 must publish a fallback link");
+    std::fs::write(target.join("stale-artifact"), b"built before the clean")
+        .expect("write through the fallback link");
+
+    std::fs::create_dir_all(&btrfs).expect("the volume is mounted again");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 2 (volume back) failed:\n{out}");
+
+    let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+    assert!(ok, "run 3 (--rotate, the clean recipe) failed:\n{out}");
+
+    std::fs::remove_dir_all(&btrfs).expect("the volume goes away again");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 4 (volume absent again) failed:\n{out}");
+    assert_target_usable(checkout.path(), "run 4, volume absent again");
+
+    let republished = std::fs::read_link(&target).expect("run 4 must publish a fallback link");
+    assert!(
+        !target.join("stale-artifact").exists(),
+        "target/ -> {republished:?} republishes {first_payload:?}, the payload the clean \
+         reported gone; every cargo fingerprint and build-script OUT_DIR written before the \
+         clean is back:\n{out}"
+    );
+    assert_ne!(
+        republished, first_payload,
+        "run 4 reused an earlier outage's payload instead of publishing a fresh one:\n{out}"
     );
 }
