@@ -9428,7 +9428,10 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 verify_hashes[f"verify-dns-{stage}.json"] = hashlib.sha256(
                     handle.read()).hexdigest()
         hashes = {}
-        for name in ("corpus-dns.log", "corpus-access.log"):
+        # The replay server's own logs and the campaign's per-bracket record of
+        # what it served. campaign_summary requires all three beside the
+        # evidence, each hashing to what the verdict recorded.
+        for name in ("corpus-dns.log", "corpus-access.log", "replay-queries.log"):
             path = os.path.join(run_dir, name)
             with open(path, "w") as handle:
                 handle.write('{"ts": 1.0}\n')
@@ -9451,6 +9454,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
             "verify_file_sha256": verify_hashes,
             "corpus_dns_log_sha256": hashes["corpus-dns.log"],
             "corpus_access_log_sha256": hashes["corpus-access.log"],
+            "replay_queries_log_sha256": hashes["replay-queries.log"],
             "corpus_serve_exit_status": 0,
             "reason": None,
             "verdict": verdict,
@@ -9543,7 +9547,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
                 "verify-dns-before-run.json", "verify-dns-after-run.json",
                 "dns-owner.log", "corpus-dns.log", "corpus-access.log",
-                "summary.json",
+                "replay-queries.log", "summary.json",
             },
         )
 
