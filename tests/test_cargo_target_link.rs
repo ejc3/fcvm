@@ -280,19 +280,12 @@ fn cargo_target_link_heals_when_btrfs_is_gone_entirely() {
     );
     assert_target_usable(work.path(), "btrfs root absent");
 
-    // And it must be a REAL local directory, not the stale link with its target
-    // recreated. `$BTRFS_ROOT` absent means the volume is unmounted; recreating
-    // the path underneath a mountpoint writes build artifacts to the small root
-    // filesystem while still looking like btrfs — the exact failure this whole
-    // indirection exists to avoid.
-    assert!(
-        std::fs::symlink_metadata(work.path().join("target"))
-            .expect("target must exist")
-            .file_type()
-            .is_dir(),
-        "target is still a symlink after the btrfs volume disappeared; artifacts would be \
-         written under the unmounted mountpoint {gone:?} — i.e. onto the root filesystem"
-    );
+    // And it must be the script's own fallback link, not the stale link with
+    // its target recreated. `$BTRFS_ROOT` absent means the volume is unmounted;
+    // recreating the path underneath a mountpoint writes build artifacts to the
+    // small root filesystem while still looking like btrfs, the exact failure
+    // this whole indirection exists to avoid.
+    assert_local_fallback_link(work.path(), &gone, "btrfs root absent");
 }
 
 /// A different textual spelling can still resolve to the same directory inode. Opening that
@@ -566,9 +559,8 @@ fn cargo_target_link_fails_loudly_on_a_non_directory_target() {
 /// the logic inline) nothing else here would notice.
 ///
 /// This reads the recipe's COMMAND lines only, not the whole file: a match
-/// anywhere in the Makefile would also be satisfied by a comment mentioning the
-/// script, which is the failure mode that made an earlier version of the AMI-hash
-/// test pass with its subject deleted.
+/// anywhere in the Makefile is also satisfied by a comment mentioning the
+/// script, which would pass with the recipe deleted.
 #[test]
 fn makefile_delegates_to_the_script() {
     let mk = std::fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
@@ -598,10 +590,10 @@ fn makefile_delegates_to_the_script() {
     );
 }
 
-/// The disk preflight used to glob `cargo-target*`, which selected the parent
-/// `cargo-target/` directory instead of its per-worktree children.  One idle
-/// sibling could therefore never be reclaimed independently, and deleting the
-/// parent left every checkout's target symlink dangling.
+/// The disk preflight selects per-worktree children, never the parent
+/// `cargo-target/` directory. A glob that matches the parent makes an idle
+/// sibling unreclaimable on its own, and removing the parent leaves every
+/// checkout's target symlink dangling.
 ///
 /// This also exercises the lease rather than merely inspecting shell text: an
 /// old-looking target stays intact while a fake Cargo process holds the shared
@@ -2642,4 +2634,958 @@ fn persistent_runner_entrypoints_route_cargo_through_the_lease() {
             "{path} bypasses the leased host-tools Make target"
         );
     }
+}
+
+/// The volume EXISTS but cannot be written: keep the local `target/`.
+///
+/// GitHub-hosted runners have no `/mnt/fcvm-btrfs`, and podman CREATES it as an
+/// empty root-owned directory to satisfy `CONTAINER_RUN_BASE`'s bind mount. Inside
+/// the container the volume is therefore a directory (`[ -d ]` true) that the
+/// build user cannot write, while the checkout's own `target/` is a bind mount --
+/// a real directory the recipe should simply keep. The script tested `-d`, took
+/// the btrfs branch, and died on `mkdir` before reaching its own
+/// "retaining unmanaged local target/" exit:
+///
+/// ```text
+/// mkdir: cannot create directory '/mnt/fcvm-btrfs/cargo-target': Permission denied
+/// ERROR: cannot create /mnt/fcvm-btrfs/cargo-target/fcvm-1602bce1
+/// make: *** [Makefile:337: cargo-target-link] Error 1
+/// ```
+///
+/// Every Weekly `container-bench` since 2026-08-10 (the script landed 08-09; the
+/// last green Weekly was 08-03). Unwritable is produced two ways because this
+/// file also runs under sudo, where mode bits cannot stop root: as a normal user
+/// a 0o555 tempdir, as root a procfs path that no uid can `mkdir` under.
+#[test]
+fn cargo_target_link_keeps_a_bind_mounted_target_when_btrfs_is_unwritable() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    // The bind-mounted target/: a real directory that already exists.
+    std::fs::create_dir(checkout.path().join("target")).expect("pre-existing target/");
+
+    let unwritable_tmp = tempfile::tempdir().expect("btrfs stand-in");
+    let btrfs_root: PathBuf = if nix_geteuid_is_root() {
+        PathBuf::from("/proc")
+    } else {
+        std::fs::set_permissions(
+            unwritable_tmp.path(),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("chmod 0555");
+        unwritable_tmp.path().to_path_buf()
+    };
+
+    let (ok, out) = run_link(checkout.path(), &btrfs_root);
+
+    // Restore so the tempdir can be removed whatever the outcome.
+    let _ = std::fs::set_permissions(
+        unwritable_tmp.path(),
+        std::fs::Permissions::from_mode(0o755),
+    );
+
+    assert!(
+        ok,
+        "the recipe failed instead of keeping the existing target/ when the btrfs \
+         volume is present but unwritable:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_dir() && !target.is_symlink(),
+        "target/ should have been kept as the real (bind-mounted) directory it was; \
+         it is now {:?}\n{out}",
+        std::fs::symlink_metadata(&target).map(|m| m.file_type())
+    );
+    assert_target_usable(checkout.path(), "unwritable btrfs volume");
+}
+
+fn nix_geteuid_is_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// The worktree directory EXISTS on the volume but cannot be written into.
+///
+/// `mkdir -p` is idempotent: on an existing directory it succeeds without
+/// creating anything, so a writability probe built on it alone selects the
+/// managed branch and publishes a symlink to a directory Cargo cannot write --
+/// exit 0, then an opaque failure several steps later. Ownership changes and
+/// read-only remounts both produce this state. The probe has to CREATE an entry
+/// inside the directory, not merely confirm the directory.
+///
+/// Root cannot be stopped by mode bits, so the root branch remounts the volume
+/// read-only through a bind mount and gets EROFS instead.
+#[test]
+fn cargo_target_link_falls_back_when_the_existing_worktree_dir_is_unwritable() {
+    // A FRESH checkout: no target/ yet. With one pre-existing, the script's
+    // "retaining unmanaged local target/" exit fires before any symlink is
+    // published and hides exactly the defect under test.
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(ok, "the recipe failed outright:\n{out}");
+    assert_local_fallback_link(
+        checkout.path(),
+        btrfs.path(),
+        "existing but unwritable worktree dir",
+    );
+}
+
+/// "Is a directory" is not "is writable". A `-d` test alone reports a target/
+/// nothing can write as a successful fallback, and cargo fails several steps
+/// later with its own error, so every path that leaves target/ as a plain local
+/// directory runs `require_writable_local_target`. Two of the three exits are
+/// driven here through the fixture every uid can use: target/ pointing at
+/// /proc/self, a directory root itself cannot create in. The third (retaining an
+/// unmanaged REAL directory) cannot be staged for uid 0 without a mount or
+/// `chattr +i`, neither of which the container lane permits (overlayfs refuses
+/// the flag), so it is pinned structurally in
+/// `every_local_target_exit_probes_writability_first`.
+#[test]
+fn cargo_target_link_refuses_an_unwritable_local_target_when_btrfs_is_unusable() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    std::os::unix::fs::symlink("/proc/self", checkout.path().join("target"))
+        .expect("procfs-backed local target/");
+    let unwritable_tmp = tempfile::tempdir().expect("btrfs stand-in");
+    let btrfs_root: PathBuf = if nix_geteuid_is_root() {
+        PathBuf::from("/proc")
+    } else {
+        std::fs::set_permissions(
+            unwritable_tmp.path(),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("chmod 0555");
+        unwritable_tmp.path().to_path_buf()
+    };
+
+    let (ok, out) = run_link(checkout.path(), &btrfs_root);
+    let _ = std::fs::set_permissions(
+        unwritable_tmp.path(),
+        std::fs::Permissions::from_mode(0o755),
+    );
+
+    assert!(
+        !ok,
+        "the recipe reported success with a target/ nothing can write (btrfs unusable, \
+         local target/ kept on a `-d` test alone):\n{out}"
+    );
+    assert!(
+        out.contains("nothing can write"),
+        "the failure must say the local target/ is unwritable, not something else:\n{out}"
+    );
+}
+
+#[test]
+fn cargo_target_link_refuses_an_unwritable_local_target_on_managed_fallback() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    // The managed worktree dir cannot be written, so the script falls back to
+    // the local target/ ... which is just as unwritable, and is not a managed
+    // link, so the fallback keeps it.
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+    std::os::unix::fs::symlink("/proc/self", checkout.path().join("target"))
+        .expect("procfs-backed local target/");
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(
+        !ok,
+        "the managed-dir fallback reported success with a local target/ nothing can \
+         write:\n{out}"
+    );
+    assert!(
+        out.contains("nothing can write"),
+        "the failure must say the local target/ is unwritable, not something else:\n{out}"
+    );
+}
+
+/// A managed link is DROPPED, never probed through, when its generation cannot
+/// be leased.
+///
+/// The unusable-volume path (the volume exists but `$WT_TARGET` cannot be
+/// created) never opens a generation lease, yet `target/` can still resolve
+/// into the managed tree: a rotated `.generation-*` directory outlives the
+/// canonical path the pruner removed. Probing writability THROUGH that link
+/// creates and removes a file inside a generation this run holds no lease on,
+/// which is the census/rewalk race the lease protocol exists to prevent; and if
+/// that generation is itself unwritable the script fails instead of falling
+/// back. So the link goes and a local `target/` takes its place; the generation
+/// is left untouched for the pruner. Staged for every uid: a dangling symlink
+/// at `$WT_TARGET` defeats `mkdir -p` for root too.
+#[test]
+fn cargo_target_link_drops_a_managed_link_it_cannot_lease() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(wt.parent().unwrap()).expect("cargo-target parent");
+    let generation = wt.with_file_name(format!(
+        "{}.generation-stale000",
+        wt.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&generation).expect("retained generation");
+    // `set_file_time` opens a FILE; a directory's mtime is pinned with touch.
+    let pinned = std::process::Command::new("touch")
+        .args(["-d", "@1600000000"])
+        .arg(&generation)
+        .status()
+        .expect("run touch");
+    assert!(pinned.success(), "pin the generation's mtime");
+    std::os::unix::fs::symlink(btrfs.path().join("cargo-target/absent"), &wt)
+        .expect("dangling $WT_TARGET, so mkdir -p fails for every uid");
+    std::os::unix::fs::symlink(&generation, checkout.path().join("target"))
+        .expect("target/ -> retained generation");
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(
+        ok,
+        "the recipe failed instead of falling back to a local target/:\n{out}"
+    );
+    assert_local_fallback_link(
+        checkout.path(),
+        btrfs.path(),
+        "managed link dropped on an unusable volume",
+    );
+    let mtime = std::fs::metadata(&generation)
+        .expect("generation still exists")
+        .modified()
+        .expect("mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    assert_eq!(
+        mtime, 1_600_000_000,
+        "the retained generation was written through (a probe file was created and \
+         removed in it) without a lease\n{out}"
+    );
+}
+
+/// An existing `$WT_TARGET` that cannot be OPENED falls back too. Losing read
+/// permission as well as write (an ownership change that leaves a fresh
+/// checkout's directory 0700, say) passes `mkdir -p`, but the generation-lease
+/// open `exec {fd}<"$candidate"` fails; under `set -e` that ends the script
+/// instead of creating the promised local target/.
+/// Root can open any directory, so when the tests are root the script runs as
+/// uid 65534 through `setpriv`, from a copy of scripts/ that uid can read, over
+/// tempdirs handed to that uid.
+#[test]
+fn cargo_target_link_falls_back_when_the_managed_dir_cannot_be_opened() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("existing managed dir");
+    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
+
+    // Hand the directory back before asserting, so the tempdir can be removed.
+    let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        ok,
+        "the recipe died instead of falling back when the managed dir cannot be \
+         opened:\n{out}"
+    );
+    assert_local_fallback_link(
+        checkout.path(),
+        btrfs.path(),
+        "managed dir that cannot be opened",
+    );
+}
+
+/// `run_link`, but as uid 65534 when the tests are root: root can open and
+/// write any directory, so a fixture about permissions must run as someone who
+/// cannot. Both tempdirs are handed to that uid, and scripts/ is copied where it
+/// can read them (the script sources cargo-target-lib.sh next to itself).
+fn run_link_unprivileged(dir: &Path, btrfs_root: &Path) -> (bool, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } != 0 {
+        return run_link(dir, btrfs_root);
+    }
+    let tools = tempfile::tempdir().expect("tools tempdir");
+    std::fs::set_permissions(tools.path(), std::fs::Permissions::from_mode(0o755)).expect("0755");
+    let scripts = tools.path().join("scripts");
+    std::fs::create_dir(&scripts).expect("scripts dir");
+    for name in ["cargo-target-link.sh", "cargo-target-lib.sh"] {
+        std::fs::copy(repo_root().join("scripts").join(name), scripts.join(name)).expect(name);
+    }
+    std::fs::set_permissions(
+        scripts.join("cargo-target-link.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("0755");
+    for owned in [dir, btrfs_root] {
+        let chowned = Command::new("chown")
+            .args(["-R", "65534:65534"])
+            .arg(owned)
+            .status()
+            .expect("chown -R");
+        assert!(chowned.success(), "hand {} to uid 65534", owned.display());
+    }
+    let out = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg(scripts.join("cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs_root)
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(dir)
+        .output()
+        .expect("run scripts/cargo-target-link.sh as uid 65534");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// `run_link` with extra script arguments (`--rotate`).
+fn run_link_with(dir: &Path, btrfs_root: &Path, args: &[&str]) -> (bool, String) {
+    let out = Command::new(repo_root().join("scripts/cargo-target-link.sh"))
+        .args(args)
+        .env("BTRFS_ROOT", btrfs_root)
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(dir)
+        .output()
+        .expect("run scripts/cargo-target-link.sh");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// The PUBLISHED generation that cannot be opened FAILS CLOSED; it does not
+/// fall back. Without that generation's lease the script cannot know whether a
+/// Cargo wrapper still holds it shared, and a generation
+/// that lost only read permission (0333) is one Cargo can still create entries
+/// in; replacing `target/` under such a build would split it across two trees.
+/// Same unprivileged stand-in as the candidate case.
+#[test]
+fn cargo_target_link_refuses_to_replace_a_published_generation_it_cannot_lease() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("published generation");
+    std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("published link");
+    // Write and search, no read: Cargo can still create entries here, the
+    // lease open (O_RDONLY) cannot succeed.
+    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o333)).expect("chmod 333");
+
+    let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
+
+    let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        !ok,
+        "the recipe replaced target/ under a published generation it could not lease:\n{out}"
+    );
+    assert!(
+        out.contains("refusing to replace target/"),
+        "the refusal must say why:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_symlink() && std::fs::read_link(&target).expect("readlink") == wt,
+        "target/ must be left pointing at the published generation\n{out}"
+    );
+}
+
+/// `--rotate` must not report a clean it did not perform.
+///
+/// With an UNMANAGED `target/` link and a managed candidate that cannot be
+/// written, retaining the link and exiting 0 reports `make clean` as done while
+/// the linked directory's payload survives. Both the unusable-volume branch and
+/// the fallback refuse instead.
+#[test]
+fn cargo_target_link_rotate_refuses_to_retain_an_unmanaged_link() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+    let elsewhere = tempfile::tempdir().expect("unmanaged payload dir");
+    let payload = elsewhere.path().join("payload");
+    std::fs::write(&payload, b"built artifacts").expect("payload");
+    std::os::unix::fs::symlink(elsewhere.path(), checkout.path().join("target"))
+        .expect("unmanaged link");
+
+    let (ok, out) = run_link_with(checkout.path(), btrfs.path(), &["--rotate"]);
+
+    assert!(
+        !ok,
+        "--rotate reported success while retaining an unmanaged target/ link whose \
+         payload it cannot rotate away:\n{out}"
+    );
+    assert!(
+        out.contains("refusing unsafe clean"),
+        "the refusal must say why:\n{out}"
+    );
+    assert!(
+        payload.exists(),
+        "a refused rotation must not delete the payload either"
+    );
+}
+
+/// A dangling UNMANAGED link is replaced on the fallback path, not tripped
+/// over. It is absent to `[ -e target ]` and EEXIST to `mkdir -p target`, which
+/// under `set -e` ends the script before the diagnostic that follows.
+#[test]
+fn cargo_target_link_replaces_a_dangling_unmanaged_link_on_fallback() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let _wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+    std::os::unix::fs::symlink("/nonexistent/elsewhere", checkout.path().join("target"))
+        .expect("dangling unmanaged link");
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(
+        ok,
+        "the recipe died on a dangling unmanaged target/ link instead of replacing it:\n{out}"
+    );
+    assert_target_usable(checkout.path(), "dangling unmanaged link replaced");
+}
+
+/// A RETIRED generation that is readable but no longer writable rotates to a
+/// fresh one. The candidate write probe runs only when the candidate is REUSED:
+/// probing a retired one first sends the script to `fallback_to_local`, which
+/// drops the managed link and leaves every later run on the root filesystem,
+/// while `new_generation` needs only the parent writable. Unprivileged
+/// stand-in as elsewhere: root writes anything.
+#[test]
+fn cargo_target_link_rotates_a_retired_generation_it_cannot_write() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("retired generation");
+    // Mark it retired exactly as retire_target does.
+    let marked = Command::new("python3")
+        .args([
+            "-c",
+            "import os, sys; os.setxattr(sys.argv[1], b'user.fcvm.retired', b'v1')",
+        ])
+        .arg(&wt)
+        .status()
+        .expect("python3");
+    assert!(
+        marked.success(),
+        "set the retirement xattr on {} (user xattrs must be supported there)",
+        wt.display()
+    );
+    std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("published link");
+    std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+
+    let (ok, out) = run_link_unprivileged(checkout.path(), btrfs.path());
+
+    let _ = std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755));
+    assert!(
+        ok,
+        "the recipe failed on a retired read-only generation:\n{out}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_symlink(),
+        "target/ was replaced by a local directory instead of rotating to a fresh \
+         managed generation:\n{out}"
+    );
+    let link = std::fs::read_link(&target).expect("readlink");
+    assert!(
+        link.to_string_lossy().contains("/cargo-target/") && link != wt,
+        "target/ should point at a FRESH managed generation, not {}\n{out}",
+        link.display()
+    );
+    assert_target_usable(checkout.path(), "rotated to a fresh generation");
+}
+
+/// Dropping a published managed link waits for the build that holds it.
+/// Unlinking `target/` on the unusable-volume path with no lease on the
+/// generation it published lets a Cargo wrapper holding that generation SHARED
+/// resolve later `target/...` paths into a different tree. The script takes the
+/// generation's exclusive lease first: with a shared holder present it blocks,
+/// and the link stays.
+#[test]
+fn cargo_target_link_waits_for_a_shared_holder_before_dropping_a_managed_link() {
+    use std::os::unix::io::AsRawFd as _;
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(wt.parent().unwrap()).expect("cargo-target parent");
+    let generation = wt.with_file_name(format!(
+        "{}.generation-held0000",
+        wt.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&generation).expect("published generation");
+    // $WT_TARGET cannot be created (dangling symlink), so the volume is unusable.
+    std::os::unix::fs::symlink(btrfs.path().join("cargo-target/absent"), &wt)
+        .expect("dangling $WT_TARGET");
+    std::os::unix::fs::symlink(&generation, checkout.path().join("target"))
+        .expect("target/ -> published generation");
+    // A Cargo wrapper mid-build: the generation is held SHARED for the run.
+    let holder = std::fs::File::open(&generation).expect("open generation");
+    let held = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_SH) };
+    assert_eq!(held, 0, "take the shared lease");
+
+    let out = Command::new("timeout")
+        .arg("4")
+        .arg(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs.path())
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(checkout.path())
+        .output()
+        .expect("run under timeout");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(holder);
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the script did not wait for the shared holder (expected timeout exit 124):\n{text}"
+    );
+    let target = checkout.path().join("target");
+    assert!(
+        target.is_symlink() && std::fs::read_link(&target).expect("readlink") == generation,
+        "target/ was dropped while a build still held its generation\n{text}"
+    );
+}
+
+/// Every exit that leaves target/ as a plain local directory probes it first.
+///
+/// Behavioural coverage above reaches two of the three exits; this pins all of
+/// them by shape, so a fourth exit (or a probe dropped from one) fails here.
+#[test]
+fn every_local_target_exit_probes_writability_first() {
+    let script =
+        std::fs::read_to_string(repo_root().join("scripts/cargo-target-link.sh")).expect("script");
+    let lines: Vec<&str> = script.lines().collect();
+    fn is_code(l: &str) -> bool {
+        !l.trim().is_empty() && !l.trim().starts_with('#')
+    }
+    let mut exits = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() != "exit 0" {
+            continue;
+        }
+        exits += 1;
+        let preceding: Vec<&str> = lines[..i]
+            .iter()
+            .rev()
+            .filter(|l| is_code(l))
+            .take(3)
+            .copied()
+            .collect();
+        assert!(
+            preceding
+                .iter()
+                .any(|l| l.contains("require_writable_local_target")),
+            "line {}: `exit 0` without a writability probe among the three preceding \
+             statements {:?}; a target/ that passes `-d` but cannot be written is a cargo \
+             error several steps later",
+            i + 1,
+            preceding
+        );
+    }
+    assert!(
+        exits >= 2,
+        "expected the managed-dir fallback and the unmanaged-target retention to each \
+         `exit 0`; found {exits}. If the script's shape changed, move this pin with it."
+    );
+    let last = lines
+        .iter()
+        .rev()
+        .find(|l| is_code(l))
+        .map(|l| l.trim())
+        .unwrap_or("");
+    assert_eq!(
+        last, "require_writable_local_target",
+        "the script's fall-through end (the else-branch and self-heal paths) must be \
+         the probe itself"
+    );
+}
+
+/// Helper: this checkout's managed worktree dir, exactly as the script names it.
+fn managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
+    let p = std::fs::canonicalize(checkout).expect("canonical checkout path");
+    let base: String = p
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let digest = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(p.to_string_lossy().as_bytes()))
+    };
+    btrfs_root
+        .join("cargo-target")
+        .join(format!("{base}-{}", &digest[..8]))
+}
+
+/// Helper: every fallback payload this checkout holds, published or not,
+/// sorted. Each activation names its own, so more than one means an earlier
+/// payload was neither published nor reclaimed.
+fn local_fallback_payloads(checkout: &Path) -> Vec<PathBuf> {
+    let checkout = std::fs::canonicalize(checkout).expect("canonical checkout path");
+    let mut payloads: Vec<PathBuf> = std::fs::read_dir(&checkout)
+        .unwrap_or_else(|error| panic!("read {checkout:?}: {error}"))
+        .map(|entry| entry.expect("checkout entry").path())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".cargo-target-local.generation-"))
+        })
+        .collect();
+    payloads.sort();
+    payloads
+}
+
+/// The script's own fallback: `target` is a link to the checkout-local payload,
+/// never a real `target/` dentry, so a later run can replace it once the volume
+/// is back. Returns the payload path.
+fn assert_local_fallback_link(checkout: &Path, btrfs_root: &Path, ctx: &str) -> PathBuf {
+    let target = checkout.join("target");
+    let link = std::fs::read_link(&target).unwrap_or_else(|error| {
+        panic!(
+            "{ctx}: target/ is not a symlink ({error}); a real target/ dentry is retained as \
+             unmanaged by every later run, so the checkout would never return to the btrfs \
+             cache. symlink_metadata={:?}",
+            std::fs::symlink_metadata(&target).map(|m| m.file_type())
+        )
+    });
+    assert!(
+        !link.starts_with(btrfs_root),
+        "{ctx}: target/ -> {link:?} points into the btrfs root {btrfs_root:?}"
+    );
+    assert_eq!(
+        local_fallback_payloads(checkout),
+        vec![link.clone()],
+        "{ctx}: target/ must publish the checkout's one fallback payload"
+    );
+    assert_target_usable(checkout, ctx);
+    link
+}
+
+/// Make this checkout's managed worktree dir "exist but refuse writes" without
+/// any privilege: point it at procfs, where creating an entry is refused for
+/// root and non-root alike. `mkdir -p` on it succeeds (it exists), a lease fd
+/// opens, and the write probe inside the lease fails -- exactly the
+/// ownership-change / read-only-remount state, staged with a symlink.
+///
+/// A chmod as the invoking user does not stop root, and a read-only bind
+/// remount is refused for UID 0 WITHOUT CAP_SYS_ADMIN (an unprivileged
+/// container), which fails the test before it reaches the script.
+fn unwritable_managed_worktree_dir(checkout: &Path, btrfs_root: &Path) -> PathBuf {
+    let wt = managed_worktree_dir(checkout, btrfs_root);
+    std::fs::create_dir_all(wt.parent().unwrap()).expect("cargo-target parent");
+    std::os::unix::fs::symlink("/proc/self", &wt).expect("procfs-backed worktree dir");
+    assert!(
+        wt.is_dir(),
+        "the procfs stand-in does not resolve to a directory"
+    );
+    assert!(
+        std::fs::File::create(wt.join(".fcvm-fixture-probe")).is_err(),
+        "the procfs stand-in accepted a write; the fixture proves nothing"
+    );
+    wt
+}
+
+/// A managed symlink whose directory has become unwritable must be REPLACED.
+///
+/// With `target` already pointing at the managed directory, noticing that the
+/// directory is unwritable and warning is not enough: the link still resolves,
+/// so the dangling-link repair is skipped and the final `-d target` check
+/// passes, which is exit 0 with a target Cargo cannot create files in. The
+/// fallback repoints the existing managed link at the local payload, under the
+/// generation lease it already holds for that replacement.
+#[test]
+fn cargo_target_link_replaces_a_managed_link_to_an_unwritable_dir() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = unwritable_managed_worktree_dir(checkout.path(), btrfs.path());
+    std::os::unix::fs::symlink(&wt, checkout.path().join("target")).expect("managed link");
+
+    let (ok, out) = run_link(checkout.path(), btrfs.path());
+
+    assert!(ok, "the recipe failed outright:\n{out}");
+    assert_local_fallback_link(
+        checkout.path(),
+        btrfs.path(),
+        "managed link to an unwritable dir",
+    );
+}
+
+/// The write probe must happen INSIDE the generation lease, never before it.
+///
+/// `prune-cargo-target.sh` takes LOCK_EX on a generation, takes a census of its
+/// entries, then rewalks the locked tree. A probe entry created before the
+/// script has leased the generation appears after the census with no record,
+/// and one removed during the rewalk raises "target entry disappeared during
+/// reclaim", so an ordinary concurrent `make` aborts the hourly preflight and
+/// its job.
+///
+/// The test IS the pruner: it holds LOCK_EX on the worktree directory and runs
+/// the script under a timeout. Correct behaviour is to block at the lease
+/// without having touched the directory -- so its mtime (which any create or
+/// unlink inside it bumps) must be unchanged when the timeout fires.
+#[test]
+fn cargo_target_link_does_not_touch_a_generation_it_has_not_leased() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let wt = managed_worktree_dir(checkout.path(), btrfs.path());
+    std::fs::create_dir_all(&wt).expect("managed dir");
+
+    // Be the pruner: LOCK_EX on the generation directory.
+    let dir = std::fs::File::open(&wt).expect("open the generation dir");
+    use std::os::unix::io::AsRawFd;
+    let locked = unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        locked,
+        0,
+        "could not take the pruner's LOCK_EX on {}",
+        wt.display()
+    );
+    // Settle so that a later create/unlink moves the mtime by a visible amount.
+    // (`touch`, not set_file_time: that helper opens for write, which a
+    // directory refuses with EISDIR.)
+    assert!(
+        Command::new("touch")
+            .args(["-d", "@1600000000"])
+            .arg(&wt)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "could not settle the directory mtime"
+    );
+    let before = std::fs::metadata(&wt).expect("stat").mtime();
+
+    let out = Command::new("timeout")
+        .arg("4")
+        .arg(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs.path())
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(checkout.path())
+        .output()
+        .expect("run the script under timeout");
+    let after = std::fs::metadata(&wt).expect("stat").mtime();
+    drop(dir); // releases the lock
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the script did not block on the pruner's lease; it completed with {:?}\n{}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        before, after,
+        "the generation directory was modified (mtime {before} -> {after}) while the \
+         pruner held its lease: the write probe ran outside the lock"
+    );
+}
+
+/// A fallback the script created must not outlive the outage that caused it.
+///
+/// A REAL target/ directory created while the volume is unavailable sends the
+/// next run with the volume back down the pre-protocol branch, which retains
+/// any real target/ as unmanaged: the checkout never returns to the btrfs cache
+/// and every later build lands on the root filesystem until the disk guard
+/// quarantines the runner. The fallback is a link to a checkout-local payload,
+/// which the recovered run replaces under the same lease as any other published
+/// link, and reclaims once it publishes nothing.
+#[test]
+fn cargo_target_link_returns_to_btrfs_after_a_volume_outage() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    assert!(!btrfs.exists(), "precondition: the volume is not mounted");
+
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 1 (volume absent) failed:\n{out}");
+    assert_target_usable(checkout.path(), "run 1, volume absent");
+    let target = checkout.path().join("target");
+    let payload = std::fs::canonicalize(&target).expect("resolve the fallback payload");
+    std::fs::write(
+        target.join("built-during-outage"),
+        b"built while the volume was down",
+    )
+    .expect("write through target/ during the outage");
+
+    std::fs::create_dir_all(&btrfs).expect("the volume is mounted again");
+
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 2 (volume back) failed:\n{out}");
+    let link = std::fs::read_link(&target).unwrap_or_else(|error| {
+        panic!(
+            "run 2: target/ is not a symlink ({error}); the fallback the script created \
+             during the outage was retained as an unmanaged real target/, so this checkout \
+             never returns to the btrfs cache and every later build stays on the root \
+             filesystem:\n{out}"
+        )
+    });
+    assert!(
+        link.starts_with(btrfs.join("cargo-target")),
+        "run 2: target/ -> {link:?} is not under the recovered volume:\n{out}"
+    );
+    assert_target_usable(checkout.path(), "run 2, volume back");
+    assert!(
+        !target.join("built-during-outage").exists(),
+        "the outage payload is still published through target/"
+    );
+    assert!(
+        local_fallback_payloads(checkout.path()).is_empty(),
+        "the outage payload is unreachable and sits on the root filesystem this indirection \
+         keeps free; nothing else enumerates it:\n{out}"
+    );
+    assert!(
+        out.contains(payload.to_str().expect("utf-8 payload path")),
+        "run 2 must name the payload {payload:?} it reclaimed:\n{out}"
+    );
+}
+
+/// A real target/ the script did not create is retained, volume or no volume.
+/// Its dentry may carry a mount that exists only in another mount namespace,
+/// and renaming or removing it could move or detach that mount; only the
+/// script's own fallback lives behind a replaceable link.
+#[test]
+fn cargo_target_link_retains_a_real_target_it_did_not_create() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let target = checkout.path().join("target");
+    std::fs::create_dir(&target).expect("pre-existing real target/");
+    let artifact = target.join("pre-protocol-artifact");
+    std::fs::write(&artifact, b"not the script's to move").expect("write artifact");
+
+    for (volume_present, ctx) in [(false, "volume absent"), (true, "volume back")] {
+        if volume_present {
+            std::fs::create_dir_all(&btrfs).expect("mount the volume");
+        }
+        let (ok, out) = run_link(checkout.path(), &btrfs);
+        assert!(ok, "{ctx}: the recipe failed:\n{out}");
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .expect("target/ must exist")
+                .file_type()
+                .is_dir(),
+            "{ctx}: a real target/ the script did not create was replaced by {:?}:\n{out}",
+            std::fs::read_link(&target)
+        );
+        if volume_present {
+            assert!(
+                out.contains("retaining unmanaged local target/"),
+                "{ctx}: retention must be stated:\n{out}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&artifact).expect("read the retained artifact"),
+            b"not the script's to move",
+            "{ctx}: the retained payload changed"
+        );
+        assert!(
+            local_fallback_payloads(checkout.path()).is_empty(),
+            "{ctx}: a fallback payload was created beside a retained real target/:\n{out}"
+        );
+        assert_target_usable(checkout.path(), ctx);
+    }
+}
+
+/// `--rotate` keeps refusing while the volume is down: the fallback link, and a
+/// fallback payload with no link over it, would both report a clean while the
+/// payload survives.
+#[test]
+fn cargo_target_link_rotate_refuses_the_local_fallback_while_the_volume_is_down() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "fallback failed:\n{out}");
+    let payload = assert_local_fallback_link(checkout.path(), &btrfs, "volume absent");
+    let target = checkout.path().join("target");
+    std::fs::write(target.join("artifact"), b"survives").expect("write through target/");
+
+    let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+    assert!(
+        !ok && out.contains("refusing unsafe clean"),
+        "--rotate reported a clean it cannot perform on the fallback link:\n{out}"
+    );
+    assert_eq!(
+        std::fs::read_link(&target).expect("readlink"),
+        payload,
+        "a refused rotation must leave the fallback link in place"
+    );
+
+    std::fs::remove_file(&target).expect("unlink the fallback link");
+    let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+    assert!(
+        !ok && out.contains("refusing unsafe clean"),
+        "--rotate republished a surviving fallback payload as a clean target/:\n{out}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&target).is_err(),
+        "a refused rotation must not publish anything"
+    );
+    assert_eq!(
+        std::fs::read(payload.join("artifact")).expect("read the surviving payload"),
+        b"survives"
+    );
+}
+
+/// A clean the volume outlived must not leave a payload a later outage can
+/// republish.
+///
+/// The volume is absent, so a fallback payload is published and built into; the
+/// volume returns and the next run publishes a btrfs generation; `--rotate`
+/// (the `clean` recipe) reports a clean; the volume goes away again. The
+/// fallback published by the last run must be empty. Anything the first outage
+/// left in it is cargo cache and build-script output that the clean reported
+/// gone.
+#[test]
+fn cargo_target_link_publishes_a_fresh_fallback_after_a_clean() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let target = checkout.path().join("target");
+
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 1 (volume absent) failed:\n{out}");
+    let first_payload = std::fs::read_link(&target).expect("run 1 must publish a fallback link");
+    std::fs::write(target.join("stale-artifact"), b"built before the clean")
+        .expect("write through the fallback link");
+
+    std::fs::create_dir_all(&btrfs).expect("the volume is mounted again");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 2 (volume back) failed:\n{out}");
+
+    let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+    assert!(ok, "run 3 (--rotate, the clean recipe) failed:\n{out}");
+
+    std::fs::remove_dir_all(&btrfs).expect("the volume goes away again");
+    let (ok, out) = run_link(checkout.path(), &btrfs);
+    assert!(ok, "run 4 (volume absent again) failed:\n{out}");
+    assert_target_usable(checkout.path(), "run 4, volume absent again");
+
+    let republished = std::fs::read_link(&target).expect("run 4 must publish a fallback link");
+    assert!(
+        !target.join("stale-artifact").exists(),
+        "target/ -> {republished:?} republishes {first_payload:?}, the payload the clean \
+         reported gone; every cargo fingerprint and build-script OUT_DIR written before the \
+         clean is back:\n{out}"
+    );
+    assert_ne!(
+        republished, first_payload,
+        "run 4 reused an earlier outage's payload instead of publishing a fresh one:\n{out}"
+    );
 }
