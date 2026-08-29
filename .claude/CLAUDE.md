@@ -576,6 +576,14 @@ kernel.apparmor_restrict_unprivileged_userns=0
 SYSCTL
 sudo sysctl -p /etc/sysctl.d/99-fcvm.conf
 
+# 1c. AllowOther mounts. Without user_allow_other, fuse-pipe falls back to
+#     SessionACL::Owner (fuse-pipe/src/client/mount.rs) and
+#     `make test-unit` fails on fuse-pipe::test_allow_other
+#     test_allow_other_with_fuse_conf, "Test requires user_allow_other in
+#     /etc/fuse.conf". CI and both test Containerfiles set it, so only a
+#     hand-built box is missing it.
+grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+
 # 2. Packages (Ubuntu 24.04). btrfs-progs is needed by the very next step;
 #    bc/bison/flex/libelf-dev are the kernel fallback build's dependencies —
 #    setup builds a kernel locally whenever a profile's release artifact is
