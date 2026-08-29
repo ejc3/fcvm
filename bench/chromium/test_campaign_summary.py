@@ -1228,12 +1228,12 @@ class CampaignSummary(unittest.TestCase):
         RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
         .../campaign-x-summary.json: 1 cell(s), on all seven shapes.
         """
-        # The captured config may carry the other resolv.conf lines and
-        # indented nameservers; only the resolvers it establishes matter.
+        # The captured config may carry the other resolv.conf lines; only the
+        # resolvers it establishes matter.
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "run")
             write_run(run_dir, verify_overrides={
-                "resolv_conf_vm": "search corp.example\noptions ndots:1\n\tnameserver 10.0.2.2\n",
+                "resolv_conf_vm": "search corp.example\noptions ndots:1\nnameserver 10.0.2.2\n",
                 "resolv_conf_container": "# generated\nnameserver 10.0.2.2\n",
             })
             out = os.path.join(d, "campaign-x-summary.json")
@@ -1249,6 +1249,10 @@ class CampaignSummary(unittest.TestCase):
             ({"resolv_conf_container": "nameserver 10.0.2.2\nnameserver 1.1.1.1\n"},
              "1.1.1.1"),
             ({"resolv_conf_vm": "search corp.example\n"}, "resolv_conf_vm"),
+            # glibc reads a directive only at the start of a line and skips
+            # `#`/`;` comments, so neither of these configures a resolver.
+            ({"resolv_conf_vm": "\tnameserver 10.0.2.2\n"}, "resolv_conf_vm"),
+            ({"resolv_conf_container": "#nameserver 10.0.2.2\n"}, "resolv_conf_container"),
             ({"resolv_conf_vm": ""}, "resolv_conf_vm"),
             ({"resolv_conf_container": None}, "resolv_conf_container"),
         )

@@ -82,10 +82,11 @@ OWNER_SAMPLE = re.compile(
 # The sampler accepts a load only in this shape; dns_load_stats counts only
 # these when it reports load_samples and load_max_1min.
 LOAD_NUMBER = re.compile(r"^[0-9]+(\.[0-9]+)?$")
-# One resolver line of a captured /etc/resolv.conf. resolv.conf(5) allows
-# leading whitespace and ignores anything after the address; `#` and `;`
-# start a comment, so a commented-out nameserver establishes nothing.
-NAMESERVER_LINE = re.compile(r"^[ \t]*nameserver[ \t]+(\S+)", re.MULTILINE)
+# One resolver line of a captured /etc/resolv.conf, read the way glibc reads
+# it: the keyword at the start of the line, followed by whitespace and the
+# address. An indented line is not a directive to glibc and a `#` or `;` line
+# is a comment, so neither configures a resolver.
+NAMESERVER_LINE = re.compile(r"^nameserver[ \t]+(\S+)", re.MULTILINE)
 # The seal identity of one run, as reqbench.py stamps it into every record's
 # meta and reqanalyze carries it into the cell (CELL_FIELDS).
 SEAL_FIELDS = (
