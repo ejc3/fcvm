@@ -73,6 +73,37 @@ mkdir -p "$LOGDIR"
 # Created here, not left to reqbench: the replay server's logs and the resolver
 # evidence below are written into it before any reqbench phase runs.
 mkdir -p "$RESULTS"
+# $RESULTS/diag is reqbench's diag phase's output directory, and its cmd_diag
+# owns it exclusively under $RESULTS/diag/.lock from before its first removal
+# to past the atomic rename that publishes its summary. The cleanup below
+# removes that summary, so it takes the same lock, with the same bounded wait
+# and refusal: unlocked, the removal lands inside a diag's critical section,
+# after the rename and before the release, and that diag exits reporting a
+# summary that no longer exists. Held for the removal alone; the campaign's
+# own diag phase takes the lock again, from the sub-make's own process.
+CAMPAIGN_DIAG_LOCK_FD=""
+acquire_diag_lock() {
+    local lock="$RESULTS/diag/.lock" wait_s="${DIAG_LOCK_WAIT:-${HUGEPAGE_POOL_LOCK_WAIT:-60}}"
+    mkdir -p "$RESULTS/diag" || { echo "BLOCKED: cannot create $RESULTS/diag" >&2; return 1; }
+    touch "$lock" 2>/dev/null || true
+    exec {CAMPAIGN_DIAG_LOCK_FD}<>"$lock" || true
+    if [ -z "$CAMPAIGN_DIAG_LOCK_FD" ]; then
+        echo "BLOCKED: diag output lock unavailable at $lock" >&2
+        return 1
+    fi
+    if ! flock -x -w "$wait_s" "$CAMPAIGN_DIAG_LOCK_FD"; then
+        echo "BLOCKED: a diag owns $RESULTS/diag (waited ${wait_s}s); its summary is published under this lock, so this campaign refuses to clear the directory rather than removing a record out from under it" >&2
+        return 1
+    fi
+}
+
+release_diag_lock() {
+    [ -n "$CAMPAIGN_DIAG_LOCK_FD" ] || return 0
+    exec {CAMPAIGN_DIAG_LOCK_FD}>&-
+    CAMPAIGN_DIAG_LOCK_FD=""
+}
+
+acquire_diag_lock || exit 2
 # An explicit RESULTS can be reused. Evidence an earlier campaign left there
 # must not outlive this one's start: a clean verdict beside a run this
 # campaign never finished would be indexed as if it were this run's, and
@@ -89,6 +120,7 @@ mkdir -p "$RESULTS"
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
     "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-serve.status \
     "$RESULTS"/reqbench.jsonl "$RESULTS"/analysis.json "$RESULTS"/diag/summary.json
+release_diag_lock
 
 # The 14 URLs, in the order the sealed 2026-08-14 run cycled them. Order is part
 # of the schedule: reqanalyze re-derives the expected URL per record from it, so

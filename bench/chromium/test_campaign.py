@@ -718,18 +718,137 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-run", handle.read())
 
-    # The rm may continue over backslash-newlines; the block runs whole.
+    # From `mkdir -p "$RESULTS"` to the end of the rm, which may continue over
+    # backslash-newlines, plus the lock release that closes the block. The
+    # whole thing runs, so the lock the removal takes runs with it.
     START_CLEANUP = re.compile(
-        r'(mkdir -p "\$RESULTS"\n(?:#[^\n]*\n)*rm -f (?:[^\n]*\\\n)*[^\n]*\n)')
+        r'(mkdir -p "\$RESULTS"\n.*?rm -f (?:[^\n]*\\\n)*[^\n]*\n'
+        r'(?:release_diag_lock\n)?)', re.S)
 
-    def _run_start_cleanup(self, results: str):
-        """Execute the block after `mkdir -p "$RESULTS"` that clears an
-        earlier campaign's evidence, against a pre-filled RESULTS."""
+    def _start_cleanup_script(self, results: str) -> str:
+        """The shipped start-cleanup block, ready to run against `results`."""
         block = self.START_CLEANUP.search(campaign())
         self.assertIsNotNone(block, "the campaign does not clear stale evidence at start")
+        return f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'
+
+    def _run_start_cleanup(self, results: str, env=None, timeout=30, tail=""):
+        """Execute the block after `mkdir -p "$RESULTS"` that clears an
+        earlier campaign's evidence, against a pre-filled RESULTS."""
         return subprocess.run(
-            ["bash", "-c", f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'],
-            capture_output=True, text=True, timeout=30)
+            ["bash", "-c", self._start_cleanup_script(results) + tail],
+            capture_output=True, text=True, timeout=timeout,
+            env=None if env is None else dict(os.environ, **env))
+
+    # A process that takes $RESULTS/diag/.lock exactly as reqbench.sh's
+    # cmd_diag does, announces that it holds it, and holds until told to let
+    # go. The announcement and the release are FIFO reads and writes, so the
+    # test orders itself against the lock rather than against the clock.
+    LOCK_HOLDER = """set -euo pipefail
+exec {fd}<>"$LOCK"
+flock -x "$fd"
+echo held > "$READY"
+read -r _ < "$GO"
+"""
+
+    class _DiagLockHolder:
+        """Holds the diag output lock for the body of a `with` block."""
+
+        def __init__(self, test, results):
+            self.test, self.results = test, results
+            self.lock = os.path.join(results, "diag", ".lock")
+
+        def __enter__(self):
+            os.makedirs(os.path.dirname(self.lock), exist_ok=True)
+            open(self.lock, "a").close()
+            self.ready = self.lock + ".ready"
+            self.go = self.lock + ".go"
+            for fifo in (self.ready, self.go):
+                os.mkfifo(fifo)
+            self.proc = subprocess.Popen(
+                ["bash", "-c", DnsBrackets.LOCK_HOLDER],
+                env=dict(os.environ, LOCK=self.lock, READY=self.ready, GO=self.go),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Blocks until the holder has the lock: opening a FIFO for reading
+            # returns when a writer opens it, and the holder redirects to it
+            # only after flock returns.
+            with open(self.ready) as ready:
+                self.test.assertEqual(ready.read().strip(), "held")
+            return self
+
+        def release(self):
+            if self.proc.poll() is None:
+                with open(self.go, "w") as go:
+                    go.write("go\n")
+            self.test.assertEqual(self.proc.wait(timeout=30), 0,
+                                  self.proc.stderr.read())
+
+        def __exit__(self, *exc):
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait(timeout=30)
+            return False
+
+    def test_a_diag_holding_its_lock_blocks_the_start_cleanup(self):
+        """diag/summary.json belongs to reqbench's diag phase, which owns
+        $RESULTS/diag under $RESULTS/diag/.lock from before its first removal
+        to past the atomic rename that publishes the summary. A campaign
+        start that removes the summary without that lock can take it out of
+        a diag's hands after the rename and before the release, leaving the
+        diag to exit 0 over a summary that is gone. The start takes the same
+        lock, waits DIAG_LOCK_WAIT seconds for it, and refuses rather than
+        deleting.
+
+        RED BEFORE THE FIX: `AssertionError: 0 != 0 : the start deleted
+        diag/summary.json while a diag held the lock`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            with self._DiagLockHolder(self, results) as holder:
+                summary = os.path.join(results, "diag", "summary.json")
+                with open(summary, "w") as handle:
+                    handle.write('{"passed": true}\n')
+                blocked = self._run_start_cleanup(
+                    results, env={"DIAG_LOCK_WAIT": "1"})
+                self.assertTrue(os.path.exists(summary),
+                                "the start deleted diag/summary.json while a "
+                                "diag held the lock")
+                self.assertNotEqual(
+                    blocked.returncode, 0,
+                    f"the start reported success without the lock: {blocked.stdout}")
+                self.assertIn("diag", blocked.stderr.lower(),
+                              f"the refusal does not name the lock: {blocked.stderr}")
+                holder.release()
+            # The lock is the only thing that held it back: once the diag has
+            # let go, the same start clears the same summary.
+            cleared = self._run_start_cleanup(results, env={"DIAG_LOCK_WAIT": "1"})
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            self.assertFalse(os.path.exists(summary),
+                             "the start left an earlier campaign's diag summary")
+
+    def test_the_start_cleanup_releases_the_diag_lock(self):
+        """The campaign's own diag phase takes this lock in a sub-make, from
+        its own process. A start that kept the lock for the campaign's
+        lifetime would refuse every diag it launches.
+
+        Positive control: it cannot go red against the unfixed campaign,
+        which takes no lock at all. It was watched red against a fix that
+        acquired the lock and never released it (`released=1`).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(os.path.join(results, "diag"))
+            with open(os.path.join(results, "diag", "summary.json"), "w") as handle:
+                handle.write('{"passed": true}\n')
+            # A fresh open of the lock file: flock is per open file
+            # description, so this fails while the start still holds its own.
+            done = self._run_start_cleanup(
+                results,
+                tail=f'\nif flock -x -n "{results}/diag/.lock" -c true; '
+                     'then echo "released=0"; else echo "released=$?"; fi\n')
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn("released=0", done.stdout,
+                          f"the start still holds the diag lock: {done.stdout}")
 
     def test_stale_evidence_from_an_earlier_campaign_is_cleared_at_start(self):
         """An explicit RESULTS can be reused. A clean dns-evidence.json left
