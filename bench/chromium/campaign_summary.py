@@ -11,8 +11,8 @@ optional otherwise; when present its verdict must be "clean", it must carry
 the replay server's exit status 0, every file it cites must be present and
 agree with the sha256 it recorded, each verify bracket must record the run's
 resolver in both captured /etc/resolv.conf views and nowhere else, with the
-URL probes run under no proxy and every host and URL answered through it,
-and every sample in dns-owner.log must name its
+URL probes run under no proxy and exactly the hostnames and URLs the cell
+measured answered through it, and every sample in dns-owner.log must name its
 serve_pid as the owner of 127.0.0.1:53 with dnsmasq inactive and a load the
 evidence accounts for) and diag/summary.json (reqbench.sh diag; required when
 the cell's guest_dns names a baked resolver or its guest_env is non-empty,
@@ -291,13 +291,37 @@ def bracket_answers(run_dir, name, verify):
     return answers
 
 
-def check_verify_bracket(run_dir, name, verify, resolver):
+def check_coverage(run_dir, name, kind, probed, measured):
+    """The bracket probed exactly what the run measured, or RunError.
+
+    corpus_campaign.sh gives HOP D the same URL list it measures on, and
+    derives the hostnames from it. A bracket over some other list is
+    evidence about another campaign's configuration: one that probed a
+    single page says nothing about the rest of the corpus, and one that
+    probed pages this run never loaded was not run for it.
+    """
+    missing = sorted(measured - probed)
+    if missing:
+        raise RunError(
+            f"{run_dir}: {name} probed no {kind} for {', '.join(missing)}, "
+            f"which this run measured; a bracket over part of the corpus is "
+            "not evidence for the rest of it"
+        )
+    extra = sorted(probed - measured)
+    if extra:
+        raise RunError(
+            f"{run_dir}: {name} probed {kind} {', '.join(extra)}, which this "
+            "run did not measure; that bracket was run for another URL list"
+        )
+
+
+def check_verify_bracket(run_dir, name, verify, resolver, measured_urls, measured_hosts):
     """Hold one HOP D bracket to what the campaign asserted when it ran it:
     the clone resolved through `resolver` (None takes the bracket's own, so
     the remaining brackets are held to the first), both captured
     /etc/resolv.conf views named that resolver and no other, the URL probes
-    ran with no proxy, and every corpus host and URL answered through it.
-    Returns the resolver the bracket names.
+    ran with no proxy, and every host and URL the run measured answered
+    through it. Returns the resolver the bracket names.
 
     passed=true is also what HOP D writes when it was given nothing to check,
     so it is not on its own a bracket."""
@@ -356,6 +380,7 @@ def check_verify_bracket(run_dir, name, verify, resolver):
             f"{run_dir}: {name} records no resolved host; a bracket that "
             "checked nothing proves nothing"
         )
+    check_coverage(run_dir, name, "host", set(hosts), measured_hosts)
     for host, record in sorted(hosts.items()):
         if not isinstance(record, dict) or record.get("ok") is not True:
             raise RunError(f"{run_dir}: {name} records {host} as {record!r}, not resolved")
@@ -370,6 +395,7 @@ def check_verify_bracket(run_dir, name, verify, resolver):
             f"{run_dir}: {name} records no fetched URL; a bracket that "
             "checked nothing proves nothing"
         )
+    check_coverage(run_dir, name, "URL", set(urls), measured_urls)
     for url, record in sorted(urls.items()):
         if not isinstance(record, dict) or record.get("ok") is not True:
             raise RunError(f"{run_dir}: {name} records {url} as {record!r}, not fetched")
@@ -386,12 +412,18 @@ def check_verify_bracket(run_dir, name, verify, resolver):
     return dns_server
 
 
-def check_evidence(run_dir, evidence, sources, guest_dns):
+def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls):
     """Hold a clean verdict to the files it cites; raise RunError otherwise.
 
-    Returns the set of addresses the verify brackets' resolver answered,
-    the run's own record of where its pages came from.
+    measured_urls is the cell's own URL list, what every bracket has to have
+    covered. Returns the set of addresses the verify brackets' resolver
+    answered, the run's own record of where its pages came from.
     """
+    if not measured_urls:
+        raise RunError(
+            f"{run_dir}: analysis.json cell names no url, so nothing says which "
+            "pages the verify brackets had to have covered; re-run reqanalyze"
+        )
     if not isinstance(evidence, dict):
         # Valid JSON that is not an object ([] for one) has no verdict to
         # read; refusing it here keeps every .get() below on a dict.
@@ -459,6 +491,10 @@ def check_evidence(run_dir, evidence, sources, guest_dns):
             "file the verdict read"
         )
     cited = {os.path.basename(p) for p in verify_files}
+    # The hostnames HOP D was given, derived from the measured URLs the way
+    # corpus_campaign.sh's corpus_hosts derives them: the authority, port
+    # included, in the spelling the campaign passed as VERIFY_DNS_HOSTS.
+    measured_hosts = {urlsplit(url).netloc for url in measured_urls}
     resolver = guest_dns if isinstance(guest_dns, str) and guest_dns else None
     answers = set()
     for stage in VERIFY_STAGES:
@@ -478,7 +514,9 @@ def check_evidence(run_dir, evidence, sources, guest_dns):
                 "dns-evidence.json recorded at the verdict"
             )
         verify = parse_json(data, path)
-        resolver = check_verify_bracket(run_dir, name, verify, resolver)
+        resolver = check_verify_bracket(
+            run_dir, name, verify, resolver, set(measured_urls), measured_hosts
+        )
         answers |= bracket_answers(run_dir, name, verify)
     # The replay server's own logs, pinned by hash at the verdict.
     for field, name in REPLAY_LOGS.items():
@@ -798,13 +836,14 @@ def load_cell(run_dir):
             f"{run_dir}: stall_gate failed: {stall_gate.get('violations')}"
         )
 
+    measured = [part.strip() for part in str(cell.get("url") or "").split(",") if part.strip()]
     dns_verdict = None
     load_max_1min = None
     answers = set()
     evidence_path = os.path.join(run_dir, "dns-evidence.json")
     if os.path.isfile(evidence_path):
         evidence = sources.read_json(evidence_path)
-        answers = check_evidence(run_dir, evidence, sources, cell["guest_dns"])
+        answers = check_evidence(run_dir, evidence, sources, cell["guest_dns"], measured)
         dns_verdict = evidence["verdict"]
         # Reported, not gated: the run driver refused a busy box at the
         # start, and evidence from before the sampler carried the load
@@ -831,7 +870,6 @@ def load_cell(run_dir):
     diag = None
     diag_path = os.path.join(run_dir, "diag", "summary.json")
     if os.path.isfile(diag_path):
-        measured = [part.strip() for part in str(cell.get("url") or "").split(",") if part.strip()]
         addresses = recorded_addresses(run_dir, measured, guest_env, answers)
         diag = summarize_diag(
             run_dir, sources.read_json(diag_path), cell, measured, addresses, max_ms

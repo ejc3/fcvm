@@ -1215,6 +1215,80 @@ class CampaignSummary(unittest.TestCase):
                 self.assertIn("verify-dns-", text)
                 self.assertIn(expected, text)
 
+    URLS_TWO = ("https://example.com/", "https://b.example/sub/")
+
+    @classmethod
+    def _two_url_run(cls, **kwargs):
+        """write_run kwargs for a cell that measured URLS_TWO, with brackets
+        and a diag that cover both."""
+        hosts = {"example.com": {"answer": "10.0.2.2", "ok": True},
+                 "b.example": {"answer": "10.0.2.2", "ok": True}}
+        urls = {url: {"status": 200, "ok": True, "proxy_env_ignored": []}
+                for url in cls.URLS_TWO}
+        run = dict(
+            cell_overrides={"url": ",".join(cls.URLS_TWO)},
+            verify_overrides={"hosts": hosts, "urls": urls},
+            diag=diag_summary(urls=cls.URLS_TWO),
+        )
+        for key, value in kwargs.items():
+            if key in ("verify_overrides", "cell_overrides"):
+                run[key] = {**run[key], **value}
+            else:
+                run[key] = value
+        return run
+
+    def test_a_bracket_that_did_not_cover_the_measured_urls_refuses(self):
+        """A bracket says the clone resolved and fetched what HOP D was told
+        to probe, which the campaign sets from the same URL list it measures.
+        The index re-derived the resolver and the answers from the bracket but
+        never compared its host and URL sets with the cell's, so a bracket
+        that probed one page of a fourteen-page corpus, or pages from another
+        campaign, was indexed as proof for all of them.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s), on all five shapes.
+        """
+        # Control: brackets and diag covering both measured URLs.
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, **self._two_url_run())
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+        cls_urls = self.URLS_TWO
+        one_host = {"example.com": {"answer": "10.0.2.2", "ok": True}}
+        one_url = {self.URLS_TWO[0]: {"status": 200, "ok": True,
+                                      "proxy_env_ignored": []}}
+        cases = (
+            # The bracket probed one page of the two the run measured.
+            ({"urls": one_url}, self.URLS_TWO[1]),
+            ({"hosts": one_host}, "b.example"),
+            # A bracket from another campaign's URL list says nothing about
+            # the pages this run measured, even where it covers all of them.
+            ({"urls": {url: {"status": 200, "ok": True, "proxy_env_ignored": []}
+                       for url in (*cls_urls, "https://other.example/")}},
+             "other.example"),
+            ({"hosts": {host: {"answer": "10.0.2.2", "ok": True}
+                        for host in ("example.com", "b.example", "other.example")}},
+             "other.example"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(bracket=overrides), tempfile.TemporaryDirectory() as d:
+                _paths, text = self._refused(d, **self._two_url_run(
+                    verify_overrides=overrides))
+                self.assertIn("verify-dns-", text)
+                self.assertIn(expected, text)
+        # A cell that names no URL gives the coverage check nothing to
+        # compare, so every bracket would pass it. That is a refusal, and it
+        # has to be one here: a cell with brackets, no guest_dns and no baked
+        # environment needs no diag, so the diag's own url check never runs.
+        for extra in ({}, {"guest_dns": None, "diag": None}):
+            with self.subTest(cell="no url", extra=extra), \
+                    tempfile.TemporaryDirectory() as d:
+                _paths, text = self._refused(
+                    d, cell_overrides={"url": None}, **extra)
+                self.assertIn("url", text)
+
     def test_brackets_that_disagree_on_the_resolver_refuse(self):
         """A cell with no guest_dns has no resolver to hold the brackets to,
         so the first bracket's is the reference and the other two are held to

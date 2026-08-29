@@ -31,6 +31,7 @@ import time
 import types
 import unittest
 import urllib.request
+from urllib.parse import urlsplit
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -9284,9 +9285,16 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
 
     CORPUS = ["https://example.com/", "https://developer.mozilla.org/en-US/"]
 
-    @staticmethod
-    def _evidence(run_dir, verdict):
-        """dns-evidence.json plus every file it names, as the campaign leaves them."""
+    @classmethod
+    def _evidence(cls, run_dir, verdict):
+        """dns-evidence.json plus every file it names, as the campaign leaves
+        them. corpus_campaign.sh hands HOP D the same URL list it measures on
+        (VERIFY_DNS_URLS="$URLS") and the hostnames it derives from it, so
+        every bracket covers the whole corpus."""
+        hosts = {urlsplit(url).netloc: {"answer": "10.0.2.2", "ok": True}
+                 for url in cls.CORPUS}
+        urls = {url: {"status": 200, "ok": True, "proxy_env_ignored": []}
+                for url in cls.CORPUS}
         verify_files = []
         verify_hashes = {}
         for stage in ("pre", "before-run", "after-run"):
@@ -9295,9 +9303,8 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 json.dump({
                     "dns_server": "10.0.2.2", "resolv_conf_vm": "nameserver 10.0.2.2\n",
                     "resolv_conf_container": "nameserver 10.0.2.2\n",
-                    "hosts": {"example.com": {"answer": "10.0.2.2", "ok": True}},
-                    "urls": {"https://example.com/": {"status": 200, "ok": True,
-                                                      "proxy_env_ignored": []}},
+                    "hosts": hosts,
+                    "urls": urls,
                     "proxies_disabled": True,
                     "timestamp": "2026-08-28T00:00:00Z", "passed": True,
                 }, handle)
