@@ -133,6 +133,15 @@ any_fallback_payload() {
 # root against the same bind-mounted checkout, so a root-owned payload beside a
 # user-owned one is an ordinary state, and root is not stopped by permissions.
 #
+# Ownership is decided on a stat of a name and the removal runs on a descriptor
+# opened from that same name, which is a second resolution. Both decisions are
+# therefore remade on the descriptor before anything is unlinked: its uid must
+# be this identity and its (st_dev, st_ino) must be the pair the check ran on.
+# Without that, a rename in between hands the walk a directory nothing checked,
+# and the comparison before the rmdir proves only that the name still resolves
+# to the replacement, so the foreign-owner guard is defeated and another
+# identity loses a tree.
+#
 # Every outcome is named. Failing the run is reserved for a payload this
 # identity owns and could not reclaim: nothing else enumerates it and its name
 # is never published again, so no later run clears it either, and each outage
@@ -200,6 +209,15 @@ def open_beneath(parent_fd, name):
     raise OSError(code, os.strerror(code), name)
 
 
+def remove_directory(directory_fd, name, decided):
+    # rmdir takes a name, not a descriptor, so the identity behind the name is
+    # checked once more against the stat the removal was decided on.
+    final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (final.st_dev, final.st_ino) != (decided.st_dev, decided.st_ino):
+        raise RuntimeError(f"{name} changed identity while it was being reclaimed")
+    os.rmdir(name, dir_fd=directory_fd)
+
+
 def prune(directory_fd, device):
     for name in os.listdir(directory_fd):
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -208,10 +226,17 @@ def prune(directory_fd, device):
         if stat.S_ISDIR(info.st_mode):
             child_fd = open_beneath(directory_fd, name)
             try:
+                # The name was resolved a second time to open it. Descend only
+                # into the directory the checks above were made about.
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise RuntimeError(
+                        f"{name} changed identity while it was being reclaimed"
+                    )
                 prune(child_fd, device)
             finally:
                 os.close(child_fd)
-            os.rmdir(name, dir_fd=directory_fd)
+            remove_directory(directory_fd, name, info)
         else:
             os.unlink(name, dir_fd=directory_fd)
 
@@ -260,17 +285,35 @@ try:
             failed = True
             continue
         try:
+            # The ownership check above and the open are two resolutions of one
+            # name, and everything below acts on the descriptor. Remake both
+            # decisions on it: a rename in that window otherwise hands the walk
+            # a directory nothing checked, and the comparison before the rmdir
+            # would only prove the name still resolves to that replacement.
+            opened = os.fstat(payload_fd)
+            if opened.st_uid != os.geteuid():
+                report(
+                    f"==> ERROR: the fallback payload {path} is owned by uid {opened.st_uid} "
+                    f"once opened, not {os.geteuid()}; it changed identity between its "
+                    f"ownership check and the open and is not reclaimed"
+                )
+                failed = True
+                continue
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                report(
+                    f"==> ERROR: the fallback payload {path} changed identity between its "
+                    f"ownership check and the open ({info.st_dev}:{info.st_ino} is now "
+                    f"{opened.st_dev}:{opened.st_ino}); it is not reclaimed"
+                )
+                failed = True
+                continue
             try:
                 fcntl.flock(payload_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 report(f"==> WARNING: {path} is leased by another build and is not reclaimed")
                 continue
-            payload = os.fstat(payload_fd)
-            prune(payload_fd, payload.st_dev)
-            final = os.stat(name, dir_fd=checkout_fd, follow_symlinks=False)
-            if (final.st_dev, final.st_ino) != (payload.st_dev, payload.st_ino):
-                raise RuntimeError("the payload name changed inode while it was reclaimed")
-            os.rmdir(name, dir_fd=checkout_fd)
+            prune(payload_fd, opened.st_dev)
+            remove_directory(checkout_fd, name, opened)
         except (MountBoundary, OSError, RuntimeError) as error:
             report(f"==> ERROR: cannot reclaim the fallback payload {path}: {error}")
             failed = True

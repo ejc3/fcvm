@@ -3743,6 +3743,196 @@ fn cargo_target_link_refuses_to_reclaim_a_payload_owned_by_another_user() {
     );
 }
 
+/// Run the script with the reclaim's ownership check and its open of `victim`
+/// separated by a rename, so the descriptor the reclaim goes on to prune is
+/// never the directory that check approved.
+///
+/// The interleave is by construction, not by timing: the swap runs inside the
+/// `os.stat` call whose result the ownership check reads, so the open that
+/// follows can only ever see the replacement. The hook is a `sitecustomize`
+/// module on `PYTHONPATH`, which CPython imports before it runs the reclaim, so
+/// the script, its walk and its removal are the real ones.
+fn run_link_with_payload_swapped_after_its_check(
+    dir: &Path,
+    btrfs_root: &Path,
+    victim: &str,
+    replacement: &Path,
+) -> (bool, String) {
+    let hook_dir = tempfile::tempdir().expect("hook tempdir");
+    std::fs::set_permissions(hook_dir.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("0755");
+    let checkout = dir.to_string_lossy().into_owned();
+    let replacement_path = replacement.to_string_lossy().into_owned();
+    let program = format!(
+        r#"import os
+
+_real_stat = os.stat
+_checkout = {checkout:?}
+_victim = {victim:?}
+_replacement = {replacement_path:?}
+_moved_aside = os.path.join(_checkout, "payload-moved-aside")
+_marker = os.path.join(_checkout, "swap-performed")
+
+
+def _stat(path, *args, dir_fd=None, follow_symlinks=True, **kwargs):
+    info = _real_stat(path, *args, dir_fd=dir_fd, follow_symlinks=follow_symlinks, **kwargs)
+    if dir_fd is not None and path == _victim and not os.path.lexists(_marker):
+        os.rename(os.path.join(_checkout, _victim), _moved_aside)
+        os.rename(_replacement, os.path.join(_checkout, _victim))
+        with open(_marker, "w") as handle:
+            handle.write("swapped\n")
+    return info
+
+
+os.stat = _stat
+"#
+    );
+    std::fs::write(hook_dir.path().join("sitecustomize.py"), program).expect("write the hook");
+    let out = Command::new(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", btrfs_root)
+        .env("PYTHONPATH", hook_dir.path())
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(dir)
+        .output()
+        .expect("run scripts/cargo-target-link.sh");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// Assert the swapped-in tree came through the run whole.
+fn assert_bystander_survived(swapped: &Path, before: &std::fs::Metadata, out: &str) {
+    assert!(
+        swapped.is_dir(),
+        "the reclaim removed {swapped:?}, the tree renamed onto the payload name after the \
+         ownership check approved a different directory:\n{out}"
+    );
+    let sentinel = swapped.join("must-survive");
+    let contents = std::fs::read(&sentinel).unwrap_or_else(|error| {
+        panic!(
+            "the reclaim pruned {sentinel:?}, so a tree its ownership check never saw was \
+             erased: {error}\n{out}"
+        )
+    });
+    assert_eq!(
+        contents, b"a tree the reclaim never checked",
+        "the reclaim rewrote the contents of a tree its ownership check never saw:\n{out}"
+    );
+    let after = std::fs::symlink_metadata(swapped).expect("stat the swapped-in tree");
+    assert_eq!(
+        (after.dev(), after.ino()),
+        (before.dev(), before.ino()),
+        "the swapped-in tree was removed and something else took its name; the reclaim acted \
+         on it under a check made about a different inode:\n{out}"
+    );
+}
+
+/// A payload's ownership check and the open that follows are two separate
+/// resolutions of one pathname. A rename in between hands the reclaim a
+/// descriptor for a directory nothing checked, and the comparison further down
+/// only proves the pathname still names that replacement, so its tree is pruned
+/// and removed on the strength of a check made about a different inode.
+#[test]
+fn cargo_target_link_refuses_a_payload_whose_identity_changed_before_it_was_opened() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let victim_name = ".cargo-target-local.generation-victim";
+    std::fs::create_dir(checkout.path().join(victim_name)).expect("unpublished payload");
+    let bystander = checkout.path().join("bystander");
+    std::fs::create_dir(&bystander).expect("bystander tree");
+    std::fs::write(
+        bystander.join("must-survive"),
+        b"a tree the reclaim never checked",
+    )
+    .expect("write the bystander sentinel");
+    let before = std::fs::symlink_metadata(&bystander).expect("stat the bystander");
+
+    let (ok, out) = run_link_with_payload_swapped_after_its_check(
+        checkout.path(),
+        btrfs.path(),
+        victim_name,
+        &bystander,
+    );
+
+    assert!(
+        checkout.path().join("swap-performed").is_file(),
+        "the swap never happened, so this run says nothing about the window it is about:\n{out}"
+    );
+    let swapped = checkout.path().join(victim_name);
+    assert_bystander_survived(&swapped, &before, &out);
+    assert!(
+        out.contains(&swapped.display().to_string()),
+        "a payload the reclaim refused was passed over without naming it:\n{out}"
+    );
+    assert!(
+        out.contains("changed identity"),
+        "the refusal does not say why the payload was left alone:\n{out}"
+    );
+    assert!(
+        !ok,
+        "the run reported success while a payload it owns went unreclaimed; nothing else \
+         enumerates it and its name is never published again:\n{out}"
+    );
+}
+
+/// The same window, defeating the guard it exists for. A payload owned by
+/// another uid is never removed, and the container lane runs as root against
+/// the same bind-mounted checkout, so root is not stopped by permissions once
+/// the check has been made about a different inode.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn cargo_target_link_refuses_a_payload_swapped_for_another_users_tree() {
+    assert!(
+        nix_geteuid_is_root(),
+        "BLOCKED: this fixture needs root to stage a tree owned by another uid"
+    );
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let btrfs = tempfile::tempdir().expect("btrfs stand-in");
+    let victim_name = ".cargo-target-local.generation-victim";
+    std::fs::create_dir(checkout.path().join(victim_name)).expect("unpublished payload");
+    let foreign = checkout.path().join("another-identitys-tree");
+    std::fs::create_dir(&foreign).expect("foreign tree");
+    std::fs::write(
+        foreign.join("must-survive"),
+        b"a tree the reclaim never checked",
+    )
+    .expect("write the foreign sentinel");
+    let chowned = Command::new("chown")
+        .args(["-R", "65534:65534"])
+        .arg(&foreign)
+        .status()
+        .expect("chown -R");
+    assert!(chowned.success(), "hand the foreign tree to uid 65534");
+    let before = std::fs::symlink_metadata(&foreign).expect("stat the foreign tree");
+
+    let (ok, out) = run_link_with_payload_swapped_after_its_check(
+        checkout.path(),
+        btrfs.path(),
+        victim_name,
+        &foreign,
+    );
+
+    assert!(
+        checkout.path().join("swap-performed").is_file(),
+        "the swap never happened, so this run says nothing about the window it is about:\n{out}"
+    );
+    let swapped = checkout.path().join(victim_name);
+    assert_bystander_survived(&swapped, &before, &out);
+    assert!(
+        out.contains(&swapped.display().to_string()) && out.contains("65534"),
+        "the run erased or passed over another identity's tree without naming it and the uid \
+         that owns it:\n{out}"
+    );
+    assert!(
+        !ok,
+        "the run reported success while a payload it owns went unreclaimed; nothing else \
+         enumerates it and its name is never published again:\n{out}"
+    );
+}
+
 /// A payload this identity owns and cannot reclaim fails the run.
 ///
 /// It is on the root filesystem, nothing else enumerates it, and its name is
