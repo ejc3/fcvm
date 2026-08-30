@@ -19,7 +19,7 @@
 # user + net + mount namespace, so the :53 listeners and the resolv.conf this
 # reads are that namespace's, and the host's DNS configuration is untouched.
 #
-#   scripts/probe-pasta-dns-gateway.sh
+#   PASTA_BIN=<assets_dir>/pasta/pasta-<sha>.bin scripts/probe-pasta-dns-gateway.sh
 #
 # Exit 0 both expectations held, 1 an expectation failed, 2 could not run.
 set -euo pipefail
@@ -34,9 +34,22 @@ if [ "${1:-}" != "--inside" ]; then
         command -v "$tool" >/dev/null 2>&1 \
             || { echo "BLOCKED: '$tool' missing; this probe cannot evaluate anything" >&2; exit 2; }
     done
-    PASTA_BIN="${PASTA_BIN:-$(ls -t /mnt/fcvm-btrfs/pasta/pasta-*.bin 2>/dev/null | head -1 || true)}"
-    [ -x "${PASTA_BIN:-}" ] \
-        || { echo "BLOCKED: no pasta binary; set PASTA_BIN or run 'make setup-fcvm'" >&2; exit 2; }
+    # The caller names the binary. Which pasta fcvm runs is a function of the
+    # ACTIVE config: get_pasta_for_config (src/setup/pasta.rs) content-
+    # addresses it over the passt repo, the pinned commit, every embedded
+    # patch and the host libc, under paths.assets_dir. Neither half is
+    # available here. Reading the config would mean copying find_config_file's
+    # five-step lookup (--config, FCVM_CONFIG_DIR, SUDO_USER's home, XDG,
+    # /etc, next to the binary) into bash, where it would diverge silently.
+    # Picking the newest pasta-*.bin under the default assets dir, which this
+    # did, answers a different question: on a box carrying more than one pin
+    # it runs a stale artifact, and on a non-default assets_dir it reports no
+    # binary at all. Either way the verdict would be about something other
+    # than the runtime under review, which is worse than no verdict.
+    [ -n "${PASTA_BIN:-}" ] \
+        || { echo "BLOCKED: set PASTA_BIN to the pasta fcvm resolves for your config: <paths.assets_dir>/pasta/pasta-<sha>.bin, whose path 'fcvm setup' logs" >&2; exit 2; }
+    [ -x "$PASTA_BIN" ] \
+        || { echo "BLOCKED: PASTA_BIN=$PASTA_BIN is not an executable file" >&2; exit 2; }
     # --pid --mount-proc makes the --inside shell init of a PID namespace, and
     # --kill-child ties that shell's life to this one. The two DNS responders
     # below never return on their own: each loops on recvfrom forever, and a

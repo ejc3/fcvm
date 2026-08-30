@@ -172,6 +172,17 @@ say() { printf '\n=== %s\n' "$*"; }
 #      1-min load every DNS_SAMPLE_INTERVAL seconds while the run is in
 #      flight ($RESULTS/dns-owner.log). The quiet gate reads the load once,
 #      before the run; the samples are what says it stayed quiet.
+#      Only the measured run is sampled, because it is the only phase whose
+#      output is a number. The golden produces a snapshot, whose bytes do not
+#      depend on how busy the box was. The settle phase's whole output IS a
+#      load reading. The verify brackets assert WHICH server answered, an
+#      identity with no timing in it. The diag's one time-based limit
+#      (DIAG_MAX_LOAD_MS) fails closed, so contention can make it refuse but
+#      never pass wrongly, and reqbench.sh's cmd_diag says the same in the
+#      other direction: "No quiet-host guard, nothing here is measured".
+#      campaign_summary re-derives load_samples and load_max_1min from the
+#      dns-owner.log column and holds dns-evidence.json to them, so the run's
+#      load record is checked rather than trusted.
 #   3. $RESULTS/dns-evidence.json ties them together with each bracket's
 #      sha256 (verify_file_sha256), the replay server's own DNS and access
 #      logs and the per-bracket replay-queries.log (sha256), its exit status

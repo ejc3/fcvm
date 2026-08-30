@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 use tracing::{debug, info, warn};
 
 use super::{
@@ -68,14 +69,30 @@ fn peer_of(host_ip: &str) -> Option<String> {
 /// same `ip` binary, so a run that cannot ask this question was never going
 /// to finish setup anyway.
 async fn kernel_routes_peer_via_veth(veth_name: &str, peer_ip: &str) -> Result<bool> {
-    let output = tokio::process::Command::new("ip")
+    kernel_routes_peer_via_veth_with(Path::new("ip"), veth_name, peer_ip).await
+}
+
+/// The probe, with the `ip` binary named.
+///
+/// A parameter so the unavailable-verdict case is exercised by pointing this
+/// at a stub, rather than by prepending a directory to the process's PATH:
+/// `std::env::set_var` is undefined behaviour while any other thread reads the
+/// environment, and plain `cargo test` runs this crate's suite with a thread
+/// per test, about twenty of which spawn a program by bare name.
+async fn kernel_routes_peer_via_veth_with(
+    ip_bin: &Path,
+    veth_name: &str,
+    peer_ip: &str,
+) -> Result<bool> {
+    let ip = ip_bin.display();
+    let output = tokio::process::Command::new(ip_bin)
         .args(["route", "get", peer_ip])
         .output()
         .await
-        .with_context(|| format!("running `ip route get {peer_ip}`"))?;
+        .with_context(|| format!("running `{ip} route get {peer_ip}`"))?;
     if !output.status.success() {
         anyhow::bail!(
-            "`ip route get {peer_ip}` failed ({}): {}",
+            "`{ip} route get {peer_ip}` failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -663,18 +680,13 @@ mod tests {
     /// RED before the fix: kernel_routes_peer_via_veth returned `true` on any
     /// spawn error or nonzero exit, so a candidate nobody could verify was
     /// taken as verified, the same silent acceptance #820 is about. The fake
-    /// `ip` here exits 1; nextest runs each test in its own process, but
-    /// plain `cargo test` does not, so the PATH mutation goes through the
-    /// crate-wide environment lock, which excludes both the other mutators and
-    /// the siblings that spawn the real `ip` by name. Prepending is deliberate:
-    /// the rest of PATH stays intact, so a sibling spawning any other program
-    /// by name is unaffected even inside the window.
+    /// `ip` here exits 1, and it is named to the probe instead of being put on
+    /// PATH: the process is shared with every sibling test under plain
+    /// `cargo test`, and nothing this test does may be visible to them.
     #[tokio::test]
     async fn an_unavailable_route_verdict_is_an_error_not_an_acceptance() {
-        let mut env = crate::test_env::lock_process_env_async().await;
-        let dir = std::env::temp_dir().join(format!("fcvm-fakeip-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join("ip");
+        let dir = tempfile::tempdir().expect("temp dir for the stub ip");
+        let fake = dir.path().join("ip");
         std::fs::write(
             &fake,
             "#!/bin/sh\necho 'RTNETLINK answers: Network is unreachable' >&2\nexit 1\n",
@@ -684,13 +696,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let prev = std::env::var("PATH").unwrap_or_default();
-        env.set("PATH", format!("{}:{}", dir.display(), prev));
 
-        let verdict = kernel_routes_peer_via_veth("veth0-vm-abc12", "10.0.0.2").await;
+        let verdict = kernel_routes_peer_via_veth_with(&fake, "veth0-vm-abc12", "10.0.0.2").await;
 
-        drop(env);
-        let _ = std::fs::remove_dir_all(&dir);
         let err = verdict.expect_err(
             "an `ip route get` that cannot answer must be an error; returning true \
              accepts an unverified subnet, which is the #820 failure itself",

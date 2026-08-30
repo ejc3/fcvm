@@ -87,13 +87,17 @@ def _execed_children(pid, want, parent_comm):
     `comm` is the exec witness: `fork()` copies the parent's, `execve()`
     replaces it, so a child whose comm still matches its parent's has not
     exec'd yet.
+
+    A witness has to be readable at both ends. `proc_comm` swallows its OSError
+    and returns `""`, so an unreadable `/proc/<pid>/comm` is silence, not
+    evidence, at the child end and at the parent end alike. And the question is
+    how MANY children have exec'd, not whether all of them have: a parent with
+    an unrelated child still has the one the caller asked to wait for.
     """
     kids = reqbench.children_of(pid)
     comms = [reqbench.proc_comm(k) for k in kids]
-    settled = len(kids) >= want and all(
-        c is not None and c != parent_comm for c in comms
-    )
-    return kids, comms, settled
+    witnesses = sum(1 for c in comms if c and parent_comm and c != parent_comm)
+    return kids, comms, witnesses >= want
 
 
 def wait_for_execed_children(pid, want, timeout):
@@ -1522,6 +1526,69 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 )
             finally:
                 kill_tree(p)
+
+
+class ExecWitnessCounting(unittest.TestCase):
+    """`_execed_children` counts exec witnesses; it does not poll every child.
+
+    RED BEFORE THE FIX, all three, against `settled = len(kids) >= want and
+    all(c is not None and c != parent_comm for c in comms)`:
+
+        AssertionError: False is not true : one exec'd child satisfies want=1
+        AssertionError: True is not false : an unreadable comm is not an exec witness
+        AssertionError: True is not false : an unreadable parent comm proves nothing
+    """
+
+    @contextmanager
+    def _procfs(self, kids, comms):
+        """Stub `children_of`/`proc_comm`. `comms` maps pid -> comm."""
+        real_children, real_comm = reqbench.children_of, reqbench.proc_comm
+        reqbench.children_of = lambda pid: list(kids)
+        reqbench.proc_comm = lambda pid: comms[pid]
+        try:
+            yield
+        finally:
+            reqbench.children_of, reqbench.proc_comm = real_children, real_comm
+
+    def test_an_unrelated_child_does_not_hide_a_ready_one(self):
+        """`all(...)` made every child a precondition for any one of them.
+
+        A parent that has forked two children, one of which has exec'd, has
+        the one child `wait_for_execed_children(pid, 1, timeout)` asked for.
+        Requiring the other to have exec'd too makes that call time out and
+        the caller assert on a name it never waited for.
+        """
+        with self._procfs([10, 11], {10: "fastexit", 11: "python3"}):
+            kids, comms, settled = _execed_children(1, 1, "python3")
+        self.assertEqual(kids, [10, 11])
+        self.assertEqual(comms, ["fastexit", "python3"])
+        self.assertTrue(settled, "one exec'd child satisfies want=1")
+
+    def test_two_wanted_is_still_two(self):
+        """Counting witnesses must not settle below `want`."""
+        with self._procfs([10, 11], {10: "fastexit", 11: "python3"}):
+            _, _, settled = _execed_children(1, 2, "python3")
+        self.assertFalse(settled, "only one child has exec'd")
+        with self._procfs([10, 11], {10: "fastexit", 11: "lingersleep"}):
+            _, _, settled = _execed_children(1, 2, "python3")
+        self.assertTrue(settled, "both children have exec'd")
+
+    def test_an_unreadable_comm_is_not_an_exec_witness(self):
+        """`proc_comm` swallows the OSError and returns `""`.
+
+        `"" != parent_comm` is true, so an unreadable `/proc/<pid>/comm` used
+        to report an `execve` that was never observed — the caller then read
+        the name it was waiting for from a child that may still be pre-exec.
+        """
+        with self._procfs([10], {10: ""}):
+            _, _, settled = _execed_children(1, 1, "python3")
+        self.assertFalse(settled, "an unreadable comm is not an exec witness")
+
+    def test_an_unreadable_parent_comm_proves_nothing(self):
+        """With no parent comm there is nothing for a child's to differ from."""
+        with self._procfs([10], {10: "python3"}):
+            _, _, settled = _execed_children(1, 1, "")
+        self.assertFalse(settled, "an unreadable parent comm proves nothing")
 
 
 class FindStateIsEventDriven(unittest.TestCase):

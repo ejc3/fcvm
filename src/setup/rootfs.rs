@@ -747,7 +747,20 @@ pub fn generate_setup_script(plan: &Plan) -> String {
 /// a nested env-reset `sudo podman build` did not ("image not known").
 /// An fcvm-private variable cannot perturb any other tool.
 pub fn fcvm_config_dir() -> Result<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("FCVM_CONFIG_DIR") {
+    fcvm_config_dir_from(std::env::var_os("FCVM_CONFIG_DIR"))
+}
+
+/// The rule, with the override already read.
+///
+/// Split out so the relative-path refusal is asserted by passing a value
+/// rather than by writing `FCVM_CONFIG_DIR` into the process:
+/// `std::env::set_var` is undefined behaviour while any other thread reads the
+/// environment, and plain `cargo test` runs this crate's suite with a thread
+/// per test.
+fn fcvm_config_dir_from(
+    config_dir_override: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf> {
+    if let Some(dir) = config_dir_override {
         let dir = std::path::PathBuf::from(dir);
         // Relative paths are refused rather than resolved: the value crosses
         // process boundaries (nextest -> sudo -> fcvm -> nested launches) where
@@ -804,6 +817,15 @@ pub fn generate_config(force: bool) -> Result<PathBuf> {
 ///    5c. CARGO_MANIFEST_DIR (debug builds only)
 /// 6. ERROR (no embedded fallback)
 pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
+    find_config_file_with(explicit_path, std::env::var_os("FCVM_CONFIG_DIR"))
+}
+
+/// The chain, with the `FCVM_CONFIG_DIR` override already read. A parameter
+/// for the same reason [`fcvm_config_dir_from`] takes one.
+fn find_config_file_with(
+    explicit_path: Option<&str>,
+    config_dir_override: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
     // 1. Explicit --config
     if let Some(path) = explicit_path {
         let p = PathBuf::from(path);
@@ -829,8 +851,8 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
     // not the invoking user's ~/.config/fcvm. A set-but-invalid override
     // (relative path) is an error, not a fallback — silently reading a
     // different file is the failure this chain exists to remove.
-    if std::env::var_os("FCVM_CONFIG_DIR").is_some() {
-        let config_dir = fcvm_config_dir()?;
+    if config_dir_override.is_some() {
+        let config_dir = fcvm_config_dir_from(config_dir_override.clone())?;
         let p = config_dir.join(CONFIG_FILE);
         if p.exists() {
             return Ok(p);
@@ -842,7 +864,7 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
 
     // 3. SUDO_USER's config (when running with sudo). Skipped entirely when an
     // FCVM_CONFIG_DIR override is set — see above.
-    if std::env::var_os("FCVM_CONFIG_DIR").is_none() {
+    if config_dir_override.is_none() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             // Get the invoking user's home directory
             match nix::unistd::User::from_name(&sudo_user) {
@@ -863,7 +885,7 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
     }
 
     // 4. Default user config dir (XDG); FCVM_CONFIG_DIR-set case handled above.
-    if let Ok(config_dir) = fcvm_config_dir() {
+    if let Ok(config_dir) = fcvm_config_dir_from(config_dir_override) {
         let p = config_dir.join(CONFIG_FILE);
         if p.exists() {
             return Ok(p);
@@ -2595,7 +2617,6 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::lock_process_env;
 
     #[test]
     fn firecracker_commit_pins_deserialize_for_global_and_profile_configs() {
@@ -2736,39 +2757,103 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
         assert!(sh.success(), "sh -c 'exit 0' should succeed");
     }
 
-    /// The wrapper reads the two process-globals and the resolver applies
-    /// them. Only `FCVM_FIRECRACKER_BIN` is mutated here, under the shared
-    /// environment lock: nothing else in the crate reads it, and PATH stays
-    /// whatever the process was started with.
+    /// Tells a re-executed copy of this test binary to run the child arm of
+    /// `setup_vm_firecracker_bin_from_reads_the_environment_override`.
+    const FIRECRACKER_WRAPPER_CHILD: &str = "FCVM_TEST_FIRECRACKER_WRAPPER_CHILD";
+
+    /// The wrapper reads the two process globals and the resolver applies
+    /// them.
+    ///
+    /// `FCVM_FIRECRACKER_BIN` is set on a CHILD with `Command::env`, and this
+    /// test re-executes its own binary to be that child. Setting it here
+    /// instead would be `std::env::set_var`, which is undefined behaviour
+    /// while any other thread reads the environment; plain `cargo test` runs
+    /// this crate's suite with a thread per test, so there is always such a
+    /// thread. The child's own environment is private to it, so the three
+    /// cases below need no lock and are visible to nothing else.
     #[test]
     fn setup_vm_firecracker_bin_from_reads_the_environment_override() {
+        if let Some(case) = std::env::var_os(FIRECRACKER_WRAPPER_CHILD) {
+            return firecracker_wrapper_child(&case.to_string_lossy());
+        }
+
         let real = std::env::current_exe().expect("test binary path");
-        let mut env = lock_process_env();
-
-        env.set("FCVM_FIRECRACKER_BIN", &real);
-        assert_eq!(
-            setup_vm_firecracker_bin_from(None).unwrap(),
-            real,
-            "the wrapper must consult FCVM_FIRECRACKER_BIN"
-        );
-
-        env.set("FCVM_FIRECRACKER_BIN", "/nonexistent/firecracker");
-        let err = setup_vm_firecracker_bin_from(None).unwrap_err().to_string();
-        assert!(
-            err.contains("FCVM_FIRECRACKER_BIN"),
-            "error should name the variable, got: {err}"
-        );
-
-        // Unset, and a profile binary present: the wrapper falls through to it
-        // without consulting PATH.
-        env.unset("FCVM_FIRECRACKER_BIN");
         let assets = tempfile::tempdir().expect("temp assets dir");
         let built = assets.path().join("firecracker-default-0123456789ab.bin");
         std::fs::write(&built, b"#!/bin/sh\nexit 0\n").expect("write stub");
-        assert_eq!(
-            setup_vm_firecracker_bin_from(Some(built.clone())).unwrap(),
-            built
+
+        for (case, value) in [
+            ("set-and-present", Some(real.clone().into_os_string())),
+            (
+                "set-and-missing",
+                Some(std::ffi::OsString::from("/nonexistent/firecracker")),
+            ),
+            ("unset", None),
+        ] {
+            let mut child = std::process::Command::new(&real);
+            child
+                .args([
+                    "--exact",
+                    "setup::rootfs::tests::setup_vm_firecracker_bin_from_reads_the_environment_override",
+                    "--nocapture",
+                ])
+                .env(FIRECRACKER_WRAPPER_CHILD, case)
+                .env("FCVM_TEST_FIRECRACKER_STUB", &built);
+            match value {
+                Some(v) => child.env("FCVM_FIRECRACKER_BIN", v),
+                None => child.env_remove("FCVM_FIRECRACKER_BIN"),
+            };
+            let out = child.output().expect("re-running this test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // A filter that matches nothing runs zero tests and exits 0, which
+            // would make every case below pass without evaluating anything.
+            assert!(
+                stdout.contains(&format!("child arm ran: {case}")),
+                "the child never reached the arm for '{case}', so this case \
+                 asserted nothing:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                out.status.success(),
+                "the '{case}' child failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                out.status
+            );
+        }
+    }
+
+    /// One case of the test above, running in a child whose environment the
+    /// parent set with `Command::env`.
+    fn firecracker_wrapper_child(case: &str) {
+        let stub = PathBuf::from(
+            std::env::var_os("FCVM_TEST_FIRECRACKER_STUB").expect("the parent names a stub"),
         );
+        match case {
+            "set-and-present" => {
+                let real = std::env::current_exe().expect("test binary path");
+                assert_eq!(
+                    setup_vm_firecracker_bin_from(None).unwrap(),
+                    real,
+                    "the wrapper must consult FCVM_FIRECRACKER_BIN"
+                );
+            }
+            "set-and-missing" => {
+                let err = setup_vm_firecracker_bin_from(None).unwrap_err().to_string();
+                assert!(
+                    err.contains("FCVM_FIRECRACKER_BIN"),
+                    "error should name the variable, got: {err}"
+                );
+            }
+            // Unset, and a profile binary present: the wrapper falls through
+            // to it without consulting PATH.
+            "unset" => {
+                assert_eq!(
+                    setup_vm_firecracker_bin_from(Some(stub.clone())).unwrap(),
+                    stub
+                );
+            }
+            other => panic!("unknown child case '{other}'"),
+        }
+        println!("child arm ran: {case}");
     }
 
     /// A --config path that does not exist must fail, not quietly fall back to
@@ -2776,17 +2861,31 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
     #[test]
     fn find_config_file_propagates_a_relative_fcvm_config_dir() {
         // A set-but-invalid override must ERROR, not silently fall through to
-        // some other config location. The lookup chain reads the variable, so
-        // this one cannot become an argument; it goes through the shared
-        // environment lock instead, and the handle puts the old value back
-        // even when the assertion below fires first.
-        let mut env = lock_process_env();
-        env.set("FCVM_CONFIG_DIR", "relative/not-absolute");
-        let err = find_config_file(None)
+        // some other config location. The override is an argument, so the
+        // process the rest of the suite shares keeps its own FCVM_CONFIG_DIR.
+        let err = find_config_file_with(None, Some("relative/not-absolute".into()))
             .expect_err("a relative FCVM_CONFIG_DIR must be an error, not a fallthrough");
         assert!(
             format!("{err:#}").contains("absolute"),
             "error should name the absolute-path requirement: {err:#}"
+        );
+    }
+
+    /// The wrapper reads the variable the chain is documented to honour.
+    /// Without this, `find_config_file_with` could be correct while nothing
+    /// ever handed it the override.
+    #[test]
+    fn find_config_file_reads_the_config_dir_override() {
+        let src = include_str!("rootfs.rs");
+        let start = src
+            .find("pub fn find_config_file(explicit_path: Option<&str>)")
+            .expect("find_config_file present in rootfs.rs");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its closing brace")];
+        assert!(
+            body.contains(
+                r#"find_config_file_with(explicit_path, std::env::var_os("FCVM_CONFIG_DIR"))"#
+            ),
+            "find_config_file must pass FCVM_CONFIG_DIR to the chain, got:\n{body}"
         );
     }
 

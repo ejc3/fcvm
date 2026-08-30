@@ -81,6 +81,111 @@ fn processes_matching(needle: &str) -> Vec<String> {
     found
 }
 
+/// With no `PASTA_BIN`, the probe must refuse rather than pick a binary out of
+/// a directory listing.
+///
+/// Which pasta fcvm runs is a function of the ACTIVE config: the binary is
+/// content-addressed under `paths.assets_dir`, and the config that names both
+/// is found through a lookup chain this script cannot replicate. A listing
+/// answers a different question, so the probe would report on an artifact that
+/// is not the one under review.
+///
+/// The situation is built rather than waited for: a tmpfs over `/mnt` inside a
+/// private mount namespace, holding one plausible-looking `pasta-*.bin` that
+/// records nothing and sleeps. Everything else is the shipped script.
+///
+/// RED BEFORE THE FIX:
+///
+/// ```text
+/// assertion `left == right` failed: the probe resolved a pasta out of the
+/// assets directory and ran the whole thing: exit status: 0
+/// stdout:
+/// OK   with -D none:    10.0.2.2 (the replay on host 127.0.0.1:53 answered)
+/// OK   without it:      203.0.113.99 (pasta redirected port 53 to the host's own resolver)
+///   left: Some(0)
+///  right: Some(2)
+/// ```
+///
+/// Two OK lines: a verdict about a binary the caller never named.
+#[test]
+fn the_probe_refuses_to_guess_which_pasta_to_run() {
+    require_tools();
+    let script = repo_root().join("scripts/probe-pasta-dns-gateway.sh");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("create stub bin");
+    let calls = tmp.path().join("dig-calls");
+    write_exec(
+        &bin.join("nsenter"),
+        &format!(
+            "#!/bin/bash\n\
+             for a in \"$@\"; do\n\
+             \tcase \"$a\" in\n\
+             \t\tdig) n=$(cat {calls} 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >{calls}\n\
+             \t\t\t[ \"$n\" = 1 ] && echo 10.0.2.2 || echo 203.0.113.99\n\
+             \t\t\texit 0 ;;\n\
+             \t\tpasta0) echo '2: pasta0    inet 10.0.2.100/24 scope global pasta0' ; exit 0 ;;\n\
+             \tesac\n\
+             done\n\
+             exit 0\n",
+            calls = calls.display()
+        ),
+    );
+    write_exec(&bin.join("dig"), "#!/bin/bash\nexit 0\n");
+    let work_root = tmp.path().join("work");
+    std::fs::create_dir_all(&work_root).expect("create work root");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // A private /mnt so the plant is this test's, and the box's real assets
+    // directory is neither read nor written.
+    let plant = "set -e\n\
+         mount -t tmpfs none /mnt\n\
+         mkdir -p /mnt/fcvm-btrfs/pasta\n\
+         printf '#!/bin/sh\\nexec sleep 60\\n' >/mnt/fcvm-btrfs/pasta/pasta-stale.bin\n\
+         chmod +x /mnt/fcvm-btrfs/pasta/pasta-stale.bin\n\
+         exec bash \"$0\"\n";
+    let output = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--fork",
+            "--",
+            "bash",
+            "-c",
+            plant,
+        ])
+        .arg(&script)
+        .env("PATH", &path)
+        .env("TMPDIR", &work_root)
+        .env_remove("PASTA_BIN")
+        .output()
+        .expect("run the probe");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the probe resolved a pasta out of the assets directory and ran the \
+         whole thing: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        !stdout.contains("OK ") && !stdout.contains("FAIL "),
+        "the probe rendered a verdict without being told which binary to \
+         test:\nstdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("PASTA_BIN"),
+        "a refusal must name what the caller has to supply:\nstderr:\n{stderr}"
+    );
+}
+
 /// The probe runs to its normal end and leaves nothing behind.
 ///
 /// The pasta binary, the namespace entry and the query are stubbed: what is
