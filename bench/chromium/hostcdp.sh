@@ -12,7 +12,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${IMAGE:-localhost/chromium-bench-req}"
-REPS="${REPS:-202}"
+# REPS is the MEASURED rep count and WARMUP is EXTRA, exactly as reqbench.py
+# reads --reps/--warmup ("for rep in range(args.warmup + args.reps)"), so the
+# campaign's REPS/WARMUP can be handed to both arms and produce the same
+# schedule. The default measured count is what REPS=202 WARMUP=2 used to yield.
+REPS="${REPS:-200}"
 WARMUP="${WARMUP:-2}"
 URL="${URL:-http://127.0.0.1:8000/medium.html}"
 CDP_PORT="${CDP_PORT:-9222}"
@@ -23,6 +27,25 @@ LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 
 mkdir -p "$RESULTS"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+# URL may name ONE url (today's contract) or a comma-separated list. The list is
+# cycled exactly as reqbench.py cycles the VM arm's schedule -- url_for_rep()
+# returns urls[rep % len(urls)], rep counted from 0 across warmup and measured
+# reps alike -- so this host control can run the SAME corpus schedule as the VM
+# arm rather than a different workload. Whitespace around a member is stripped
+# and empty members are dropped, matching reqbench.parse_urls.
+mapfile -t URLS < <(printf '%s' "$URL" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF')
+[ "${#URLS[@]}" -gt 0 ] || { log "REFUSING: URL names no urls"; exit 2; }
+# Nothing to summarise, and the summary would die on an empty list after the
+# warmup reps had already run.
+[ "$REPS" -ge 1 ] || { log "REFUSING: REPS must be >= 1 (it is the MEASURED count; WARMUP is extra), got $REPS"; exit 2; }
+# reqbench refuses a multi-URL run with fewer than two full cycles of warmup;
+# the same floor here keeps the two schedules the same shape rather than
+# comparing a warmed VM arm against a cold host arm.
+if [ "${#URLS[@]}" -gt 1 ] && [ "$WARMUP" -lt $((2 * ${#URLS[@]})) ]; then
+    log "REFUSING: a ${#URLS[@]}-url schedule needs WARMUP >= $((2 * ${#URLS[@]})) (two full cycles), got $WARMUP"
+    exit 2
+fi
 
 # Same quiet-box refusal as the VM harness: a contaminated baseline poisons
 # every ratio computed against it. SETTLE_WAIT_SECS > 0 bounds a wait for the
@@ -74,9 +97,15 @@ if [ -n "${BENCH_RESOLVE_ALL_TO:-}" ]; then
 fi
 resolve_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' \
     "${BENCH_RESOLVE_ALL_TO:-}")
+urls_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${URLS[@]}")
 
 log "starting host container ($IMAGE) with CDP on $CDP_PORT"
-podman run -d --name "$CNAME" --network host "${resolve_env[@]}" "$IMAGE" >/dev/null
+cpus_arg=()
+if [ -n "${CPUS:-}" ]; then
+    cpus_arg=(--cpus "$CPUS")
+fi
+cpus_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' "${CPUS:-}")
+podman run -d --name "$CNAME" --network host "${cpus_arg[@]}" "${resolve_env[@]}" "$IMAGE" >/dev/null
 
 # Ready = the same two conditions the VM golden gates on: warm marker file AND
 # a live CDP round trip that finds a page target (cdp_health inside the image).
@@ -85,12 +114,14 @@ until podman exec "$CNAME" test -f /run/bench-ready 2>/dev/null; do
     [ $((SECONDS - t0)) -lt 120 ] || { log "container never became ready"; podman logs "$CNAME" | tail -20 >&2; exit 1; }
     sleep 0.5
 done
-log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps ($WARMUP warmup) against $URL"
+log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP warmup ($((WARMUP + REPS)) total) against $URL"
 
 # Record the measured configuration beside the numbers, not in prose.
 {
     echo "{\"image\": \"$IMAGE\", \"image_id\": \"$(podman inspect --format '{{.Image}}' "$CNAME")\","
-    echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
+    echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"total_reps\": $((WARMUP + REPS)),"
+    echo " \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
+    echo " \"urls\": $urls_json, \"url_count\": ${#URLS[@]}, \"cpus\": $cpus_json,"
     echo " \"driver\": \"cdpdrive.py\", \"network\": \"host (no VM, no DNAT)\","
     echo " \"resolve_all_to\": $resolve_json,"
     echo " \"host_kernel\": \"$(uname -r)\", \"loadavg_at_start\": \"$la\"}"
@@ -98,9 +129,11 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps ($WARMUP warm
 
 OUT="$RESULTS/hostcdp.jsonl"
 : > "$OUT"
-for rep in $(seq 0 $((REPS - 1))); do
+TOTAL_REPS=$((WARMUP + REPS))
+for rep in $(seq 0 $((TOTAL_REPS - 1))); do
+    rep_url="${URLS[$((rep % ${#URLS[@]}))]}"
     t_start=$(date +%s.%N)
-    if out=$(python3 "$HERE/cdpdrive.py" "127.0.0.1:$CDP_PORT" "$URL" --format jpeg --nav-timing 2>&1); then
+    if out=$(python3 "$HERE/cdpdrive.py" "127.0.0.1:$CDP_PORT" "$rep_url" --format jpeg --nav-timing 2>&1); then
         ok=true
     else
         ok=false
@@ -108,21 +141,76 @@ for rep in $(seq 0 $((REPS - 1))); do
     t_end=$(date +%s.%N)
     wall_ms=$(python3 -c "print(f'{(${t_end}-${t_start})*1000:.1f}')")
     warm=$([ "$rep" -lt "$WARMUP" ] && echo true || echo false)
-    printf '{"rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "driver": %s}\n' \
-        "$rep" "$ok" "$warm" "$wall_ms" \
+    # Per-rep 1-minute load, the same field reqbench.py puts on every record
+    # (rec["loadavg1"]) and reqanalyze reports as min/median/max "during run".
+    # The start-of-run reading in run.json cannot show contention that arrived
+    # mid-run, which is the contention that would move these numbers. A
+    # non-numeric read becomes null rather than killing a run mid-loop.
+    la_rep=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>/dev/null || true)
+    [[ "$la_rep" =~ ^[0-9]+([.][0-9]+)?$ ]] || la_rep=null
+    printf '{"rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "loadavg1": %s, "url": %s, "driver": %s}\n' \
+        "$rep" "$ok" "$warm" "$wall_ms" "$la_rep" \
+        "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$rep_url")" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$out")" >> "$OUT"
-    [ "$ok" = true ] || { log "rep $rep FAILED: $out"; exit 4; }
+    [ "$ok" = true ] || { log "rep $rep FAILED ($rep_url): $out"; exit 4; }
 done
 
-python3 - "$OUT" "$WARMUP" <<'PY'
+python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json" <<'PY'
 import json, statistics, sys
 rows = [json.loads(l) for l in open(sys.argv[1])]
-measured = [r["wall_ms"] for r in rows if not r["warmup"]]
-measured.sort()
+measured_rows = [r for r in rows if not r["warmup"]]
+
+
+def pct(values, p):
+    """p50 is statistics.median, which is what reqanalyze uses for every median
+    it publishes, so a ratio taken between this number and a VM arm's median is
+    between two numbers computed the same way. Other percentiles are
+    nearest-rank."""
+    values = sorted(values)
+    n = len(values)
+    if p == 50:
+        return statistics.median(values)
+    return values[max(0, -(-p * n // 100) - 1)]
+
+
+measured = [r["wall_ms"] for r in measured_rows]
 n = len(measured)
-p50 = measured[max(0, -(-50*n//100) - 1)]
-p95 = measured[max(0, -(-95*n//100) - 1)]
+if n == 0:
+    # REPS >= 1 is enforced before any rep runs and measured == REPS, so this
+    # can only mean the jsonl and the warmup count disagree. Refuse rather than
+    # die on an IndexError after minutes of work with no summary beside the
+    # jsonl.
+    sys.exit(f"REFUSING: no measured reps in {len(rows)} rows (warmup={sys.argv[2]}); nothing to summarise")
+p50, p95 = pct(measured, 50), pct(measured, 95)
 print(f"host direct-CDP warm pool: n={n} p50={p50:.1f}ms p95={p95:.1f}ms "
       f"mean={statistics.mean(measured):.1f}ms failures=0")
+per_url = {}
+if any("url" in r for r in measured_rows):
+    by_url = {}
+    for r in measured_rows:
+        by_url.setdefault(r.get("url", ""), []).append(r["wall_ms"])
+    for url, vals in by_url.items():
+        per_url[url] = {"n": len(vals), "p50_ms": round(pct(vals, 50), 1),
+                        "p95_ms": round(pct(vals, 95), 1),
+                        "mean_ms": round(statistics.mean(vals), 1)}
+    if len(by_url) > 1:
+        print("per-url wall p50 (ms):")
+        for url, s in sorted(per_url.items(), key=lambda kv: kv[1]["p50_ms"]):
+            print(f"  {s['p50_ms']:8.1f}  n={s['n']:3d}  {url}")
+# Name the convention in the record, not only in the code that produced it: a
+# ratio between this p50 and a reqanalyze median is only meaningful if both are
+# statistics.median, and a reader of summary.json alone cannot otherwise tell.
+la = [r["loadavg1"] for r in measured_rows if isinstance(r.get("loadavg1"), (int, float))]
+load = None
+if la:
+    load = {"n": len(la), "min": round(min(la), 2),
+            "median": round(statistics.median(la), 2), "max": round(max(la), 2)}
+    print(f"loadavg1 during measured reps: min={load['min']} median={load['median']} "
+          f"max={load['max']}   <-- contention check")
+json.dump({"n": n, "p50_ms": round(p50, 1), "p95_ms": round(p95, 1),
+           "mean_ms": round(statistics.mean(measured), 1),
+           "failures": 0, "p50_convention": "statistics.median",
+           "loadavg1_measured": load, "per_url": per_url},
+          open(sys.argv[3], "w"), indent=1)
 PY
 log "results in $RESULTS"

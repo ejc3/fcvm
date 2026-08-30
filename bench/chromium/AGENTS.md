@@ -65,6 +65,28 @@ The host control takes the same variable directly:
 `make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
 `resolve_all_to` in its `run.json` (null when unset).
 
+`URL=` on the host control names one url or a comma-separated list, and a list
+is cycled the way `reqbench.url_for_rep` cycles the VM arm's: `urls[rep %
+len(urls)]`, rep counted from 0 across warmup and measured reps alike. Each
+record carries the `url` it rendered and `summary.json` carries `per_url`
+medians beside the aggregate, so a corpus host baseline is comparable to a
+corpus VM arm url by url. A multi-url run with fewer than two full cycles of
+warmup is refused rather than run, because a cold host arm against a warm VM
+arm is not a control for it. `REPS=` is the MEASURED rep count and `WARMUP=` is
+extra, the way `reqbench.py` reads `--reps`/`--warmup`
+(`for rep in range(args.warmup + args.reps)`), so the campaign's `REPS=202
+WARMUP=28` hands both arms the same schedule instead of leaving the host with
+174 measured rows and a partial final cycle. `run.json` carries `total_reps`
+beside `reps` and `warmup`; a record without `total_reps` predates this and its
+`reps` is a total. `summary.json` names its own `p50_convention`
+(`statistics.median`, what `reqanalyze` publishes), so a reader can tell whether
+a ratio against a VM p50 is between two numbers of the same kind, and every
+jsonl row carries `loadavg1` the way `reqbench.py` stamps it, summarised over
+the measured reps as `loadavg1_measured`. `CPUS=` bounds the container's CPU budget
+(`podman run --cpus`) and is recorded as `cpus` in `run.json`, null when unset,
+which means the whole machine: a host baseline on every core compared against a
+2-vCPU VM arm is two variables, not one.
+
 `bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
 answers what holds a page's load event inside a restored clone, on the
 golden the run uses, on the run's backend and UFFD mode (`BACKEND=`,
