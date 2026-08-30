@@ -13,8 +13,25 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="${REPO:-$(cd "$HERE/../.." && pwd)}"
-BENCH="$REPO/bench/chromium"
+CORPUS_EXTRA_STAGED="${CORPUS_EXTRA_STAGED:-0}"
+case "$CORPUS_EXTRA_STAGED" in
+    0)
+        REPO="${REPO:-$(cd "$HERE/../.." && pwd)}"
+        REPO="$(cd "$REPO" && pwd -P)"
+        SOURCE_BENCH="$REPO/bench/chromium"
+        BENCH="$SOURCE_BENCH"
+        ;;
+    1)
+        REPO="${CORPUS_EXTRA_SOURCE_REPO:?CORPUS_EXTRA_SOURCE_REPO is required for a staged run}"
+        REPO="$(cd "$REPO" && pwd -P)"
+        SOURCE_BENCH="${CORPUS_EXTRA_SOURCE_BENCH:?CORPUS_EXTRA_SOURCE_BENCH is required for a staged run}"
+        BENCH="$HERE"
+        ;;
+    *)
+        echo "BLOCKED: CORPUS_EXTRA_STAGED must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 RUN_ID="${RUN_ID:-$(tr -d - </proc/sys/kernel/random/uuid)}"
 CONTAINER_OWNER_TOKEN="${CONTAINER_OWNER_TOKEN:-$(tr -d - </proc/sys/kernel/random/uuid)}"
@@ -68,9 +85,9 @@ validate_phases() {
     || { echo "BLOCKED: CONTAINER_OWNER_TOKEN must be 32 lowercase hexadecimal characters" >&2; exit 2; }
 validate_phases
 
-for tool in awk bash cat curl cut date dig dirname env flock git grep head install jq \
-        kill mkdir pgrep podman python3 rm rmdir sed seq setsid sha256sum sleep \
-        sudo systemctl tee timeout tr uname; do
+for tool in awk bash cat chmod cp curl cut date dig dirname env find flock git grep \
+        head install jq kill mkdir mktemp mv pgrep podman python3 rm rmdir sed seq \
+        setsid sha256sum sleep sort sudo systemctl tee timeout tr uname xargs; do
     command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
 done
 
@@ -81,10 +98,55 @@ done
 # fs.protected_regular=2 rejects another UID's O_CREAT open in sticky /run/lock,
 # even at mode 0666, which would split the supposed lease by caller identity.
 CORPUS_EXTRA_LOCK="/run/lock/fcvm-corpus-extra.lock"
-sudo -n install -d -o root -g root -m 0755 "$CORPUS_EXTRA_LOCK" \
-    || { echo "BLOCKED: cannot provision host-wide lease $CORPUS_EXTRA_LOCK" >&2; exit 2; }
-exec 9<"$CORPUS_EXTRA_LOCK"
-flock -n 9 || { echo "BLOCKED: another corpus-extra run owns $CORPUS_EXTRA_LOCK" >&2; exit 2; }
+
+stage_runtime_bundle() {
+    local stage source manifest_temp bundle_digest bundle_dest
+    local sources=(
+        corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py
+        corpus_serve.py report.py reqbench.py owned_process.py corpus_campaign.sh
+    )
+    mkdir -- "$RESULTS/runtime"
+    stage=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
+    for source in "${sources[@]}"; do
+        cp --reflink=auto --preserve=mode,timestamps \
+            "$SOURCE_BENCH/$source" "$stage/$source"
+    done
+    cp --reflink=auto --preserve=mode,timestamps \
+        "$REPO/target/release/fcvm" "$stage/fcvm"
+    cp -a --reflink=auto "$SOURCE_BENCH/corpus-live" "$stage/corpus-live"
+    chmod 0555 "$stage/fcvm"
+    manifest_temp=$(mktemp "$RESULTS/runtime/.manifest.XXXXXX")
+    (
+        cd "$stage"
+        find . -type f ! -name MANIFEST.sha256 -print0 \
+            | sort -z \
+            | xargs -0 sha256sum
+    ) > "$manifest_temp"
+    mv --no-target-directory "$manifest_temp" "$stage/MANIFEST.sha256"
+    bundle_digest=$(sha256sum "$stage/MANIFEST.sha256" | cut -d' ' -f1)
+    bundle_dest="$RESULTS/runtime/$bundle_digest"
+    chmod -R a-w "$stage"
+    mv --no-target-directory "$stage" "$bundle_dest"
+    BUNDLE_SHA256="$bundle_digest"
+    BUNDLE_DIR="$(cd "$bundle_dest" && pwd -P)"
+}
+
+verify_runtime_bundle() {
+    local manifest_digest
+    [ "$HERE" = "${CORPUS_EXTRA_RUNTIME_BUNDLE:-}" ] || {
+        echo "FAILED: the executing harness is not its recorded runtime bundle" >&2
+        return 1
+    }
+    manifest_digest=$(sha256sum "$BENCH/MANIFEST.sha256" | cut -d' ' -f1) || return 1
+    [ "$manifest_digest" = "${RUNTIME_BUNDLE_SHA256:-}" ] || {
+        echo "FAILED: runtime bundle manifest identity changed" >&2
+        return 1
+    }
+    (cd "$BENCH" && sha256sum --check --strict --status MANIFEST.sha256) || {
+        echo "FAILED: runtime bundle bytes changed" >&2
+        return 1
+    }
+}
 
 claim_output_dir() {
     local path="$1" label="$2" parent
@@ -106,7 +168,49 @@ claim_output_dirs() {
     return 2
 }
 
-claim_output_dirs
+if [ "$CORPUS_EXTRA_STAGED" = 0 ]; then
+    sudo -n install -d -o root -g root -m 0755 "$CORPUS_EXTRA_LOCK" \
+        || { echo "BLOCKED: cannot provision host-wide lease $CORPUS_EXTRA_LOCK" >&2; exit 2; }
+    exec 9<"$CORPUS_EXTRA_LOCK"
+    flock -n 9 \
+        || { echo "BLOCKED: another corpus-extra run owns $CORPUS_EXTRA_LOCK" >&2; exit 2; }
+    claim_output_dirs
+    RESULTS="$(cd "$RESULTS" && pwd -P)"
+    LOGDIR="$(cd "$LOGDIR" && pwd -P)"
+    SOURCE_REVISION=$(git -C "$REPO" rev-parse HEAD)
+    SOURCE_GIT_DIRTY=$(git -C "$REPO" status --porcelain --untracked-files=no | tr '\n' ';')
+    RUNTIME_IMAGE=$(podman inspect --format '{{.Id}}' "$IMAGE")
+    [[ "$RUNTIME_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+        echo "BLOCKED: image $IMAGE resolved to invalid identity '$RUNTIME_IMAGE'" >&2
+        exit 2
+    }
+    stage_runtime_bundle
+    bundle_dir="$BUNDLE_DIR"
+    exec env \
+        CORPUS_EXTRA_STAGED=1 \
+        CORPUS_EXTRA_SOURCE_REPO="$REPO" \
+        CORPUS_EXTRA_SOURCE_BENCH="$SOURCE_BENCH" \
+        CORPUS_EXTRA_RUNTIME_BUNDLE="$bundle_dir" \
+        RUNTIME_BUNDLE_SHA256="$BUNDLE_SHA256" \
+        SOURCE_REVISION="$SOURCE_REVISION" \
+        SOURCE_GIT_DIRTY="$SOURCE_GIT_DIRTY" \
+        RUNTIME_IMAGE="$RUNTIME_IMAGE" \
+        PYTHONDONTWRITEBYTECODE=1 \
+        STAMP="$STAMP" RUN_ID="$RUN_ID" CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
+        RESULTS="$RESULTS" LOGDIR="$LOGDIR" TAG="$TAG" IMAGE="$IMAGE" PHASES="$PHASES" \
+        REPS="$REPS" WARMUP="$WARMUP" MEM_NS="$MEM_NS" MEM_REPS="$MEM_REPS" \
+        CPUTIME_REPS="$CPUTIME_REPS" MEM_SEED="$MEM_SEED" \
+        UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH="$UFFD_PREFETCH" \
+        bash "$bundle_dir/corpus_extra.sh"
+fi
+
+[ -e /proc/self/fd/9 ] \
+    || { echo "BLOCKED: staged run did not inherit the host-wide lease" >&2; exit 2; }
+flock -n 9 \
+    || { echo "BLOCKED: staged run does not own the host-wide lease" >&2; exit 2; }
+RESULTS="$(cd "$RESULTS" && pwd -P)"
+LOGDIR="$(cd "$LOGDIR" && pwd -P)"
+verify_runtime_bundle || exit 2
 
 campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.sh" | sed 's/^URLS="//; s/"$//')
 [ "$campaign_urls" = "$URLS" ] || {
@@ -119,15 +223,17 @@ campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.s
 # nothing. git_dirty lists every tracked file that differs from HEAD.
 {
     echo "{"
-    echo " \"git_head\": \"$(git -C "$REPO" rev-parse HEAD)\","
-    echo " \"git_dirty\": \"$(git -C "$REPO" status --porcelain --untracked-files=no | tr '\n' ';')\","
+    echo " \"git_head\": \"$SOURCE_REVISION\","
+    echo " \"git_dirty\": \"$SOURCE_GIT_DIRTY\","
+    echo " \"runtime_bundle_sha256\": \"$RUNTIME_BUNDLE_SHA256\","
     echo " \"host_kernel\": \"$(uname -r)\", \"machine\": \"$(uname -m)\","
-    echo " \"image\": \"$IMAGE\", \"image_id\": \"$(podman inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null)\","
+    echo " \"image\": \"$IMAGE\", \"image_id\": \"$RUNTIME_IMAGE\","
     echo " \"tag\": \"$TAG\", \"reps\": $REPS, \"warmup\": $WARMUP,"
-    for f in hostcdp.sh cdpdrive.py render.py corpus_mem.py corpus_serve.py report.py; do
+    for f in corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py \
+            corpus_serve.py report.py reqbench.py owned_process.py corpus_campaign.sh; do
         echo " \"$f\": \"$(sha256sum "$BENCH/$f" | cut -d' ' -f1)\","
     done
-    echo " \"fcvm\": \"$(sha256sum "$REPO/target/release/fcvm" | cut -d' ' -f1)\""
+    echo " \"fcvm\": \"$(sha256sum "$BENCH/fcvm" | cut -d' ' -f1)\""
     echo "}"
 } > "$RESULTS/provenance.json"
 # Valid JSON is not the property that matters. Every field here is a command
@@ -320,11 +426,22 @@ cleanup_owned_containers() {
     return "$rc"
 }
 
+mark_runtime_bundle_withdrawn() {
+    local marker="$RESULTS/.WITHDRAWN.$$"
+    printf '%s\n' \
+        'WITHDRAWN: the staged runtime bundle changed during measurement; no result in this directory is publishable.' \
+        > "$marker" \
+        && mv -f -- "$marker" "$RESULTS/WITHDRAWN"
+}
+
 cleanup() {
-    local original_rc=$? cleanup_rc=0
+    local original_rc=$? cleanup_rc=0 bundle_ok=1 phase_cleanup_rc=0
     trap - EXIT
     set +e
-    stop_active_phase || cleanup_rc=1
+    stop_active_phase || phase_cleanup_rc=1
+    verify_runtime_bundle || cleanup_rc=1
+    [ "$cleanup_rc" -eq 0 ] || bundle_ok=0
+    [ "$phase_cleanup_rc" -eq 0 ] || cleanup_rc=1
     cleanup_owned_containers || cleanup_rc=1
     stop_corpus_serve || cleanup_rc=1
     if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
@@ -332,6 +449,9 @@ cleanup() {
         systemctl is-active --quiet dnsmasq || {
             echo "FAILED: dnsmasq did not restart; this box has no DNS. Check: sudo ss -lnup 'sport = :53'" >&2
             cleanup_rc=1; }
+    fi
+    if [ "$bundle_ok" -eq 0 ]; then
+        mark_runtime_bundle_withdrawn || cleanup_rc=1
     fi
     [ "$original_rc" -ne 0 ] && exit "$original_rc"
     exit "$cleanup_rc"
@@ -415,7 +535,7 @@ if [[ ",$PHASES," == *",hostcdp,"* ]]; then
         esac
         say "hostcdp/$arm over the corpus: $REPS measured reps plus $WARMUP warmup, cpus=${cpus:-<all>}, resolver rule -> 127.0.0.1"
         run_logged "$LOGDIR/hostcdp-$arm.log" env \
-            URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" IMAGE="$IMAGE" CPUS="$cpus" \
+            URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" IMAGE="$RUNTIME_IMAGE" CPUS="$cpus" \
             RUNID="$RUN_ID-$arm" BENCH_RESOLVE_ALL_TO=127.0.0.1 SETTLE_WAIT_SECS=300 \
             CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
             RESULTS="$RESULTS/hostcdp-$arm" bash "$BENCH/hostcdp.sh"
@@ -425,17 +545,18 @@ fi
 if [[ ",$PHASES," == *",memory,"* ]]; then
     say "matched-basis memory: N in $MEM_NS, $MEM_REPS reps, interleaved seed $MEM_SEED"
     run_logged "$LOGDIR/memory.log" python3 "$BENCH/corpus_mem.py" \
-        --results "$RESULTS/memory" --tag "$TAG" --image "$IMAGE" \
+        --results "$RESULTS/memory" --tag "$TAG" --image "$RUNTIME_IMAGE" \
         --urls "$URLS" --ns "$MEM_NS" --reps "$MEM_REPS" \
         --seed "$MEM_SEED" \
         --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" \
         --cputime-reps "$CPUTIME_REPS" \
         --run-id "$RUN_ID" \
         --container-owner-token "$CONTAINER_OWNER_TOKEN" \
-        --fcvm "$REPO/target/release/fcvm"
+        --fcvm "$BENCH/fcvm"
 fi
 
 stop_corpus_serve
 require_corpus_serve_clean
+verify_runtime_bundle
 say "records: $RESULTS"
 say "logs:    $LOGDIR"

@@ -1770,8 +1770,9 @@ class ProvenanceNamesBytes(unittest.TestCase):
         os.makedirs(bench)
         os.makedirs(os.path.join(tmp, "repo", "target", "release"))
         os.makedirs(results)
-        for name in ("hostcdp.sh", "cdpdrive.py", "render.py", "corpus_mem.py",
-                     "corpus_serve.py", "report.py"):
+        for name in ("corpus_extra.sh", "corpus_mem.py", "hostcdp.sh",
+                     "cdpdrive.py", "render.py", "corpus_serve.py", "report.py",
+                     "reqbench.py", "owned_process.py", "corpus_campaign.sh", "fcvm"):
             if bench_has_files:
                 with open(os.path.join(bench, name), "w") as handle:
                     handle.write(name)
@@ -1791,6 +1792,9 @@ class ProvenanceNamesBytes(unittest.TestCase):
                     f'export PATH="{stub}:$PATH"\n'
                     f'REPO="{tmp}/repo"\nBENCH="{bench}"\nRESULTS="{results}"\n'
                     'IMAGE=localhost/x\nTAG=t\nREPS=1\nWARMUP=0\n'
+                    'SOURCE_REVISION=abc123\nSOURCE_GIT_DIRTY=\n'
+                    'RUNTIME_BUNDLE_SHA256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n'
+                    'RUNTIME_IMAGE=sha256:deadbeef\n'
                     + self.block() + "\necho ACCEPTED\n")
         return subprocess.run(["bash", script], capture_output=True, text=True, timeout=60)
 
