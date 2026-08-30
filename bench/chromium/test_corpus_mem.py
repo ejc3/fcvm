@@ -216,6 +216,23 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
         self.assertEqual(rec["host"], None)
         self.assertIn("host_error", rec)
 
+    def test_the_recorded_reason_is_the_reason(self):
+        """`die` exits with a CODE, so str(SystemExit) is "2", not the message.
+
+        A record that says the host arm failed and cannot say why is the same
+        shape as a diagnostic that reports nothing and a clean result: the
+        reader cannot tell them apart. The host arm's own refusals carry their
+        text.
+        """
+        def refuse(_args, _res):
+            raise corpus_mem.HostArmRefused(
+                "podman reports no container cgroup for cbmem-cpu-abc")
+        out = self.run_with_failing_host(refuse)
+        with open(out) as handle:
+            rec = json.load(handle)
+        self.assertIn("no container cgroup", rec["host_error"],
+                      f"the record does not name the refusal: {rec['host_error']!r}")
+
     def test_a_host_arm_that_raises_still_leaves_the_record(self):
         def crash(_args, _res):
             raise RuntimeError("podman went away")

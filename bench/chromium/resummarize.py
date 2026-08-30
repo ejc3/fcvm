@@ -50,6 +50,8 @@ if la:
     load = {"n": len(la), "min": round(min(la), 2),
             "median": round(statistics.median(la), 2), "max": round(max(la), 2)}
 out = {"n": len(vals), "p50_ms": round(pct(vals, 50), 1), "p95_ms": round(pct(vals, 95), 1),
+       # 0 by construction: the run is refused above if any measured rep
+       # failed, which is the same invariant hostcdp.sh's own summary has.
        "mean_ms": round(statistics.mean(vals), 1), "failures": len(failed),
        "p50_convention": "statistics.median", "loadavg1_measured": load,
        "per_url": per_url}

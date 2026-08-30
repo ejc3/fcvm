@@ -73,6 +73,16 @@ def wait_quiet(limit, timeout_s):
         time.sleep(10)
 
 
+class HostArmRefused(Exception):
+    """The host CPU arm declining to publish a figure it cannot attribute.
+
+    Not `die`: `die` calls sys.exit(CODE), so a caller recording str(SystemExit)
+    stores "2" and the record cannot say why the arm refused. That is the same
+    shape as a diagnostic whose silence is indistinguishable from a clean
+    result. This carries its text into `res["host_error"]`.
+    """
+
+
 def sh_bounded(cmd, timeout):
     """Run cmd, and turn a hang into a failed attempt rather than a hang.
 
@@ -655,8 +665,14 @@ def run_cputime(args, cg, fcvm_side, out_path):
     # missing cpu.stat, a failed render -- doing the same thing again.
     try:
         cputime_host_arm(args, res)
+    except HostArmRefused as exc:
+        res["host_error"] = str(exc)
+        log(f"cputime host arm refused: {exc}")
     except SystemExit as exc:
-        res.setdefault("host_error", str(exc))
+        # die() exits with a CODE, so this cannot recover the message; the text
+        # is on stderr. Kept so a die() added to that path later still cannot
+        # destroy the fcvm records.
+        res.setdefault("host_error", f"refused with exit status {exc.code}")
         log(f"cputime host arm refused: {res['host_error']}")
     except Exception as exc:  # noqa: BLE001 - the fcvm records outrank any host failure
         res.setdefault("host_error", f"{type(exc).__name__}: {exc}")
@@ -702,11 +718,13 @@ def cputime_host_arm(args, res):
         # per-render CPU figure with every other process on the box inside it.
         rel = sh(["podman", "inspect", "--format", "{{.State.CgroupPath}}", name]).stdout.strip()
         if not rel.startswith("/") or rel == "/":
-            die(f"podman reports no container cgroup for {name} (got {rel!r}); "
+            raise HostArmRefused(
+                f"podman reports no container cgroup for {name} (got {rel!r}); "
                 "a CPU figure read from the root cgroup would be the whole machine")
         cgp = "/sys/fs/cgroup" + rel
         if not os.path.isdir(cgp):
-            die(f"container cgroup {cgp} does not exist; nothing can be attributed to it")
+            raise HostArmRefused(
+                f"container cgroup {cgp} does not exist; nothing can be attributed to it")
         # Two warmup renders first, outside the window, so first-touch costs
         # (fonts, code paths, page cache) are not charged to the measured reps.
         # A warmup that silently failed would leave those costs inside the
@@ -714,19 +732,20 @@ def cputime_host_arm(args, res):
         for i in range(2):
             ok, out = render("127.0.0.1:9222", args.urls[i % len(args.urls)])
             if not ok:
-                die(f"cputime container failed its warmup render: {out}")
+                raise HostArmRefused(f"cputime container failed its warmup render: {out}")
         before = cgroup_cpu_usec(cgp)
         if before is None:
-            die(f"cputime container cgroup {cgp} has no cpu.stat")
+            raise HostArmRefused(f"cputime container cgroup {cgp} has no cpu.stat")
         t0 = time.monotonic()
         for i in range(args.cputime_reps):
             ok, out = render("127.0.0.1:9222", args.urls[i % len(args.urls)])
             if not ok:
-                die(f"cputime container failed to render: {out}")
+                raise HostArmRefused(f"cputime container failed to render: {out}")
         wall = (time.monotonic() - t0) * 1000
         after = cgroup_cpu_usec(cgp)
         if after is None:
-            die(f"cputime container cgroup {cgp} stopped reporting cpu.stat "
+            raise HostArmRefused(
+                f"cputime container cgroup {cgp} stopped reporting cpu.stat "
                 "before the window closed; nothing can be differenced")
         res["host"] = {"n": args.cputime_reps,
                        "per_request_cpu_ms": round((after - before) / 1000.0 / args.cputime_reps, 1),
@@ -741,6 +760,8 @@ def cputime_host_arm(args, res):
         pass
     finally:
         sh(["podman", "rm", "-f", name])
+    if "host_error" in res:
+        log("cputime host arm produced no figure: " + res["host_error"])
 
 
 def main():
