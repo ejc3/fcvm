@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+use super::names;
 use super::namespace;
 use super::tcp_proxy;
 use super::types::generate_mac;
 use super::veth;
 use super::{NetworkConfig, NetworkManager, PortMapping, Protocol};
-use crate::state::truncate_id;
 
 /// Guest network addressing (same as pasta/bridged for Firecracker compatibility)
 const GUEST_IP: &str = "10.0.2.100";
@@ -64,6 +64,9 @@ pub struct RoutedNetwork {
 }
 
 impl RoutedNetwork {
+    /// `tap_device` is the caller's derivation of the TAP name. `setup()`
+    /// replaces it with the name from the reservation it makes, for the same
+    /// reason as `BridgedNetwork::new`.
     pub fn new(vm_id: String, tap_device: String, port_mappings: Vec<PortMapping>) -> Self {
         Self {
             vm_id,
@@ -368,50 +371,6 @@ impl RoutedNetwork {
 #[async_trait::async_trait]
 impl NetworkManager for RoutedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
-        // Generate unique namespace/veth names. Use hash-based short ID with
-        // collision detection: if the namespace already exists, bump a counter.
-        // Linux interface names are max 15 chars, so we use 5-char suffixes.
-        let (ns_name, host_veth, guest_veth) = {
-            let base = truncate_id(&self.vm_id, 8);
-            let mut ns = format!("fcvm-{}", base);
-            let mut hv = format!("veth-{}", base);
-            let mut gv = format!("vns-{}", base);
-
-            // Check for collision (another VM with same truncated ID).
-            // Bounded to 100 iterations to prevent infinite loops.
-            let mut found = !std::path::Path::new(&format!("/var/run/netns/{}", ns)).exists();
-            if !found {
-                for i in 1u32..=100 {
-                    warn!(namespace = %ns, "namespace collision, retrying with suffix");
-                    let suffix = format!("{}{}", base, i);
-                    // Truncate to keep within IFNAMSIZ (15 chars)
-                    let short = &suffix[..suffix.len().min(10)];
-                    ns = format!("fcvm-{}", short);
-                    hv = format!("veth-{}", short);
-                    gv = format!("vns-{}", short);
-                    if !std::path::Path::new(&format!("/var/run/netns/{}", ns)).exists() {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if !found {
-                anyhow::bail!(
-                    "could not find a free namespace name after 100 attempts \
-                     (base={}, last tried={}). Check for stale namespaces with: ip netns list",
-                    base,
-                    ns
-                );
-            }
-            (ns, hv, gv)
-        };
-
-        info!(
-            vm_id = %self.vm_id,
-            namespace = %ns_name,
-            "setting up routed networking"
-        );
-
         // Resolve the IPv6 subnet: explicit --ipv6-prefix or auto-detect a /64
         // from host interfaces.
         let (host_ipv6, network, prefix_len) = if let Some(ref prefix) = self.ipv6_prefix {
@@ -467,9 +426,28 @@ impl NetworkManager for RoutedNetwork {
             "IPv6 addresses for routed networking"
         );
 
-        // 1. Create network namespace
-        namespace::create_namespace(&ns_name).await?;
+        // 1. Reserve the namespace and, with it, the name base for the veth
+        //    pair and the TAP. names::reserve creates the namespace, so the
+        //    creation itself decides which VM owns the base; the
+        //    check-then-create this replaced could hand one name to two VMs,
+        //    and bumped the suffix by appending and truncating, which rendered
+        //    two attempts as one name for an id ending in digits (#888).
+        let vm_names = names::reserve(&self.vm_id, &["veth-", "vns-"])
+            .await
+            .context("reserving per-VM network names")?;
+        let ns_name = vm_names.namespace.clone();
         self.namespace_id = Some(ns_name.clone());
+        let host_veth = vm_names.link("veth-");
+        let guest_veth = vm_names.link("vns-");
+        // The TAP is created inside the reserved namespace, so its name is
+        // settled by the reservation, not by the caller's derivation.
+        self.tap_device = vm_names.link("tap-");
+
+        info!(
+            vm_id = %self.vm_id,
+            namespace = %ns_name,
+            "setting up routed networking"
+        );
 
         // 1b. Turn Duplicate Address Detection off inside the namespace, before any
         //     interface exists there. Every link in here is a private point-to-point

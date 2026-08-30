@@ -25,6 +25,18 @@ pub struct InNamespaceNatConfig {
     pub host_veth_ip_cidr: String,
 }
 
+/// Whether an interface of this name exists in the calling namespace.
+///
+/// `/sys/class/net` is per network namespace, so this answers for the
+/// namespace the caller is in. Both ends of a veth pair are created in the
+/// host namespace before the guest end is moved, so both names must be free
+/// here at creation time.
+pub fn link_exists(if_name: &str) -> bool {
+    std::path::Path::new("/sys/class/net")
+        .join(if_name)
+        .exists()
+}
+
 /// Creates a veth pair and moves guest side into a namespace
 ///
 /// Creates a pair of virtual ethernet devices. The host side remains in the
@@ -1028,7 +1040,9 @@ mod parse_tests {
 #[cfg(feature = "privileged-tests")]
 mod tests {
     use super::*;
-    use crate::network::namespace::{create_namespace, delete_namespace, exec_in_namespace};
+    use crate::network::namespace::{
+        create_namespace, delete_namespace, exec_in_namespace, NamespaceCreation,
+    };
 
     #[tokio::test]
     async fn test_veth_lifecycle() {
@@ -1041,7 +1055,10 @@ mod tests {
         let _ = delete_namespace(ns_name).await;
 
         // Create namespace
-        create_namespace(ns_name).await.unwrap();
+        assert_eq!(
+            create_namespace(ns_name).await.unwrap(),
+            NamespaceCreation::Created
+        );
 
         // Create veth pair
         create_veth_pair(host_veth, guest_veth, ns_name)
@@ -1082,7 +1099,10 @@ mod tests {
         let _ = delete_namespace(ns_name).await;
 
         // Create namespace
-        create_namespace(ns_name).await.unwrap();
+        assert_eq!(
+            create_namespace(ns_name).await.unwrap(),
+            NamespaceCreation::Created
+        );
 
         // Create TAP device
         create_tap_in_ns(ns_name, tap_name).await.unwrap();

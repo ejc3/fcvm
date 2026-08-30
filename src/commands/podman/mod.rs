@@ -1457,6 +1457,8 @@ async fn prepare_vm_for_lifecycle(
         );
     }
 
+    // Bridged and routed re-derive this from the namespace they reserve (see
+    // network::names); read the settled name back from network_config.
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let mut network: Box<dyn NetworkManager> = match args.network {
         NetworkMode::Bridged => {

@@ -1,13 +1,41 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
-/// Creates a named network namespace
+/// Directory `ip netns` keeps its named namespaces in.
+const NETNS_DIR: &str = "/var/run/netns";
+
+/// What `create_namespace` found.
 ///
-/// This uses `ip netns add` to create a persistent namespace in /var/run/netns/.
-/// The namespace will survive even if no processes are in it.
-pub async fn create_namespace(ns_name: &str) -> Result<()> {
+/// A separate outcome rather than an error so a caller searching for a free
+/// name can move on, and so no caller can mistake "somebody else's namespace"
+/// for "mine".
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceCreation {
+    /// This call created the namespace.
+    Created,
+    /// The name was already taken; this call created nothing.
+    AlreadyExists,
+}
+
+/// The file `ip netns` uses to represent a named namespace.
+pub fn namespace_path(ns_name: &str) -> PathBuf {
+    Path::new(NETNS_DIR).join(ns_name)
+}
+
+/// Creates a named network namespace in /var/run/netns/.
+///
+/// The namespace survives even if no processes are in it.
+///
+/// An existing name is reported as `AlreadyExists`, never adopted. `ip netns
+/// add` fails with EEXIST, which makes it the compare-and-swap that decides
+/// which VM owns a name. Adopting instead put two VMs' interfaces in one
+/// namespace: the second VM's veth or TAP creation failed on a name the first
+/// VM already held, and its cleanup then deleted the namespace the first VM
+/// was still running in (#888).
+pub async fn create_namespace(ns_name: &str) -> Result<NamespaceCreation> {
     debug!(namespace = %ns_name, "creating network namespace");
 
     let output = Command::new("ip")
@@ -18,15 +46,14 @@ pub async fn create_namespace(ns_name: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "File exists" error - namespace already created
         if stderr.contains("File exists") {
-            warn!(namespace = %ns_name, "namespace already exists, reusing");
-            return Ok(());
+            debug!(namespace = %ns_name, "namespace name is taken by another VM");
+            return Ok(NamespaceCreation::AlreadyExists);
         }
         anyhow::bail!("failed to create namespace {}: {}", ns_name, stderr);
     }
 
-    Ok(())
+    Ok(NamespaceCreation::Created)
 }
 
 /// Deletes a named network namespace
@@ -57,8 +84,7 @@ pub async fn delete_namespace(ns_name: &str) -> Result<()> {
 
 /// Checks if a namespace exists
 pub async fn namespace_exists(ns_name: &str) -> bool {
-    let ns_path = format!("/var/run/netns/{}", ns_name);
-    Path::new(&ns_path).exists()
+    namespace_path(ns_name).exists()
 }
 
 /// Executes a command inside a network namespace
@@ -143,11 +169,17 @@ mod tests {
         let _ = delete_namespace(ns_name).await;
 
         // Create namespace
-        create_namespace(ns_name).await.unwrap();
+        assert_eq!(
+            create_namespace(ns_name).await.unwrap(),
+            NamespaceCreation::Created
+        );
         assert!(namespace_exists(ns_name).await);
 
-        // Creating again should be idempotent
-        create_namespace(ns_name).await.unwrap();
+        // Creating again must report the name as taken, never adopt it (#888)
+        assert_eq!(
+            create_namespace(ns_name).await.unwrap(),
+            NamespaceCreation::AlreadyExists
+        );
 
         // Delete namespace
         delete_namespace(ns_name).await.unwrap();
@@ -166,7 +198,10 @@ mod tests {
         let _ = delete_namespace(ns_name).await;
 
         // Create namespace
-        create_namespace(ns_name).await.unwrap();
+        assert_eq!(
+            create_namespace(ns_name).await.unwrap(),
+            NamespaceCreation::Created
+        );
 
         // Execute command in namespace
         let output = exec_in_namespace(ns_name, &["ip", "link", "show"])
