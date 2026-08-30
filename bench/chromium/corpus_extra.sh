@@ -17,6 +17,7 @@ REPO="${REPO:-$(cd "$HERE/../.." && pwd)}"
 BENCH="$REPO/bench/chromium"
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 RUN_ID="${RUN_ID:-$(tr -d - </proc/sys/kernel/random/uuid)}"
+CONTAINER_OWNER_TOKEN="${CONTAINER_OWNER_TOKEN:-$(tr -d - </proc/sys/kernel/random/uuid)}"
 RESULTS="${RESULTS:-$BENCH/results/corpusextra-$STAMP-$RUN_ID}"
 LOGDIR="${LOGDIR:-/tmp/corpusextra-$STAMP-$RUN_ID}"
 TAG="${TAG:-cb-req-corpus}"
@@ -63,6 +64,8 @@ validate_phases() {
 
 [[ "$RUN_ID" =~ ^[0-9a-f]{32}$ ]] \
     || { echo "BLOCKED: RUN_ID must be a 32-character lowercase hexadecimal owner ID" >&2; exit 2; }
+[[ "$CONTAINER_OWNER_TOKEN" =~ ^[0-9a-f]{32}$ ]] \
+    || { echo "BLOCKED: CONTAINER_OWNER_TOKEN must be 32 lowercase hexadecimal characters" >&2; exit 2; }
 validate_phases
 
 for tool in awk bash cat curl cut date dig dirname env flock git grep head install jq \
@@ -240,15 +243,30 @@ require_corpus_serve_clean() {
 }
 
 cleanup_owned_containers() {
-    local listed rc=0 name
-    listed=$(timeout 30 podman ps -a --format '{{.Names}}') \
+    local listed rc=0 id name identity actual_id owner extra
+    listed=$(timeout 30 podman ps -a --no-trunc --format '{{.ID}} {{.Names}}') \
         || { echo "FAILED: cannot enumerate containers owned by run $RUN_ID" >&2; return 1; }
-    while IFS= read -r name; do
-        [ -n "$name" ] || continue
+    while read -r id name extra; do
+        [ -n "$id" ] || continue
+        if [ -z "$name" ] || [ -n "$extra" ]; then
+            echo "FAILED: cannot parse container identity row '$id $name $extra'" >&2
+            rc=1
+            continue
+        fi
         case "$name" in
             cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*|cbmem-cpu-"$RUN_ID")
-                timeout 30 podman rm -f -- "$name" >/dev/null 2>&1 \
-                    || { echo "FAILED: could not remove owned container $name" >&2; rc=1; }
+                identity=$(timeout 30 podman inspect --format \
+                    '{{.Id}} {{ index .Config.Labels "io.fcvm.bench.owner" }}' "$id") \
+                    || { echo "FAILED: cannot inspect possible owned container $name ($id)" >&2; rc=1; continue; }
+                read -r actual_id owner extra <<<"$identity"
+                if [ "$actual_id" != "$id" ] || [ -n "$extra" ]; then
+                    echo "FAILED: container identity changed while inspecting $name ($id -> $identity)" >&2
+                    rc=1
+                    continue
+                fi
+                [ "$owner" = "$CONTAINER_OWNER_TOKEN" ] || continue
+                timeout 30 podman rm -f -- "$actual_id" >/dev/null 2>&1 \
+                    || { echo "FAILED: could not remove owned container $name ($actual_id)" >&2; rc=1; }
                 ;;
         esac
     done <<<"$listed"
@@ -350,6 +368,7 @@ if [[ ",$PHASES," == *",hostcdp,"* ]]; then
         run_logged "$LOGDIR/hostcdp-$arm.log" env \
             URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" IMAGE="$IMAGE" CPUS="$cpus" \
             RUNID="$RUN_ID-$arm" BENCH_RESOLVE_ALL_TO=127.0.0.1 SETTLE_WAIT_SECS=300 \
+            CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
             RESULTS="$RESULTS/hostcdp-$arm" bash "$BENCH/hostcdp.sh"
     done
 fi
@@ -363,6 +382,7 @@ if [[ ",$PHASES," == *",memory,"* ]]; then
         --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" \
         --cputime-reps "$CPUTIME_REPS" \
         --run-id "$RUN_ID" \
+        --container-owner-token "$CONTAINER_OWNER_TOKEN" \
         --fcvm "$REPO/target/release/fcvm"
 fi
 
