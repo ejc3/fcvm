@@ -189,11 +189,33 @@ def cgroup_bytes(cg_path):
 
 
 def cgroup_procs(cg_path):
-    try:
-        with open(os.path.join(cg_path, "cgroup.procs")) as f:
-            return [int(x) for x in f.read().split()]
-    except (OSError, ValueError):
-        return []
+    """Every pid in this cgroup SUBTREE, which is the process set
+    memory.current is charged over.
+
+    Not just the named node. Rootless podman nests a container's processes one
+    level below the cgroup `podman inspect` reports, so a single-node read
+    returned [] for every container while memory.current still counted them,
+    and pool_pss_kb came back 0 with pool_containers = N. The instance-count
+    check upstream cannot catch that: pool_containers is counted from
+    `podman ps`, not from this function. measure_cgroup_set drops a leaf with no
+    procs, so on the fcvm side the same miss lowers `clones` and the cell is
+    refused -- the failure was one-sided, in fcvm's favour.
+
+    A node whose cgroup.procs cannot be read or parsed is skipped whole rather
+    than contributing the pids parsed before the bad token, so a torn read
+    cannot put a partial process set behind a total that looks complete.
+    """
+    pids = []
+    for root, _dirs, files in os.walk(cg_path):
+        if "cgroup.procs" not in files:
+            continue
+        try:
+            with open(os.path.join(root, "cgroup.procs")) as f:
+                node = [int(x) for x in f.read().split()]
+        except (OSError, ValueError):
+            continue
+        pids.extend(node)
+    return pids
 
 
 def cgroup_stat(cg_path):
