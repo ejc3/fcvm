@@ -1016,21 +1016,44 @@ async fn profile_firecracker_for_setup_vm(profile_name: &str) -> Result<Option<P
     Ok(None)
 }
 
-/// The resolution order itself, with the profile's Firecracker already looked
-/// up. Split out from [`setup_vm_firecracker_bin`] so the order is asserted
+/// The resolution order, with the profile's Firecracker already looked up.
+/// Split out from [`setup_vm_firecracker_bin`] so the order is asserted
 /// without a config file or an assets directory.
+///
+/// This reads the two process-globals the order depends on and hands them to
+/// [`setup_vm_firecracker_bin_resolved`], which is the whole rule as a pure
+/// function. Making PATH an argument is what lets the order test say "nothing
+/// on PATH" without emptying the real one: the library suite shares one
+/// process under plain `cargo test`, and an empty PATH there breaks every
+/// sibling test that spawns a program by bare name.
 fn setup_vm_firecracker_bin_from(profile_firecracker: Option<PathBuf>) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
+    setup_vm_firecracker_bin_resolved(
+        std::env::var_os("FCVM_FIRECRACKER_BIN"),
+        profile_firecracker,
+        std::env::var_os("PATH"),
+    )
+}
+
+/// `FCVM_FIRECRACKER_BIN`, then the profile's Firecracker, then `search_path`.
+fn setup_vm_firecracker_bin_resolved(
+    env_override: Option<std::ffi::OsString>,
+    profile_firecracker: Option<PathBuf>,
+    search_path: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if let Some(path) = env_override {
         let p = PathBuf::from(&path);
         if !p.exists() {
-            bail!("FCVM_FIRECRACKER_BIN={} does not exist", path);
+            bail!("FCVM_FIRECRACKER_BIN={} does not exist", p.display());
         }
         return Ok(p);
     }
     if let Some(path) = profile_firecracker {
         return Ok(path);
     }
-    which::which("firecracker").context(
+    // `which_in` takes a cwd, but consults it only for a binary name that
+    // contains a path separator; "firecracker" never does.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    which::which_in("firecracker", search_path, cwd).context(
         "firecracker not found in PATH; set FCVM_FIRECRACKER_BIN to the binary \
          fcvm built under <assets_dir>/firecracker/",
     )
@@ -2572,59 +2595,7 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Puts one process-global environment variable back the way it was.
-    ///
-    /// A test that mutates PATH or FCVM_FIRECRACKER_BIN and restores it on
-    /// its last line restores nothing when an assertion fires first, and a
-    /// test that removes a variable it did not record cannot put it back at
-    /// all. Both are the same bug: the restore has to be tied to the scope,
-    /// not to reaching the end of it.
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        /// Record the current value, then set this one.
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let guard = Self {
-                key,
-                previous: std::env::var_os(key),
-            };
-            std::env::set_var(key, value);
-            guard
-        }
-
-        /// Record the current value, then unset the variable.
-        fn unset(key: &'static str) -> Self {
-            let guard = Self {
-                key,
-                previous: std::env::var_os(key),
-            };
-            std::env::remove_var(key);
-            guard
-        }
-
-        /// Another value for the same variable, still restored by this guard.
-        fn set_to(&self, value: impl AsRef<std::ffi::OsStr>) {
-            std::env::set_var(self.key, value);
-        }
-
-        /// Unset the variable, still restored by this guard.
-        fn unset_now(&self) {
-            std::env::remove_var(self.key);
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::lock_process_env;
 
     #[test]
     fn firecracker_commit_pins_deserialize_for_global_and_profile_configs() {
@@ -2680,15 +2651,22 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
         }
     }
 
-    /// FCVM_FIRECRACKER_BIN and PATH are both process-globals, so the whole
-    /// resolution order is asserted in one test rather than racing across
-    /// several.
+    /// The whole resolution order, asserted without touching the process
+    /// environment: the override and the search path are both arguments.
     ///
     /// The profile arm is the one a fresh host depends on. `fcvm setup` builds
     /// a Firecracker under the assets directory and then boots the rootfs setup
     /// VM, so consulting PATH alone failed with "firecracker not found in PATH"
     /// on a box with no system-wide Firecracker, immediately after printing the
     /// path of the binary it had just built.
+    ///
+    /// RED BEFORE THE FIX: this test set `PATH=""` process-wide, so the bare
+    /// `sh` spawn below died with
+    /// `spawning sh by name must keep working while this test runs:
+    /// Os { code: 2, kind: NotFound, message: "No such file or directory" }`.
+    /// That spawn is what every sibling test doing the same thing hits when it
+    /// lands in the window, which is the defect: nextest gives each test its
+    /// own process, plain `cargo test` gives the library suite one.
     #[test]
     fn setup_vm_firecracker_bin_prefers_env_then_profile_then_path() {
         let real = std::env::current_exe().expect("test binary path");
@@ -2698,26 +2676,34 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
         let built = assets.path().join("firecracker-default-0123456789ab.bin");
         std::fs::write(&built, b"#!/bin/sh\nexit 0\n").expect("write stub");
 
-        // An empty PATH removes whatever system-wide Firecracker this box may
-        // have, so the assertions below observe the profile arm. Both
-        // variables are held by a guard: any assertion below can end the test
-        // early, and the process must not be left with an empty PATH or
-        // without the FCVM_FIRECRACKER_BIN it was started with.
-        let _path = EnvVarGuard::set("PATH", "");
-        let firecracker_bin = EnvVarGuard::set("FCVM_FIRECRACKER_BIN", &real);
+        // A search path holding one empty directory removes whatever
+        // system-wide Firecracker this box may have, so the assertions below
+        // observe the profile arm. It is an argument, not the process PATH, so
+        // no sibling test can see it.
+        let empty_dir = tempfile::tempdir().expect("temp search dir");
+        let nothing_on_path = || Some(std::ffi::OsString::from(empty_dir.path()));
+        let override_of = |p: &std::path::Path| Some(std::ffi::OsString::from(p));
 
         // Set and existing: returned as-is, ahead of the profile's binary.
         assert_eq!(
-            setup_vm_firecracker_bin_from(Some(built.clone())).unwrap(),
+            setup_vm_firecracker_bin_resolved(
+                override_of(&real),
+                Some(built.clone()),
+                nothing_on_path()
+            )
+            .unwrap(),
             real
         );
 
         // Set and missing: the error names the variable, so the reader knows
         // which knob is wrong instead of getting a bare ENOENT.
-        firecracker_bin.set_to("/nonexistent/firecracker");
-        let err = setup_vm_firecracker_bin_from(Some(built.clone()))
-            .unwrap_err()
-            .to_string();
+        let err = setup_vm_firecracker_bin_resolved(
+            override_of(std::path::Path::new("/nonexistent/firecracker")),
+            Some(built.clone()),
+            nothing_on_path(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("FCVM_FIRECRACKER_BIN"),
             "error should name the variable, got: {err}"
@@ -2725,61 +2711,63 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
 
         // Unset, a Firecracker built for the profile, nothing on PATH: the
         // built binary is used rather than the setup failing.
-        firecracker_bin.unset_now();
         assert_eq!(
-            setup_vm_firecracker_bin_from(Some(built.clone()))
+            setup_vm_firecracker_bin_resolved(None, Some(built.clone()), nothing_on_path())
                 .expect("the Firecracker fcvm built must satisfy the setup VM"),
             built
         );
 
         // Unset, nothing built, nothing on PATH: still an error, and it names
         // the override so the reader has somewhere to go.
-        let err = setup_vm_firecracker_bin_from(None).unwrap_err().to_string();
+        let err = setup_vm_firecracker_bin_resolved(None, None, nothing_on_path())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("FCVM_FIRECRACKER_BIN"),
             "error should name the override, got: {err}"
         );
+
+        // The process the suite shares is untouched: PATH still resolves a
+        // bare program name, which is what ~20 sibling tests rely on.
+        let sh = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .expect("spawning sh by name must keep working while this test runs");
+        assert!(sh.success(), "sh -c 'exit 0' should succeed");
     }
 
-    /// The guard has to survive the case it exists for: an assertion that
-    /// fires while the variable is held at a test value.
-    ///
-    /// RED BEFORE THE FIX (the guard without its Drop): `PATH was left at the
-    /// test's value after a panic: left: Err(NotPresent), right: Ok("before")`
-    /// -- the guard recorded the previous value and never put it back, which
-    /// is what the hand-written save/restore in the test above did whenever an
-    /// assertion fired first.
+    /// The wrapper reads the two process-globals and the resolver applies
+    /// them. Only `FCVM_FIRECRACKER_BIN` is mutated here, under the shared
+    /// environment lock: nothing else in the crate reads it, and PATH stays
+    /// whatever the process was started with.
     #[test]
-    fn an_env_var_guard_restores_its_variable_through_a_panic() {
-        const KEY: &str = "FCVM_ENV_GUARD_PROBE";
+    fn setup_vm_firecracker_bin_from_reads_the_environment_override() {
+        let real = std::env::current_exe().expect("test binary path");
+        let mut env = lock_process_env();
 
-        // A variable that was set keeps its value.
-        std::env::set_var(KEY, "before");
-        let panicked = std::panic::catch_unwind(|| {
-            let guard = EnvVarGuard::set(KEY, "during");
-            assert_eq!(std::env::var(KEY).as_deref(), Ok("during"));
-            guard.unset_now();
-            panic!("the assertion this stands in for");
-        });
-        assert!(panicked.is_err(), "the probe did not panic");
+        env.set("FCVM_FIRECRACKER_BIN", &real);
         assert_eq!(
-            std::env::var(KEY).as_deref(),
-            Ok("before"),
-            "PATH was left at the test's value after a panic"
+            setup_vm_firecracker_bin_from(None).unwrap(),
+            real,
+            "the wrapper must consult FCVM_FIRECRACKER_BIN"
         );
 
-        // A variable that was not set stays unset.
-        std::env::remove_var(KEY);
-        let panicked = std::panic::catch_unwind(|| {
-            let _guard = EnvVarGuard::unset(KEY);
-            let _also = EnvVarGuard::set(KEY, "during");
-            panic!("the assertion this stands in for");
-        });
-        assert!(panicked.is_err(), "the probe did not panic");
+        env.set("FCVM_FIRECRACKER_BIN", "/nonexistent/firecracker");
+        let err = setup_vm_firecracker_bin_from(None).unwrap_err().to_string();
+        assert!(
+            err.contains("FCVM_FIRECRACKER_BIN"),
+            "error should name the variable, got: {err}"
+        );
+
+        // Unset, and a profile binary present: the wrapper falls through to it
+        // without consulting PATH.
+        env.unset("FCVM_FIRECRACKER_BIN");
+        let assets = tempfile::tempdir().expect("temp assets dir");
+        let built = assets.path().join("firecracker-default-0123456789ab.bin");
+        std::fs::write(&built, b"#!/bin/sh\nexit 0\n").expect("write stub");
         assert_eq!(
-            std::env::var_os(KEY),
-            None,
-            "a variable the test invented outlived it"
+            setup_vm_firecracker_bin_from(Some(built.clone())).unwrap(),
+            built
         );
     }
 
@@ -2788,12 +2776,14 @@ firecracker_commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
     #[test]
     fn find_config_file_propagates_a_relative_fcvm_config_dir() {
         // A set-but-invalid override must ERROR, not silently fall through to
-        // some other config location (nextest runs each test in its own
-        // process, so the env mutation cannot leak).
-        std::env::set_var("FCVM_CONFIG_DIR", "relative/not-absolute");
+        // some other config location. The lookup chain reads the variable, so
+        // this one cannot become an argument; it goes through the shared
+        // environment lock instead, and the handle puts the old value back
+        // even when the assertion below fires first.
+        let mut env = lock_process_env();
+        env.set("FCVM_CONFIG_DIR", "relative/not-absolute");
         let err = find_config_file(None)
             .expect_err("a relative FCVM_CONFIG_DIR must be an error, not a fallthrough");
-        std::env::remove_var("FCVM_CONFIG_DIR");
         assert!(
             format!("{err:#}").contains("absolute"),
             "error should name the absolute-path requirement: {err:#}"

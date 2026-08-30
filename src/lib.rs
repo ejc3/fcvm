@@ -9,6 +9,8 @@ pub mod paths;
 pub mod setup;
 pub mod state;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod test_env;
 pub mod uffd;
 pub mod utils;
 pub mod version_cache;

@@ -662,13 +662,16 @@ mod tests {
     ///
     /// RED before the fix: kernel_routes_peer_via_veth returned `true` on any
     /// spawn error or nonzero exit, so a candidate nobody could verify was
-    /// taken as verified — the same silent acceptance #820 is about. The fake
+    /// taken as verified, the same silent acceptance #820 is about. The fake
     /// `ip` here exits 1; nextest runs each test in its own process, but
-    /// plain `cargo test` does not, so the PATH mutation additionally holds
-    /// PATH_IP_LOCK against siblings that spawn the real `ip` by name.
+    /// plain `cargo test` does not, so the PATH mutation goes through the
+    /// crate-wide environment lock, which excludes both the other mutators and
+    /// the siblings that spawn the real `ip` by name. Prepending is deliberate:
+    /// the rest of PATH stays intact, so a sibling spawning any other program
+    /// by name is unaffected even inside the window.
     #[tokio::test]
     async fn an_unavailable_route_verdict_is_an_error_not_an_acceptance() {
-        let _path_lock = crate::network::PATH_IP_LOCK.lock().await;
+        let mut env = crate::test_env::lock_process_env_async().await;
         let dir = std::env::temp_dir().join(format!("fcvm-fakeip-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("ip");
@@ -682,11 +685,11 @@ mod tests {
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let prev = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), prev));
+        env.set("PATH", format!("{}:{}", dir.display(), prev));
 
         let verdict = kernel_routes_peer_via_veth("veth0-vm-abc12", "10.0.0.2").await;
 
-        std::env::set_var("PATH", prev);
+        drop(env);
         let _ = std::fs::remove_dir_all(&dir);
         let err = verdict.expect_err(
             "an `ip route get` that cannot answer must be an error; returning true \
