@@ -18,12 +18,15 @@ Two quantities are compared, never mixed:
 """
 import argparse
 from collections import Counter
+import ctypes
 import fcntl
 import hashlib
 import ipaddress
 import json
 import math
 import os
+import random
+import secrets
 import statistics
 import sys
 import tempfile
@@ -97,7 +100,70 @@ def parse_jsonl(text, label):
     return rows
 
 
-def write_json_atomic(path, value):
+def open_output_target(path):
+    absolute = os.path.abspath(path)
+    directory, name = os.path.split(absolute)
+    if not name:
+        raise Refusal(f"output path {path!r} names no file")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    directory_fd = None
+    try:
+        directory_fd = os.open(directory, flags)
+        directory_stat = os.fstat(directory_fd)
+    except OSError as error:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise Refusal(f"cannot open output directory {directory}: {error}") from error
+    return {
+        "path": path,
+        "absolute": absolute,
+        "directory": directory,
+        "name": name,
+        "directory_fd": directory_fd,
+        "directory_stat": directory_stat,
+    }
+
+
+def ensure_output_directory(target):
+    try:
+        current = os.stat(target["directory"])
+    except OSError as error:
+        raise Refusal(
+            f"output directory {target['directory']} cannot be rechecked: {error}"
+        ) from error
+    if not os.path.samestat(current, target["directory_stat"]):
+        raise Refusal(f"output directory {target['directory']} changed during comparison")
+
+
+def rename_noreplace(directory_fd, source, destination):
+    """Rename one directory entry without overwriting a concurrent creator."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise Refusal("renameat2 is required for race-free output handling") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(destination),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), source)
+
+
+def write_json_atomic(path, value, output_target=None):
+    if output_target is not None:
+        return write_json_atomic_at(output_target, value)
     directory = os.path.dirname(os.path.abspath(path)) or "."
     fd, temporary = tempfile.mkstemp(prefix=".compare-", dir=directory)
     try:
@@ -112,6 +178,81 @@ def write_json_atomic(path, value):
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+        raise
+
+
+def write_json_atomic_at(target, value):
+    ensure_output_directory(target)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    while True:
+        temporary = f".compare-{os.getpid()}-{secrets.token_hex(8)}"
+        try:
+            fd = os.open(
+                temporary, flags, 0o600, dir_fd=target["directory_fd"]
+            )
+            break
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise Refusal(
+                f"cannot create temporary output in {target['directory']}: {error}"
+            ) from error
+    linked = False
+    temporary_exists = True
+    try:
+        try:
+            handle = os.fdopen(fd, "w")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
+            json.dump(value, handle, indent=1, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            written_stat = os.fstat(handle.fileno())
+        ensure_output_directory(target)
+        try:
+            os.link(
+                temporary,
+                target["name"],
+                src_dir_fd=target["directory_fd"],
+                dst_dir_fd=target["directory_fd"],
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise Refusal(
+                f"output {target['path']} appeared during comparison; refusing "
+                "to replace it"
+            ) from error
+        linked = True
+        os.unlink(temporary, dir_fd=target["directory_fd"])
+        temporary_exists = False
+        current = os.stat(
+            target["name"],
+            dir_fd=target["directory_fd"],
+            follow_symlinks=False,
+        )
+        if not os.path.samestat(current, written_stat):
+            raise Refusal(f"output {target['path']} changed during publication")
+        ensure_output_directory(target)
+    except BaseException:
+        if linked:
+            try:
+                current = os.stat(
+                    target["name"],
+                    dir_fd=target["directory_fd"],
+                    follow_symlinks=False,
+                )
+                if os.path.samestat(current, written_stat):
+                    os.unlink(target["name"], dir_fd=target["directory_fd"])
+            except FileNotFoundError:
+                pass
+        if temporary_exists:
+            try:
+                os.unlink(temporary, dir_fd=target["directory_fd"])
+            except FileNotFoundError:
+                pass
         raise
 
 
@@ -131,6 +272,24 @@ def finite_nonnegative(value):
     )
 
 
+def finite_positive(value):
+    return finite_nonnegative(value) and value > 0
+
+
+def required_string(record, key, label):
+    value = record.get(key)
+    if not isinstance(value, str) or not value:
+        raise Refusal(f"{label} has invalid {key}={value!r}")
+    return value
+
+
+def sha256_field(record, key, label):
+    value = required_string(record, key, label)
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise Refusal(f"{label} has invalid {key}={value!r}")
+    return value
+
+
 def declared_urls(record, label):
     urls = record.get("urls")
     if urls is None:
@@ -144,6 +303,16 @@ def declared_urls(record, label):
         or any(not isinstance(url, str) or not url for url in urls)
     ):
         raise Refusal(f"{label} has no valid ordered URL corpus")
+    value = record.get("url")
+    if value is not None:
+        if not isinstance(value, str):
+            raise Refusal(f"{label} has invalid url={value!r}")
+        split_urls = [part.strip() for part in value.split(",") if part.strip()]
+        if split_urls != urls:
+            raise Refusal(
+                f"{label} has contradictory corpus declarations: "
+                f"url={split_urls!r} urls={urls!r}"
+            )
     return urls
 
 
@@ -191,21 +360,121 @@ def pct(v, p):
     return v[max(0, -(-p * len(v) // 100) - 1)]
 
 
+def vm_schedule(meta, label):
+    measured = integer_field(meta, "reps", label, minimum=1)
+    warmup = integer_field(meta, "warmup", label)
+    seed = meta.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise Refusal(f"{label} has invalid seed={seed!r}")
+    arms = meta.get("arms")
+    if (
+        not isinstance(arms, list)
+        or not arms
+        or any(not isinstance(arm, str) or not arm for arm in arms)
+        or len(set(arms)) != len(arms)
+    ):
+        raise Refusal(f"{label} has no valid unique arm schedule")
+    urls = declared_urls(meta, label)
+    rng = random.Random(seed)
+    schedule = []
+    for rep in range(warmup + measured):
+        order = list(arms)
+        rng.shuffle(order)
+        schedule.extend((rep, arm, rep < warmup) for arm in order)
+    return schedule, urls
+
+
+def validate_vm_metric(record, key, label):
+    value = record.get(key)
+    if not finite_nonnegative(value):
+        raise Refusal(f"{label} has invalid {key}={value!r}")
+    return value
+
+
 def load_vm(run_dir, analysis):
     artifact = read_artifact(os.path.join(run_dir, "reqbench.jsonl"))
     bind_analysis_input(analysis, artifact)
     rows = parse_jsonl(artifact["text"], artifact["path"])
+    if rows[0].get("kind") != "meta":
+        raise Refusal(f"{artifact['path']} first record is not VM metadata")
     metas = [row for row in rows if row.get("kind") == "meta"]
     if len(metas) != 1:
         raise Refusal(
             f"{artifact['path']} has {len(metas)} meta records; exactly one is required"
         )
-    recs = []
-    for row in rows:
-        # A rep that does not say it worked is not a rep known to have worked.
-        if row.get("arm") and row.get("warmup") is False and row.get("ok") is True:
-            recs.append(row)
-    return metas[0], recs, artifact_identity(artifact)
+    meta = metas[0]
+    run_id = required_string(meta, "run_id", "VM reqbench metadata")
+    if analysis.get("run_id") != run_id:
+        raise Refusal(
+            f"analysis.json run_id={analysis.get('run_id')!r} does not match "
+            f"VM reqbench metadata run_id={run_id!r}"
+        )
+    schedule, urls = vm_schedule(meta, "VM reqbench metadata")
+    records = rows[1:]
+    if len(records) != len(schedule):
+        raise Refusal(
+            f"VM reqbench schedule declares {len(schedule)} arm/rep records but "
+            f"{artifact['path']} contains {len(records)}"
+        )
+
+    measured = []
+    for ordinal, (record, expected) in enumerate(zip(records, schedule), 1):
+        rep, arm, is_warmup = expected
+        label = f"{artifact['path']}:{ordinal + 1}"
+        if record.get("run_id") != run_id:
+            raise Refusal(
+                f"{label} run_id={record.get('run_id')!r} does not match "
+                f"VM reqbench metadata run_id={run_id!r}"
+            )
+        actual_rep = integer_field(record, "rep", label)
+        if record.get("arm") != arm or actual_rep != rep:
+            raise Refusal(
+                f"{label} does not match the declared VM schedule: "
+                f"got arm={record.get('arm')!r} rep={actual_rep!r}, "
+                f"expected arm={arm!r} rep={rep}"
+            )
+        if record.get("warmup") is not is_warmup:
+            raise Refusal(
+                f"{label} has warmup={record.get('warmup')!r}; expected {is_warmup}"
+            )
+        expected_record_id = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"
+        if record.get("record_id") != expected_record_id:
+            raise Refusal(
+                f"{label} has record_id={record.get('record_id')!r}; "
+                f"expected {expected_record_id!r}"
+            )
+        expected_url = urls[rep % len(urls)]
+        if record.get("url") != expected_url:
+            raise Refusal(
+                f"{label} URL {record.get('url')!r} does not match corpus schedule "
+                f"{expected_url!r}"
+            )
+        if record.get("ok") is not True:
+            raise Refusal(f"{label} is not a successful VM rep")
+        if is_warmup:
+            continue
+
+        if arm in ("cdp", "noop"):
+            validate_vm_metric(record, "blocking_ms", label)
+            validate_vm_metric(record, "wall_ms", label)
+        if arm == "cdp":
+            render = record.get("render")
+            if not isinstance(render, dict):
+                raise Refusal(f"{label} has no render object")
+            if render.get("ok") is not True:
+                raise Refusal(f"{label} render success is not true")
+            if render.get("url") != expected_url:
+                raise Refusal(f"{label} render URL does not match its VM record")
+            stages = render.get("stages")
+            nav = render.get("nav")
+            if not isinstance(stages, dict):
+                raise Refusal(f"{label} render has no stages object")
+            if not isinstance(nav, dict):
+                raise Refusal(f"{label} render has no nav object")
+            validate_vm_metric(stages, "total_ms", f"{label} render stages")
+            validate_vm_metric(nav, "load_ms", f"{label} render nav")
+        measured.append(record)
+    return meta, measured, artifact_identity(artifact)
 
 
 def driver_total(rec):
@@ -439,6 +708,66 @@ def validate_host_compatibility(label, meta, host_rows, counts, vm_meta, vm_rows
             f"VM image_id {vm_meta.get('image_id')!r}"
         )
 
+    compatibility = (
+        ("host_boot_id", "host_boot_id"),
+        ("host_machine", "host_machine"),
+        ("host_kernel", "host_kernel_release"),
+        ("source_revision", "source_revision"),
+        ("harness_sha256", "harness_sha256"),
+        ("runtime_bundle_sha256", "runtime_bundle_sha256"),
+    )
+    for host_key, vm_key in compatibility:
+        host_value = required_string(meta, host_key, f"host {label} run.json")
+        vm_value = required_string(vm_meta, vm_key, "VM reqbench metadata")
+        if host_key in ("harness_sha256", "runtime_bundle_sha256"):
+            sha256_field(meta, host_key, f"host {label} run.json")
+            sha256_field(vm_meta, vm_key, "VM reqbench metadata")
+        if host_value != vm_value:
+            raise Refusal(
+                f"host {label} {host_key}={host_value!r} does not match "
+                f"VM {vm_key}={vm_value!r}"
+            )
+
+    sha256_field(meta, "hostcdp_sha256", f"host {label} run.json")
+    if meta.get("driver") != "cdpdrive.py":
+        raise Refusal(
+            f"host {label} driver={meta.get('driver')!r}; expected 'cdpdrive.py'"
+        )
+    if meta.get("network") != "host (no VM, no DNAT)":
+        raise Refusal(
+            f"host {label} network={meta.get('network')!r}; expected "
+            "'host (no VM, no DNAT)'"
+        )
+    if meta.get("comparison_label") != label:
+        raise Refusal(
+            f"host {label} label does not match run.json comparison_label="
+            f"{meta.get('comparison_label')!r}"
+        )
+    budget = meta.get("cpu_budget")
+    cpus = meta.get("cpus")
+    if budget == "unlimited":
+        if cpus is not None:
+            raise Refusal(
+                f"host {label} cpu_budget='unlimited' requires cpus=null, got {cpus!r}"
+            )
+    elif budget == "vm-matched":
+        if not finite_positive(cpus):
+            raise Refusal(
+                f"host {label} cpu_budget='vm-matched' has invalid cpus={cpus!r}"
+            )
+        vm_cpus = vm_meta.get("cpu")
+        if not finite_positive(vm_cpus):
+            raise Refusal(f"VM reqbench metadata has invalid cpu={vm_cpus!r}")
+        if cpus != vm_cpus:
+            raise Refusal(
+                f"host {label} cpus={cpus!r} does not match VM cpu={vm_cpus!r}"
+            )
+    else:
+        raise Refusal(
+            f"host {label} has invalid cpu_budget={budget!r}; expected "
+            "'unlimited' or 'vm-matched'"
+        )
+
     if any(url_needs_resolver(url) for url in vm_urls):
         vm_address = vm_resolver(vm_meta)
         if vm_address is None:
@@ -473,6 +802,143 @@ def per_url(rows, key):
     return {u: {"n": len(v), "p50": round(pct(v, 50), 1)} for u, v in out.items()}
 
 
+def comparison_input_paths(args):
+    inputs = [
+        ("VM analysis.json", os.path.join(args.vm_run, "analysis.json")),
+        ("VM reqbench.jsonl", os.path.join(args.vm_run, "reqbench.jsonl")),
+        ("running comparator source", __file__),
+    ]
+    for ordinal, spec in enumerate(args.host, 1):
+        _label, separator, directory = spec.partition("=")
+        if separator and directory:
+            inputs.extend((
+                (f"host {ordinal} run.json", os.path.join(directory, "run.json")),
+                (f"host {ordinal} hostcdp.jsonl",
+                 os.path.join(directory, "hostcdp.jsonl")),
+            ))
+    return inputs
+
+
+def path_stat(path, label, fail_on_error, directory_fd=None):
+    try:
+        return os.stat(path, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        if fail_on_error:
+            raise Refusal(f"cannot inspect {label} {path}: {error}") from error
+        return None
+
+
+def reject_output_alias(output, inputs, target=None):
+    output_absolute = target["absolute"] if target else os.path.abspath(output)
+    output_realpath = os.path.realpath(output_absolute)
+    if target:
+        output_stat = path_stat(
+            target["name"], "output", True, target["directory_fd"]
+        )
+    else:
+        output_stat = path_stat(output_absolute, "output", True)
+    protected_inputs = []
+    for label, path in inputs:
+        input_absolute = os.path.abspath(path)
+        input_realpath = os.path.realpath(input_absolute)
+        input_stat = path_stat(input_absolute, label, False)
+        protected_inputs.append({
+            "label": label,
+            "path": path,
+            "absolute": input_absolute,
+            "realpath": input_realpath,
+            "stat": input_stat,
+        })
+        same_inode = (
+            output_stat is not None
+            and input_stat is not None
+            and os.path.samestat(output_stat, input_stat)
+        )
+        if (
+            output_absolute == input_absolute
+            or output_realpath == input_realpath
+            or same_inode
+        ):
+            raise Refusal(f"--out {output!r} aliases {label} {path!r}")
+    return {"output_stat": output_stat, "protected_inputs": protected_inputs}
+
+
+def quarantined_alias(quarantined_stat, protected_inputs):
+    for protected in protected_inputs:
+        current_stat = path_stat(
+            protected["absolute"], protected["label"], False
+        )
+        for input_stat in (protected["stat"], current_stat):
+            if input_stat is not None and os.path.samestat(
+                    quarantined_stat, input_stat):
+                return protected
+    return None
+
+
+def restore_quarantined_output(target, quarantine):
+    try:
+        rename_noreplace(target["directory_fd"], quarantine, target["name"])
+    except OSError as error:
+        preserved = os.path.join(target["directory"], quarantine)
+        raise Refusal(
+            f"cannot restore raced output {target['path']}; its bytes remain at "
+            f"{preserved}: {error}"
+        ) from error
+
+
+def clear_stale_output(target, preflight):
+    while True:
+        quarantine = f".compare-stale-{os.getpid()}-{secrets.token_hex(8)}"
+        try:
+            rename_noreplace(
+                target["directory_fd"], target["name"], quarantine
+            )
+            break
+        except FileNotFoundError:
+            return
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise Refusal(
+                f"cannot quarantine stale output {target['path']}: {error}"
+            ) from error
+
+    try:
+        quarantined_stat = os.stat(
+            quarantine, dir_fd=target["directory_fd"]
+        )
+    except OSError as error:
+        restore_quarantined_output(target, quarantine)
+        raise Refusal(
+            f"cannot inspect quarantined output {target['path']}: {error}"
+        ) from error
+    expected_stat = preflight["output_stat"]
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if expected_stat is None or any(
+            getattr(expected_stat, field) != getattr(quarantined_stat, field)
+            for field in stable_fields):
+        restore_quarantined_output(target, quarantine)
+        raise Refusal(
+            f"output {target['path']} changed after preflight; refusing to remove it"
+        )
+    protected = quarantined_alias(
+        quarantined_stat, preflight["protected_inputs"]
+    )
+    if protected is not None:
+        restore_quarantined_output(target, quarantine)
+        raise Refusal(
+            f"--out {target['path']!r} changed after preflight and aliases "
+            f"{protected['label']} {protected['path']!r}"
+        )
+    try:
+        os.unlink(quarantine, dir_fd=target["directory_fd"])
+    except OSError as error:
+        restore_quarantined_output(target, quarantine)
+        raise Refusal(f"cannot clear stale output {target['path']}: {error}") from error
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vm-run", required=True)
@@ -482,23 +948,43 @@ def main():
 
     # The lock file is permanent. Unlinking a flock inode while another caller
     # waits on it creates two lock domains and admits concurrent writers.
+    target = open_output_target(a.out)
     lock_path = f"{a.out}.lock"
     try:
-        output_lock = open(lock_path, "a+")
-    except OSError as error:
-        raise Refusal(f"cannot open output lock {lock_path}: {error}") from error
-    with output_lock:
         try:
-            fcntl.flock(output_lock.fileno(), fcntl.LOCK_EX)
-            os.unlink(a.out)
-        except FileNotFoundError:
-            pass
+            ensure_output_directory(target)
+            lock_fd = os.open(
+                f"{target['name']}.lock",
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                0o666,
+                dir_fd=target["directory_fd"],
+            )
+            try:
+                output_lock = os.fdopen(lock_fd, "r+")
+            except BaseException:
+                os.close(lock_fd)
+                raise
         except OSError as error:
-            raise Refusal(f"cannot clear stale output {a.out}: {error}") from error
-        run_comparison(a)
+            raise Refusal(f"cannot open output lock {lock_path}: {error}") from error
+        with output_lock:
+            try:
+                fcntl.flock(output_lock.fileno(), fcntl.LOCK_EX)
+                ensure_output_directory(target)
+                preflight = reject_output_alias(
+                    a.out, comparison_input_paths(a), target
+                )
+                ensure_output_directory(target)
+                clear_stale_output(target, preflight)
+            except OSError as error:
+                raise Refusal(
+                    f"cannot clear stale output {a.out}: {error}"
+                ) from error
+            run_comparison(a, target)
+    finally:
+        os.close(target["directory_fd"])
 
 
-def run_comparison(a):
+def run_comparison(a, output_target=None):
     analysis_artifact = read_artifact(os.path.join(a.vm_run, "analysis.json"))
     analysis = parse_json(analysis_artifact["text"], analysis_artifact["path"])
     if not analysis.get("publishable") or not analysis.get("gate", {}).get("passed"):
@@ -532,6 +1018,9 @@ def run_comparison(a):
                        "wall_ms": summarize(noop, "wall_ms")},
            "hosts": {}, "ratios": {}}
 
+    seen_host_datasets = {}
+    seen_host_run_ids = {}
+    hostcdp_sha256 = None
     for spec in a.host:
         label, _, d = spec.partition("=")
         if not label or not d:
@@ -541,11 +1030,48 @@ def run_comparison(a):
         meta, _records, rows, counts, identities = load_host_dataset(
             d, require_driver=True
         )
+        dataset_identity = (
+            identities["run_json"]["size"],
+            identities["run_json"]["sha256"],
+            identities["hostcdp_jsonl"]["size"],
+            identities["hostcdp_jsonl"]["sha256"],
+        )
+        previous = seen_host_datasets.get(dataset_identity)
+        if previous is not None:
+            raise Refusal(
+                f"the same host dataset was supplied as labels {previous!r} "
+                f"and {label!r}"
+            )
+        previous = seen_host_run_ids.get(meta["run_id"])
+        if previous is not None:
+            raise Refusal(
+                f"the same host dataset run_id={meta['run_id']!r} was supplied "
+                f"as labels {previous!r} and {label!r}"
+            )
+        seen_host_datasets[dataset_identity] = label
+        seen_host_run_ids[meta["run_id"]] = label
         validate_host_compatibility(label, meta, rows, counts, vm_meta, vm)
+        current_hostcdp_sha256 = meta["hostcdp_sha256"]
+        if hostcdp_sha256 is None:
+            hostcdp_sha256 = current_hostcdp_sha256
+        elif current_hostcdp_sha256 != hostcdp_sha256:
+            raise Refusal(
+                f"host {label} hostcdp_sha256={current_hostcdp_sha256!r} does "
+                f"not match the comparison producer {hostcdp_sha256!r}"
+            )
         out["input_identity"]["hosts"][label] = identities
         out["hosts"][label] = {
             "dir": os.path.abspath(d), "run_id": meta["run_id"],
-            "cpus": meta.get("cpus"),
+            "comparison_label": meta["comparison_label"],
+            "cpu_budget": meta["cpu_budget"], "cpus": meta.get("cpus"),
+            "host_boot_id": meta["host_boot_id"],
+            "host_machine": meta["host_machine"],
+            "host_kernel": meta["host_kernel"],
+            "source_revision": meta["source_revision"],
+            "harness_sha256": meta["harness_sha256"],
+            "runtime_bundle_sha256": meta["runtime_bundle_sha256"],
+            "hostcdp_sha256": meta["hostcdp_sha256"],
+            "driver": meta["driver"], "network": meta["network"],
             "image_id": meta.get("image_id"), "resolve_all_to": meta.get("resolve_all_to"),
             "reps": counts["measured"], "warmup": counts["warmup"],
             "total_reps": counts["total"], "count_convention": counts["convention"],
@@ -566,7 +1092,7 @@ def run_comparison(a):
             if h["load_event_ms"]["p50"] else None,
         }
 
-    write_json_atomic(a.out, out)
+    write_json_atomic(a.out, out, output_target)
     print(json.dumps({k: out[k] for k in ("cell", "vm", "vm_noop", "ratios")}, indent=1)[:6000])
     print("\nper-URL wall/blocking p50 (ms)")
     urls = list(out["vm"]["per_url_blocking_p50"])

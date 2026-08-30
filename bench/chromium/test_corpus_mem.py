@@ -16,6 +16,7 @@ Run: python3 -m unittest test_corpus_mem -v
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -31,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import corpus_mem  # noqa: E402
+import compare as bench_compare  # noqa: E402
 import report as bench_report  # noqa: E402
 
 EXTRA = os.path.join(HERE, "corpus_extra.sh")
@@ -1596,18 +1598,20 @@ class ComparePublicationGate(unittest.TestCase):
     """compare.py divides a VM p50 by a host p50 and writes comparison.json.
 
     The comparison must bind the raw VM bytes to the analysis that passed its
-    publication gate, and must prove that each host input is complete and
-    compatible before it computes a ratio. A rep that does not explicitly say
-    it succeeded reaches neither side's medians.
+    publication gate, and must prove that every scheduled VM and host input is
+    complete and compatible before it computes a ratio.
     """
 
     URL = "https://example.com/"
     IMAGE_ID = "sha256:" + "a" * 64
     CELL = {"cpu": 2, "memory_mib": 1024, "backend": "uffd", "uffd_mode": "minor",
             "snapshot": "cb-req-corpus", "image": "localhost/chromium-bench-req",
-            "image_id": IMAGE_ID, "url": URL, "guest_dns": "10.0.2.2",
+            "image_id": IMAGE_ID, "url": URL, "urls": [URL],
+            "guest_dns": "10.0.2.2",
             "guest_env": [], "engine": "chromium", "cdp_port": 9222,
-            "source_revision": "abc123", "fcvm_sha256": "d", "runtime_bundle_sha256": "e",
+            "source_revision": "b" * 40, "harness_sha256": "c" * 64,
+            "fcvm_sha256": "d", "runtime_bundle_sha256": "e" * 64,
+            "host_boot_id": "00000000-0000-4000-8000-000000000001",
             "host_kernel_release": "k", "host_machine": "aarch64"}
 
     @staticmethod
@@ -1618,19 +1622,49 @@ class ComparePublicationGate(unittest.TestCase):
                 "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
     def make_run(self, publishable=True, passed=True, vm_rows=(), cell=None,
-                 include_identity=True, warmup=0):
+                 include_identity=True, warmup=0, meta_overrides=None):
         tmp = tempfile.mkdtemp()
         cell = dict(cell or self.CELL)
+        measured = [dict(row) for row in vm_rows]
+        template = dict(measured[0]) if measured else self.vm_rep(1.0)
+        run_id = "r1"
+        urls = list(cell.get("urls") or [cell["url"]])
+
+        scheduled = []
+        for rep in range(warmup):
+            row = dict(template)
+            row.update(rep=rep, warmup=True, url=urls[rep % len(urls)],
+                       run_id=run_id,
+                       record_id=f"{run_id}:cdp:{rep}:1")
+            scheduled.append(row)
+        for offset, original in enumerate(measured):
+            rep = warmup + offset
+            row = dict(original)
+            row.update(rep=rep, warmup=False, url=urls[rep % len(urls)],
+                       run_id=run_id,
+                       record_id=f"{run_id}:cdp:{rep}:0")
+            scheduled.append(row)
+
         records = os.path.join(tmp, "reqbench.jsonl")
+        meta = {
+            "kind": "meta", "run_id": run_id, "seed": 1,
+            "arms": ["cdp"], "reps": len(measured), "warmup": warmup,
+            "url": ",".join(urls), "urls": urls,
+            "image": cell["image"], "image_id": cell["image_id"],
+            "guest_dns": cell["guest_dns"], "guest_env": cell["guest_env"],
+            "source_revision": cell["source_revision"],
+            "harness_sha256": cell["harness_sha256"],
+            "runtime_bundle_sha256": cell["runtime_bundle_sha256"],
+            "host_boot_id": cell["host_boot_id"],
+            "host_kernel_release": cell["host_kernel_release"],
+            "host_machine": cell["host_machine"],
+            "cpu": cell["cpu"],
+        }
+        if meta_overrides:
+            meta.update(meta_overrides)
         with open(records, "w") as handle:
-            handle.write(json.dumps({
-                "kind": "meta", "run_id": "r1", "arms": ["cdp"],
-                "reps": len(vm_rows), "warmup": warmup, "url": cell["url"],
-                "image": cell["image"], "image_id": cell["image_id"],
-                "guest_dns": cell["guest_dns"], "guest_env": cell["guest_env"],
-                "host_kernel_release": cell["host_kernel_release"],
-            }) + "\n")
-            for row in vm_rows:
+            handle.write(json.dumps(meta) + "\n")
+            for row in scheduled:
                 handle.write(json.dumps(row) + "\n")
         analysis = {"publishable": publishable, "gate": {"passed": passed},
                     "run_id": "r1", "cell": cell}
@@ -1643,11 +1677,55 @@ class ComparePublicationGate(unittest.TestCase):
             json.dump(analysis, handle)
         return tmp
 
+    def rewrite_vm_records(self, run, mutate):
+        records = os.path.join(run, "reqbench.jsonl")
+        with open(records) as handle:
+            rows = [json.loads(line) for line in handle]
+        mutate(rows)
+        with open(records, "w") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        analysis_path = os.path.join(run, "analysis.json")
+        with open(analysis_path) as handle:
+            analysis = json.load(handle)
+        analysis["analysis_identity"]["inputs"] = [self.artifact_identity(records)]
+        with open(analysis_path, "w") as handle:
+            json.dump(analysis, handle)
+
+    def make_two_arm_run(self):
+        run = self.make_run(vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)])
+
+        def add_noop(rows):
+            meta, cdp_rows = rows[0], rows[1:]
+            meta["arms"] = ["cdp", "noop"]
+            schedule = []
+            rng = random.Random(meta["seed"])
+            for rep, cdp in enumerate(cdp_rows):
+                order = list(meta["arms"])
+                rng.shuffle(order)
+                for arm in order:
+                    if arm == "cdp":
+                        schedule.append(cdp)
+                    else:
+                        schedule.append({
+                            "arm": "noop", "rep": rep, "warmup": False,
+                            "run_id": meta["run_id"],
+                            "record_id": f"{meta['run_id']}:noop:{rep}:0",
+                            "url": meta["urls"][rep % len(meta["urls"])],
+                            "ok": True, "blocking_ms": 40.0,
+                            "wall_ms": 200.0,
+                        })
+            rows[:] = [meta, *schedule]
+
+        self.rewrite_vm_records(run, add_noop)
+        return run
+
     @staticmethod
     def vm_rep(blocking_ms, ok=True, include_ok=True):
         rec = {"arm": "cdp", "warmup": False, "blocking_ms": blocking_ms,
                "wall_ms": blocking_ms, "url": ComparePublicationGate.URL,
-               "render": {"stages": {"total_ms": blocking_ms},
+               "render": {"ok": True, "url": ComparePublicationGate.URL,
+                          "stages": {"total_ms": blocking_ms},
                           "nav": {"load_ms": blocking_ms}}}
         if include_ok:
             rec["ok"] = ok
@@ -1676,9 +1754,16 @@ class ComparePublicationGate(unittest.TestCase):
             "reps": len(rows) - warmup, "warmup": warmup,
             "total_reps": len(rows), "url": ",".join(urls),
             "urls": urls, "url_count": len(urls), "cdp_port": 9222,
-            "cpus": "2", "driver": "cdpdrive.py",
+            "comparison_label": "host", "cpu_budget": "vm-matched",
+            "cpus": 2, "driver": "cdpdrive.py",
             "network": "host (no VM, no DNAT)",
             "resolve_all_to": "127.0.0.1", "host_kernel": "k",
+            "host_boot_id": self.CELL["host_boot_id"],
+            "host_machine": self.CELL["host_machine"],
+            "source_revision": self.CELL["source_revision"],
+            "harness_sha256": self.CELL["harness_sha256"],
+            "runtime_bundle_sha256": self.CELL["runtime_bundle_sha256"],
+            "hostcdp_sha256": "f" * 64,
         }
         if meta_overrides:
             meta.update(meta_overrides)
@@ -1712,56 +1797,231 @@ class ComparePublicationGate(unittest.TestCase):
             capture_output=True, text=True, timeout=60), out
 
     def test_output_cannot_name_or_alias_any_input(self):
-        cases = ("analysis", "reqbench", "host-run", "host-rows",
-                 "analysis-symlink", "analysis-hardlink")
-        for case in cases:
-            with self.subTest(case=case):
-                run, host = self.valid_comparison()
-                inputs = {
-                    "analysis": os.path.join(run, "analysis.json"),
-                    "reqbench": os.path.join(run, "reqbench.jsonl"),
-                    "host-run": os.path.join(host, "run.json"),
-                    "host-rows": os.path.join(host, "hostcdp.jsonl"),
-                }
-                if case == "analysis-symlink":
-                    out = os.path.join(run, "output-link.json")
-                    os.symlink(inputs["analysis"], out)
-                    protected = inputs["analysis"]
-                elif case == "analysis-hardlink":
-                    out = os.path.join(run, "output-hardlink.json")
-                    os.link(inputs["analysis"], out)
-                    protected = inputs["analysis"]
-                else:
-                    out = inputs[case]
-                    protected = out
-                with open(protected, "rb") as handle:
-                    before = handle.read()
-                proc, _ = self.run_compare(run, [("host", host)], out=out)
-                self.assertNotEqual(
-                    proc.returncode, 0,
-                    f"--out accepted an alias of {case}",
-                )
-                self.assertIn("alias", proc.stderr.lower(), proc.stderr)
-                with open(protected, "rb") as handle:
-                    self.assertEqual(handle.read(), before,
-                                     f"--out destroyed or rewrote {case}")
-                if case.endswith(("symlink", "hardlink")):
-                    self.assertTrue(os.path.lexists(out),
-                                    "the refused alias itself was unlinked")
+        for input_name in ("analysis", "reqbench", "host-run", "host-rows"):
+            for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
+                with self.subTest(input=input_name, alias=alias_kind):
+                    run, host = self.valid_comparison()
+                    inputs = {
+                        "analysis": os.path.join(run, "analysis.json"),
+                        "reqbench": os.path.join(run, "reqbench.jsonl"),
+                        "host-run": os.path.join(host, "run.json"),
+                        "host-rows": os.path.join(host, "hostcdp.jsonl"),
+                    }
+                    protected = inputs[input_name]
+                    if alias_kind == "direct":
+                        out = protected
+                    elif alias_kind == "realpath":
+                        alias_root = tempfile.mkdtemp()
+                        os.symlink(os.path.dirname(protected),
+                                   os.path.join(alias_root, "through-directory"))
+                        out = os.path.join(alias_root, "through-directory",
+                                           os.path.basename(protected))
+                    else:
+                        out = os.path.join(run, f"output-{input_name}-{alias_kind}")
+                        if alias_kind == "symlink":
+                            os.symlink(protected, out)
+                        else:
+                            os.link(protected, out)
+                    with open(protected, "rb") as handle:
+                        before = handle.read()
+                    proc, _ = self.run_compare(run, [("host", host)], out=out)
+                    self.assertNotEqual(
+                        proc.returncode, 0,
+                        f"--out accepted a {alias_kind} alias of {input_name}",
+                    )
+                    self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+                    with open(protected, "rb") as handle:
+                        self.assertEqual(
+                            handle.read(), before,
+                            f"--out destroyed or rewrote {input_name}",
+                        )
+                    if alias_kind in ("symlink", "hardlink"):
+                        self.assertTrue(
+                            os.path.lexists(out),
+                            "the refused alias itself was unlinked",
+                        )
 
     def test_output_cannot_alias_the_running_comparator(self):
+        for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
+            with self.subTest(alias=alias_kind):
+                run, host = self.valid_comparison()
+                with tempfile.TemporaryDirectory() as tmp:
+                    copied = os.path.join(tmp, "compare.py")
+                    shutil.copyfile(os.path.join(HERE, "compare.py"), copied)
+                    if alias_kind == "direct":
+                        out = copied
+                    elif alias_kind == "realpath":
+                        os.mkdir(os.path.join(tmp, "unused"))
+                        out = os.path.join(tmp, "unused", "..", "compare.py")
+                    else:
+                        out = os.path.join(tmp, f"output-{alias_kind}")
+                        if alias_kind == "symlink":
+                            os.symlink(copied, out)
+                        else:
+                            os.link(copied, out)
+                    with open(copied, "rb") as handle:
+                        before = handle.read()
+                    proc, _ = self.run_compare(run, [("host", host)],
+                                               out=out, script=copied)
+                    self.assertNotEqual(
+                        proc.returncode, 0,
+                        f"the comparator accepted its {alias_kind} source alias",
+                    )
+                    self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+                    with open(copied, "rb") as handle:
+                        self.assertEqual(handle.read(), before)
+                    if alias_kind in ("symlink", "hardlink"):
+                        self.assertTrue(os.path.lexists(out))
+
+    def test_output_parent_cannot_be_swapped_onto_an_input_after_preflight(self):
         run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        protected = os.path.join(run, "analysis.json")
+        with open(protected, "rb") as handle:
+            before = handle.read()
         with tempfile.TemporaryDirectory() as tmp:
-            copied = os.path.join(tmp, "compare.py")
-            shutil.copyfile(os.path.join(HERE, "compare.py"), copied)
-            with open(copied, "rb") as handle:
-                before = handle.read()
-            proc, _ = self.run_compare(run, out=copied, script=copied)
-            self.assertNotEqual(proc.returncode, 0,
-                                "the comparator overwrote its own source")
-            self.assertIn("alias", proc.stderr.lower(), proc.stderr)
-            with open(copied, "rb") as handle:
+            output_parent = os.path.join(tmp, "output")
+            moved_parent = os.path.join(tmp, "moved-output")
+            os.mkdir(output_parent)
+            out = os.path.join(output_parent, "analysis.json")
+            with open(out, "w") as handle:
+                json.dump({"publishable": True, "stale": True}, handle)
+
+            original = bench_compare.reject_output_alias
+
+            def swap_parent_after_preflight(*args, **kwargs):
+                protected_inputs = original(*args, **kwargs)
+                os.rename(output_parent, moved_parent)
+                os.symlink(run, output_parent)
+                return protected_inputs
+
+            argv = ["compare.py", "--vm-run", run, "--out", out]
+            with mock.patch.object(
+                    bench_compare, "reject_output_alias",
+                    side_effect=swap_parent_after_preflight), \
+                    mock.patch.object(sys, "argv", argv):
+                with self.assertRaises(bench_compare.Refusal):
+                    bench_compare.main()
+
+            self.assertTrue(os.path.exists(protected),
+                            "a parent swap let stale-output removal delete an input")
+            with open(protected, "rb") as handle:
                 self.assertEqual(handle.read(), before)
+
+    def test_input_moved_onto_output_after_preflight_is_not_unlinked(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        protected = os.path.join(run, "analysis.json")
+        with open(protected, "rb") as handle:
+            before = handle.read()
+        with tempfile.TemporaryDirectory() as output_parent:
+            out = os.path.join(output_parent, "comparison.json")
+            original = bench_compare.reject_output_alias
+
+            def move_input_after_preflight(*args, **kwargs):
+                protected_inputs = original(*args, **kwargs)
+                os.rename(protected, out)
+                return protected_inputs
+
+            argv = ["compare.py", "--vm-run", run, "--out", out]
+            with mock.patch.object(
+                    bench_compare, "reject_output_alias",
+                    side_effect=move_input_after_preflight), \
+                    mock.patch.object(sys, "argv", argv):
+                with self.assertRaises(bench_compare.Refusal):
+                    bench_compare.main()
+
+            self.assertTrue(os.path.exists(out),
+                            "stale-output removal unlinked the raced input")
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), before)
+
+    def test_output_replaced_after_preflight_is_not_deleted(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        with tempfile.TemporaryDirectory() as output_parent:
+            out = os.path.join(output_parent, "comparison.json")
+            concurrent = os.path.join(output_parent, "concurrent.json")
+            with open(out, "wb") as handle:
+                handle.write(b"stale comparison\n")
+            replacement = b"concurrent writer result\n"
+            with open(concurrent, "wb") as handle:
+                handle.write(replacement)
+            original = bench_compare.reject_output_alias
+
+            def replace_output_after_preflight(*args, **kwargs):
+                preflight = original(*args, **kwargs)
+                os.replace(concurrent, out)
+                return preflight
+
+            argv = ["compare.py", "--vm-run", run, "--out", out]
+            with mock.patch.object(
+                    bench_compare, "reject_output_alias",
+                    side_effect=replace_output_after_preflight), \
+                    mock.patch.object(sys, "argv", argv):
+                with self.assertRaises(bench_compare.Refusal):
+                    bench_compare.main()
+
+            with open(out, "rb") as handle:
+                self.assertEqual(
+                    handle.read(), replacement,
+                    "stale-output removal deleted a concurrent writer's inode",
+                )
+
+    def test_output_parent_cannot_be_swapped_onto_an_input_before_publish(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        protected = os.path.join(run, "analysis.json")
+        with open(protected, "rb") as handle:
+            before = handle.read()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_parent = os.path.join(tmp, "output")
+            moved_parent = os.path.join(tmp, "moved-output")
+            os.mkdir(output_parent)
+            out = os.path.join(output_parent, "analysis.json")
+            original = bench_compare.write_json_atomic
+
+            def swap_parent_before_publish(*args, **kwargs):
+                os.rename(output_parent, moved_parent)
+                os.symlink(run, output_parent)
+                return original(*args, **kwargs)
+
+            argv = ["compare.py", "--vm-run", run, "--out", out]
+            with mock.patch.object(
+                    bench_compare, "write_json_atomic",
+                    side_effect=swap_parent_before_publish), \
+                    mock.patch.object(sys, "argv", argv):
+                with self.assertRaises(bench_compare.Refusal):
+                    bench_compare.main()
+
+            with open(protected, "rb") as handle:
+                self.assertEqual(
+                    handle.read(), before,
+                    "a parent swap let atomic publication replace an input",
+                )
+
+    def test_input_moved_onto_output_before_publish_is_not_replaced(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        protected = os.path.join(run, "analysis.json")
+        with open(protected, "rb") as handle:
+            before = handle.read()
+        with tempfile.TemporaryDirectory() as output_parent:
+            out = os.path.join(output_parent, "comparison.json")
+            original = bench_compare.write_json_atomic
+
+            def move_input_before_publish(*args, **kwargs):
+                os.rename(protected, out)
+                return original(*args, **kwargs)
+
+            argv = ["compare.py", "--vm-run", run, "--out", out]
+            with mock.patch.object(
+                    bench_compare, "write_json_atomic",
+                    side_effect=move_input_before_publish), \
+                    mock.patch.object(sys, "argv", argv):
+                with self.assertRaises(bench_compare.Refusal):
+                    bench_compare.main()
+
+            with open(out, "rb") as handle:
+                self.assertEqual(
+                    handle.read(), before,
+                    "atomic publication replaced the raced input",
+                )
 
     def test_a_run_that_failed_its_gate_is_refused(self):
         run = self.make_run(passed=False, vm_rows=[self.vm_rep(700.0)])
@@ -1782,6 +2042,21 @@ class ComparePublicationGate(unittest.TestCase):
         self.assertFalse(os.path.exists(out),
                          "the refused rerun left an earlier comparison quotable")
 
+    def test_an_unreadable_nonalias_input_still_removes_an_earlier_comparison(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        out = os.path.join(run, "comparison.json")
+        with open(out, "w") as handle:
+            json.dump({"publishable": True, "stale": True}, handle)
+        records = os.path.join(run, "reqbench.jsonl")
+        os.unlink(records)
+        os.symlink("reqbench.jsonl", records)
+        proc, _ = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(
+            os.path.exists(out),
+            "alias preflight left an earlier comparison quotable when stat failed",
+        )
+
     def test_an_unpublishable_run_is_refused(self):
         run = self.make_run(publishable=False, vm_rows=[self.vm_rep(700.0)])
         proc, out = self.run_compare(run)
@@ -1799,22 +2074,177 @@ class ComparePublicationGate(unittest.TestCase):
         self.assertEqual(rec["vm"]["blocking_ms"]["p50"], 700.0)
         self.assertEqual(rec["vm"]["blocking_ms"]["n"], 3)
 
-    def test_a_record_that_does_not_say_it_succeeded_is_not_counted(self):
-        """A rep with no `ok` is not a rep known to have worked.
-
-        The host loader already dropped it. The VM loader kept it, so the same
-        record was measured or discarded depending on which side produced it.
-        """
+    def test_a_vm_record_that_does_not_say_it_succeeded_is_refused(self):
         rows = [self.vm_rep(v) for v in (600.0, 700.0, 800.0)]
         rows.append(self.vm_rep(30000.0, include_ok=False))
         run = self.make_run(vm_rows=rows)
         proc, out = self.run_compare(run)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        with open(out) as handle:
-            rec = json.load(handle)
-        self.assertEqual(rec["vm"]["blocking_ms"]["n"], 3,
-                         "a rep that never said it succeeded reached the medians")
-        self.assertEqual(rec["vm"]["blocking_ms"]["p50"], 700.0)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a missing VM success silently reduced n")
+        self.assertIn("successful", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_failed_vm_record_is_refused(self):
+        rows = [self.vm_rep(600.0), self.vm_rep(700.0, ok=False),
+                self.vm_rep(800.0)]
+        run = self.make_run(vm_rows=rows)
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a failed VM rep silently reduced n")
+        self.assertIn("successful", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_meta_run_id_must_match_the_gated_analysis(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        analysis_path = os.path.join(run, "analysis.json")
+        with open(analysis_path) as handle:
+            analysis = json.load(handle)
+        analysis["run_id"] = "different-run"
+        with open(analysis_path, "w") as handle:
+            json.dump(analysis, handle)
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "analysis and raw records named different VM runs")
+        self.assertIn("run_id", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_meta_must_be_the_first_record(self):
+        run = self.make_run(vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)])
+        self.rewrite_vm_records(
+            run, lambda rows: rows.append(rows.pop(0)))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "records before VM metadata were accepted")
+        self.assertIn("first", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_every_vm_row_must_name_the_meta_run_id(self):
+        run = self.make_run(vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)])
+        self.rewrite_vm_records(
+            run, lambda rows: rows[2].update(run_id="different-run"))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a row from another VM run entered the medians")
+        self.assertIn("run_id", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_declared_arm_schedule_must_be_complete(self):
+        run = self.make_run(
+            vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)],
+            meta_overrides={"arms": ["cdp", "noop"]},
+        )
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a wholly missing declared VM arm was ignored")
+        self.assertIn("schedule", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_schedule_cannot_have_a_missing_rep(self):
+        run = self.make_run(vm_rows=[self.vm_rep(v) for v in (600.0, 700.0, 800.0)])
+        self.rewrite_vm_records(run, lambda rows: rows.pop(2))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a gap in the VM schedule silently reduced n")
+        self.assertIn("schedule", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_schedule_cannot_duplicate_a_rep(self):
+        run = self.make_run(vm_rows=[self.vm_rep(v) for v in (600.0, 700.0, 800.0)])
+        self.rewrite_vm_records(run, lambda rows: rows[2].update(rep=0))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a duplicated VM rep silently replaced a scheduled rep")
+        self.assertIn("schedule", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_rep_must_be_an_integer_not_a_boolean(self):
+        run = self.make_run(vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)])
+        self.rewrite_vm_records(run, lambda rows: rows[1].update(rep=False))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "boolean False was accepted as VM rep zero")
+        self.assertIn("invalid rep", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_warmup_flag_must_match_its_rep(self):
+        run = self.make_run(
+            vm_rows=[self.vm_rep(v) for v in (600.0, 700.0, 800.0)],
+            warmup=1,
+        )
+        self.rewrite_vm_records(run, lambda rows: rows[-1].update(warmup=True))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a measured VM rep relabelled as warmup silently reduced n")
+        self.assertIn("warmup", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_record_id_must_name_its_exact_schedule_cell(self):
+        run = self.make_run(vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)])
+        self.rewrite_vm_records(
+            run, lambda rows: rows[2].update(record_id="r1:cdp:0:0"))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a VM row carried another schedule cell's identity")
+        self.assertIn("record_id", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_url_must_match_the_declared_corpus_schedule(self):
+        run = self.make_run(vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)])
+        self.rewrite_vm_records(
+            run, lambda rows: rows[2].update(url="https://different.example/"))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a different page entered the VM corpus medians")
+        self.assertIn("corpus schedule", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_url_and_urls_metadata_must_name_the_same_corpus(self):
+        run = self.make_run(vm_rows=[self.vm_rep(600.0), self.vm_rep(700.0)])
+        self.rewrite_vm_records(
+            run, lambda rows: rows[0].update(url="https://different.example/"))
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "contradictory VM corpus declarations were accepted")
+        self.assertIn("corpus", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_every_vm_cdp_success_has_every_compared_metric(self):
+        mutations = {
+            "blocking_ms": lambda row: row.pop("blocking_ms"),
+            "wall_ms": lambda row: row.pop("wall_ms"),
+            "total_ms": lambda row: row["render"]["stages"].pop("total_ms"),
+            "load_ms": lambda row: row["render"]["nav"].pop("load_ms"),
+            "render success": lambda row: row["render"].update(ok=False),
+        }
+        for metric, mutate in mutations.items():
+            with self.subTest(metric=metric):
+                run = self.make_run(
+                    vm_rows=[self.vm_rep(v) for v in (600.0, 700.0, 800.0)])
+                self.rewrite_vm_records(run, lambda rows: mutate(rows[2]))
+                proc, out = self.run_compare(run)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"a VM cdp row missing {metric} silently reduced its own n",
+                )
+                self.assertIn(metric.split()[0], proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_every_vm_noop_success_has_every_compared_metric(self):
+        for metric in ("blocking_ms", "wall_ms"):
+            with self.subTest(metric=metric):
+                run = self.make_two_arm_run()
+
+                def remove_metric(rows):
+                    next(row for row in rows if row.get("arm") == "noop").pop(metric)
+
+                self.rewrite_vm_records(run, remove_metric)
+                proc, out = self.run_compare(run)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"a VM noop row missing {metric} silently reduced its own n",
+                )
+                self.assertIn(metric, proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
 
     def test_analysis_must_name_the_current_reqbench_bytes(self):
         rows = [self.vm_rep(v) for v in (600.0, 700.0, 800.0)]
@@ -1891,6 +2321,81 @@ class ComparePublicationGate(unittest.TestCase):
             identities["hosts"]["host"]["hostcdp_jsonl"]["sha256"],
             self.artifact_identity(os.path.join(host, "hostcdp.jsonl"))["sha256"],
         )
+
+    def test_host_environment_and_producer_must_match_the_vm_arm(self):
+        mutations = {
+            "host_boot_id": ("00000000-0000-4000-8000-000000000099", "boot"),
+            "host_machine": ("x86_64", "machine"),
+            "host_kernel": ("totally-other-kernel", "kernel"),
+            "source_revision": ("9" * 40, "source_revision"),
+            "harness_sha256": ("9" * 64, "harness_sha256"),
+            "runtime_bundle_sha256": ("9" * 64, "runtime_bundle_sha256"),
+            "hostcdp_sha256": (None, "hostcdp_sha256"),
+            "driver": ("different-driver.py", "driver"),
+            "network": ("bridge", "network"),
+        }
+        for field, (value, message) in mutations.items():
+            with self.subTest(field=field):
+                run, host = self.valid_comparison(
+                    meta_overrides={field: value})
+                proc, out = self.run_compare(run, [("host", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"host {field} was not part of compatibility",
+                )
+                self.assertIn(message, proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_host_cpu_budget_and_output_label_are_explicit(self):
+        mutations = (
+            ({"comparison_label": "not-host"}, "label"),
+            ({"cpu_budget": "unlimited", "cpus": 2}, "cpu_budget"),
+            ({"cpu_budget": "vm-matched", "cpus": 3}, "cpus"),
+            ({"cpu_budget": "vm-matched", "cpus": "2"}, "cpus"),
+        )
+        for overrides, message in mutations:
+            with self.subTest(overrides=overrides):
+                run, host = self.valid_comparison(meta_overrides=overrides)
+                proc, out = self.run_compare(run, [("host", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    "an ambiguous host CPU arm was labelled and ratioed",
+                )
+                self.assertIn(message, proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_the_same_host_dataset_cannot_fill_two_comparison_arms(self):
+        run, host = self.valid_comparison()
+        proc, out = self.run_compare(
+            run, [("host", host), ("second-label", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "one host recording filled two ratio arms")
+        self.assertIn("same host dataset", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_arms_must_name_the_same_hostcdp_producer(self):
+        rows = [self.host_rep(0, True)] + [
+            self.host_rep(i, False, wall_ms=float(100 + i))
+            for i in range(1, 4)
+        ]
+        run = self.make_run(
+            vm_rows=[self.vm_rep(v) for v in (600.0, 700.0, 800.0)],
+            warmup=1,
+        )
+        free = self.make_host(rows, meta_overrides={
+            "comparison_label": "free", "cpu_budget": "unlimited",
+            "cpus": None, "hostcdp_sha256": "f" * 64,
+        })
+        cpu2 = self.make_host(rows, meta_overrides={
+            "comparison_label": "cpu2", "cpu_budget": "vm-matched",
+            "cpus": 2, "hostcdp_sha256": "e" * 64,
+        })
+        proc, out = self.run_compare(
+            run, [("free", free), ("cpu2", cpu2)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "two host producers were presented as one comparison")
+        self.assertIn("hostcdp_sha256", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
 
     def test_a_truncated_successful_host_prefix_is_refused(self):
         rows = [self.host_rep(0, True), self.host_rep(1, False),
