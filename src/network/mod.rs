@@ -315,19 +315,19 @@ pub const AWS_VPC_IPV6_RESOLVER: &str = "fd00:ec2::253";
 
 /// A search domain that is an AWS VPC internal zone.
 ///
-/// The zone is `<region>.compute.internal`, or `ec2.internal` in us-east-1,
-/// and it is the domain-name AWS DHCP hands the host. The `<region>` label is
-/// validated, not merely the suffix: `foo.compute.internal` is a custom
-/// domain-name, and the measurement on [`sole_aws_vpc_zone`] records the
-/// probed resolver answering it NXDOMAIN exactly as it answers an unrelated
-/// private suffix. Accepting it forwards a suffix that cannot resolve, and
-/// hides a real zone named after it.
+/// The zone is `<region>.compute.internal` outside us-east-1, or `ec2.internal`
+/// in us-east-1, and it is the domain-name AWS DHCP hands the host. The
+/// `<region>` label is validated, not merely the suffix: `foo.compute.internal`
+/// is a custom domain-name, and the measurement on [`sole_aws_vpc_zone`]
+/// records the probed resolver answering it NXDOMAIN exactly as it answers an
+/// unrelated private suffix. Accepting it forwards a suffix that cannot
+/// resolve, and hides a real zone named after it.
 fn is_aws_vpc_internal_zone(domain: &str) -> bool {
     let domain = normalized_zone(domain);
     domain == "ec2.internal"
         || domain
             .strip_suffix(".compute.internal")
-            .is_some_and(is_aws_region_label)
+            .is_some_and(|region| region != "us-east-1" && is_aws_region_label(region))
 }
 
 /// An AWS region name: two or more lowercase words of at least two letters,
@@ -352,7 +352,7 @@ fn is_aws_vpc_internal_zone(domain: &str) -> bool {
 /// Where it encodes a guess about them it goes stale on the same schedule and
 /// just as quietly, which is what a positional model of the name turned out to
 /// be. One uniform claim about every word makes fewer guesses to be wrong
-/// about, and `every_published_aws_region_label_survives_the_probe_narrowing`
+/// about, and `every_published_aws_region_label_is_recognized`
 /// checks the remaining ones against AWS's own region list rather than against
 /// the examples someone remembered.
 ///
@@ -947,6 +947,39 @@ mod tests {
         }
     }
 
+    /// us-east-1 uses `ec2.internal`, not the region-shaped zone used by every
+    /// other AWS region. Treating the unused spelling as this host's zone
+    /// forwards a suffix the VPC resolver does not serve.
+    #[test]
+    fn us_east_1_compute_internal_is_not_a_vpc_zone() {
+        let groups = resolver_groups(&[readable(
+            RESOLV_CONF_SOURCES[0],
+            "nameserver 10.0.0.2\nsearch us-east-1.compute.internal\n",
+        )]);
+
+        assert!(
+            search_domains_of(&search_narrowed_to_sole_aws_vpc_zone(groups)).is_empty(),
+            "us-east-1's VPC resolver serves ec2.internal, not \
+             us-east-1.compute.internal"
+        );
+    }
+
+    /// The unused us-east-1 spelling is not a second VPC zone. If it appears
+    /// beside `ec2.internal`, the real zone remains unambiguous and survives.
+    #[test]
+    fn us_east_1_compute_internal_does_not_hide_ec2_internal() {
+        let groups = resolver_groups(&[readable(
+            RESOLV_CONF_SOURCES[0],
+            "nameserver 10.0.0.2\nsearch us-east-1.compute.internal ec2.internal\n",
+        )]);
+
+        assert_eq!(
+            search_domains_of(&search_narrowed_to_sole_aws_vpc_zone(groups)),
+            vec!["ec2.internal"],
+            "the unused spelling must not make us-east-1's real zone ambiguous"
+        );
+    }
+
     /// `foo.compute.internal` is a custom DHCP domain-name, not a region's VPC
     /// zone, and the measurement records the probed resolver answering it
     /// NXDOMAIN with no authority. A suffix test takes it for this host's zone,
@@ -1049,7 +1082,7 @@ mod tests {
             // One pattern covers every partition. `eusc-de-east-1` is the AWS
             // European Sovereign Cloud region whose shape the first version of
             // that pattern did not have (#891);
-            // `every_published_aws_region_label_survives_the_probe_narrowing`
+            // `every_published_aws_region_label_is_recognized`
             // runs AWS's whole published list through this path.
             "ap-southeast-4.compute.internal",
             "il-central-1.compute.internal",
@@ -1081,6 +1114,7 @@ mod tests {
             "us-west-.compute.internal",
             "us-west-1a.compute.internal",
             "ip-10-0-1-49.us-west-1.compute.internal",
+            "us-east-1.compute.internal",
         ];
         // Shaped like a region and not one. `is_aws_region_label` admits these
         // deliberately and says why: it no longer claims to know how long a
@@ -1130,8 +1164,8 @@ mod tests {
         }
     }
 
-    /// Every region code AWS publishes, run through the zone test, plus the
-    /// non-regions the test exists to reject.
+    /// Every region code AWS publishes, run through the region-label test,
+    /// plus the non-regions the zone test exists to reject.
     ///
     /// The list is the union of `partitions[].regions` in botocore's
     /// `endpoints.json` as shipped with aws-cli 2.32.28, which is AWS's own
@@ -1175,7 +1209,7 @@ mod tests {
     /// `true` for everything would pass, which is the shape of a check that
     /// cannot fail.
     #[test]
-    fn every_published_aws_region_label_survives_the_probe_narrowing() {
+    fn every_published_aws_region_label_is_recognized() {
         let regions = [
             "af-south-1",
             "ap-east-1",
@@ -1226,17 +1260,10 @@ mod tests {
         ];
 
         for region in regions {
-            let zone = format!("{region}.compute.internal");
-            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
-                servers: vec!["10.0.0.2".to_string()],
-                search_domains: vec![zone.clone()],
-            }]);
-            assert_eq!(
-                search_domains_of(&narrowed),
-                vec![zone.as_str()],
-                "{region} is a region AWS publishes today, so the label in \
-                 {zone} has to read as a region and not as a custom \
-                 domain-name"
+            assert!(
+                is_aws_region_label(region),
+                "{region} is a region AWS publishes today, so it has to read \
+                 as a region and not as a custom domain-name"
             );
         }
 
