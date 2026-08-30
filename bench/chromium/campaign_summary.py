@@ -430,7 +430,7 @@ def check_verify_bracket(run_dir, name, verify, resolver, measured_urls, measure
     return dns_server
 
 
-def check_replay_queries(run_dir, name, data):
+def check_replay_queries(run_dir, name, data, dns_data, stage_hosts, answers):
     """Read the bracket records back, rather than only hashing them.
 
     A hash pins bytes; it does not say the bytes mean anything. Every other
@@ -446,6 +446,21 @@ def check_replay_queries(run_dir, name, data):
     of directories this reads. Note that a failing bracket writes its record
     BEFORE the `missing` gate, deliberately, so a `missing=` other than none is
     exactly the trace of a bracket that did not pass.
+
+    The counts a record carries are its own claim about corpus-dns.log, and
+    reading only the record left them tied to nothing: `queries=0
+    hosts_seen=14/14 missing=none` is impossible and was accepted, and a clean
+    fixture whose DNS log held one row claimed 42 queries over 14 hosts and
+    indexed (Codex, 2026-08-30). So each claim is re-derived from the log the
+    same way replay_qnames_since derives it: an A query this server answered
+    with an address a bracket recorded.
+
+    A bracket's window runs from its own `since_row` to the point the bracket
+    ended, which nothing records, so the window read here runs to the NEXT
+    bracket's `since_row` (the end of the log, for the last). That is a
+    superset of the real window, which is the direction that cannot refuse a
+    run the campaign produced: the log must merely hold at least what the
+    record claimed.
     """
     text = data.decode("utf-8", "replace")
     lines = [line for line in text.splitlines() if line != ""]
@@ -454,8 +469,21 @@ def check_replay_queries(run_dir, name, data):
             f"{run_dir}: {name} holds {len(lines)} bracket record(s), not the "
             f"{len(VERIFY_STAGES)} a clean campaign writes ({', '.join(VERIFY_STAGES)})"
         )
+    # The log's rows, by the line index since_row counts in (replay_log_rows
+    # is `wc -l`). A row that will not parse is not a qualifying answer and is
+    # not dropped from the indexing, since the window bounds are line numbers.
+    rows = []
+    for raw in dns_data.decode("utf-8", "replace").splitlines():
+        try:
+            rows.append(json.loads(raw))
+        except ValueError:
+            rows.append(None)
+    windows = [int(REPLAY_QUERY_RECORD.match(line)["since"])
+               if REPLAY_QUERY_RECORD.match(line) else None
+               for line in lines]
+
     previous = -1
-    for stage, line in zip(VERIFY_STAGES, lines):
+    for index, (stage, line) in enumerate(zip(VERIFY_STAGES, lines)):
         record = REPLAY_QUERY_RECORD.match(line)
         if record is None:
             raise RunError(f"{run_dir}: {name} line is not a bracket record: {line!r}")
@@ -482,6 +510,20 @@ def check_replay_queries(run_dir, name, data):
                 f"{run_dir}: {name} records the {stage} bracket seeing "
                 f"{seen} of {wanted} hosts answered, with none reported missing"
             )
+        queries = int(record["queries"])
+        if queries < seen:
+            raise RunError(
+                f"{run_dir}: {name} records the {stage} bracket seeing {seen} "
+                f"hosts answered inside a window holding {queries} queries, "
+                "which cannot have happened"
+            )
+        hosts = stage_hosts.get(stage) or set()
+        if wanted != len(hosts):
+            raise RunError(
+                f"{run_dir}: {name} records the {stage} bracket over {wanted} "
+                f"hosts, but verify-dns-{stage}.json names {len(hosts)}; the "
+                "bracket and its record must be about the same hosts"
+            )
         since = int(record["since"])
         if since <= previous:
             raise RunError(
@@ -490,6 +532,30 @@ def check_replay_queries(run_dir, name, data):
                 "reaches back credits an earlier bracket's queries to this one"
             )
         previous = since
+        # Re-derive the claim from corpus-dns.log over a superset of the
+        # bracket's window: since_row to the next bracket's, or the end.
+        nxt = windows[index + 1] if index + 1 < len(windows) else len(rows)
+        if nxt is None or nxt > len(rows):
+            nxt = len(rows)
+        answered = [row for row in rows[since:nxt]
+                    if isinstance(row, dict)
+                    and isinstance(row.get("qname"), str)
+                    and row.get("qtype") == 1
+                    and canonical_ip(row.get("answer")) in answers]
+        if len(answered) < queries:
+            raise RunError(
+                f"{run_dir}: {name} records {queries} answered queries for the "
+                f"{stage} bracket, but corpus-dns.log holds {len(answered)} "
+                f"from row {since} to {nxt}; the record claims answers this "
+                "replay server never logged"
+            )
+        unlogged = hosts - {row["qname"] for row in answered}
+        if unlogged:
+            raise RunError(
+                f"{run_dir}: {name} records the {stage} bracket seeing every "
+                f"host answered, but corpus-dns.log logs no answer from row "
+                f"{since} to {nxt} for {', '.join(sorted(unlogged))}"
+            )
 
 
 def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id):
@@ -595,6 +661,7 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
     measured_hosts = {urlsplit(url).netloc for url in measured_urls}
     resolver = guest_dns if isinstance(guest_dns, str) and guest_dns else None
     answers = set()
+    stage_hosts = {}
     for stage in VERIFY_STAGES:
         name = f"verify-dns-{stage}.json"
         if name not in cited:
@@ -616,7 +683,9 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
             run_dir, name, verify, resolver, set(measured_urls), measured_hosts
         )
         answers |= bracket_answers(run_dir, name, verify)
+        stage_hosts[stage] = set(verify.get("hosts") or {})
     # The replay server's own logs, pinned by hash at the verdict.
+    bodies = {}
     for field, name in REPLAY_LOGS.items():
         want = evidence.get(field)
         if not is_sha256(want):
@@ -630,8 +699,15 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
                 f"{run_dir}: {name} sha256 {digest} does not match the "
                 f"{want} dns-evidence.json recorded at the verdict"
             )
-        if name == "replay-queries.log":
-            check_replay_queries(run_dir, name, data)
+        bodies[name] = data
+    check_replay_queries(
+        run_dir,
+        "replay-queries.log",
+        bodies["replay-queries.log"],
+        bodies["corpus-dns.log"],
+        stage_hosts,
+        answers,
+    )
     return answers
 
 

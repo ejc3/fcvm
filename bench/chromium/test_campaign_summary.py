@@ -125,17 +125,53 @@ class EvidenceIgnoreRules(unittest.TestCase):
 
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
+# The hosts write_verify's bracket names, which the replay logs must agree with.
+DEFAULT_BRACKET_HOSTS = {"example.com": {"answer": "10.0.2.2", "ok": True}}
 # The replay server's own logs plus the campaign's per-bracket record of what
-# it served, with the line each carries in a run directory.
+# it served. The bracket records are read back against corpus-dns.log, so the two agree
+# here the way a campaign leaves them: one A answer per bracket for the single
+# host write_verify's bracket names, each in its own window.
 CORPUS_LOGS = {
-    "corpus-dns.log": '{"ts": 1.0, "qname": "example.com"}\n',
+    "corpus-dns.log": "".join(
+        '{"ts": %s, "peer": "10.0.2.100", "qname": "example.com", '
+        '"qtype": 1, "answer": "10.0.2.2"}\n' % ts
+        for ts in (1.0, 2.0, 3.0)
+    ),
     "corpus-access.log": '{"ts": 1.0, "path": "/", "status": 200}\n',
-    "replay-queries.log": (
-        "pre since_row=0 queries=14 hosts_seen=14/14 missing=none\n"
-        "before-run since_row=14 queries=14 hosts_seen=14/14 missing=none\n"
-        "after-run since_row=28 queries=14 hosts_seen=14/14 missing=none\n"
+    "replay-queries.log": "".join(
+        f"{stage} since_row={row} queries=1 hosts_seen=1/1 missing=none\n"
+        for row, stage in enumerate(VERIFY_STAGES)
     ),
 }
+
+
+def campaign_logs(stage_hosts):
+    """The three replay logs a campaign leaves, for these brackets.
+
+    campaign_summary reads the bracket records back against corpus-dns.log, so
+    a fixture cannot state the two independently: each bracket's window holds
+    one A answer per host that bracket names, answered with the address that
+    bracket recorded, and the record counts exactly those.
+    """
+    dns, records, row = [], [], 0
+    for stage in VERIFY_STAGES:
+        hosts = stage_hosts.get(stage) or {}
+        for host, entry in hosts.items():
+            answer = (entry or {}).get("answer") if isinstance(entry, dict) else None
+            dns.append(json.dumps({"ts": 1.0 + row, "peer": "10.0.2.100",
+                                   "qname": host, "qtype": 1, "answer": answer}))
+        records.append(
+            f"{stage} since_row={row} queries={len(hosts)} "
+            f"hosts_seen={len(hosts)}/{len(hosts)} missing=none"
+        )
+        row += len(hosts)
+    return {
+        "corpus-dns.log": "".join(line + "\n" for line in dns),
+        "corpus-access.log": CORPUS_LOGS["corpus-access.log"],
+        "replay-queries.log": "".join(line + "\n" for line in records),
+    }
+
+
 # The seal identity reqbench.py stamps into every record's meta and
 # reqanalyze carries into the cell: the runtime bundle reqbench.sh sealed,
 # the binaries and sources hashed into it, the source revision, and the
@@ -315,6 +351,7 @@ def write_run(
             handle.write(f"{withdrawn}\nsecond line: detail the refusal need not quote\n")
     if dns_verdict is not None:
         verify_files = []
+        stage_hosts = {}
         verify_hashes = {}
         for stage in VERIFY_STAGES:
             verify_path = os.path.join(run_dir, f"verify-dns-{stage}.json")
@@ -324,8 +361,10 @@ def write_run(
             paths[f"verify-{stage}"] = verify_path
             verify_files.append(verify_path)
             verify_hashes[f"verify-dns-{stage}.json"] = sha256_file(verify_path)
+            with open(verify_path) as handle:
+                stage_hosts[stage] = json.load(handle).get("hosts") or {}
         hashes = {}
-        for name, line in {**CORPUS_LOGS, **(corpus_logs or {})}.items():
+        for name, line in {**campaign_logs(stage_hosts), **(corpus_logs or {})}.items():
             log_path = os.path.join(run_dir, name)
             with open(log_path, "w") as handle:
                 handle.write(line)
@@ -1462,42 +1501,69 @@ class CampaignSummary(unittest.TestCase):
         softest target of the set, because a forged directory only has to
         carry non-empty bytes and a matching digest.
 
+        Reading only the record is not enough either, because its counts are
+        its own claim about corpus-dns.log: `queries=0 hosts_seen=1/1` is
+        impossible, and a record may claim answers the log never logged. Each
+        claim is re-derived from the log over a superset of the bracket's
+        window.
+
         The campaign gates each record at write time, so a run it produced
         carries three well-formed ones. That says nothing about a directory
         the index is asked to read: the gate that matters is the one at the
         boundary where the bytes are trusted.
 
-        RED BEFORE THE FIX: every case below indexed, `AssertionError: 0 != 0`
-        with `wrote ...: 1 cell(s)`.
+        RED BEFORE THE FIX: every record-shape case indexed,
+        `AssertionError: 0 != 0` with `wrote ...: 1 cell(s)`.
+
+        RED BEFORE THE SECOND FIX (the cross-check against corpus-dns.log):
+        the four cases below that forge counts or hosts indexed the same way.
         """
-        clean = CORPUS_LOGS["replay-queries.log"]
+        clean = campaign_logs({stage: DEFAULT_BRACKET_HOSTS for stage in VERIFY_STAGES})
+        records = clean["replay-queries.log"]
         cases = (
             ("a bracket's record dropped",
-             "\n".join(clean.splitlines()[:2]) + "\n"),
+             {"replay-queries.log": "\n".join(records.splitlines()[:2]) + "\n"}),
             ("a fourth record nobody wrote",
-             clean + "after-run since_row=42 queries=14 hosts_seen=14/14 missing=none\n"),
+             {"replay-queries.log": records
+              + "after-run since_row=3 queries=1 hosts_seen=1/1 missing=none\n"}),
             ("the same bracket three times",
-             clean.replace("before-run", "pre").replace("after-run", "pre")),
+             {"replay-queries.log":
+              records.replace("before-run", "pre").replace("after-run", "pre")}),
             ("the brackets out of order",
-             "\n".join(reversed(clean.splitlines())) + "\n"),
+             {"replay-queries.log": "\n".join(reversed(records.splitlines())) + "\n"}),
             ("a bracket that reported names it never saw answered",
-             clean.replace("after-run since_row=28 queries=14 hosts_seen=14/14 missing=none",
-                           "after-run since_row=28 queries=14 hosts_seen=12/14 "
-                           "missing=example.com,news.ycombinator.com")),
+             {"replay-queries.log": records.replace(
+                 "after-run since_row=2 queries=1 hosts_seen=1/1 missing=none",
+                 "after-run since_row=2 queries=1 hosts_seen=0/1 missing=example.com")}),
             ("a bracket whose hosts_seen does not reach its total",
-             clean.replace("hosts_seen=14/14 missing=none",
-                           "hosts_seen=13/14 missing=none", 1)),
+             {"replay-queries.log": records.replace(
+                 "hosts_seen=1/1 missing=none", "hosts_seen=0/1 missing=none", 1)}),
             ("a bracket that was asked about no hosts at all",
-             clean.replace("hosts_seen=14/14", "hosts_seen=0/0")),
+             {"replay-queries.log": records.replace("hosts_seen=1/1", "hosts_seen=0/0")}),
+            ("a bracket counting hosts its own evidence does not name",
+             {"replay-queries.log": records.replace("hosts_seen=1/1", "hosts_seen=14/14")}),
             ("a window that reaches back over an earlier bracket",
-             clean.replace("after-run since_row=28", "after-run since_row=0")),
+             {"replay-queries.log": records.replace("after-run since_row=2",
+                                                    "after-run since_row=0")}),
             ("a line that is not a bracket record",
-             clean + "x\n"),
+             {"replay-queries.log": records + "x\n"}),
+            # The record's counts are claims about the DNS log, and until they
+            # were derived from it a record could say anything.
+            ("hosts answered inside a window that held no queries",
+             {"replay-queries.log": records.replace("queries=1", "queries=0")}),
+            ("more answered queries than this server ever logged",
+             {"replay-queries.log": records.replace("queries=1", "queries=5")}),
+            ("every host answered, with no answer in the log for any of them",
+             {"corpus-dns.log": clean["corpus-dns.log"].replace(
+                 '"qname": "example.com"', '"qname": "elsewhere.test"')}),
+            ("every host answered, by a server answering another address",
+             {"corpus-dns.log": clean["corpus-dns.log"].replace(
+                 '"answer": "10.0.2.2"', '"answer": "203.0.113.99"')}),
         )
-        for label, body in cases:
+        for label, logs in cases:
             with self.subTest(label), tempfile.TemporaryDirectory() as d:
                 run_dir = os.path.join(d, "run")
-                write_run(run_dir, corpus_logs={"replay-queries.log": body})
+                write_run(run_dir, corpus_logs=logs)
                 out = os.path.join(d, "campaign-x-summary.json")
                 rc, text = self._summarize(out, [run_dir])
                 self.assertNotEqual(rc, 0, f"{label}: {text}")

@@ -9547,16 +9547,23 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         # The replay server's own logs and the campaign's per-bracket record of
         # what it served. campaign_summary requires all three beside the
         # evidence, each hashing to what the verdict recorded.
-        # replay-queries.log is read back rather than only hashed, so it holds
-        # the record a clean campaign writes: one per bracket, in order, over
-        # windows that do not overlap.
+        # replay-queries.log is read back against corpus-dns.log rather than
+        # only hashed, so the two agree the way a campaign leaves them: one
+        # record per bracket, in order, over its own window, and in that
+        # window one A answer per host the bracket names.
+        dns, records, row = [], [], 0
+        for stage in ("pre", "before-run", "after-run"):
+            for host in hosts:
+                dns.append(json.dumps({"ts": 1.0 + row, "peer": "10.0.2.100",
+                                       "qname": host, "qtype": 1,
+                                       "answer": "10.0.2.2"}))
+            records.append(f"{stage} since_row={row} queries={len(hosts)} "
+                           f"hosts_seen={len(hosts)}/{len(hosts)} missing=none")
+            row += len(hosts)
         bodies = {
-            "corpus-dns.log": '{"ts": 1.0}\n',
+            "corpus-dns.log": "".join(line + "\n" for line in dns),
             "corpus-access.log": '{"ts": 1.0}\n',
-            "replay-queries.log": "".join(
-                f"{stage} since_row={row} queries=14 hosts_seen=14/14 missing=none\n"
-                for row, stage in enumerate(("pre", "before-run", "after-run"))
-            ),
+            "replay-queries.log": "".join(line + "\n" for line in records),
         }
         for name, body in bodies.items():
             path = os.path.join(run_dir, name)
