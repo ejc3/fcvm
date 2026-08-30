@@ -100,10 +100,12 @@ done
 CORPUS_EXTRA_LOCK="/run/lock/fcvm-corpus-extra.lock"
 
 stage_runtime_bundle() {
-    local stage source manifest_temp bundle_digest bundle_dest
+    local stage source reqbench_manifest_temp manifest_temp
+    local reqbench_digest bundle_digest bundle_dest
     local sources=(
         corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py
-        corpus_serve.py report.py reqbench.py owned_process.py corpus_campaign.sh
+        corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py
+        owned_process.py corpus_campaign.sh
     )
     mkdir -- "$RESULTS/runtime"
     stage=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
@@ -113,8 +115,19 @@ stage_runtime_bundle() {
     done
     cp --reflink=auto --preserve=mode,timestamps \
         "$REPO/target/release/fcvm" "$stage/fcvm"
+    cp --reflink=auto --preserve=mode,timestamps \
+        "$REPO/target/release/fc-agent" "$stage/fc-agent"
     cp -a --reflink=auto "$SOURCE_BENCH/corpus-live" "$stage/corpus-live"
-    chmod 0555 "$stage/fcvm"
+    chmod 0555 "$stage/fcvm" "$stage/fc-agent"
+    reqbench_manifest_temp=$(mktemp "$RESULTS/runtime/.reqbench-manifest.XXXXXX")
+    (
+        cd "$stage"
+        sha256sum fcvm fc-agent reqbench.sh reqbench.py reqanalyze.py \
+            cdpdrive.py render.py wddrive.py
+    ) > "$reqbench_manifest_temp"
+    mv --no-target-directory \
+        "$reqbench_manifest_temp" "$stage/REQBENCH_MANIFEST.sha256"
+    reqbench_digest=$(sha256sum "$stage/REQBENCH_MANIFEST.sha256" | cut -d' ' -f1)
     manifest_temp=$(mktemp "$RESULTS/runtime/.manifest.XXXXXX")
     (
         cd "$stage"
@@ -127,6 +140,7 @@ stage_runtime_bundle() {
     bundle_dest="$RESULTS/runtime/$bundle_digest"
     chmod -R a-w "$stage"
     mv --no-target-directory "$stage" "$bundle_dest"
+    REQBENCH_BUNDLE_SHA256="$reqbench_digest"
     BUNDLE_SHA256="$bundle_digest"
     BUNDLE_DIR="$(cd "$bundle_dest" && pwd -P)"
 }
@@ -138,7 +152,7 @@ verify_runtime_bundle() {
         return 1
     }
     manifest_digest=$(sha256sum "$BENCH/MANIFEST.sha256" | cut -d' ' -f1) || return 1
-    [ "$manifest_digest" = "${RUNTIME_BUNDLE_SHA256:-}" ] || {
+    [ "$manifest_digest" = "${CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256:-}" ] || {
         echo "FAILED: runtime bundle manifest identity changed" >&2
         return 1
     }
@@ -191,7 +205,8 @@ if [ "$CORPUS_EXTRA_STAGED" = 0 ]; then
         CORPUS_EXTRA_SOURCE_REPO="$REPO" \
         CORPUS_EXTRA_SOURCE_BENCH="$SOURCE_BENCH" \
         CORPUS_EXTRA_RUNTIME_BUNDLE="$bundle_dir" \
-        RUNTIME_BUNDLE_SHA256="$BUNDLE_SHA256" \
+        CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="$BUNDLE_SHA256" \
+        REQBENCH_RUNTIME_BUNDLE_SHA256="$REQBENCH_BUNDLE_SHA256" \
         SOURCE_REVISION="$SOURCE_REVISION" \
         SOURCE_GIT_DIRTY="$SOURCE_GIT_DIRTY" \
         RUNTIME_IMAGE="$RUNTIME_IMAGE" \
@@ -225,12 +240,14 @@ campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.s
     echo "{"
     echo " \"git_head\": \"$SOURCE_REVISION\","
     echo " \"git_dirty\": \"$SOURCE_GIT_DIRTY\","
-    echo " \"runtime_bundle_sha256\": \"$RUNTIME_BUNDLE_SHA256\","
+    echo " \"corpus_extra_runtime_bundle_sha256\": \"$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256\","
+    echo " \"reqbench_runtime_bundle_sha256\": \"$REQBENCH_RUNTIME_BUNDLE_SHA256\","
     echo " \"host_kernel\": \"$(uname -r)\", \"machine\": \"$(uname -m)\","
     echo " \"image\": \"$IMAGE\", \"image_id\": \"$RUNTIME_IMAGE\","
     echo " \"tag\": \"$TAG\", \"reps\": $REPS, \"warmup\": $WARMUP,"
     for f in corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py \
-            corpus_serve.py report.py reqbench.py owned_process.py corpus_campaign.sh; do
+            corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py \
+            owned_process.py corpus_campaign.sh; do
         echo " \"$f\": \"$(sha256sum "$BENCH/$f" | cut -d' ' -f1)\","
     done
     echo " \"fcvm\": \"$(sha256sum "$BENCH/fcvm" | cut -d' ' -f1)\""
