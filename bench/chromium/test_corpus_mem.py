@@ -155,29 +155,39 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertIn("b" * 32, second)
 
     def test_teardown_does_not_wait_for_a_peer_runs_container(self):
-        side = corpus_mem.ContainerSide(SimpleNamespace(), "a" * 32)
-        owned = {"name": side.prefix("host1r1") + "0"}
+        token = "c" * 32
+        side = corpus_mem.ContainerSide(
+            SimpleNamespace(container_owner_token=token), "a" * 32)
+        owned = {"name": side.prefix("host1r1") + "0", "container_id": "ours"}
+        calls = []
 
         def shell(cmd, *_args, **_kwargs):
-            if cmd[:3] == ["podman", "ps", "-a"]:
-                return Completed(0, "cbmem-peer-run-host1r1-0\n", "")
+            calls.append(cmd)
+            if cmd[:3] == ["podman", "inspect", "--format"]:
+                return Completed(0, f"ours {token}\n", "")
+            if cmd[:3] == ["podman", "container", "exists"]:
+                return Completed(1, "", "")
             return Completed()
 
-        ticks = iter((0.0, 1.0, 121.0))
-        with mock.patch.object(corpus_mem, "sh", shell), \
-             mock.patch.object(corpus_mem.time, "monotonic", side_effect=lambda: next(ticks)), \
-             mock.patch.object(corpus_mem.time, "sleep", return_value=None):
+        with mock.patch.object(corpus_mem, "sh_bounded", shell):
             side.tear_down([owned])
+        self.assertFalse(any(cmd[:3] == ["podman", "ps", "-a"] for cmd in calls))
 
-    def test_teardown_deadline_before_first_poll_reports_the_owned_container(self):
-        side = corpus_mem.ContainerSide(SimpleNamespace(), "a" * 32)
+    def test_teardown_that_cannot_identify_the_target_keeps_it_owned(self):
+        side = corpus_mem.ContainerSide(
+            SimpleNamespace(container_owner_token="c" * 32), "a" * 32)
         owned = {"name": side.prefix("host1r1") + "0"}
-        ticks = iter((0.0, 121.0))
-        with mock.patch.object(corpus_mem, "sh", return_value=Completed()), \
-             mock.patch.object(corpus_mem.time, "monotonic", side_effect=lambda: next(ticks)):
-            with self.assertRaises(SystemExit) as caught:
+        side.owned.add(owned["name"])
+
+        def shell(cmd, *_args, **_kwargs):
+            if cmd[:3] == ["podman", "container", "exists"]:
+                return Completed(0, "", "")
+            return Completed(125, "", "podman unavailable")
+
+        with mock.patch.object(corpus_mem, "sh_bounded", shell):
+            with self.assertRaises(RuntimeError):
                 side.tear_down([owned])
-        self.assertNotIn(caught.exception.code, (0, None))
+        self.assertIn(owned["name"], side.owned)
 
     def test_outer_cleanup_reaps_only_its_run_after_a_signal(self):
         with open(EXTRA) as handle:
@@ -299,6 +309,33 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertEqual(removed, [],
                          "cleanup deleted a same-name container this run did not create")
 
+    def test_partial_creation_is_cleaned_by_owner_label_and_exact_id(self):
+        token = "a" * 32
+        args = SimpleNamespace(image="image", urls=["https://example.com/"],
+                               container_owner_token=token)
+        side = corpus_mem.ContainerSide(args, "b" * 32)
+        removed = []
+        name = side.prefix("host1r1") + "0"
+
+        def bounded(cmd, _timeout):
+            if cmd[:3] == ["podman", "run", "-d"]:
+                return Completed(124, "", "timed out after create")
+            if cmd[:3] == ["podman", "inspect", "--format"]:
+                return Completed(0, f"{'c' * 64} {token}\n", "")
+            if cmd[:3] == ["podman", "rm", "-f"]:
+                removed.append(cmd[-1])
+                return Completed()
+            if cmd[:3] == ["podman", "container", "exists"]:
+                return Completed(1, "", "")
+            return Completed()
+
+        with mock.patch.object(corpus_mem, "sh_bounded", bounded):
+            with self.assertRaises(SystemExit):
+                side.bring_up(1, "host1r1", [0])
+            side.stop_all()
+        self.assertEqual(removed, ["c" * 64])
+        self.assertNotIn(name, side.owned)
+
     def test_shared_replay_ports_are_locked_before_dnsmasq_is_touched(self):
         with open(EXTRA) as handle:
             source = handle.read()
@@ -357,7 +394,8 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertRegex(source, r'\s1\)')
 
     def test_container_render_outputs_are_removed_before_sampling(self):
-        args = SimpleNamespace(image="image", urls=["https://example.com/"])
+        args = SimpleNamespace(image="image", urls=["https://example.com/"],
+                               container_owner_token="c" * 32)
         side = corpus_mem.ContainerSide(args, "a" * 32)
         calls = []
 
@@ -374,24 +412,25 @@ class RunScopedContainerCleanup(unittest.TestCase):
                         "render.py's JPEG and DOM remain charged to the container cgroup")
 
     def test_failed_podman_listing_cannot_report_cleanup_complete(self):
-        side = corpus_mem.ContainerSide(SimpleNamespace(), "a" * 32)
+        side = corpus_mem.ContainerSide(
+            SimpleNamespace(container_owner_token="c" * 32), "a" * 32)
         name = side.prefix("host1r1") + "0"
         side.owned.add(name)
 
         def bounded(cmd, _timeout):
-            if cmd[:3] == ["podman", "ps", "-a"]:
-                return Completed(125, "", "podman unavailable")
+            if cmd[:3] == ["podman", "container", "exists"]:
+                return Completed(0, "", "")
             return Completed(125, "", "remove failed")
 
         with mock.patch.object(corpus_mem, "sh_bounded", bounded, create=True):
-            with self.assertRaises(SystemExit) as caught:
+            with self.assertRaises(RuntimeError):
                 side.tear_down([{"name": name}])
-        self.assertNotIn(caught.exception.code, (0, None))
         self.assertIn(name, side.owned,
                       "failed cleanup discarded the only record of its live container")
 
     def test_failed_podman_run_keeps_the_name_owned_for_final_cleanup(self):
-        args = SimpleNamespace(image="image", urls=["https://example.com/"])
+        args = SimpleNamespace(image="image", urls=["https://example.com/"],
+                               container_owner_token="c" * 32)
         side = corpus_mem.ContainerSide(args, "a" * 32)
         name = side.prefix("host1r1") + "0"
         with mock.patch.object(
@@ -403,7 +442,8 @@ class RunScopedContainerCleanup(unittest.TestCase):
 
     def test_failed_cputime_container_run_keeps_the_name_owned(self):
         args = SimpleNamespace(run_id="a" * 32, image="image",
-                               container_resolve_to="127.0.0.1")
+                               container_resolve_to="127.0.0.1",
+                               container_owner_token="c" * 32)
         side = corpus_mem.ContainerSide(args, args.run_id)
         result = Completed(125, "", "runtime failed after create")
         with mock.patch.object(corpus_mem, "sh_bounded", return_value=result):
@@ -802,6 +842,7 @@ class ArgumentValidation(unittest.TestCase):
             urls=["https://example.com/"], ns=[1, 2, 4, 8], reps=2,
             cputime_reps=42, settle=5.0, quiet_limit=1.0,
             quiet_wait=300.0, run_id="a" * 32,
+            container_owner_token="b" * 32,
         )
         for key, value in overrides.items():
             setattr(args, key, value)
@@ -825,6 +866,11 @@ class ArgumentValidation(unittest.TestCase):
 
     def test_valid_arguments_are_accepted(self):
         corpus_mem.validate_args(self.args())
+
+    def test_invalid_container_owner_token_is_refused(self):
+        for value in ("", "short", "A" * 32, "a/b", "has space", "a" * 100):
+            with self.subTest(container_owner_token=value):
+                self.assert_refused(container_owner_token=value)
 
     def test_csv_parsing_rejects_empty_members(self):
         for value in ("", ",", "one,", ",one", "one,,two"):
