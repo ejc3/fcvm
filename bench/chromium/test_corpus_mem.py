@@ -134,7 +134,9 @@ class SnapshotGenerationLease(unittest.TestCase):
             source = handle.read()
         self.assertIn("def main_with_resources(resources", source)
         body = source[source.index("def main_with_resources(resources"):]
-        lease = body.find("snapshot_generation_under_lease(resources")
+        lease_match = re.search(
+            r"snapshot_generation_under_lease\(\s*resources", body)
+        lease = -1 if lease_match is None else lease_match.start()
         serve = body.find("fcvm_side.start_serve()")
         self.assertGreaterEqual(lease, 0)
         self.assertGreater(serve, lease,
@@ -424,6 +426,41 @@ class RunScopedContainerCleanup(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 side.bring_up(1, "fcvm1r1", [0])
         self.assertIn("mem-" + "a" * 32 + "-fcvm1r1-0", side.owned)
+
+    def test_unreadable_state_directory_cannot_prove_a_clone_is_gone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing-state")
+            with self.assertRaises(corpus_mem.CloneStateReadError):
+                corpus_mem.clone_gone(missing, "clone-a")
+
+    def test_malformed_state_cannot_prove_a_clone_is_gone(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            with open(os.path.join(state_dir, "unknown.json"), "w") as handle:
+                handle.write("{not-json\n")
+            with self.assertRaises(corpus_mem.CloneStateReadError):
+                corpus_mem.clone_gone(state_dir, "clone-a")
+
+    def test_state_proof_failure_does_not_skip_later_clone_teardown(self):
+        args = SimpleNamespace(state_dir="/state")
+        cg = mock.Mock()
+        side = corpus_mem.FcvmSide(args, cg, "a" * 32)
+        clones = []
+        for index in range(2):
+            proc = mock.Mock()
+            clone = {"name": f"clone-{index}", "leaf": f"leaf-{index}",
+                     "proc": proc}
+            clones.append(clone)
+            side.owned[clone["name"]] = clone
+        with mock.patch.object(
+                corpus_mem, "clone_gone",
+                side_effect=[corpus_mem.CloneStateReadError("cannot read state"), True]):
+            with self.assertRaises(corpus_mem.CloneStateReadError):
+                side.tear_down(clones)
+        self.assertEqual(cg.rm.call_count, 2,
+                         "one proof error skipped teardown of a later clone")
+        for clone in clones:
+            clone["proc"].terminate.assert_called_once()
+            clone["proc"].wait.assert_called_once()
 
     def test_one_cleanup_failure_does_not_skip_the_other_resources(self):
         calls = []
@@ -1140,6 +1177,58 @@ class FrozenCopiesAreRecordsNotTests(unittest.TestCase):
             path = getattr(sys.modules.get(mod), "__file__", "") or ""
             self.assertNotIn(os.sep + "results" + os.sep, path,
                              f"CI would run the frozen copy {path}")
+
+
+class ArchivedCorpusExtraDisposition(unittest.TestCase):
+    """Legacy artifacts stay available, but no unprovable result is quotable."""
+
+    RESULTS = os.path.join(HERE, "results")
+
+    def marker(self, directory):
+        path = os.path.join(self.RESULTS, directory, "WITHDRAWN")
+        self.assertTrue(os.path.isfile(path), f"{path} is missing")
+        with open(path) as handle:
+            reason = handle.readline().strip()
+        self.assertTrue(reason, f"{path} names no reason")
+
+    def test_legacy_host_ratio_is_withdrawn_not_relabelled(self):
+        directory = "corpusextra-hostcdp-20260830-172413"
+        self.marker(directory)
+        root = os.path.join(self.RESULTS, directory)
+        self.assertFalse(os.path.exists(os.path.join(root, "comparison.json")),
+                         "the unbound host ratio remains quotable")
+        host = os.path.join(root, "hostcdp-free")
+        with open(os.path.join(host, "run.json")) as handle:
+            meta = json.load(handle)
+        self.assertNotIn("run_id", meta,
+                         "do not invent an identity the old producer never recorded")
+        with open(os.path.join(host, "hostcdp.jsonl")) as handle:
+            row = json.loads(next(handle))
+        self.assertNotIn("run_json_sha256", row)
+        self.assertNotIn("loadavg1", row)
+
+    def test_failed_memory_attempt_is_permanently_withdrawn(self):
+        directory = "corpusextra-memory-20260830-173915"
+        self.marker(directory)
+        root = os.path.join(self.RESULTS, directory, "memory")
+        self.assertFalse(os.path.exists(os.path.join(root, "summary.json")))
+        with open(os.path.join(root, "phase.log")) as handle:
+            last = [line.strip() for line in handle if line.strip()][-1]
+        self.assertIn(" BLOCKED:", last)
+
+    def test_blocked_memory_and_cpu_design_is_permanently_withdrawn(self):
+        directory = "corpusextra-memory-20260830-181830"
+        self.marker(directory)
+        root = os.path.join(self.RESULTS, directory, "memory")
+        with open(os.path.join(root, "run.json")) as handle:
+            meta = json.load(handle)
+        self.assertNotIn("schedule", meta)
+        self.assertNotIn("snapshot_generation", meta)
+        with open(os.path.join(root, "samples.jsonl")) as handle:
+            sides = [json.loads(line)["side"] for line in handle]
+        switches = sum(left != right for left, right in zip(sides, sides[1:]))
+        self.assertEqual(switches, 1,
+                         "the invalidating blocked-side order changed; re-audit the archive")
 
 
 class ComparePublicationGate(unittest.TestCase):
