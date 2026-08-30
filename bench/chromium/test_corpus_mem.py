@@ -13,6 +13,7 @@ None of them raises on its own. Each one produces a run that looks finished.
 Run: python3 -m unittest test_corpus_mem -v
 """
 
+import hashlib
 import json
 import os
 import re
@@ -807,7 +808,7 @@ class ExactHostListener(unittest.TestCase):
 
 
 class Resummarize(unittest.TestCase):
-    """A recomputed host summary must not assert a failure count it never counted.
+    """A recomputed host summary must describe one complete successful run.
 
     resummarize.py exists to restate a hostcdp run's p50 under the median
     convention reqanalyze publishes, so the ratio compare.py takes against the
@@ -816,17 +817,42 @@ class Resummarize(unittest.TestCase):
 
     hostcdp.sh can write "failures": 0 because it exits 4 on the first failed
     rep, so a summary it reaches is a run with none. resummarize.py has no such
-    invariant: it is pointed at a directory. It filtered on `warmup` only, so a
-    failed rep's wall_ms -- a timeout, the largest number in the file -- went
-    into the distribution, and the field beside it still said no failures.
+    process invariant: it is pointed at a directory. It must prove the declared
+    record count, schedule, and successes, and remove an earlier summary when
+    that proof fails.
     """
 
     @staticmethod
-    def run_on(rows):
+    def run_on(rows, meta=None, stale_summary=False):
         tmp = tempfile.mkdtemp()
+        if meta is None:
+            warmup = sum(r.get("warmup") is True for r in rows)
+            urls = list(dict.fromkeys(r.get("url") for r in rows))
+            meta = {
+                "reps": len(rows) - warmup,
+                "warmup": warmup,
+                "total_reps": len(rows),
+                "urls": urls,
+                "url_count": len(urls),
+            }
+        if meta is not False:
+            meta = dict(meta)
+            meta.setdefault("run_id", "resummarize-fixture")
+            with open(os.path.join(tmp, "run.json"), "w") as handle:
+                json.dump(meta, handle)
+            with open(os.path.join(tmp, "run.json"), "rb") as handle:
+                run_json_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        else:
+            run_json_sha256 = None
         with open(os.path.join(tmp, "hostcdp.jsonl"), "w") as handle:
             for r in rows:
-                handle.write(json.dumps(r) + "\n")
+                record = dict(r)
+                if run_json_sha256 is not None:
+                    record["run_json_sha256"] = run_json_sha256
+                handle.write(json.dumps(record) + "\n")
+        if stale_summary:
+            with open(os.path.join(tmp, "summary.json"), "w") as handle:
+                json.dump({"n": 999, "failures": 0, "passed": True}, handle)
         proc = subprocess.run([sys.executable, os.path.join(HERE, "resummarize.py"), tmp],
                               capture_output=True, text=True, timeout=60)
         return tmp, proc
@@ -845,6 +871,18 @@ class Resummarize(unittest.TestCase):
             rec = json.load(handle)
         self.assertEqual(rec["n"], 5)
         self.assertEqual(rec["failures"], 0)
+        self.assertEqual(rec["p50_ms"], 103.0)
+
+    def test_a_complete_legacy_run_is_summarised(self):
+        rows = [self.rep(0, warmup=True)] + \
+               [self.rep(i, wall_ms=float(100 + i)) for i in range(1, 6)]
+        meta = {"reps": 6, "warmup": 1,
+                "urls": ["https://example.com/"], "url_count": 1}
+        tmp, proc = self.run_on(rows, meta=meta)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(os.path.join(tmp, "summary.json")) as handle:
+            rec = json.load(handle)
+        self.assertEqual(rec["n"], 5)
         self.assertEqual(rec["p50_ms"], 103.0)
 
     def test_a_run_holding_a_failed_rep_is_refused(self):
@@ -888,6 +926,43 @@ class Resummarize(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("REFUSING", proc.stderr, proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
+
+    def test_a_truncated_successful_prefix_is_refused(self):
+        """Every row present can say ok=true while the run is still partial.
+
+        The producer records the promised measured, warmup, and total counts in
+        run.json. Four successful measured rows are not a completed five-rep
+        run, so resummarizing them would turn interruption into a fast-looking
+        result with failures=0.
+        """
+        rows = [self.rep(0, warmup=True)] + [self.rep(i) for i in range(1, 5)]
+        meta = {"reps": 5, "warmup": 1, "total_reps": 6,
+                "urls": ["https://example.com/"], "url_count": 1}
+        tmp, proc = self.run_on(rows, meta=meta)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a successful prefix was published as a completed run")
+        self.assertIn("REFUSING", proc.stderr, proc.stderr)
+        self.assertIn("total_reps", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
+
+    def test_a_refusal_removes_an_earlier_successful_summary(self):
+        """A non-zero exit beside passed-looking summary.json fails open."""
+        rows = [self.rep(0, warmup=True), self.rep(1),
+                self.rep(2, ok=False, wall_ms=30000.0)]
+        tmp, proc = self.run_on(rows, stale_summary=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("REFUSING", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")),
+                         "the refused recomputation left the stale successful summary")
+
+    def test_missing_run_metadata_is_refused(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows, meta=False)
+        self.assertNotEqual(proc.returncode, 0,
+                            "records with no declared count were summarized")
+        self.assertIn("REFUSING", proc.stderr, proc.stderr)
+        self.assertIn("run.json", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
 
 
@@ -958,46 +1033,120 @@ class FrozenCopiesAreRecordsNotTests(unittest.TestCase):
 class ComparePublicationGate(unittest.TestCase):
     """compare.py divides a VM p50 by a host p50 and writes comparison.json.
 
-    Its one refusal is the publication gate, and its record filters decide which
-    reps reach the medians. hostcdp.sh's producer always writes `ok`, and so does
-    reqbench, so the two filters agree on every record either has produced. They
-    did not agree in the code: the host side dropped a record whose `ok` was
-    absent, the VM side kept it. Verified against
-    results/reqbench-20260830-171007-corpus/reqbench.jsonl (460 records, all
-    carrying ok=true) and hostcdp-free/hostcdp.jsonl (230, all ok=true), so
-    aligning them moves no published number.
+    The comparison must bind the raw VM bytes to the analysis that passed its
+    publication gate, and must prove that each host input is complete and
+    compatible before it computes a ratio. A rep that does not explicitly say
+    it succeeded reaches neither side's medians.
     """
 
+    URL = "https://example.com/"
+    IMAGE_ID = "sha256:" + "a" * 64
     CELL = {"cpu": 2, "memory_mib": 1024, "backend": "uffd", "uffd_mode": "minor",
-            "snapshot": "cb-req-corpus", "image_id": "sha256:x",
+            "snapshot": "cb-req-corpus", "image": "localhost/chromium-bench-req",
+            "image_id": IMAGE_ID, "url": URL, "guest_dns": "10.0.2.2",
+            "guest_env": [], "engine": "chromium", "cdp_port": 9222,
             "source_revision": "abc123", "fcvm_sha256": "d", "runtime_bundle_sha256": "e",
             "host_kernel_release": "k", "host_machine": "aarch64"}
 
-    def make_run(self, publishable=True, passed=True, vm_rows=()):
+    @staticmethod
+    def artifact_identity(path):
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        return {"path": path, "realpath": os.path.realpath(path),
+                "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+    def make_run(self, publishable=True, passed=True, vm_rows=(), cell=None,
+                 include_identity=True, warmup=0):
         tmp = tempfile.mkdtemp()
-        with open(os.path.join(tmp, "analysis.json"), "w") as handle:
-            json.dump({"publishable": publishable, "gate": {"passed": passed},
-                       "run_id": "r1", "cell": self.CELL}, handle)
-        with open(os.path.join(tmp, "reqbench.jsonl"), "w") as handle:
+        cell = dict(cell or self.CELL)
+        records = os.path.join(tmp, "reqbench.jsonl")
+        with open(records, "w") as handle:
+            handle.write(json.dumps({
+                "kind": "meta", "run_id": "r1", "arms": ["cdp"],
+                "reps": len(vm_rows), "warmup": warmup, "url": cell["url"],
+                "image": cell["image"], "image_id": cell["image_id"],
+                "guest_dns": cell["guest_dns"], "guest_env": cell["guest_env"],
+                "host_kernel_release": cell["host_kernel_release"],
+            }) + "\n")
             for row in vm_rows:
                 handle.write(json.dumps(row) + "\n")
+        analysis = {"publishable": publishable, "gate": {"passed": passed},
+                    "run_id": "r1", "cell": cell}
+        if include_identity:
+            analysis["analysis_identity"] = {
+                "schema_version": 6,
+                "inputs": [self.artifact_identity(records)],
+            }
+        with open(os.path.join(tmp, "analysis.json"), "w") as handle:
+            json.dump(analysis, handle)
         return tmp
 
     @staticmethod
     def vm_rep(blocking_ms, ok=True, include_ok=True):
         rec = {"arm": "cdp", "warmup": False, "blocking_ms": blocking_ms,
-               "wall_ms": blocking_ms, "url": "https://example.com/",
+               "wall_ms": blocking_ms, "url": ComparePublicationGate.URL,
                "render": {"stages": {"total_ms": blocking_ms},
                           "nav": {"load_ms": blocking_ms}}}
         if include_ok:
             rec["ok"] = ok
         return rec
 
-    def run_compare(self, run_dir):
+    @staticmethod
+    def host_rep(rep, warmup, url=URL, ok=True, wall_ms=100.0,
+                 complete_driver=True):
+        driver = {"ok": True, "url": url,
+                  "stages": {"total_ms": wall_ms},
+                  "nav": {"load_ms": wall_ms}}
+        if not complete_driver:
+            driver = {"ok": True, "url": url, "stages": {},
+                      "nav": {"load_ms": wall_ms}}
+        return {"rep": rep, "ok": ok, "warmup": warmup,
+                "wall_ms": wall_ms, "loadavg1": 0.2,
+                "url": url, "driver": json.dumps(driver)}
+
+    def make_host(self, rows, meta_overrides=None):
+        tmp = tempfile.mkdtemp()
+        warmup = sum(r["warmup"] is True for r in rows)
+        urls = list(dict.fromkeys(r["url"] for r in rows))
+        meta = {
+            "run_id": os.path.basename(tmp),
+            "image": self.CELL["image"], "image_id": self.IMAGE_ID.removeprefix("sha256:"),
+            "reps": len(rows) - warmup, "warmup": warmup,
+            "total_reps": len(rows), "url": ",".join(urls),
+            "urls": urls, "url_count": len(urls), "cdp_port": 9222,
+            "cpus": "2", "driver": "cdpdrive.py",
+            "network": "host (no VM, no DNAT)",
+            "resolve_all_to": "127.0.0.1", "host_kernel": "k",
+        }
+        if meta_overrides:
+            meta.update(meta_overrides)
+        with open(os.path.join(tmp, "run.json"), "w") as handle:
+            json.dump(meta, handle)
+        self.bind_host_rows(tmp, rows)
+        return tmp
+
+    @staticmethod
+    def bind_host_rows(host, rows=None):
+        if rows is None:
+            with open(os.path.join(host, "hostcdp.jsonl")) as handle:
+                rows = [json.loads(line) for line in handle]
+        with open(os.path.join(host, "run.json"), "rb") as handle:
+            run_json_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        with open(os.path.join(host, "hostcdp.jsonl"), "w") as handle:
+            for row in rows:
+                record = dict(row)
+                record["run_json_sha256"] = run_json_sha256
+                handle.write(json.dumps(record) + "\n")
+
+    def run_compare(self, run_dir, hosts=()):
         out = os.path.join(run_dir, "comparison.json")
+        argv = [sys.executable, os.path.join(HERE, "compare.py"),
+                "--vm-run", run_dir]
+        for label, host_dir in hosts:
+            argv.extend(["--host", f"{label}={host_dir}"])
+        argv.extend(["--out", out])
         return subprocess.run(
-            [sys.executable, os.path.join(HERE, "compare.py"),
-             "--vm-run", run_dir, "--out", out],
+            argv,
             capture_output=True, text=True, timeout=60), out
 
     def test_a_run_that_failed_its_gate_is_refused(self):
@@ -1006,6 +1155,18 @@ class ComparePublicationGate(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0,
                             "a run that did not pass its publication gate was quoted")
         self.assertFalse(os.path.exists(out))
+
+    def test_a_refusal_removes_an_earlier_comparison(self):
+        """A failed rerun beside an old comparison fails open."""
+        run = self.make_run(passed=False, vm_rows=[self.vm_rep(700.0)])
+        out = os.path.join(run, "comparison.json")
+        with open(out, "w") as handle:
+            json.dump({"publishable": True, "stale": True}, handle)
+        proc, returned_out = self.run_compare(run)
+        self.assertEqual(returned_out, out)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(out),
+                         "the refused rerun left an earlier comparison quotable")
 
     def test_an_unpublishable_run_is_refused(self):
         run = self.make_run(publishable=False, vm_rows=[self.vm_rep(700.0)])
@@ -1040,6 +1201,210 @@ class ComparePublicationGate(unittest.TestCase):
         self.assertEqual(rec["vm"]["blocking_ms"]["n"], 3,
                          "a rep that never said it succeeded reached the medians")
         self.assertEqual(rec["vm"]["blocking_ms"]["p50"], 700.0)
+
+    def test_analysis_must_name_the_current_reqbench_bytes(self):
+        rows = [self.vm_rep(v) for v in (600.0, 700.0, 800.0)]
+        run = self.make_run(vm_rows=rows)
+        path = os.path.join(run, "reqbench.jsonl")
+        with open(path) as handle:
+            before = handle.read()
+        after = before.replace('"blocking_ms": 800.0',
+                               '"blocking_ms": 900.0', 1)
+        self.assertNotEqual(after, before)
+        self.assertEqual(len(after), len(before),
+                         "this test must isolate the content digest from size")
+        with open(path, "w") as handle:
+            handle.write(after)
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "compare used records other than the gated input bytes")
+        self.assertIn("REFUSING", proc.stderr, proc.stderr)
+        self.assertIn("analysis_identity.inputs", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_analysis_without_an_input_identity_is_refused(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)], include_identity=False)
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("analysis_identity.inputs", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_analysis_input_identity_is_portable_by_content(self):
+        """Archived records move, so inode and absolute path are not identity."""
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        analysis_path = os.path.join(run, "analysis.json")
+        with open(analysis_path) as handle:
+            analysis = json.load(handle)
+        recorded = analysis["analysis_identity"]["inputs"][0]
+        recorded.update(path="/recording-host/reqbench.jsonl",
+                        realpath="/recording-host/reqbench.jsonl",
+                        device=123, inode=456, mtime_ns=1, ctime_ns=1)
+        with open(analysis_path, "w") as handle:
+            json.dump(analysis, handle)
+        proc, out = self.run_compare(run)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(out))
+
+    def valid_comparison(self, host_rows=None, meta_overrides=None, vm_rows=None,
+                         vm_warmup=None):
+        if vm_rows is None:
+            vm_rows = [self.vm_rep(v) for v in (600.0, 700.0, 800.0)]
+        if host_rows is None:
+            host_rows = [self.host_rep(0, True)] + [
+                self.host_rep(i, False, wall_ms=float(100 + i))
+                for i in range(1, 4)
+            ]
+        if vm_warmup is None:
+            vm_warmup = sum(row["warmup"] is True for row in host_rows)
+        run = self.make_run(vm_rows=vm_rows, warmup=vm_warmup)
+        host = self.make_host(host_rows, meta_overrides=meta_overrides)
+        return run, host
+
+    def test_a_complete_compatible_host_is_compared(self):
+        run, host = self.valid_comparison()
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            rec = json.load(handle)
+        self.assertEqual(rec["hosts"]["host"]["wall_ms"]["n"], 3)
+        self.assertEqual(rec["hosts"]["host"]["driver_total_ms"]["n"], 3)
+        identities = rec["input_identity"]
+        self.assertEqual(
+            identities["reqbench_jsonl"]["sha256"],
+            self.artifact_identity(os.path.join(run, "reqbench.jsonl"))["sha256"],
+        )
+        self.assertEqual(
+            identities["hosts"]["host"]["hostcdp_jsonl"]["sha256"],
+            self.artifact_identity(os.path.join(host, "hostcdp.jsonl"))["sha256"],
+        )
+
+    def test_a_truncated_successful_host_prefix_is_refused(self):
+        rows = [self.host_rep(0, True), self.host_rep(1, False),
+                self.host_rep(2, False)]
+        run, host = self.valid_comparison(host_rows=rows)
+        with open(os.path.join(host, "run.json")) as handle:
+            meta = json.load(handle)
+        meta.update(reps=3, warmup=1, total_reps=4)
+        with open(os.path.join(host, "run.json"), "w") as handle:
+            json.dump(meta, handle)
+        self.bind_host_rows(host)
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "compare treated a successful prefix as a completed host arm")
+        self.assertIn("total_reps", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_rows_must_belong_to_their_run_metadata(self):
+        """Separate file hashes do not prevent a metadata/rows splice."""
+        rows = [self.host_rep(0, True)] + [
+            self.host_rep(i, False, wall_ms=float(100 + i))
+            for i in range(1, 4)
+        ]
+        run, host = self.valid_comparison(host_rows=rows)
+        other = self.make_host(
+            rows, meta_overrides={"resolve_all_to": "203.0.113.9"})
+        with open(os.path.join(other, "hostcdp.jsonl"), "rb") as handle:
+            other_rows = handle.read()
+        with open(os.path.join(host, "hostcdp.jsonl"), "wb") as handle:
+            handle.write(other_rows)
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "rows from another run were attributed to this run.json")
+        self.assertIn("run.json", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_measured_count_must_match_the_vm_arm(self):
+        host_rows = [self.host_rep(0, True), self.host_rep(1, False),
+                     self.host_rep(2, False)]
+        run, host = self.valid_comparison(host_rows=host_rows)
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "different host and VM sample counts were ratioed")
+        self.assertIn("measured", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_warmup_count_must_match_the_vm_arm(self):
+        run, host = self.valid_comparison(vm_warmup=2)
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "host and VM runs with different warmup schedules were ratioed")
+        self.assertIn("warmup", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_corpus_must_match_the_vm_arm(self):
+        other = "https://different.example/"
+        rows = [self.host_rep(0, True, url=other)] + [
+            self.host_rep(i, False, url=other) for i in range(1, 4)
+        ]
+        run, host = self.valid_comparison(host_rows=rows)
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "different corpora were presented as one comparison")
+        self.assertIn("corpus", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_image_identity_must_match_the_vm_arm(self):
+        run, host = self.valid_comparison(meta_overrides={"image_id": "b" * 64})
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "different container images were ratioed")
+        self.assertIn("image_id", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_image_identity_must_be_present(self):
+        run, host = self.valid_comparison(meta_overrides={"image_id": None})
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("image_id", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_resolver_identity_must_match_the_vm_arm(self):
+        run, host = self.valid_comparison(
+            meta_overrides={"resolve_all_to": "203.0.113.9"})
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "a live/other resolver host run was compared to the replay VM run")
+        self.assertIn("resolver", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_resolver_identity_must_be_present_for_a_hostname_corpus(self):
+        run, host = self.valid_comparison(meta_overrides={"resolve_all_to": None})
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("resolver", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_legacy_total_count_is_interpreted_unambiguously(self):
+        """Before total_reps existed, run.json's reps field meant total.
+
+        The tracked 2026-08-30 host records use this documented schema:
+        reps=230, warmup=28 means 202 measured. The compatibility rule is
+        deterministic and must not reject those complete archived bytes.
+        """
+        run, host = self.valid_comparison()
+        with open(os.path.join(host, "run.json")) as handle:
+            meta = json.load(handle)
+        del meta["total_reps"]
+        meta["reps"] += meta["warmup"]
+        with open(os.path.join(host, "run.json"), "w") as handle:
+            json.dump(meta, handle)
+        self.bind_host_rows(host)
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            rec = json.load(handle)
+        self.assertEqual(rec["hosts"]["host"]["wall_ms"]["n"], 3)
+
+    def test_every_host_success_must_have_complete_driver_metrics(self):
+        rows = [self.host_rep(0, True)] + [
+            self.host_rep(i, False, complete_driver=(i != 2)) for i in range(1, 4)
+        ]
+        run, host = self.valid_comparison(host_rows=rows)
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "a missing driver measurement silently reduced its own n")
+        self.assertIn("total_ms", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
 
 
 class ProvenanceNamesBytes(unittest.TestCase):

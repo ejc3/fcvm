@@ -34,13 +34,19 @@ if ! [[ "$CDP_PORT" =~ ^[0-9]+$ ]] \
     echo "REFUSING: CDP_PORT must be in 1..65535" >&2
     exit 2
 fi
-for tool in awk cut pgrep podman python3 timeout; do
+for tool in awk cut date dirname mkdir pgrep podman python3 sed seq sha256sum \
+        sleep timeout tr uname; do
     command -v "$tool" >/dev/null 2>&1 \
         || { echo "REFUSING: '$tool' missing" >&2; exit 2; }
 done
 
-mkdir -p "$RESULTS"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+results_parent=$(dirname -- "$RESULTS")
+mkdir -p -- "$results_parent"
+if ! mkdir -- "$RESULTS" 2>/dev/null; then
+    log "REFUSING: RESULTS must name a new directory; could not claim $RESULTS"
+    exit 2
+fi
 
 container_owns_cdp() {
     timeout 30 podman exec "$CNAME" python3 -c '
@@ -177,6 +183,7 @@ fi
 resolve_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' \
     "${BENCH_RESOLVE_ALL_TO:-}")
 urls_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${URLS[@]}")
+run_id_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$RUNID")
 
 log "starting host container ($IMAGE) with CDP on $CDP_PORT"
 cpus_arg=()
@@ -201,9 +208,11 @@ until timeout 30 podman exec "$CNAME" test -f /run/bench-ready 2>/dev/null \
 done
 log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP warmup ($((WARMUP + REPS)) total) against $URL"
 
-# Record the measured configuration beside the numbers, not in prose.
+# Record the measured configuration beside the numbers, not in prose. Each row
+# below carries this file's exact SHA-256, so a copied jsonl cannot acquire a
+# different run's image, resolver, corpus, or count metadata by co-location.
 {
-    echo "{\"image\": \"$IMAGE\", \"image_id\": \"$(timeout 30 podman inspect --format '{{.Image}}' "$CNAME")\","
+    echo "{\"run_id\": $run_id_json, \"image\": \"$IMAGE\", \"image_id\": \"$(timeout 30 podman inspect --format '{{.Image}}' "$CNAME")\","
     echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"total_reps\": $((WARMUP + REPS)),"
     echo " \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
     echo " \"urls\": $urls_json, \"url_count\": ${#URLS[@]}, \"cpus\": $cpus_json,"
@@ -211,6 +220,7 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP
     echo " \"resolve_all_to\": $resolve_json,"
     echo " \"host_kernel\": \"$(uname -r)\", \"loadavg_at_start\": \"$la\"}"
 } > "$RESULTS/run.json"
+run_json_sha256=$(sha256sum "$RESULTS/run.json" | cut -d' ' -f1)
 
 OUT="$RESULTS/hostcdp.jsonl"
 : > "$OUT"
@@ -233,8 +243,8 @@ for rep in $(seq 0 $((TOTAL_REPS - 1))); do
     # non-numeric read becomes null rather than killing a run mid-loop.
     la_rep=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>/dev/null || true)
     [[ "$la_rep" =~ ^[0-9]+([.][0-9]+)?$ ]] || la_rep=null
-    printf '{"rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "loadavg1": %s, "url": %s, "driver": %s}\n' \
-        "$rep" "$ok" "$warm" "$wall_ms" "$la_rep" \
+    printf '{"run_json_sha256": "%s", "rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "loadavg1": %s, "url": %s, "driver": %s}\n' \
+        "$run_json_sha256" "$rep" "$ok" "$warm" "$wall_ms" "$la_rep" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$rep_url")" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$out")" >> "$OUT"
     [ "$ok" = true ] || { log "rep $rep FAILED ($rep_url): $out"; exit 4; }

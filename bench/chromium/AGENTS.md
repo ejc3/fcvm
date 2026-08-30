@@ -82,10 +82,17 @@ beside `reps` and `warmup`; a record without `total_reps` predates this and its
 (`statistics.median`, what `reqanalyze` publishes), so a reader can tell whether
 a ratio against a VM p50 is between two numbers of the same kind, and every
 jsonl row carries `loadavg1` the way `reqbench.py` stamps it, summarised over
-the measured reps as `loadavg1_measured`. `CPUS=` bounds the container's CPU budget
+the measured reps as `loadavg1_measured`. `run.json` also carries the producer's
+`run_id`, and every jsonl row carries the SHA-256 of the exact `run.json` bytes;
+comparison and resummarization refuse rows that are missing that binding or
+name different metadata. `CPUS=` bounds the container's CPU budget
 (`podman run --cpus`) and is recorded as `cpus` in `run.json`, null when unset,
 which means the whole machine: a host baseline on every core compared against a
 2-vCPU VM arm is two variables, not one.
+
+`RESULTS=` is an ownership claim, not a resume directory. `hostcdp.sh` creates
+its final component atomically and refuses an existing directory before writing
+anything, so a failed rerun cannot leave old `summary.json` beside new records.
 
 `bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
 answers what holds a page's load event inside a restored clone, on the
