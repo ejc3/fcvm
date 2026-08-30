@@ -65,7 +65,9 @@ validate_phases() {
     || { echo "BLOCKED: RUN_ID must be a 32-character lowercase hexadecimal owner ID" >&2; exit 2; }
 validate_phases
 
-for tool in install jq curl dig flock python3 podman pgrep setsid sudo tee timeout; do
+for tool in awk bash cat curl cut date dig dirname env flock git grep head install jq \
+        kill mkdir pgrep podman python3 rm rmdir sed seq setsid sha256sum sleep \
+        sudo systemctl tee timeout tr uname; do
     command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
 done
 
@@ -81,7 +83,27 @@ sudo -n install -d -o root -g root -m 0755 "$CORPUS_EXTRA_LOCK" \
 exec 9<"$CORPUS_EXTRA_LOCK"
 flock -n 9 || { echo "BLOCKED: another corpus-extra run owns $CORPUS_EXTRA_LOCK" >&2; exit 2; }
 
-mkdir -p "$RESULTS" "$LOGDIR"
+claim_output_dir() {
+    local path="$1" label="$2" parent
+    parent=$(dirname -- "$path") \
+        || { echo "BLOCKED: cannot identify parent of $label directory $path" >&2; return 2; }
+    mkdir -p -- "$parent" \
+        || { echo "BLOCKED: cannot create parent of $label directory $path" >&2; return 2; }
+    mkdir -- "$path" \
+        || { echo "BLOCKED: $label directory $path already exists or cannot be claimed" >&2; return 2; }
+}
+
+claim_output_dirs() {
+    claim_output_dir "$RESULTS" results || return 2
+    if claim_output_dir "$LOGDIR" log; then
+        return 0
+    fi
+    rmdir -- "$RESULTS" \
+        || echo "FAILED: could not release newly claimed empty results directory $RESULTS" >&2
+    return 2
+}
+
+claim_output_dirs
 
 campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.sh" | sed 's/^URLS="//; s/"$//')
 [ "$campaign_urls" = "$URLS" ] || {

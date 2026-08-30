@@ -142,6 +142,20 @@ def validate_args(args):
         die("--run-id must be a 32-character lowercase hexadecimal owner ID")
 
 
+def claim_results_dir(path):
+    """Claim a new result directory so records from two runs cannot mix."""
+    try:
+        os.makedirs(path)
+    except FileExistsError:
+        die(f"results directory {path} already exists; refusing to reuse prior output")
+    except OSError as exc:
+        die(f"cannot create results directory {path}: {exc}")
+    try:
+        os.mkdir(os.path.join(path, "logs"))
+    except OSError as exc:
+        die(f"cannot create the owned log directory under {path}: {exc}")
+
+
 def validate_snapshot_for_benchmark(generation, image, image_id, expected_dns):
     """Bind the snapshot tag to the image bytes and replay resolver in use."""
     if generation.get("image") != image:
@@ -1076,7 +1090,6 @@ def main():
     args.run_id = args.run_id or uuid.uuid4().hex
     validate_args(args)
     install_signal_cleanup()
-    os.makedirs(os.path.join(args.results, "logs"), exist_ok=True)
 
     for tool in ("podman", "sudo", "bash"):
         if not shutil.which(tool):
@@ -1126,12 +1139,13 @@ def main():
                      "firecracker, the namespace holder and pasta; a container's cgroup is "
                      "podman's own. MemAvailable delta from a quiesced pre-sample is recorded "
                      "beside them as an attribution-free check."}
-    with open(os.path.join(args.results, "run.json"), "w") as f:
+    claim_results_dir(args.results)
+    with open(os.path.join(args.results, "run.json"), "x") as f:
         json.dump(meta, f, indent=1)
 
     cg = CgroupSet(f"/sys/fs/cgroup/cbmem-{args.run_id}.slice")
     cells = []
-    out = open(os.path.join(args.results, "samples.jsonl"), "a")
+    out = open(os.path.join(args.results, "samples.jsonl"), "x")
     fcvm_side = None
     container_side = None
     failure = None
