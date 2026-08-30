@@ -202,6 +202,8 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertIsNotNone(cleanup, "run-owned container cleanup is gone")
         owner = "a" * 32
         peer = "b" * 32
+        token = "c" * 32
+        peer_token = "d" * 32
         names = (
             f"cbmem-{owner}-host1r1-0",
             f"hostcdp-{owner}-free",
@@ -216,14 +218,18 @@ class RunScopedContainerCleanup(unittest.TestCase):
             with open(podman, "w") as handle:
                 handle.write(
                     "#!/bin/sh\n"
+                    "last=\nfor arg do last=$arg; done\n"
                     "case $1 in\n"
-                    f"  ps) printf '%s\\n' {' '.join(names)} ;;\n"
-                    "  rm) printf '%s\\n' \"$4\" >>\"$REMOVED\" ;;\n"
+                    f"  ps) printf '%s\\n' {' '.join(repr(f'id{i} {name}') for i, name in enumerate(names))} ;;\n"
+                    "  inspect) case \"$last\" in\n"
+                    f"    id0) echo 'id0 {token}' ;; id1) echo 'id1 {token}' ;; id2) echo 'id2 {token}' ;;\n"
+                    f"    *) echo \"$last {peer_token}\" ;; esac ;;\n"
+                    "  rm) printf '%s\\n' \"$last\" >>\"$REMOVED\" ;;\n"
                     "  *) exit 64 ;;\n"
                     "esac\n")
             os.chmod(podman, 0o755)
             script = ("set -euo pipefail\n"
-                      f"RUN_ID={owner}\n"
+                      f"RUN_ID={owner}\nCONTAINER_OWNER_TOKEN={token}\n"
                       + cleanup.group(0) + "\n"
                       + "cleanup_owned_containers\n")
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"],
@@ -233,10 +239,12 @@ class RunScopedContainerCleanup(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             with open(removed) as handle:
                 actual = set(handle.read().splitlines())
-        self.assertEqual(actual, set(names[:3]),
+        self.assertEqual(actual, {"id0", "id1", "id2"},
                          "cleanup crossed the run ownership boundary")
         self.assertIn('--run-id "$RUN_ID"', source,
                       "the child and outer cleanup do not share an owner ID")
+        self.assertIn('--container-owner-token "$CONTAINER_OWNER_TOKEN"', source,
+                      "the child and outer cleanup do not share ownership proof")
         self.assertIn("stop_active_phase", match.group(1),
                       "cleanup can race a child that is still creating containers")
         self.assertLess(match.group(1).find("stop_active_phase"),
