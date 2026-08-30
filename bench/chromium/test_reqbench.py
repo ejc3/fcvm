@@ -81,6 +81,21 @@ def spawn_mixed_parent(linger_bin, fast_bin):
     return subprocess.Popen([sys.executable, "-c", code, linger_bin, fast_bin])
 
 
+def _execed_children(pid, want, parent_comm):
+    """One sample: (children, comms, has `pid` got `want` exec'd children?).
+
+    `comm` is the exec witness: `fork()` copies the parent's, `execve()`
+    replaces it, so a child whose comm still matches its parent's has not
+    exec'd yet.
+    """
+    kids = reqbench.children_of(pid)
+    comms = [reqbench.proc_comm(k) for k in kids]
+    settled = len(kids) >= want and all(
+        c is not None and c != parent_comm for c in comms
+    )
+    return kids, comms, settled
+
+
 def wait_for_execed_children(pid, want, timeout):
     """Wait until `pid` has `want` children that have finished exec'ing.
 
@@ -99,13 +114,8 @@ def wait_for_execed_children(pid, want, timeout):
     """
     parent_comm = reqbench.proc_comm(pid)
     deadline = time.monotonic() + timeout
-    kids, comms = [], []
     while True:
-        kids = reqbench.children_of(pid)
-        comms = [reqbench.proc_comm(k) for k in kids]
-        settled = len(kids) >= want and all(
-            c is not None and c != parent_comm for c in comms
-        )
+        kids, comms, settled = _execed_children(pid, want, parent_comm)
         if settled or time.monotonic() >= deadline:
             return kids, comms
         time.sleep(0.005)
@@ -149,14 +159,41 @@ def spawn_pdeathsig_parent_ignoring_sigterm(child_argv):
 
 
 def wait_for_child(pid, timeout=5.0):
-    """Block until `pid` has forked at least one child. Returns the child list."""
+    """Block until `pid` has a child that has finished exec'ing.
+
+    Waiting for the fork alone is not enough, and here the consequence is worse
+    than a misread name. `spawn_pdeathsig_parent` arms PR_SET_PDEATHSIG from
+    `preexec_fn`, which runs in the child after `fork` and before `execve`,
+    while `/proc/<pid>/task/<tid>/children` lists the child from the fork
+    onward. A caller that stops at "a child exists" can therefore kill the
+    parent while the child is still pre-`prctl`, and PR_SET_PDEATHSIG armed
+    after the parent has already exited never fires at all: the child is
+    reparented and outlives the teardown for good. The fixture then proves
+    nothing about the code under test, because the teardown aborts on the
+    survivor instead of reaching the branch the test came for.
+
+    Measured on one contended core, 30 reps of
+    TeardownNormalLeakVerdict.test_on_disk_leftovers_are_reaped_but_still_abort_the_run:
+    3 aborted with `left {pid: 'sleep'} alive after 2.0s`, `fcvm_exit_ms` 1.1
+    and `all_gone` false after the full budget. That is not scheduling latency,
+    it is a child that was never armed.
+
+    `execve` runs strictly after `preexec_fn`, so a child whose comm no longer
+    matches its parent's has already armed. Returns the child list.
+    """
+    parent_comm = reqbench.proc_comm(pid)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        kids = reqbench.children_of(pid)
-        if kids:
+    while True:
+        kids, comms, settled = _execed_children(pid, 1, parent_comm)
+        if settled:
             return kids
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"pid {pid} never forked a child that finished exec within "
+                f"{timeout}s (children={kids} comms={comms} "
+                f"parent_comm={parent_comm!r})"
+            )
         time.sleep(0.005)
-    raise AssertionError(f"pid {pid} never forked a child")
 
 
 def kill_tree(p):
@@ -699,11 +736,23 @@ class TeardownNormalLeakVerdict(unittest.TestCase):
                     data,
                     verify_disk_cleanup=True,
                 )
-            self.assertFalse(cm.exception.teardown["disk_cleanup_verified"])
+            # Name the abort before reading anything off it. `teardown_normal`
+            # raises this same type for a process survivor and for a failed
+            # child attribution, and neither reaches the disk stage, so neither
+            # carries `disk_cleanup_verified`. A bare subscript turns "the
+            # fixture lost a race" into `KeyError: 'disk_cleanup_verified'` and
+            # buries the message that says what actually went wrong.
+            teardown = cm.exception.teardown
+            self.assertIn("left on-disk state", str(cm.exception), teardown)
+            self.assertIn(
+                "disk_cleanup_verified",
+                teardown,
+                f"the disk abort must report its verdict: {teardown}",
+            )
+            self.assertFalse(teardown["disk_cleanup_verified"])
             self.assertFalse(os.path.exists(state))
             self.assertFalse(os.path.exists(state + ".lock"))
             self.assertFalse(os.path.exists(data))
-            self.assertIn("left on-disk state", str(cm.exception))
 
 
 class TeardownAttributionFailure(unittest.TestCase):
