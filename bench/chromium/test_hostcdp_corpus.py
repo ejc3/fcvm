@@ -2,7 +2,9 @@
 """hostcdp.sh runs the corpus schedule, not one URL repeated.
 
 The VM arm cycles its URL list with reqbench.url_for_rep -- urls[rep % len(urls)],
-rep counted from 0 across warmup and measured reps alike. A host control that
+rep counted from 0 across warmup and measured reps alike, over
+range(warmup + reps), so its --reps is the MEASURED count and --warmup is extra.
+hostcdp.sh reads REPS and WARMUP the same way. A host control that
 rendered ONE page while the VM arm rendered fourteen would not be a control for
 it, so these pin the cycle, the per-record url, the run.json fields, and the
 two-full-cycles warmup floor.
@@ -81,22 +83,24 @@ exec {sys.executable} "$@"
 
     def test_reps_cycle_the_list_the_way_the_vm_arm_does(self):
         """Red: every rep recorded the whole comma-separated spec as one URL."""
-        reps = 8
-        proc, urls, _, _ = self._run(",".join(URLS), reps, 6)
+        reps, warmup = 3, 6
+        proc, urls, _, _ = self._run(",".join(URLS), reps, warmup)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertEqual(urls, [URLS[rep % len(URLS)] for rep in range(reps)])
+        self.assertEqual(urls, [URLS[rep % len(URLS)] for rep in range(warmup + reps)])
 
     def test_each_record_carries_the_url_it_rendered(self):
         """Red: records had no url field, so per-URL medians were underivable."""
-        proc, _, _, d = self._run(",".join(URLS), 9, 6)
+        reps, warmup = 3, 6
+        proc, _, _, d = self._run(",".join(URLS), reps, warmup)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        rows = [json.loads(line) for line in open(os.path.join(d, "results", "hostcdp.jsonl"))]
+        with open(os.path.join(d, "results", "hostcdp.jsonl")) as handle:
+            rows = [json.loads(line) for line in handle]
         self.assertEqual([r["url"] for r in rows],
-                         [URLS[rep % len(URLS)] for rep in range(9)])
+                         [URLS[rep % len(URLS)] for rep in range(warmup + reps)])
 
     def test_run_json_records_the_parsed_corpus(self):
         """Red: KeyError 'urls' -- the record could not say what was rendered."""
-        _, _, meta, _ = self._run(",".join(URLS) + " , ", 6, 6)
+        _, _, meta, _ = self._run(",".join(URLS) + " , ", 3, 6)
         self.assertEqual(meta["urls"], URLS)
         self.assertEqual(meta["url_count"], 3)
 
@@ -104,19 +108,41 @@ exec {sys.executable} "$@"
         """One URL keeps today's contract: a one-element list, every rep on it."""
         proc, urls, meta, _ = self._run(URLS[0], 3, 1)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertEqual(urls, [URLS[0]] * 3)
+        self.assertEqual(urls, [URLS[0]] * 4)
         self.assertEqual(meta["urls"], [URLS[0]])
         self.assertEqual(meta["url_count"], 1)
 
-    def test_all_warmup_refuses_instead_of_dying_in_the_summary(self):
-        """Red: IndexError out of the summary after every rep had already run."""
-        proc, _, _, _ = self._run(URLS[0], 3, 3)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("all 3 reps were warmup", proc.stderr)
+    def test_reps_is_the_measured_count_like_the_vm_arm(self):
+        """Red: REPS counted warmup in, so the campaign's REPS=202 WARMUP=28
+        gave 174 measured host rows against the VM arm's 202 and a partial
+        final URL cycle. reqbench.py runs range(warmup + reps)."""
+        reps, warmup = 6, 6
+        proc, urls, meta, d = self._run(",".join(URLS), reps, warmup)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual(len(urls), warmup + reps)
+        self.assertEqual(urls, [URLS[rep % len(URLS)] for rep in range(warmup + reps)])
+        self.assertEqual(meta["reps"], reps)
+        self.assertEqual(meta["warmup"], warmup)
+        self.assertEqual(meta["total_reps"], warmup + reps)
+        with open(os.path.join(d, "results", "summary.json")) as handle:
+            summary = json.load(handle)
+        self.assertEqual(summary["n"], reps)
+        # A whole number of cycles measured means per_url is balanced, which is
+        # what makes an aggregate median comparable to the VM arm's.
+        self.assertEqual({u: v["n"] for u, v in summary["per_url"].items()},
+                         {u: reps // len(URLS) for u in URLS})
+
+    def test_zero_reps_refuses_before_running_anything(self):
+        """Red: the summary died on IndexError after the warmup reps had run."""
+        proc, urls, meta, _ = self._run(URLS[0], 0, 2)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("REPS must be >= 1", proc.stderr)
+        self.assertEqual(urls, [])
+        self.assertIsNone(meta)
 
     def test_multi_url_refuses_less_than_two_full_cycles_of_warmup(self):
         """Red: exit 0 -- a cold host arm would have been compared to a warm VM arm."""
-        proc, urls, meta, _ = self._run(",".join(URLS), 9, 5)
+        proc, urls, meta, _ = self._run(",".join(URLS), 3, 5)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("two full cycles", proc.stderr)
         self.assertEqual(urls, [])

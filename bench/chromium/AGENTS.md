@@ -72,7 +72,13 @@ record carries the `url` it rendered and `summary.json` carries `per_url`
 medians beside the aggregate, so a corpus host baseline is comparable to a
 corpus VM arm url by url. A multi-url run with fewer than two full cycles of
 warmup is refused rather than run, because a cold host arm against a warm VM
-arm is not a control for it. `CPUS=` bounds the container's CPU budget
+arm is not a control for it. `REPS=` is the MEASURED rep count and `WARMUP=` is
+extra, the way `reqbench.py` reads `--reps`/`--warmup`
+(`for rep in range(args.warmup + args.reps)`), so the campaign's `REPS=202
+WARMUP=28` hands both arms the same schedule instead of leaving the host with
+174 measured rows and a partial final cycle. `run.json` carries `total_reps`
+beside `reps` and `warmup`; a record without `total_reps` predates this and its
+`reps` is a total. `CPUS=` bounds the container's CPU budget
 (`podman run --cpus`) and is recorded as `cpus` in `run.json`, null when unset,
 which means the whole machine: a host baseline on every core compared against a
 2-vCPU VM arm is two variables, not one.

@@ -12,7 +12,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${IMAGE:-localhost/chromium-bench-req}"
-REPS="${REPS:-202}"
+# REPS is the MEASURED rep count and WARMUP is EXTRA, exactly as reqbench.py
+# reads --reps/--warmup ("for rep in range(args.warmup + args.reps)"), so the
+# campaign's REPS/WARMUP can be handed to both arms and produce the same
+# schedule. The default measured count is what REPS=202 WARMUP=2 used to yield.
+REPS="${REPS:-200}"
 WARMUP="${WARMUP:-2}"
 URL="${URL:-http://127.0.0.1:8000/medium.html}"
 CDP_PORT="${CDP_PORT:-9222}"
@@ -32,6 +36,9 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 # and empty members are dropped, matching reqbench.parse_urls.
 mapfile -t URLS < <(printf '%s' "$URL" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF')
 [ "${#URLS[@]}" -gt 0 ] || { log "REFUSING: URL names no urls"; exit 2; }
+# Nothing to summarise, and the summary would die on an empty list after the
+# warmup reps had already run.
+[ "$REPS" -ge 1 ] || { log "REFUSING: REPS must be >= 1 (it is the MEASURED count; WARMUP is extra), got $REPS"; exit 2; }
 # reqbench refuses a multi-URL run with fewer than two full cycles of warmup;
 # the same floor here keeps the two schedules the same shape rather than
 # comparing a warmed VM arm against a cold host arm.
@@ -107,12 +114,13 @@ until podman exec "$CNAME" test -f /run/bench-ready 2>/dev/null; do
     [ $((SECONDS - t0)) -lt 120 ] || { log "container never became ready"; podman logs "$CNAME" | tail -20 >&2; exit 1; }
     sleep 0.5
 done
-log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps ($WARMUP warmup) against $URL"
+log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP warmup ($((WARMUP + REPS)) total) against $URL"
 
 # Record the measured configuration beside the numbers, not in prose.
 {
     echo "{\"image\": \"$IMAGE\", \"image_id\": \"$(podman inspect --format '{{.Image}}' "$CNAME")\","
-    echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
+    echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"total_reps\": $((WARMUP + REPS)),"
+    echo " \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
     echo " \"urls\": $urls_json, \"url_count\": ${#URLS[@]}, \"cpus\": $cpus_json,"
     echo " \"driver\": \"cdpdrive.py\", \"network\": \"host (no VM, no DNAT)\","
     echo " \"resolve_all_to\": $resolve_json,"
@@ -121,7 +129,8 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps ($WARMUP warm
 
 OUT="$RESULTS/hostcdp.jsonl"
 : > "$OUT"
-for rep in $(seq 0 $((REPS - 1))); do
+TOTAL_REPS=$((WARMUP + REPS))
+for rep in $(seq 0 $((TOTAL_REPS - 1))); do
     rep_url="${URLS[$((rep % ${#URLS[@]}))]}"
     t_start=$(date +%s.%N)
     if out=$(python3 "$HERE/cdpdrive.py" "127.0.0.1:$CDP_PORT" "$rep_url" --format jpeg --nav-timing 2>&1); then
@@ -160,10 +169,11 @@ def pct(values, p):
 measured = [r["wall_ms"] for r in measured_rows]
 n = len(measured)
 if n == 0:
-    # Every rep was warmup. The reps ran, so the run looks successful; without
-    # this the summary dies on an IndexError after minutes of work and the
-    # record holds a jsonl with no summary beside it.
-    sys.exit(f"REFUSING: all {len(rows)} reps were warmup (REPS must exceed WARMUP); nothing to summarise")
+    # REPS >= 1 is enforced before any rep runs and measured == REPS, so this
+    # can only mean the jsonl and the warmup count disagree. Refuse rather than
+    # die on an IndexError after minutes of work with no summary beside the
+    # jsonl.
+    sys.exit(f"REFUSING: no measured reps in {len(rows)} rows (warmup={sys.argv[2]}); nothing to summarise")
 p50, p95 = pct(measured, 50), pct(measured, 95)
 print(f"host direct-CDP warm pool: n={n} p50={p50:.1f}ms p95={p95:.1f}ms "
       f"mean={statistics.mean(measured):.1f}ms failures=0")
