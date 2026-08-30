@@ -1106,9 +1106,10 @@ impl GuestBootInputs {
     ///   the sources name, because an IPv4 resolver is unreachable from a
     ///   routed guest. detect_ipv6_dns reads only the host's resolv.conf for
     ///   that, so the same selector runs here and the groups narrow to it.
-    ///   Its probe fallback (fd00:ec2::253) belongs to no source and leaves
-    ///   the groups whole, since that resolver does serve the VPC suffix the
-    ///   host carries and emptying the list would break it: see #886.
+    ///   Its probe fallback selects the AWS VPC resolver, which belongs to no
+    ///   source, so instead of a group the search domains narrow to the one
+    ///   AWS VPC internal zone the snapshot names, and to nothing when it
+    ///   names several (#886).
     /// * The four FUSE knobs are read only inside fc-agent's FUSE mount path
     ///   (fc-agent/src/fuse/mod.rs), and mount_fuse_volumes runs only when
     ///   the boot plan carries volumes (fc-agent/src/agent.rs), so a
@@ -1139,16 +1140,19 @@ impl GuestBootInputs {
             // to it exactly as bridged's do.
             //
             // When no source names an IPv6 server, detect_ipv6_dns falls back
-            // to probing the AWS VPC resolver at fd00:ec2::253, which belongs
-            // to no source and so has no group to narrow to. The groups are
-            // left whole there rather than emptied: that resolver does serve
-            // the VPC suffix the host's resolv.conf carries, and dropping it
-            // would break short-name resolution that works today. A suffix
-            // from an unrelated source still reaches it, which is #886.
-            if let Some(server) = crate::network::first_ipv6_nameserver(&self.dns) {
-                let groups = std::mem::take(&mut self.dns);
-                self.dns = crate::network::narrowed_to(groups, &server);
-            }
+            // to probing the AWS VPC resolver, which belongs to no source and
+            // so has no group to select. Narrowing to a group would empty the
+            // search list and break the VPC suffix that resolver does serve,
+            // and leaving the list whole sends an unrelated source's private
+            // suffix to it. Neither: the search domains narrow to the one AWS
+            // VPC internal zone the snapshot names, region label and all, and
+            // to nothing at all when it names several, because nothing in a
+            // resolv.conf snapshot says which of them this host owns (#886).
+            let groups = std::mem::take(&mut self.dns);
+            self.dns = match crate::network::first_ipv6_nameserver(&groups) {
+                Some(server) => crate::network::narrowed_to(groups, &server),
+                None => crate::network::search_narrowed_to_sole_aws_vpc_zone(groups),
+            };
         }
         if !has_fuse_volumes {
             self.fuse_readers = None;
@@ -2001,6 +2005,73 @@ mod tests {
         ]
     }
 
+    /// An EC2 host with no IPv6 nameserver, so routed falls back to probing.
+    /// The run file holds what AWS DHCP handed out (the VPC resolver and the
+    /// VPC's internal zone); /etc/resolv.conf holds an unrelated corporate
+    /// resolver and its private suffix.
+    fn ec2_host() -> [crate::network::ResolvSource; 2] {
+        [
+            resolv_source(
+                crate::network::RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch us-west-1.compute.internal\n",
+            ),
+            resolv_source(
+                crate::network::ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch corp.example\n",
+            ),
+        ]
+    }
+
+    /// The same EC2 host with a VPN link into another region's VPC, which
+    /// contributes that VPC's internal zone to the merged search list. AWS
+    /// hands an instance exactly one internal zone, so the second one belongs
+    /// to a VPC this host's resolver does not serve.
+    fn ec2_host_with_a_foreign_vpc_zone() -> [crate::network::ResolvSource; 2] {
+        [
+            resolv_source(
+                crate::network::RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch us-west-1.compute.internal\n",
+            ),
+            resolv_source(
+                crate::network::ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch eu-west-1.compute.internal corp.example\n",
+            ),
+        ]
+    }
+
+    /// The same pair with the foreign zone FIRST, which a merged
+    /// systemd-resolved list or a VPN link's own ordering can produce. Nothing
+    /// else differs, so a rule that answers differently for the two orderings
+    /// is reading search order as evidence of which link owns a domain.
+    fn ec2_host_with_a_foreign_vpc_zone_first() -> [crate::network::ResolvSource; 2] {
+        [
+            resolv_source(
+                crate::network::RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch eu-west-1.compute.internal\n",
+            ),
+            resolv_source(
+                crate::network::ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch us-west-1.compute.internal corp.example\n",
+            ),
+        ]
+    }
+
+    /// An EC2 host whose DHCP option set carries a custom `.compute.internal`
+    /// subdomain, with the region's real zone named after it. `foo` is not a
+    /// region, so this host names one VPC zone and not two.
+    fn ec2_host_with_a_custom_compute_internal_domain() -> [crate::network::ResolvSource; 2] {
+        [
+            resolv_source(
+                crate::network::RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch foo.compute.internal\n",
+            ),
+            resolv_source(
+                crate::network::ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch us-west-1.compute.internal\n",
+            ),
+        ]
+    }
+
     /// Bridged forwards ONE resolver, so the guest must see only the suffixes
     /// belonging to it. Keeping the whole merged search list expands a short
     /// name with a private suffix from a source whose resolver was never
@@ -2098,24 +2169,56 @@ mod tests {
         );
     }
 
-    /// The probe fallback: no source names an IPv6 server, so detect_ipv6_dns
-    /// probes the AWS VPC resolver at fd00:ec2::253, which belongs to no
-    /// source and has no group to narrow to. The list is left whole on purpose
-    /// rather than emptied, because that resolver does serve the VPC suffix
-    /// the host's resolv.conf carries and emptying it would break short-name
-    /// resolution that works today. A suffix from an unrelated source still
-    /// reaches that resolver: #886 tracks closing that, and this test exists so
-    /// the decision is deliberate rather than an oversight.
+    /// An EC2 host on routed's probe-fallback path: one source carries the
+    /// AWS DHCP option set's VPC suffix, another carries an unrelated private
+    /// suffix, and neither names an IPv6 server, so `detect_ipv6_dns` probes
+    /// the AWS VPC resolver.
+    ///
+    /// Measured on an EC2 instance in us-west-1: that resolver answers
+    /// `ip-10-0-1-49.us-west-1.compute.internal` with A 10.0.1.49, identically
+    /// to the host's own 10.0.0.2 and to 169.254.169.253, and returns NXDOMAIN
+    /// for `db.corp.example` carrying the root SOA, meaning it recursed the
+    /// private label into the public DNS on the way. So the host's own VPC
+    /// suffix belongs with that resolver and the unrelated one does not
+    /// (#886, CWE-200).
     #[test]
-    fn routed_without_an_ipv6_source_keeps_the_search_list() {
-        let inputs = GuestBootInputs::from_sources(None, &two_source_host(), &no_runtime_knobs())
+    fn routed_on_the_probe_path_forwards_only_the_suffixes_the_probed_resolver_serves() {
+        let inputs = GuestBootInputs::from_sources(None, &ec2_host(), &no_runtime_knobs())
             .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
 
-        assert_eq!(inputs.host_dns(), vec!["10.1.0.2", "192.0.2.53"]);
         assert_eq!(
             inputs.dns_search(),
-            vec!["corp.example", "lab.example"],
-            "nothing was selected, so nothing is narrowed away"
+            vec!["us-west-1.compute.internal"],
+            "the probed VPC resolver serves the VPC zone and NXDOMAINs the rest"
+        );
+        assert_eq!(
+            inputs.host_dns(),
+            vec!["10.0.0.2", "10.99.0.53"],
+            "the probe replaces the guest's resolver in the network config, so \
+             the groups' servers are not what narrows"
+        );
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
+            ..Default::default()
+        };
+        // What RoutedNetwork::setup puts in the network config when the probe
+        // answers: the probed server replaces the guest's resolver list.
+        let network_config = crate::network::NetworkConfig {
+            dns_server: Some(crate::network::AWS_VPC_IPV6_RESOLVER.to_string()),
+            ..Default::default()
+        };
+
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        assert!(
+            !boot_args.contains("corp.example"),
+            "a suffix the probed resolver recurses into the public DNS must not \
+             be emitted: {boot_args:?}"
+        );
+        assert!(
+            boot_args.contains("fcvm_dns_search=us-west-1.compute.internal"),
+            "the suffix the probed resolver does serve still reaches the guest: {boot_args:?}"
         );
     }
 
@@ -2143,6 +2246,121 @@ mod tests {
         );
         assert!(
             boot_args.contains("fcvm_dns_search=corp.example|lab.example"),
+            "every forwarded resolver keeps its suffixes: {boot_args:?}"
+        );
+    }
+
+    /// The probe path on a host carrying a second AWS VPC internal zone. AWS
+    /// gives an instance exactly one, so one of these came from another link,
+    /// and measured on an EC2 instance in us-west-1
+    /// `ip-10-0-1-49.eu-west-1.compute.internal` comes back NXDOMAIN with no
+    /// authority, the same verdict that resolver gives `db.corp.example`.
+    ///
+    /// Which of the two is this host's is not in the resolv.conf snapshot, and
+    /// order is not evidence: systemd-resolved merges every link's domains into
+    /// one file in an order of its own. So routed forwards neither and emits no
+    /// search list at all. The guest resolves by fully qualified name; the
+    /// alternative is a private label sent to a resolver that NXDOMAINs it,
+    /// with the usable zone dropped in its place.
+    #[test]
+    fn routed_on_the_probe_path_forwards_no_zone_when_the_host_names_two() {
+        for sources in [
+            ec2_host_with_a_foreign_vpc_zone(),
+            ec2_host_with_a_foreign_vpc_zone_first(),
+        ] {
+            let inputs = GuestBootInputs::from_sources(None, &sources, &no_runtime_knobs())
+                .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+
+            assert!(
+                inputs.dns_search().is_empty(),
+                "two VPC zones and no evidence of which is this host's, got {:?}",
+                inputs.dns_search()
+            );
+
+            let config = crate::firecracker::FirecrackerConfig {
+                host_dns: inputs.host_dns(),
+                dns_search: inputs.dns_search(),
+                ..Default::default()
+            };
+            let network_config = crate::network::NetworkConfig {
+                dns_server: Some(crate::network::AWS_VPC_IPV6_RESOLVER.to_string()),
+                ..Default::default()
+            };
+            let boot_args = build_runtime_boot_args(&network_config, &config);
+            assert!(
+                !boot_args.contains("fcvm_dns_search"),
+                "no search list may be emitted when the host's zone is unknown: {boot_args:?}"
+            );
+        }
+    }
+
+    /// The probe path on a host whose DHCP domain-name is a custom
+    /// `.compute.internal` subdomain rather than a region's zone, with the real
+    /// zone named after it. Measured on an EC2 instance in us-west-1,
+    /// `foo.compute.internal` is NXDOMAIN with no authority, so a suffix test
+    /// forwards a suffix that cannot resolve and drops the zone that can.
+    #[test]
+    fn routed_on_the_probe_path_skips_a_compute_internal_suffix_that_names_no_region() {
+        let inputs = GuestBootInputs::from_sources(
+            None,
+            &ec2_host_with_a_custom_compute_internal_domain(),
+            &no_runtime_knobs(),
+        )
+        .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+
+        assert_eq!(
+            inputs.dns_search(),
+            vec!["us-west-1.compute.internal"],
+            "foo names no region, so the host names one VPC zone, not two"
+        );
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
+            ..Default::default()
+        };
+        let network_config = crate::network::NetworkConfig {
+            dns_server: Some(crate::network::AWS_VPC_IPV6_RESOLVER.to_string()),
+            ..Default::default()
+        };
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        assert!(
+            !boot_args.contains("foo.compute.internal"),
+            "a region-less compute.internal suffix must not reach the guest: {boot_args:?}"
+        );
+        assert!(
+            boot_args.contains("fcvm_dns_search=us-west-1.compute.internal"),
+            "the host's own VPC zone still reaches the guest: {boot_args:?}"
+        );
+    }
+
+    /// The probe-path narrowing must stay confined to the probe path. Rootless
+    /// forwards every source's resolver, including the corporate one, so every
+    /// source's suffixes still resolve there and dropping the non-AWS suffix
+    /// would break short names that work today. Same host as
+    /// `routed_on_the_probe_path_forwards_only_the_suffixes_the_probed_resolver_serves`,
+    /// so an over-correction that narrows by domain rather than by mode is red
+    /// here.
+    #[test]
+    fn the_probe_narrowing_does_not_reach_a_mode_that_forwards_every_resolver() {
+        let inputs = GuestBootInputs::from_sources(None, &ec2_host(), &no_runtime_knobs())
+            .for_launch(crate::firecracker::FcNetworkMode::Rootless, false);
+
+        assert_eq!(inputs.host_dns(), vec!["10.0.0.2", "10.99.0.53"]);
+        assert_eq!(
+            inputs.dns_search(),
+            vec!["us-west-1.compute.internal", "corp.example"],
+            "the corporate resolver reaches this guest, so its suffix must too"
+        );
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
+            ..Default::default()
+        };
+        let boot_args = build_runtime_boot_args(&crate::network::NetworkConfig::default(), &config);
+        assert!(
+            boot_args.contains("fcvm_dns_search=us-west-1.compute.internal|corp.example"),
             "every forwarded resolver keeps its suffixes: {boot_args:?}"
         );
     }

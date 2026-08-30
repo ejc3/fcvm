@@ -306,6 +306,190 @@ pub fn first_ipv6_nameserver(groups: &[ResolverGroup]) -> Option<String> {
         .cloned()
 }
 
+/// The IPv6 address of the AWS VPC resolver, which routed mode probes when no
+/// resolv.conf source names an IPv6 server.
+///
+/// Spelled once, next to the rule for what this resolver serves, so the probe
+/// and the search-domain narrowing that depends on it cannot drift apart.
+pub const AWS_VPC_IPV6_RESOLVER: &str = "fd00:ec2::253";
+
+/// A search domain that is an AWS VPC internal zone.
+///
+/// The zone is `<region>.compute.internal` outside us-east-1, or `ec2.internal`
+/// in us-east-1, and it is the domain-name AWS DHCP hands the host. The
+/// `<region>` label is validated, not merely the suffix: `foo.compute.internal`
+/// is a custom domain-name, and the measurement on [`sole_aws_vpc_zone`]
+/// records the probed resolver answering it NXDOMAIN exactly as it answers an
+/// unrelated private suffix. Accepting it forwards a suffix that cannot
+/// resolve, and hides a real zone named after it.
+fn is_aws_vpc_internal_zone(domain: &str) -> bool {
+    let domain = normalized_zone(domain);
+    domain == "ec2.internal"
+        || domain
+            .strip_suffix(".compute.internal")
+            .is_some_and(|region| region != "us-east-1" && is_aws_region_label(region))
+}
+
+/// An AWS region name: two or more lowercase words of at least two letters,
+/// then a decimal number. `us-west-2` and `eu-central-1` through
+/// `ap-southeast-4`, `il-central-1`, `us-gov-west-1`, `cn-northwest-1`,
+/// `us-isob-east-1` and `eusc-de-east-1`.
+///
+/// The shape is loose about word LENGTHS and POSITIONS because the first
+/// version of this check was not, and that is what broke it. It required a
+/// two-letter first word followed by words of at least three letters, and
+/// claimed in this comment that every region in every partition has that form.
+/// The AWS European Sovereign Cloud region in Brandenburg has neither: `eusc`
+/// is four letters and `de` is two. An instance there carries a real
+/// `eusc-de-east-1.compute.internal` zone that the check called a custom
+/// domain-name, so the probe path dropped the host's own zone (#891).
+///
+/// That is the staleness failure a pattern was chosen over a list to avoid, so
+/// the argument has to be stated more carefully than it was. A list admits no
+/// non-region at all, which is the stronger guarantee, but it rejects a real
+/// zone the day AWS opens a region and reports nothing when it does. A pattern
+/// avoids that only where it encodes properties AWS's namespace actually has.
+/// Where it encodes a guess about them it goes stale on the same schedule and
+/// just as quietly, which is what a positional model of the name turned out to
+/// be. One uniform claim about every word makes fewer guesses to be wrong
+/// about, and `every_published_aws_region_label_is_recognized`
+/// checks the remaining ones against AWS's own region list rather than against
+/// the examples someone remembered.
+///
+/// The looseness is affordable because a false accept is bounded at both ends
+/// and a false reject is not. Beside a real zone a false accept makes the input
+/// ambiguous and [`sole_aws_vpc_zone`] forwards neither. Alone it is a
+/// `.compute.internal` name, which the probed resolver answers NXDOMAIN with no
+/// authority instead of recursing it into the public DNS the way it recurses
+/// `db.corp.example`, so the label reaches AWS's resolver and stops there. A
+/// false reject is a legitimate EC2 host silently losing its own zone for as
+/// long as nobody notices.
+///
+/// So `my-test-1.compute.internal` and `usa-west-1.compute.internal` are
+/// accepted, and that is the price. `foo.compute.internal`, the custom
+/// domain-name whose NXDOMAIN the measurement on [`sole_aws_vpc_zone`] records,
+/// still is not: it names no region at all.
+fn is_aws_region_label(label: &str) -> bool {
+    let parts: Vec<&str> = label.split('-').collect();
+    let [words @ .., number] = parts.as_slice() else {
+        return false;
+    };
+    words.len() >= 2
+        && words
+            .iter()
+            .all(|word| word.len() >= 2 && word.bytes().all(|b| b.is_ascii_lowercase()))
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A search domain compared the way DNS compares names: case-insensitively,
+/// with the trailing root label a presentation detail rather than a difference.
+fn normalized_zone(domain: &str) -> String {
+    domain.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The one AWS VPC internal zone this host's search list names, or `None` when
+/// it names none or several.
+///
+/// Measured on an EC2 instance in us-west-1, against [`AWS_VPC_IPV6_RESOLVER`]
+/// and against the same service's 10.0.0.2 and 169.254.169.253, all three
+/// returning identical verdicts:
+///
+/// | query | verdict |
+/// |---|---|
+/// | `ip-10-0-1-49.us-west-1.compute.internal` | NOERROR, A 10.0.1.49 |
+/// | `foo.compute.internal` | NXDOMAIN, no authority |
+/// | `ip-10-0-1-49.eu-west-1.compute.internal` | NXDOMAIN, no authority |
+/// | `db.corp.example` | NXDOMAIN carrying the root SOA |
+/// | `secret-host.internal.example.com` | NOERROR carrying example.com's SOA at Cloudflare |
+///
+/// AWS gives an instance exactly one internal zone and its resolver is
+/// authoritative for that one. Rows two and three are what a zone-shape test
+/// forwards and this resolver will not answer. Rows four and five are why a
+/// suffix it does not serve is dropped rather than merely tried later: it is
+/// recursed into the public DNS, which discloses the private label to AWS's
+/// resolver and then to the parent zone's authoritative servers (CWE-200), and
+/// still does not resolve. The kept zone is private to that resolver: the same
+/// `ip-10-0-1-49.us-west-1.compute.internal` is NXDOMAIN at 1.1.1.1.
+///
+/// Read off the search list, with no lookup of any kind.
+/// `GuestBootInputs::for_launch` runs before `RoutedNetwork::setup` probes, and
+/// its result is hashed into the snapshot key, so this has to be a pure
+/// function of the same resolv.conf snapshot the key is computed from. That is
+/// what rules out the alternatives: the instance's region from IMDS is an HTTP
+/// request and the resolver's own verdict is a DNS query, both then taken at
+/// key time, and on a host that is not on EC2 both have to time out first.
+///
+/// Which leaves a host that names two. Nothing in a resolv.conf snapshot says
+/// which link a search domain came from. Order does not: it decides how a
+/// short name is expanded, and systemd-resolved merges every link's domains
+/// into one file in an order of its own, so a VPN link's zone can precede the
+/// host's. Pairing a domain with a nameserver does not either, because that
+/// same merge collapses every link onto the 127.0.0.53 stub. So do not pick
+/// one. Forward none and let the guest use fully qualified names: losing
+/// short-name completion is something a guest can work around, and handing a
+/// private label to a resolver that NXDOMAINs it while dropping the zone that
+/// would have worked is not.
+fn sole_aws_vpc_zone(groups: &[ResolverGroup]) -> Option<String> {
+    let mut zones: Vec<String> = search_domains_of(groups)
+        .iter()
+        .filter(|domain| is_aws_vpc_internal_zone(domain))
+        .map(|domain| normalized_zone(domain))
+        .collect();
+    zones.sort();
+    zones.dedup();
+    match zones.as_slice() {
+        [zone] => Some(zone.clone()),
+        _ => None,
+    }
+}
+
+/// The groups carrying this host's AWS VPC internal zone and nothing else,
+/// servers untouched.
+///
+/// What routed mode applies when no source named an IPv6 server and
+/// `detect_ipv6_dns` fell back to probing [`AWS_VPC_IPV6_RESOLVER`]. That
+/// address belongs to no source, so there is no group to select and
+/// [`narrowed_to`] does not apply; the probed server replaces the guest's
+/// resolver list in the network config rather than in these groups, which is
+/// why only the search side narrows here.
+///
+/// `sole_aws_vpc_zone` holds which zone that is, and names none on a host
+/// carrying none or several. Three kinds of host therefore keep no search
+/// domain.
+///
+/// One is not on EC2 and lands here because "no source names an IPv6 server"
+/// is all `for_launch` can see. Nothing is lost: fd00:ec2::253 is a
+/// VPC-internal address that does not answer off EC2, so the probe returns
+/// None, routed hands the guest no IPv6 resolver at all, and the IPv4 servers
+/// it gets instead are unreachable from a routed guest. No suffix had a
+/// resolver to be completed against.
+///
+/// One is an EC2 instance whose VPC overrides the DHCP domain-name, so its own
+/// zone names no region even though its resolver may serve it.
+///
+/// One names two VPC zones, its own and another VPC's arriving over a VPN link
+/// or a merged resolved list, and the snapshot does not say which is which.
+///
+/// The last two lose short-name completion on routed. That is the conservative
+/// side of a decision made from the search list alone: keeping the list whole
+/// instead hands every private suffix to the AWS resolver on every host where
+/// the probe does answer, which is the leak this narrowing exists to close.
+pub fn search_narrowed_to_sole_aws_vpc_zone(groups: Vec<ResolverGroup>) -> Vec<ResolverGroup> {
+    let zone = sole_aws_vpc_zone(&groups);
+    groups
+        .into_iter()
+        .map(|group| ResolverGroup {
+            servers: group.servers,
+            search_domains: group
+                .search_domains
+                .into_iter()
+                .filter(|domain| zone.as_deref() == Some(normalized_zone(domain).as_str()))
+                .collect(),
+        })
+        .collect()
+}
+
 /// The groups narrowed to one server: those that named it, carrying only it.
 ///
 /// What a mode that forwards a single resolver applies. Dropping the other
@@ -674,6 +858,445 @@ mod tests {
         assert_eq!(narrowed.len(), 1, "only the group that named it survives");
         assert_eq!(narrowed[0].servers, vec!["2001:db8::53"]);
         assert_eq!(search_domains_of(&narrowed), vec!["lab.example"]);
+    }
+
+    /// Routed's probe fallback selects a resolver no source named, so there is
+    /// no group to narrow to. The search domains narrow instead, to the one
+    /// zone the probed AWS VPC resolver answers (#886).
+    #[test]
+    fn the_probed_aws_resolver_keeps_only_the_zone_it_serves() {
+        let groups = resolver_groups(&[
+            readable(
+                RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch us-west-1.compute.internal\n",
+            ),
+            readable(
+                ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch corp.example lab.internal\n",
+            ),
+        ]);
+
+        let narrowed = search_narrowed_to_sole_aws_vpc_zone(groups);
+        assert_eq!(
+            search_domains_of(&narrowed),
+            vec!["us-west-1.compute.internal"],
+            "the VPC zone resolves at the probed server; the other suffixes are \
+             recursed into the public DNS and never resolve"
+        );
+        assert_eq!(
+            narrowed
+                .iter()
+                .flat_map(|group| group.servers.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["10.0.0.2", "10.99.0.53"],
+            "the probed server replaces the guest's resolver in the network \
+             config, so the servers here are not the thing being narrowed"
+        );
+    }
+
+    /// Two AWS VPC internal zones on one host: its own, and another VPC's
+    /// arriving over a VPN link or a merged systemd-resolved list. Exactly one
+    /// is this host's and the probed resolver answers NXDOMAIN for the other,
+    /// measured in us-west-1 as `ip-10-0-1-49.eu-west-1.compute.internal`
+    /// NXDOMAIN with no authority. Nothing in the snapshot says which is which.
+    ///
+    /// Order does not, which is what this test holds: it runs the same pair
+    /// both ways round, and the previous rule of taking the first AWS-shaped
+    /// entry answered differently for each. resolv.conf order decides how a
+    /// short name is expanded, not which link contributed a domain, and
+    /// resolved merges every link's domains into one file with no marking.
+    ///
+    /// So neither is forwarded. The guest loses short-name completion and
+    /// recovers it by using a fully qualified name; guessing instead hands a
+    /// private label to a resolver that cannot answer it and drops the zone
+    /// that would have worked, which the guest cannot recover from.
+    #[test]
+    fn two_aws_vpc_zones_are_ambiguous_so_the_probe_narrowing_forwards_neither() {
+        for (first, second) in [
+            ("us-west-1.compute.internal", "eu-west-1.compute.internal"),
+            ("eu-west-1.compute.internal", "us-west-1.compute.internal"),
+            ("ec2.internal", "us-west-1.compute.internal"),
+        ] {
+            let groups = resolver_groups(&[
+                readable(
+                    RESOLV_CONF_SOURCES[0],
+                    &format!("nameserver 10.0.0.2\nsearch {first}\n"),
+                ),
+                readable(
+                    ETC_RESOLV_CONF,
+                    &format!("nameserver 10.99.0.53\nsearch {second} corp.example\n"),
+                ),
+            ]);
+
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(groups);
+            assert!(
+                search_domains_of(&narrowed).is_empty(),
+                "{first} before {second}: two VPC zones, and the snapshot does not \
+                 say which one this host owns, so neither may be forwarded"
+            );
+            assert_eq!(
+                narrowed
+                    .iter()
+                    .flat_map(|group| group.servers.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec!["10.0.0.2", "10.99.0.53"],
+                "the servers are untouched even when every suffix goes"
+            );
+        }
+    }
+
+    /// us-east-1 uses `ec2.internal`, not the region-shaped zone used by every
+    /// other AWS region. Treating the unused spelling as this host's zone
+    /// forwards a suffix the VPC resolver does not serve.
+    #[test]
+    fn us_east_1_compute_internal_is_not_a_vpc_zone() {
+        let groups = resolver_groups(&[readable(
+            RESOLV_CONF_SOURCES[0],
+            "nameserver 10.0.0.2\nsearch us-east-1.compute.internal\n",
+        )]);
+
+        assert!(
+            search_domains_of(&search_narrowed_to_sole_aws_vpc_zone(groups)).is_empty(),
+            "us-east-1's VPC resolver serves ec2.internal, not \
+             us-east-1.compute.internal"
+        );
+    }
+
+    /// The unused us-east-1 spelling is not a second VPC zone. If it appears
+    /// beside `ec2.internal`, the real zone remains unambiguous and survives.
+    #[test]
+    fn us_east_1_compute_internal_does_not_hide_ec2_internal() {
+        let groups = resolver_groups(&[readable(
+            RESOLV_CONF_SOURCES[0],
+            "nameserver 10.0.0.2\nsearch us-east-1.compute.internal ec2.internal\n",
+        )]);
+
+        assert_eq!(
+            search_domains_of(&search_narrowed_to_sole_aws_vpc_zone(groups)),
+            vec!["ec2.internal"],
+            "the unused spelling must not make us-east-1's real zone ambiguous"
+        );
+    }
+
+    /// `foo.compute.internal` is a custom DHCP domain-name, not a region's VPC
+    /// zone, and the measurement records the probed resolver answering it
+    /// NXDOMAIN with no authority. A suffix test takes it for this host's zone,
+    /// which forwards a suffix that cannot resolve AND drops the real zone
+    /// named after it. Validating the region label separates the two.
+    #[test]
+    fn a_compute_internal_suffix_naming_no_region_is_not_a_vpc_zone() {
+        let groups = resolver_groups(&[
+            readable(
+                RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch foo.compute.internal\n",
+            ),
+            readable(
+                ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch us-west-1.compute.internal\n",
+            ),
+        ]);
+
+        assert_eq!(
+            search_domains_of(&search_narrowed_to_sole_aws_vpc_zone(groups)),
+            vec!["us-west-1.compute.internal"],
+            "foo names no region, so it is not a second VPC zone, the input is \
+             not ambiguous, and the real zone behind it survives"
+        );
+    }
+
+    /// Several sources naming the SAME zone is one zone, not an ambiguity. A
+    /// merged resolved list repeats a link's domain, and a host whose run file
+    /// and /etc/resolv.conf both carry the DHCP domain-name names it twice.
+    /// Case and a trailing root label are presentation, so those spellings are
+    /// the same zone too and the count stays at one.
+    #[test]
+    fn one_zone_named_by_several_sources_is_not_two_zones() {
+        let groups = resolver_groups(&[
+            readable(
+                RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch us-west-1.compute.internal\n",
+            ),
+            readable(
+                ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch US-West-1.Compute.Internal. corp.example\n",
+            ),
+        ]);
+
+        assert_eq!(
+            search_domains_of(&search_narrowed_to_sole_aws_vpc_zone(groups)),
+            vec!["us-west-1.compute.internal", "US-West-1.Compute.Internal."],
+            "both spellings name the one zone, so it is forwarded in each \
+             source's own spelling and corp.example is not"
+        );
+    }
+
+    /// A host that is not on EC2 reaches the probe path whenever no source
+    /// names an IPv6 server, and `for_launch` cannot know the probe will fail
+    /// there. It carries no AWS VPC zone, so nothing is forwarded. Nothing is
+    /// lost: `detect_ipv6_dns` returns None on that host, routed gives the
+    /// guest no IPv6 resolver, and the IPv4 servers the guest is handed instead
+    /// are unreachable from a routed guest, so no suffix had a resolver to be
+    /// completed against. Keeping the list whole would send those private
+    /// suffixes to the AWS resolver on every host where the probe DOES answer.
+    #[test]
+    fn a_host_with_no_aws_vpc_zone_forwards_no_suffix_on_the_probe_path() {
+        let groups = resolver_groups(&[readable(
+            ETC_RESOLV_CONF,
+            "nameserver 10.99.0.53\nsearch corp.example lab.example\n",
+        )]);
+
+        let narrowed = search_narrowed_to_sole_aws_vpc_zone(groups);
+        assert!(
+            search_domains_of(&narrowed).is_empty(),
+            "no zone here is one the probed resolver serves"
+        );
+        assert_eq!(
+            narrowed
+                .iter()
+                .flat_map(|group| group.servers.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["10.99.0.53"],
+            "the servers are untouched even when every suffix goes"
+        );
+    }
+
+    /// The zone SHAPE, which is the `.compute.internal` suffix AND a region in
+    /// front of it, not a substring match and not a blanket `.internal`
+    /// allowance. us-east-1's VPC zone is `ec2.internal` and every other
+    /// region's is `<region>.compute.internal`; measured on an EC2 instance,
+    /// the VPC resolver NXDOMAINs `foo.compute.internal` and `host1.lab.internal`
+    /// alike, so the suffix on its own is not the test. Each domain is fed by
+    /// itself, so each is the sole candidate in its own case; a host naming
+    /// SEVERAL is what
+    /// `two_aws_vpc_zones_are_ambiguous_so_the_probe_narrowing_forwards_neither`
+    /// pins.
+    #[test]
+    fn only_an_aws_internal_zone_survives_the_probe_narrowing() {
+        let kept = [
+            "ec2.internal",
+            "us-west-1.compute.internal",
+            "eu-west-1.compute.internal",
+            // One pattern covers every partition. `eusc-de-east-1` is the AWS
+            // European Sovereign Cloud region whose shape the first version of
+            // that pattern did not have (#891);
+            // `every_published_aws_region_label_is_recognized`
+            // runs AWS's whole published list through this path.
+            "ap-southeast-4.compute.internal",
+            "il-central-1.compute.internal",
+            "us-gov-west-1.compute.internal",
+            "cn-northwest-1.compute.internal",
+            "us-isob-east-1.compute.internal",
+            "eusc-de-east-1.compute.internal",
+            "US-West-1.Compute.Internal",
+            "us-west-1.compute.internal.",
+        ];
+        let dropped = [
+            "corp.example",
+            "lab.internal",
+            "internal",
+            "compute.internal",
+            "notec2.internal",
+            "ec2.internal.example.com",
+            "compute.internal.example.com",
+            // Right suffix, and the label in front of it is not a region: a
+            // custom DHCP domain-name, a truncated or malformed region, an
+            // availability zone, and a hostname that already carries the zone.
+            "foo.compute.internal",
+            "dev.compute.internal",
+            "us.compute.internal",
+            "us-1.compute.internal",
+            "us-w-1.compute.internal",
+            "u-west-1.compute.internal",
+            "us-west.compute.internal",
+            "us-west-.compute.internal",
+            "us-west-1a.compute.internal",
+            "ip-10-0-1-49.us-west-1.compute.internal",
+            "us-east-1.compute.internal",
+        ];
+        // Shaped like a region and not one. `is_aws_region_label` admits these
+        // deliberately and says why: it no longer claims to know how long a
+        // region's words are, because claiming that is what rejected
+        // `eusc-de-east-1`. Asserted rather than left unstated so that
+        // tightening the pattern again is a deliberate act with a test to
+        // change, not a silent one.
+        let admitted_false_accepts = ["usa-west-1.compute.internal", "my-test-1.compute.internal"];
+
+        for domain in kept {
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+                servers: vec!["10.0.0.2".to_string()],
+                search_domains: vec![domain.to_string()],
+            }]);
+            assert_eq!(
+                search_domains_of(&narrowed),
+                vec![domain],
+                "{domain} is an AWS VPC internal zone"
+            );
+        }
+
+        for domain in dropped {
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+                servers: vec!["10.0.0.2".to_string()],
+                search_domains: vec![domain.to_string()],
+            }]);
+            assert!(
+                search_domains_of(&narrowed).is_empty(),
+                "{domain} is not a zone the probed resolver serves, and asking \
+                 it discloses the private label to the public DNS"
+            );
+        }
+
+        for domain in admitted_false_accepts {
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+                servers: vec!["10.0.0.2".to_string()],
+                search_domains: vec![domain.to_string()],
+            }]);
+            assert_eq!(
+                search_domains_of(&narrowed),
+                vec![domain],
+                "{domain} is the shape of a region, so it is forwarded. The \
+                 probed resolver NXDOMAINs it without recursing it into the \
+                 public DNS, which is the bound that makes the false accept \
+                 cheaper than rejecting a region AWS has opened"
+            );
+        }
+    }
+
+    /// Every region code AWS publishes, run through the region-label test,
+    /// plus the non-regions the zone test exists to reject.
+    ///
+    /// The list is the union of `partitions[].regions` in botocore's
+    /// `endpoints.json` as shipped with aws-cli 2.32.28, which is AWS's own
+    /// machine-readable region list. All 46 codes, all eight partitions.
+    /// Regenerate it with:
+    ///
+    /// ```text
+    /// python3 -c 'import json,sys; d=json.load(open(sys.argv[1]));
+    ///   print(sorted({r for p in d["partitions"] for r in p["regions"]}))' \
+    ///   $(dirname $(readlink -f $(command -v aws)))/awscli/botocore/data/endpoints.json
+    /// ```
+    ///
+    /// `eusc-de-east-1` is why this test exists. The first version of
+    /// [`is_aws_region_label`] required a two-letter first word and three-letter
+    /// words after it, and asserted in its own doc comment that "every region in
+    /// every partition has that form". The AWS European Sovereign Cloud region
+    /// in Brandenburg has neither: `eusc` is four letters and `de` is two. An
+    /// instance there carries `eusc-de-east-1.compute.internal` as its
+    /// DHCP domain-name, the shape test called it a custom domain-name, and the
+    /// probe path dropped the host's own zone.
+    ///
+    /// AWS documents the internal zone with no partition in it. The Route 53
+    /// autodefined-rules page lists `{Region-name}.compute.internal, for
+    /// example, eu-west-1.compute.internal. The us-east-1 Region doesn't use
+    /// this domain name.`, and lists the PUBLIC zone one line below as
+    /// `{Region-name}.compute.{amazon-domain-name}, for example,
+    /// eu-west-1.compute.amazonaws.com or cn-north-1.compute.amazonaws.com.cn`.
+    /// The partition domain is a placeholder in the public zone and absent from
+    /// the internal one, and us-east-1 is the only carve-out either page names
+    /// (EC2's hostname-types page says the same: "Format for an instance in any
+    /// other AWS Region: {private-ipv4-address.region}.compute.internal").
+    /// So `<region>.compute.internal` holds in aws-eusc as it does in aws-cn.
+    ///
+    /// The loop asserts that each published region code is RECOGNISED as one,
+    /// which is what [`is_aws_region_label`] decides. It is not a claim that
+    /// AWS serves every one of those zones: the same Route 53 page says
+    /// us-east-1 does not use `<region>.compute.internal`, and the zone it does
+    /// use is asserted separately below.
+    ///
+    /// The negatives are half the test. Without them a predicate that returned
+    /// `true` for everything would pass, which is the shape of a check that
+    /// cannot fail.
+    #[test]
+    fn every_published_aws_region_label_is_recognized() {
+        let regions = [
+            "af-south-1",
+            "ap-east-1",
+            "ap-east-2",
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-northeast-3",
+            "ap-south-1",
+            "ap-south-2",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ap-southeast-3",
+            "ap-southeast-4",
+            "ap-southeast-5",
+            "ap-southeast-6",
+            "ap-southeast-7",
+            "ca-central-1",
+            "ca-west-1",
+            "cn-north-1",
+            "cn-northwest-1",
+            "eu-central-1",
+            "eu-central-2",
+            "eu-isoe-west-1",
+            "eu-north-1",
+            "eu-south-1",
+            "eu-south-2",
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3",
+            "eusc-de-east-1",
+            "il-central-1",
+            "me-central-1",
+            "me-south-1",
+            "mx-central-1",
+            "sa-east-1",
+            "us-east-1",
+            "us-east-2",
+            "us-gov-east-1",
+            "us-gov-west-1",
+            "us-iso-east-1",
+            "us-iso-west-1",
+            "us-isob-east-1",
+            "us-isob-west-1",
+            "us-isof-east-1",
+            "us-isof-south-1",
+            "us-west-1",
+            "us-west-2",
+        ];
+
+        for region in regions {
+            assert!(
+                is_aws_region_label(region),
+                "{region} is a region AWS publishes today, so it has to read \
+                 as a region and not as a custom domain-name"
+            );
+        }
+
+        // us-east-1's own zone, which is the one carve-out both AWS pages name.
+        let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+            servers: vec!["10.0.0.2".to_string()],
+            search_domains: vec!["ec2.internal".to_string()],
+        }]);
+        assert_eq!(search_domains_of(&narrowed), vec!["ec2.internal"]);
+
+        for domain in [
+            "corp.example",
+            "lab.internal",
+            "internal",
+            "compute.internal",
+            "foo.compute.internal",
+            "us.compute.internal",
+            "us-1.compute.internal",
+            "us-west.compute.internal",
+            "us-west-.compute.internal",
+            "us-west-1a.compute.internal",
+            "ip-10-0-1-49.us-west-1.compute.internal",
+        ] {
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+                servers: vec!["10.0.0.2".to_string()],
+                search_domains: vec![domain.to_string()],
+            }]);
+            assert!(
+                search_domains_of(&narrowed).is_empty(),
+                "{domain} names no region, so it is not a VPC zone and asking \
+                 the probed resolver for it resolves nothing"
+            );
+        }
     }
 
     /// The other half of #875: the search list and the nameserver list have to
