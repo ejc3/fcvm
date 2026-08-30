@@ -55,8 +55,16 @@ KITESURF_CORPUS = {
 CONTROL_PAGES = frozenset({"noop", "noopsh"})
 
 
-def rendered_pages(reqs):
-    """The pages a run rendered, read off its own request records."""
+def benchmarked_pages(reqs):
+    """The run's page list, read off its own request records.
+
+    A page its schedule covered belongs to the workload whether or not every
+    render of it succeeded, so this does NOT filter on render_ok: the failures
+    section counts what failed, and dropping a failed page here would take a
+    14-URL corpus run down to 13 pages and withdraw a comparability claim that
+    still holds. The block below says "page list" rather than "rendered" for
+    the same reason.
+    """
     return sorted({r["url"] for r in reqs if r.get("url")} - CONTROL_PAGES)
 
 
@@ -73,20 +81,20 @@ def kitesurf_context(pages):
     """
     if set(pages) == set(KITESURF_CORPUS):
         workload = """\
-Comparable: the workload. This run rendered the 14-URL corpus behind the rows
-above, mirrored locally by bench/chromium/corpus_mirror.sh from
+Comparable: the workload. This run's page list is the 14-URL corpus behind the
+rows above, mirrored locally by bench/chromium/corpus_mirror.sh from
 kitesurf.cloudflare.app/corpus.txt, so both sides render the same page list
 rather than unrelated pages. Their two wall-time rows also measure the axis
 this report measures."""
     else:
         rendered = (
-            f"This run rendered {', '.join(pages)}, not the 14-URL corpus the "
-            "rows above were measured over, so the two page lists are unrelated "
-            "and no number here answers a row above page for page."
+            f"This run's page list is {', '.join(pages)}, not the 14-URL "
+            "corpus the rows above were measured over, so the two page lists "
+            "are unrelated and no number here answers a row above page for page."
             if pages
-            else "This run's records name no rendered page at all, so there is "
-            "nothing here to set beside the 14-URL corpus the rows above were "
-            "measured over."
+            else "This run's records name no page at all, so there is nothing "
+            "here to set beside the 14-URL corpus the rows above were measured "
+            "over."
         )
         # Wrapped rather than hand-broken: the page list comes from the records,
         # so its length is not known when this is written.
@@ -779,7 +787,7 @@ def cmd_finalize(args):
     w(md_table(["scenario", "page", "n", "ready p50 ms", "artifact p50/p95 ms",
                 "nav p50", "shot p50", "in-guest render p50"], rows))
 
-    w(kitesurf_context(rendered_pages(reqs)) + "\n")
+    w(kitesurf_context(benchmarked_pages(reqs)) + "\n")
 
     # ---- failures
     fails = [r for r in reqs if not r.get("ok") and r.get("phase", "").startswith(("p3", "burst", "sust"))]

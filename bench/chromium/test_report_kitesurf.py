@@ -290,7 +290,7 @@ class WorkloadComparability(unittest.TestCase):
     correct for a corpus run and appended unconditionally.
     """
 
-    def finalize(self, pages):
+    def finalize(self, pages, render_ok=True):
         """report.md for a run whose request records name exactly `pages`."""
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -309,8 +309,9 @@ class WorkloadComparability(unittest.TestCase):
         # page; a corpus run must stay corpus-backed with them present.
         for label in list(pages) + ["noop", "noopsh"]:
             name = f"p3__rootless-proxy__uffd-4k__{label}__r1.log"
+            outcome = "RENDER_OK" if render_ok else "RENDER_FAIL nav timeout"
             with open(os.path.join(d, "requests", name), "w") as f:
-                f.write("1000.0 BENCH_T0\n1001.0 RENDER_OK\n1002.0 BENCH_EXIT rc=0\n")
+                f.write(f"1000.0 BENCH_T0\n1001.0 {outcome}\n1002.0 BENCH_EXIT rc=0\n")
         report.cmd_finalize(argparse.Namespace(results_dir=d))
         with open(os.path.join(d, "report.md")) as f:
             md = f.read()
@@ -356,24 +357,56 @@ class WorkloadComparability(unittest.TestCase):
         )
         self.assertRegex(
             md,
-            r"(?i)this run rendered the (?:same |14-URL )",
+            r"(?i)this run's page list is the 14-URL corpus",
             "the shared-corpus claim is not bound to what this run rendered, so "
             "it says nothing about the report it sits in",
         )
         self.assertNotIn("Not comparable: the workload", md)
 
+    def test_a_page_whose_renders_all_failed_is_not_called_rendered(self):
+        """A page a run scheduled is part of its workload whether the render
+        succeeded or not, and the failures section below already counts what
+        failed. What the block may not do is tell the reader the run RENDERED a
+        page whose every record is a RENDER_FAIL: that is the same shape of
+        false statement as the workload claim this class exists for.
+        """
+        md = self.finalize(["minimal", "medium", "heavy"], render_ok=False)
+        self.assertNotRegex(
+            md,
+            r"(?i)\bthis run rendered\b",
+            "the block credits the run with rendering pages its own records show failing",
+        )
+        self.assertIn(
+            "heavy, medium, minimal",
+            md,
+            "a failed render does not take a page out of the run's page list",
+        )
+
+    def test_a_corpus_run_with_a_failed_page_still_states_the_shared_corpus(self):
+        """What makes the workloads comparable is the page list, not the success rate.
+
+        Dropping a page whose renders failed would take a 14-URL corpus run down
+        to 13 pages and silently withdraw a claim that still holds.
+        """
+        md = self.finalize(CORPUS_PAGES, render_ok=False)
+        self.assertIn(
+            "same page list",
+            md,
+            "a failed render withdrew a shared-corpus claim that still holds",
+        )
+
     def test_a_run_whose_records_name_no_page_claims_nothing(self):
         """A results dir with no request record is not a corpus run either."""
         md = self.finalize([])
         self.assertIn("Not comparable: the workload", md)
-        self.assertIn("no rendered page", md)
+        self.assertIn("name no page at all", md)
         self.assertNotIn("same page list", md)
 
     def test_a_run_whose_records_name_no_page_claims_nothing(self):
         """A results dir with no request record is not a corpus run either."""
         md = self.finalize([])
         self.assertIn("Not comparable: the workload", md)
-        self.assertIn("no rendered page", md)
+        self.assertIn("name no page at all", md)
         self.assertNotIn("same page list", md)
 
 
