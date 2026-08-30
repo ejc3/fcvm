@@ -624,9 +624,27 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                 seen[key] = value
         return seen
 
-    def _run(self, script, env, timeout=60):
-        return subprocess.run(["bash", "-c", script], env=env,
+    def _run(self, script, env, timeout=60, prefix=()):
+        return subprocess.run([*prefix, "bash", "-c", script], env=env,
                               capture_output=True, text=True, timeout=timeout)
+
+    def _mode_bits_enforced(self):
+        """A prefix that makes `chmod 0444` deny writes at every uid.
+
+        Mode bits only stop a process that lacks CAP_DAC_OVERRIDE, and root
+        keeps it, so under a root suite the write a test is trying to fail
+        succeeded and the test asserted nothing. Dropping the capability from
+        the bounding set costs one exec and leaves the scenario otherwise
+        identical. An unprivileged run needs no prefix and cannot use one:
+        applying a bounding set takes CAP_SETPCAP.
+        """
+        if os.geteuid() != 0:
+            return []
+        if shutil.which("setpriv") is None:
+            self.fail("BLOCKED: running as root without setpriv, so "
+                      "CAP_DAC_OVERRIDE cannot be dropped and the mode bits "
+                      "below would not deny the write this test is about")
+        return ["setpriv", "--bounding-set=-dac_override,-dac_read_search"]
 
     def test_verify_carries_the_corpus_resolver_knobs_and_keeps_its_evidence(self):
         """run_verify must hand reqbench every corpus host and URL, the replay
@@ -919,6 +937,12 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         left, so the campaign was clean with a later bracket's record never
         written.
 
+        The record is made unwritable by mode bits, which only bind a process
+        without CAP_DAC_OVERRIDE, so the run drops that capability. Under a
+        root suite the append had otherwise succeeded and this asserted
+        nothing: `0 != 7 : a bracket whose record could not be written was
+        accepted` (Codex, 2026-08-30).
+
         RED BEFORE THE FIX: exit 0 and VERIFIED, with replay-queries.log still
         holding nothing but the earlier bracket's line.
         """
@@ -937,7 +961,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                       f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
                       'run_verify before-run || { echo REFUSED; exit 7; }\necho VERIFIED\n')
             try:
-                result = self._run(script, env)
+                result = self._run(script, env, prefix=self._mode_bits_enforced())
             finally:
                 os.chmod(record, 0o644)
             self.assertEqual(result.returncode, 7,
@@ -1053,6 +1077,12 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         into verify-dns-<stage>.json was unchecked, so when it failed the
         `jq -e` that follows validated whatever copy was already there.
 
+        The stale copy is held down by mode bits, so the run drops
+        CAP_DAC_OVERRIDE. Root overwrote it instead, and the fresh evidence
+        then failed `jq -e` for the ordinary reason: green against a campaign
+        with both the `rm -f` and the checked `cp` removed, which is the
+        regression this pins.
+
         RED BEFORE THE FIX: VERIFIED printed, exit 0, over a bracket whose
         fresh evidence says passed=false.
         """
@@ -1068,7 +1098,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                       f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
                       'run_verify pre || { echo REFUSED; exit 7; }\necho VERIFIED\n')
             try:
-                result = self._run(script, env)
+                result = self._run(script, env, prefix=self._mode_bits_enforced())
             finally:
                 if os.path.exists(stale):
                     os.chmod(stale, 0o644)
