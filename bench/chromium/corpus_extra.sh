@@ -180,6 +180,7 @@ esac
 DNSMASQ_WAS_ACTIVE=no
 systemctl is-active --quiet dnsmasq 2>/dev/null && DNSMASQ_WAS_ACTIVE=yes
 SERVE_PID=""
+SERVE_START_TIME=""
 ACTIVE_PHASE_PID=""
 
 run_logged() {
@@ -221,15 +222,61 @@ stop_active_phase() {
 }
 
 stop_corpus_serve() {
+    local rc alive=0
     [ -n "$SERVE_PID" ] || return 0
-    if sudo kill -0 "$SERVE_PID" 2>/dev/null; then
+    set +e
+    sudo python3 "$BENCH/owned_process.py" signal \
+        "$SERVE_PID" "$SERVE_START_TIME" 15 >/dev/null 2>&1
+    rc=$?
+    set -e
+    case "$rc" in
+        0)
         say "stopping corpus_serve ($SERVE_PID)"
-        sudo kill "$SERVE_PID" 2>/dev/null || true
-        for _ in $(seq 1 50); do sudo kill -0 "$SERVE_PID" 2>/dev/null || break; sleep 0.1; done
-        sudo kill -9 "$SERVE_PID" 2>/dev/null || true
+        ;;
+        3) ;;
+        *) echo "FAILED: cannot signal owned corpus_serve process $SERVE_PID" >&2; return 1 ;;
+    esac
+    for _ in $(seq 1 50); do
+        set +e
+        sudo python3 "$BENCH/owned_process.py" signal \
+            "$SERVE_PID" "$SERVE_START_TIME" 0 >/dev/null 2>&1
+        rc=$?
+        set -e
+        case "$rc" in
+            0) alive=1; sleep 0.1 ;;
+            3) alive=0; break ;;
+            *) echo "FAILED: cannot verify owned corpus_serve process $SERVE_PID" >&2; return 1 ;;
+        esac
+    done
+    if [ "$alive" -eq 1 ]; then
+        say "corpus_serve $SERVE_PID did not exit; escalating to SIGKILL"
+        set +e
+        sudo python3 "$BENCH/owned_process.py" signal \
+            "$SERVE_PID" "$SERVE_START_TIME" 9 >/dev/null 2>&1
+        rc=$?
+        set -e
+        case "$rc" in 0|3) ;; *) return 1 ;; esac
+        for _ in $(seq 1 50); do
+            set +e
+            sudo python3 "$BENCH/owned_process.py" signal \
+                "$SERVE_PID" "$SERVE_START_TIME" 0 >/dev/null 2>&1
+            rc=$?
+            set -e
+            case "$rc" in
+                0) sleep 0.1 ;;
+                3) alive=0; break ;;
+                *) return 1 ;;
+            esac
+        done
+        [ "$alive" -eq 0 ] \
+            || { echo "FAILED: owned corpus_serve process $SERVE_PID survived SIGKILL" >&2; return 1; }
     fi
     for _ in $(seq 1 50); do [ -f "$RESULTS/corpus-serve.status" ] && break; sleep 0.1; done
-    [ -f "$RESULTS/corpus-serve.status" ] && say "corpus_serve exit status: $(tr -d '[:space:]' <"$RESULTS/corpus-serve.status")"
+    [ -f "$RESULTS/corpus-serve.status" ] \
+        || { echo "FAILED: corpus_serve left no exit status" >&2; return 1; }
+    say "corpus_serve exit status: $(tr -d '[:space:]' <"$RESULTS/corpus-serve.status")"
+    SERVE_PID=""
+    SERVE_START_TIME=""
 }
 
 require_corpus_serve_clean() {
@@ -307,6 +354,8 @@ sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.
 for _ in $(seq 1 50); do [ -s "$SERVE_PIDFILE" ] && break; sleep 0.1; done
 SERVE_PID=$(cat "$SERVE_PIDFILE" 2>/dev/null || true)
 [ -n "$SERVE_PID" ] || { echo "BLOCKED: corpus_serve did not start" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
+SERVE_START_TIME=$(sudo python3 "$BENCH/owned_process.py" identity "$SERVE_PID") \
+    || { echo "BLOCKED: cannot record corpus_serve process identity for pid $SERVE_PID" >&2; exit 3; }
 sudo kill -0 "$SERVE_PID" 2>/dev/null || {
     echo "BLOCKED: corpus_serve pid $SERVE_PID is not alive" >&2
     cat "$LOGDIR/corpus_serve.log" >&2
