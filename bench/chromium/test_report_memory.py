@@ -11,10 +11,16 @@ containers, so a zero on one side alone moves the published ratio.
 Run: python3 -m unittest test_report_memory -v
 """
 
+import contextlib
+import io
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -103,6 +109,69 @@ class CgroupProcs(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(report.cgroup_procs(os.path.join(tmp, "absent")), [])
             self.assertEqual(report.cgroup_procs(write_cgroup(os.path.join(tmp, "empty"))), [])
+
+
+class PodmanCgroupIdentity(unittest.TestCase):
+    """A container sample belongs only to the cgroup podman identifies.
+
+    An inspect failure and an empty CgroupPath used to become
+    ``/sys/fs/cgroup``. The recursive process walk then measured the whole host
+    while ``pool_containers`` still named the requested pool, so every
+    downstream nonzero/count gate accepted it.
+    """
+
+    @staticmethod
+    def args():
+        return SimpleNamespace(
+            cgroup_root=None,
+            cgroup_prefix=None,
+            state_dir=None,
+            name_prefix=None,
+            podman_prefix="owned-",
+            extra=None,
+        )
+
+    def drive(self, inspect_result, cgroup_root="/sys/fs/cgroup"):
+        def run(cmd, **_kwargs):
+            if cmd[:2] == ["podman", "ps"]:
+                return subprocess.CompletedProcess(cmd, 0, "owned-one\n", "")
+            if cmd[:2] == ["podman", "inspect"]:
+                return inspect_result
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        output = io.StringIO()
+        with mock.patch.object(subprocess, "run", run), \
+             mock.patch.object(report, "CGROUP_ROOT", cgroup_root, create=True), \
+             mock.patch.object(report, "read_meminfo", return_value={}), \
+             mock.patch.object(report, "cgroup_procs", return_value=[4001]), \
+             mock.patch.object(report, "pss_kb_of_pid", return_value=64), \
+             mock.patch.object(report, "cgroup_bytes", return_value=4096), \
+             contextlib.redirect_stdout(output):
+            report.cmd_sample(self.args())
+        return json.loads(output.getvalue())
+
+    def test_failed_inspect_refuses_the_sample_instead_of_measuring_the_host(self):
+        failed = subprocess.CompletedProcess(
+            ["podman", "inspect"], 125, "", "container disappeared")
+        with self.assertRaises(SystemExit) as caught:
+            self.drive(failed)
+        self.assertNotIn(caught.exception.code, (0, None))
+
+    def test_empty_cgroup_path_refuses_the_sample_instead_of_measuring_the_host(self):
+        empty = subprocess.CompletedProcess(["podman", "inspect"], 0, "\n", "")
+        with self.assertRaises(SystemExit) as caught:
+            self.drive(empty)
+        self.assertNotIn(caught.exception.code, (0, None))
+
+    def test_existing_non_root_cgroup_is_measured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "owned.slice"))
+            valid = subprocess.CompletedProcess(
+                ["podman", "inspect"], 0, "/owned.slice\n", "")
+            rec = self.drive(valid, cgroup_root=tmp)
+        self.assertEqual(rec["pool_containers"], 1)
+        self.assertEqual(rec["pool_procs"], 1)
+        self.assertEqual(rec["pool_pss_kb"], 64)
 
 
 if __name__ == "__main__":

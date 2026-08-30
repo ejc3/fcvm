@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -415,9 +416,10 @@ class ContainerSide:
     def __init__(self, args, run_id):
         self.args = args
         self.run_id = run_id
+        self.owned = set()
 
     def prefix(self, cell_tag):
-        return f"cbmem-{cell_tag}-"
+        return f"cbmem-{self.run_id}-{cell_tag}-"
 
     def bring_up(self, n, cell_tag):
         live = []
@@ -430,6 +432,7 @@ class ContainerSide:
                     self.args.image])
             if r.returncode != 0:
                 die(f"podman run {name} failed: {r.stderr.strip()}")
+            self.owned.add(name)
             live.append({"i": i, "name": name})
         for c in live:
             deadline = time.monotonic() + 180
@@ -450,15 +453,24 @@ class ContainerSide:
         return live
 
     def tear_down(self, live):
+        names_owned = {c["name"] for c in live}
         for c in live:
             sh(["podman", "rm", "-f", c["name"]])
         deadline = time.monotonic() + 120
+        remaining = set(names_owned)
         while time.monotonic() < deadline:
             names = sh(["podman", "ps", "-a", "--format", "{{.Names}}"]).stdout.split()
-            if not [n for n in names if n.startswith("cbmem-")]:
+            remaining = names_owned.intersection(names)
+            if not remaining:
+                self.owned.difference_update(names_owned)
                 return
             time.sleep(0.5)
-        die("containers outlived their removal; a later cell would be contaminated")
+        die(f"owned containers outlived their removal: {', '.join(sorted(remaining))}; "
+            "a later cell would be contaminated")
+
+    def stop_all(self):
+        if self.owned:
+            self.tear_down([{"name": name} for name in sorted(self.owned)])
 
     def sample(self, extra, cell_tag):
         return sample(extra, podman_prefix=self.prefix(cell_tag))
@@ -476,6 +488,19 @@ def slope_intercept(xs, ys):
         return None, None
     slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
     return slope, my - slope * mx
+
+
+def build_cell_schedule(sides, ns, reps, seed):
+    """Pair the two sides at each (N, rep), with a reproducible shuffled order."""
+    rng = random.Random(seed)
+    pairs = [(n, rep) for n in ns for rep in range(1, reps + 1)]
+    rng.shuffle(pairs)
+    schedule = []
+    for n, rep in pairs:
+        pair_sides = list(sides)
+        rng.shuffle(pair_sides)
+        schedule.extend((side, n, rep) for side in pair_sides)
+    return schedule
 
 
 def empty_bases(s, side):
@@ -698,7 +723,7 @@ def cputime_host_arm(args, res):
     refused in `res`. It never writes cputime.json; run_cputime does that
     whatever happens here.
     """
-    name = f"cbmem-cpu-{args.run_id[:8]}"
+    name = f"cbmem-cpu-{args.run_id}"
     sh(["podman", "rm", "-f", name])
     r = sh(["podman", "run", "-d", "--name", name, "--network", "host",
             "-e", f"BENCH_RESOLVE_ALL_TO={args.container_resolve_to}", args.image])
@@ -780,7 +805,8 @@ def main():
     p.add_argument("--urls", required=True, help="comma-separated corpus")
     p.add_argument("--ns", default="1,2,4,8")
     p.add_argument("--reps", type=int, default=2)
-    p.add_argument("--sides", default="fcvm,container")
+    p.add_argument("--seed", type=int, default=20260830,
+                   help="recorded seed for the interleaved memory-cell schedule")
     p.add_argument("--fcvm", default=os.path.join(os.path.dirname(os.path.dirname(HERE)), "target/release/fcvm"))
     p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
     p.add_argument("--cdp-port", type=int, default=9222)
@@ -806,7 +832,7 @@ def main():
     if not os.access(args.fcvm, os.X_OK):
         die(f"no fcvm binary at {args.fcvm}")
     snap = os.path.join(args.data_root, "snapshots", args.tag, "config.json")
-    if "fcvm" in args.sides and not os.path.exists(snap):
+    if not os.path.exists(snap):
         die(f"no golden snapshot at {snap}")
     if sh(["sudo", "-n", "true"]).returncode != 0:
         die("passwordless sudo is required to create the per-instance cgroups")
@@ -815,6 +841,8 @@ def main():
         die(f"stray fcvm/firecracker processes would be charged to this measurement:\n{stray}")
     la = wait_quiet(args.quiet_limit, args.quiet_wait)
 
+    schedule = build_cell_schedule(
+        ["fcvm-clone", "host-container"], args.ns, args.reps, args.seed)
     meta = {"run_id": args.run_id, "started": time.time(), "loadavg1_at_start": la,
             "host_kernel": os.uname().release, "machine": os.uname().machine,
             "snapshot": args.tag, "image": args.image,
@@ -823,6 +851,9 @@ def main():
             "report_py_sha256": sh(["sha256sum", REPORT]).stdout.split()[0],
             "cdpdrive_sha256": sh(["sha256sum", CDPDRIVE]).stdout.split()[0],
             "urls": args.urls, "ns": args.ns, "reps": args.reps,
+            "schedule_seed": args.seed,
+            "schedule": [{"side": side, "n": n, "rep": rep}
+                         for side, n, rep in schedule],
             "uffd_mode": args.uffd_mode, "uffd_prefetch": args.uffd_prefetch,
             "basis": "cgroup memory.current and PSS summed over EXACTLY that cgroup's "
                      "process set, on both sides: an fcvm clone's leaf cgroup holds fcvm, "
@@ -836,24 +867,22 @@ def main():
     cells = []
     out = open(os.path.join(args.results, "samples.jsonl"), "a")
     fcvm_side = None
+    container_side = None
     try:
-        sides = []
-        if "fcvm" in args.sides:
-            cg.setup()
-            fcvm_side = FcvmSide(args, cg, args.run_id)
-            fcvm_side.start_serve()
-            sides.append(fcvm_side)
-        if "container" in args.sides:
-            sides.append(ContainerSide(args, args.run_id))
-        for side in sides:
-            for n in args.ns:
-                for rep in range(1, args.reps + 1):
-                    cells.append(run_cell(side, args, n, rep, out))
+        cg.setup()
+        fcvm_side = FcvmSide(args, cg, args.run_id)
+        fcvm_side.start_serve()
+        container_side = ContainerSide(args, args.run_id)
+        sides = {fcvm_side.name: fcvm_side, container_side.name: container_side}
+        for side_name, n, rep in schedule:
+            cells.append(run_cell(sides[side_name], args, n, rep, out))
         if args.cputime_reps:
             cpu = run_cputime(args, cg, fcvm_side,
                               os.path.join(args.results, "cputime.json"))
             print(json.dumps(cpu, indent=1))
     finally:
+        if container_side:
+            container_side.stop_all()
         if fcvm_side:
             fcvm_side.stop_serve()
         cg.rm_all()

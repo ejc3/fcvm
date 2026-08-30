@@ -20,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -27,6 +29,8 @@ sys.path.insert(0, HERE)
 import corpus_mem  # noqa: E402
 
 EXTRA = os.path.join(HERE, "corpus_extra.sh")
+CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
+HOSTCDP = os.path.join(HERE, "hostcdp.sh")
 
 
 class Completed:
@@ -34,6 +38,113 @@ class Completed:
 
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+class CorpusExtraSchedule(unittest.TestCase):
+    """The host control and VM campaign execute the same measured schedule."""
+
+    @staticmethod
+    def default(path, name):
+        with open(path) as handle:
+            source = handle.read()
+        match = re.search(
+            rf'^{name}="\$\{{{name}:-([0-9]+)\}}"', source, re.MULTILINE)
+        if not match:
+            raise AssertionError(f"no numeric {name} default in {path}")
+        return int(match.group(1))
+
+    def test_host_control_measured_reps_match_the_vm_campaign(self):
+        self.assertEqual(self.default(EXTRA, "REPS"), self.default(CAMPAIGN, "REPS"),
+                         "the host and VM arms weight the 14-page corpus differently")
+
+
+class MemoryCellSchedule(unittest.TestCase):
+    """Matched sides stay adjacent in a reproducible, recorded cell schedule."""
+
+    def test_memory_cells_are_interleaved_by_recorded_seed(self):
+        sides = ["fcvm", "container"]
+        schedule = corpus_mem.build_cell_schedule(sides, [1, 2, 4], 2, seed=9182)
+        self.assertEqual(schedule,
+                         corpus_mem.build_cell_schedule(sides, [1, 2, 4], 2, seed=9182))
+        expected = sorted((side, n, rep)
+                          for n in (1, 2, 4)
+                          for rep in (1, 2)
+                          for side in sides)
+        self.assertEqual(sorted(schedule), expected)
+        for offset in range(0, len(schedule), len(sides)):
+            pair = schedule[offset:offset + len(sides)]
+            self.assertEqual({side for side, _n, _rep in pair}, set(sides))
+            self.assertEqual(len({(n, rep) for _side, n, rep in pair}), 1,
+                             f"matched sides were separated in {pair}")
+
+        with open(os.path.join(HERE, "corpus_mem.py")) as handle:
+            source = handle.read()
+        self.assertIn('"schedule_seed"', source,
+                      "the seed needed to reproduce the cell order is not recorded")
+
+
+class RunScopedContainerCleanup(unittest.TestCase):
+    """One run never names, waits for, or removes another run's containers."""
+
+    def test_memory_container_names_include_the_full_run_id(self):
+        args = SimpleNamespace()
+        first = corpus_mem.ContainerSide(args, "a" * 32).prefix("host1r1")
+        second = corpus_mem.ContainerSide(args, "b" * 32).prefix("host1r1")
+        self.assertNotEqual(first, second)
+        self.assertIn("a" * 32, first)
+        self.assertIn("b" * 32, second)
+
+    def test_teardown_does_not_wait_for_a_peer_runs_container(self):
+        side = corpus_mem.ContainerSide(SimpleNamespace(), "a" * 32)
+        owned = {"name": side.prefix("host1r1") + "0"}
+
+        def shell(cmd, **_kwargs):
+            if cmd[:3] == ["podman", "ps", "-a"]:
+                return Completed(0, "cbmem-peer-run-host1r1-0\n", "")
+            return Completed()
+
+        ticks = iter((0.0, 1.0, 121.0))
+        with mock.patch.object(corpus_mem, "sh", shell), \
+             mock.patch.object(corpus_mem.time, "monotonic", side_effect=lambda: next(ticks)), \
+             mock.patch.object(corpus_mem.time, "sleep", return_value=None):
+            side.tear_down([owned])
+
+    def test_teardown_deadline_before_first_poll_reports_the_owned_container(self):
+        side = corpus_mem.ContainerSide(SimpleNamespace(), "a" * 32)
+        owned = {"name": side.prefix("host1r1") + "0"}
+        ticks = iter((0.0, 121.0))
+        with mock.patch.object(corpus_mem, "sh", return_value=Completed()), \
+             mock.patch.object(corpus_mem.time, "monotonic", side_effect=lambda: next(ticks)):
+            with self.assertRaises(SystemExit) as caught:
+                side.tear_down([owned])
+        self.assertNotIn(caught.exception.code, (0, None))
+
+    def test_outer_cleanup_does_not_enumerate_every_benchmark_container(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        match = re.search(r'^cleanup\(\) \{\n(.*?)^\}', source,
+                          re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, "corpus_extra cleanup function is gone")
+        self.assertNotIn("podman ps", match.group(1),
+                         "the outer trap still enumerates and deletes peer resources")
+
+    def test_shared_replay_ports_are_locked_before_dnsmasq_is_touched(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        lock = source.find("flock -n 9")
+        dnsmasq = source.find("sudo systemctl stop dnsmasq")
+        self.assertGreaterEqual(lock, 0, "the shared DNS/HTTP/HTTPS ports have no lease")
+        self.assertGreaterEqual(dnsmasq, 0, "the dnsmasq handoff is gone")
+        self.assertLess(lock, dnsmasq,
+                        "the shared-port lease starts after host DNS is already changed")
+
+    def test_host_control_name_is_derived_from_its_run_id(self):
+        with open(HOSTCDP) as handle:
+            source = handle.read()
+        match = re.search(r'^CNAME="([^"]+)"', source, re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertIn("$RUNID", match.group(1))
+        self.assertNotIn("$$", match.group(1))
 
 
 class StrayPreflight(unittest.TestCase):

@@ -22,7 +22,7 @@ URL="${URL:-http://127.0.0.1:8000/medium.html}"
 CDP_PORT="${CDP_PORT:-9222}"
 RUNID="${RUNID:-$(tr -d - </proc/sys/kernel/random/uuid)}"
 RESULTS="${RESULTS:-$HERE/results/hostcdp-$RUNID}"
-CNAME="hostcdp-$$"
+CNAME="hostcdp-$RUNID"
 LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 
 mkdir -p "$RESULTS"

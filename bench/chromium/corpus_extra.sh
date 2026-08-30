@@ -16,21 +16,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$HERE/../.." && pwd)}"
 BENCH="$REPO/bench/chromium"
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
-RESULTS="${RESULTS:-$BENCH/results/corpusextra-$STAMP}"
-LOGDIR="${LOGDIR:-/tmp/corpusextra-$STAMP}"
+RUN_ID="${RUN_ID:-$(tr -d - </proc/sys/kernel/random/uuid)}"
+RESULTS="${RESULTS:-$BENCH/results/corpusextra-$STAMP-$RUN_ID}"
+LOGDIR="${LOGDIR:-/tmp/corpusextra-$STAMP-$RUN_ID}"
 TAG="${TAG:-cb-req-corpus}"
 IMAGE="${IMAGE:-localhost/chromium-bench-req}"
 PHASES="${PHASES:-hostcdp,memory}"
-REPS="${REPS:-230}"          # total attempts; the first WARMUP are discarded
+REPS="${REPS:-202}"          # measured reps; WARMUP is extra, matching the VM arm
 WARMUP="${WARMUP:-28}"       # two full 14-URL cycles, the campaign's warmup
 MEM_NS="${MEM_NS:-1,2,4,8}"
 MEM_REPS="${MEM_REPS:-2}"
 # CPU-seconds per screenshot on both sides, over three full cycles of the
 # corpus. A different metric from the wall-clock arms, kept in its own record.
 CPUTIME_REPS="${CPUTIME_REPS:-42}"
-# Which side(s) of the memory measurement this invocation runs. Split into two
-# invocations so each fits inside one idle-watchdog window on this box.
-MEM_SIDES="${MEM_SIDES:-fcvm,container}"
+MEM_SEED="${MEM_SEED:-20260830}"
 UFFD_MODE="${UFFD_MODE:-minor}"
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 
@@ -39,12 +38,21 @@ UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 # control a different workload from the VM arm it is a control for.
 URLS="https://example.com/,https://news.ycombinator.com/,https://developers.cloudflare.com/,https://blog.cloudflare.com/,https://en.wikipedia.org/,https://developer.mozilla.org/en-US/,https://www.elmundo.es/,https://www.rtp.pt/noticias/,https://www.theguardian.com/international,https://todomvc.com/examples/javascript-es6/dist/,https://todomvc.com/examples/react/dist/index.html,https://todomvc.com/examples/vue/dist/,https://todomvc.com/examples/angular/dist/browser/,https://todomvc.com/examples/preact/dist/"
 
-mkdir -p "$RESULTS" "$LOGDIR"
 say() { printf '\n=== %s %s\n' "$(date +%H:%M:%S)" "$*"; }
 
-for tool in jq curl dig python3 podman sudo; do
+for tool in jq curl dig flock python3 podman sudo; do
     command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
 done
+
+# DNS 53, HTTP 80, HTTPS 443 and dnsmasq are host-wide resources. Hold one
+# per-user lease before creating output or touching any of them.
+LOCK_DIR="/run/user/$UID"
+[ -d "$LOCK_DIR" ] || LOCK_DIR=/tmp
+CORPUS_EXTRA_LOCK="$LOCK_DIR/fcvm-corpus-extra-$UID.lock"
+exec 9>"$CORPUS_EXTRA_LOCK"
+flock -n 9 || { echo "BLOCKED: another corpus-extra run owns $CORPUS_EXTRA_LOCK" >&2; exit 2; }
+
+mkdir -p "$RESULTS" "$LOGDIR"
 
 campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.sh" | sed 's/^URLS="//; s/"$//')
 [ "$campaign_urls" = "$URLS" ] || {
@@ -111,7 +119,6 @@ stop_corpus_serve() {
 
 cleanup() {
     set +e
-    podman ps -a --format '{{.Names}}' | grep -E '^(cbmem-|hostcdp-)' | xargs -r podman rm -f >/dev/null 2>&1
     stop_corpus_serve
     if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
         for _ in $(seq 1 10); do sudo systemctl start dnsmasq >/dev/null 2>&1 && break; sleep 1; done
@@ -167,19 +174,21 @@ if [[ ",$PHASES," == *",hostcdp,"* ]]; then
             cpu2) cpus=2 ;;
             *) echo "BLOCKED: unknown hostcdp arm '$arm'" >&2; exit 2 ;;
         esac
-        say "hostcdp/$arm over the corpus: $REPS attempts, $WARMUP warmup, cpus=${cpus:-<all>}, resolver rule -> 127.0.0.1"
+        say "hostcdp/$arm over the corpus: $REPS measured reps plus $WARMUP warmup, cpus=${cpus:-<all>}, resolver rule -> 127.0.0.1"
         URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" IMAGE="$IMAGE" CPUS="$cpus" \
+            RUNID="$RUN_ID-$arm" \
             BENCH_RESOLVE_ALL_TO=127.0.0.1 SETTLE_WAIT_SECS=300 \
             RESULTS="$RESULTS/hostcdp-$arm" bash "$BENCH/hostcdp.sh" 2>&1 | tee "$LOGDIR/hostcdp-$arm.log"
     done
 fi
 
 if [[ ",$PHASES," == *",memory,"* ]]; then
-    say "matched-basis memory: N in $MEM_NS, $MEM_REPS reps, both sides"
+    say "matched-basis memory: N in $MEM_NS, $MEM_REPS reps, interleaved seed $MEM_SEED"
     python3 "$BENCH/corpus_mem.py" --results "$RESULTS/memory" --tag "$TAG" --image "$IMAGE" \
         --urls "$URLS" --ns "$MEM_NS" --reps "$MEM_REPS" \
+        --seed "$MEM_SEED" \
         --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" \
-        --cputime-reps "$CPUTIME_REPS" --sides "$MEM_SIDES" \
+        --cputime-reps "$CPUTIME_REPS" \
         --fcvm "$REPO/target/release/fcvm" 2>&1 | tee "$LOGDIR/memory.log"
 fi
 

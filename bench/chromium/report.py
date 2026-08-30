@@ -17,9 +17,12 @@ import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 import textwrap
 import time
+
+CGROUP_ROOT = "/sys/fs/cgroup"
 
 # The date the six quoted Cloudflare rows were last checked against their source.
 # The prose below and test_report_kitesurf.py both read this constant, so the
@@ -282,6 +285,45 @@ def firecracker_pids_for_vm_ids(vm_ids):
     return out
 
 
+def refuse_sample(message):
+    print(f"REFUSING: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def podman_container_cgroup(name):
+    """Return one container's existing non-root cgroup or refuse the sample."""
+    try:
+        result = subprocess.run(
+            ["podman", "inspect", "--format", "{{.State.CgroupPath}}", name],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        refuse_sample(f"podman inspect failed for {name}: {exc}")
+    if result.returncode != 0:
+        refuse_sample(
+            f"podman inspect failed for {name} with status {result.returncode}: "
+            f"{result.stderr.strip()}")
+
+    relative = result.stdout.strip()
+    if not relative.startswith("/") or relative == "/":
+        refuse_sample(
+            f"podman reports no container cgroup for {name} (got {relative!r}); "
+            "the root cgroup is the whole machine")
+
+    root = os.path.realpath(CGROUP_ROOT)
+    path = os.path.realpath(os.path.join(root, relative.lstrip("/")))
+    try:
+        inside_root = os.path.commonpath((root, path)) == root
+    except ValueError:
+        inside_root = False
+    if path == root or not inside_root:
+        refuse_sample(f"podman cgroup for {name} escapes {root}: {relative!r}")
+    if not os.path.isdir(path):
+        refuse_sample(
+            f"podman cgroup for {name} does not exist at {path}; "
+            "nothing can be attributed to it")
+    return path
+
+
 def cmd_sample(args):
     rec = {"ts": time.time()}
     mi = read_meminfo()
@@ -322,23 +364,20 @@ def cmd_sample(args):
 
     # --- host-native container pool: the SAME two bases ----------------------
     if args.podman_prefix:
-        import subprocess
         try:
-            names = subprocess.run(
+            result = subprocess.run(
                 ["podman", "ps", "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=20).stdout.split()
-        except Exception:
-            names = []
+                capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            refuse_sample(f"podman ps failed while identifying the container pool: {exc}")
+        if result.returncode != 0:
+            refuse_sample(
+                f"podman ps failed with status {result.returncode}: {result.stderr.strip()}")
+        names = result.stdout.split()
         names = [n for n in names if n.startswith(args.podman_prefix)]
         tot_pss = tot_cg = tot_procs = 0
         for n in names:
-            try:
-                cg = subprocess.run(
-                    ["podman", "inspect", "--format", "{{.State.CgroupPath}}", n],
-                    capture_output=True, text=True, timeout=20).stdout.strip()
-            except Exception:
-                continue
-            path = "/sys/fs/cgroup" + cg
+            path = podman_container_cgroup(n)
             procs = cgroup_procs(path)
             tot_procs += len(procs)
             tot_pss += sum(pss_kb_of_pid(p) for p in procs)
