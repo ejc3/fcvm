@@ -79,16 +79,6 @@ def wait_quiet(limit, timeout_s):
         time.sleep(10)
 
 
-class HostArmRefused(Exception):
-    """The host CPU arm declining to publish a figure it cannot attribute.
-
-    Not `die`: `die` calls sys.exit(CODE), so a caller recording str(SystemExit)
-    stores "2" and the record cannot say why the arm refused. That is the same
-    shape as a diagnostic whose silence is indistinguishable from a clean
-    result. This carries its text into `res["host_error"]`.
-    """
-
-
 class CloneStateReadError(RuntimeError):
     """The state directory cannot prove whether an owned clone is gone."""
 
@@ -137,9 +127,6 @@ def validate_args(args):
         die("--ns contains duplicate cell sizes")
     if not isinstance(args.reps, int) or isinstance(args.reps, bool) or args.reps <= 0:
         die("--reps must be a positive integer")
-    if (not isinstance(args.cputime_reps, int) or isinstance(args.cputime_reps, bool)
-            or args.cputime_reps < 0):
-        die("--cputime-reps must be a nonnegative integer")
     timings = (args.settle, args.quiet_limit, args.quiet_wait)
     if any(not isinstance(value, (int, float)) or isinstance(value, bool)
            or not math.isfinite(value) or value < 0 for value in timings):
@@ -283,24 +270,6 @@ def sample(extra: dict, cgroup_root=None, cgroup_prefix=None, podman_prefix=None
     if r.returncode != 0:
         die(f"report.py sample failed: {r.stderr.strip()}")
     return json.loads(r.stdout)
-
-
-def cgroup_cpu_usec(cg_path):
-    """usage_usec of one cgroup.
-
-    In cgroup v2 this accumulates the CPU time of every descendant, including
-    processes that have already exited, so reading it after an instance is gone
-    but before its leaf is removed gives the COMPLETE CPU cost of that instance:
-    clone spawn, snapshot restore, the render, and teardown.
-    """
-    try:
-        with open(os.path.join(cg_path, "cpu.stat")) as f:
-            for line in f:
-                if line.startswith("usage_usec"):
-                    return int(line.split()[1])
-    except (OSError, ValueError):
-        return None
-    return None
 
 
 def stray_vmm_processes():
@@ -635,10 +604,7 @@ class FcvmSide:
 # listening on (cdpdrive: 130 resolve attempts, no page target, 2026-08-30
 # 18:10). What the memory measurement needs is that the instance rendered the
 # page; where the driver runs does not change the instance's footprint, and the
-# exec'd python has exited before anything is sampled. The single cputime
-# container keeps the host-driven path, where one container can own the host's
-# 9222 and the driver sits outside its cgroup, exactly as cdpdrive sits outside
-# a clone's.
+# exec'd python has exited before anything is sampled.
 CONTAINER_NET = "slirp4netns:allow_host_loopback=true"
 CONTAINER_RESOLVE_TO = "10.0.2.2"
 CONTAINER_OWNER_LABEL = "io.fcvm.bench.owner"
@@ -913,253 +879,6 @@ def cell_values(cell):
     return out
 
 
-def median_ms(values):
-    """The p50 of a list of milliseconds, as statistics.median.
-
-    hostcdp.sh and resummarize.py both write "p50_convention":
-    "statistics.median" into their records, because a ratio between a host p50
-    and a VM p50 means something only when both are computed the same way and a
-    reader of the record alone cannot otherwise tell. This arm used
-    sorted(v)[len(v) // 2], which on an even-length list is the upper of the two
-    middle values rather than their mean. On its own 42-record run that is
-    1643.5 against a median of 1486.0: 10.6% high, under a key named p50, set
-    beside a host mean.
-    """
-    return round(statistics.median(values), 1)
-
-
-def cputime_fcvm_arm(args, cg, fcvm_side):
-    """One clone per request, sequentially, its leaf cgroup's CPU read once gone.
-
-    Symmetric with cputime_host_arm so the caller can hold one arm's result while
-    the other fails. This one is the expensive half: args.cputime_reps whole
-    clone lifecycles.
-    """
-    per = []
-    # The UFFD serve is shared by every clone and sits OUTSIDE the clone's
-    # cgroup, so it would be missing from a per-clone CPU figure. Its own
-    # leaf is differenced across the whole loop and reported per request.
-    serve_cpu_before = cgroup_cpu_usec(f"{cg.base}/serve-0")
-    for i in range(args.cputime_reps):
-        leaf = f"req-cpu-{i}"
-        cgp = cg.leaf(leaf)
-        name = f"mem-{args.run_id}-cpu-{i}"
-        log_path = os.path.join(args.results, "logs", f"{name}.log")
-        argv = [args.fcvm, "snapshot", "run", "--pid", str(fcvm_side.serve_pid),
-                "--name", name, "--no-dirty-tracking", "--no-swap"]
-        proc = spawn_in_cgroup(cgp, argv, log_path, dict(os.environ, RUST_LOG="fcvm=info"))
-        clone = {"i": i, "leaf": leaf, "name": name,
-                 "proc": proc, "log": log_path}
-        fcvm_side.owned[name] = clone
-        found = find_clone_state(args.state_dir, name, time.monotonic() + 180, proc)
-        if not found:
-            die(f"cputime clone {name} never published a state file; see {log_path}")
-        _, ip = found
-        deadline = time.monotonic() + 180
-        while not port_open(ip, args.cdp_port):
-            if time.monotonic() >= deadline:
-                die(f"cputime clone {name} never answered CDP; see {log_path}")
-            time.sleep(0.05)
-        t0 = time.monotonic()
-        ok, out = render(f"{ip}:{args.cdp_port}", args.urls[i % len(args.urls)])
-        wall = (time.monotonic() - t0) * 1000
-        if not ok:
-            die(f"cputime clone {name} failed to render: {out}")
-        proc.terminate()
-        try:
-            proc.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=60)
-        gone_by = time.monotonic() + 120
-        while not clone_gone(args.state_dir, name):
-            if time.monotonic() >= gone_by:
-                die(f"cputime clone {name} state file outlived its process")
-            time.sleep(0.2)
-        usec = cgroup_cpu_usec(cgp)
-        cg.rm(leaf)
-        fcvm_side.owned.pop(name, None)
-        if usec is None:
-            die(f"cputime clone {name} left no cpu.stat to read")
-        per.append({"i": i, "url": args.urls[i % len(args.urls)],
-                    "cpu_ms": usec / 1000.0, "render_wall_ms": round(wall, 1)})
-        log(f"cputime fcvm {i + 1}/{args.cputime_reps}: {usec / 1000.0:.0f} ms CPU")
-    serve_cpu_after = cgroup_cpu_usec(f"{cg.base}/serve-0")
-    serve_per_req = None
-    if serve_cpu_before is not None and serve_cpu_after is not None:
-        serve_per_req = round((serve_cpu_after - serve_cpu_before) / 1000.0
-                              / args.cputime_reps, 1)
-    vals = sorted(r["cpu_ms"] for r in per)
-    return {"n": len(vals), "per_request_cpu_ms_p50": median_ms(vals),
-            "serve_cpu_ms_per_request": serve_per_req,
-            "per_request_cpu_ms_mean": round(statistics.mean(vals), 1),
-            "min": round(vals[0], 1), "max": round(vals[-1], 1),
-            "basis": "leaf cgroup usage_usec over one whole clone lifecycle "
-                     "(spawn, restore, render, teardown)",
-            "records": per}
-
-
-def run_cputime(args, cg, fcvm_side, out_path, container_side=None):
-    """CPU-seconds to produce one screenshot, on both sides, same corpus.
-
-    This is a different metric from the wall-clock arms and is kept separate
-    from them on purpose: it is the only quantity in this report that is the
-    same KIND of number as a published CPU-time figure. It is still measured on
-    a different machine from any such figure, so it licenses no conversion.
-
-      fcvm    one clone per request, sequentially: spawn, restore, render one
-              corpus page, tear down. Its leaf cgroup's usage_usec is read once
-              the instance is gone, so it covers the whole lifecycle.
-      host    one warm container, the same schedule of renders, its cgroup's
-              usage_usec differenced across the run and divided by the renders.
-              The container's idle cost between renders is inside that
-              difference, which is what a warm pool actually pays.
-    """
-    res = {"reps": args.cputime_reps, "urls": args.urls, "fcvm": None, "host": None}
-    if fcvm_side is not None:
-        res["fcvm"] = cputime_fcvm_arm(args, cg, fcvm_side)
-    # The host arm must not be able to take the fcvm arm with it. That arm cost
-    # 42 clone lifecycles above, it is already measured, and an unwritten
-    # cputime.json threw all of it away once (2026-08-30 17:53, "cputime
-    # container never became ready" after 42 clones). Catching only TimeoutError
-    # left every other host-side refusal -- an unattributable cgroup path, a
-    # missing cpu.stat, a failed render -- doing the same thing again.
-    try:
-        cputime_host_arm(args, res, container_side)
-    except HostArmRefused as exc:
-        res["host_error"] = str(exc)
-        log(f"cputime host arm refused: {exc}")
-    except SystemExit as exc:
-        # die() exits with a CODE, so this cannot recover the message; the text
-        # is on stderr. Kept so a die() added to that path later still cannot
-        # destroy the fcvm records.
-        res.setdefault("host_error", f"refused with exit status {exc.code}")
-        log(f"cputime host arm refused: {res['host_error']}")
-    except Exception as exc:  # noqa: BLE001 - the fcvm records outrank any host failure
-        res.setdefault("host_error", f"{type(exc).__name__}: {exc}")
-        log(f"cputime host arm failed: {res['host_error']}")
-    finally:
-        with open(out_path, "w") as f:
-            json.dump(res, f, indent=1)
-    if res["host"] is None:
-        die("cputime host arm produced no figure after the fcvm record was saved: "
-            + res.get("host_error", "no reason recorded"))
-    return {k: v for k, v in res.items() if k != "urls"}
-
-
-def cputime_host_arm(args, res, container_side=None):
-    """One warm container, the same renders, its cgroup CPU differenced.
-
-    Refuses rather than publishes an unattributable figure, and records what it
-    refused in `res`. It never writes cputime.json; run_cputime does that
-    whatever happens here.
-    """
-    name = f"cbmem-cpu-{args.run_id}"
-    if container_side is not None:
-        container_side.owned.add(name)
-    r = sh_bounded(["podman", "run", "-d", "--name", name, "--network", "host",
-                    "--label", f"{CONTAINER_OWNER_LABEL}={args.container_owner_token}",
-                    "-e", f"BENCH_RESOLVE_ALL_TO={args.container_resolve_to}",
-                    args.image], 120)
-    if r.returncode != 0:
-        res["host_error"] = f"podman run failed: {r.stderr.strip()}"
-        return
-    container_id = r.stdout.strip()
-    if not container_id or any(character.isspace() for character in container_id):
-        res["host_error"] = "podman run returned no exact container ID"
-        return
-    if container_side is not None:
-        container_side.owned_ids[name] = container_id
-    try:
-        deadline = time.monotonic() + 180
-        while True:
-            if sh_bounded(["podman", "exec", name, "test", "-f",
-                           "/run/bench-ready"], 30).returncode == 0 \
-                    and container_owns_tcp_listener(name, 9222):
-                break
-            if time.monotonic() >= deadline:
-                logs_result = sh_bounded(
-                    ["podman", "logs", "--tail", "40", name], 30)
-                state_result = sh_bounded(
-                    ["podman", "inspect", "--format",
-                     "{{.State.Status}} {{.State.ExitCode}}", name], 30)
-                logs = (logs_result.stdout if logs_result.returncode == 0
-                        else f"<podman logs failed: {logs_result.stderr.strip()}>")
-                state = (state_result.stdout.strip() if state_result.returncode == 0
-                         else f"<podman inspect failed: {state_result.stderr.strip()}>")
-                res["host_error"] = ("container never became ready; state=%s logs=%s"
-                                     % (state, logs[-1500:]))
-                log("cputime host arm FAILED: " + res["host_error"])
-                raise TimeoutError(res["host_error"])
-            time.sleep(0.25)
-        # An empty CgroupPath would make this "/sys/fs/cgroup", whose cpu.stat
-        # exists and reports the WHOLE MACHINE: a fail-open that would publish a
-        # per-render CPU figure with every other process on the box inside it.
-        inspected = sh_bounded(
-            ["podman", "inspect", "--format", "{{.State.CgroupPath}}", name], 30)
-        if inspected.returncode != 0:
-            raise HostArmRefused(
-                f"podman inspect failed for {name}: {inspected.stderr.strip()}")
-        rel = inspected.stdout.strip()
-        if not rel.startswith("/") or rel == "/":
-            raise HostArmRefused(
-                f"podman reports no container cgroup for {name} (got {rel!r}); "
-                "a CPU figure read from the root cgroup would be the whole machine")
-        cgp = "/sys/fs/cgroup" + rel
-        if not os.path.isdir(cgp):
-            raise HostArmRefused(
-                f"container cgroup {cgp} does not exist; nothing can be attributed to it")
-        # Two warmup renders first, outside the window, so first-touch costs
-        # (fonts, code paths, page cache) are not charged to the measured reps.
-        # A warmup that silently failed would leave those costs inside the
-        # window and inflate the host figure, so the result is checked.
-        for i in range(2):
-            ok, out = render("127.0.0.1:9222", args.urls[i % len(args.urls)])
-            if not ok:
-                raise HostArmRefused(f"cputime container failed its warmup render: {out}")
-        before = cgroup_cpu_usec(cgp)
-        if before is None:
-            raise HostArmRefused(f"cputime container cgroup {cgp} has no cpu.stat")
-        t0 = time.monotonic()
-        for i in range(args.cputime_reps):
-            ok, out = render("127.0.0.1:9222", args.urls[i % len(args.urls)])
-            if not ok:
-                raise HostArmRefused(f"cputime container failed to render: {out}")
-        wall = (time.monotonic() - t0) * 1000
-        after = cgroup_cpu_usec(cgp)
-        if after is None:
-            raise HostArmRefused(
-                f"cputime container cgroup {cgp} stopped reporting cpu.stat "
-                "before the window closed; nothing can be differenced")
-        res["host"] = {"n": args.cputime_reps,
-                       "per_request_cpu_ms": round((after - before) / 1000.0 / args.cputime_reps, 1),
-                       "total_cpu_ms": round((after - before) / 1000.0, 1),
-                       "total_wall_ms": round(wall, 1),
-                       "cgroup": cgp,
-                       "basis": "container cgroup usage_usec differenced across the renders, "
-                                "divided by the renders; includes the container's idle cost "
-                                "between them"}
-        log(f"cputime host: {res['host']['per_request_cpu_ms']} ms CPU per render")
-    except TimeoutError:
-        pass
-    finally:
-        try:
-            remove_owned_container(
-                name, args.container_owner_token,
-                container_side.owned_ids.get(name) if container_side is not None else container_id)
-        except RuntimeError as exc:
-            res["host"] = None
-            res["host_error"] = str(exc)
-        else:
-            if container_side is not None:
-                container_side.owned_ids.pop(name, None)
-                container_side.owned.discard(name)
-        if container_side is not None and name not in container_side.owned_ids:
-            container_side.owned.discard(name)
-    if "host_error" in res:
-        log("cputime host arm produced no figure: " + res["host_error"])
-
-
 def main():
     """Run one measurement while releasing every whole-run lease on exit."""
     with ExitStack() as resources:
@@ -1185,8 +904,6 @@ def main_with_resources(resources):
     p.add_argument("--settle", type=float, default=5.0)
     p.add_argument("--quiet-limit", type=float, default=1.0)
     p.add_argument("--quiet-wait", type=float, default=300.0)
-    p.add_argument("--cputime-reps", type=int, default=0,
-                   help="CPU-seconds per screenshot on both sides, over this many renders")
     p.add_argument("--run-id", default="",
                    help="owner ID shared with the outer cleanup; defaults to a UUID")
     p.add_argument("--container-owner-token", default="",
@@ -1272,11 +989,6 @@ def main_with_resources(resources):
         for side_name, n, rep, url_indices in schedule:
             cells.append(run_cell(
                 sides[side_name], args, n, rep, url_indices, out))
-        if args.cputime_reps:
-            cpu = run_cputime(
-                args, cg, fcvm_side, os.path.join(args.results, "cputime.json"),
-                container_side)
-            print(json.dumps(cpu, indent=1))
     except BaseException as exc:
         failure = exc
     try:

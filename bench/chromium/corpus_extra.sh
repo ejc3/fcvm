@@ -44,9 +44,6 @@ REPS="${REPS:-202}"          # measured reps; WARMUP is extra, matching the VM a
 WARMUP="${WARMUP:-28}"       # two full 14-URL cycles, the campaign's warmup
 MEM_NS="${MEM_NS:-1,2,4,8}"
 MEM_REPS="${MEM_REPS:-2}"
-# CPU-seconds per screenshot on both sides, over three full cycles of the
-# corpus. A different metric from the wall-clock arms, kept in its own record.
-CPUTIME_REPS="${CPUTIME_REPS:-42}"
 MEM_SEED="${MEM_SEED:-20260830}"
 UFFD_MODE="${UFFD_MODE:-minor}"
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
@@ -214,7 +211,7 @@ if [ "$CORPUS_EXTRA_STAGED" = 0 ]; then
         STAMP="$STAMP" RUN_ID="$RUN_ID" CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
         RESULTS="$RESULTS" LOGDIR="$LOGDIR" TAG="$TAG" IMAGE="$IMAGE" PHASES="$PHASES" \
         REPS="$REPS" WARMUP="$WARMUP" MEM_NS="$MEM_NS" MEM_REPS="$MEM_REPS" \
-        CPUTIME_REPS="$CPUTIME_REPS" MEM_SEED="$MEM_SEED" \
+        MEM_SEED="$MEM_SEED" \
         UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH="$UFFD_PREFETCH" \
         bash "$bundle_dir/corpus_extra.sh"
 fi
@@ -424,7 +421,7 @@ cleanup_owned_containers() {
             continue
         fi
         case "$name" in
-            cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*|cbmem-cpu-"$RUN_ID")
+            cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*)
                 identity=$(timeout 30 podman inspect --format \
                     '{{.Id}} {{ index .Config.Labels "io.fcvm.bench.owner" }}' "$id") \
                     || { echo "FAILED: cannot inspect possible owned container $name ($id)" >&2; rc=1; continue; }
@@ -572,7 +569,6 @@ if [[ ",$PHASES," == *",memory,"* ]]; then
         --urls "$URLS" --ns "$MEM_NS" --reps "$MEM_REPS" \
         --seed "$MEM_SEED" \
         --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" \
-        --cputime-reps "$CPUTIME_REPS" \
         --run-id "$RUN_ID" \
         --container-owner-token "$CONTAINER_OWNER_TOKEN" \
         --fcvm "$BENCH/fcvm"

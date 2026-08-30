@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""The memory/CPU harness's gates and refusals, pinned.
+"""The memory harness's gates and refusals, pinned.
 
 corpus_mem.py runs for hours and publishes per-instance memory and per-render
-CPU for fcvm against host containers. Every property here is a way for it to
-finish and report a number that is not a measurement: a preflight that clears
+results for fcvm against host containers. Every property here is a way for it
+to finish and report a number that is not a measurement: a preflight that clears
 the box because it could not look, a basis summed over a process set the sample
 never saw, a subprocess that outlives the deadline meant to bound it, and a
 recorded arm thrown away by the failure of the arm after it.
@@ -34,6 +34,7 @@ import corpus_mem  # noqa: E402
 import report as bench_report  # noqa: E402
 
 EXTRA = os.path.join(HERE, "corpus_extra.sh")
+CORPUS_MEM = os.path.join(HERE, "corpus_mem.py")
 CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
 HOSTCDP = os.path.join(HERE, "hostcdp.sh")
 OWNED_PROCESS = os.path.join(HERE, "owned_process.py")
@@ -478,17 +479,6 @@ class RunScopedContainerCleanup(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 side.bring_up(1, "host1r1", [0])
         self.assertIn(name, side.owned)
-
-    def test_failed_cputime_container_run_keeps_the_name_owned(self):
-        args = SimpleNamespace(run_id="a" * 32, image="image",
-                               container_resolve_to="127.0.0.1",
-                               container_owner_token="c" * 32)
-        side = corpus_mem.ContainerSide(args, args.run_id)
-        result = Completed(125, "", "runtime failed after create")
-        with mock.patch.object(corpus_mem, "sh_bounded", return_value=result):
-            rec = {"host": None}
-            corpus_mem.cputime_host_arm(args, rec, side)
-        self.assertIn("cbmem-cpu-" + args.run_id, side.owned)
 
     def test_failed_clone_readiness_keeps_the_process_owned_for_final_cleanup(self):
         proc = mock.Mock()
@@ -1256,7 +1246,7 @@ class ArgumentValidation(unittest.TestCase):
     def args(**overrides):
         args = SimpleNamespace(
             urls=["https://example.com/"], ns=[1, 2, 4, 8], reps=2,
-            cputime_reps=0, settle=5.0, quiet_limit=1.0,
+            settle=5.0, quiet_limit=1.0,
             quiet_wait=300.0, run_id="a" * 32,
             container_owner_token="b" * 32,
         )
@@ -1284,7 +1274,15 @@ class ArgumentValidation(unittest.TestCase):
         corpus_mem.validate_args(self.args())
 
     def test_unpaired_cpu_measurement_is_refused(self):
-        self.assert_refused(cputime_reps=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                [sys.executable, CORPUS_MEM, "--results", os.path.join(tmp, "out"),
+                 "--tag", "tag", "--urls", "https://example.com/",
+                 "--cputime-reps", "1"],
+                capture_output=True, text=True, timeout=30,
+            )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unrecognized arguments: --cputime-reps 1", proc.stderr)
 
     def test_invalid_container_owner_token_is_refused(self):
         for value in ("", "short", "A" * 32, "a/b", "has space", "a" * 100):
@@ -1314,90 +1312,6 @@ class CanonicalImageIdentity(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(SystemExit):
                     corpus_mem.canonical_image_id(value)
-
-
-class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
-    """The fcvm arm costs 42 clone lifecycles. The host arm must not take it.
-
-    The comment above the host arm already says a failure there is "recorded,
-    not fatal", and cites losing a whole run to it on 2026-08-30 17:53. Only
-    TimeoutError was caught, so every other refusal on the host side -- an
-    unattributable cgroup path, a missing cpu.stat, a failed render -- called
-    die() or raised past the one write of cputime.json and discarded the fcvm
-    records with it.
-    """
-
-    # What the expensive arm produced. run_cputime must still be holding this
-    # when the host arm fails; with fcvm_side=None there is nothing to lose and
-    # the test would only prove a file was written.
-    FCVM_ARM = {"n": 42, "per_request_cpu_ms_p50": 1486.0, "records": [{"i": 0}]}
-
-    def run_with_failing_host(self, boom):
-        for name, fake in (("cputime_host_arm", boom),
-                           ("cputime_fcvm_arm", lambda *_a: dict(self.FCVM_ARM))):
-            real = getattr(corpus_mem, name)
-            setattr(corpus_mem, name, fake)
-            self.addCleanup(setattr, corpus_mem, name, real)
-
-        class Args:
-            cputime_reps = 3
-            urls = ["https://example.com/"]
-        tmp = tempfile.mkdtemp()
-        out = os.path.join(tmp, "cputime.json")
-        exit_code = None
-        try:
-            corpus_mem.run_cputime(Args(), object(), object(), out)
-        except SystemExit as exc:
-            exit_code = exc.code
-        return out, exit_code
-
-    def assert_fcvm_arm_survived(self, rec):
-        self.assertEqual(rec["fcvm"], self.FCVM_ARM,
-                         "the measured fcvm arm did not reach the record")
-
-    def test_a_host_arm_that_refuses_still_leaves_the_record(self):
-        def refuse(_args, res, *_rest):
-            res["host_error"] = "podman reports no container cgroup"
-            corpus_mem.die("a CPU figure read from the root cgroup would be the whole machine")
-        out, exit_code = self.run_with_failing_host(refuse)
-        self.assertNotIn(exit_code, (0, None),
-                         "host:null was written by a successful benchmark")
-        self.assertTrue(os.path.exists(out), "cputime.json was not written")
-        with open(out) as handle:
-            rec = json.load(handle)
-        self.assertEqual(rec["host"], None)
-        self.assertIn("host_error", rec)
-        self.assert_fcvm_arm_survived(rec)
-
-    def test_the_recorded_reason_is_the_reason(self):
-        """`die` exits with a CODE, so str(SystemExit) is "2", not the message.
-
-        A record that says the host arm failed and cannot say why is the same
-        shape as a diagnostic that reports nothing and a clean result: the
-        reader cannot tell them apart. The host arm's own refusals carry their
-        text.
-        """
-        def refuse(_args, _res, *_rest):
-            raise corpus_mem.HostArmRefused(
-                "podman reports no container cgroup for cbmem-cpu-abc")
-        out, exit_code = self.run_with_failing_host(refuse)
-        self.assertNotIn(exit_code, (0, None))
-        with open(out) as handle:
-            rec = json.load(handle)
-        self.assertIn("no container cgroup", rec["host_error"],
-                      f"the record does not name the refusal: {rec['host_error']!r}")
-        self.assert_fcvm_arm_survived(rec)
-
-    def test_a_host_arm_that_raises_still_leaves_the_record(self):
-        def crash(_args, _res, *_rest):
-            raise RuntimeError("podman went away")
-        out, exit_code = self.run_with_failing_host(crash)
-        self.assertNotIn(exit_code, (0, None))
-        self.assertTrue(os.path.exists(out), "cputime.json was not written")
-        with open(out) as handle:
-            rec = json.load(handle)
-        self.assertIsNone(rec["host"])
-        self.assert_fcvm_arm_survived(rec)
 
 
 class ExactHostListener(unittest.TestCase):
@@ -1578,41 +1492,6 @@ class Resummarize(unittest.TestCase):
         self.assertIn("REFUSING", proc.stderr, proc.stderr)
         self.assertIn("run.json", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
-
-
-class MedianConvention(unittest.TestCase):
-    """A field named p50 has to hold statistics.median.
-
-    hostcdp.sh and resummarize.py both write "p50_convention":
-    "statistics.median" into their records, because a ratio between a host p50
-    and a VM p50 is only meaningful when both are computed the same way, and a
-    reader of the record alone cannot otherwise tell. The fcvm CPU arm computed
-    sorted(v)[len(v) // 2] instead, which on an even-length list is the upper of
-    the two middle values.
-
-    Measured on this harness's own 42-record cputime run
-    (results/corpusextra-memory-20260830-181830/memory/cputime.json): the field
-    says 1643.5, the median of those records is 1486.0. 10.6% high, published
-    under a key named p50 and set beside a host mean.
-    """
-
-    def test_an_even_length_list_gets_the_median_not_the_upper_middle(self):
-        self.assertEqual(corpus_mem.median_ms([1.0, 2.0, 3.0, 4.0]), 2.5)
-
-    def test_the_recorded_cputime_run_medians_to_1486(self):
-        """The exact case that was published wrong."""
-        rec = os.path.join(
-            os.path.dirname(os.path.dirname(HERE)), "bench", "chromium", "results",
-            "corpusextra-memory-20260830-181830", "memory", "cputime.json")
-        if not os.path.exists(rec):
-            self.skipTest("the recorded cputime run is not in this tree")
-        with open(rec) as handle:
-            vals = [r["cpu_ms"] for r in json.load(handle)["fcvm"]["records"]]
-        self.assertEqual(len(vals), 42)
-        self.assertEqual(corpus_mem.median_ms(vals), 1486.0)
-
-    def test_an_odd_length_list_is_unchanged(self):
-        self.assertEqual(corpus_mem.median_ms([5.0, 1.0, 3.0]), 3.0)
 
 
 class FrozenCopiesAreRecordsNotTests(unittest.TestCase):
@@ -2270,7 +2149,7 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         for path in ("$BENCH/hostcdp.sh", "$BENCH/corpus_mem.py",
                      "$BENCH/corpus_serve.py", "$BENCH/fcvm"):
             self.assertIn(path, source)
-        self.assertIn('CPUTIME_REPS="${CPUTIME_REPS:-0}"', source)
+        self.assertNotIn("CPUTIME_REPS", source)
 
 
 if __name__ == "__main__":
