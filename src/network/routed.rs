@@ -1149,8 +1149,8 @@ async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
 /// IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable from the VM without MASQUERADE.
 /// The server is either:
 /// 1. `selected`, the IPv6 nameserver the launch's resolv.conf snapshot named
-/// 2. a probe of known cloud IPv6 DNS endpoints (AWS fd00:ec2::253), which runs
-///    only when that snapshot named no IPv6 server
+/// 2. a probe of the AWS VPC resolver at [`crate::network::AWS_VPC_IPV6_RESOLVER`],
+///    which runs only when that snapshot named no IPv6 server
 async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
     // `selected` is network::first_ipv6_nameserver applied to the launch's one
     // resolv.conf snapshot, the same snapshot GuestBootInputs::for_launch
@@ -1163,14 +1163,15 @@ async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
         return Some(server);
     }
 
-    // The snapshot named no IPv6 nameserver. Probe known cloud IPv6 endpoints.
-    // AWS VPCs provide dual-stack DNS at fd00:ec2::253.
+    // The snapshot named no IPv6 nameserver. Fall back to the AWS VPC
+    // resolver, which every dual-stack VPC provides at a well-known ULA.
+    let server = crate::network::AWS_VPC_IPV6_RESOLVER;
     let probe = tokio::process::Command::new("dig")
         .args([
             "+short",
             "+timeout=2",
             "+tries=1",
-            "@fd00:ec2::253",
+            &format!("@{server}"),
             "example.com",
         ])
         .output()
@@ -1178,8 +1179,8 @@ async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
         .ok()?;
 
     if probe.status.success() && !String::from_utf8_lossy(&probe.stdout).trim().is_empty() {
-        info!("detected IPv6 DNS at fd00:ec2::253 (AWS VPC)");
-        return Some("fd00:ec2::253".to_string());
+        info!("detected IPv6 DNS at {server} (AWS VPC)");
+        return Some(server.to_string());
     }
 
     None
@@ -1412,8 +1413,8 @@ mod tests {
     /// cached snapshot then preserves that mismatch.
     ///
     /// 2001:db8::53 is the documentation range (RFC 3849). No host's
-    /// resolv.conf names it, and the probe fallback can only return
-    /// fd00:ec2::253 or None, so a second read of THIS machine cannot produce
+    /// resolv.conf names it, and the probe fallback can only return the AWS
+    /// VPC resolver or None, so a second read of THIS machine cannot produce
     /// it. Returning it is therefore proof that the launch snapshot decided.
     /// Before the snapshot was threaded through, this returned whatever the
     /// host named at setup time (or None), never the argument.
@@ -1434,7 +1435,7 @@ mod tests {
     async fn routed_probes_only_when_the_snapshot_named_no_ipv6_resolver() {
         let probed = detect_ipv6_dns(None).await;
         assert!(
-            probed.is_none() || probed.as_deref() == Some("fd00:ec2::253"),
+            probed.is_none() || probed.as_deref() == Some(crate::network::AWS_VPC_IPV6_RESOLVER),
             "with no snapshot resolver the only outcomes are the AWS VPC probe \
              or nothing, got {probed:?}"
         );
