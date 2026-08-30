@@ -751,7 +751,9 @@ class ReplyContract(ReplayFixture, unittest.TestCase):
     rows carried no remote address; corpus-access.log holds a line for every
     one of them (27 GET answered 404, 2 POST answered 404, 3 HEAD answered
     501) and every one was cross-origin. The replay had answered all 32 and
-    the trace could not say so.
+    the trace could not say so. That diag's results were not kept, so those
+    counts are the provenance of this change rather than a record anything may
+    be quoted from; the tests below are what hold the behaviour.
 
     Watched red against corpus_serve.py at 336ac438; the failure is quoted on
     each test.

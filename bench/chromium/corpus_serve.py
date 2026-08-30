@@ -176,11 +176,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         blocks the 404 before the renderer sees it, reports net::ERR_FAILED,
         and receives no response, so the trace records no remote address and
         cannot say the request was answered here rather than off the box.
-        Measured 2026-08-29 over a 42-render diag: 32 traced rows carried no
-        remote address, every one of them cross-origin and every one answered
-        by this server (27 GET 404, 2 POST 404, 3 HEAD 501). The status is
-        unchanged, so a url the corpus does not hold still says so, in the
-        status, in the access log and in /––misses.
+        Measured 2026-08-29 over a 42-render diag whose results were not
+        kept: 32 traced rows carried no remote address, every one of them
+        cross-origin and every one answered by this server (27 GET 404, 2
+        POST 404, 3 HEAD 501). Those counts are why this code is shaped the
+        way it is; they are not a sealed record and nothing may be quoted
+        from them. What holds the behaviour is test_corpus_serve_logs.py.
+        The status is unchanged, so a url the corpus does not hold still
+        says so, in the status, in the access log and in /––misses.
         """
         if not self._cors_sent:
             self._cors_sent = True
