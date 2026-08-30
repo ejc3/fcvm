@@ -278,6 +278,91 @@ fn the_probe_refuses_a_pasta_bin_that_is_not_a_regular_file() {
     );
 }
 
+/// A namespace the kernel refuses must not leave a work directory behind.
+///
+/// `mktemp -d` runs in the OUTER shell, so the directory exists on the host
+/// before `unshare` starts, while the `trap` that removes it is installed by
+/// the `--inside` shell. An `unshare` that fails, on a box with unprivileged
+/// user namespaces switched off or under a restrictive AppArmor profile, never
+/// reaches that trap, so every attempt left one more directory in TMPDIR. The
+/// probe is meant to be cheap to re-run while the pasta wiring is in question,
+/// which is exactly the usage that accumulates them.
+///
+/// `unshare` is stubbed to fail, because the alternative is turning off
+/// unprivileged user namespaces on the host running the test.
+///
+/// RED BEFORE THE FIX:
+///
+/// ```text
+/// the probe left 1 director(ies) in its TMPDIR after exiting with exit status: 1:
+/// tmp.qkV3rXo1aE
+/// ```
+#[test]
+fn the_probe_leaves_no_work_directory_when_the_namespace_fails() {
+    require_tools();
+    let script = repo_root().join("scripts/probe-pasta-dns-gateway.sh");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("create stub bin");
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    // The kernel's refusal, without having to reconfigure the host. The tool
+    // check ahead of it only asks whether `unshare` is on PATH.
+    write_exec(
+        &bin.join("unshare"),
+        "#!/bin/bash
+exit 1
+",
+    );
+    write_exec(
+        &bin.join("pasta"),
+        "#!/bin/bash
+exec sleep 60
+",
+    );
+    let work_root = tmp.path().join("work");
+    std::fs::create_dir_all(&work_root).expect("create work root");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .env("PATH", &path)
+        .env("TMPDIR", &work_root)
+        .env("PASTA_BIN", bin.join("pasta"))
+        .output()
+        .expect("run the probe");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // A probe that stopped before `mktemp -d` leaves nothing behind for a
+    // reason that says nothing about the trap.
+    assert!(
+        !stderr.contains("this probe cannot evaluate anything") && !stderr.contains("BLOCKED:"),
+        "BLOCKED: the probe stopped before it reached the namespace, so this \
+         says nothing about the work directory:\nstderr:\n{stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "the stubbed unshare was supposed to fail the run:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let left: Vec<String> = std::fs::read_dir(&work_root)
+        .expect("read work root")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the probe left {} director(ies) in its TMPDIR after exiting with {}:\n{}",
+        left.len(),
+        output.status,
+        left.join("\n"),
+    );
+}
+
 /// The probe runs to its normal end and leaves nothing behind.
 ///
 /// The pasta binary, the namespace entry and the query are stubbed: what is

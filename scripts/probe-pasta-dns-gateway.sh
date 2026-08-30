@@ -60,8 +60,15 @@ if [ "${1:-}" != "--inside" ]; then
     # without a PID namespace every run left both of them holding the private
     # net and mount namespaces open. PID 1 exiting is what ends them, on the
     # success path, on a failed expectation, and on a kill.
+    # The work directory is created HERE, so it exists on the host before
+    # unshare starts, and the --inside shell's trap is not reached at all when
+    # unshare fails (userns off, a restrictive AppArmor profile). Owned here
+    # too, or every refused attempt leaves one more directory in TMPDIR.
+    WORK=$(mktemp -d) \
+        || { echo "BLOCKED: cannot create a work directory under ${TMPDIR:-/tmp}" >&2; exit 2; }
+    trap 'rm -rf "$WORK"' EXIT
     unshare --user --map-root-user --net --mount --pid --mount-proc --kill-child --fork -- \
-        "$0" --inside "$PASTA_BIN" "$(mktemp -d)" \
+        "$0" --inside "$PASTA_BIN" "$WORK" \
         || exit $?
     exit 0
 fi
