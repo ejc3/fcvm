@@ -146,6 +146,8 @@ def validate_args(args):
         die("settle and quiet-box values must be finite and nonnegative")
     if not re.fullmatch(r"[0-9a-f]{32}", args.run_id or ""):
         die("--run-id must be a 32-character lowercase hexadecimal owner ID")
+    if not re.fullmatch(r"[0-9a-f]{32}", args.container_owner_token or ""):
+        die("--container-owner-token must be a 32-character lowercase hexadecimal token")
 
 
 def claim_results_dir(path):
@@ -639,6 +641,54 @@ class FcvmSide:
 # a clone's.
 CONTAINER_NET = "slirp4netns:allow_host_loopback=true"
 CONTAINER_RESOLVE_TO = "10.0.2.2"
+CONTAINER_OWNER_LABEL = "io.fcvm.bench.owner"
+
+
+def inspected_container_identity(name):
+    """Return (exact ID, benchmark owner token), None if the name is absent."""
+    inspected = sh_bounded(
+        ["podman", "inspect", "--format",
+         f'{{{{.Id}}}} {{{{ index .Config.Labels "{CONTAINER_OWNER_LABEL}" }}}}',
+         name], 30)
+    if inspected.returncode != 0:
+        exists = sh_bounded(["podman", "container", "exists", name], 30)
+        if exists.returncode == 1:
+            return None
+        raise RuntimeError(
+            f"cannot identify container {name}: {inspected.stderr.strip() or exists.stderr.strip()}"
+        )
+    fields = inspected.stdout.split()
+    if len(fields) != 2:
+        raise RuntimeError(
+            f"podman returned no exact ID and owner label for {name}: "
+            f"{inspected.stdout.strip()!r}"
+        )
+    return fields[0], fields[1]
+
+
+def remove_owned_container(name, owner_token, expected_id=None):
+    """Remove only the exact container this invocation can prove it created."""
+    identity = inspected_container_identity(name)
+    if identity is None:
+        return
+    container_id, actual_owner = identity
+    if actual_owner != owner_token or (expected_id and container_id != expected_id):
+        log(f"leaving unowned same-name container {name} ({container_id}) untouched")
+        return
+    removed = sh_bounded(["podman", "rm", "-f", "--", container_id], 30)
+    if removed.returncode != 0:
+        raise RuntimeError(
+            f"cannot remove owned container {name} ({container_id}): "
+            f"{removed.stderr.strip()}"
+        )
+    exists = sh_bounded(["podman", "container", "exists", container_id], 30)
+    if exists.returncode == 0:
+        raise RuntimeError(f"owned container {name} ({container_id}) survived podman rm")
+    if exists.returncode != 1:
+        raise RuntimeError(
+            f"cannot verify removal of owned container {name} ({container_id}): "
+            f"{exists.stderr.strip()}"
+        )
 
 
 class ContainerSide:
@@ -648,6 +698,7 @@ class ContainerSide:
         self.args = args
         self.run_id = run_id
         self.owned = set()
+        self.owned_ids = {}
 
     def prefix(self, cell_tag):
         return f"cbmem-{self.run_id}-{cell_tag}-"
@@ -658,12 +709,17 @@ class ContainerSide:
             name = f"{self.prefix(cell_tag)}{i}"
             self.owned.add(name)
             r = sh_bounded(["podman", "run", "-d", "--name", name,
+                            "--label", f"{CONTAINER_OWNER_LABEL}={self.args.container_owner_token}",
                             "--network", CONTAINER_NET,
                             "-e", f"BENCH_RESOLVE_ALL_TO={CONTAINER_RESOLVE_TO}",
                             self.args.image], 120)
             if r.returncode != 0:
                 die(f"podman run {name} failed: {r.stderr.strip()}")
-            live.append({"i": i, "name": name})
+            container_id = r.stdout.strip()
+            if not container_id or any(character.isspace() for character in container_id):
+                die(f"podman run {name} returned no exact container ID")
+            self.owned_ids[name] = container_id
+            live.append({"i": i, "name": name, "container_id": container_id})
         for c in live:
             deadline = time.monotonic() + 180
             while sh_bounded(["podman", "exec", c["name"], "test", "-f",
@@ -690,29 +746,27 @@ class ContainerSide:
         return live
 
     def tear_down(self, live):
-        names_owned = {c["name"] for c in live}
+        errors = []
         for c in live:
-            sh_bounded(["podman", "rm", "-f", c["name"]], 30)
-        deadline = time.monotonic() + 120
-        remaining = set(names_owned)
-        while time.monotonic() < deadline:
-            listed = sh_bounded(
-                ["podman", "ps", "-a", "--format", "{{.Names}}"], 30)
-            if listed.returncode != 0:
-                die(f"cannot verify removal of owned containers: "
-                    f"{listed.stderr.strip()}")
-            names = listed.stdout.split()
-            remaining = names_owned.intersection(names)
-            if not remaining:
-                self.owned.difference_update(names_owned)
-                return
-            time.sleep(0.5)
-        die(f"owned containers outlived their removal: {', '.join(sorted(remaining))}; "
-            "a later cell would be contaminated")
+            name = c["name"]
+            try:
+                remove_owned_container(
+                    name, self.args.container_owner_token,
+                    c.get("container_id", self.owned_ids.get(name)))
+            except RuntimeError as exc:
+                errors.append(exc)
+                continue
+            self.owned.discard(name)
+            self.owned_ids.pop(name, None)
+        if errors:
+            raise errors[0]
 
     def stop_all(self):
         if self.owned:
-            self.tear_down([{"name": name} for name in sorted(self.owned)])
+            self.tear_down([
+                {"name": name, "container_id": self.owned_ids.get(name)}
+                for name in sorted(self.owned)
+            ])
 
     def sample(self, extra, cell_tag):
         return sample(extra, podman_prefix=self.prefix(cell_tag))
@@ -1004,11 +1058,18 @@ def cputime_host_arm(args, res, container_side=None):
     if container_side is not None:
         container_side.owned.add(name)
     r = sh_bounded(["podman", "run", "-d", "--name", name, "--network", "host",
+                    "--label", f"{CONTAINER_OWNER_LABEL}={args.container_owner_token}",
                     "-e", f"BENCH_RESOLVE_ALL_TO={args.container_resolve_to}",
                     args.image], 120)
     if r.returncode != 0:
         res["host_error"] = f"podman run failed: {r.stderr.strip()}"
         return
+    container_id = r.stdout.strip()
+    if not container_id or any(character.isspace() for character in container_id):
+        res["host_error"] = "podman run returned no exact container ID"
+        return
+    if container_side is not None:
+        container_side.owned_ids[name] = container_id
     try:
         deadline = time.monotonic() + 180
         while True:
@@ -1082,12 +1143,18 @@ def cputime_host_arm(args, res, container_side=None):
     except TimeoutError:
         pass
     finally:
-        removed = sh_bounded(["podman", "rm", "-f", name], 30)
-        if removed.returncode != 0:
+        try:
+            remove_owned_container(
+                name, args.container_owner_token,
+                container_side.owned_ids.get(name) if container_side is not None else container_id)
+        except RuntimeError as exc:
             res["host"] = None
-            res["host_error"] = (
-                f"podman rm failed for {name}: {removed.stderr.strip()}")
-        elif container_side is not None:
+            res["host_error"] = str(exc)
+        else:
+            if container_side is not None:
+                container_side.owned_ids.pop(name, None)
+                container_side.owned.discard(name)
+        if container_side is not None and name not in container_side.owned_ids:
             container_side.owned.discard(name)
     if "host_error" in res:
         log("cputime host arm produced no figure: " + res["host_error"])
@@ -1122,6 +1189,8 @@ def main_with_resources(resources):
                    help="CPU-seconds per screenshot on both sides, over this many renders")
     p.add_argument("--run-id", default="",
                    help="owner ID shared with the outer cleanup; defaults to a UUID")
+    p.add_argument("--container-owner-token", default="",
+                   help="32-hex token proving which containers this invocation created")
     args = p.parse_args()
 
     args.urls = parse_csv(args.urls, "--urls")
@@ -1131,6 +1200,7 @@ def main_with_resources(resources):
         die(f"--ns must be comma-separated integers: {exc}")
     args.state_dir = os.path.join(args.data_root, "state")
     args.run_id = args.run_id or uuid.uuid4().hex
+    args.container_owner_token = args.container_owner_token or uuid.uuid4().hex
     validate_args(args)
     install_signal_cleanup()
 
