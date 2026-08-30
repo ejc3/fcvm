@@ -36,7 +36,7 @@ import campaign_summary  # noqa: E402
 
 
 class EvidenceIgnoreRules(unittest.TestCase):
-    """Evidence files are negated out of the results ignore; raw output is not.
+    """Evidence files are negated out of the results ignore; unused raw output is not.
 
     RED BEFORE THE FIX: verify-dns.json, dns-evidence.json and dns-owner.log
     were ignored by `results/**` (git check-ignore exit 0), and the literal
@@ -68,6 +68,7 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "!results/**/replay-queries.log",
         "!results/**/campaign-*-summary.json",
         "!results/**/WITHDRAWN",
+        "!results/**/reqbench.jsonl",
     )
     EVIDENCE = (
         "results/run-x/verify-dns.json",
@@ -83,9 +84,9 @@ class EvidenceIgnoreRules(unittest.TestCase):
         "results/campaign-x-summary.json",
         "results/campaign-x/campaign-x-summary.json",
         "results/run-x/WITHDRAWN",
+        "results/run-x/reqbench.jsonl",
     )
     RAW = (
-        "results/run-x/reqbench.jsonl",
         "results/run-x/requests/0.json",
         "results/run-x/raw.json",
         "results/run-x/report.md",
