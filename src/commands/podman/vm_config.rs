@@ -1107,8 +1107,8 @@ impl GuestBootInputs {
     ///   routed guest. detect_ipv6_dns reads only the host's resolv.conf for
     ///   that, so the same selector runs here and the groups narrow to it.
     ///   Its probe fallback selects the AWS VPC resolver, which belongs to no
-    ///   source, so instead of a group the search domains narrow to the zones
-    ///   that resolver is authoritative for (#886).
+    ///   source, so instead of a group the search domains narrow to the one
+    ///   zone that resolver is authoritative for, this host's own (#886).
     /// * The four FUSE knobs are read only inside fc-agent's FUSE mount path
     ///   (fc-agent/src/fuse/mod.rs), and mount_fuse_volumes runs only when
     ///   the boot plan carries volumes (fc-agent/src/agent.rs), so a
@@ -1143,12 +1143,13 @@ impl GuestBootInputs {
             // so has no group to select. Narrowing to a group would empty the
             // search list and break the VPC suffix that resolver does serve,
             // and leaving the list whole sends an unrelated source's private
-            // suffix to it. Neither: the search domains narrow to the zones
-            // the probed resolver is authoritative for (#886).
+            // suffix to it. Neither: the search domains narrow to the one zone
+            // the probed resolver is authoritative for, which is this host's
+            // own VPC internal zone and not every zone shaped like one (#886).
             let groups = std::mem::take(&mut self.dns);
             self.dns = match crate::network::first_ipv6_nameserver(&groups) {
                 Some(server) => crate::network::narrowed_to(groups, &server),
-                None => crate::network::search_narrowed_to_aws_vpc_zones(groups),
+                None => crate::network::search_narrowed_to_local_aws_vpc_zone(groups),
             };
         }
         if !has_fuse_volumes {
@@ -2019,6 +2020,23 @@ mod tests {
         ]
     }
 
+    /// The same EC2 host with a VPN link into another region's VPC, which
+    /// contributes that VPC's internal zone to the merged search list. AWS
+    /// hands an instance exactly one internal zone, so the second one belongs
+    /// to a VPC this host's resolver does not serve.
+    fn ec2_host_with_a_foreign_vpc_zone() -> [crate::network::ResolvSource; 2] {
+        [
+            resolv_source(
+                crate::network::RESOLV_CONF_SOURCES[0],
+                "nameserver 10.0.0.2\nsearch us-west-1.compute.internal\n",
+            ),
+            resolv_source(
+                crate::network::ETC_RESOLV_CONF,
+                "nameserver 10.99.0.53\nsearch eu-west-1.compute.internal corp.example\n",
+            ),
+        ]
+    }
+
     /// Bridged forwards ONE resolver, so the guest must see only the suffixes
     /// belonging to it. Keeping the whole merged search list expands a short
     /// name with a private suffix from a source whose resolver was never
@@ -2125,8 +2143,9 @@ mod tests {
     /// `ip-10-0-1-49.us-west-1.compute.internal` with A 10.0.1.49, identically
     /// to the host's own 10.0.0.2 and to 169.254.169.253, and returns NXDOMAIN
     /// for `db.corp.example` carrying the root SOA, meaning it recursed the
-    /// private label into the public DNS on the way. So the VPC suffix belongs
-    /// with that resolver and the unrelated one does not (#886, CWE-200).
+    /// private label into the public DNS on the way. So the host's own VPC
+    /// suffix belongs with that resolver and the unrelated one does not
+    /// (#886, CWE-200).
     #[test]
     fn routed_on_the_probe_path_forwards_only_the_suffixes_the_probed_resolver_serves() {
         let inputs = GuestBootInputs::from_sources(None, &ec2_host(), &no_runtime_knobs())
@@ -2193,6 +2212,48 @@ mod tests {
         assert!(
             boot_args.contains("fcvm_dns_search=corp.example|lab.example"),
             "every forwarded resolver keeps its suffixes: {boot_args:?}"
+        );
+    }
+
+    /// The probe path on a host that carries a second AWS VPC internal zone.
+    /// `<region>.compute.internal` names the region, and the probed resolver
+    /// answers for its own VPC only: measured on an EC2 instance in us-west-1,
+    /// `ip-10-0-1-49.eu-west-1.compute.internal` comes back NXDOMAIN with no
+    /// authority, the same verdict that resolver gives `db.corp.example`. A
+    /// zone shape test alone would forward it, so the narrowing is to the one
+    /// zone this host was given, not to every zone that looks like one.
+    #[test]
+    fn routed_on_the_probe_path_forwards_only_the_hosts_own_vpc_zone() {
+        let inputs = GuestBootInputs::from_sources(
+            None,
+            &ec2_host_with_a_foreign_vpc_zone(),
+            &no_runtime_knobs(),
+        )
+        .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+
+        assert_eq!(
+            inputs.dns_search(),
+            vec!["us-west-1.compute.internal"],
+            "a foreign region's VPC zone is NXDOMAIN at the probed resolver"
+        );
+
+        let config = crate::firecracker::FirecrackerConfig {
+            host_dns: inputs.host_dns(),
+            dns_search: inputs.dns_search(),
+            ..Default::default()
+        };
+        let network_config = crate::network::NetworkConfig {
+            dns_server: Some(crate::network::AWS_VPC_IPV6_RESOLVER.to_string()),
+            ..Default::default()
+        };
+        let boot_args = build_runtime_boot_args(&network_config, &config);
+        assert!(
+            !boot_args.contains("eu-west-1"),
+            "another VPC's internal zone must not reach the guest: {boot_args:?}"
+        );
+        assert!(
+            boot_args.contains("fcvm_dns_search=us-west-1.compute.internal"),
+            "the host's own VPC zone still reaches the guest: {boot_args:?}"
         );
     }
 
