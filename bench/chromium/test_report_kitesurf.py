@@ -20,10 +20,14 @@ whole, label and both cells and direction together, and each row's direction wor
 multiplier are recomputed from that row's own two values.
 """
 
+import argparse
 import datetime
+import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,7 +35,18 @@ sys.path.insert(0, HERE)
 
 import report  # noqa: E402
 
-BLOCK = report.KITESURF_CONTEXT
+# bench.sh's own schedule: three host-served fixtures over http plus one over
+# https. Every standard `make bench-chromium` report is written for these.
+FIXTURE_PAGES = ["heavy", "medium", "medium-https", "minimal"]
+CORPUS_PAGES = sorted(report.KITESURF_CORPUS)
+
+FIXTURE_BLOCK = report.kitesurf_context(FIXTURE_PAGES)
+CORPUS_BLOCK = report.kitesurf_context(CORPUS_PAGES)
+
+# The six quoted rows, the summary and the source are the same whichever
+# workload the run measured, so the assertions below hold against either block
+# and BLOCK stands for both. WorkloadComparability asserts what differs.
+BLOCK = FIXTURE_BLOCK
 
 # Cloudflare's table, as published: one tuple per row, cell for cell. The row is
 # the unit of truth here. A label divorced from its two values says nothing, so
@@ -214,10 +229,42 @@ class ComparatorDirection(unittest.TestCase):
             "the block's prose and KITESURF_VERIFIED have drifted apart",
         )
 
-    def test_states_the_corpus_is_shared(self):
-        """corpus_mirror.sh mirrors their public corpus, so the workload axis is close."""
-        self.assertIn("corpus_mirror.sh", BLOCK)
-        self.assertIn("kitesurf.cloudflare.app/corpus.txt", BLOCK)
+    def test_names_the_corpus_the_quoted_rows_were_measured_over(self):
+        """Whatever this run rendered, the reader is told what THEY rendered."""
+        for name, block in (("fixture", FIXTURE_BLOCK), ("corpus", CORPUS_BLOCK)):
+            with self.subTest(workload=name):
+                self.assertIn("corpus_mirror.sh", block)
+                self.assertIn("kitesurf.cloudflare.app/corpus.txt", block)
+
+    def test_the_quoted_rows_do_not_depend_on_what_this_run_rendered(self):
+        """Only the workload paragraph varies; the six rows are theirs either way.
+
+        Every other assertion in this class is made against one block, so this
+        is what entitles them to speak for both.
+        """
+        self.assertEqual(table_rows(FIXTURE_BLOCK), table_rows(CORPUS_BLOCK))
+        for shared in ("Their summary:", f"verified on {report.KITESURF_VERIFIED}",
+                       "Not comparable: everything else."):
+            with self.subTest(text=shared):
+                self.assertIn(shared, FIXTURE_BLOCK)
+                self.assertIn(shared, CORPUS_BLOCK)
+
+    def test_the_corpus_is_the_one_corpus_mirror_actually_mirrors(self):
+        """The claim is that OUR mirror holds THEIR pages, so the two lists must agree.
+
+        report.KITESURF_CORPUS decides which run is corpus-backed and
+        corpus_mirror.sh decides which pages exist to render. If they drift, the
+        block credits a run with a corpus it did not render.
+        """
+        script = open(os.path.join(HERE, "corpus_mirror.sh")).read()
+        block = re.search(r"^URLS=\(\n(.*?)^\)$", script, re.M | re.S)
+        self.assertIsNotNone(block, "corpus_mirror.sh no longer declares a URLS array")
+        mirrored = re.findall(r'"([^"]+)"', block.group(1))
+        self.assertEqual(
+            sorted(mirrored),
+            sorted(report.KITESURF_CORPUS.values()),
+            "report.KITESURF_CORPUS and corpus_mirror.sh name different pages",
+        )
 
     def test_does_not_claim_hardware_the_source_never_states(self):
         """Neither the docs page nor the blog post names the measurement hardware."""
@@ -226,6 +273,108 @@ class ComparatorDirection(unittest.TestCase):
             r"(?i)\b(?:EPYC|Xeon|AMD|Intel)\b",
             "comparator attributes hardware to Cloudflare that their page never states",
         )
+
+
+class WorkloadComparability(unittest.TestCase):
+    """The shared-corpus claim belongs to a run that rendered the shared corpus.
+
+    `report.py finalize` writes one report per run, and bench.sh's own schedule
+    renders three host-served fixtures (minimal.html, medium.html, heavy.html)
+    and never the corpus. A block that states the workload is comparable no
+    matter what the run rendered puts a false claim in every standard
+    `make bench-chromium` report, which is the same defect as the inverted wall
+    row: prose that contradicts the records beneath it.
+
+    Both directions are asserted here, through `cmd_finalize` rather than
+    against the block alone, because the defect was in the wiring: the block was
+    correct for a corpus run and appended unconditionally.
+    """
+
+    def finalize(self, pages):
+        """report.md for a run whose request records name exactly `pages`."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        os.makedirs(os.path.join(d, "requests"))
+        os.makedirs(os.path.join(d, "samples"))
+        with open(os.path.join(d, "hostinfo.json"), "w") as f:
+            json.dump({"uname": "Linux test", "cpu_model": "Neoverse-V1", "nproc": 64,
+                       "mem_total_kb": 128 * 1024 * 1024, "vm_cpu": 2,
+                       "vm_mem_mib": 2048, "reps": 1,
+                       "contention_note": "synthetic fixture"}, f)
+        with open(os.path.join(d, "availability.json"), "w") as f:
+            json.dump({"modes": {"rootless-proxy": {"available": "yes", "reason": ""}},
+                       "hugepages": {"available": "no", "reason": "off", "pool_pages": 0},
+                       "file_huge_cell": "skipped"}, f)
+        # Every run also carries the two orchestration controls, which render no
+        # page; a corpus run must stay corpus-backed with them present.
+        for label in list(pages) + ["noop", "noopsh"]:
+            name = f"p3__rootless-proxy__uffd-4k__{label}__r1.log"
+            with open(os.path.join(d, "requests", name), "w") as f:
+                f.write("1000.0 BENCH_T0\n1001.0 RENDER_OK\n1002.0 BENCH_EXIT rc=0\n")
+        report.cmd_finalize(argparse.Namespace(results_dir=d))
+        with open(os.path.join(d, "report.md")) as f:
+            md = f.read()
+        # The comparator block alone: the assertions are about what it claims,
+        # and the surrounding tables would bury the failure message.
+        head = md.index("### Published comparator")
+        tail = md.index("\n## ", head)
+        return md[head:tail]
+
+    def test_a_fixture_run_does_not_claim_the_workload_is_comparable(self):
+        """bench.sh renders its own fixtures, so its report may not claim a shared corpus."""
+        md = self.finalize(["minimal", "medium", "heavy", "medium-https"])
+        self.assertIn(
+            "Not comparable: the workload",
+            md,
+            "a report over host-served fixtures does not say its workload is "
+            "incomparable to the corpus the quoted rows were measured over",
+        )
+        self.assertNotIn(
+            "same page list",
+            md,
+            "a report over host-served fixtures claims both sides rendered the "
+            "same page list",
+        )
+        for page in ("minimal", "medium", "heavy"):
+            self.assertIn(
+                page, md, f"the block does not name {page}, the page this run rendered"
+            )
+
+    def test_a_corpus_run_states_the_shared_corpus(self):
+        """The corpus point is the strongest half of the comparison where it holds."""
+        md = self.finalize(CORPUS_PAGES)
+        self.assertIn(
+            "Comparable: the workload",
+            md,
+            "a report over the mirrored corpus does not claim the workload it shares",
+        )
+        self.assertIn(
+            "same page list",
+            md,
+            "a report over the mirrored corpus does not state that both sides "
+            "rendered the same page list",
+        )
+        self.assertRegex(
+            md,
+            r"(?i)this run rendered the (?:same |14-URL )",
+            "the shared-corpus claim is not bound to what this run rendered, so "
+            "it says nothing about the report it sits in",
+        )
+        self.assertNotIn("Not comparable: the workload", md)
+
+    def test_a_run_whose_records_name_no_page_claims_nothing(self):
+        """A results dir with no request record is not a corpus run either."""
+        md = self.finalize([])
+        self.assertIn("Not comparable: the workload", md)
+        self.assertIn("no rendered page", md)
+        self.assertNotIn("same page list", md)
+
+    def test_a_run_whose_records_name_no_page_claims_nothing(self):
+        """A results dir with no request record is not a corpus run either."""
+        md = self.finalize([])
+        self.assertIn("Not comparable: the workload", md)
+        self.assertIn("no rendered page", md)
+        self.assertNotIn("same page list", md)
 
 
 if __name__ == "__main__":

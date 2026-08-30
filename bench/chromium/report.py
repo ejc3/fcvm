@@ -18,6 +18,7 @@ import os
 import re
 import statistics
 import sys
+import textwrap
 import time
 
 # The date the six quoted Cloudflare rows were last checked against their source.
@@ -25,7 +26,84 @@ import time
 # recorded date and the asserted date cannot drift apart.
 KITESURF_VERIFIED = "2026-08-30"
 
-KITESURF_CONTEXT = f"""\
+# The Kitesurf public corpus (kitesurf.cloudflare.app/corpus.txt): site key ->
+# source URL, the 14 pages Cloudflare's quoted rows were measured over.
+# corpus_mirror.sh mirrors them, corpus_capture.py reads this mapping rather
+# than keeping a second copy, and a run's request records name a corpus page by
+# its site key. The comparator block below claims a shared workload only for a
+# run whose records name exactly these pages, so the list and the claim cannot
+# drift apart.
+KITESURF_CORPUS = {
+    "example.com_root": "https://example.com/",
+    "news.ycombinator.com_root": "https://news.ycombinator.com/",
+    "developers.cloudflare.com_root": "https://developers.cloudflare.com/",
+    "blog.cloudflare.com_root": "https://blog.cloudflare.com/",
+    "en.wikipedia.org_root": "https://en.wikipedia.org/",
+    "developer.mozilla.org_en-US": "https://developer.mozilla.org/en-US/",
+    "www.elmundo.es_root": "https://www.elmundo.es/",
+    "www.rtp.pt_noticias": "https://www.rtp.pt/noticias/",
+    "www.theguardian.com_international": "https://www.theguardian.com/international",
+    "todomvc.com_examples-javascript-es6-dist": "https://todomvc.com/examples/javascript-es6/dist/",
+    "todomvc.com_examples-react-dist-index.html": "https://todomvc.com/examples/react/dist/index.html",
+    "todomvc.com_examples-vue-dist": "https://todomvc.com/examples/vue/dist/",
+    "todomvc.com_examples-angular-dist-browser": "https://todomvc.com/examples/angular/dist/browser/",
+    "todomvc.com_examples-preact-dist": "https://todomvc.com/examples/preact/dist/",
+}
+
+# Schedule entries that occupy a request record without rendering anything: the
+# two orchestration controls. They are not part of a run's workload.
+CONTROL_PAGES = frozenset({"noop", "noopsh"})
+
+
+def rendered_pages(reqs):
+    """The pages a run rendered, read off its own request records."""
+    return sorted({r["url"] for r in reqs if r.get("url")} - CONTROL_PAGES)
+
+
+def kitesurf_context(pages):
+    """The published comparator, with the workload paragraph written for `pages`.
+
+    The six quoted rows are the same whatever this run rendered; whether the
+    workload behind them is comparable is not. bench.sh's schedule renders three
+    host-served fixtures and never the corpus, so a block that states the
+    workload is shared regardless of the records puts a false claim in every
+    standard `make bench-chromium` report. The claim is made only for a run
+    whose records name the 14 corpus pages, and a run that rendered anything
+    else says so and names what it rendered instead.
+    """
+    if set(pages) == set(KITESURF_CORPUS):
+        workload = """\
+Comparable: the workload. This run rendered the 14-URL corpus behind the rows
+above, mirrored locally by bench/chromium/corpus_mirror.sh from
+kitesurf.cloudflare.app/corpus.txt, so both sides render the same page list
+rather than unrelated pages. Their two wall-time rows also measure the axis
+this report measures."""
+    else:
+        rendered = (
+            f"This run rendered {', '.join(pages)}, not the 14-URL corpus the "
+            "rows above were measured over, so the two page lists are unrelated "
+            "and no number here answers a row above page for page."
+            if pages
+            else "This run's records name no rendered page at all, so there is "
+            "nothing here to set beside the 14-URL corpus the rows above were "
+            "measured over."
+        )
+        # Wrapped rather than hand-broken: the page list comes from the records,
+        # so its length is not known when this is written.
+        workload = "\n\n".join(
+            textwrap.fill(para, width=78, break_on_hyphens=False, break_long_words=False)
+            for para in (
+                f"Not comparable: the workload. {rendered}",
+                "bench/chromium/corpus_mirror.sh mirrors that corpus from "
+                "kitesurf.cloudflare.app/corpus.txt for the runs that render it, "
+                "and this block states the shared-workload comparison only for a "
+                "run whose own records name those 14 pages. Their two wall-time "
+                "rows do measure the axis this report measures, on their pages "
+                "rather than on these.",
+            )
+        )
+
+    return f"""\
 ### Published comparator (context, not measured here)
 
 Cloudflare publishes six rows comparing Kitesurf against a warm Chromium pool,
@@ -50,10 +128,7 @@ Every figure above was verified on {KITESURF_VERIFIED} against
 https://developers.cloudflare.com/browser-run/kitesurf/, which carries the same
 table as https://blog.cloudflare.com/kitesurf/.
 
-Comparable: the workload. bench/chromium/corpus_mirror.sh mirrors the same
-public corpus they benchmarked (kitesurf.cloudflare.app/corpus.txt, 14 URLs),
-so both sides render the same page list rather than unrelated pages. Their two
-wall-time rows also measure the axis this report measures.
+{workload}
 
 Not comparable: everything else. Their page does not state what hardware
 produced these numbers; this report runs on a single ARM64 Graviton box that
@@ -704,7 +779,7 @@ def cmd_finalize(args):
     w(md_table(["scenario", "page", "n", "ready p50 ms", "artifact p50/p95 ms",
                 "nav p50", "shot p50", "in-guest render p50"], rows))
 
-    w(KITESURF_CONTEXT + "\n")
+    w(kitesurf_context(rendered_pages(reqs)) + "\n")
 
     # ---- failures
     fails = [r for r in reqs if not r.get("ok") and r.get("phase", "").startswith(("p3", "burst", "sust"))]
