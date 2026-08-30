@@ -68,8 +68,24 @@ campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.s
     echo " \"fcvm\": \"$(sha256sum "$REPO/target/release/fcvm" | cut -d' ' -f1)\""
     echo "}"
 } > "$RESULTS/provenance.json"
-python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$RESULTS/provenance.json" \
-    || { echo "BLOCKED: provenance.json is not valid JSON" >&2; exit 2; }
+# Valid JSON is not the property that matters. Every field here is a command
+# substitution inside an echo, so a missing sha256sum target or an image podman
+# does not know leaves the field empty, echo still exits 0 under `set -e`, and an
+# object full of "" parses. The record would then name no binary, no image and no
+# script bytes while reading as complete. git_dirty is exempt: empty is what a
+# clean tree says.
+python3 - "$RESULTS/provenance.json" <<'PY' || exit 2
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        rec = json.load(handle)
+except (OSError, ValueError) as exc:
+    sys.exit(f"BLOCKED: provenance.json is not valid JSON: {exc}")
+empty = sorted(k for k, v in rec.items() if k != "git_dirty" and v in ("", None))
+if empty:
+    sys.exit("BLOCKED: provenance.json names nothing for " + ", ".join(empty)
+             + "; these numbers would cite no bytes")
+PY
 
 load1=$(awk '{print $1}' /proc/loadavg)
 awk -v l="$load1" 'BEGIN{exit !(l > 2.0)}' && { echo "BLOCKED: 1-min load $load1 > 2.0" >&2; exit 2; }

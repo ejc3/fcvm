@@ -73,6 +73,21 @@ def wait_quiet(limit, timeout_s):
         time.sleep(10)
 
 
+def sh_bounded(cmd, timeout):
+    """Run cmd, and turn a hang into a failed attempt rather than a hang.
+
+    A loop that bounds itself with a deadline evaluates that deadline only
+    between attempts, so one unbounded `podman exec` against a wedged container
+    holds the harness there forever and the diagnostic the deadline exists to
+    produce is never reached. An attempt that times out is a failed attempt,
+    which is what these loops already handle.
+    """
+    try:
+        return sh(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
+
+
 def port_open(host, port, timeout=0.5):
     try:
         with socket.create_connection((host, port), timeout):
@@ -119,6 +134,28 @@ def cgroup_cpu_usec(cg_path):
     except (OSError, ValueError):
         return None
     return None
+
+
+def stray_vmm_processes():
+    """fcvm/firecracker processes already on the box, or BLOCKED if unknowable.
+
+    The refusal this feeds exists because a leftover VMM is charged to whatever
+    this run measures. `pgrep ... || true` reported the same empty string for a
+    clean box and for every way pgrep can fail to answer: 127 (not installed),
+    2 (bad pattern), 3 (fatal error). Only exit 1 is "no match"; anything else
+    means the box was never checked, and a check that did not run cannot clear
+    it.
+    """
+    try:
+        r = sh(["pgrep", "-a", "fcvm|firecracker"], timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        die(f"cannot run pgrep to check for stray fcvm/firecracker processes: {exc}")
+    if r.returncode == 1:
+        return ""
+    if r.returncode != 0:
+        die(f"pgrep exited {r.returncode} looking for stray fcvm/firecracker "
+            f"processes, so this box was never cleared: {r.stderr.strip()}")
+    return r.stdout.strip()
 
 
 def quiesce(seconds=4):
@@ -388,7 +425,8 @@ class ContainerSide:
             live.append({"i": i, "name": name, "cdp": cdp})
         for c in live:
             deadline = time.monotonic() + 180
-            while sh(["podman", "exec", c["name"], "test", "-f", "/run/bench-ready"]).returncode != 0:
+            while sh_bounded(["podman", "exec", c["name"], "test", "-f",
+                              "/run/bench-ready"], 30).returncode != 0:
                 if time.monotonic() >= deadline:
                     logs = sh(["podman", "logs", "--tail", "20", c["name"]]).stdout
                     die(f"container {c['name']} never became ready: {logs}")
@@ -432,6 +470,26 @@ def slope_intercept(xs, ys):
     return slope, my - slope * mx
 
 
+def empty_bases(s, side):
+    """Which of this steady sample's bases came back as nothing.
+
+    Every basis is a sum over the processes of live instances that have each
+    rendered a page, so once the instance count is satisfied none of them can be
+    zero. A zero is a sample that could not see the process set. report.py's
+    single-node cgroup.procs read produced exactly that on the container side:
+    pool_containers counted from `podman ps` was right while pool_procs and
+    pool_pss_kb were 0, and cell_values reads both with `.get(key, 0)`, so the
+    zero reached summary.json and the least-squares fit as a number.
+
+    A missing key is treated as a zero because `.get(key, 0)` downstream cannot
+    tell them apart either.
+    """
+    keys = (("clone_procs", "clone_cgroup_kb", "clone_pss_kb")
+            if side == "fcvm-clone" else
+            ("pool_procs", "pool_cgroup_kb", "pool_pss_kb"))
+    return [k for k in keys if not s.get(k)]
+
+
 def run_cell(side, args, n, rep, out):
     cell_tag = f"{side.name.split('-')[0]}{n}r{rep}"
     common = {"side": side.name, "n": n, "rep": rep, "run_id": args.run_id,
@@ -463,6 +521,11 @@ def run_cell(side, args, n, rep, out):
     if counted != n:
         die(f"{side.name} n={n} rep={rep}: {counted} instance(s) were accounted, not {n}; "
             "the per-instance figure from this cell would be wrong")
+    empty = empty_bases(steady[1], side.name)
+    if empty:
+        die(f"{side.name} n={n} rep={rep}: {', '.join(empty)} came back zero with "
+            f"{counted} instance(s) accounted; a zero basis is a sample that could "
+            "not see the process set, not a measurement of one")
     side.tear_down(live)
     quiesce()
     post = side.sample(dict(common, phase="post"), cell_tag)
@@ -569,25 +632,45 @@ def run_cputime(args, cg, fcvm_side, out_path):
                        "basis": "leaf cgroup usage_usec over one whole clone lifecycle "
                                 "(spawn, restore, render, teardown)",
                        "records": per}
-    # host: one warm container, the same renders.
-    #
-    # A failure here is recorded, not fatal: the fcvm half above costs 42 clone
-    # lifecycles and is already measured, and an unwritten cputime.json threw
-    # all of it away once (2026-08-30 17:53, "cputime container never became
-    # ready" after 42 clones).
+    # The host arm must not be able to take the fcvm arm with it. That arm cost
+    # 42 clone lifecycles above, it is already measured, and an unwritten
+    # cputime.json threw all of it away once (2026-08-30 17:53, "cputime
+    # container never became ready" after 42 clones). Catching only TimeoutError
+    # left every other host-side refusal -- an unattributable cgroup path, a
+    # missing cpu.stat, a failed render -- doing the same thing again.
+    try:
+        cputime_host_arm(args, res)
+    except SystemExit as exc:
+        res.setdefault("host_error", str(exc))
+        log(f"cputime host arm refused: {res['host_error']}")
+    except Exception as exc:  # noqa: BLE001 - the fcvm records outrank any host failure
+        res.setdefault("host_error", f"{type(exc).__name__}: {exc}")
+        log(f"cputime host arm failed: {res['host_error']}")
+    finally:
+        with open(out_path, "w") as f:
+            json.dump(res, f, indent=1)
+    return {k: v for k, v in res.items() if k != "urls"}
+
+
+def cputime_host_arm(args, res):
+    """One warm container, the same renders, its cgroup CPU differenced.
+
+    Refuses rather than publishes an unattributable figure, and records what it
+    refused in `res`. It never writes cputime.json; run_cputime does that
+    whatever happens here.
+    """
     name = f"cbmem-cpu-{args.run_id[:8]}"
     sh(["podman", "rm", "-f", name])
     r = sh(["podman", "run", "-d", "--name", name, "--network", "host",
             "-e", f"BENCH_RESOLVE_ALL_TO={args.container_resolve_to}", args.image])
     if r.returncode != 0:
         res["host_error"] = f"podman run failed: {r.stderr.strip()}"
-        with open(out_path, "w") as f:
-            json.dump(res, f, indent=1)
-        return {k: v for k, v in res.items() if k != "urls"}
+        return
     try:
         deadline = time.monotonic() + 180
         while True:
-            if sh(["podman", "exec", name, "test", "-f", "/run/bench-ready"]).returncode == 0 \
+            if sh_bounded(["podman", "exec", name, "test", "-f",
+                           "/run/bench-ready"], 30).returncode == 0 \
                     and port_open("127.0.0.1", 9222):
                 break
             if time.monotonic() >= deadline:
@@ -611,8 +694,12 @@ def run_cputime(args, cg, fcvm_side, out_path):
             die(f"container cgroup {cgp} does not exist; nothing can be attributed to it")
         # Two warmup renders first, outside the window, so first-touch costs
         # (fonts, code paths, page cache) are not charged to the measured reps.
+        # A warmup that silently failed would leave those costs inside the
+        # window and inflate the host figure, so the result is checked.
         for i in range(2):
-            render("127.0.0.1:9222", args.urls[i % len(args.urls)])
+            ok, out = render("127.0.0.1:9222", args.urls[i % len(args.urls)])
+            if not ok:
+                die(f"cputime container failed its warmup render: {out}")
         before = cgroup_cpu_usec(cgp)
         if before is None:
             die(f"cputime container cgroup {cgp} has no cpu.stat")
@@ -623,6 +710,9 @@ def run_cputime(args, cg, fcvm_side, out_path):
                 die(f"cputime container failed to render: {out}")
         wall = (time.monotonic() - t0) * 1000
         after = cgroup_cpu_usec(cgp)
+        if after is None:
+            die(f"cputime container cgroup {cgp} stopped reporting cpu.stat "
+                "before the window closed; nothing can be differenced")
         res["host"] = {"n": args.cputime_reps,
                        "per_request_cpu_ms": round((after - before) / 1000.0 / args.cputime_reps, 1),
                        "total_cpu_ms": round((after - before) / 1000.0, 1),
@@ -636,9 +726,6 @@ def run_cputime(args, cg, fcvm_side, out_path):
         pass
     finally:
         sh(["podman", "rm", "-f", name])
-    with open(out_path, "w") as f:
-        json.dump(res, f, indent=1)
-    return {k: v for k, v in res.items() if k != "urls"}
 
 
 def main():
@@ -681,7 +768,7 @@ def main():
         die(f"no golden snapshot at {snap}")
     if sh(["sudo", "-n", "true"]).returncode != 0:
         die("passwordless sudo is required to create the per-instance cgroups")
-    stray = sh(["bash", "-c", "pgrep -a 'fcvm|firecracker' || true"]).stdout.strip()
+    stray = stray_vmm_processes()
     if stray:
         die(f"stray fcvm/firecracker processes would be charged to this measurement:\n{stray}")
     la = wait_quiet(args.quiet_limit, args.quiet_wait)
