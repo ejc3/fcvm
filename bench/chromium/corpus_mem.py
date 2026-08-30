@@ -25,6 +25,8 @@ sampling itself is report.py's `sample` subcommand, unmodified.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
+import fcntl
 import json
 import math
 import os
@@ -39,7 +41,7 @@ import sys
 import time
 import uuid
 
-from reqbench import snapshot_generation
+from reqbench import snapshot_generation, valid_snapshot_name
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(HERE, "report.py")
@@ -85,6 +87,10 @@ class HostArmRefused(Exception):
     shape as a diagnostic whose silence is indistinguishable from a clean
     result. This carries its text into `res["host_error"]`.
     """
+
+
+class CloneStateReadError(RuntimeError):
+    """The state directory cannot prove whether an owned clone is gone."""
 
 
 def sh_bounded(cmd, timeout):
@@ -171,6 +177,24 @@ def validate_snapshot_for_benchmark(generation, image, image_id, expected_dns):
     if generation.get("guest_env") != []:
         die(f"snapshot has unexpected baked container environment: "
             f"{generation.get('guest_env')!r}")
+
+
+def snapshot_generation_under_lease(resources, data_root, tag):
+    """Read one snapshot generation and keep its shared lock until stack exit."""
+    if not valid_snapshot_name(tag):
+        raise RuntimeError(
+            "snapshot tag must be 1..128 ASCII letters, digits, '-', '_', or '.', "
+            "excluding . and .."
+        )
+    lock_path = os.path.join(data_root, "snapshots", f"{tag}.lock")
+    try:
+        lock_file = resources.enter_context(open(lock_path, "a+"))
+        fcntl.flock(lock_file, fcntl.LOCK_SH)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot hold snapshot generation lock {lock_path}: {exc}"
+        ) from exc
+    return snapshot_generation(data_root, tag)
 
 
 _LISTENER_OWNER_PROBE = r"""
@@ -384,8 +408,10 @@ def spawn_in_cgroup(cg_path, argv, log_path, env=None):
 def state_files(state_dir):
     try:
         return [os.path.join(state_dir, f) for f in os.listdir(state_dir) if f.endswith(".json")]
-    except OSError:
-        return []
+    except OSError as exc:
+        raise CloneStateReadError(
+            f"cannot enumerate clone state directory {state_dir}: {exc}"
+        ) from exc
 
 
 def find_clone_state(state_dir, name, deadline, proc):
@@ -413,10 +439,17 @@ def clone_gone(state_dir, name):
     for path in state_files(state_dir):
         try:
             with open(path) as f:
-                if json.load(f).get("name") == name:
-                    return False
-        except (OSError, ValueError):
-            continue
+                state = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise CloneStateReadError(
+                f"cannot read clone state {path} while proving {name} is gone: {exc}"
+            ) from exc
+        if not isinstance(state, dict):
+            raise CloneStateReadError(
+                f"clone state {path} is not an object while proving {name} is gone"
+            )
+        if state.get("name") == name:
+            return False
     return True
 
 
@@ -532,14 +565,18 @@ class FcvmSide:
                     f"cannot reap clone {c['name']}: {type(exc).__name__}: {exc}"))
                 clean = False
             deadline = time.monotonic() + 120
-            while not clone_gone(self.args.state_dir, c["name"]):
-                if time.monotonic() >= deadline:
-                    errors.append(RuntimeError(
-                        f"clone {c['name']} state file outlived its process; "
-                        "a later cell would be contaminated"))
-                    clean = False
-                    break
-                time.sleep(0.2)
+            try:
+                while not clone_gone(self.args.state_dir, c["name"]):
+                    if time.monotonic() >= deadline:
+                        errors.append(RuntimeError(
+                            f"clone {c['name']} state file outlived its process; "
+                            "a later cell would be contaminated"))
+                        clean = False
+                        break
+                    time.sleep(0.2)
+            except CloneStateReadError as exc:
+                errors.append(exc)
+                clean = False
             try:
                 self.cg.rm(c["leaf"])
             except BaseException as exc:
@@ -1057,6 +1094,12 @@ def cputime_host_arm(args, res, container_side=None):
 
 
 def main():
+    """Run one measurement while releasing every whole-run lease on exit."""
+    with ExitStack() as resources:
+        return main_with_resources(resources)
+
+
+def main_with_resources(resources):
     p = argparse.ArgumentParser()
     p.add_argument("--results", required=True)
     p.add_argument("--tag", required=True, help="golden snapshot the clones restore from")
@@ -1097,7 +1140,8 @@ def main():
     if not os.access(args.fcvm, os.X_OK):
         die(f"no fcvm binary at {args.fcvm}")
     try:
-        generation = snapshot_generation(args.data_root, args.tag)
+        generation = snapshot_generation_under_lease(
+            resources, args.data_root, args.tag)
     except RuntimeError as exc:
         die(str(exc))
     inspected = sh_bounded(

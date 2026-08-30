@@ -188,6 +188,12 @@ run_logged() {
     wait "$ACTIVE_PHASE_PID"
     rc=$?
     set -e
+    if kill -0 -- "-$ACTIVE_PHASE_PID" 2>/dev/null; then
+        say "measurement phase leader $ACTIVE_PHASE_PID exited with descendants still running"
+        stop_active_phase
+        [ "$rc" -ne 0 ] && return "$rc"
+        return 1
+    fi
     ACTIVE_PHASE_PID=""
     return "$rc"
 }

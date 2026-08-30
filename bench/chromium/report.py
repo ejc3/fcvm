@@ -287,8 +287,8 @@ def measure_cgroup_set(root, prefix):
     stat_sums = {"anon": 0, "file": 0, "kernel": 0, "sock": 0}
     try:
         entries = sorted(os.listdir(root))
-    except OSError:
-        return 0, 0, 0, 0, stat_sums
+    except OSError as exc:
+        raise CgroupReadError(f"cannot enumerate cgroup root {root}: {exc}") from exc
     for name in entries:
         if not name.startswith(prefix):
             continue
