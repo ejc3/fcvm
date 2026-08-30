@@ -35,6 +35,7 @@ import report as bench_report  # noqa: E402
 EXTRA = os.path.join(HERE, "corpus_extra.sh")
 CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
 HOSTCDP = os.path.join(HERE, "hostcdp.sh")
+OWNED_PROCESS = os.path.join(HERE, "owned_process.py")
 
 
 class Completed:
@@ -253,6 +254,35 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertIn('setsid "$@"', source,
                       "killing only the phase parent can leave its VMM children running")
         self.assertIn('kill -TERM -- "-$pid"', source)
+
+    def test_reused_root_pid_is_never_signalled(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("owned_process", OWNED_PROCESS)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sent = []
+        identities = iter((111, 222))
+        result = module.signal_if_identity(
+            4242, 111, 15,
+            read_identity=lambda _pid: next(identities),
+            open_pidfd=lambda _pid: 9,
+            send_signal=lambda fd, sig: sent.append((fd, sig)),
+            close_pidfd=lambda _fd: None,
+        )
+        self.assertFalse(result)
+        self.assertEqual(sent, [], "a replacement process received the cleanup signal")
+
+    def test_corpus_serve_ownership_is_cleared_after_stop(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        function = re.search(r'^stop_corpus_serve\(\) \{\n.*?^\}', source,
+                             re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(function)
+        body = function.group(0)
+        self.assertIn('owned_process.py" signal', body)
+        self.assertIn('SERVE_PID=""', body)
+        self.assertIn('SERVE_START_TIME=""', body)
 
     def test_a_phase_leader_cannot_leave_an_untracked_descendant(self):
         with open(EXTRA) as handle:
