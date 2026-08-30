@@ -25,8 +25,64 @@ RESULTS="${RESULTS:-$HERE/results/hostcdp-$RUNID}"
 CNAME="hostcdp-$RUNID"
 LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 
+[[ "$RUNID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$ ]] \
+    || { echo "REFUSING: RUNID must be 1-96 filename-safe characters" >&2; exit 2; }
+[[ "$REPS" =~ ^[0-9]+$ && "$WARMUP" =~ ^[0-9]+$ ]] \
+    || { echo "REFUSING: REPS and WARMUP must be nonnegative integers" >&2; exit 2; }
+if ! [[ "$CDP_PORT" =~ ^[0-9]+$ ]] \
+        || [ "$CDP_PORT" -lt 1 ] || [ "$CDP_PORT" -gt 65535 ]; then
+    echo "REFUSING: CDP_PORT must be in 1..65535" >&2
+    exit 2
+fi
+for tool in awk cut pgrep podman python3 timeout; do
+    command -v "$tool" >/dev/null 2>&1 \
+        || { echo "REFUSING: '$tool' missing" >&2; exit 2; }
+done
+
 mkdir -p "$RESULTS"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+container_owns_cdp() {
+    timeout 30 podman exec "$CNAME" python3 -c '
+import os
+import sys
+
+port = int(sys.argv[1])
+inodes = set()
+for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        rows = open(table).read().splitlines()[1:]
+    except OSError:
+        continue
+    for row in rows:
+        fields = row.split()
+        if len(fields) <= 9 or fields[3] != "0A":
+            continue
+        try:
+            local_port = int(fields[1].rsplit(":", 1)[1], 16)
+        except (IndexError, ValueError):
+            continue
+        if local_port == port:
+            inodes.add(fields[9])
+if not inodes:
+    raise SystemExit(1)
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target[8:-1] in inodes:
+            raise SystemExit(0)
+raise SystemExit(1)
+' "$CDP_PORT" >/dev/null 2>&1
+}
 
 # URL may name ONE url (today's contract) or a comma-separated list. The list is
 # cycled exactly as reqbench.py cycles the VM arm's schedule -- url_for_rep()
@@ -62,7 +118,19 @@ quiet_sample() {
     # LOADAVG_FILE would otherwise pass the gate without a load reading.
     [[ "$la" =~ ^[0-9]+([.][0-9]+)?$ ]] \
         || { log "REFUSING: no numeric 1-minute load readable from $LOADAVG_FILE (got '$la')"; exit 2; }
-    fc=$(pgrep -c firecracker || true)
+    fc=0
+    for process in fcvm firecracker; do
+        if count=$(pgrep -c -x "$process" 2>&1); then rc=0; else rc=$?; fi
+        case "$rc" in
+            0)
+                [[ "$count" =~ ^[0-9]+$ ]] \
+                    || { log "REFUSING: pgrep returned a nonnumeric count for $process: $count"; exit 2; }
+                fc=$((fc + count))
+                ;;
+            1) ;;
+            *) log "REFUSING: pgrep exited $rc while checking $process: $count"; exit 2 ;;
+        esac
+    done
     [ "${ALLOW_BUSY:-0}" != 1 ] || return 0
     [ "${fc:-0}" -eq 0 ] || return 1
     # Same 1.0 gate as faultbench; the earlier printf-rounding form refused at 0.70.
@@ -83,8 +151,19 @@ until quiet_sample; do
     sleep "$nap"
 done
 
-cleanup() { podman rm -f "$CNAME" >/dev/null 2>&1 || true; }
+cleanup() {
+    original_rc=$?
+    trap - EXIT
+    if ! timeout 30 podman rm -f -- "$CNAME" >/dev/null 2>&1; then
+        log "FAILED: could not remove owned container $CNAME"
+        [ "$original_rc" -ne 0 ] && exit "$original_rc"
+        exit 1
+    fi
+    exit "$original_rc"
+}
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # BENCH_RESOLVE_ALL_TO=<ip> is the resolver rule the VM arm bakes into its
 # golden through reqbench.sh GUEST_ENV; the same variable goes to this
@@ -105,20 +184,26 @@ if [ -n "${CPUS:-}" ]; then
     cpus_arg=(--cpus "$CPUS")
 fi
 cpus_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' "${CPUS:-}")
-podman run -d --name "$CNAME" --network host "${cpus_arg[@]}" "${resolve_env[@]}" "$IMAGE" >/dev/null
+timeout 120 podman run -d --name "$CNAME" --network host \
+    "${cpus_arg[@]}" "${resolve_env[@]}" "$IMAGE" >/dev/null
 
 # Ready = the same two conditions the VM golden gates on: warm marker file AND
 # a live CDP round trip that finds a page target (cdp_health inside the image).
 t0=$SECONDS
-until podman exec "$CNAME" test -f /run/bench-ready 2>/dev/null; do
-    [ $((SECONDS - t0)) -lt 120 ] || { log "container never became ready"; podman logs "$CNAME" | tail -20 >&2; exit 1; }
+until timeout 30 podman exec "$CNAME" test -f /run/bench-ready 2>/dev/null \
+        && container_owns_cdp; do
+    [ $((SECONDS - t0)) -lt 120 ] || {
+        log "container never became ready with an owned CDP listener"
+        timeout 30 podman logs --tail 20 "$CNAME" >&2 || true
+        exit 1
+    }
     sleep 0.5
 done
 log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP warmup ($((WARMUP + REPS)) total) against $URL"
 
 # Record the measured configuration beside the numbers, not in prose.
 {
-    echo "{\"image\": \"$IMAGE\", \"image_id\": \"$(podman inspect --format '{{.Image}}' "$CNAME")\","
+    echo "{\"image\": \"$IMAGE\", \"image_id\": \"$(timeout 30 podman inspect --format '{{.Image}}' "$CNAME")\","
     echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"total_reps\": $((WARMUP + REPS)),"
     echo " \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
     echo " \"urls\": $urls_json, \"url_count\": ${#URLS[@]}, \"cpus\": $cpus_json,"

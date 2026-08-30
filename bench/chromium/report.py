@@ -164,14 +164,15 @@ def read_meminfo():
 
 
 def pss_kb_of_pid(pid):
+    path = f"/proc/{pid}/smaps_rollup"
     try:
-        with open(f"/proc/{pid}/smaps_rollup") as f:
+        with open(path) as f:
             for line in f:
                 if line.startswith("Pss:"):
                     return int(line.split()[1])
-    except (OSError, ValueError):
-        return 0
-    return 0
+    except (OSError, ValueError) as exc:
+        raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+    raise CgroupReadError(f"cannot read {path}: no Pss field")
 
 
 # --- matched-basis memory accounting -------------------------------------
@@ -182,13 +183,19 @@ def pss_kb_of_pid(pid):
 #   pss     PSS summed over exactly that cgroup's process set
 # plus a machine-level MemAvailable delta recorded by the caller.
 
+
+class CgroupReadError(RuntimeError):
+    """A cgroup basis could not be read completely."""
+
+
 def cgroup_bytes(cg_path):
-    """memory.current of one cgroup (bytes), or None if unreadable."""
+    """memory.current of one cgroup (bytes), or refuse an incomplete basis."""
+    path = os.path.join(cg_path, "memory.current")
     try:
-        with open(os.path.join(cg_path, "memory.current")) as f:
+        with open(path) as f:
             return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as exc:
+        raise CgroupReadError(f"cannot read {path}: {exc}") from exc
 
 
 def cgroup_procs(cg_path):
@@ -204,36 +211,73 @@ def cgroup_procs(cg_path):
     procs, so on the fcvm side the same miss lowers `clones` and the cell is
     refused -- the failure was one-sided, in fcvm's favour.
 
-    A node whose cgroup.procs cannot be read or parsed is skipped whole rather
-    than contributing the pids parsed before the bad token, so a torn read
-    cannot put a partial process set behind a total that looks complete.
+    Every node must be readable and parseable. Skipping one produces a subtotal
+    that is indistinguishable from the complete process set memory.current is
+    charged over.
     """
+    if not os.path.isdir(cg_path):
+        return []
+
+    def walk_error(exc):
+        raise CgroupReadError(f"cannot walk cgroup subtree {cg_path}: {exc}") from exc
+
     pids = []
-    for root, _dirs, files in os.walk(cg_path):
+    for root, _dirs, files in os.walk(cg_path, onerror=walk_error):
         if "cgroup.procs" not in files:
-            continue
+            raise CgroupReadError(f"cgroup node has no cgroup.procs: {root}")
+        path = os.path.join(root, "cgroup.procs")
         try:
-            with open(os.path.join(root, "cgroup.procs")) as f:
+            with open(path) as f:
                 node = [int(x) for x in f.read().split()]
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError) as exc:
+            raise CgroupReadError(f"cannot read {path}: {exc}") from exc
         pids.extend(node)
+    if len(pids) != len(set(pids)):
+        raise CgroupReadError(
+            f"process moved within cgroup subtree {cg_path} while it was read")
     return pids
 
 
 def cgroup_stat(cg_path):
+    """Read one complete memory.stat record."""
+    path = os.path.join(cg_path, "memory.stat")
     out = {}
     try:
-        with open(os.path.join(cg_path, "memory.stat")) as f:
+        with open(path) as f:
             for line in f:
                 k, _, v = line.partition(" ")
-                try:
-                    out[k] = int(v)
-                except ValueError:
-                    pass
-    except OSError:
-        pass
+                if not k or not v:
+                    raise ValueError(f"malformed line {line!r}")
+                out[k] = int(v)
+    except (OSError, ValueError) as exc:
+        raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+    missing = sorted({"anon", "file", "kernel", "sock"} - out.keys())
+    if missing:
+        raise CgroupReadError(f"{path} has no {', '.join(missing)} field(s)")
     return out
+
+
+def measure_complete_cgroup(cg_path, with_stat=True):
+    """Read both bases over one process set that stayed unchanged."""
+    if not os.path.isdir(cg_path):
+        raise CgroupReadError(f"cgroup disappeared before it was sampled: {cg_path}")
+    before = cgroup_procs(cg_path)
+    if not before:
+        after = cgroup_procs(cg_path)
+        if after:
+            raise CgroupReadError(
+                f"process set changed in {cg_path} while it was sampled: [] -> {after}")
+        raise CgroupReadError(
+            f"owned cgroup {cg_path} has no processes; zero is not a complete sample")
+    current = cgroup_bytes(cg_path)
+    pss = sum(pss_kb_of_pid(pid) for pid in before)
+    stat = cgroup_stat(cg_path) if with_stat else {}
+    after = cgroup_procs(cg_path)
+    if sorted(before) != sorted(after):
+        raise CgroupReadError(
+            f"process set changed in {cg_path} while it was sampled: "
+            f"{sorted(before)} -> {sorted(after)}")
+    return before, current, pss, stat
 
 
 def measure_cgroup_set(root, prefix):
@@ -251,16 +295,11 @@ def measure_cgroup_set(root, prefix):
         path = os.path.join(root, name)
         if not os.path.isdir(path):
             continue
-        procs = cgroup_procs(path)
-        if not procs:
-            continue  # leaf with no live process contributes nothing
-        cb = cgroup_bytes(path)
+        procs, cb, pss, st = measure_complete_cgroup(path)
         n += 1
         tot_procs += len(procs)
-        if cb is not None:
-            tot_cg += cb
-        tot_pss += sum(pss_kb_of_pid(p) for p in procs)
-        st = cgroup_stat(path)
+        tot_cg += cb
+        tot_pss += pss
         for k in stat_sums:
             stat_sums[k] += st.get(k, 0)
     return n, tot_cg, tot_pss, tot_procs, stat_sums
@@ -337,7 +376,11 @@ def cmd_sample(args):
 
     # --- fcvm clones: EVERY process of each clone, via its own cgroup --------
     if args.cgroup_root and args.cgroup_prefix:
-        n, cg, pss, nproc, st = measure_cgroup_set(args.cgroup_root, args.cgroup_prefix)
+        try:
+            n, cg, pss, nproc, st = measure_cgroup_set(
+                args.cgroup_root, args.cgroup_prefix)
+        except CgroupReadError as exc:
+            refuse_sample(str(exc))
         rec["clones"] = n
         rec["clone_procs"] = nproc
         rec["clone_cgroup_kb"] = cg // 1024
@@ -378,12 +421,14 @@ def cmd_sample(args):
         tot_pss = tot_cg = tot_procs = 0
         for n in names:
             path = podman_container_cgroup(n)
-            procs = cgroup_procs(path)
+            try:
+                procs, cb, pss, _st = measure_complete_cgroup(
+                    path, with_stat=False)
+            except CgroupReadError as exc:
+                refuse_sample(f"container {n}: {exc}")
             tot_procs += len(procs)
-            tot_pss += sum(pss_kb_of_pid(p) for p in procs)
-            cb = cgroup_bytes(path)
-            if cb is not None:
-                tot_cg += cb
+            tot_pss += pss
+            tot_cg += cb
         rec["pool_containers"] = len(names)
         rec["pool_procs"] = tot_procs
         rec["pool_pss_kb"] = tot_pss

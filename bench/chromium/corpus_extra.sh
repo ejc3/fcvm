@@ -21,7 +21,7 @@ RESULTS="${RESULTS:-$BENCH/results/corpusextra-$STAMP-$RUN_ID}"
 LOGDIR="${LOGDIR:-/tmp/corpusextra-$STAMP-$RUN_ID}"
 TAG="${TAG:-cb-req-corpus}"
 IMAGE="${IMAGE:-localhost/chromium-bench-req}"
-PHASES="${PHASES:-hostcdp,memory}"
+PHASES="${PHASES-hostcdp,memory}"
 REPS="${REPS:-202}"          # measured reps; WARMUP is extra, matching the VM arm
 WARMUP="${WARMUP:-28}"       # two full 14-URL cycles, the campaign's warmup
 MEM_NS="${MEM_NS:-1,2,4,8}"
@@ -40,16 +40,45 @@ URLS="https://example.com/,https://news.ycombinator.com/,https://developers.clou
 
 say() { printf '\n=== %s %s\n' "$(date +%H:%M:%S)" "$*"; }
 
-for tool in jq curl dig flock python3 podman sudo; do
+validate_phases() {
+    local remaining="$PHASES" phase seen=","
+    [ -n "$remaining" ] || { echo "BLOCKED: PHASES names no phases" >&2; return 2; }
+    while :; do
+        phase="${remaining%%,*}"
+        [ -n "$phase" ] || { echo "BLOCKED: PHASES contains an empty phase" >&2; return 2; }
+        case "$phase" in
+            hostcdp|memory) ;;
+            *) echo "BLOCKED: unknown phase '$phase'" >&2; return 2 ;;
+        esac
+        case "$seen" in
+            *",$phase,"*) echo "BLOCKED: PHASES repeats '$phase'" >&2; return 2 ;;
+        esac
+        seen="$seen$phase,"
+        case "$remaining" in
+            *,*) remaining="${remaining#*,}" ;;
+            *) break ;;
+        esac
+    done
+}
+
+[[ "$RUN_ID" =~ ^[0-9a-f]{32}$ ]] \
+    || { echo "BLOCKED: RUN_ID must be a 32-character lowercase hexadecimal owner ID" >&2; exit 2; }
+validate_phases
+
+for tool in install jq curl dig flock python3 podman pgrep setsid sudo tee timeout; do
     command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
 done
 
-# DNS 53, HTTP 80, HTTPS 443 and dnsmasq are host-wide resources. Hold one
-# per-user lease before creating output or touching any of them.
-LOCK_DIR="/run/user/$UID"
-[ -d "$LOCK_DIR" ] || LOCK_DIR=/tmp
-CORPUS_EXTRA_LOCK="$LOCK_DIR/fcvm-corpus-extra-$UID.lock"
-exec 9>"$CORPUS_EXTRA_LOCK"
+# DNS 53, HTTP 80, HTTPS 443 and dnsmasq are host-wide resources. Every UID
+# therefore has to contend on the same inode before creating output or touching
+# any of them. A root-owned directory can be opened read-only by both rootful
+# and rootless callers. A regular file created by one caller cannot: Linux's
+# fs.protected_regular=2 rejects another UID's O_CREAT open in sticky /run/lock,
+# even at mode 0666, which would split the supposed lease by caller identity.
+CORPUS_EXTRA_LOCK="/run/lock/fcvm-corpus-extra.lock"
+sudo -n install -d -o root -g root -m 0755 "$CORPUS_EXTRA_LOCK" \
+    || { echo "BLOCKED: cannot provision host-wide lease $CORPUS_EXTRA_LOCK" >&2; exit 2; }
+exec 9<"$CORPUS_EXTRA_LOCK"
 flock -n 9 || { echo "BLOCKED: another corpus-extra run owns $CORPUS_EXTRA_LOCK" >&2; exit 2; }
 
 mkdir -p "$RESULTS" "$LOGDIR"
@@ -97,13 +126,68 @@ PY
 
 load1=$(awk '{print $1}' /proc/loadavg)
 awk -v l="$load1" 'BEGIN{exit !(l > 2.0)}' && { echo "BLOCKED: 1-min load $load1 > 2.0" >&2; exit 2; }
-if pgrep -x fcvm >/dev/null 2>&1 || pgrep -x firecracker >/dev/null 2>&1; then
-    echo "BLOCKED: stray fcvm/firecracker processes" >&2; pgrep -a 'fcvm|firecracker' >&2; exit 2
-fi
+find_stray_vmms() {
+    local process output rc found=""
+    for process in fcvm firecracker; do
+        set +e
+        output=$(pgrep -a -x "$process" 2>&1)
+        rc=$?
+        set -e
+        case "$rc" in
+            0) found="${found}${found:+$'\n'}${output}" ;;
+            1) ;;
+            *) echo "BLOCKED: pgrep exited $rc while checking $process: $output" >&2; return 2 ;;
+        esac
+    done
+    [ -n "$found" ] || return 1
+    printf '%s\n' "$found"
+}
+set +e
+stray_vmms=$(find_stray_vmms)
+rc=$?
+set -e
+case "$rc" in
+    0) echo "BLOCKED: stray fcvm/firecracker processes" >&2; printf '%s\n' "$stray_vmms" >&2; exit 2 ;;
+    1) ;;
+    *) exit 2 ;;
+esac
 
 DNSMASQ_WAS_ACTIVE=no
 systemctl is-active --quiet dnsmasq 2>/dev/null && DNSMASQ_WAS_ACTIVE=yes
 SERVE_PID=""
+ACTIVE_PHASE_PID=""
+
+run_logged() {
+    local log_path="$1" rc
+    shift
+    setsid "$@" > >(tee "$log_path") 2>&1 &
+    ACTIVE_PHASE_PID=$!
+    set +e
+    wait "$ACTIVE_PHASE_PID"
+    rc=$?
+    set -e
+    ACTIVE_PHASE_PID=""
+    return "$rc"
+}
+
+stop_active_phase() {
+    local pid="$ACTIVE_PHASE_PID"
+    [ -n "$pid" ] || return 0
+    if kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; then
+        say "stopping active measurement phase ($pid)"
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            if ! kill -0 -- "-$pid" 2>/dev/null && ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 0.1
+        done
+        if kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; then
+            say "measurement phase $pid did not exit; escalating to SIGKILL"
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    wait "$pid" 2>/dev/null || true
+    ACTIVE_PHASE_PID=""
+}
 
 stop_corpus_serve() {
     [ -n "$SERVE_PID" ] || return 0
@@ -117,23 +201,59 @@ stop_corpus_serve() {
     [ -f "$RESULTS/corpus-serve.status" ] && say "corpus_serve exit status: $(tr -d '[:space:]' <"$RESULTS/corpus-serve.status")"
 }
 
+require_corpus_serve_clean() {
+    local status_file="$RESULTS/corpus-serve.status" status
+    [ -f "$status_file" ] \
+        || { echo "FAILED: corpus_serve left no exit status; replay logs may be incomplete" >&2; return 1; }
+    status=$(tr -d '[:space:]' <"$status_file") \
+        || { echo "FAILED: cannot read $status_file" >&2; return 1; }
+    [ "$status" = 0 ] \
+        || { echo "FAILED: corpus_serve exited $status; replay logs are not complete" >&2; return 1; }
+}
+
+cleanup_owned_containers() {
+    local listed rc=0 name
+    listed=$(timeout 30 podman ps -a --format '{{.Names}}') \
+        || { echo "FAILED: cannot enumerate containers owned by run $RUN_ID" >&2; return 1; }
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        case "$name" in
+            cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*|cbmem-cpu-"$RUN_ID")
+                timeout 30 podman rm -f -- "$name" >/dev/null 2>&1 \
+                    || { echo "FAILED: could not remove owned container $name" >&2; rc=1; }
+                ;;
+        esac
+    done <<<"$listed"
+    return "$rc"
+}
+
 cleanup() {
+    local original_rc=$? cleanup_rc=0
+    trap - EXIT
     set +e
-    stop_corpus_serve
+    stop_active_phase || cleanup_rc=1
+    cleanup_owned_containers || cleanup_rc=1
+    stop_corpus_serve || cleanup_rc=1
     if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
         for _ in $(seq 1 10); do sudo systemctl start dnsmasq >/dev/null 2>&1 && break; sleep 1; done
         systemctl is-active --quiet dnsmasq || {
             echo "FAILED: dnsmasq did not restart; this box has no DNS. Check: sudo ss -lnup 'sport = :53'" >&2
-            exit 1; }
+            cleanup_rc=1; }
     fi
+    [ "$original_rc" -ne 0 ] && exit "$original_rc"
+    exit "$cleanup_rc"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [ "$DNSMASQ_WAS_ACTIVE" = yes ] && { say "stopping dnsmasq for 127.0.0.1:53"; sudo systemctl stop dnsmasq; }
 
 say "starting corpus_serve (DNS 127.0.0.1:53 -> 10.0.2.2, HTTP 80, HTTPS 443)"
 SERVE_PIDFILE="$LOGDIR/corpus_serve.pid"
 rm -f "$SERVE_PIDFILE" "$RESULTS/corpus-serve.status"
+# The caller owns LOGDIR; sudo applies only to the detached replay wrapper.
+# shellcheck disable=SC2024
 sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 --dns-log "$4" --access-log "$5" & pid=$!; echo "$pid" > "$1"; wait "$pid"; rc=$?; echo "$rc" > "$6.tmp" && mv "$6.tmp" "$6"' \
     _ "$SERVE_PIDFILE" "$BENCH/corpus_serve.py" "$BENCH/corpus-live" \
     "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" "$RESULTS/corpus-serve.status" \
@@ -141,8 +261,32 @@ sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.
 for _ in $(seq 1 50); do [ -s "$SERVE_PIDFILE" ] && break; sleep 0.1; done
 SERVE_PID=$(cat "$SERVE_PIDFILE" 2>/dev/null || true)
 [ -n "$SERVE_PID" ] || { echo "BLOCKED: corpus_serve did not start" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
+sudo kill -0 "$SERVE_PID" 2>/dev/null || {
+    echo "BLOCKED: corpus_serve pid $SERVE_PID is not alive" >&2
+    cat "$LOGDIR/corpus_serve.log" >&2
+    exit 3
+}
 grep -q "loaded [1-9]" "$LOGDIR/corpus_serve.log" || {
     echo "BLOCKED: corpus_serve loaded no urls" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
+
+answer=""
+code=""
+for _ in $(seq 1 100); do
+    answer=$(dig +short +time=2 +tries=1 @127.0.0.1 blog.cloudflare.com A 2>/dev/null | head -1 || true)
+    code=$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 5 \
+        --resolve 'blog.cloudflare.com:443:127.0.0.1' https://blog.cloudflare.com/ 2>/dev/null || true)
+    if [ "$answer" = "10.0.2.2" ] && [ "$code" = "200" ]; then break; fi
+    sudo kill -0 "$SERVE_PID" 2>/dev/null || {
+        echo "BLOCKED: corpus_serve died during startup" >&2
+        cat "$LOGDIR/corpus_serve.log" >&2
+        exit 3
+    }
+    sleep 0.2
+done
+[ "$answer" = "10.0.2.2" ] \
+    || { echo "BLOCKED: wildcard DNS answered '$answer', expected 10.0.2.2" >&2; exit 3; }
+[ "$code" = "200" ] \
+    || { echo "BLOCKED: HTTPS replay returned '$code' for blog.cloudflare.com" >&2; exit 3; }
 
 # Every corpus member must replay before anything is measured: a partial corpus
 # measures error pages as renders, which look like fast, plausible numbers.
@@ -156,10 +300,10 @@ for url in $(printf '%s\n' "$URLS" | tr ',' ' '); do
         case "$ucode" in 200|30[1278]) break ;; esac
         sleep 0.2
     done
-    case "$ucode" in 200|30[1278]) ;; *) missing="$missing\n  $ucode  $url" ;; esac
+    case "$ucode" in 200|30[1278]) ;; *) missing="${missing}"$'\n'"  $ucode  $url" ;; esac
     checked=$((checked + 1))
 done
-[ -z "$missing" ] || { printf "BLOCKED: the corpus does not serve every URL:$missing\n" >&2; exit 3; }
+[ -z "$missing" ] || { printf 'BLOCKED: the corpus does not serve every URL:%s\n' "$missing" >&2; exit 3; }
 say "corpus complete: all $checked URLs replay locally"
 
 # Two host arms. "free" is the naive host container: the whole box is available
@@ -175,22 +319,26 @@ if [[ ",$PHASES," == *",hostcdp,"* ]]; then
             *) echo "BLOCKED: unknown hostcdp arm '$arm'" >&2; exit 2 ;;
         esac
         say "hostcdp/$arm over the corpus: $REPS measured reps plus $WARMUP warmup, cpus=${cpus:-<all>}, resolver rule -> 127.0.0.1"
-        URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" IMAGE="$IMAGE" CPUS="$cpus" \
-            RUNID="$RUN_ID-$arm" \
-            BENCH_RESOLVE_ALL_TO=127.0.0.1 SETTLE_WAIT_SECS=300 \
-            RESULTS="$RESULTS/hostcdp-$arm" bash "$BENCH/hostcdp.sh" 2>&1 | tee "$LOGDIR/hostcdp-$arm.log"
+        run_logged "$LOGDIR/hostcdp-$arm.log" env \
+            URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" IMAGE="$IMAGE" CPUS="$cpus" \
+            RUNID="$RUN_ID-$arm" BENCH_RESOLVE_ALL_TO=127.0.0.1 SETTLE_WAIT_SECS=300 \
+            RESULTS="$RESULTS/hostcdp-$arm" bash "$BENCH/hostcdp.sh"
     done
 fi
 
 if [[ ",$PHASES," == *",memory,"* ]]; then
     say "matched-basis memory: N in $MEM_NS, $MEM_REPS reps, interleaved seed $MEM_SEED"
-    python3 "$BENCH/corpus_mem.py" --results "$RESULTS/memory" --tag "$TAG" --image "$IMAGE" \
+    run_logged "$LOGDIR/memory.log" python3 "$BENCH/corpus_mem.py" \
+        --results "$RESULTS/memory" --tag "$TAG" --image "$IMAGE" \
         --urls "$URLS" --ns "$MEM_NS" --reps "$MEM_REPS" \
         --seed "$MEM_SEED" \
         --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" \
         --cputime-reps "$CPUTIME_REPS" \
-        --fcvm "$REPO/target/release/fcvm" 2>&1 | tee "$LOGDIR/memory.log"
+        --run-id "$RUN_ID" \
+        --fcvm "$REPO/target/release/fcvm"
 fi
 
+stop_corpus_serve
+require_corpus_serve_clean
 say "records: $RESULTS"
 say "logs:    $LOGDIR"

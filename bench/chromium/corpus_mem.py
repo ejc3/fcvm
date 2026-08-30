@@ -26,16 +26,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import re
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
 import sys
 import time
 import uuid
+
+from reqbench import snapshot_generation
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(HERE, "report.py")
@@ -96,6 +100,119 @@ def sh_bounded(cmd, timeout):
         return sh(cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
+
+
+def parse_csv(raw, option):
+    """Parse a comma-separated option without silently dropping cells."""
+    values = [value.strip() for value in raw.split(",")]
+    if not raw or any(not value for value in values):
+        die(f"{option} must not be empty or contain empty members")
+    if len(set(values)) != len(values):
+        die(f"{option} contains duplicates")
+    return values
+
+
+def canonical_image_id(raw):
+    """Return the image identity shape snapshot provenance records."""
+    digest = raw[7:] if raw.startswith("sha256:") else raw
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        die(f"podman returned invalid image ID {raw!r}")
+    return "sha256:" + digest
+
+
+def validate_args(args):
+    """Refuse an empty or ambiguous measurement grid before creating output."""
+    if not args.urls or any(not isinstance(url, str) or not url for url in args.urls):
+        die("--urls must name at least one nonempty URL")
+    if not args.ns or any(not isinstance(n, int) or isinstance(n, bool) or n <= 0
+                          for n in args.ns):
+        die("--ns must name one or more positive integers")
+    if len(set(args.ns)) != len(args.ns):
+        die("--ns contains duplicate cell sizes")
+    if not isinstance(args.reps, int) or isinstance(args.reps, bool) or args.reps <= 0:
+        die("--reps must be a positive integer")
+    if (not isinstance(args.cputime_reps, int) or isinstance(args.cputime_reps, bool)
+            or args.cputime_reps < 0):
+        die("--cputime-reps must be a nonnegative integer")
+    timings = (args.settle, args.quiet_limit, args.quiet_wait)
+    if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+           or not math.isfinite(value) or value < 0 for value in timings):
+        die("settle and quiet-box values must be finite and nonnegative")
+    if not re.fullmatch(r"[0-9a-f]{32}", args.run_id or ""):
+        die("--run-id must be a 32-character lowercase hexadecimal owner ID")
+
+
+def validate_snapshot_for_benchmark(generation, image, image_id, expected_dns):
+    """Bind the snapshot tag to the image bytes and replay resolver in use."""
+    if generation.get("image") != image:
+        die(f"snapshot image {generation.get('image')!r} does not match {image!r}")
+    if generation.get("image_id") != image_id:
+        die(f"snapshot image ID {generation.get('image_id')!r} does not match "
+            f"current {image} ID {image_id!r}")
+    if (generation.get("guest_dns") != expected_dns
+            or generation.get("dns_server") != expected_dns):
+        die(f"snapshot did not bake replay DNS {expected_dns}: "
+            f"guest_dns={generation.get('guest_dns')!r} "
+            f"dns_server={generation.get('dns_server')!r}")
+    if generation.get("guest_env") != []:
+        die(f"snapshot has unexpected baked container environment: "
+            f"{generation.get('guest_env')!r}")
+
+
+_LISTENER_OWNER_PROBE = r"""
+import os
+import sys
+
+port = int(sys.argv[1])
+inodes = set()
+for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        rows = open(table).read().splitlines()[1:]
+    except OSError:
+        continue
+    for row in rows:
+        fields = row.split()
+        if len(fields) > 9 and fields[3] == "0A":
+            try:
+                local_port = int(fields[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if local_port == port:
+                inodes.add(fields[9])
+if not inodes:
+    raise SystemExit(1)
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target[8:-1] in inodes:
+            raise SystemExit(0)
+raise SystemExit(1)
+"""
+
+
+def container_owns_tcp_listener(name, port):
+    """Prove a host-network listener belongs to this container's PID namespace."""
+    result = sh_bounded(
+        ["podman", "exec", name, "python3", "-c", _LISTENER_OWNER_PROBE, str(port)],
+        30)
+    return result.returncode == 0
+
+
+def install_signal_cleanup():
+    """Turn termination into SystemExit so main's finally block runs."""
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
 
 
 def port_open(host, port, timeout=0.5):
@@ -181,28 +298,60 @@ class CgroupSet:
 
     def __init__(self, base):
         self.base = base
+        self.created = False
 
     def setup(self):
-        if sh(["sudo", "-n", "mkdir", "-p", self.base]).returncode != 0:
+        if os.path.exists(self.base):
+            die(f"cgroup {self.base} already exists; this run does not own it")
+        made = sh_bounded(["sudo", "-n", "mkdir", self.base], 30)
+        if made.returncode != 0:
             die(f"cannot create {self.base}; per-instance cgroup accounting is the measurement")
-        r = sh(["sudo", "-n", "sh", "-c", f"echo '+memory' > {self.base}/cgroup.subtree_control"])
+        self.created = True
+        r = sh_bounded(
+            ["sudo", "-n", "sh", "-c",
+             f"echo '+memory' > {self.base}/cgroup.subtree_control"], 30)
         if r.returncode != 0:
             die(f"cannot delegate +memory to {self.base}: {r.stderr.strip()}")
 
     def leaf(self, name):
         path = f"{self.base}/{name}"
-        if sh(["sudo", "-n", "mkdir", "-p", path]).returncode != 0:
+        if not self.created:
+            die(f"cannot create leaf before owning cgroup {self.base}")
+        if os.path.exists(path):
+            die(f"leaf cgroup {path} already exists; this run does not own it")
+        if sh_bounded(["sudo", "-n", "mkdir", path], 30).returncode != 0:
             die(f"cannot create leaf cgroup {path}")
         return path
 
     def rm(self, name):
-        sh(["sudo", "-n", "rmdir", f"{self.base}/{name}"])
+        path = f"{self.base}/{name}"
+        result = sh_bounded(["sudo", "-n", "rmdir", path], 30)
+        if result.returncode != 0 and os.path.isdir(path):
+            raise RuntimeError(
+                f"cannot remove cgroup {path}: {result.stderr.strip()}")
 
     def rm_all(self):
-        for name in sorted(os.listdir(self.base)) if os.path.isdir(self.base) else []:
+        if not self.created:
+            return
+        try:
+            names = sorted(os.listdir(self.base)) if os.path.isdir(self.base) else []
+        except OSError as exc:
+            raise RuntimeError(f"cannot enumerate owned cgroup {self.base}: {exc}") from exc
+        errors = []
+        for name in names:
             if os.path.isdir(os.path.join(self.base, name)):
-                self.rm(name)
-        sh(["sudo", "-n", "rmdir", self.base])
+                try:
+                    self.rm(name)
+                except RuntimeError as exc:
+                    errors.append(exc)
+        result = sh_bounded(["sudo", "-n", "rmdir", self.base], 30)
+        if result.returncode != 0 and os.path.isdir(self.base):
+            errors.append(RuntimeError(
+                f"cannot remove cgroup {self.base}: {result.stderr.strip()}"))
+        else:
+            self.created = False
+        if errors:
+            raise errors[0]
 
 
 def spawn_in_cgroup(cg_path, argv, log_path, env=None):
@@ -271,6 +420,7 @@ class FcvmSide:
         self.run_id = run_id
         self.serve_proc = None
         self.serve_pid = None
+        self.owned = {}
 
     def start_serve(self):
         cg = self.cg.leaf("serve-0")
@@ -307,7 +457,7 @@ class FcvmSide:
         self.serve_proc = None
         self.cg.rm("serve-0")
 
-    def bring_up(self, n, cell_tag):
+    def bring_up(self, n, cell_tag, url_indices):
         """n clones, each restored, each having rendered one corpus page."""
         live = []
         for i in range(n):
@@ -319,7 +469,10 @@ class FcvmSide:
                     "--name", name, "--no-dirty-tracking", "--no-swap"]
             env = dict(os.environ, RUST_LOG="fcvm=info")
             proc = spawn_in_cgroup(cgp, argv, log_path, env)
-            live.append({"i": i, "leaf": leaf, "name": name, "proc": proc, "log": log_path})
+            clone = {"i": i, "leaf": leaf, "name": name,
+                     "proc": proc, "log": log_path}
+            self.owned[name] = clone
+            live.append(clone)
         # wait for every clone's published CDP port, then render one page on each
         for c in live:
             found = find_clone_state(self.args.state_dir, c["name"], time.monotonic() + 180, c["proc"])
@@ -334,7 +487,7 @@ class FcvmSide:
                     die(f"clone {c['name']} never answered on {c['endpoint']}; see {c['log']}")
                 time.sleep(0.05)
         for c in live:
-            url = self.args.urls[c["i"] % len(self.args.urls)]
+            url = self.args.urls[url_indices[c["i"]]]
             ok, out = render(c["endpoint"], url)
             if not ok:
                 die(f"clone {c['name']} failed to render {url}: {out}")
@@ -342,25 +495,52 @@ class FcvmSide:
         return live
 
     def tear_down(self, live):
+        errors = []
         for c in live:
             try:
                 c["proc"].terminate()
             except ProcessLookupError:
                 pass
         for c in live:
+            clean = True
             try:
                 c["proc"].wait(timeout=120)
             except subprocess.TimeoutExpired:
-                c["proc"].kill()
-                c["proc"].wait(timeout=60)
-        deadline = time.monotonic() + 120
-        for c in live:
+                try:
+                    c["proc"].kill()
+                    c["proc"].wait(timeout=60)
+                except BaseException as exc:
+                    errors.append(RuntimeError(
+                        f"cannot stop clone {c['name']}: {type(exc).__name__}: {exc}"))
+                    clean = False
+            except BaseException as exc:
+                errors.append(RuntimeError(
+                    f"cannot reap clone {c['name']}: {type(exc).__name__}: {exc}"))
+                clean = False
+            deadline = time.monotonic() + 120
             while not clone_gone(self.args.state_dir, c["name"]):
                 if time.monotonic() >= deadline:
-                    die(f"clone {c['name']} state file outlived its process; a later cell would be contaminated")
+                    errors.append(RuntimeError(
+                        f"clone {c['name']} state file outlived its process; "
+                        "a later cell would be contaminated"))
+                    clean = False
+                    break
                 time.sleep(0.2)
-        for c in live:
-            self.cg.rm(c["leaf"])
+            try:
+                self.cg.rm(c["leaf"])
+            except BaseException as exc:
+                errors.append(RuntimeError(
+                    f"cannot remove clone {c['name']} cgroup: "
+                    f"{type(exc).__name__}: {exc}"))
+                clean = False
+            if clean:
+                self.owned.pop(c["name"], None)
+        if errors:
+            raise errors[0]
+
+    def stop_all(self):
+        if self.owned:
+            self.tear_down(list(self.owned.values()))
 
     def sample(self, extra, cell_tag):
         """The clones, plus the UFFD serve process measured on the same bases.
@@ -421,45 +601,56 @@ class ContainerSide:
     def prefix(self, cell_tag):
         return f"cbmem-{self.run_id}-{cell_tag}-"
 
-    def bring_up(self, n, cell_tag):
+    def bring_up(self, n, cell_tag, url_indices):
         live = []
         for i in range(n):
             name = f"{self.prefix(cell_tag)}{i}"
-            sh(["podman", "rm", "-f", name])
-            r = sh(["podman", "run", "-d", "--name", name,
-                    "--network", CONTAINER_NET,
-                    "-e", f"BENCH_RESOLVE_ALL_TO={CONTAINER_RESOLVE_TO}",
-                    self.args.image])
+            self.owned.add(name)
+            r = sh_bounded(["podman", "run", "-d", "--name", name,
+                            "--network", CONTAINER_NET,
+                            "-e", f"BENCH_RESOLVE_ALL_TO={CONTAINER_RESOLVE_TO}",
+                            self.args.image], 120)
             if r.returncode != 0:
                 die(f"podman run {name} failed: {r.stderr.strip()}")
-            self.owned.add(name)
             live.append({"i": i, "name": name})
         for c in live:
             deadline = time.monotonic() + 180
             while sh_bounded(["podman", "exec", c["name"], "test", "-f",
                               "/run/bench-ready"], 30).returncode != 0:
                 if time.monotonic() >= deadline:
-                    logs = sh(["podman", "logs", "--tail", "20", c["name"]]).stdout
+                    logs = sh_bounded(
+                        ["podman", "logs", "--tail", "20", c["name"]], 30).stdout
                     die(f"container {c['name']} never became ready: {logs}")
                 time.sleep(0.25)
         for c in live:
-            url = self.args.urls[c["i"] % len(self.args.urls)]
+            url = self.args.urls[url_indices[c["i"]]]
             r = sh(["podman", "exec", c["name"], "python3", "/opt/bench/render.py", url,
                     "--out-prefix", "/tmp/mem", "--format", "jpeg"], timeout=180)
             if r.returncode != 0:
                 die(f"container {c['name']} failed to render {url}: "
                     f"{(r.stdout + r.stderr)[-400:]}")
+            removed = sh_bounded(
+                ["podman", "exec", c["name"], "rm", "-f",
+                 "/tmp/mem.jpeg", "/tmp/mem.dom.html"], 30)
+            if removed.returncode != 0:
+                die(f"container {c['name']} could not discard render outputs: "
+                    f"{removed.stderr.strip()}")
             c["url"] = url
         return live
 
     def tear_down(self, live):
         names_owned = {c["name"] for c in live}
         for c in live:
-            sh(["podman", "rm", "-f", c["name"]])
+            sh_bounded(["podman", "rm", "-f", c["name"]], 30)
         deadline = time.monotonic() + 120
         remaining = set(names_owned)
         while time.monotonic() < deadline:
-            names = sh(["podman", "ps", "-a", "--format", "{{.Names}}"]).stdout.split()
+            listed = sh_bounded(
+                ["podman", "ps", "-a", "--format", "{{.Names}}"], 30)
+            if listed.returncode != 0:
+                die(f"cannot verify removal of owned containers: "
+                    f"{listed.stderr.strip()}")
+            names = listed.stdout.split()
             remaining = names_owned.intersection(names)
             if not remaining:
                 self.owned.difference_update(names_owned)
@@ -477,6 +668,30 @@ class ContainerSide:
 
 
 # --------------------------------------------------------------------------
+def cleanup_harness_resources(container_side, fcvm_side, cg, out):
+    """Attempt every independent cleanup even when an earlier one fails."""
+    first_error = None
+    cleanups = (
+        ("host containers", container_side.stop_all if container_side else None),
+        ("fcvm clones", fcvm_side.stop_all if fcvm_side else None),
+        ("fcvm serve", fcvm_side.stop_serve if fcvm_side else None),
+        ("cgroups", cg.rm_all),
+        ("sample output", out.close),
+    )
+    for label, cleanup in cleanups:
+        if cleanup is None:
+            continue
+        try:
+            cleanup()
+        except BaseException as exc:  # cleanup after SystemExit must still continue
+            if first_error is None:
+                first_error = exc
+            else:
+                log(f"cleanup of {label} also failed: {type(exc).__name__}: {exc}")
+    if first_error is not None:
+        raise first_error
+
+
 def slope_intercept(xs, ys):
     """Least squares over the concrete N grid: marginal cost and fixed cost."""
     n = len(xs)
@@ -490,16 +705,19 @@ def slope_intercept(xs, ys):
     return slope, my - slope * mx
 
 
-def build_cell_schedule(sides, ns, reps, seed):
-    """Pair the two sides at each (N, rep), with a reproducible shuffled order."""
+def build_cell_schedule(sides, ns, reps, seed, url_count):
+    """Pair both sides and rotate the corpus across the complete cell grid."""
     rng = random.Random(seed)
     pairs = [(n, rep) for n in ns for rep in range(1, reps + 1)]
     rng.shuffle(pairs)
+    cursor = rng.randrange(url_count)
     schedule = []
     for n, rep in pairs:
+        url_indices = tuple((cursor + i) % url_count for i in range(n))
+        cursor = (cursor + n) % url_count
         pair_sides = list(sides)
         rng.shuffle(pair_sides)
-        schedule.extend((side, n, rep) for side in pair_sides)
+        schedule.extend((side, n, rep, url_indices) for side in pair_sides)
     return schedule
 
 
@@ -523,17 +741,18 @@ def empty_bases(s, side):
     return [k for k in keys if not s.get(k)]
 
 
-def run_cell(side, args, n, rep, out):
+def run_cell(side, args, n, rep, url_indices, out):
     cell_tag = f"{side.name.split('-')[0]}{n}r{rep}"
     common = {"side": side.name, "n": n, "rep": rep, "run_id": args.run_id,
               "snapshot": args.tag if side.name == "fcvm-clone" else None,
               "image": args.image, "uffd_mode": args.uffd_mode if side.name == "fcvm-clone" else None,
-              "uffd_prefetch": args.uffd_prefetch if side.name == "fcvm-clone" else None}
+              "uffd_prefetch": args.uffd_prefetch if side.name == "fcvm-clone" else None,
+              "url_indices": list(url_indices)}
     quiesce()
     pre = side.sample(dict(common, phase="pre"), cell_tag)
     out.write(json.dumps(pre) + "\n"); out.flush()
     log(f"{side.name} n={n} rep={rep}: bringing up")
-    live = side.bring_up(n, cell_tag)
+    live = side.bring_up(n, cell_tag, url_indices)
     time.sleep(args.settle)
     steady = []
     for k in range(3):
@@ -624,6 +843,9 @@ def cputime_fcvm_arm(args, cg, fcvm_side):
         argv = [args.fcvm, "snapshot", "run", "--pid", str(fcvm_side.serve_pid),
                 "--name", name, "--no-dirty-tracking", "--no-swap"]
         proc = spawn_in_cgroup(cgp, argv, log_path, dict(os.environ, RUST_LOG="fcvm=info"))
+        clone = {"i": i, "leaf": leaf, "name": name,
+                 "proc": proc, "log": log_path}
+        fcvm_side.owned[name] = clone
         found = find_clone_state(args.state_dir, name, time.monotonic() + 180, proc)
         if not found:
             die(f"cputime clone {name} never published a state file; see {log_path}")
@@ -651,6 +873,7 @@ def cputime_fcvm_arm(args, cg, fcvm_side):
             time.sleep(0.2)
         usec = cgroup_cpu_usec(cgp)
         cg.rm(leaf)
+        fcvm_side.owned.pop(name, None)
         if usec is None:
             die(f"cputime clone {name} left no cpu.stat to read")
         per.append({"i": i, "url": args.urls[i % len(args.urls)],
@@ -671,7 +894,7 @@ def cputime_fcvm_arm(args, cg, fcvm_side):
             "records": per}
 
 
-def run_cputime(args, cg, fcvm_side, out_path):
+def run_cputime(args, cg, fcvm_side, out_path, container_side=None):
     """CPU-seconds to produce one screenshot, on both sides, same corpus.
 
     This is a different metric from the wall-clock arms and is kept separate
@@ -697,7 +920,7 @@ def run_cputime(args, cg, fcvm_side, out_path):
     # left every other host-side refusal -- an unattributable cgroup path, a
     # missing cpu.stat, a failed render -- doing the same thing again.
     try:
-        cputime_host_arm(args, res)
+        cputime_host_arm(args, res, container_side)
     except HostArmRefused as exc:
         res["host_error"] = str(exc)
         log(f"cputime host arm refused: {exc}")
@@ -713,10 +936,13 @@ def run_cputime(args, cg, fcvm_side, out_path):
     finally:
         with open(out_path, "w") as f:
             json.dump(res, f, indent=1)
+    if res["host"] is None:
+        die("cputime host arm produced no figure after the fcvm record was saved: "
+            + res.get("host_error", "no reason recorded"))
     return {k: v for k, v in res.items() if k != "urls"}
 
 
-def cputime_host_arm(args, res):
+def cputime_host_arm(args, res, container_side=None):
     """One warm container, the same renders, its cgroup CPU differenced.
 
     Refuses rather than publishes an unattributable figure, and records what it
@@ -724,9 +950,11 @@ def cputime_host_arm(args, res):
     whatever happens here.
     """
     name = f"cbmem-cpu-{args.run_id}"
-    sh(["podman", "rm", "-f", name])
-    r = sh(["podman", "run", "-d", "--name", name, "--network", "host",
-            "-e", f"BENCH_RESOLVE_ALL_TO={args.container_resolve_to}", args.image])
+    if container_side is not None:
+        container_side.owned.add(name)
+    r = sh_bounded(["podman", "run", "-d", "--name", name, "--network", "host",
+                    "-e", f"BENCH_RESOLVE_ALL_TO={args.container_resolve_to}",
+                    args.image], 120)
     if r.returncode != 0:
         res["host_error"] = f"podman run failed: {r.stderr.strip()}"
         return
@@ -735,12 +963,18 @@ def cputime_host_arm(args, res):
         while True:
             if sh_bounded(["podman", "exec", name, "test", "-f",
                            "/run/bench-ready"], 30).returncode == 0 \
-                    and port_open("127.0.0.1", 9222):
+                    and container_owns_tcp_listener(name, 9222):
                 break
             if time.monotonic() >= deadline:
-                logs = sh(["podman", "logs", "--tail", "40", name]).stdout
-                state = sh(["podman", "inspect", "--format",
-                            "{{.State.Status}} {{.State.ExitCode}}", name]).stdout.strip()
+                logs_result = sh_bounded(
+                    ["podman", "logs", "--tail", "40", name], 30)
+                state_result = sh_bounded(
+                    ["podman", "inspect", "--format",
+                     "{{.State.Status}} {{.State.ExitCode}}", name], 30)
+                logs = (logs_result.stdout if logs_result.returncode == 0
+                        else f"<podman logs failed: {logs_result.stderr.strip()}>")
+                state = (state_result.stdout.strip() if state_result.returncode == 0
+                         else f"<podman inspect failed: {state_result.stderr.strip()}>")
                 res["host_error"] = ("container never became ready; state=%s logs=%s"
                                      % (state, logs[-1500:]))
                 log("cputime host arm FAILED: " + res["host_error"])
@@ -749,7 +983,12 @@ def cputime_host_arm(args, res):
         # An empty CgroupPath would make this "/sys/fs/cgroup", whose cpu.stat
         # exists and reports the WHOLE MACHINE: a fail-open that would publish a
         # per-render CPU figure with every other process on the box inside it.
-        rel = sh(["podman", "inspect", "--format", "{{.State.CgroupPath}}", name]).stdout.strip()
+        inspected = sh_bounded(
+            ["podman", "inspect", "--format", "{{.State.CgroupPath}}", name], 30)
+        if inspected.returncode != 0:
+            raise HostArmRefused(
+                f"podman inspect failed for {name}: {inspected.stderr.strip()}")
+        rel = inspected.stdout.strip()
         if not rel.startswith("/") or rel == "/":
             raise HostArmRefused(
                 f"podman reports no container cgroup for {name} (got {rel!r}); "
@@ -792,7 +1031,13 @@ def cputime_host_arm(args, res):
     except TimeoutError:
         pass
     finally:
-        sh(["podman", "rm", "-f", name])
+        removed = sh_bounded(["podman", "rm", "-f", name], 30)
+        if removed.returncode != 0:
+            res["host"] = None
+            res["host_error"] = (
+                f"podman rm failed for {name}: {removed.stderr.strip()}")
+        elif container_side is not None:
+            container_side.owned.discard(name)
     if "host_error" in res:
         log("cputime host arm produced no figure: " + res["host_error"])
 
@@ -818,12 +1063,19 @@ def main():
     p.add_argument("--quiet-wait", type=float, default=300.0)
     p.add_argument("--cputime-reps", type=int, default=0,
                    help="CPU-seconds per screenshot on both sides, over this many renders")
+    p.add_argument("--run-id", default="",
+                   help="owner ID shared with the outer cleanup; defaults to a UUID")
     args = p.parse_args()
 
-    args.urls = [u.strip() for u in args.urls.split(",") if u.strip()]
-    args.ns = [int(x) for x in args.ns.split(",") if x.strip()]
+    args.urls = parse_csv(args.urls, "--urls")
+    try:
+        args.ns = [int(x) for x in parse_csv(args.ns, "--ns")]
+    except ValueError as exc:
+        die(f"--ns must be comma-separated integers: {exc}")
     args.state_dir = os.path.join(args.data_root, "state")
-    args.run_id = uuid.uuid4().hex
+    args.run_id = args.run_id or uuid.uuid4().hex
+    validate_args(args)
+    install_signal_cleanup()
     os.makedirs(os.path.join(args.results, "logs"), exist_ok=True)
 
     for tool in ("podman", "sudo", "bash"):
@@ -831,9 +1083,19 @@ def main():
             die(f"'{tool}' is missing; this harness cannot render a verdict without it")
     if not os.access(args.fcvm, os.X_OK):
         die(f"no fcvm binary at {args.fcvm}")
-    snap = os.path.join(args.data_root, "snapshots", args.tag, "config.json")
-    if not os.path.exists(snap):
-        die(f"no golden snapshot at {snap}")
+    try:
+        generation = snapshot_generation(args.data_root, args.tag)
+    except RuntimeError as exc:
+        die(str(exc))
+    inspected = sh_bounded(
+        ["podman", "inspect", "--format", "{{.Id}}", args.image], 30)
+    raw_image_id = inspected.stdout.strip()
+    if inspected.returncode != 0:
+        die(f"cannot identify current image {args.image}: "
+            f"{inspected.stderr.strip() or raw_image_id!r}")
+    image_id = canonical_image_id(raw_image_id)
+    validate_snapshot_for_benchmark(
+        generation, args.image, image_id, CONTAINER_RESOLVE_TO)
     if sh(["sudo", "-n", "true"]).returncode != 0:
         die("passwordless sudo is required to create the per-instance cgroups")
     stray = stray_vmm_processes()
@@ -842,18 +1104,22 @@ def main():
     la = wait_quiet(args.quiet_limit, args.quiet_wait)
 
     schedule = build_cell_schedule(
-        ["fcvm-clone", "host-container"], args.ns, args.reps, args.seed)
+        ["fcvm-clone", "host-container"], args.ns, args.reps, args.seed,
+        len(args.urls))
     meta = {"run_id": args.run_id, "started": time.time(), "loadavg1_at_start": la,
             "host_kernel": os.uname().release, "machine": os.uname().machine,
             "snapshot": args.tag, "image": args.image,
-            "image_id": sh(["podman", "inspect", "--format", "{{.Id}}", args.image]).stdout.strip(),
+            "image_id": image_id,
+            "snapshot_generation": generation,
             "fcvm_sha256": sh(["sha256sum", args.fcvm]).stdout.split()[0] if os.path.exists(args.fcvm) else None,
             "report_py_sha256": sh(["sha256sum", REPORT]).stdout.split()[0],
             "cdpdrive_sha256": sh(["sha256sum", CDPDRIVE]).stdout.split()[0],
             "urls": args.urls, "ns": args.ns, "reps": args.reps,
             "schedule_seed": args.seed,
-            "schedule": [{"side": side, "n": n, "rep": rep}
-                         for side, n, rep in schedule],
+            "schedule": [{"side": side, "n": n, "rep": rep,
+                          "url_indices": list(url_indices),
+                          "urls": [args.urls[index] for index in url_indices]}
+                         for side, n, rep, url_indices in schedule],
             "uffd_mode": args.uffd_mode, "uffd_prefetch": args.uffd_prefetch,
             "basis": "cgroup memory.current and PSS summed over EXACTLY that cgroup's "
                      "process set, on both sides: an fcvm clone's leaf cgroup holds fcvm, "
@@ -868,25 +1134,32 @@ def main():
     out = open(os.path.join(args.results, "samples.jsonl"), "a")
     fcvm_side = None
     container_side = None
+    failure = None
     try:
         cg.setup()
         fcvm_side = FcvmSide(args, cg, args.run_id)
         fcvm_side.start_serve()
         container_side = ContainerSide(args, args.run_id)
         sides = {fcvm_side.name: fcvm_side, container_side.name: container_side}
-        for side_name, n, rep in schedule:
-            cells.append(run_cell(sides[side_name], args, n, rep, out))
+        for side_name, n, rep, url_indices in schedule:
+            cells.append(run_cell(
+                sides[side_name], args, n, rep, url_indices, out))
         if args.cputime_reps:
-            cpu = run_cputime(args, cg, fcvm_side,
-                              os.path.join(args.results, "cputime.json"))
+            cpu = run_cputime(
+                args, cg, fcvm_side, os.path.join(args.results, "cputime.json"),
+                container_side)
             print(json.dumps(cpu, indent=1))
-    finally:
-        if container_side:
-            container_side.stop_all()
-        if fcvm_side:
-            fcvm_side.stop_serve()
-        cg.rm_all()
-        out.close()
+    except BaseException as exc:
+        failure = exc
+    try:
+        cleanup_harness_resources(container_side, fcvm_side, cg, out)
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
+        else:
+            log(f"cleanup also failed: {type(exc).__name__}: {exc}")
+    if failure is not None:
+        raise failure
 
     summary = {"run_id": args.run_id, "meta": meta, "cells": []}
     for c in cells:
