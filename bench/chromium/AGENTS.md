@@ -65,6 +65,18 @@ The host control takes the same variable directly:
 `make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
 `resolve_all_to` in its `run.json` (null when unset).
 
+`URL=` on the host control names one url or a comma-separated list, and a list
+is cycled the way `reqbench.url_for_rep` cycles the VM arm's: `urls[rep %
+len(urls)]`, rep counted from 0 across warmup and measured reps alike. Each
+record carries the `url` it rendered and `summary.json` carries `per_url`
+medians beside the aggregate, so a corpus host baseline is comparable to a
+corpus VM arm url by url. A multi-url run with fewer than two full cycles of
+warmup is refused rather than run, because a cold host arm against a warm VM
+arm is not a control for it. `CPUS=` bounds the container's CPU budget
+(`podman run --cpus`) and is recorded as `cpus` in `run.json`, null when unset,
+which means the whole machine: a host baseline on every core compared against a
+2-vCPU VM arm is two variables, not one.
+
 `bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
 answers what holds a page's load event inside a restored clone, on the
 golden the run uses, on the run's backend and UFFD mode (`BACKEND=`,

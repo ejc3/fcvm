@@ -24,6 +24,22 @@ LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 mkdir -p "$RESULTS"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
+# URL may name ONE url (today's contract) or a comma-separated list. The list is
+# cycled exactly as reqbench.py cycles the VM arm's schedule -- url_for_rep()
+# returns urls[rep % len(urls)], rep counted from 0 across warmup and measured
+# reps alike -- so this host control can run the SAME corpus schedule as the VM
+# arm rather than a different workload. Whitespace around a member is stripped
+# and empty members are dropped, matching reqbench.parse_urls.
+mapfile -t URLS < <(printf '%s' "$URL" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF')
+[ "${#URLS[@]}" -gt 0 ] || { log "REFUSING: URL names no urls"; exit 2; }
+# reqbench refuses a multi-URL run with fewer than two full cycles of warmup;
+# the same floor here keeps the two schedules the same shape rather than
+# comparing a warmed VM arm against a cold host arm.
+if [ "${#URLS[@]}" -gt 1 ] && [ "$WARMUP" -lt $((2 * ${#URLS[@]})) ]; then
+    log "REFUSING: a ${#URLS[@]}-url schedule needs WARMUP >= $((2 * ${#URLS[@]})) (two full cycles), got $WARMUP"
+    exit 2
+fi
+
 # Same quiet-box refusal as the VM harness: a contaminated baseline poisons
 # every ratio computed against it. SETTLE_WAIT_SECS > 0 bounds a wait for the
 # box to go quiet before refusing (same knob as reqbench.sh guard_quiet; the
@@ -74,9 +90,15 @@ if [ -n "${BENCH_RESOLVE_ALL_TO:-}" ]; then
 fi
 resolve_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' \
     "${BENCH_RESOLVE_ALL_TO:-}")
+urls_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${URLS[@]}")
 
 log "starting host container ($IMAGE) with CDP on $CDP_PORT"
-podman run -d --name "$CNAME" --network host "${resolve_env[@]}" "$IMAGE" >/dev/null
+cpus_arg=()
+if [ -n "${CPUS:-}" ]; then
+    cpus_arg=(--cpus "$CPUS")
+fi
+cpus_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' "${CPUS:-}")
+podman run -d --name "$CNAME" --network host "${cpus_arg[@]}" "${resolve_env[@]}" "$IMAGE" >/dev/null
 
 # Ready = the same two conditions the VM golden gates on: warm marker file AND
 # a live CDP round trip that finds a page target (cdp_health inside the image).
@@ -91,6 +113,7 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps ($WARMUP warm
 {
     echo "{\"image\": \"$IMAGE\", \"image_id\": \"$(podman inspect --format '{{.Image}}' "$CNAME")\","
     echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
+    echo " \"urls\": $urls_json, \"url_count\": ${#URLS[@]}, \"cpus\": $cpus_json,"
     echo " \"driver\": \"cdpdrive.py\", \"network\": \"host (no VM, no DNAT)\","
     echo " \"resolve_all_to\": $resolve_json,"
     echo " \"host_kernel\": \"$(uname -r)\", \"loadavg_at_start\": \"$la\"}"
@@ -99,8 +122,9 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps ($WARMUP warm
 OUT="$RESULTS/hostcdp.jsonl"
 : > "$OUT"
 for rep in $(seq 0 $((REPS - 1))); do
+    rep_url="${URLS[$((rep % ${#URLS[@]}))]}"
     t_start=$(date +%s.%N)
-    if out=$(python3 "$HERE/cdpdrive.py" "127.0.0.1:$CDP_PORT" "$URL" --format jpeg --nav-timing 2>&1); then
+    if out=$(python3 "$HERE/cdpdrive.py" "127.0.0.1:$CDP_PORT" "$rep_url" --format jpeg --nav-timing 2>&1); then
         ok=true
     else
         ok=false
@@ -108,21 +132,57 @@ for rep in $(seq 0 $((REPS - 1))); do
     t_end=$(date +%s.%N)
     wall_ms=$(python3 -c "print(f'{(${t_end}-${t_start})*1000:.1f}')")
     warm=$([ "$rep" -lt "$WARMUP" ] && echo true || echo false)
-    printf '{"rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "driver": %s}\n' \
+    printf '{"rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "url": %s, "driver": %s}\n' \
         "$rep" "$ok" "$warm" "$wall_ms" \
+        "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$rep_url")" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$out")" >> "$OUT"
-    [ "$ok" = true ] || { log "rep $rep FAILED: $out"; exit 4; }
+    [ "$ok" = true ] || { log "rep $rep FAILED ($rep_url): $out"; exit 4; }
 done
 
-python3 - "$OUT" "$WARMUP" <<'PY'
+python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json" <<'PY'
 import json, statistics, sys
 rows = [json.loads(l) for l in open(sys.argv[1])]
-measured = [r["wall_ms"] for r in rows if not r["warmup"]]
-measured.sort()
+measured_rows = [r for r in rows if not r["warmup"]]
+
+
+def pct(values, p):
+    """p50 is statistics.median, which is what reqanalyze uses for every median
+    it publishes, so a ratio taken between this number and a VM arm's median is
+    between two numbers computed the same way. Other percentiles are
+    nearest-rank."""
+    values = sorted(values)
+    n = len(values)
+    if p == 50:
+        return statistics.median(values)
+    return values[max(0, -(-p * n // 100) - 1)]
+
+
+measured = [r["wall_ms"] for r in measured_rows]
 n = len(measured)
-p50 = measured[max(0, -(-50*n//100) - 1)]
-p95 = measured[max(0, -(-95*n//100) - 1)]
+if n == 0:
+    # Every rep was warmup. The reps ran, so the run looks successful; without
+    # this the summary dies on an IndexError after minutes of work and the
+    # record holds a jsonl with no summary beside it.
+    sys.exit(f"REFUSING: all {len(rows)} reps were warmup (REPS must exceed WARMUP); nothing to summarise")
+p50, p95 = pct(measured, 50), pct(measured, 95)
 print(f"host direct-CDP warm pool: n={n} p50={p50:.1f}ms p95={p95:.1f}ms "
       f"mean={statistics.mean(measured):.1f}ms failures=0")
+per_url = {}
+if any("url" in r for r in measured_rows):
+    by_url = {}
+    for r in measured_rows:
+        by_url.setdefault(r.get("url", ""), []).append(r["wall_ms"])
+    for url, vals in by_url.items():
+        per_url[url] = {"n": len(vals), "p50_ms": round(pct(vals, 50), 1),
+                        "p95_ms": round(pct(vals, 95), 1),
+                        "mean_ms": round(statistics.mean(vals), 1)}
+    if len(by_url) > 1:
+        print("per-url wall p50 (ms):")
+        for url, s in sorted(per_url.items(), key=lambda kv: kv[1]["p50_ms"]):
+            print(f"  {s['p50_ms']:8.1f}  n={s['n']:3d}  {url}")
+json.dump({"n": n, "p50_ms": round(p50, 1), "p95_ms": round(p95, 1),
+           "mean_ms": round(statistics.mean(measured), 1),
+           "failures": 0, "per_url": per_url},
+          open(sys.argv[3], "w"), indent=1)
 PY
 log "results in $RESULTS"
