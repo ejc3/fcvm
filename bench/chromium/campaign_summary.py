@@ -99,6 +99,14 @@ SEAL_FIELDS = (
     "snapshot_config_sha256",
 )
 WITHDRAWN_MARKER = "WITHDRAWN"
+# One verify bracket's record, as corpus_campaign.sh's
+# verify_replay_answered_the_guest prints it: the stage, the row the bracket's
+# window opened at, how many queries fell in it, how many of the corpus hosts
+# were seen answered inside it, and which were not.
+REPLAY_QUERY_RECORD = re.compile(
+    r"^(?P<stage>\S+) since_row=(?P<since>\d+) queries=(?P<queries>\d+) "
+    r"hosts_seen=(?P<seen>\d+)/(?P<wanted>\d+) missing=(?P<missing>\S+)$"
+)
 # The replay evidence a run must still carry to be indexable: the two logs the
 # replay server writes, and the campaign's own per-bracket record of what it
 # was asked for. That third file is the only thing tying each bracket's window
@@ -422,6 +430,68 @@ def check_verify_bracket(run_dir, name, verify, resolver, measured_urls, measure
     return dns_server
 
 
+def check_replay_queries(run_dir, name, data):
+    """Read the bracket records back, rather than only hashing them.
+
+    A hash pins bytes; it does not say the bytes mean anything. Every other
+    artifact the evidence cites is re-derived at this boundary -- dns-owner.log
+    against the recorded sample count, each bracket through
+    check_verify_bracket -- and this one was pinned and unread, which made it
+    the cheapest thing to forge in a directory the index is asked to publish.
+
+    A run the campaign produced carries exactly one well-formed record per
+    bracket, because verify_replay_answered_the_guest fails the bracket when
+    the append fails or a name went unanswered, and campaign_fail turns any
+    failed bracket into `unclean`. That is a property of runs it produced, not
+    of directories this reads. Note that a failing bracket writes its record
+    BEFORE the `missing` gate, deliberately, so a `missing=` other than none is
+    exactly the trace of a bracket that did not pass.
+    """
+    text = data.decode("utf-8", "replace")
+    lines = [line for line in text.splitlines() if line != ""]
+    if len(lines) != len(VERIFY_STAGES):
+        raise RunError(
+            f"{run_dir}: {name} holds {len(lines)} bracket record(s), not the "
+            f"{len(VERIFY_STAGES)} a clean campaign writes ({', '.join(VERIFY_STAGES)})"
+        )
+    previous = -1
+    for stage, line in zip(VERIFY_STAGES, lines):
+        record = REPLAY_QUERY_RECORD.match(line)
+        if record is None:
+            raise RunError(f"{run_dir}: {name} line is not a bracket record: {line!r}")
+        if record["stage"] != stage:
+            raise RunError(
+                f"{run_dir}: {name} names bracket {record['stage']!r} where the "
+                f"{stage!r} record belongs; the brackets run in "
+                f"{', '.join(VERIFY_STAGES)} order"
+            )
+        if record["missing"] != "none":
+            raise RunError(
+                f"{run_dir}: {name} records the {stage} bracket missing "
+                f"{record['missing']}, so this replay server did not answer "
+                "those names inside that bracket's window"
+            )
+        seen, wanted = int(record["seen"]), int(record["wanted"])
+        if wanted < 1:
+            raise RunError(
+                f"{run_dir}: {name} records the {stage} bracket over 0 hosts, "
+                "so it checked nothing"
+            )
+        if seen != wanted:
+            raise RunError(
+                f"{run_dir}: {name} records the {stage} bracket seeing "
+                f"{seen} of {wanted} hosts answered, with none reported missing"
+            )
+        since = int(record["since"])
+        if since <= previous:
+            raise RunError(
+                f"{run_dir}: {name} opens the {stage} bracket at row {since}, "
+                f"not after the previous bracket's {previous}; a window that "
+                "reaches back credits an earlier bracket's queries to this one"
+            )
+        previous = since
+
+
 def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id):
     """Hold a clean verdict to the files it cites; raise RunError otherwise.
 
@@ -554,12 +624,14 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
         path = os.path.join(run_dir, name)
         if not os.path.isfile(path):
             raise RunError(f"{run_dir}: {name} cited by dns-evidence.json is missing")
-        _data, digest = sources.read_hashed(path)
+        data, digest = sources.read_hashed(path)
         if digest != want:
             raise RunError(
                 f"{run_dir}: {name} sha256 {digest} does not match the "
                 f"{want} dns-evidence.json recorded at the verdict"
             )
+        if name == "replay-queries.log":
+            check_replay_queries(run_dir, name, data)
     return answers
 
 

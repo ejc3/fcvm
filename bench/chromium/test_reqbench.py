@@ -9547,10 +9547,21 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         # The replay server's own logs and the campaign's per-bracket record of
         # what it served. campaign_summary requires all three beside the
         # evidence, each hashing to what the verdict recorded.
-        for name in ("corpus-dns.log", "corpus-access.log", "replay-queries.log"):
+        # replay-queries.log is read back rather than only hashed, so it holds
+        # the record a clean campaign writes: one per bracket, in order, over
+        # windows that do not overlap.
+        bodies = {
+            "corpus-dns.log": '{"ts": 1.0}\n',
+            "corpus-access.log": '{"ts": 1.0}\n',
+            "replay-queries.log": "".join(
+                f"{stage} since_row={row} queries=14 hosts_seen=14/14 missing=none\n"
+                for row, stage in enumerate(("pre", "before-run", "after-run"))
+            ),
+        }
+        for name, body in bodies.items():
             path = os.path.join(run_dir, name)
             with open(path, "w") as handle:
-                handle.write('{"ts": 1.0}\n')
+                handle.write(body)
             with open(path, "rb") as handle:
                 hashes[name] = hashlib.sha256(handle.read()).hexdigest()
         with open(os.path.join(run_dir, "dns-owner.log"), "w") as handle:
