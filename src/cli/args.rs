@@ -201,7 +201,10 @@ pub struct RunArgs {
     /// boot, so it is baked into any snapshot taken from this VM. Rootless
     /// guests reach host loopback services via the pasta gateway 10.0.2.2,
     /// so `--dns 10.0.2.2` points the guest at a DNS server bound on host
-    /// 127.0.0.1 (the corpus replay benchmark arm).
+    /// 127.0.0.1 (the corpus replay benchmark arm). Naming the gateway also
+    /// stops pasta claiming the guest's port 53 for the host's own resolver,
+    /// which would otherwise send those queries somewhere else entirely
+    /// (src/network/pasta.rs, resolver_is_pasta_gateway).
     #[arg(long)]
     pub dns: Option<String>,
 

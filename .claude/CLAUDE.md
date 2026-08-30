@@ -563,13 +563,57 @@ The ordering below matters; each step's trap is noted inline.
 # 1. KVM access (new login session required after; a live ssh master keeps old groups)
 sudo usermod -aG kvm $USER
 
+# 1b. Unprivileged user namespaces. Ubuntu 24.04 ships
+#     kernel.apparmor_restrict_unprivileged_userns=1, which makes rootless
+#     podman and skopeo fail: `unshare -U -r true` reports "write failed
+#     /proc/self/uid_map: Operation not permitted" and the first image export
+#     dies with "Error during unshare(...): Operation not permitted". Every
+#     long-lived fcvm box gets this from terraform (dev-user-data.tf), so the
+#     requirement was invisible to anyone following these steps by hand.
+#
+#     THIS IS FOR A DEDICATED fcvm OR CI BOX, and host isolation is the
+#     precondition for the whole quickstart. The two settings are host-wide:
+#     they let ANY local user create a user namespace and hold root inside it,
+#     which is what AppArmor's restriction exists to withhold, and they widen
+#     the kernel surface an unprivileged local account can reach (every
+#     CAP_SYS_ADMIN-gated interface a namespace makes available, and the
+#     userns-reachable bug classes behind them). On a box other people log in
+#     to, that is a boundary you are removing for them too. fcvm cannot run
+#     rootless without it, so the answer for a shared host is a separate box,
+#     not a narrower sysctl.
+sudo tee /etc/sysctl.d/99-fcvm.conf >/dev/null <<'SYSCTL'
+kernel.unprivileged_userns_clone=1
+kernel.apparmor_restrict_unprivileged_userns=0
+SYSCTL
+sudo sysctl -p /etc/sysctl.d/99-fcvm.conf
+
+# 1c. AllowOther mounts. Without user_allow_other, fuse-pipe falls back to
+#     SessionACL::Owner (fuse-pipe/src/client/mount.rs) and
+#     `make test-unit` fails on fuse-pipe::test_allow_other
+#     test_allow_other_with_fuse_conf, "Test requires user_allow_other in
+#     /etc/fuse.conf". CI and both test Containerfiles set it, so only a
+#     hand-built box is missing it.
+#
+#     This is also host-wide: it lets any local user mount a FUSE filesystem
+#     other UIDs can read, which is the point here (pjdfstest switches uid
+#     across a fuse-pipe mount) and is another reason step 1b's dedicated box
+#     is the precondition.
+#
+#     The guard matches the directive and nothing else, because that is what
+#     fuse-pipe accepts (`l.trim() == "user_allow_other"`, mount.rs). A prefix
+#     match calls `user_allow_other # comment` configured while every mount
+#     still takes SessionACL::Owner and the test above keeps failing.
+grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+
 # 2. Packages (Ubuntu 24.04). btrfs-progs is needed by the very next step;
 #    bc/bison/flex/libelf-dev are the kernel fallback build's dependencies —
 #    setup builds a kernel locally whenever a profile's release artifact is
-#    absent, and a fresh box hits that path.
+#    absent, and a fresh box hits that path. libseccomp-dev is the firecracker
+#    fork's: setup builds it from source and the link fails with
+#    "cannot find -lseccomp" without the headers.
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
-    btrfs-progs bc bison flex libelf-dev
+    btrfs-progs bc bison flex libelf-dev libseccomp-dev
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable

@@ -1749,9 +1749,16 @@ async fn cmd_snapshot_run_inner(
                 .context("allocating loopback IP"));
 
             // With bridge mode, guest IP is always 10.0.2.100 on pasta network
-            // Each clone runs in its own namespace, so no IP conflict
+            // Each clone runs in its own namespace, so no IP conflict.
+            //
+            // The clone's pasta is wired for the resolver the snapshot baked,
+            // the same value the reboot plan re-bakes into the guest's
+            // resolv.conf. A golden made with --dns 10.0.2.2 restores with
+            // pasta's DNS special case off, so its guests keep reaching the
+            // host loopback service the golden was recorded against.
             let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                 .with_loopback_ip(loopback_ip)
+                .with_dns_server(saved_network.dns_server.clone())
                 .with_restore_mode();
             Box::new(net)
         }

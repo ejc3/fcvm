@@ -81,6 +81,25 @@ def spawn_mixed_parent(linger_bin, fast_bin):
     return subprocess.Popen([sys.executable, "-c", code, linger_bin, fast_bin])
 
 
+def _execed_children(pid, want, parent_comm):
+    """One sample: (children, comms, has `pid` got `want` exec'd children?).
+
+    `comm` is the exec witness: `fork()` copies the parent's, `execve()`
+    replaces it, so a child whose comm still matches its parent's has not
+    exec'd yet.
+
+    A witness has to be readable at both ends. `proc_comm` swallows its OSError
+    and returns `""`, so an unreadable `/proc/<pid>/comm` is silence, not
+    evidence, at the child end and at the parent end alike. And the question is
+    how MANY children have exec'd, not whether all of them have: a parent with
+    an unrelated child still has the one the caller asked to wait for.
+    """
+    kids = reqbench.children_of(pid)
+    comms = [reqbench.proc_comm(k) for k in kids]
+    witnesses = sum(1 for c in comms if c and parent_comm and c != parent_comm)
+    return kids, comms, witnesses >= want
+
+
 def wait_for_execed_children(pid, want, timeout):
     """Wait until `pid` has `want` children that have finished exec'ing.
 
@@ -99,13 +118,8 @@ def wait_for_execed_children(pid, want, timeout):
     """
     parent_comm = reqbench.proc_comm(pid)
     deadline = time.monotonic() + timeout
-    kids, comms = [], []
     while True:
-        kids = reqbench.children_of(pid)
-        comms = [reqbench.proc_comm(k) for k in kids]
-        settled = len(kids) >= want and all(
-            c is not None and c != parent_comm for c in comms
-        )
+        kids, comms, settled = _execed_children(pid, want, parent_comm)
         if settled or time.monotonic() >= deadline:
             return kids, comms
         time.sleep(0.005)
@@ -149,14 +163,41 @@ def spawn_pdeathsig_parent_ignoring_sigterm(child_argv):
 
 
 def wait_for_child(pid, timeout=5.0):
-    """Block until `pid` has forked at least one child. Returns the child list."""
+    """Block until `pid` has a child that has finished exec'ing.
+
+    Waiting for the fork alone is not enough, and here the consequence is worse
+    than a misread name. `spawn_pdeathsig_parent` arms PR_SET_PDEATHSIG from
+    `preexec_fn`, which runs in the child after `fork` and before `execve`,
+    while `/proc/<pid>/task/<tid>/children` lists the child from the fork
+    onward. A caller that stops at "a child exists" can therefore kill the
+    parent while the child is still pre-`prctl`, and PR_SET_PDEATHSIG armed
+    after the parent has already exited never fires at all: the child is
+    reparented and outlives the teardown for good. The fixture then proves
+    nothing about the code under test, because the teardown aborts on the
+    survivor instead of reaching the branch the test came for.
+
+    Measured on one contended core, 30 reps of
+    TeardownNormalLeakVerdict.test_on_disk_leftovers_are_reaped_but_still_abort_the_run:
+    3 aborted with `left {pid: 'sleep'} alive after 2.0s`, `fcvm_exit_ms` 1.1
+    and `all_gone` false after the full budget. That is not scheduling latency,
+    it is a child that was never armed.
+
+    `execve` runs strictly after `preexec_fn`, so a child whose comm no longer
+    matches its parent's has already armed. Returns the child list.
+    """
+    parent_comm = reqbench.proc_comm(pid)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        kids = reqbench.children_of(pid)
-        if kids:
+    while True:
+        kids, comms, settled = _execed_children(pid, 1, parent_comm)
+        if settled:
             return kids
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"pid {pid} never forked a child that finished exec within "
+                f"{timeout}s (children={kids} comms={comms} "
+                f"parent_comm={parent_comm!r})"
+            )
         time.sleep(0.005)
-    raise AssertionError(f"pid {pid} never forked a child")
 
 
 def kill_tree(p):
@@ -699,11 +740,23 @@ class TeardownNormalLeakVerdict(unittest.TestCase):
                     data,
                     verify_disk_cleanup=True,
                 )
-            self.assertFalse(cm.exception.teardown["disk_cleanup_verified"])
+            # Name the abort before reading anything off it. `teardown_normal`
+            # raises this same type for a process survivor and for a failed
+            # child attribution, and neither reaches the disk stage, so neither
+            # carries `disk_cleanup_verified`. A bare subscript turns "the
+            # fixture lost a race" into `KeyError: 'disk_cleanup_verified'` and
+            # buries the message that says what actually went wrong.
+            teardown = cm.exception.teardown
+            self.assertIn("left on-disk state", str(cm.exception), teardown)
+            self.assertIn(
+                "disk_cleanup_verified",
+                teardown,
+                f"the disk abort must report its verdict: {teardown}",
+            )
+            self.assertFalse(teardown["disk_cleanup_verified"])
             self.assertFalse(os.path.exists(state))
             self.assertFalse(os.path.exists(state + ".lock"))
             self.assertFalse(os.path.exists(data))
-            self.assertIn("left on-disk state", str(cm.exception))
 
 
 class TeardownAttributionFailure(unittest.TestCase):
@@ -1473,6 +1526,69 @@ class TeardownFastCpuAccounting(unittest.TestCase):
                 )
             finally:
                 kill_tree(p)
+
+
+class ExecWitnessCounting(unittest.TestCase):
+    """`_execed_children` counts exec witnesses; it does not poll every child.
+
+    RED BEFORE THE FIX, all three, against `settled = len(kids) >= want and
+    all(c is not None and c != parent_comm for c in comms)`:
+
+        AssertionError: False is not true : one exec'd child satisfies want=1
+        AssertionError: True is not false : an unreadable comm is not an exec witness
+        AssertionError: True is not false : an unreadable parent comm proves nothing
+    """
+
+    @contextmanager
+    def _procfs(self, kids, comms):
+        """Stub `children_of`/`proc_comm`. `comms` maps pid -> comm."""
+        real_children, real_comm = reqbench.children_of, reqbench.proc_comm
+        reqbench.children_of = lambda pid: list(kids)
+        reqbench.proc_comm = lambda pid: comms[pid]
+        try:
+            yield
+        finally:
+            reqbench.children_of, reqbench.proc_comm = real_children, real_comm
+
+    def test_an_unrelated_child_does_not_hide_a_ready_one(self):
+        """`all(...)` made every child a precondition for any one of them.
+
+        A parent that has forked two children, one of which has exec'd, has
+        the one child `wait_for_execed_children(pid, 1, timeout)` asked for.
+        Requiring the other to have exec'd too makes that call time out and
+        the caller assert on a name it never waited for.
+        """
+        with self._procfs([10, 11], {10: "fastexit", 11: "python3"}):
+            kids, comms, settled = _execed_children(1, 1, "python3")
+        self.assertEqual(kids, [10, 11])
+        self.assertEqual(comms, ["fastexit", "python3"])
+        self.assertTrue(settled, "one exec'd child satisfies want=1")
+
+    def test_two_wanted_is_still_two(self):
+        """Counting witnesses must not settle below `want`."""
+        with self._procfs([10, 11], {10: "fastexit", 11: "python3"}):
+            _, _, settled = _execed_children(1, 2, "python3")
+        self.assertFalse(settled, "only one child has exec'd")
+        with self._procfs([10, 11], {10: "fastexit", 11: "lingersleep"}):
+            _, _, settled = _execed_children(1, 2, "python3")
+        self.assertTrue(settled, "both children have exec'd")
+
+    def test_an_unreadable_comm_is_not_an_exec_witness(self):
+        """`proc_comm` swallows the OSError and returns `""`.
+
+        `"" != parent_comm` is true, so an unreadable `/proc/<pid>/comm` used
+        to report an `execve` that was never observed — the caller then read
+        the name it was waiting for from a child that may still be pre-exec.
+        """
+        with self._procfs([10], {10: ""}):
+            _, _, settled = _execed_children(1, 1, "python3")
+        self.assertFalse(settled, "an unreadable comm is not an exec witness")
+
+    def test_an_unreadable_parent_comm_proves_nothing(self):
+        """With no parent comm there is nothing for a child's to differ from."""
+        with self._procfs([10], {10: "python3"}):
+            _, _, settled = _execed_children(1, 1, "")
+        self.assertFalse(settled, "an unreadable parent comm proves nothing")
 
 
 class FindStateIsEventDriven(unittest.TestCase):
@@ -9428,10 +9544,31 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 verify_hashes[f"verify-dns-{stage}.json"] = hashlib.sha256(
                     handle.read()).hexdigest()
         hashes = {}
-        for name in ("corpus-dns.log", "corpus-access.log"):
+        # The replay server's own logs and the campaign's per-bracket record of
+        # what it served. campaign_summary requires all three beside the
+        # evidence, each hashing to what the verdict recorded.
+        # replay-queries.log is read back against corpus-dns.log rather than
+        # only hashed, so the two agree the way a campaign leaves them: one
+        # record per bracket, in order, over its own window, and in that
+        # window one A answer per host the bracket names.
+        dns, records, row = [], [], 0
+        for stage in ("pre", "before-run", "after-run"):
+            for host in hosts:
+                dns.append(json.dumps({"ts": 1.0 + row, "peer": "10.0.2.100",
+                                       "qname": host, "qtype": 1,
+                                       "answer": "10.0.2.2"}))
+            records.append(f"{stage} since_row={row} queries={len(hosts)} "
+                           f"hosts_seen={len(hosts)}/{len(hosts)} missing=none")
+            row += len(hosts)
+        bodies = {
+            "corpus-dns.log": "".join(line + "\n" for line in dns),
+            "corpus-access.log": '{"ts": 1.0}\n',
+            "replay-queries.log": "".join(line + "\n" for line in records),
+        }
+        for name, body in bodies.items():
             path = os.path.join(run_dir, name)
             with open(path, "w") as handle:
-                handle.write('{"ts": 1.0}\n')
+                handle.write(body)
             with open(path, "rb") as handle:
                 hashes[name] = hashlib.sha256(handle.read()).hexdigest()
         with open(os.path.join(run_dir, "dns-owner.log"), "w") as handle:
@@ -9451,6 +9588,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
             "verify_file_sha256": verify_hashes,
             "corpus_dns_log_sha256": hashes["corpus-dns.log"],
             "corpus_access_log_sha256": hashes["corpus-access.log"],
+            "replay_queries_log_sha256": hashes["replay-queries.log"],
             "corpus_serve_exit_status": 0,
             "reason": None,
             "verdict": verdict,
@@ -9543,7 +9681,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
                 "verify-dns-before-run.json", "verify-dns-after-run.json",
                 "dns-owner.log", "corpus-dns.log", "corpus-access.log",
-                "summary.json",
+                "replay-queries.log", "summary.json",
             },
         )
 

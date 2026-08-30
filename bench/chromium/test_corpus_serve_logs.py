@@ -271,10 +271,12 @@ class DnsLog(unittest.TestCase):
         self.assertFalse(thread.is_alive(), "serve_dns kept running on a closed socket")
 
 
-class AccessLog(unittest.TestCase):
-    """--access-log: {ts, peer, method, host, path, status, bytes, duration_ms}.
+class ReplayFixture:
+    """A shipped ReplayServer over a one-file corpus, for the cases below.
 
-    Red: `AttributeError: module 'corpus_serve' has no attribute 'JsonlLog'`.
+    A mixin rather than a base TestCase: unittest re-runs the tests it finds
+    on a subclass, so inheriting the fixture from AccessLog would run the log
+    tests a second time under the reply-contract class's name.
     """
 
     BODY = b"hello from the corpus\n"
@@ -288,6 +290,9 @@ class AccessLog(unittest.TestCase):
             json.dump({"resources": {
                 "https://example.test/a.txt": {"file": "a.txt", "status": 200,
                                                "mime": "text/plain"},
+            }, "redirects": {
+                "https://example.test/old.txt": {"status": 301,
+                                                 "location": "https://example.test/a.txt"},
             }}, handle)
         return os.path.join(d, "corpus")
 
@@ -324,6 +329,13 @@ class AccessLog(unittest.TestCase):
         if log is not None:
             self.addCleanup(log.close)
         return self._replay(d, log)[0]
+
+
+class AccessLog(ReplayFixture, unittest.TestCase):
+    """--access-log: {ts, peer, method, host, path, status, bytes, duration_ms}.
+
+    Red: `AttributeError: module 'corpus_serve' has no attribute 'JsonlLog'`.
+    """
 
     def _rows(self, server, log_path: str) -> list:
         """The log once every handler `server` dequeued has finished.
@@ -722,6 +734,182 @@ class AccessLog(unittest.TestCase):
                               f"corpus_serve exited {early_exit} while a handler was still running")
             self.assertEqual(proc.returncode, 0,
                              f"corpus_serve exited {proc.returncode} on SIGTERM:\n{output}")
+
+
+class ReplyContract(ReplayFixture, unittest.TestCase):
+    """Every reply this server makes has to be one the browser will deliver.
+
+    A cross-origin fetch is a CORS request, and a reply without
+    Access-Control-Allow-Origin is blocked before the renderer sees it:
+    Chromium reports net::ERR_FAILED, emits no Network.responseReceived, and
+    the trace row carries no remote address. reqbench's diag then counts the
+    request as one it cannot attribute (no_remote_ip), which is what it
+    should do, because at that point nothing in the record says whether the
+    replay answered it or it left the box.
+
+    That is not hypothetical. In the 42-render diag of 2026-08-29, 32 traced
+    rows carried no remote address; corpus-access.log holds a line for every
+    one of them (27 GET answered 404, 2 POST answered 404, 3 HEAD answered
+    501) and every one was cross-origin. The replay had answered all 32 and
+    the trace could not say so. That diag's results were not kept, so those
+    counts are the provenance of this change rather than a record anything may
+    be quoted from; the tests below are what hold the behaviour.
+
+    Watched red against corpus_serve.py at 336ac438; the failure is quoted on
+    each test.
+    """
+
+    def _request(self, port, method, path, host="cdn.test", origin=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+        headers = {"Host": host}
+        if origin is not None:
+            headers["Origin"] = origin
+        conn.request(method, path, headers=headers)
+        response = conn.getresponse()
+        return response, response.read()
+
+    def test_a_miss_carries_the_cors_headers_a_hit_carries(self):
+        """Red: `None != 'https://page.test' : the 404 for a url the corpus
+        does not hold carries no Access-Control-Allow-Origin, so a
+        cross-origin fetch of it is blocked and its trace row names no
+        remote address`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, body = self._request(server.server_port, "GET",
+                                           "/absent.json", origin="https://page.test")
+            self.assertEqual((response.status, body), (404, b""))
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"),
+                             "https://page.test",
+                             "the 404 for a url the corpus does not hold carries no "
+                             "Access-Control-Allow-Origin, so a cross-origin fetch of "
+                             "it is blocked and its trace row names no remote address")
+            self.assertEqual(response.headers.get("Access-Control-Allow-Credentials"),
+                             "true")
+            self.assertEqual(response.headers.get("Vary"), "Origin")
+
+    def test_a_miss_without_an_origin_allows_any(self):
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, _ = self._request(server.server_port, "GET", "/absent.json")
+            self.assertEqual(response.status, 404)
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "*")
+            self.assertIsNone(response.headers.get("Access-Control-Allow-Credentials"))
+
+    def test_a_replayed_redirect_carries_them(self):
+        """The captured redirect map answers before the corpus is consulted,
+        so its reply is a third one that has to survive a CORS check.
+
+        Red: `None != 'https://page.test' : a replayed redirect carries no
+        Access-Control-Allow-Origin`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, _ = self._request(server.server_port, "GET", "/old.txt",
+                                        host="example.test", origin="https://page.test")
+            self.assertEqual(response.status, 301)
+            self.assertEqual(response.headers.get("Location"),
+                             "https://example.test/a.txt")
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"),
+                             "https://page.test",
+                             "a replayed redirect carries no Access-Control-Allow-Origin")
+
+    def test_a_method_with_no_handler_still_carries_them(self):
+        """The base class answers 501 for a method this server does not
+        implement. That reply is as cross-origin as any other.
+
+        Red: `None != 'https://page.test' : the 501 for an unhandled method
+        carries no Access-Control-Allow-Origin`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, _ = self._request(server.server_port, "PUT", "/a.txt",
+                                        host="example.test", origin="https://page.test")
+            self.assertEqual(response.status, 501)
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"),
+                             "https://page.test",
+                             "the 501 for an unhandled method carries no "
+                             "Access-Control-Allow-Origin")
+
+    def test_head_is_answered_from_the_corpus(self):
+        """A HEAD of a recorded url gets that url's status and length and no
+        body, not the base class's 501 for an unimplemented method.
+        www.rtp.pt/rtp-sensor is in the corpus and was answered 501 three
+        times in the 2026-08-29 diag.
+
+        Red: `501 != 200 : HEAD of a recorded url is answered on the method
+        rather than from the corpus`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, body = self._request(server.server_port, "HEAD", "/a.txt",
+                                           host="example.test")
+            self.assertEqual(response.status, 200,
+                             "HEAD of a recorded url is answered on the method "
+                             "rather than from the corpus")
+            self.assertEqual(body, b"", "HEAD replied with a body")
+            self.assertEqual(response.headers.get("Content-Length"),
+                             str(len(self.BODY)))
+            self.assertEqual(response.headers.get("Content-Type"),
+                             "text/plain; charset=utf-8")
+
+    def test_head_of_a_url_the_corpus_does_not_hold_is_a_404(self):
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, body = self._request(server.server_port, "HEAD", "/absent.json",
+                                           origin="https://page.test")
+            self.assertEqual(response.status, 404)
+            self.assertEqual(body, b"")
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"),
+                             "https://page.test")
+
+    def test_every_reply_names_one_allowed_origin(self):
+        """Two Access-Control-Allow-Origin headers are worse than none: the
+        browser rejects a reply that names more than one value. The preflight
+        and the hit both used to send the header themselves, so a second
+        sender has to leave exactly one behind.
+
+        Red with the explicit send left in do_OPTIONS beside the shared one:
+        `['*', '*'] has length 2, expected 1`.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            for method, path, host in (("OPTIONS", "/a.txt", "example.test"),
+                                       ("GET", "/a.txt", "example.test"),
+                                       ("GET", "/old.txt", "example.test"),
+                                       ("GET", "/absent.json", "cdn.test"),
+                                       ("HEAD", "/a.txt", "example.test")):
+                response, _ = self._request(server.server_port, method, path,
+                                            host=host, origin="https://page.test")
+                names = response.headers.get_all("Access-Control-Allow-Origin") or []
+                self.assertEqual(len(names), 1,
+                                 f"{method} {path} sent {names}")
+
+    def test_the_preflight_still_lists_the_methods_it_allows(self):
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, _ = self._request(server.server_port, "OPTIONS", "/absent.json",
+                                        origin="https://page.test")
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"),
+                             "https://page.test")
+            self.assertEqual(response.headers.get("Access-Control-Allow-Credentials"),
+                             "true")
+            self.assertIn("HEAD", response.headers.get("Access-Control-Allow-Methods"))
+
+    def test_a_miss_is_still_a_miss(self):
+        """The headers are the fix; the status is not. A url the corpus does
+        not hold has to keep saying so, or a stub would be indistinguishable
+        from a recording.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            response, body = self._request(server.server_port, "GET", "/absent.json",
+                                           origin="https://page.test")
+            self.assertEqual((response.status, body), (404, b""))
+            self.assertEqual(server.RequestHandlerClass.misses,
+                             ["cdn.test/absent.json"])
 
 
 class Flags(unittest.TestCase):

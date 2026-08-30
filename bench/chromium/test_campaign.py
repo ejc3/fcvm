@@ -21,6 +21,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -275,6 +276,45 @@ class PartialCorpus(unittest.TestCase):
                          "this refused because nothing was reachable rather "
                          "than because the corpus is partial")
 
+    def test_the_pass_line_counts_every_url_it_probed(self):
+        """The line that reports the probe's result has to name the number of
+        URLs the probe actually checked.
+
+        `printf '%s'` writes no trailing newline, so `wc -l` counted the
+        separators rather than the fields and the campaign announced 13 URLs
+        for the 14 it had just fetched, in every run:
+
+            === corpus complete: all 13 URLs replay locally
+
+        Red: `'2' != '1' : the pass line reports 1 URLs after probing 2`.
+        """
+        block = re.search(r"(missing=\"\"\n.*?\nfi)\n", campaign(), re.S)
+        self.assertIsNotNone(block, "the corpus completeness probe is gone")
+        line = re.search(r'^say "corpus complete: .*$', campaign(), re.M)
+        self.assertIsNotNone(line, "the corpus completeness pass line is gone")
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.OnlyOne)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        probe = self.retarget(block.group(1), server.server_port)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as script:
+            script.write('set -u\nsay() { printf "%s\\n" "$*"; }\n'
+                         'URLS="http://x/served,http://x/served"\n'
+                         f'{probe}\n{line.group(0)}\n')
+            path = script.name
+        self.addCleanup(os.unlink, path)
+        result = subprocess.run(["bash", path], capture_output=True, text=True,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0,
+                         f"{result.stdout}{result.stderr}")
+        reported = re.search(r"corpus complete: all (\d+) URLs", result.stdout)
+        self.assertIsNotNone(reported, f"no pass line printed\n{result.stdout}")
+        self.assertEqual(reported.group(1), "2",
+                         f"the pass line reports {reported.group(1)} URLs "
+                         f"after probing 2")
+
     def test_a_complete_corpus_passes(self):
         """The guard must not refuse a corpus that IS complete."""
         block = re.search(r"(missing=\"\"\n.*?\nfi)\n", campaign(), re.S)
@@ -441,11 +481,34 @@ class DnsBrackets(unittest.TestCase):
         r"(GUEST_DNS=10\.0\.2\.2[^\n]*\\\n[^\n]*engine_target golden\)[^\n]*)")
     URL_LINE = re.compile(r'^URLS="([^"]+)"$', re.M)
 
+    # MAKE_DNS_QNAMES: the names the clone this sub-make stands for resolved,
+    # appended to the replay server's DNS log AS THE BRACKET RUNS -- the same
+    # order as the real thing, where corpus_serve logs each query while the
+    # sub-make is in flight. A bracket that expects the log to say otherwise
+    # sets this to a subset, or to nothing.
+    # MAKE_DNS_QNAMES_AAAA and MAKE_DNS_QNAMES_OTHER_ANSWER: the rows that
+    # reach this server WITHOUT it supplying the answer HOP D saw. corpus_serve
+    # answers A queries with --answer-ip and logs every other type with
+    # answer "" (serve_dns), so a name whose A came from a resolver cache
+    # while only its AAAA arrived here is a row in this log that says nothing
+    # about the answer.
     FAKE_MAKE = """#!/bin/bash
 env > "$MAKE_ENV_DUMP"
 echo "$*" > "$MAKE_ARGV"
 [ -z "${MAKE_VERIFY_JSON:-}" ] || printf '%s\\n' "$MAKE_VERIFY_JSON" > "$RESULTS/verify-dns.json"
 [ -z "${MAKE_DIAG_JSON:-}" ] || { mkdir -p "$RESULTS/diag"; printf '%s\\n' "$MAKE_DIAG_JSON" > "$RESULTS/diag/summary.json"; }
+for qname in ${MAKE_DNS_QNAMES:-}; do
+    printf '{"ts":%s,"peer":"127.0.0.1:40001","qname":"%s","qtype":1,"answer":"10.0.2.2"}\\n' \\
+        "$(date +%s)" "$qname" >> "$RESULTS/corpus-dns.log"
+done
+for qname in ${MAKE_DNS_QNAMES_AAAA:-}; do
+    printf '{"ts":%s,"peer":"127.0.0.1:40001","qname":"%s","qtype":28,"answer":""}\\n' \\
+        "$(date +%s)" "$qname" >> "$RESULTS/corpus-dns.log"
+done
+for qname in ${MAKE_DNS_QNAMES_OTHER_ANSWER:-}; do
+    printf '{"ts":%s,"peer":"127.0.0.1:40001","qname":"%s","qtype":1,"answer":"10.0.2.3"}\\n' \\
+        "$(date +%s)" "$qname" >> "$RESULTS/corpus-dns.log"
+done
 exit "${MAKE_RC:-0}"
 """
     # Decoy :53 listeners with OTHER pids, as on the bench host itself:
@@ -538,6 +601,9 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             LOADAVG_FILE=loadavg,
             RESULTS=results, LOGDIR=logs, REPO=tmp, TAG="cb-req-corpus",
             ENGINE="chromium",
+            # The passing shape: the clone asked the replay server for every
+            # corpus host while the bracket ran.
+            MAKE_DNS_QNAMES=" ".join(self._hosts_of(self._urls())),
         )
         return env, results
 
@@ -558,9 +624,27 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                 seen[key] = value
         return seen
 
-    def _run(self, script, env, timeout=60):
-        return subprocess.run(["bash", "-c", script], env=env,
+    def _run(self, script, env, timeout=60, prefix=()):
+        return subprocess.run([*prefix, "bash", "-c", script], env=env,
                               capture_output=True, text=True, timeout=timeout)
+
+    def _mode_bits_enforced(self):
+        """A prefix that makes `chmod 0444` deny writes at every uid.
+
+        Mode bits only stop a process that lacks CAP_DAC_OVERRIDE, and root
+        keeps it, so under a root suite the write a test is trying to fail
+        succeeded and the test asserted nothing. Dropping the capability from
+        the bounding set costs one exec and leaves the scenario otherwise
+        identical. An unprivileged run needs no prefix and cannot use one:
+        applying a bounding set takes CAP_SETPCAP.
+        """
+        if os.geteuid() != 0:
+            return []
+        if shutil.which("setpriv") is None:
+            self.fail("BLOCKED: running as root without setpriv, so "
+                      "CAP_DAC_OVERRIDE cannot be dropped and the mode bits "
+                      "below would not deny the write this test is about")
+        return ["setpriv", "--bounding-set=-dac_override,-dac_read_search"]
 
     def test_verify_carries_the_corpus_resolver_knobs_and_keeps_its_evidence(self):
         """run_verify must hand reqbench every corpus host and URL, the replay
@@ -655,11 +739,349 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                                     f"{label}: accepted\n{result.stdout}")
                 self.assertNotIn("VERIFIED", result.stdout)
 
+    def test_a_bracket_the_replay_server_never_answered_is_refused(self):
+        """HOP D reads what the clone RESOLVED. On its own that cannot say
+        WHERE the answer came from: a corpus_serve leaked from an earlier
+        campaign, an /etc/hosts baked into the golden, or a resolver cache in
+        the clone all answer 10.0.2.2 with this campaign's replay server never
+        consulted. The bracket must also see the query arrive here.
+
+        RED BEFORE THE FIX: every case below printed VERIFIED with exit 0
+        while corpus-dns.log held nothing from the bracket.
+        """
+        urls = self._urls()
+        hosts = self._hosts_of(urls)
+        # (names the clone asked for, the fragment the refusal must carry)
+        cases = {
+            "no query at all": ("", "holds no queries"),
+            "one host answered elsewhere": (" ".join(hosts[:-1]), hosts[-1]),
+        }
+        for label, (qnames, expected) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, _results = self._fakes(tmp)
+                env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+                env["MAKE_DNS_QNAMES"] = qnames
+                script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                          f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                          'run_verify pre\necho VERIFIED\n')
+                result = self._run(script, env)
+                self.assertNotEqual(result.returncode, 0,
+                                    f"{label}: accepted\n{result.stdout}")
+                self.assertNotIn("VERIFIED", result.stdout)
+                self.assertIn(expected, result.stderr,
+                              f"{label}: the refusal does not say what was "
+                              f"missing\n{result.stderr}")
+
+    def test_a_bracket_with_no_corpus_names_is_refused(self):
+        """Every check in the bracket is a claim about a list of names, and
+        every one of them is vacuously true when that list is empty: jq's
+        `all` over an empty array is true, and "the replay answered for every
+        corpus host" holds when there are no corpus hosts. A bracket left in
+        that state renders a verdict it cannot support, the same shape as a
+        gate reporting CLEAR because its tooling was missing.
+
+        The corpus URL list is a literal in the script today, so this state is
+        not reachable by configuration; it is one edit away, and the edit
+        would land as a passing campaign rather than a failing one.
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, against a corpus-dns.log the
+        bracket never saw a single line written to.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            env["MAKE_VERIFY_JSON"] = json.dumps({
+                "dns_server": "10.0.2.2", "hosts": {}, "urls": {},
+                "proxies_disabled": True, "passed": True,
+            })
+            env["MAKE_DNS_QNAMES"] = ""
+            # The second and third brackets always meet a log the first
+            # bracket filled, so the empty-log guard above them cannot stand
+            # in for this one. One line from an earlier bracket is enough.
+            with open(os.path.join(results, "corpus-dns.log"), "w") as handle:
+                handle.write(json.dumps({
+                    "ts": 1755000000.0, "peer": "127.0.0.1:41552",
+                    "qname": "example.com", "qtype": 1, "answer": "10.0.2.2",
+                }) + "\n")
+            script = ('set -euo pipefail\nsay() { :; }\nURLS=""\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(result.returncode, 0,
+                                f"an empty corpus was accepted\n{result.stdout}")
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("names no hosts", result.stderr, result.stderr)
+
+    def test_an_earlier_campaigns_queries_cannot_answer_for_this_bracket(self):
+        """The replay log is append-only across a campaign, so "the log
+        mentions this host" is not evidence: the queries have to fall inside
+        the bracket's own window.
+
+        RED BEFORE THE FIX: a log full of yesterday's queries passed.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            with open(os.path.join(results, "corpus-dns.log"), "w") as handle:
+                for host in self._hosts_of(urls):
+                    handle.write(json.dumps({
+                        "ts": 1755000000.0, "peer": "127.0.0.1:41552",
+                        "qname": host, "qtype": 1, "answer": "10.0.2.2"}) + "\n")
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            env["MAKE_DNS_QNAMES"] = ""
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(result.returncode, 0,
+                                f"a stale replay log was accepted\n{result.stdout}")
+            self.assertNotIn("VERIFIED", result.stdout)
+
+    def _pin_the_clock(self, tmp, epoch: str) -> None:
+        """A `date` on PATH that answers `+%s` with one fixed second.
+
+        The bracket boundary and the queries around it are a sub-second
+        apart in the real thing, which no test can schedule. Pinning the
+        second the campaign sees makes "the preceding phase's query landed
+        in the second this bracket opened" an exact input rather than a
+        race. Every other `date` call reaches the real binary.
+        """
+        real = shutil.which("date")
+        self.assertIsNotNone(real, "date is missing; this test cannot evaluate anything")
+        path = os.path.join(tmp, "bin", "date")
+        with open(path, "w") as handle:
+            handle.write('#!/bin/bash\n'
+                         'if [ "${1:-}" = +%s ]; then echo "$FAKE_EPOCH"; exit 0; fi\n'
+                         f'exec {real} "$@"\n')
+        os.chmod(path, 0o755)
+
+    def test_a_query_from_the_phase_before_the_bracket_cannot_answer_for_it(self):
+        """The boundary has to separate the two ends of one second.
+
+        `date +%s` truncates, so a query the preceding phase made 0.4 s
+        before the bracket opened carries a ts at or above the second the
+        bracket recorded, and satisfied it. The settle wait, the golden and
+        the diag all render the same corpus names immediately before a
+        bracket runs, so this is the ordinary case, not a contrived one.
+        The boundary is the replay log's own length instead: everything this
+        bracket provoked is appended after it.
+
+        RED BEFORE THE FIX: `a query from the phase before the bracket was
+        accepted` -- exit 0 and VERIFIED, against a log whose every line was
+        written before run_verify was called.
+        """
+        urls = self._urls()
+        epoch = "1755000000"
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._pin_the_clock(tmp, epoch)
+            env["FAKE_EPOCH"] = epoch
+            with open(os.path.join(results, "corpus-dns.log"), "w") as handle:
+                for host in self._hosts_of(urls):
+                    handle.write(json.dumps({
+                        "ts": float(epoch) + 0.4, "peer": "127.0.0.1:41552",
+                        "qname": host, "qtype": 1, "answer": "10.0.2.2"}) + "\n")
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            # The clone this bracket stands for asked the replay server
+            # nothing at all.
+            env["MAKE_DNS_QNAMES"] = ""
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a query from the phase before the bracket was accepted\n"
+                + result.stdout)
+            self.assertNotIn("VERIFIED", result.stdout)
+
+    def test_a_passing_bracket_records_what_the_replay_served(self):
+        """The count is the record that the two ends of the query met. Without
+        a file saying so, a later reader has HOP D's answer and nothing that
+        ties it to this campaign's server."""
+        urls = self._urls()
+        hosts = self._hosts_of(urls)
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            line = read_if_exists(os.path.join(results, "replay-queries.log")).strip()
+            self.assertTrue(line, "the bracket left no replay-queries.log")
+            self.assertIn("pre ", line)
+            self.assertIn(f"hosts_seen={len(hosts)}/{len(hosts)}", line)
+            self.assertIn("missing=none", line)
+
+    def _stub_tool(self, tmp, name, body="#!/bin/bash\nexit 1\n"):
+        """A tool of that name, first on the bracket's PATH, that cannot run.
+
+        The campaign renders its verdict through these; a verdict from a tool
+        that could not evaluate anything is the `jq: command not found`
+        shape, and must block rather than pass.
+        """
+        path = os.path.join(tmp, "bin", name)
+        with open(path, "w") as handle:
+            handle.write(body)
+        os.chmod(path, 0o755)
+
+    def test_a_bracket_whose_record_cannot_be_written_is_refused(self):
+        """The append is the bracket's own record, and its failure was silent.
+
+        run_verify is called as `run_verify pre || campaign_fail ...`, which
+        turns errexit off inside the function, so a redirection that could not
+        be written left the rest of the bracket to carry on: `[ -n "$missing" ]`
+        was false, `say` succeeded, and the function returned 0.
+        write_dns_evidence then hashed the nonempty file an EARLIER bracket had
+        left, so the campaign was clean with a later bracket's record never
+        written.
+
+        The record is made unwritable by mode bits, which only bind a process
+        without CAP_DAC_OVERRIDE, so the run drops that capability. Under a
+        root suite the append had otherwise succeeded and this asserted
+        nothing: `0 != 7 : a bracket whose record could not be written was
+        accepted` (Codex, 2026-08-30).
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, with replay-queries.log still
+        holding nothing but the earlier bracket's line.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            record = os.path.join(results, "replay-queries.log")
+            hosts = len(self._hosts_of(urls))
+            earlier = (f"pre since_row=0 queries={hosts} "
+                       f"hosts_seen={hosts}/{hosts} missing=none\n")
+            with open(record, "w") as handle:
+                handle.write(earlier)
+            os.chmod(record, 0o444)
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify before-run || { echo REFUSED; exit 7; }\necho VERIFIED\n')
+            try:
+                result = self._run(script, env, prefix=self._mode_bits_enforced())
+            finally:
+                os.chmod(record, 0o644)
+            self.assertEqual(result.returncode, 7,
+                             "a bracket whose record could not be written was "
+                             f"accepted\n{result.stdout}{result.stderr}")
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("replay-queries.log", result.stderr, result.stderr)
+            with open(record) as handle:
+                self.assertEqual(handle.read(), earlier,
+                                 "the earlier bracket's line is all this verdict "
+                                 "would have had to hash")
+
+    def test_a_bracket_answered_for_another_record_type_is_refused(self):
+        """A row is only this server's answer when it IS the answer.
+
+        corpus_serve answers A queries with --answer-ip and logs every other
+        type with answer "" (serve_dns). Counting any row for the hostname
+        passes a name whose A result came from a resolver cache while only its
+        AAAA reached this server, which is not the 10.0.2.2 HOP D recorded.
+
+        RED BEFORE THE FIX: both cases printed VERIFIED with exit 0.
+        """
+        urls = self._urls()
+        hosts = self._hosts_of(urls)
+        cases = {
+            "only the AAAA reached the replay": "MAKE_DNS_QNAMES_AAAA",
+            "an answer this server never gave": "MAKE_DNS_QNAMES_OTHER_ANSWER",
+        }
+        for label, knob in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, _results = self._fakes(tmp)
+                env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+                env["MAKE_DNS_QNAMES"] = " ".join(hosts[:-1])
+                env[knob] = hosts[-1]
+                script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                          f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                          'run_verify pre\necho VERIFIED\n')
+                result = self._run(script, env)
+                self.assertNotEqual(result.returncode, 0,
+                                    f"{label}: accepted\n{result.stdout}")
+                self.assertNotIn("VERIFIED", result.stdout)
+                self.assertIn(hosts[-1], result.stderr,
+                              f"{label}: the refusal does not name the host the "
+                              f"replay never answered for\n{result.stderr}")
+
+    def test_a_bracket_whose_comparison_could_not_run_is_refused(self):
+        """`comm` decides the verdict, so a `comm` that cannot run must block.
+
+        The difference was taken unchecked, and a comm that fails prints
+        nothing, which reads as "no host is missing". The bracket then passed
+        while the line it wrote said hosts_seen=0/10: a verdict rendered by a
+        tool that evaluated nothing, the shape of the `jq: command not found`
+        CLEAR in AGENTS.md.
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, with the bracket's own record
+        reading `pre since_row=0 queries=10 hosts_seen=0/10 missing=none`.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._stub_tool(tmp, "comm")
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a bracket whose comparison never ran was accepted\n"
+                + result.stdout
+                + read_if_exists(os.path.join(results, "replay-queries.log")))
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("cannot compare", result.stderr, result.stderr)
+
+    def test_a_bracket_that_could_not_measure_its_window_is_refused(self):
+        """The window's boundary is a count, and it fell back to 0 unchecked.
+
+        since_row is what keeps the preceding phase's queries out of the
+        bracket. replay_log_rows swallowed a failed count and printed 0, which
+        opens the window to the whole log, so the bracket is answered by rows
+        written before it ran: exactly what
+        test_an_earlier_campaigns_queries_cannot_answer_for_this_bracket
+        refuses, reachable again through a tool that could not count.
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, against a log whose every row
+        predates the bracket and a clone that asked this server nothing.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._stub_tool(tmp, "wc")
+            with open(os.path.join(results, "corpus-dns.log"), "w") as handle:
+                for host in self._hosts_of(urls):
+                    handle.write(json.dumps({
+                        "ts": 1755000000.0, "peer": "127.0.0.1:41552",
+                        "qname": host, "qtype": 1, "answer": "10.0.2.2"}) + "\n")
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            env["MAKE_DNS_QNAMES"] = ""
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(result.returncode, 0,
+                                "a bracket that could not measure its window was "
+                                f"accepted\n{result.stdout}")
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("cannot measure the replay DNS log", result.stderr,
+                          result.stderr)
+
     def test_a_stale_read_only_bracket_copy_cannot_stand_in(self):
         """run_verify is called as `run_verify pre || campaign_fail ...`, and
         bash turns errexit off inside a function invoked that way. The copy
         into verify-dns-<stage>.json was unchecked, so when it failed the
         `jq -e` that follows validated whatever copy was already there.
+
+        The stale copy is held down by mode bits, so the run drops
+        CAP_DAC_OVERRIDE. Root overwrote it instead, and the fresh evidence
+        then failed `jq -e` for the ordinary reason: green against a campaign
+        with both the `rm -f` and the checked `cp` removed, which is the
+        regression this pins.
 
         RED BEFORE THE FIX: VERIFIED printed, exit 0, over a bracket whose
         fresh evidence says passed=false.
@@ -676,7 +1098,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                       f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
                       'run_verify pre || { echo REFUSED; exit 7; }\necho VERIFIED\n')
             try:
-                result = self._run(script, env)
+                result = self._run(script, env, prefix=self._mode_bits_enforced())
             finally:
                 if os.path.exists(stale):
                     os.chmod(stale, 0o644)
@@ -993,7 +1415,9 @@ read -r _ < "$GO"
                       "a campaign that dies mid-run leaks the replay server")
 
     BRACKETS = ("pre", "before-run", "after-run")
-    REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log")
+    # The two logs the replay server writes, and the campaign's own record of
+    # what each bracket saw it serve. dns-evidence.json hashes all three.
+    REPLAY_LOGS = ("corpus-dns.log", "corpus-access.log", "replay-queries.log")
 
     RUN_ID = "20260828-000000-corpus"
 
@@ -1215,23 +1639,35 @@ wait_sampler_gone() {
     def test_a_missing_or_empty_replay_log_is_unclean(self):
         """The replay server's own logs are the other half of the evidence;
         a null hash was recorded without lowering the verdict.
+        replay-queries.log is held to the same rule: it is the only record
+        tying each bracket's window to the queries this server received, and
+        campaign_summary refuses a run that cannot produce it, so a verdict
+        written without it names a run that can never be published.
 
         RED BEFORE THE FIX: verdict clean with corpus_dns_log_sha256 null.
+
+        RED BEFORE THE SECOND FIX (replay-queries.log): `'clean' != 'unclean'`
+        for both the missing and the empty case.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            env, results = self._fakes(tmp)
-            self._leave_files(results, logs=("corpus-access.log",))
-            evidence, _ = self._sample(env, results, files=False)
-            self.assertEqual(evidence["verdict"], "unclean", evidence)
-            self.assertIsNone(evidence["corpus_dns_log_sha256"])
-            self.assertIn("corpus-dns.log", evidence["reason"])
-        with tempfile.TemporaryDirectory() as tmp:
-            env, results = self._fakes(tmp)
-            self._leave_files(results)
-            open(os.path.join(results, "corpus-access.log"), "w").close()
-            evidence, _ = self._sample(env, results, files=False)
-            self.assertEqual(evidence["verdict"], "unclean", evidence)
-            self.assertIn("corpus-access.log", evidence["reason"])
+        for name in self.REPLAY_LOGS:
+            field = name.rsplit(".", 1)[0].replace("-", "_") + "_log_sha256"
+            with self.subTest(log=name, state="missing"), \
+                    tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                self._leave_files(
+                    results, logs=[o for o in self.REPLAY_LOGS if o != name])
+                evidence, _ = self._sample(env, results, files=False)
+                self.assertEqual(evidence["verdict"], "unclean", evidence)
+                self.assertIsNone(evidence[field])
+                self.assertIn(name, evidence["reason"])
+            with self.subTest(log=name, state="empty"), \
+                    tempfile.TemporaryDirectory() as tmp:
+                env, results = self._fakes(tmp)
+                self._leave_files(results)
+                open(os.path.join(results, name), "w").close()
+                evidence, _ = self._sample(env, results, files=False)
+                self.assertEqual(evidence["verdict"], "unclean", evidence)
+                self.assertIn(name, evidence["reason"])
 
     def test_a_sampler_that_died_mid_run_is_unclean(self):
         """One clean sample followed by a dead sampler was accepted: the
@@ -1303,8 +1739,9 @@ wait_sampler_gone() {
                 self.assertIn("cannot write", result.stderr,
                               f"the failed {tool} was not what made the verdict unclean")
                 self.assertEqual(sorted(os.listdir(results)),
-                                 sorted(["analysis.json", "dns-owner.log", "corpus-dns.log",
-                                         "corpus-access.log", "corpus-serve.status"]
+                                 sorted(["analysis.json", "dns-owner.log",
+                                         "corpus-serve.status"]
+                                        + list(self.REPLAY_LOGS)
                                         + [f"verify-dns-{s}.json" for s in self.BRACKETS]),
                                  "a partial evidence file or temp file was left behind")
 
@@ -1627,6 +2064,7 @@ class DiagPhase(unittest.TestCase):
     _run = DnsBrackets._run
     _helpers = DnsBrackets._helpers
     _urls = DnsBrackets._urls
+    _hosts_of = staticmethod(DnsBrackets._hosts_of)
 
     DIAG_BLOCK = re.compile(
         r'(run_diag \|\| campaign_fail[^\n]*\n'
