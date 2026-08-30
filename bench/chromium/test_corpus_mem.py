@@ -668,6 +668,9 @@ if [ "${{1:-}}" = "$HOSTCDP_DRIVER" ]; then
     nonnumeric) printf '%s\n' 'not-a-load' >"$LOADAVG_FILE" ;;
     missing) rm -f -- "$LOADAVG_FILE" ;;
   esac
+  case "${{DRIVER_RUNTIME_ACTION:-}}" in
+    tamper) printf '%s\n' mutated >"$RUNTIME_PAYLOAD" ;;
+  esac
   printf '%s\n' '{{"ok":true,"url":"https://example.com/","stages":{{"total_ms":1.0}},"nav":{{"load_ms":1.0}}}}'
   exit 0
 fi
@@ -690,6 +693,21 @@ exec {real_timeout!r} "$duration" "$@"
 ''')
             os.chmod(timeout, 0o755)
 
+        runtime = os.path.join(tmp, "runtime")
+        os.mkdir(runtime)
+        payload = os.path.join(runtime, "payload")
+        with open(payload, "w") as handle:
+            handle.write("sealed\n")
+        payload_digest = hashlib.sha256(b"sealed\n").hexdigest()
+        manifest = os.path.join(runtime, "REQBENCH_MANIFEST.sha256")
+        with open(manifest, "w") as handle:
+            handle.write(f"{payload_digest}  payload\n")
+        with open(manifest, "rb") as handle:
+            runtime_digest = hashlib.sha256(handle.read()).hexdigest()
+        revision = subprocess.check_output(
+            ["git", "-C", os.path.dirname(os.path.dirname(HERE)),
+             "rev-parse", "HEAD"], text=True).strip()
+
         env = dict(
             os.environ,
             PATH=bindir + os.pathsep + os.environ["PATH"],
@@ -707,6 +725,11 @@ exec {real_timeout!r} "$duration" "$@"
             URL="https://example.com/",
             COMPARISON_LABEL="free",
             CPU_BUDGET="unlimited",
+            SOURCE_REVISION=revision,
+            REQBENCH_RUNTIME_MANIFEST=manifest,
+            REQBENCH_RUNTIME_BUNDLE_SHA256=runtime_digest,
+            CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="b" * 64,
+            RUNTIME_PAYLOAD=payload,
         )
         env.pop("CPUS", None)
         env.pop("CONTAINER_OWNER_TOKEN", None)
@@ -798,6 +821,9 @@ exec {real_timeout!r} "$duration" "$@"
                 "host_machine": os.uname().machine,
                 "host_kernel": os.uname().release,
                 "source_revision": revision,
+                "runtime_bundle_sha256": env["REQBENCH_RUNTIME_BUNDLE_SHA256"],
+                "corpus_extra_runtime_bundle_sha256":
+                    env["CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256"],
                 "harness_sha256": reqbench.harness_sha256(),
                 "hostcdp_sha256": producer_hash,
                 "driver": "cdpdrive.py",
@@ -811,6 +837,15 @@ exec {real_timeout!r} "$duration" "$@"
             self.assertRegex(run.get("container_owner_token", ""), r"^[0-9a-f]{32}$")
             with open(state + ".owner") as handle:
                 self.assertEqual(handle.read().strip(), run["container_owner_token"])
+
+    def test_runtime_manifest_drift_refuses_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, DRIVER_RUNTIME_ACTION="tamper")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("runtime", proc.stderr.lower())
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
 
     def test_vm_matched_cpu_budget_records_a_finite_json_number(self):
         with tempfile.TemporaryDirectory() as tmp:
