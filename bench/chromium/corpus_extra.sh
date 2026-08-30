@@ -571,6 +571,9 @@ if [[ ",$PHASES," == *",memory,"* ]]; then
         --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" \
         --run-id "$RUN_ID" \
         --container-owner-token "$CONTAINER_OWNER_TOKEN" \
+        --source-revision "$SOURCE_REVISION" \
+        --runtime-bundle-sha256 "$REQBENCH_RUNTIME_BUNDLE_SHA256" \
+        --corpus-extra-runtime-bundle-sha256 "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" \
         --fcvm "$BENCH/fcvm"
 fi
 

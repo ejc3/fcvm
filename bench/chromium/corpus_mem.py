@@ -135,6 +135,15 @@ def validate_args(args):
         die("--run-id must be a 32-character lowercase hexadecimal owner ID")
     if not re.fullmatch(r"[0-9a-f]{32}", args.container_owner_token or ""):
         die("--container-owner-token must be a 32-character lowercase hexadecimal token")
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                        args.source_revision or ""):
+        die("--source-revision must be a 40- or 64-character lowercase commit ID")
+    for option, value in (
+            ("--runtime-bundle-sha256", args.runtime_bundle_sha256),
+            ("--corpus-extra-runtime-bundle-sha256",
+             args.corpus_extra_runtime_bundle_sha256)):
+        if not re.fullmatch(r"[0-9a-f]{64}", value or ""):
+            die(f"{option} must be a lowercase sha256")
 
 
 def claim_results_dir(path):
@@ -908,6 +917,9 @@ def main_with_resources(resources):
                    help="owner ID shared with the outer cleanup; defaults to a UUID")
     p.add_argument("--container-owner-token", default="",
                    help="32-hex token proving which containers this invocation created")
+    p.add_argument("--source-revision", required=True)
+    p.add_argument("--runtime-bundle-sha256", required=True)
+    p.add_argument("--corpus-extra-runtime-bundle-sha256", required=True)
     args = p.parse_args()
 
     args.urls = parse_csv(args.urls, "--urls")
@@ -952,6 +964,10 @@ def main_with_resources(resources):
         len(args.urls))
     meta = {"run_id": args.run_id, "started": time.time(), "loadavg1_at_start": la,
             "host_kernel": os.uname().release, "machine": os.uname().machine,
+            "source_revision": args.source_revision,
+            "runtime_bundle_sha256": args.runtime_bundle_sha256,
+            "corpus_extra_runtime_bundle_sha256":
+                args.corpus_extra_runtime_bundle_sha256,
             "snapshot": args.tag, "image": args.image,
             "image_id": image_id,
             "snapshot_generation": generation,

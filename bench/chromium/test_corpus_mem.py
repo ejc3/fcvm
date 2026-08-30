@@ -1281,6 +1281,9 @@ class ArgumentValidation(unittest.TestCase):
             proc = subprocess.run(
                 [sys.executable, CORPUS_MEM, "--results", os.path.join(tmp, "out"),
                  "--tag", "tag", "--urls", "https://example.com/",
+                 "--source-revision", "a" * 40,
+                 "--runtime-bundle-sha256", "b" * 64,
+                 "--corpus-extra-runtime-bundle-sha256", "c" * 64,
                  "--cputime-reps", "1"],
                 capture_output=True, text=True, timeout=30,
             )
