@@ -579,6 +579,73 @@ def median_ms(values):
     return round(statistics.median(values), 1)
 
 
+def cputime_fcvm_arm(args, cg, fcvm_side):
+    """One clone per request, sequentially, its leaf cgroup's CPU read once gone.
+
+    Symmetric with cputime_host_arm so the caller can hold one arm's result while
+    the other fails. This one is the expensive half: args.cputime_reps whole
+    clone lifecycles.
+    """
+    per = []
+    # The UFFD serve is shared by every clone and sits OUTSIDE the clone's
+    # cgroup, so it would be missing from a per-clone CPU figure. Its own
+    # leaf is differenced across the whole loop and reported per request.
+    serve_cpu_before = cgroup_cpu_usec(f"{cg.base}/serve-0")
+    for i in range(args.cputime_reps):
+        leaf = f"req-cpu-{i}"
+        cgp = cg.leaf(leaf)
+        name = f"mem-{args.run_id}-cpu-{i}"
+        log_path = os.path.join(args.results, "logs", f"{name}.log")
+        argv = [args.fcvm, "snapshot", "run", "--pid", str(fcvm_side.serve_pid),
+                "--name", name, "--no-dirty-tracking", "--no-swap"]
+        proc = spawn_in_cgroup(cgp, argv, log_path, dict(os.environ, RUST_LOG="fcvm=info"))
+        found = find_clone_state(args.state_dir, name, time.monotonic() + 180, proc)
+        if not found:
+            die(f"cputime clone {name} never published a state file; see {log_path}")
+        _, ip = found
+        deadline = time.monotonic() + 180
+        while not port_open(ip, args.cdp_port):
+            if time.monotonic() >= deadline:
+                die(f"cputime clone {name} never answered CDP; see {log_path}")
+            time.sleep(0.05)
+        t0 = time.monotonic()
+        ok, out = render(f"{ip}:{args.cdp_port}", args.urls[i % len(args.urls)])
+        wall = (time.monotonic() - t0) * 1000
+        if not ok:
+            die(f"cputime clone {name} failed to render: {out}")
+        proc.terminate()
+        try:
+            proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=60)
+        gone_by = time.monotonic() + 120
+        while not clone_gone(args.state_dir, name):
+            if time.monotonic() >= gone_by:
+                die(f"cputime clone {name} state file outlived its process")
+            time.sleep(0.2)
+        usec = cgroup_cpu_usec(cgp)
+        cg.rm(leaf)
+        if usec is None:
+            die(f"cputime clone {name} left no cpu.stat to read")
+        per.append({"i": i, "url": args.urls[i % len(args.urls)],
+                    "cpu_ms": usec / 1000.0, "render_wall_ms": round(wall, 1)})
+        log(f"cputime fcvm {i + 1}/{args.cputime_reps}: {usec / 1000.0:.0f} ms CPU")
+    serve_cpu_after = cgroup_cpu_usec(f"{cg.base}/serve-0")
+    serve_per_req = None
+    if serve_cpu_before is not None and serve_cpu_after is not None:
+        serve_per_req = round((serve_cpu_after - serve_cpu_before) / 1000.0
+                              / args.cputime_reps, 1)
+    vals = sorted(r["cpu_ms"] for r in per)
+    return {"n": len(vals), "per_request_cpu_ms_p50": median_ms(vals),
+            "serve_cpu_ms_per_request": serve_per_req,
+            "per_request_cpu_ms_mean": round(statistics.mean(vals), 1),
+            "min": round(vals[0], 1), "max": round(vals[-1], 1),
+            "basis": "leaf cgroup usage_usec over one whole clone lifecycle "
+                     "(spawn, restore, render, teardown)",
+            "records": per}
+
+
 def run_cputime(args, cg, fcvm_side, out_path):
     """CPU-seconds to produce one screenshot, on both sides, same corpus.
 
@@ -597,64 +664,7 @@ def run_cputime(args, cg, fcvm_side, out_path):
     """
     res = {"reps": args.cputime_reps, "urls": args.urls, "fcvm": None, "host": None}
     if fcvm_side is not None:
-        per = []
-        # The UFFD serve is shared by every clone and sits OUTSIDE the clone's
-        # cgroup, so it would be missing from a per-clone CPU figure. Its own
-        # leaf is differenced across the whole loop and reported per request.
-        serve_cpu_before = cgroup_cpu_usec(f"{cg.base}/serve-0")
-        for i in range(args.cputime_reps):
-            leaf = f"req-cpu-{i}"
-            cgp = cg.leaf(leaf)
-            name = f"mem-{args.run_id}-cpu-{i}"
-            log_path = os.path.join(args.results, "logs", f"{name}.log")
-            argv = [args.fcvm, "snapshot", "run", "--pid", str(fcvm_side.serve_pid),
-                    "--name", name, "--no-dirty-tracking", "--no-swap"]
-            proc = spawn_in_cgroup(cgp, argv, log_path, dict(os.environ, RUST_LOG="fcvm=info"))
-            found = find_clone_state(args.state_dir, name, time.monotonic() + 180, proc)
-            if not found:
-                die(f"cputime clone {name} never published a state file; see {log_path}")
-            _, ip = found
-            deadline = time.monotonic() + 180
-            while not port_open(ip, args.cdp_port):
-                if time.monotonic() >= deadline:
-                    die(f"cputime clone {name} never answered CDP; see {log_path}")
-                time.sleep(0.05)
-            t0 = time.monotonic()
-            ok, out = render(f"{ip}:{args.cdp_port}", args.urls[i % len(args.urls)])
-            wall = (time.monotonic() - t0) * 1000
-            if not ok:
-                die(f"cputime clone {name} failed to render: {out}")
-            proc.terminate()
-            try:
-                proc.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=60)
-            gone_by = time.monotonic() + 120
-            while not clone_gone(args.state_dir, name):
-                if time.monotonic() >= gone_by:
-                    die(f"cputime clone {name} state file outlived its process")
-                time.sleep(0.2)
-            usec = cgroup_cpu_usec(cgp)
-            cg.rm(leaf)
-            if usec is None:
-                die(f"cputime clone {name} left no cpu.stat to read")
-            per.append({"i": i, "url": args.urls[i % len(args.urls)],
-                        "cpu_ms": usec / 1000.0, "render_wall_ms": round(wall, 1)})
-            log(f"cputime fcvm {i + 1}/{args.cputime_reps}: {usec / 1000.0:.0f} ms CPU")
-        serve_cpu_after = cgroup_cpu_usec(f"{cg.base}/serve-0")
-        serve_per_req = None
-        if serve_cpu_before is not None and serve_cpu_after is not None:
-            serve_per_req = round((serve_cpu_after - serve_cpu_before) / 1000.0
-                                  / args.cputime_reps, 1)
-        vals = sorted(r["cpu_ms"] for r in per)
-        res["fcvm"] = {"n": len(vals), "per_request_cpu_ms_p50": median_ms(vals),
-                       "serve_cpu_ms_per_request": serve_per_req,
-                       "per_request_cpu_ms_mean": round(statistics.mean(vals), 1),
-                       "min": round(vals[0], 1), "max": round(vals[-1], 1),
-                       "basis": "leaf cgroup usage_usec over one whole clone lifecycle "
-                                "(spawn, restore, render, teardown)",
-                       "records": per}
+        res["fcvm"] = cputime_fcvm_arm(args, cg, fcvm_side)
     # The host arm must not be able to take the fcvm arm with it. That arm cost
     # 42 clone lifecycles above, it is already measured, and an unwritten
     # cputime.json threw all of it away once (2026-08-30 17:53, "cputime

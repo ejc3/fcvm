@@ -58,23 +58,28 @@ class StrayPreflight(unittest.TestCase):
         self.patch(lambda *_a, **_k: Completed(0, "4242 firecracker --api-sock x\n", ""))
         self.assertIn("firecracker", corpus_mem.stray_vmm_processes())
 
+    def assert_blocks(self):
+        """SystemExit with a NON-ZERO code. `sys.exit(0)` is also a SystemExit,
+        and a preflight that exits clean is the fail-open this refuses."""
+        with self.assertRaises(SystemExit) as caught:
+            corpus_mem.stray_vmm_processes()
+        self.assertNotIn(caught.exception.code, (0, None),
+                         "the preflight exited cleanly; the run would continue")
+
     def test_a_preflight_that_could_not_run_blocks_the_run(self):
         """exit 127 is "pgrep is not installed", not "the box is clean"."""
         self.patch(lambda *_a, **_k: Completed(127, "", "pgrep: command not found"))
-        with self.assertRaises(SystemExit):
-            corpus_mem.stray_vmm_processes()
+        self.assert_blocks()
 
     def test_a_preflight_that_errored_blocks_the_run(self):
         self.patch(lambda *_a, **_k: Completed(2, "", "pgrep: syntax error"))
-        with self.assertRaises(SystemExit):
-            corpus_mem.stray_vmm_processes()
+        self.assert_blocks()
 
     def test_a_preflight_that_cannot_be_spawned_blocks_the_run(self):
         def boom(*_a, **_k):
             raise FileNotFoundError("pgrep")
         self.patch(boom)
-        with self.assertRaises(SystemExit):
-            corpus_mem.stray_vmm_processes()
+        self.assert_blocks()
 
 
 class ZeroBasis(unittest.TestCase):
@@ -189,10 +194,17 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
     records with it.
     """
 
+    # What the expensive arm produced. run_cputime must still be holding this
+    # when the host arm fails; with fcvm_side=None there is nothing to lose and
+    # the test would only prove a file was written.
+    FCVM_ARM = {"n": 42, "per_request_cpu_ms_p50": 1486.0, "records": [{"i": 0}]}
+
     def run_with_failing_host(self, boom):
-        real = corpus_mem.cputime_host_arm
-        corpus_mem.cputime_host_arm = boom
-        self.addCleanup(setattr, corpus_mem, "cputime_host_arm", real)
+        for name, fake in (("cputime_host_arm", boom),
+                           ("cputime_fcvm_arm", lambda *_a: dict(self.FCVM_ARM))):
+            real = getattr(corpus_mem, name)
+            setattr(corpus_mem, name, fake)
+            self.addCleanup(setattr, corpus_mem, name, real)
 
         class Args:
             cputime_reps = 3
@@ -200,10 +212,14 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         out = os.path.join(tmp, "cputime.json")
         try:
-            corpus_mem.run_cputime(Args(), None, None, out)
+            corpus_mem.run_cputime(Args(), object(), object(), out)
         except SystemExit:
             pass
         return out
+
+    def assert_fcvm_arm_survived(self, rec):
+        self.assertEqual(rec["fcvm"], self.FCVM_ARM,
+                         "the measured fcvm arm did not reach the record")
 
     def test_a_host_arm_that_refuses_still_leaves_the_record(self):
         def refuse(_args, res):
@@ -215,6 +231,7 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
             rec = json.load(handle)
         self.assertEqual(rec["host"], None)
         self.assertIn("host_error", rec)
+        self.assert_fcvm_arm_survived(rec)
 
     def test_the_recorded_reason_is_the_reason(self):
         """`die` exits with a CODE, so str(SystemExit) is "2", not the message.
@@ -232,6 +249,7 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
             rec = json.load(handle)
         self.assertIn("no container cgroup", rec["host_error"],
                       f"the record does not name the refusal: {rec['host_error']!r}")
+        self.assert_fcvm_arm_survived(rec)
 
     def test_a_host_arm_that_raises_still_leaves_the_record(self):
         def crash(_args, _res):
@@ -239,7 +257,9 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
         out = self.run_with_failing_host(crash)
         self.assertTrue(os.path.exists(out), "cputime.json was not written")
         with open(out) as handle:
-            self.assertIsNone(json.load(handle)["host"])
+            rec = json.load(handle)
+        self.assertIsNone(rec["host"])
+        self.assert_fcvm_arm_survived(rec)
 
 
 class Resummarize(unittest.TestCase):
@@ -291,7 +311,12 @@ class Resummarize(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0,
                             "a run with a failed rep was summarised; its timeout "
                             f"is now in the p95\n{proc.stdout}{proc.stderr}")
-        self.assertIn("1", proc.stdout + proc.stderr)
+        # A refusal, not a traceback: the unfixed script died inside
+        # statistics.median on the empty-run case, which is also a non-zero
+        # exit and would satisfy a bare returncode check.
+        self.assertIn("REFUSING", proc.stderr, proc.stderr)
+        self.assertIn("1 of 5 measured reps", proc.stderr, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")),
                          "a refused run still left a quotable summary.json")
 
@@ -313,8 +338,12 @@ class Resummarize(unittest.TestCase):
         self.assertEqual(rec["loadavg1_measured"]["n"], 5)
 
     def test_a_run_with_no_measured_reps_is_refused(self):
+        """Refused, not crashed. The unfixed script raised StatisticsError from
+        an empty median, which exits non-zero for a reason no reader can act on."""
         tmp, proc = self.run_on([self.rep(0, warmup=True)])
         self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("REFUSING", proc.stderr, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
 
 
