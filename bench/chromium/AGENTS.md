@@ -163,15 +163,17 @@ true` the same way. The marker is tracked (`!results/**/WITHDRAWN` in
 stays unquotable (REVIEW.md).
 
 A corpus campaign's run directory also keeps the replay server's two logs,
-`corpus-dns.log` and `corpus-access.log`, tracked because `dns-evidence.json`
-records their sha256 and `campaign_summary.py` refuses the run unless both are
-present and match. Expect them to be large: the DNS log has one line per query
-and the access log one line per HTTP request the server answered, from the
-campaign's startup probes through the three verify brackets and every rep of
-every arm of the measured run, so it is the biggest record in the directory
-and a short one means the server was not serving the whole run.
+`corpus-dns.log` and `corpus-access.log`, plus the campaign's own
+`replay-queries.log`, one line per verify bracket. All three are tracked
+because `dns-evidence.json` records their sha256 and `campaign_summary.py`
+refuses the run unless each is present and matches. Expect the server's two
+to be large: the DNS log has one line per query and the access log one line
+per HTTP request the server answered, from the campaign's startup probes
+through the three verify brackets and every rep of every arm of the measured
+run, so it is the biggest record in the directory and a short one means the
+server was not serving the whole run.
 
-The evidence is only as good as the checks behind it, and four of them are
+The evidence is only as good as the checks behind it, and six of them are
 easy to get wrong:
 
 - The server's exit status. `corpus_serve.py` exits 1 when a log line could
@@ -194,6 +196,15 @@ easy to get wrong:
   variable first, and reports what it ignored; `verify-dns.json` carries
   `proxies_disabled` and `run_verify` refuses a bracket without it. Any new
   in-guest probe that opens a URL needs the same treatment.
+- What the replay server answered, as against what it was asked.
+  `verify_replay_answered_the_guest` selects `qtype == 1` rows whose
+  `answer` is `10.0.2.2`, because `corpus_serve.py` logs every other query
+  type with `answer: ""`: a hostname whose A came from a resolver cache
+  while only its AAAA reached the replay would otherwise close the bracket
+  on a row that carries no answer. The whole function is checked command by
+  command, since it is reached through `run_verify X || campaign_fail ...`
+  and bash suspends errexit for everything on the left of `||`, so an
+  unchecked `comm`, count or append renders a pass nothing evaluated.
 - The verify brackets themselves. `passed: true` is also what HOP D writes
   when it was given nothing to check, and a bracket is a plain file in the
   run directory. `write_dns_evidence` records each bracket's sha256 as

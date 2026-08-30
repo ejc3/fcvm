@@ -486,6 +486,12 @@ class DnsBrackets(unittest.TestCase):
     # order as the real thing, where corpus_serve logs each query while the
     # sub-make is in flight. A bracket that expects the log to say otherwise
     # sets this to a subset, or to nothing.
+    # MAKE_DNS_QNAMES_AAAA and MAKE_DNS_QNAMES_OTHER_ANSWER: the rows that
+    # reach this server WITHOUT it supplying the answer HOP D saw. corpus_serve
+    # answers A queries with --answer-ip and logs every other type with
+    # answer "" (serve_dns), so a name whose A came from a resolver cache
+    # while only its AAAA arrived here is a row in this log that says nothing
+    # about the answer.
     FAKE_MAKE = """#!/bin/bash
 env > "$MAKE_ENV_DUMP"
 echo "$*" > "$MAKE_ARGV"
@@ -493,6 +499,14 @@ echo "$*" > "$MAKE_ARGV"
 [ -z "${MAKE_DIAG_JSON:-}" ] || { mkdir -p "$RESULTS/diag"; printf '%s\\n' "$MAKE_DIAG_JSON" > "$RESULTS/diag/summary.json"; }
 for qname in ${MAKE_DNS_QNAMES:-}; do
     printf '{"ts":%s,"peer":"127.0.0.1:40001","qname":"%s","qtype":1,"answer":"10.0.2.2"}\\n' \\
+        "$(date +%s)" "$qname" >> "$RESULTS/corpus-dns.log"
+done
+for qname in ${MAKE_DNS_QNAMES_AAAA:-}; do
+    printf '{"ts":%s,"peer":"127.0.0.1:40001","qname":"%s","qtype":28,"answer":""}\\n' \\
+        "$(date +%s)" "$qname" >> "$RESULTS/corpus-dns.log"
+done
+for qname in ${MAKE_DNS_QNAMES_OTHER_ANSWER:-}; do
+    printf '{"ts":%s,"peer":"127.0.0.1:40001","qname":"%s","qtype":1,"answer":"10.0.2.3"}\\n' \\
         "$(date +%s)" "$qname" >> "$RESULTS/corpus-dns.log"
 done
 exit "${MAKE_RC:-0}"
@@ -881,6 +895,157 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             self.assertIn("pre ", line)
             self.assertIn(f"hosts_seen={len(hosts)}/{len(hosts)}", line)
             self.assertIn("missing=none", line)
+
+    def _stub_tool(self, tmp, name, body="#!/bin/bash\nexit 1\n"):
+        """A tool of that name, first on the bracket's PATH, that cannot run.
+
+        The campaign renders its verdict through these; a verdict from a tool
+        that could not evaluate anything is the `jq: command not found`
+        shape, and must block rather than pass.
+        """
+        path = os.path.join(tmp, "bin", name)
+        with open(path, "w") as handle:
+            handle.write(body)
+        os.chmod(path, 0o755)
+
+    def test_a_bracket_whose_record_cannot_be_written_is_refused(self):
+        """The append is the bracket's own record, and its failure was silent.
+
+        run_verify is called as `run_verify pre || campaign_fail ...`, which
+        turns errexit off inside the function, so a redirection that could not
+        be written left the rest of the bracket to carry on: `[ -n "$missing" ]`
+        was false, `say` succeeded, and the function returned 0.
+        write_dns_evidence then hashed the nonempty file an EARLIER bracket had
+        left, so the campaign was clean with a later bracket's record never
+        written.
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, with replay-queries.log still
+        holding nothing but the earlier bracket's line.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            record = os.path.join(results, "replay-queries.log")
+            hosts = len(self._hosts_of(urls))
+            earlier = (f"pre since_row=0 queries={hosts} "
+                       f"hosts_seen={hosts}/{hosts} missing=none\n")
+            with open(record, "w") as handle:
+                handle.write(earlier)
+            os.chmod(record, 0o444)
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify before-run || { echo REFUSED; exit 7; }\necho VERIFIED\n')
+            try:
+                result = self._run(script, env)
+            finally:
+                os.chmod(record, 0o644)
+            self.assertEqual(result.returncode, 7,
+                             "a bracket whose record could not be written was "
+                             f"accepted\n{result.stdout}{result.stderr}")
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("replay-queries.log", result.stderr, result.stderr)
+            with open(record) as handle:
+                self.assertEqual(handle.read(), earlier,
+                                 "the earlier bracket's line is all this verdict "
+                                 "would have had to hash")
+
+    def test_a_bracket_answered_for_another_record_type_is_refused(self):
+        """A row is only this server's answer when it IS the answer.
+
+        corpus_serve answers A queries with --answer-ip and logs every other
+        type with answer "" (serve_dns). Counting any row for the hostname
+        passes a name whose A result came from a resolver cache while only its
+        AAAA reached this server, which is not the 10.0.2.2 HOP D recorded.
+
+        RED BEFORE THE FIX: both cases printed VERIFIED with exit 0.
+        """
+        urls = self._urls()
+        hosts = self._hosts_of(urls)
+        cases = {
+            "only the AAAA reached the replay": "MAKE_DNS_QNAMES_AAAA",
+            "an answer this server never gave": "MAKE_DNS_QNAMES_OTHER_ANSWER",
+        }
+        for label, knob in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                env, _results = self._fakes(tmp)
+                env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+                env["MAKE_DNS_QNAMES"] = " ".join(hosts[:-1])
+                env[knob] = hosts[-1]
+                script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                          f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                          'run_verify pre\necho VERIFIED\n')
+                result = self._run(script, env)
+                self.assertNotEqual(result.returncode, 0,
+                                    f"{label}: accepted\n{result.stdout}")
+                self.assertNotIn("VERIFIED", result.stdout)
+                self.assertIn(hosts[-1], result.stderr,
+                              f"{label}: the refusal does not name the host the "
+                              f"replay never answered for\n{result.stderr}")
+
+    def test_a_bracket_whose_comparison_could_not_run_is_refused(self):
+        """`comm` decides the verdict, so a `comm` that cannot run must block.
+
+        The difference was taken unchecked, and a comm that fails prints
+        nothing, which reads as "no host is missing". The bracket then passed
+        while the line it wrote said hosts_seen=0/10: a verdict rendered by a
+        tool that evaluated nothing, the shape of the `jq: command not found`
+        CLEAR in AGENTS.md.
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, with the bracket's own record
+        reading `pre since_row=0 queries=10 hosts_seen=0/10 missing=none`.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._stub_tool(tmp, "comm")
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a bracket whose comparison never ran was accepted\n"
+                + result.stdout
+                + read_if_exists(os.path.join(results, "replay-queries.log")))
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("cannot compare", result.stderr, result.stderr)
+
+    def test_a_bracket_that_could_not_measure_its_window_is_refused(self):
+        """The window's boundary is a count, and it fell back to 0 unchecked.
+
+        since_row is what keeps the preceding phase's queries out of the
+        bracket. replay_log_rows swallowed a failed count and printed 0, which
+        opens the window to the whole log, so the bracket is answered by rows
+        written before it ran: exactly what
+        test_an_earlier_campaigns_queries_cannot_answer_for_this_bracket
+        refuses, reachable again through a tool that could not count.
+
+        RED BEFORE THE FIX: exit 0 and VERIFIED, against a log whose every row
+        predates the bracket and a clone that asked this server nothing.
+        """
+        urls = self._urls()
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            self._stub_tool(tmp, "wc")
+            with open(os.path.join(results, "corpus-dns.log"), "w") as handle:
+                for host in self._hosts_of(urls):
+                    handle.write(json.dumps({
+                        "ts": 1755000000.0, "peer": "127.0.0.1:41552",
+                        "qname": host, "qtype": 1, "answer": "10.0.2.2"}) + "\n")
+            env["MAKE_VERIFY_JSON"] = self._bracket_evidence(urls)
+            env["MAKE_DNS_QNAMES"] = ""
+            script = (f'set -euo pipefail\nsay() {{ :; }}\nURLS="{urls}"\n'
+                      f'{self._helpers()}\nCORPUS_HOSTS=$(corpus_hosts)\n'
+                      'run_verify pre\necho VERIFIED\n')
+            result = self._run(script, env)
+            self.assertNotEqual(result.returncode, 0,
+                                "a bracket that could not measure its window was "
+                                f"accepted\n{result.stdout}")
+            self.assertNotIn("VERIFIED", result.stdout)
+            self.assertIn("cannot measure the replay DNS log", result.stderr,
+                          result.stderr)
 
     def test_a_stale_read_only_bracket_copy_cannot_stand_in(self):
         """run_verify is called as `run_verify pre || campaign_fail ...`, and

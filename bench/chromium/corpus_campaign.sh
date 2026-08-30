@@ -157,12 +157,16 @@ say() { printf '\n=== %s\n' "$*"; }
 #      any load event took longer than DIAG_MAX_LOAD_MS
 #      ($RESULTS/diag/summary.json).
 #   1b. every bracket then requires this campaign's corpus_serve to have
-#      LOGGED a query for every corpus host in the rows its DNS log grew by
-#      while the bracket ran ($RESULTS/replay-queries.log). HOP D reads the
-#      answer; this reads the other end of the same query, so an answer that
-#      came from anywhere else (a corpus_serve leaked from an earlier
-#      campaign, an /etc/hosts baked into the golden, a resolver cache in the
-#      clone) fails the bracket. The peer address cannot carry that evidence:
+#      ANSWERED an A query with 10.0.2.2 for every corpus host, in the rows
+#      its DNS log grew by while the bracket ran
+#      ($RESULTS/replay-queries.log). HOP D reads the answer; this reads the
+#      other end of the same query, so an answer that came from anywhere else
+#      (a corpus_serve leaked from an earlier campaign, an /etc/hosts baked
+#      into the golden, a resolver cache in the clone) fails the bracket. The
+#      record type is part of that: corpus_serve logs an AAAA with answer "",
+#      so a name whose A came from a cache while only its AAAA arrived here
+#      leaves a row that says nothing about the answer HOP D saw. The peer
+#      address cannot carry the evidence either:
 #      pasta translates the guest's source to host loopback for a loopback
 #      destination (fwd_nat_from_tap, fwd.c), so every guest query is logged
 #      from 127.0.0.1, with only the guest's UDP source port preserved. The
@@ -205,16 +209,22 @@ corpus_hosts() {
 }
 
 # The other end of HOP D's query. HOP D reads what the clone RESOLVED; this
-# reads what this campaign's replay server was ASKED, so a bracket only passes
+# reads what this campaign's replay server ANSWERED, so a bracket only passes
 # when the two are the same event. A leaked corpus_serve from an earlier
 # campaign, an /etc/hosts baked into the golden, or a resolver cache in the
 # clone all answer 10.0.2.2 without this server ever being consulted.
 #
+# It is the answer and not merely the query, because a hostname can reach this
+# server on a lookup that carried no answer: corpus_serve answers A queries
+# with --answer-ip and logs every other type with answer "". A clone whose A
+# result came from a resolver cache while its AAAA arrived here leaves a row
+# for the name that says nothing about where the 10.0.2.2 came from.
+#
 # The peer address cannot say who asked: pasta translates a guest's source
 # address to host loopback whenever the destination is loopback
 # (fwd_nat_from_tap in fwd.c), so guest queries and the campaign's own host-side
-# dig are both logged from 127.0.0.1. What ties a query to the bracket is the
-# rows the log grew by while it ran, and the names those rows asked for.
+# dig are both logged from 127.0.0.1. What ties an answer to the bracket is the
+# rows the log grew by while it ran, and the names those rows carry.
 #
 # The boundary is the log's length, not a clock reading. `date +%s` truncates,
 # so a query the preceding phase made a fraction of a second before the bracket
@@ -222,11 +232,19 @@ corpus_hosts() {
 # answers for it. The settle wait, the golden and the diag all render these
 # same names immediately before a bracket runs.
 #
+# This function decides a bracket, and it runs with errexit off: it is reached
+# through `run_verify X || campaign_fail ...`, and bash suspends errexit for the
+# whole call tree on the left of `||`. Every command below is therefore checked
+# where its failure would change the verdict. Unchecked, a tool that could not
+# run prints nothing, an empty difference reads as "no host is missing", and the
+# bracket renders a pass it never evaluated.
+#
 # $1 = stage, $2 = rows the log held when the bracket opened.
 verify_replay_answered_the_guest() {
     local stage="$1" since="$2" log="$RESULTS/corpus-dns.log"
-    local seen missing queries wanted
-    wanted=$(printf '%s\n' "$CORPUS_HOSTS" | tr ',' '\n' | awk 'NF' | sort -u)
+    local seen missing queries wanted wanted_n hosts_seen
+    wanted=$(printf '%s\n' "$CORPUS_HOSTS" | tr ',' '\n' | awk 'NF' | sort -u) \
+        || { echo "FAILED: verify ($stage): cannot list the corpus hosts to check" >&2; return 1; }
     if [ ! -s "$log" ]; then
         echo "FAILED: verify ($stage): $log holds no queries, so this campaign's replay server answered nothing; HOP D's answers came from somewhere else" >&2
         return 1
@@ -235,32 +253,53 @@ verify_replay_answered_the_guest() {
     # empty query set, which would read as "nothing asked" either way.
     seen=$(replay_qnames_since "$log" "$since" | sort -u) \
         || { echo "FAILED: verify ($stage): cannot read the replay DNS log $log" >&2; return 1; }
-    queries=$(replay_qnames_since "$log" "$since" | wc -l) || queries=0
-    missing=$(comm -23 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | paste -sd, -)
+    queries=$(replay_qnames_since "$log" "$since" | wc -l) \
+        || { echo "FAILED: verify ($stage): cannot count the answers $log holds after row $since" >&2; return 1; }
+    missing=$(comm -23 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | paste -sd, -) \
+        || { echo "FAILED: verify ($stage): cannot compare the corpus hosts against the names this campaign's replay server answered" >&2; return 1; }
+    hosts_seen=$(comm -12 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | wc -l) \
+        || { echo "FAILED: verify ($stage): cannot count the corpus hosts this campaign's replay server answered" >&2; return 1; }
+    wanted_n=$(printf '%s\n' "$wanted" | wc -l) \
+        || { echo "FAILED: verify ($stage): cannot count the corpus hosts" >&2; return 1; }
+    # The bracket's own record, written before the verdict below so that a
+    # failing bracket also leaves the line saying what it saw. An append that
+    # cannot be written fails the bracket: write_dns_evidence hashes whatever
+    # the file already holds, which in every bracket after the first is an
+    # earlier bracket's line, so a record that never landed would be hashed as
+    # evidence of a bracket that ran.
     printf '%s since_row=%s queries=%s hosts_seen=%s/%s missing=%s\n' \
-        "$stage" "$since" "$queries" \
-        "$(comm -12 <(printf '%s\n' "$wanted") <(printf '%s\n' "$seen") | wc -l)" \
-        "$(printf '%s\n' "$wanted" | wc -l)" "${missing:-none}" \
-        >>"$RESULTS/replay-queries.log"
+        "$stage" "$since" "$queries" "$hosts_seen" "$wanted_n" "${missing:-none}" \
+        >>"$RESULTS/replay-queries.log" \
+        || { echo "FAILED: verify ($stage): cannot record this bracket in $RESULTS/replay-queries.log" >&2; return 1; }
     if [ -n "$missing" ]; then
-        echo "FAILED: verify ($stage): this campaign's replay server logged no query for $missing after row $since, so the clone's answers for those names did not come from it" >&2
+        echo "FAILED: verify ($stage): this campaign's replay server logged no A answer of 10.0.2.2 for $missing after row $since, so the clone's answers for those names did not come from it" >&2
         return 1
     fi
-    say "verify ($stage): replay served $queries queries covering every corpus host"
+    say "verify ($stage): replay answered $queries A queries covering every corpus host"
 }
 
 replay_log_rows() {
     # The replay DNS log's length now. corpus_serve writes each row with one
-    # flushed write under a lock (JsonlLog), so this counts whole rows.
+    # flushed write under a lock (JsonlLog), so this counts whole rows. A count
+    # that cannot be taken returns 1 rather than 0: 0 is a real answer (the log
+    # is empty), and printing it for a failed count opens the bracket's window
+    # to the whole file, which is how an earlier phase's queries answer for it.
     local log="$RESULTS/corpus-dns.log" n=0
-    if [ -f "$log" ]; then n=$(wc -l <"$log"); fi
+    if [ -f "$log" ]; then n=$(wc -l <"$log") || return 1; fi
     printf '%s' "$((n))"
 }
 
 replay_qnames_since() {
-    # $1 = the replay DNS log, $2 = rows to skip. A row jq cannot parse fails
-    # the pipeline, and so the bracket.
-    tail -n +"$(($2 + 1))" "$1" | jq -r 'select((.qname | type) == "string") | .qname' 2>/dev/null
+    # $1 = the replay DNS log, $2 = rows to skip. Only the A queries this
+    # server ANSWERED with 10.0.2.2 count, which is the answer HOP D read in
+    # the guest (--answer-ip below, VERIFY_DNS_ANSWER above). corpus_serve
+    # logs every other query type with answer "" (serve_dns), so counting any
+    # row for a hostname would pass a name whose A result came from a resolver
+    # cache while only its AAAA reached this server. A row jq cannot parse
+    # fails the pipeline, and so the bracket.
+    tail -n +"$(($2 + 1))" "$1" \
+        | jq -r 'select((.qname | type) == "string" and .qtype == 1 and .answer == "10.0.2.2")
+                 | .qname' 2>/dev/null
 }
 
 run_verify() {
@@ -272,7 +311,8 @@ run_verify() {
     # Before the sub-make: the replay log's length. Every query the bracket
     # provokes is appended after this row, and nothing an earlier phase asked
     # for is.
-    since_row=$(replay_log_rows)
+    since_row=$(replay_log_rows) \
+        || { echo "FAILED: verify ($stage): cannot measure the replay DNS log, so this bracket has no window to check" >&2; return 1; }
     # Every check below is a claim about a list of names, and every one of
     # them is vacuously true when the list is empty: jq's `all` over an empty
     # array is true, and "the replay answered for every corpus host" holds
