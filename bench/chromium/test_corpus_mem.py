@@ -1807,5 +1807,66 @@ class ProvenanceNamesBytes(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
 
+class CorpusExtraRuntimeBundle(unittest.TestCase):
+    """The recorded scripts and binary are the immutable bytes that execute."""
+
+    SOURCES = (
+        "corpus_extra.sh", "corpus_mem.py", "hostcdp.sh", "cdpdrive.py",
+        "render.py", "corpus_serve.py", "report.py", "reqbench.py",
+        "owned_process.py", "corpus_campaign.sh",
+    )
+
+    def test_staged_bundle_is_independent_of_later_repository_edits(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        match = re.search(r'^stage_runtime_bundle\(\) \{\n.*?^\}', source,
+                          re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, "corpus-extra has no runtime staging function")
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = os.path.join(tmp, "source")
+            repo = os.path.join(tmp, "repo")
+            results = os.path.join(tmp, "results")
+            os.makedirs(bench)
+            os.makedirs(results)
+            os.makedirs(os.path.join(repo, "target", "release"))
+            corpus = os.path.join(bench, "corpus-live")
+            os.makedirs(corpus)
+            with open(os.path.join(corpus, "page.html"), "w") as handle:
+                handle.write("original corpus\n")
+            for name in self.SOURCES:
+                with open(os.path.join(bench, name), "w") as handle:
+                    handle.write(f"original {name}\n")
+            fcvm = os.path.join(repo, "target", "release", "fcvm")
+            with open(fcvm, "w") as handle:
+                handle.write("original fcvm\n")
+            script = (
+                "set -euo pipefail\n"
+                f"SOURCE_BENCH={bench!r}\nREPO={repo!r}\nRESULTS={results!r}\n"
+                + match.group(0) + "\n"
+                + "stage_runtime_bundle\nprintf '%s\\n' \"$BUNDLE_DIR\"\n"
+            )
+            proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                                  text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            bundle = proc.stdout.strip().splitlines()[-1]
+            with open(os.path.join(bench, "corpus_mem.py"), "w") as handle:
+                handle.write("mutated after staging\n")
+            with open(os.path.join(bundle, "corpus_mem.py")) as handle:
+                self.assertEqual(handle.read(), "original corpus_mem.py\n")
+            verified = subprocess.run(
+                ["sha256sum", "--check", "--status", "MANIFEST.sha256"],
+                cwd=bundle, capture_output=True, text=True, timeout=60)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_only_the_staged_bundle_drives_measured_phases(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        self.assertIn('bash "$bundle_dir/corpus_extra.sh"', source)
+        self.assertIn('verify_runtime_bundle || cleanup_rc=1', source)
+        for path in ("$BENCH/hostcdp.sh", "$BENCH/corpus_mem.py",
+                     "$BENCH/corpus_serve.py", "$BENCH/fcvm"):
+            self.assertIn(path, source)
+
+
 if __name__ == "__main__":
     unittest.main()
