@@ -330,39 +330,54 @@ fn is_aws_vpc_internal_zone(domain: &str) -> bool {
             .is_some_and(is_aws_region_label)
 }
 
-/// An AWS region name: a two-letter area code, one or more words of at least
-/// three lowercase letters, and a decimal number. Every region in every
-/// partition has that form, `us-west-2` and `eu-central-1` through
-/// `ap-southeast-4`, `il-central-1`, `us-gov-west-1`, `cn-northwest-1` and
-/// `us-isob-east-1`.
+/// An AWS region name: two or more lowercase words of at least two letters,
+/// then a decimal number. `us-west-2` and `eu-central-1` through
+/// `ap-southeast-4`, `il-central-1`, `us-gov-west-1`, `cn-northwest-1`,
+/// `us-isob-east-1` and `eusc-de-east-1`.
 ///
-/// A pattern rather than a list of the regions that exist today, and the trade
-/// runs both ways. A list admits no non-region at all, which is the stronger
-/// guarantee, but it goes stale the day AWS opens a region: an instance there
-/// carries a real zone the list rejects, loses short-name completion, and
-/// nothing reports that the list is what did it. A pattern admits regions that
-/// do not exist yet, and with them a custom domain-name shaped like one
-/// (`my-test-1.compute.internal`).
+/// The shape is loose about word LENGTHS and POSITIONS because the first
+/// version of this check was not, and that is what broke it. It required a
+/// two-letter first word followed by words of at least three letters, and
+/// claimed in this comment that every region in every partition has that form.
+/// The AWS European Sovereign Cloud region in Brandenburg has neither: `eusc`
+/// is four letters and `de` is two. An instance there carries a real
+/// `eusc-de-east-1.compute.internal` zone that the check called a custom
+/// domain-name, so the probe path dropped the host's own zone (#891).
 ///
-/// The pattern is chosen because its false accept is bounded at both ends.
-/// Beside a real zone it makes the input ambiguous and [`sole_aws_vpc_zone`]
-/// forwards neither. Alone it is a `.compute.internal` name, which the probed
-/// resolver answers NXDOMAIN with no authority instead of recursing it into
-/// the public DNS the way it recurses `db.corp.example`, so the label reaches
-/// AWS's resolver and stops there. A stale list's failure has no such bound:
-/// it is a legitimate EC2 host silently losing its own zone for as long as
-/// nobody updates the list.
+/// That is the staleness failure a pattern was chosen over a list to avoid, so
+/// the argument has to be stated more carefully than it was. A list admits no
+/// non-region at all, which is the stronger guarantee, but it rejects a real
+/// zone the day AWS opens a region and reports nothing when it does. A pattern
+/// avoids that only where it encodes properties AWS's namespace actually has.
+/// Where it encodes a guess about them it goes stale on the same schedule and
+/// just as quietly, which is what a positional model of the name turned out to
+/// be. One uniform claim about every word makes fewer guesses to be wrong
+/// about, and `every_published_aws_region_label_survives_the_probe_narrowing`
+/// checks the remaining ones against AWS's own region list rather than against
+/// the examples someone remembered.
+///
+/// The looseness is affordable because a false accept is bounded at both ends
+/// and a false reject is not. Beside a real zone a false accept makes the input
+/// ambiguous and [`sole_aws_vpc_zone`] forwards neither. Alone it is a
+/// `.compute.internal` name, which the probed resolver answers NXDOMAIN with no
+/// authority instead of recursing it into the public DNS the way it recurses
+/// `db.corp.example`, so the label reaches AWS's resolver and stops there. A
+/// false reject is a legitimate EC2 host silently losing its own zone for as
+/// long as nobody notices.
+///
+/// So `my-test-1.compute.internal` and `usa-west-1.compute.internal` are
+/// accepted, and that is the price. `foo.compute.internal`, the custom
+/// domain-name whose NXDOMAIN the measurement on [`sole_aws_vpc_zone`] records,
+/// still is not: it names no region at all.
 fn is_aws_region_label(label: &str) -> bool {
-    let words: Vec<&str> = label.split('-').collect();
-    let [area, middle @ .., number] = words.as_slice() else {
+    let parts: Vec<&str> = label.split('-').collect();
+    let [words @ .., number] = parts.as_slice() else {
         return false;
     };
-    area.len() == 2
-        && area.bytes().all(|b| b.is_ascii_lowercase())
-        && !middle.is_empty()
-        && middle
+    words.len() >= 2
+        && words
             .iter()
-            .all(|word| word.len() >= 3 && word.bytes().all(|b| b.is_ascii_lowercase()))
+            .all(|word| word.len() >= 2 && word.bytes().all(|b| b.is_ascii_lowercase()))
         && !number.is_empty()
         && number.bytes().all(|b| b.is_ascii_digit())
 }
@@ -1031,13 +1046,17 @@ mod tests {
             "ec2.internal",
             "us-west-1.compute.internal",
             "eu-west-1.compute.internal",
-            // Every partition's regions have the same form, so one pattern
-            // covers commercial, GovCloud, China and the ISO partitions.
+            // One pattern covers every partition. `eusc-de-east-1` is the AWS
+            // European Sovereign Cloud region whose shape the first version of
+            // that pattern did not have (#891);
+            // `every_published_aws_region_label_survives_the_probe_narrowing`
+            // runs AWS's whole published list through this path.
             "ap-southeast-4.compute.internal",
             "il-central-1.compute.internal",
             "us-gov-west-1.compute.internal",
             "cn-northwest-1.compute.internal",
             "us-isob-east-1.compute.internal",
+            "eusc-de-east-1.compute.internal",
             "US-West-1.Compute.Internal",
             "us-west-1.compute.internal.",
         ];
@@ -1058,12 +1077,18 @@ mod tests {
             "us-1.compute.internal",
             "us-w-1.compute.internal",
             "u-west-1.compute.internal",
-            "usa-west-1.compute.internal",
             "us-west.compute.internal",
             "us-west-.compute.internal",
             "us-west-1a.compute.internal",
             "ip-10-0-1-49.us-west-1.compute.internal",
         ];
+        // Shaped like a region and not one. `is_aws_region_label` admits these
+        // deliberately and says why: it no longer claims to know how long a
+        // region's words are, because claiming that is what rejected
+        // `eusc-de-east-1`. Asserted rather than left unstated so that
+        // tightening the pattern again is a deliberate act with a test to
+        // change, not a silent one.
+        let admitted_false_accepts = ["usa-west-1.compute.internal", "my-test-1.compute.internal"];
 
         for domain in kept {
             let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
@@ -1086,6 +1111,163 @@ mod tests {
                 search_domains_of(&narrowed).is_empty(),
                 "{domain} is not a zone the probed resolver serves, and asking \
                  it discloses the private label to the public DNS"
+            );
+        }
+
+        for domain in admitted_false_accepts {
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+                servers: vec!["10.0.0.2".to_string()],
+                search_domains: vec![domain.to_string()],
+            }]);
+            assert_eq!(
+                search_domains_of(&narrowed),
+                vec![domain],
+                "{domain} is the shape of a region, so it is forwarded. The \
+                 probed resolver NXDOMAINs it without recursing it into the \
+                 public DNS, which is the bound that makes the false accept \
+                 cheaper than rejecting a region AWS has opened"
+            );
+        }
+    }
+
+    /// Every region code AWS publishes, run through the zone test, plus the
+    /// non-regions the test exists to reject.
+    ///
+    /// The list is the union of `partitions[].regions` in botocore's
+    /// `endpoints.json` as shipped with aws-cli 2.32.28, which is AWS's own
+    /// machine-readable region list. All 46 codes, all eight partitions.
+    /// Regenerate it with:
+    ///
+    /// ```text
+    /// python3 -c 'import json,sys; d=json.load(open(sys.argv[1]));
+    ///   print(sorted({r for p in d["partitions"] for r in p["regions"]}))' \
+    ///   $(dirname $(readlink -f $(command -v aws)))/awscli/botocore/data/endpoints.json
+    /// ```
+    ///
+    /// `eusc-de-east-1` is why this test exists. The first version of
+    /// [`is_aws_region_label`] required a two-letter first word and three-letter
+    /// words after it, and asserted in its own doc comment that "every region in
+    /// every partition has that form". The AWS European Sovereign Cloud region
+    /// in Brandenburg has neither: `eusc` is four letters and `de` is two. An
+    /// instance there carries `eusc-de-east-1.compute.internal` as its
+    /// DHCP domain-name, the shape test called it a custom domain-name, and the
+    /// probe path dropped the host's own zone.
+    ///
+    /// AWS documents the internal zone with no partition in it. The Route 53
+    /// autodefined-rules page lists `{Region-name}.compute.internal, for
+    /// example, eu-west-1.compute.internal. The us-east-1 Region doesn't use
+    /// this domain name.`, and lists the PUBLIC zone one line below as
+    /// `{Region-name}.compute.{amazon-domain-name}, for example,
+    /// eu-west-1.compute.amazonaws.com or cn-north-1.compute.amazonaws.com.cn`.
+    /// The partition domain is a placeholder in the public zone and absent from
+    /// the internal one, and us-east-1 is the only carve-out either page names
+    /// (EC2's hostname-types page says the same: "Format for an instance in any
+    /// other AWS Region: {private-ipv4-address.region}.compute.internal").
+    /// So `<region>.compute.internal` holds in aws-eusc as it does in aws-cn.
+    ///
+    /// The loop asserts that each published region code is RECOGNISED as one,
+    /// which is what [`is_aws_region_label`] decides. It is not a claim that
+    /// AWS serves every one of those zones: the same Route 53 page says
+    /// us-east-1 does not use `<region>.compute.internal`, and the zone it does
+    /// use is asserted separately below.
+    ///
+    /// The negatives are half the test. Without them a predicate that returned
+    /// `true` for everything would pass, which is the shape of a check that
+    /// cannot fail.
+    #[test]
+    fn every_published_aws_region_label_survives_the_probe_narrowing() {
+        let regions = [
+            "af-south-1",
+            "ap-east-1",
+            "ap-east-2",
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-northeast-3",
+            "ap-south-1",
+            "ap-south-2",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ap-southeast-3",
+            "ap-southeast-4",
+            "ap-southeast-5",
+            "ap-southeast-6",
+            "ap-southeast-7",
+            "ca-central-1",
+            "ca-west-1",
+            "cn-north-1",
+            "cn-northwest-1",
+            "eu-central-1",
+            "eu-central-2",
+            "eu-isoe-west-1",
+            "eu-north-1",
+            "eu-south-1",
+            "eu-south-2",
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3",
+            "eusc-de-east-1",
+            "il-central-1",
+            "me-central-1",
+            "me-south-1",
+            "mx-central-1",
+            "sa-east-1",
+            "us-east-1",
+            "us-east-2",
+            "us-gov-east-1",
+            "us-gov-west-1",
+            "us-iso-east-1",
+            "us-iso-west-1",
+            "us-isob-east-1",
+            "us-isob-west-1",
+            "us-isof-east-1",
+            "us-isof-south-1",
+            "us-west-1",
+            "us-west-2",
+        ];
+
+        for region in regions {
+            let zone = format!("{region}.compute.internal");
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+                servers: vec!["10.0.0.2".to_string()],
+                search_domains: vec![zone.clone()],
+            }]);
+            assert_eq!(
+                search_domains_of(&narrowed),
+                vec![zone.as_str()],
+                "{region} is a region AWS publishes today, so the label in \
+                 {zone} has to read as a region and not as a custom \
+                 domain-name"
+            );
+        }
+
+        // us-east-1's own zone, which is the one carve-out both AWS pages name.
+        let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+            servers: vec!["10.0.0.2".to_string()],
+            search_domains: vec!["ec2.internal".to_string()],
+        }]);
+        assert_eq!(search_domains_of(&narrowed), vec!["ec2.internal"]);
+
+        for domain in [
+            "corp.example",
+            "lab.internal",
+            "internal",
+            "compute.internal",
+            "foo.compute.internal",
+            "us.compute.internal",
+            "us-1.compute.internal",
+            "us-west.compute.internal",
+            "us-west-.compute.internal",
+            "us-west-1a.compute.internal",
+            "ip-10-0-1-49.us-west-1.compute.internal",
+        ] {
+            let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
+                servers: vec!["10.0.0.2".to_string()],
+                search_domains: vec![domain.to_string()],
+            }]);
+            assert!(
+                search_domains_of(&narrowed).is_empty(),
+                "{domain} names no region, so it is not a VPC zone and asking \
+                 the probed resolver for it resolves nothing"
             );
         }
     }
