@@ -78,7 +78,11 @@ extra, the way `reqbench.py` reads `--reps`/`--warmup`
 WARMUP=28` hands both arms the same schedule instead of leaving the host with
 174 measured rows and a partial final cycle. `run.json` carries `total_reps`
 beside `reps` and `warmup`; a record without `total_reps` predates this and its
-`reps` is a total. `CPUS=` bounds the container's CPU budget
+`reps` is a total. `summary.json` names its own `p50_convention`
+(`statistics.median`, what `reqanalyze` publishes), so a reader can tell whether
+a ratio against a VM p50 is between two numbers of the same kind, and every
+jsonl row carries `loadavg1` the way `reqbench.py` stamps it, summarised over
+the measured reps as `loadavg1_measured`. `CPUS=` bounds the container's CPU budget
 (`podman run --cpus`) and is recorded as `cpus` in `run.json`, null when unset,
 which means the whole machine: a host baseline on every core compared against a
 2-vCPU VM arm is two variables, not one.

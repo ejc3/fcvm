@@ -28,6 +28,7 @@ Run: python3 -m unittest test_hostcdp_corpus -v
 
 import json
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -64,10 +65,14 @@ case "${{1:-}}" in
 esac
 exec {sys.executable} "$@"
 ''')
+        loadavg = os.path.join(d, "loadavg")
+        with open(loadavg, "w") as handle:
+            handle.write("1.23 0.50 0.40 1/100 999\n")
         env = dict(os.environ)
         env.update({
             "PATH": binx + os.pathsep + env["PATH"],
             "ALLOW_BUSY": "1",
+            "LOADAVG_FILE": loadavg,
             "RESULTS": os.path.join(d, "results"),
             "URL": url_spec,
             "REPS": str(reps),
@@ -147,6 +152,42 @@ exec {sys.executable} "$@"
         self.assertIn("two full cycles", proc.stderr)
         self.assertEqual(urls, [])
         self.assertIsNone(meta)
+
+
+class HostCdpSummaryProvenance(unittest.TestCase):
+    """summary.json has to say how its p50 was computed and what load it ran under.
+
+    A host p50 is only divisible into a VM p50 if both are statistics.median,
+    and a reader of summary.json alone cannot check that unless the record says
+    so; the previous corpus run needed a post-hoc resummarize to add it.
+    Contention is the other half: reqbench.py stamps loadavg1 on every record
+    and reqanalyze reports min/median/max "during run", while this control
+    recorded only the load at start, which cannot show contention that arrived
+    mid-run.
+    """
+
+    def _summary_and_rows(self, reps, warmup):
+        proc, _, _, d = HostCdpCorpusSchedule._run(self, URLS[0], reps, warmup)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        with open(os.path.join(d, "results", "summary.json")) as handle:
+            summary = json.load(handle)
+        with open(os.path.join(d, "results", "hostcdp.jsonl")) as handle:
+            rows = [json.loads(line) for line in handle]
+        return summary, rows
+
+    def test_summary_names_its_p50_convention(self):
+        """Red: KeyError 'p50_convention' -- only the code knew."""
+        summary, rows = self._summary_and_rows(4, 1)
+        self.assertEqual(summary["p50_convention"], "statistics.median")
+        measured = [r["wall_ms"] for r in rows if not r["warmup"]]
+        self.assertEqual(summary["p50_ms"], round(statistics.median(measured), 1))
+
+    def test_every_rep_records_load_and_the_summary_reports_it(self):
+        """Red: KeyError 'loadavg1' -- only the start-of-run reading existed."""
+        summary, rows = self._summary_and_rows(4, 1)
+        self.assertEqual([r["loadavg1"] for r in rows], [1.23] * 5)
+        self.assertEqual(summary["loadavg1_measured"],
+                         {"n": 4, "min": 1.23, "median": 1.23, "max": 1.23})
 
 
 class HostCdpCpuBudget(unittest.TestCase):

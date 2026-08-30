@@ -141,8 +141,15 @@ for rep in $(seq 0 $((TOTAL_REPS - 1))); do
     t_end=$(date +%s.%N)
     wall_ms=$(python3 -c "print(f'{(${t_end}-${t_start})*1000:.1f}')")
     warm=$([ "$rep" -lt "$WARMUP" ] && echo true || echo false)
-    printf '{"rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "url": %s, "driver": %s}\n' \
-        "$rep" "$ok" "$warm" "$wall_ms" \
+    # Per-rep 1-minute load, the same field reqbench.py puts on every record
+    # (rec["loadavg1"]) and reqanalyze reports as min/median/max "during run".
+    # The start-of-run reading in run.json cannot show contention that arrived
+    # mid-run, which is the contention that would move these numbers. A
+    # non-numeric read becomes null rather than killing a run mid-loop.
+    la_rep=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>/dev/null || true)
+    [[ "$la_rep" =~ ^[0-9]+([.][0-9]+)?$ ]] || la_rep=null
+    printf '{"rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "loadavg1": %s, "url": %s, "driver": %s}\n' \
+        "$rep" "$ok" "$warm" "$wall_ms" "$la_rep" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$rep_url")" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$out")" >> "$OUT"
     [ "$ok" = true ] || { log "rep $rep FAILED ($rep_url): $out"; exit 4; }
@@ -190,9 +197,20 @@ if any("url" in r for r in measured_rows):
         print("per-url wall p50 (ms):")
         for url, s in sorted(per_url.items(), key=lambda kv: kv[1]["p50_ms"]):
             print(f"  {s['p50_ms']:8.1f}  n={s['n']:3d}  {url}")
+# Name the convention in the record, not only in the code that produced it: a
+# ratio between this p50 and a reqanalyze median is only meaningful if both are
+# statistics.median, and a reader of summary.json alone cannot otherwise tell.
+la = [r["loadavg1"] for r in measured_rows if isinstance(r.get("loadavg1"), (int, float))]
+load = None
+if la:
+    load = {"n": len(la), "min": round(min(la), 2),
+            "median": round(statistics.median(la), 2), "max": round(max(la), 2)}
+    print(f"loadavg1 during measured reps: min={load['min']} median={load['median']} "
+          f"max={load['max']}   <-- contention check")
 json.dump({"n": n, "p50_ms": round(p50, 1), "p95_ms": round(p95, 1),
            "mean_ms": round(statistics.mean(measured), 1),
-           "failures": 0, "per_url": per_url},
+           "failures": 0, "p50_convention": "statistics.median",
+           "loadavg1_measured": load, "per_url": per_url},
           open(sys.argv[3], "w"), indent=1)
 PY
 log "results in $RESULTS"
