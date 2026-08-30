@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -570,6 +571,344 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 Cgroup(), Output())
         self.assertEqual(calls,
                          ["container", "fcvm", "fcvm", "cgroup", "output"])
+
+
+class HostCdpProducer(unittest.TestCase):
+    """The standalone host control publishes one owned, attributable run."""
+
+    CONTAINER_ID = "c" * 64
+    PEER_ID = "d" * 64
+    IMAGE_ID = "sha256:" + "a" * 64
+
+    def environment(self, tmp, mode="ok", **overrides):
+        bindir = os.path.join(tmp, "bin")
+        os.makedirs(bindir)
+        state = os.path.join(tmp, "podman-state")
+        removed = os.path.join(tmp, "removed")
+        loadavg = os.path.join(tmp, "loadavg")
+        with open(loadavg, "w") as handle:
+            handle.write("0.1 0.2 0.3 1/1 1\n")
+
+        podman = os.path.join(bindir, "podman")
+        with open(podman, "w") as handle:
+            handle.write(f'''#!/bin/bash
+set -u
+cmd="${{1:-}}"
+[ "$#" -eq 0 ] || shift
+case "$cmd" in
+  run)
+    name=
+    owner=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name) name="$2"; shift 2 ;;
+        --label)
+          case "$2" in
+            io.fcvm.bench.owner=*) owner="${{2#*=}}" ;;
+          esac
+          shift 2
+          ;;
+        *) shift ;;
+      esac
+    done
+    [ "${{PODMAN_MODE:-ok}}" != collision ] || exit 125
+    printf '%s\n' "$name" >"$PODMAN_TEST_STATE.name"
+    printf '%s\n' "$owner" >"$PODMAN_TEST_STATE.owner"
+    printf '%s\n' '{self.CONTAINER_ID}'
+    ;;
+  inspect)
+    format=
+    target=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --format) format="$2"; shift 2 ;;
+        --type) shift 2 ;;
+        *) target="$1"; shift ;;
+      esac
+    done
+    if [ "${{PODMAN_MODE:-ok}}" = collision ]; then
+      printf '%s|%s\n' '{self.PEER_ID}' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+      exit 0
+    fi
+    [ -e "$PODMAN_TEST_STATE.name" ] || exit 1
+    case "$format" in
+      *'.Image'*) printf '%s\n' '{self.IMAGE_ID}' ;;
+      *'Config.Labels'*)
+        printf '%s|%s\n' '{self.CONTAINER_ID}' "$(cat "$PODMAN_TEST_STATE.owner")"
+        ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  exec) exit 0 ;;
+  rm)
+    target="${{@: -1}}"
+    printf '%s\n' "$target" >>"$PODMAN_REMOVED"
+    exit 0
+    ;;
+  logs) exit 0 ;;
+  *) exit 64 ;;
+esac
+''')
+        os.chmod(podman, 0o755)
+
+        pgrep = os.path.join(bindir, "pgrep")
+        with open(pgrep, "w") as handle:
+            handle.write("#!/bin/sh\nexit 1\n")
+        os.chmod(pgrep, 0o755)
+
+        python = os.path.join(bindir, "python3")
+        with open(python, "w") as handle:
+            handle.write(f'''#!/bin/bash
+if [ "${{1:-}}" = "$HOSTCDP_DRIVER" ]; then
+  [ -z "${{DRIVER_STARTED_FILE:-}}" ] || : >"$DRIVER_STARTED_FILE"
+  if [ -n "${{DRIVER_WAIT_FILE:-}}" ]; then
+    while [ ! -e "$DRIVER_WAIT_FILE" ]; do /bin/sleep 0.01; done
+  fi
+  case "${{DRIVER_LOAD_ACTION:-}}" in
+    nonnumeric) printf '%s\n' 'not-a-load' >"$LOADAVG_FILE" ;;
+    missing) rm -f -- "$LOADAVG_FILE" ;;
+  esac
+  printf '%s\n' '{{"ok":true,"url":"https://example.com/","stages":{{"total_ms":1.0}},"nav":{{"load_ms":1.0}}}}'
+  exit 0
+fi
+exec {sys.executable!r} "$@"
+''')
+        os.chmod(python, 0o755)
+
+        if mode == "partial":
+            real_timeout = shutil.which("timeout")
+            timeout = os.path.join(bindir, "timeout")
+            with open(timeout, "w") as handle:
+                handle.write(f'''#!/bin/bash
+duration="$1"
+shift
+if [ "${{1:-}}" = podman ] && [ "${{2:-}}" = run ]; then
+  "$@" >/dev/null
+  exit 124
+fi
+exec {real_timeout!r} "$duration" "$@"
+''')
+            os.chmod(timeout, 0o755)
+
+        env = dict(
+            os.environ,
+            PATH=bindir + os.pathsep + os.environ["PATH"],
+            PODMAN_MODE=mode,
+            PODMAN_TEST_STATE=state,
+            PODMAN_REMOVED=removed,
+            HOSTCDP_DRIVER=os.path.join(HERE, "cdpdrive.py"),
+            LOADAVG_FILE=loadavg,
+            RESULTS=os.path.join(tmp, "results"),
+            RUNID="1" * 32,
+            REPS="1",
+            WARMUP="0",
+            ALLOW_BUSY="1",
+            SETTLE_WAIT_SECS="0",
+            URL="https://example.com/",
+            COMPARISON_LABEL="free",
+            CPU_BUDGET="unlimited",
+        )
+        env.pop("CPUS", None)
+        env.pop("CONTAINER_OWNER_TOKEN", None)
+        env.update(overrides)
+        return env, removed, state
+
+    @staticmethod
+    def run_host(env):
+        return subprocess.run(
+            ["bash", HOSTCDP], env=env, capture_output=True, text=True,
+            timeout=30,
+        )
+
+    @staticmethod
+    def removed_ids(path):
+        if not os.path.exists(path):
+            return []
+        with open(path) as handle:
+            return handle.read().splitlines()
+
+    def test_a_name_collision_never_deletes_the_peer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, _state = self.environment(tmp, mode="collision")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                self.removed_ids(removed), [],
+                "a failed podman run made the pre-existing same-name container owned",
+            )
+
+    def test_partial_create_timeout_adopts_only_its_labeled_exact_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(tmp, mode="partial")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.removed_ids(removed), [self.CONTAINER_ID])
+            with open(state + ".owner") as handle:
+                token = handle.read().strip()
+            self.assertRegex(token, r"^[0-9a-f]{32}$")
+
+    def test_mid_run_nonnumeric_load_is_raw_evidence_not_a_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, DRIVER_LOAD_ACTION="nonnumeric")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("REFUSING", proc.stderr)
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+            with open(os.path.join(env["RESULTS"], "hostcdp.jsonl")) as handle:
+                rows = [json.loads(line) for line in handle]
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]["loadavg1"])
+            self.assertEqual(rows[0]["loadavg1_raw"], "not-a-load")
+            self.assertEqual(rows[0]["loadavg1_read_status"], 0)
+            self.assertIs(rows[0]["measurement_valid"], False)
+
+    def test_mid_run_missing_load_is_raw_evidence_not_a_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, DRIVER_LOAD_ACTION="missing")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("REFUSING", proc.stderr)
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+            with open(os.path.join(env["RESULTS"], "hostcdp.jsonl")) as handle:
+                row = json.loads(handle.readline())
+            self.assertIsNone(row["loadavg1"])
+            self.assertNotEqual(row["loadavg1_read_status"], 0)
+            self.assertIsInstance(row["loadavg1_raw"], str)
+            self.assertIs(row["measurement_valid"], False)
+
+    def test_run_metadata_binds_host_source_and_comparison_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, state = self.environment(tmp)
+            proc = self.run_host(env)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(os.path.join(env["RESULTS"], "run.json")) as handle:
+                run = json.load(handle)
+            with open("/proc/sys/kernel/random/boot_id") as handle:
+                boot_id = handle.read().strip()
+            revision = subprocess.check_output(
+                ["git", "-C", os.path.dirname(os.path.dirname(HERE)),
+                 "rev-parse", "HEAD"], text=True).strip()
+            with open(HOSTCDP, "rb") as handle:
+                producer_hash = hashlib.sha256(handle.read()).hexdigest()
+            import reqbench
+            expected = {
+                "host_boot_id": boot_id,
+                "host_machine": os.uname().machine,
+                "host_kernel": os.uname().release,
+                "source_revision": revision,
+                "harness_sha256": reqbench.harness_sha256(),
+                "hostcdp_sha256": producer_hash,
+                "driver": "cdpdrive.py",
+                "network": "host (no VM, no DNAT)",
+                "comparison_label": "free",
+                "cpu_budget": "unlimited",
+                "cpus": None,
+            }
+            for name, value in expected.items():
+                self.assertEqual(run.get(name), value, name)
+            self.assertRegex(run.get("container_owner_token", ""), r"^[0-9a-f]{32}$")
+            with open(state + ".owner") as handle:
+                self.assertEqual(handle.read().strip(), run["container_owner_token"])
+
+    def test_vm_matched_cpu_budget_records_a_finite_json_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, CPU_BUDGET="vm-matched", CPUS="2.5")
+            proc = self.run_host(env)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(os.path.join(env["RESULTS"], "run.json")) as handle:
+                run = json.load(handle)
+            self.assertEqual(run["cpu_budget"], "vm-matched")
+            self.assertEqual(run["cpus"], 2.5)
+            self.assertIsInstance(run["cpus"], float)
+
+    def test_cpu_budget_and_comparison_label_are_explicit(self):
+        cases = (
+            ({"CPU_BUDGET": "unlimited", "CPUS": "2"}, "unlimited"),
+            ({"CPU_BUDGET": "vm-matched", "CPUS": ""}, "vm-matched"),
+            ({"CPU_BUDGET": "unknown"}, "CPU_BUDGET"),
+            ({"COMPARISON_LABEL": ""}, "COMPARISON_LABEL"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as tmp:
+                env, _removed, _state = self.environment(tmp, **overrides)
+                proc = self.run_host(env)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(expected, proc.stderr)
+                self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+
+    def test_producer_and_resummarizer_serialize_on_one_permanent_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            started = os.path.join(tmp, "driver-started")
+            release = os.path.join(tmp, "release-driver")
+            env, _removed, _state = self.environment(
+                tmp, DRIVER_STARTED_FILE=started, DRIVER_WAIT_FILE=release)
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            resummarizer = None
+            producer_output = ("", "")
+            resummarizer_output = ("", "")
+            opened_shared_lock = False
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(started) and time.monotonic() < deadline:
+                    if producer.poll() is not None:
+                        output = producer.communicate()
+                        self.fail("producer exited before the held rep: " + "".join(output))
+                    time.sleep(0.01)
+                self.assertTrue(os.path.exists(started), "producer never reached the held rep")
+                resummarizer = subprocess.Popen(
+                    [sys.executable, os.path.join(HERE, "resummarize.py"), env["RESULTS"]],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                lock_path = os.path.realpath(os.path.join(env["RESULTS"], ".summary.lock"))
+                deadline = time.monotonic() + 10
+                while resummarizer.poll() is None and time.monotonic() < deadline:
+                    fd_dir = f"/proc/{resummarizer.pid}/fd"
+                    try:
+                        targets = [os.path.realpath(os.path.join(fd_dir, fd))
+                                   for fd in os.listdir(fd_dir)]
+                    except FileNotFoundError:
+                        break
+                    if lock_path in targets:
+                        opened_shared_lock = True
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(
+                    opened_shared_lock,
+                    "resummarize did not open the producer's permanent summary lock",
+                )
+                self.assertIsNone(
+                    resummarizer.poll(),
+                    "resummarize passed the producer while its records were incomplete",
+                )
+            finally:
+                with open(release, "a"):
+                    pass
+                producer_output = producer.communicate(timeout=20)
+                if resummarizer is not None:
+                    resummarizer_output = resummarizer.communicate(timeout=20)
+            self.assertEqual(producer.returncode, 0, "".join(producer_output))
+            self.assertEqual(resummarizer.returncode, 0, "".join(resummarizer_output))
+            self.assertTrue(os.path.exists(os.path.join(env["RESULTS"], ".summary.lock")))
+            with open(os.path.join(env["RESULTS"], "summary.json")) as handle:
+                self.assertEqual(json.load(handle)["n"], 1)
+
+    def test_both_summary_writers_publish_by_atomic_replace(self):
+        with open(HOSTCDP) as handle:
+            producer = handle.read()
+        with open(os.path.join(HERE, "resummarize.py")) as handle:
+            resummarizer = handle.read()
+        self.assertIn('"$RESULTS/.summary.lock"', producer)
+        self.assertIn("os.replace(temporary, output_path)", producer)
+        self.assertNotIn('open(sys.argv[3], "w")', producer)
+        self.assertIn('os.path.join(d, ".summary.lock")', resummarizer)
+        self.assertNotIn(".resummarize.lock", resummarizer)
+        self.assertIn("write_json_atomic(summary_path, out)", resummarizer)
 
 
 class CorpusExtraFailClosed(unittest.TestCase):

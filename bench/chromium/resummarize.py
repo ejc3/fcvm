@@ -38,7 +38,7 @@ def pct(values, p):
 
 d = sys.argv[1]
 summary_path = os.path.join(d, "summary.json")
-lock_path = os.path.join(d, ".resummarize.lock")
+lock_path = os.path.join(d, ".summary.lock")
 try:
     lock = open(lock_path, "a+")
 except OSError as error:

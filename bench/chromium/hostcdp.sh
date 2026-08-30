@@ -24,9 +24,20 @@ RUNID="${RUNID:-$(tr -d - </proc/sys/kernel/random/uuid)}"
 RESULTS="${RESULTS:-$HERE/results/hostcdp-$RUNID}"
 CNAME="hostcdp-$RUNID"
 LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
+CONTAINER_OWNER_TOKEN="${CONTAINER_OWNER_TOKEN:-$(tr -d - </proc/sys/kernel/random/uuid)}"
+readonly CONTAINER_OWNER_TOKEN
+OWNER_LABEL_KEY="io.fcvm.bench.owner"
+readonly OWNER_LABEL_KEY
+COMPARISON_LABEL="${COMPARISON_LABEL:-}"
+CPU_BUDGET="${CPU_BUDGET:-}"
+CONTAINER_ID=
 
 [[ "$RUNID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$ ]] \
     || { echo "REFUSING: RUNID must be 1-96 filename-safe characters" >&2; exit 2; }
+[[ "$CONTAINER_OWNER_TOKEN" =~ ^[0-9a-f]{32}$ ]] \
+    || { echo "REFUSING: CONTAINER_OWNER_TOKEN must be exactly 32 lowercase hex characters" >&2; exit 2; }
+[[ "$COMPARISON_LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] \
+    || { echo "REFUSING: COMPARISON_LABEL must be 1-64 filename-safe characters" >&2; exit 2; }
 [[ "$REPS" =~ ^[0-9]+$ && "$WARMUP" =~ ^[0-9]+$ ]] \
     || { echo "REFUSING: REPS and WARMUP must be nonnegative integers" >&2; exit 2; }
 if ! [[ "$CDP_PORT" =~ ^[0-9]+$ ]] \
@@ -34,22 +45,80 @@ if ! [[ "$CDP_PORT" =~ ^[0-9]+$ ]] \
     echo "REFUSING: CDP_PORT must be in 1..65535" >&2
     exit 2
 fi
-for tool in awk cut date dirname mkdir pgrep podman python3 sed seq sha256sum \
-        sleep timeout tr uname; do
+for tool in awk cut date dirname flock git mkdir mktemp pgrep podman python3 sed \
+        seq sha256sum sleep timeout tr uname; do
     command -v "$tool" >/dev/null 2>&1 \
         || { echo "REFUSING: '$tool' missing" >&2; exit 2; }
 done
+case "$CPU_BUDGET" in
+    unlimited)
+        [ -z "${CPUS:-}" ] \
+            || { echo "REFUSING: CPU_BUDGET=unlimited requires CPUS to be unset" >&2; exit 2; }
+        ;;
+    vm-matched)
+        [[ "${CPUS:-}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
+            || { echo "REFUSING: CPU_BUDGET=vm-matched requires a positive finite CPUS number" >&2; exit 2; }
+        awk -v value="$CPUS" 'BEGIN { exit !(value > 0) }' \
+            || { echo "REFUSING: CPU_BUDGET=vm-matched requires CPUS > 0" >&2; exit 2; }
+        ;;
+    *) echo "REFUSING: CPU_BUDGET must be unlimited or vm-matched" >&2; exit 2 ;;
+esac
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+REPO=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) \
+    || { log "REFUSING: $HERE is not in a git worktree"; exit 2; }
+
+compute_harness_sha256() {
+    python3 - "$HERE" <<'PY'
+import hashlib
+import os
+import sys
+
+here = sys.argv[1]
+names = ("reqbench.py", "cdpdrive.py", "render.py", "wddrive.py", "reqbench.sh")
+h = hashlib.sha256()
+h.update(b"fcvm-chromium-request-harness-v1\0")
+for name in names:
+    encoded = name.encode()
+    h.update(len(encoded).to_bytes(4, "big"))
+    h.update(encoded)
+    with open(os.path.join(here, name), "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+print(h.hexdigest())
+PY
+}
+
+source_revision=$(git -C "$REPO" rev-parse HEAD) \
+    || { log "REFUSING: cannot read source revision"; exit 2; }
+harness_sha256=$(compute_harness_sha256) \
+    || { log "REFUSING: cannot hash request harness sources"; exit 2; }
+hostcdp_sha256=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
+    || { log "REFUSING: cannot hash hostcdp.sh"; exit 2; }
+[[ "$harness_sha256" =~ ^[0-9a-f]{64}$ && "$hostcdp_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || { log "REFUSING: source seal produced an invalid digest"; exit 2; }
+read -r host_boot_id < /proc/sys/kernel/random/boot_id \
+    || { log "REFUSING: cannot read host boot identity"; exit 2; }
+host_machine=$(uname -m) || { log "REFUSING: cannot read host machine"; exit 2; }
+host_kernel=$(uname -r) || { log "REFUSING: cannot read host kernel"; exit 2; }
+if [ -z "$host_boot_id" ] || [ -z "$host_machine" ] || [ -z "$host_kernel" ]; then
+    log "REFUSING: host identity is incomplete"
+    exit 2
+fi
+
 results_parent=$(dirname -- "$RESULTS")
 mkdir -p -- "$results_parent"
 if ! mkdir -- "$RESULTS" 2>/dev/null; then
     log "REFUSING: RESULTS must name a new directory; could not claim $RESULTS"
     exit 2
 fi
+exec {SUMMARY_LOCK_FD}>"$RESULTS/.summary.lock" \
+    || { log "REFUSING: cannot open permanent summary lock"; exit 2; }
+flock -x "$SUMMARY_LOCK_FD" \
+    || { log "REFUSING: cannot acquire permanent summary lock"; exit 2; }
 
 container_owns_cdp() {
-    timeout 30 podman exec "$CNAME" python3 -c '
+    timeout 30 podman exec "$CONTAINER_ID" python3 -c '
 import os
 import sys
 
@@ -88,6 +157,46 @@ for pid in os.listdir("/proc"):
             raise SystemExit(0)
 raise SystemExit(1)
 ' "$CDP_PORT" >/dev/null 2>&1
+}
+
+record_owned_container_id() {
+    local candidate=$1
+    [[ "$candidate" =~ ^[0-9a-f]{64}$ ]] || return 2
+    if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "$candidate" ]; then
+        log "REFUSING: container ownership changed from $CONTAINER_ID to $candidate"
+        return 2
+    fi
+    CONTAINER_ID=$candidate
+}
+
+inspect_owned_container() {
+    local reference=$1 line inspected_id inspected_token extra
+    if ! line=$(timeout 30 podman inspect --type container \
+            --format '{{.Id}}|{{index .Config.Labels "io.fcvm.bench.owner"}}' \
+            "$reference" 2>/dev/null); then
+        return 1
+    fi
+    IFS='|' read -r inspected_id inspected_token extra <<<"$line"
+    [ -z "$extra" ] || return 2
+    [ "$inspected_token" = "$CONTAINER_OWNER_TOKEN" ] || return 2
+    record_owned_container_id "$inspected_id"
+}
+
+# A timed-out `podman run` can have committed its container before the client
+# lost its reply. Adopt by the private label, then keep only the exact 64-byte
+# container ID. A same-name peer has another token and is never adopted.
+adopt_partially_created_container() {
+    local rc
+    for _ in $(seq 1 10); do
+        if inspect_owned_container "$CNAME"; then
+            return 0
+        else
+            rc=$?
+        fi
+        [ "$rc" -ne 2 ] || return 2
+        sleep 0.1
+    done
+    return 1
 }
 
 # URL may name ONE url (today's contract) or a comma-separated list. The list is
@@ -160,8 +269,22 @@ done
 cleanup() {
     original_rc=$?
     trap - EXIT
-    if ! timeout 30 podman rm -f -- "$CNAME" >/dev/null 2>&1; then
-        log "FAILED: could not remove owned container $CNAME"
+    if [ -z "$CONTAINER_ID" ]; then
+        if adopt_partially_created_container; then
+            :
+        else
+            adopt_rc=$?
+            if [ "$adopt_rc" -eq 2 ]; then
+                log "leaving same-name container $CNAME: owner label is not this invocation"
+            elif [ "$original_rc" -eq 0 ]; then
+                log "FAILED: successful run lost its owned container identity"
+                exit 1
+            fi
+        fi
+    fi
+    if [ -n "$CONTAINER_ID" ] \
+            && ! timeout 30 podman rm -f -- "$CONTAINER_ID" >/dev/null 2>&1; then
+        log "FAILED: could not remove owned container $CONTAINER_ID"
         [ "$original_rc" -ne 0 ] && exit "$original_rc"
         exit 1
     fi
@@ -183,25 +306,45 @@ fi
 resolve_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' \
     "${BENCH_RESOLVE_ALL_TO:-}")
 urls_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${URLS[@]}")
-run_id_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$RUNID")
 
 log "starting host container ($IMAGE) with CDP on $CDP_PORT"
 cpus_arg=()
-if [ -n "${CPUS:-}" ]; then
+cpus_json=null
+if [ "$CPU_BUDGET" = vm-matched ]; then
     cpus_arg=(--cpus "$CPUS")
+    cpus_json=$(python3 -c '
+import json, math, sys
+value = float(sys.argv[1])
+if not math.isfinite(value) or value <= 0:
+    raise SystemExit("REFUSING: CPUS must be positive and finite")
+print(json.dumps(int(value) if value.is_integer() else value))
+' "$CPUS") || exit 2
 fi
-cpus_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' "${CPUS:-}")
-timeout 120 podman run -d --name "$CNAME" --network host \
-    "${cpus_arg[@]}" "${resolve_env[@]}" "$IMAGE" >/dev/null
+if podman_run_output=$(timeout 120 podman run -d --name "$CNAME" \
+        --label "$OWNER_LABEL_KEY=$CONTAINER_OWNER_TOKEN" --network host \
+        "${cpus_arg[@]}" "${resolve_env[@]}" "$IMAGE"); then
+    if ! record_owned_container_id "$podman_run_output"; then
+        log "REFUSING: podman run returned no exact container ID: $podman_run_output"
+        exit 1
+    fi
+    if ! inspect_owned_container "$CONTAINER_ID"; then
+        log "REFUSING: created container $CONTAINER_ID does not carry this invocation's owner label"
+        exit 1
+    fi
+else
+    podman_run_rc=$?
+    log "FAILED: podman run exited $podman_run_rc; cleanup will adopt only owner token $CONTAINER_OWNER_TOKEN"
+    exit "$podman_run_rc"
+fi
 
 # Ready = the same two conditions the VM golden gates on: warm marker file AND
 # a live CDP round trip that finds a page target (cdp_health inside the image).
 t0=$SECONDS
-until timeout 30 podman exec "$CNAME" test -f /run/bench-ready 2>/dev/null \
+until timeout 30 podman exec "$CONTAINER_ID" test -f /run/bench-ready 2>/dev/null \
         && container_owns_cdp; do
     [ $((SECONDS - t0)) -lt 120 ] || {
         log "container never became ready with an owned CDP listener"
-        timeout 30 podman logs --tail 20 "$CNAME" >&2 || true
+        timeout 30 podman logs --tail 20 "$CONTAINER_ID" >&2 || true
         exit 1
     }
     sleep 0.5
@@ -211,15 +354,71 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP
 # Record the measured configuration beside the numbers, not in prose. Each row
 # below carries this file's exact SHA-256, so a copied jsonl cannot acquire a
 # different run's image, resolver, corpus, or count metadata by co-location.
-{
-    echo "{\"run_id\": $run_id_json, \"image\": \"$IMAGE\", \"image_id\": \"$(timeout 30 podman inspect --format '{{.Image}}' "$CNAME")\","
-    echo " \"reps\": $REPS, \"warmup\": $WARMUP, \"total_reps\": $((WARMUP + REPS)),"
-    echo " \"url\": \"$URL\", \"cdp_port\": $CDP_PORT,"
-    echo " \"urls\": $urls_json, \"url_count\": ${#URLS[@]}, \"cpus\": $cpus_json,"
-    echo " \"driver\": \"cdpdrive.py\", \"network\": \"host (no VM, no DNAT)\","
-    echo " \"resolve_all_to\": $resolve_json,"
-    echo " \"host_kernel\": \"$(uname -r)\", \"loadavg_at_start\": \"$la\"}"
-} > "$RESULTS/run.json"
+image_id=$(timeout 30 podman inspect --format '{{.Image}}' "$CONTAINER_ID") \
+    || { log "REFUSING: cannot inspect image identity for $CONTAINER_ID"; exit 1; }
+python3 - "$RESULTS/run.json" "$RUNID" "$IMAGE" "$image_id" "$REPS" "$WARMUP" \
+        "$URL" "$CDP_PORT" "$urls_json" "$cpus_json" "$resolve_json" "$la" \
+        "$host_boot_id" "$host_machine" "$host_kernel" "$source_revision" \
+        "$harness_sha256" "$hostcdp_sha256" "$COMPARISON_LABEL" "$CPU_BUDGET" \
+        "$CONTAINER_OWNER_TOKEN" "$CONTAINER_ID" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+(output_path, run_id, image, image_id, reps, warmup, url, cdp_port,
+ urls_json, cpus_json, resolve_json, loadavg, host_boot_id, host_machine,
+ host_kernel, source_revision, harness_sha256, hostcdp_sha256,
+ comparison_label, cpu_budget, owner_token, container_id) = sys.argv[1:]
+urls = json.loads(urls_json)
+record = {
+    "run_id": run_id,
+    "image": image,
+    "image_id": image_id,
+    "reps": int(reps),
+    "warmup": int(warmup),
+    "total_reps": int(reps) + int(warmup),
+    "url": url,
+    "cdp_port": int(cdp_port),
+    "urls": urls,
+    "url_count": len(urls),
+    "cpus": json.loads(cpus_json),
+    "cpu_budget": cpu_budget,
+    "driver": "cdpdrive.py",
+    "network": "host (no VM, no DNAT)",
+    "resolve_all_to": json.loads(resolve_json),
+    "host_boot_id": host_boot_id,
+    "host_machine": host_machine,
+    "host_kernel": host_kernel,
+    "source_revision": source_revision,
+    "harness_sha256": harness_sha256,
+    "hostcdp_sha256": hostcdp_sha256,
+    "comparison_label": comparison_label,
+    "container_owner_token": owner_token,
+    "container_id": container_id,
+    "loadavg_at_start": loadavg,
+}
+directory = os.path.dirname(output_path)
+fd, temporary = tempfile.mkstemp(prefix=".run.", dir=directory)
+try:
+    with os.fdopen(fd, "w") as target:
+        json.dump(record, target, sort_keys=True)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, output_path)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
 run_json_sha256=$(sha256sum "$RESULTS/run.json" | cut -d' ' -f1)
 
 OUT="$RESULTS/hostcdp.jsonl"
@@ -239,19 +438,54 @@ for rep in $(seq 0 $((TOTAL_REPS - 1))); do
     # Per-rep 1-minute load, the same field reqbench.py puts on every record
     # (rec["loadavg1"]) and reqanalyze reports as min/median/max "during run".
     # The start-of-run reading in run.json cannot show contention that arrived
-    # mid-run, which is the contention that would move these numbers. A
-    # non-numeric read becomes null rather than killing a run mid-loop.
-    la_rep=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>/dev/null || true)
-    [[ "$la_rep" =~ ^[0-9]+([.][0-9]+)?$ ]] || la_rep=null
-    printf '{"run_json_sha256": "%s", "rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "loadavg1": %s, "url": %s, "driver": %s}\n' \
+    # mid-run, which is the contention that would move these numbers. Preserve
+    # the raw read and its status even when invalid, then refuse the run without
+    # publishing a summary.
+    if la_rep_raw=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>&1); then
+        la_rep_status=0
+    else
+        la_rep_status=$?
+    fi
+    if [[ "$la_rep_raw" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        la_rep=$(python3 -c 'import json,sys; print(json.dumps(float(sys.argv[1])))' \
+            "$la_rep_raw")
+        measurement_valid=true
+    else
+        la_rep=null
+        measurement_valid=false
+    fi
+    printf '{"run_json_sha256": "%s", "rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "loadavg1": %s, "loadavg1_raw": %s, "loadavg1_read_status": %d, "measurement_valid": %s, "url": %s, "driver": %s}\n' \
         "$run_json_sha256" "$rep" "$ok" "$warm" "$wall_ms" "$la_rep" \
+        "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$la_rep_raw")" \
+        "$la_rep_status" "$measurement_valid" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$rep_url")" \
         "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$out")" >> "$OUT"
+    if [ "$measurement_valid" != true ]; then
+        log "REFUSING: rep $rep has no numeric 1-minute load from $LOADAVG_FILE (status=$la_rep_status raw=${la_rep_raw:0:200})"
+        exit 5
+    fi
     [ "$ok" = true ] || { log "rep $rep FAILED ($rep_url): $out"; exit 4; }
 done
 
+source_revision_after=$(git -C "$REPO" rev-parse HEAD) \
+    || { log "REFUSING: cannot re-read source revision"; exit 5; }
+harness_sha256_after=$(compute_harness_sha256) \
+    || { log "REFUSING: cannot re-hash request harness sources"; exit 5; }
+hostcdp_sha256_after=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
+    || { log "REFUSING: cannot re-hash hostcdp.sh"; exit 5; }
+if [ "$source_revision_after" != "$source_revision" ] \
+        || [ "$harness_sha256_after" != "$harness_sha256" ] \
+        || [ "$hostcdp_sha256_after" != "$hostcdp_sha256" ]; then
+    log "REFUSING: producer source changed during the measured run"
+    exit 5
+fi
+
 python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json" <<'PY'
-import json, statistics, sys
+import json
+import os
+import statistics
+import sys
+import tempfile
 rows = [json.loads(l) for l in open(sys.argv[1])]
 measured_rows = [r for r in rows if not r["warmup"]]
 
@@ -302,10 +536,30 @@ if la:
             "median": round(statistics.median(la), 2), "max": round(max(la), 2)}
     print(f"loadavg1 during measured reps: min={load['min']} median={load['median']} "
           f"max={load['max']}   <-- contention check")
-json.dump({"n": n, "p50_ms": round(p50, 1), "p95_ms": round(p95, 1),
+summary = {"n": n, "p50_ms": round(p50, 1), "p95_ms": round(p95, 1),
            "mean_ms": round(statistics.mean(measured), 1),
            "failures": 0, "p50_convention": "statistics.median",
-           "loadavg1_measured": load, "per_url": per_url},
-          open(sys.argv[3], "w"), indent=1)
+           "loadavg1_measured": load, "per_url": per_url}
+output_path = sys.argv[3]
+directory = os.path.dirname(output_path)
+fd, temporary = tempfile.mkstemp(prefix=".summary.", dir=directory)
+try:
+    with os.fdopen(fd, "w") as target:
+        json.dump(summary, target, indent=1)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, output_path)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
 PY
 log "results in $RESULTS"
