@@ -29,7 +29,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import socket
 import statistics
 import subprocess
@@ -424,7 +423,6 @@ class ContainerSide:
         live = []
         for i in range(n):
             name = f"{self.prefix(cell_tag)}{i}"
-            cdp = self.args.container_cdp_base + i
             sh(["podman", "rm", "-f", name])
             r = sh(["podman", "run", "-d", "--name", name,
                     "--network", CONTAINER_NET,
@@ -432,7 +430,7 @@ class ContainerSide:
                     self.args.image])
             if r.returncode != 0:
                 die(f"podman run {name} failed: {r.stderr.strip()}")
-            live.append({"i": i, "name": name, "cdp": cdp})
+            live.append({"i": i, "name": name})
         for c in live:
             deadline = time.monotonic() + 180
             while sh_bounded(["podman", "exec", c["name"], "test", "-f",
@@ -776,8 +774,6 @@ def main():
     p.add_argument("--fcvm", default=os.path.join(os.path.dirname(os.path.dirname(HERE)), "target/release/fcvm"))
     p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
     p.add_argument("--cdp-port", type=int, default=9222)
-    p.add_argument("--container-cdp-base", type=int, default=9300)
-    p.add_argument("--container-http-base", type=int, default=8100)
     p.add_argument("--container-resolve-to", default="127.0.0.1")
     p.add_argument("--uffd-mode", default="minor")
     p.add_argument("--uffd-prefetch", default="on")
