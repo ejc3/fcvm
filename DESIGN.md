@@ -765,7 +765,7 @@ signal breaks the stale mux session and triggers immediate vsock reconnection.
 │ Host Namespace                                                   │
 │  ┌──────────────┐        veth pair         ┌──────────────────┐ │
 │  │ veth_outer   │◄─────────────────────────►│ VM Namespace     │ │
-│  │ 172.30.x.1   │                          │ (fcvm-vm-xxxxx)  │ │
+│  │ 172.30.x.1   │                          │ (fcvm-vm-xxxxxx) │ │
 │  └──────────────┘                          │                  │ │
 │                                            │  veth_inner      │ │
 │  iptables DNAT (scoped to veth IP):        │  172.30.x.2      │ │

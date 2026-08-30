@@ -1674,6 +1674,8 @@ async fn cmd_snapshot_run_inner(
     }
 
     // Setup networking - use saved network config from snapshot
+    // Bridged and routed re-derive this from the namespace they reserve (see
+    // network::names); read the settled name back from network_config.
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let port_mappings = snapshot_config.metadata.port_mappings.clone();
 

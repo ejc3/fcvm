@@ -3,9 +3,9 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 use super::{
-    namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
+    names, namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager,
+    PortMapping,
 };
-use crate::state::truncate_id;
 
 /// Derive the host-side IP for a given subnet_id
 fn derive_host_ip(subnet_id: u16, is_clone: bool) -> String {
@@ -158,6 +158,11 @@ pub struct BridgedNetwork {
 }
 
 impl BridgedNetwork {
+    /// `tap_device` is the caller's derivation of the TAP name. `setup()`
+    /// replaces it with the name from the reservation it makes, because the
+    /// TAP is created inside the reserved namespace and has to be named from
+    /// the same base. Read the settled name back from the returned
+    /// `NetworkConfig` (or `tap_device()`), never from the argument.
     pub fn new(vm_id: String, tap_device: String, port_mappings: Vec<PortMapping>) -> Self {
         Self {
             vm_id,
@@ -246,14 +251,26 @@ impl NetworkManager for BridgedNetwork {
         // Namespace and veth pair are subnet-independent; they exist before
         // subnet selection so each candidate /30 can be assigned to the real
         // veth and verified against the kernel's actual routing decision.
-        let namespace_id = format!("fcvm-{}", truncate_id(&self.vm_id, 8));
-        namespace::create_namespace(&namespace_id)
+        //
+        // The names come from names::reserve, which creates the namespace and
+        // so decides which VM owns the base. Two vm_ids that share the leading
+        // hex digits used to derive the same names, and creating the namespace
+        // silently adopted the first VM's: the second then failed on `veth
+        // pair: File exists` or `TUNSETIFF: Device or resource busy`, and its
+        // cleanup deleted the namespace the first VM was still running in
+        // (#888).
+        let vm_names = names::reserve(&self.vm_id, &["veth0-", "veth1-"])
             .await
-            .context("creating network namespace")?;
+            .context("reserving per-VM network names")?;
+        let namespace_id = vm_names.namespace.clone();
         self.namespace_id = Some(namespace_id.clone());
 
-        let host_veth = format!("veth0-{}", truncate_id(&self.vm_id, 8));
-        let guest_veth = format!("veth1-{}", truncate_id(&self.vm_id, 8));
+        let host_veth = vm_names.link("veth0-");
+        let guest_veth = vm_names.link("veth1-");
+        // The TAP is created inside the reserved namespace, so its name is
+        // settled by the reservation and not by the caller's derivation, which
+        // two VMs sharing leading hex digits render identically.
+        self.tap_device = vm_names.link("tap-");
         if let Err(e) = veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id).await {
             let _ = self.cleanup().await;
             return Err(e).context("creating veth pair");

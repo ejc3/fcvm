@@ -11,7 +11,6 @@ use tracing::{debug, info, warn};
 
 use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping, Protocol};
 use crate::paths;
-use crate::state::truncate_id;
 
 /// Guest network addressing — pasta provides L2↔L4 translation via bridge
 const GUEST_IP: &str = "10.0.2.100";
@@ -760,6 +759,15 @@ impl IpBatchScript {
     }
 }
 
+/// Name of the PID file pasta signals readiness through.
+///
+/// The whole `vm_id`, not a truncation of it: this is a file name in
+/// `data_dir` with no length limit, and two VMs sharing a name would delete
+/// each other's file as stale and then read the other's readiness (#888).
+fn pasta_pid_file_name(vm_id: &str) -> String {
+    format!("pasta-{vm_id}.pid")
+}
+
 /// Rootless networking using pasta with bridge architecture
 ///
 /// This mode uses user namespaces and pasta (from passt project) for true
@@ -1355,7 +1363,7 @@ impl PastaNetwork {
     /// pasta creates its own TAP device (pasta0) in the namespace and provides
     /// L2↔L4 translation to the host. Uses PID file for readiness signaling.
     pub async fn start_pasta(&mut self, namespace_pid: u32) -> Result<()> {
-        let pid_file = paths::data_dir().join(format!("pasta-{}.pid", truncate_id(&self.vm_id, 8)));
+        let pid_file = paths::data_dir().join(pasta_pid_file_name(&self.vm_id));
 
         // Register the inotify watch BEFORE the stale-file cleanup and spawn:
         // pasta's PID-file write after this point always produces an event, so
