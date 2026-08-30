@@ -989,6 +989,8 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
     """
 
     def test_a_surviving_child_blocks_the_reap_and_raises(self):
+        from unittest import mock
+
         with tempfile.TemporaryDirectory() as d:
             state_dir = os.path.join(d, "state")
             disks = os.path.join(d, "vm-disks", "vm-22222222222222222222222222222222")
@@ -997,6 +999,13 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
             marker = os.path.join(disks, "rootfs.raw")
             with open(marker, "w") as f:
                 f.write("golden reflink")
+            # Publishing state through an external `cat` adds a transient direct
+            # child. Hold that child across the initial capture, then let it exit
+            # before the timeout capture so the fixture regression is deterministic.
+            slow_cat = os.path.join(d, "cat")
+            with open(slow_cat, "w") as f:
+                f.write("#!/bin/bash\n/bin/cat \"$@\"\nsleep 0.2\n")
+            os.chmod(slow_cat, 0o755)
             stub = os.path.join(d, "fcvm-stub")
             with open(stub, "w") as f:
                 f.write(
@@ -1004,9 +1013,10 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
                     "sleep 300 &\n"     # UNARMED child: survives parent SIGKILL
                     "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
                     "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
-                    f"cat > {state_dir}/vm-22222222222222222222222222222222.json <<EOF\n"
-                    '{"vm_id": "vm-22222222222222222222222222222222", "name": "rb-test-run-0-exec", "pid": $$, "pid_start_time": $start, "lifecycle_ready": true}\n'
-                    "EOF\n"
+                    "printf '{\"vm_id\": \"vm-22222222222222222222222222222222\", "
+                    "\"name\": \"rb-test-run-0-exec\", \"pid\": %s, "
+                    "\"pid_start_time\": %s, \"lifecycle_ready\": true}\\n' "
+                    f'"$$" "$start" > {state_dir}/vm-22222222222222222222222222222222.json\n'
                     f": > {state_dir}/vm-22222222222222222222222222222222.json.lock\n"
                     "wait\n"
                 )
@@ -1017,12 +1027,16 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
                 timeout=0.6, teardown_timeout=0.4,
                 state_dir=state_dir, data_root=d, run_id="test-run",
             )
-            try:
-                returned = reqbench.run_exec_request(args, 0)
-            except reqbench.SurvivedTeardown as error:
-                cm = error
-            else:
-                self.fail(f"live-child exec teardown returned instead of aborting: {returned}")
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": d + os.pathsep + os.environ["PATH"]},
+            ):
+                try:
+                    returned = reqbench.run_exec_request(args, 0)
+                except reqbench.SurvivedTeardown as error:
+                    cm = error
+                else:
+                    self.fail(f"live-child exec teardown returned instead of aborting: {returned}")
             rec = cm.record
             try:
                 self.assertTrue(rec.get("survivors"), f"no survivor list in {rec}")

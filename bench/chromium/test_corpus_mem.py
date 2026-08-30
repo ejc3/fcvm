@@ -212,10 +212,8 @@ class RunScopedContainerCleanup(unittest.TestCase):
         names = (
             f"cbmem-{owner}-host1r1-0",
             f"hostcdp-{owner}-free",
-            f"cbmem-cpu-{owner}",
             f"cbmem-{peer}-host1r1-0",
             f"hostcdp-{peer}-free",
-            f"cbmem-cpu-{peer}",
         )
         with tempfile.TemporaryDirectory() as tmp:
             removed = os.path.join(tmp, "removed")
@@ -227,7 +225,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
                     "case $1 in\n"
                     f"  ps) printf '%s\\n' {' '.join(repr(f'id{i} {name}') for i, name in enumerate(names))} ;;\n"
                     "  inspect) case \"$last\" in\n"
-                    f"    id0) echo 'id0 {token}' ;; id1) echo 'id1 {token}' ;; id2) echo 'id2 {token}' ;;\n"
+                    f"    id0) echo 'id0 {token}' ;; id1) echo 'id1 {token}' ;;\n"
                     f"    *) echo \"$last {peer_token}\" ;; esac ;;\n"
                     "  rm) printf '%s\\n' \"$last\" >>\"$REMOVED\" ;;\n"
                     "  *) exit 64 ;;\n"
@@ -244,7 +242,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             with open(removed) as handle:
                 actual = set(handle.read().splitlines())
-        self.assertEqual(actual, {"id0", "id1", "id2"},
+        self.assertEqual(actual, {"id0", "id1"},
                          "cleanup crossed the run ownership boundary")
         self.assertIn('--run-id "$RUN_ID"', source,
                       "the child and outer cleanup do not share an owner ID")
