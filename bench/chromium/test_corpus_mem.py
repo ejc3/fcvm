@@ -1256,7 +1256,7 @@ class ArgumentValidation(unittest.TestCase):
     def args(**overrides):
         args = SimpleNamespace(
             urls=["https://example.com/"], ns=[1, 2, 4, 8], reps=2,
-            cputime_reps=42, settle=5.0, quiet_limit=1.0,
+            cputime_reps=0, settle=5.0, quiet_limit=1.0,
             quiet_wait=300.0, run_id="a" * 32,
             container_owner_token="b" * 32,
         )
@@ -1282,6 +1282,9 @@ class ArgumentValidation(unittest.TestCase):
 
     def test_valid_arguments_are_accepted(self):
         corpus_mem.validate_args(self.args())
+
+    def test_unpaired_cpu_measurement_is_refused(self):
+        self.assert_refused(cputime_reps=1)
 
     def test_invalid_container_owner_token_is_refused(self):
         for value in ("", "short", "A" * 32, "a/b", "has space", "a" * 100):
@@ -2267,6 +2270,7 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         for path in ("$BENCH/hostcdp.sh", "$BENCH/corpus_mem.py",
                      "$BENCH/corpus_serve.py", "$BENCH/fcvm"):
             self.assertIn(path, source)
+        self.assertIn('CPUTIME_REPS="${CPUTIME_REPS:-0}"', source)
 
 
 if __name__ == "__main__":
