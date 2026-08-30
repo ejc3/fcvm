@@ -27,26 +27,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cdpdrive
+import report
 
 HERE = Path(__file__).resolve().parent
 RENDER = cdpdrive.load_render(str(HERE / "render.py"))
 
-URLS = {
-    "example.com_root": "https://example.com/",
-    "news.ycombinator.com_root": "https://news.ycombinator.com/",
-    "developers.cloudflare.com_root": "https://developers.cloudflare.com/",
-    "blog.cloudflare.com_root": "https://blog.cloudflare.com/",
-    "en.wikipedia.org_root": "https://en.wikipedia.org/",
-    "developer.mozilla.org_en-US": "https://developer.mozilla.org/en-US/",
-    "www.elmundo.es_root": "https://www.elmundo.es/",
-    "www.rtp.pt_noticias": "https://www.rtp.pt/noticias/",
-    "www.theguardian.com_international": "https://www.theguardian.com/international",
-    "todomvc.com_examples-javascript-es6-dist": "https://todomvc.com/examples/javascript-es6/dist/",
-    "todomvc.com_examples-react-dist-index.html": "https://todomvc.com/examples/react/dist/index.html",
-    "todomvc.com_examples-vue-dist": "https://todomvc.com/examples/vue/dist/",
-    "todomvc.com_examples-angular-dist-browser": "https://todomvc.com/examples/angular/dist/browser/",
-    "todomvc.com_examples-preact-dist": "https://todomvc.com/examples/preact/dist/",
-}
+# The corpus, defined once in report.py: the comparator block there claims a
+# shared workload only for a run that rendered exactly these pages, so the
+# capture and the claim read the same list.
+URLS = report.KITESURF_CORPUS
 
 
 def capture(host: str, url: str, dest: Path) -> dict:

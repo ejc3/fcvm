@@ -18,18 +18,134 @@ import os
 import re
 import statistics
 import sys
+import textwrap
 import time
 
-KITESURF_CONTEXT = """\
+# The date the six quoted Cloudflare rows were last checked against their source.
+# The prose below and test_report_kitesurf.py both read this constant, so the
+# recorded date and the asserted date cannot drift apart.
+KITESURF_VERIFIED = "2026-08-30"
+
+# The Kitesurf public corpus (kitesurf.cloudflare.app/corpus.txt): site key ->
+# source URL, the 14 pages Cloudflare's quoted rows were measured over.
+# corpus_mirror.sh mirrors them, corpus_capture.py reads this mapping rather
+# than keeping a second copy, and a run's request records name a corpus page by
+# its site key. The comparator block below claims a shared workload only for a
+# run whose records name exactly these pages, so the list and the claim cannot
+# drift apart.
+KITESURF_CORPUS = {
+    "example.com_root": "https://example.com/",
+    "news.ycombinator.com_root": "https://news.ycombinator.com/",
+    "developers.cloudflare.com_root": "https://developers.cloudflare.com/",
+    "blog.cloudflare.com_root": "https://blog.cloudflare.com/",
+    "en.wikipedia.org_root": "https://en.wikipedia.org/",
+    "developer.mozilla.org_en-US": "https://developer.mozilla.org/en-US/",
+    "www.elmundo.es_root": "https://www.elmundo.es/",
+    "www.rtp.pt_noticias": "https://www.rtp.pt/noticias/",
+    "www.theguardian.com_international": "https://www.theguardian.com/international",
+    "todomvc.com_examples-javascript-es6-dist": "https://todomvc.com/examples/javascript-es6/dist/",
+    "todomvc.com_examples-react-dist-index.html": "https://todomvc.com/examples/react/dist/index.html",
+    "todomvc.com_examples-vue-dist": "https://todomvc.com/examples/vue/dist/",
+    "todomvc.com_examples-angular-dist-browser": "https://todomvc.com/examples/angular/dist/browser/",
+    "todomvc.com_examples-preact-dist": "https://todomvc.com/examples/preact/dist/",
+}
+
+# Schedule entries that occupy a request record without rendering anything: the
+# two orchestration controls. They are not part of a run's workload.
+CONTROL_PAGES = frozenset({"noop", "noopsh"})
+
+
+def benchmarked_pages(reqs):
+    """The run's page list, read off its own request records.
+
+    A page its schedule covered belongs to the workload whether or not every
+    render of it succeeded, so this does NOT filter on render_ok: the failures
+    section counts what failed, and dropping a failed page here would take a
+    14-URL corpus run down to 13 pages and withdraw a comparability claim that
+    still holds. The block below says "page list" rather than "rendered" for
+    the same reason.
+    """
+    return sorted({r["url"] for r in reqs if r.get("url")} - CONTROL_PAGES)
+
+
+def kitesurf_context(pages):
+    """The published comparator, with the workload paragraph written for `pages`.
+
+    The six quoted rows are the same whatever this run rendered; whether the
+    workload behind them is comparable is not. bench.sh's schedule renders three
+    host-served fixtures and never the corpus, so a block that states the
+    workload is shared regardless of the records puts a false claim in every
+    standard `make bench-chromium` report. The claim is made only for a run
+    whose records name the 14 corpus pages, and a run that rendered anything
+    else says so and names what it rendered instead.
+    """
+    if set(pages) == set(KITESURF_CORPUS):
+        workload = """\
+Comparable: the workload. This run's page list is the 14-URL corpus behind the
+rows above, mirrored locally by bench/chromium/corpus_mirror.sh from
+kitesurf.cloudflare.app/corpus.txt, so both sides render the same page list
+rather than unrelated pages. Their two wall-time rows also measure the axis
+this report measures."""
+    else:
+        rendered = (
+            f"This run's page list is {', '.join(pages)}, not the 14-URL "
+            "corpus the rows above were measured over, so the two page lists "
+            "are unrelated and no number here answers a row above page for page."
+            if pages
+            else "This run's records name no page at all, so there is nothing "
+            "here to set beside the 14-URL corpus the rows above were measured "
+            "over."
+        )
+        # Wrapped rather than hand-broken: the page list comes from the records,
+        # so its length is not known when this is written.
+        workload = "\n\n".join(
+            textwrap.fill(para, width=78, break_on_hyphens=False, break_long_words=False)
+            for para in (
+                f"Not comparable: the workload. {rendered}",
+                "bench/chromium/corpus_mirror.sh mirrors that corpus from "
+                "kitesurf.cloudflare.app/corpus.txt for the runs that render it, "
+                "and this block states the shared-workload comparison only for a "
+                "run whose own records name those 14 pages. Their two wall-time "
+                "rows do measure the axis this report measures, on their pages "
+                "rather than on these.",
+            )
+        )
+
+    return f"""\
 ### Published comparator (context, not measured here)
 
-Kitesurf's published per-instance numbers for warm browser pools, quoted for
-context: **57.8 MiB** per screenshot-service instance and **271 MiB** per full
-Chromium instance; their CPU-time screenshot comparison was **380 ms vs 1173 ms**
-(~3x) with a **1.7-1.8x wall-clock advantage** for the lighter engine.
-Caveats: their numbers come from an AMD EPYC fleet and are CPU-time metrics;
-this report is wall-clock on a single ARM64 Graviton box that runs other test
-workloads concurrently. Directional comparison only."""
+Cloudflare publishes six rows comparing Kitesurf against a warm Chromium pool,
+medians of five Browser Run quick-action runs over a 14-URL corpus. Kitesurf
+spends more wall time in order to use far less CPU and memory. Chromium is the
+faster of the two on the stopwatch.
+
+| metric | Kitesurf | Chromium (warm pool) | Kitesurf, relative |
+|---|---|---|---|
+| CPU, screenshot | 380 ms | 1,173 ms | 3.1x less CPU |
+| CPU, HTML extraction | 229 ms | 877 ms | 3.8x less CPU |
+| memory, screenshot | 57.8 MiB | 271.0 MiB | 4.7x less memory |
+| memory, HTML extraction | 39.4 MiB | 273.7 MiB | 7.0x less memory |
+| wall, screenshot | 1,148 ms | 637 ms | 1.8x slower |
+| wall, HTML extraction | 820 ms | 472 ms | 1.7x slower |
+
+Their summary: "Kitesurf wins on the memory and CPU that drive your bill (by
+3-7x), while Chromium wins wall time because a warm just-in-time compiler beats
+a cold software renderer."
+
+Every figure above was verified on {KITESURF_VERIFIED} against
+https://developers.cloudflare.com/browser-run/kitesurf/, which carries the same
+table as https://blog.cloudflare.com/kitesurf/.
+
+{workload}
+
+Not comparable: everything else. Their page does not state what hardware
+produced these numbers; this report runs on a single ARM64 Graviton box that
+runs other test workloads concurrently, so absolutes do not transfer. Their CPU
+rows are CPU-time per operation, and their memory rows are per browser-engine
+instance, while this report accounts memory through cgroup and PSS bases over a
+whole process set. Their Chromium column is a warm pool, not a per-request
+isolate. Quoted context only; the numbers in this report are measured
+independently of it."""
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +787,7 @@ def cmd_finalize(args):
     w(md_table(["scenario", "page", "n", "ready p50 ms", "artifact p50/p95 ms",
                 "nav p50", "shot p50", "in-guest render p50"], rows))
 
-    w(KITESURF_CONTEXT + "\n")
+    w(kitesurf_context(benchmarked_pages(reqs)) + "\n")
 
     # ---- failures
     fails = [r for r in reqs if not r.get("ok") and r.get("phase", "").startswith(("p3", "burst", "sust"))]
