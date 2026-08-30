@@ -37,7 +37,13 @@ def load_vm(run_dir):
                 r = json.loads(line)
             except ValueError:
                 continue
-            if r.get("arm") and not r.get("warmup") and r.get("ok") is not False:
+            # `is not False` kept a record that never said it succeeded, while
+            # load_host below drops one. Both producers always write `ok`
+            # (checked: 460 VM records and 230 host records in the 2026-08-30
+            # corpus run, every one ok=true), so the two filters agreed on every
+            # record either has produced and disagreed in the code. A rep that
+            # does not say it worked is not a rep known to have worked.
+            if r.get("arm") and not r.get("warmup") and r.get("ok"):
                 recs.append(r)
     return recs
 

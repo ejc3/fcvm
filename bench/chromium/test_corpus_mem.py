@@ -382,6 +382,93 @@ class FrozenCopiesAreRecordsNotTests(unittest.TestCase):
                              f"CI would run the frozen copy {path}")
 
 
+class ComparePublicationGate(unittest.TestCase):
+    """compare.py divides a VM p50 by a host p50 and writes comparison.json.
+
+    Its one refusal is the publication gate, and its record filters decide which
+    reps reach the medians. hostcdp.sh's producer always writes `ok`, and so does
+    reqbench, so the two filters agree on every record either has produced. They
+    did not agree in the code: the host side dropped a record whose `ok` was
+    absent, the VM side kept it. Verified against
+    results/reqbench-20260830-171007-corpus/reqbench.jsonl (460 records, all
+    carrying ok=true) and hostcdp-free/hostcdp.jsonl (230, all ok=true), so
+    aligning them moves no published number.
+    """
+
+    CELL = {"cpu": 2, "memory_mib": 1024, "backend": "uffd", "uffd_mode": "minor",
+            "snapshot": "cb-req-corpus", "image_id": "sha256:x",
+            "source_revision": "abc123", "fcvm_sha256": "d", "runtime_bundle_sha256": "e",
+            "host_kernel_release": "k", "host_machine": "aarch64"}
+
+    def make_run(self, publishable=True, passed=True, vm_rows=()):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "analysis.json"), "w") as handle:
+            json.dump({"publishable": publishable, "gate": {"passed": passed},
+                       "run_id": "r1", "cell": self.CELL}, handle)
+        with open(os.path.join(tmp, "reqbench.jsonl"), "w") as handle:
+            for row in vm_rows:
+                handle.write(json.dumps(row) + "\n")
+        return tmp
+
+    @staticmethod
+    def vm_rep(blocking_ms, ok=True, include_ok=True):
+        rec = {"arm": "cdp", "warmup": False, "blocking_ms": blocking_ms,
+               "wall_ms": blocking_ms, "url": "https://example.com/",
+               "render": {"stages": {"total_ms": blocking_ms},
+                          "nav": {"load_ms": blocking_ms}}}
+        if include_ok:
+            rec["ok"] = ok
+        return rec
+
+    def run_compare(self, run_dir):
+        out = os.path.join(run_dir, "comparison.json")
+        return subprocess.run(
+            [sys.executable, os.path.join(HERE, "compare.py"),
+             "--vm-run", run_dir, "--out", out],
+            capture_output=True, text=True, timeout=60), out
+
+    def test_a_run_that_failed_its_gate_is_refused(self):
+        run = self.make_run(passed=False, vm_rows=[self.vm_rep(700.0)])
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a run that did not pass its publication gate was quoted")
+        self.assertFalse(os.path.exists(out))
+
+    def test_an_unpublishable_run_is_refused(self):
+        run = self.make_run(publishable=False, vm_rows=[self.vm_rep(700.0)])
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_passing_run_is_summarised(self):
+        """The positive control: without it the two refusals could pass for
+        any reason at all."""
+        run = self.make_run(vm_rows=[self.vm_rep(v) for v in (600.0, 700.0, 800.0)])
+        proc, out = self.run_compare(run)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            rec = json.load(handle)
+        self.assertEqual(rec["vm"]["blocking_ms"]["p50"], 700.0)
+        self.assertEqual(rec["vm"]["blocking_ms"]["n"], 3)
+
+    def test_a_record_that_does_not_say_it_succeeded_is_not_counted(self):
+        """A rep with no `ok` is not a rep known to have worked.
+
+        The host loader already dropped it. The VM loader kept it, so the same
+        record was measured or discarded depending on which side produced it.
+        """
+        rows = [self.vm_rep(v) for v in (600.0, 700.0, 800.0)]
+        rows.append(self.vm_rep(30000.0, include_ok=False))
+        run = self.make_run(vm_rows=rows)
+        proc, out = self.run_compare(run)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            rec = json.load(handle)
+        self.assertEqual(rec["vm"]["blocking_ms"]["n"], 3,
+                         "a rep that never said it succeeded reached the medians")
+        self.assertEqual(rec["vm"]["blocking_ms"]["p50"], 700.0)
+
+
 class ProvenanceNamesBytes(unittest.TestCase):
     """A provenance record that cites empty strings cites nothing.
 
