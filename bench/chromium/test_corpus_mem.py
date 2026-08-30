@@ -1249,6 +1249,9 @@ class ArgumentValidation(unittest.TestCase):
             settle=5.0, quiet_limit=1.0,
             quiet_wait=300.0, run_id="a" * 32,
             container_owner_token="b" * 32,
+            source_revision="c" * 40,
+            runtime_bundle_sha256="d" * 64,
+            corpus_extra_runtime_bundle_sha256="e" * 64,
         )
         for key, value in overrides.items():
             setattr(args, key, value)
@@ -1288,6 +1291,17 @@ class ArgumentValidation(unittest.TestCase):
         for value in ("", "short", "A" * 32, "a/b", "has space", "a" * 100):
             with self.subTest(container_owner_token=value):
                 self.assert_refused(container_owner_token=value)
+
+    def test_invalid_runtime_identity_is_refused(self):
+        fields = (
+            ("source_revision", ("", "abc", "g" * 40, "a" * 41)),
+            ("runtime_bundle_sha256", ("", "a" * 63, "g" * 64)),
+            ("corpus_extra_runtime_bundle_sha256", ("", "a" * 65, "G" * 64)),
+        )
+        for field, values in fields:
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.assert_refused(**{field: value})
 
     def test_csv_parsing_rejects_empty_members(self):
         for value in ("", ",", "one,", ",one", "one,,two"):
@@ -2150,6 +2164,12 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
                      "$BENCH/corpus_serve.py", "$BENCH/fcvm"):
             self.assertIn(path, source)
         self.assertNotIn("CPUTIME_REPS", source)
+        self.assertIn('--source-revision "$SOURCE_REVISION"', source)
+        self.assertIn('--runtime-bundle-sha256 "$REQBENCH_RUNTIME_BUNDLE_SHA256"', source)
+        self.assertIn(
+            '--corpus-extra-runtime-bundle-sha256 "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256"',
+            source,
+        )
 
 
 if __name__ == "__main__":
