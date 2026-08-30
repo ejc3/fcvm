@@ -60,6 +60,34 @@ fn write_exec(path: &Path, body: &str) {
     std::fs::set_permissions(path, perms).expect("chmod stub");
 }
 
+/// The two commands the probe reaches the guest with, stubbed.
+///
+/// `nsenter -t <pid> -U -n -- <cmd>` runs twice per `ask`: once to wait for
+/// pasta0 to carry the guest address, once to ask the resolver. Both are
+/// answered here, the second from a counter so the two arms differ, because a
+/// real answer needs the VM-less pasta wiring these tests are not measuring.
+/// `dig` only has to exist: the probe's tool check looks it up before the
+/// namespace, and the query itself goes through the `nsenter` stub.
+fn write_guest_stubs(bin: &Path, calls: &Path) {
+    write_exec(
+        &bin.join("nsenter"),
+        &format!(
+            "#!/bin/bash\n\
+             for a in \"$@\"; do\n\
+             \tcase \"$a\" in\n\
+             \t\tdig) n=$(cat {calls} 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >{calls}\n\
+             \t\t\t[ \"$n\" = 1 ] && echo 10.0.2.2 || echo 203.0.113.99\n\
+             \t\t\texit 0 ;;\n\
+             \t\tpasta0) echo '2: pasta0    inet 10.0.2.100/24 scope global pasta0' ; exit 0 ;;\n\
+             \tesac\n\
+             done\n\
+             exit 0\n",
+            calls = calls.display()
+        ),
+    );
+    write_exec(&bin.join("dig"), "#!/bin/bash\nexit 0\n");
+}
+
 /// Processes whose command line mentions `needle`, by host pid.
 fn processes_matching(needle: &str) -> Vec<String> {
     let mut found = Vec::new();
@@ -114,24 +142,7 @@ fn the_probe_refuses_to_guess_which_pasta_to_run() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).expect("create stub bin");
-    let calls = tmp.path().join("dig-calls");
-    write_exec(
-        &bin.join("nsenter"),
-        &format!(
-            "#!/bin/bash\n\
-             for a in \"$@\"; do\n\
-             \tcase \"$a\" in\n\
-             \t\tdig) n=$(cat {calls} 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >{calls}\n\
-             \t\t\t[ \"$n\" = 1 ] && echo 10.0.2.2 || echo 203.0.113.99\n\
-             \t\t\texit 0 ;;\n\
-             \t\tpasta0) echo '2: pasta0    inet 10.0.2.100/24 scope global pasta0' ; exit 0 ;;\n\
-             \tesac\n\
-             done\n\
-             exit 0\n",
-            calls = calls.display()
-        ),
-    );
-    write_exec(&bin.join("dig"), "#!/bin/bash\nexit 0\n");
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
     let work_root = tmp.path().join("work");
     std::fs::create_dir_all(&work_root).expect("create work root");
     let path = format!(
@@ -186,6 +197,87 @@ fn the_probe_refuses_to_guess_which_pasta_to_run() {
     );
 }
 
+/// A directory passes `test -x`. The `PASTA_BIN` guard must still refuse it.
+///
+/// `-x` asks whether the caller may execute the path, and for a directory that
+/// means traverse it, so every directory this test can enter satisfies it. A
+/// `PASTA_BIN` naming one therefore walked past the documented exit-2 path and
+/// the run carried on: private namespace, veth pair, both DNS responders, and
+/// only then an invocation of a path that can never be a program. The caller
+/// got back a verdict about DNS with no mention of what they had supplied.
+///
+/// The guard sits ahead of all of that, so a refusal needs none of the stubs
+/// below; they are here to keep the pre-fix run bounded.
+///
+/// RED BEFORE THE FIX:
+///
+/// ```text
+/// assertion `left == right` failed: a directory passed the guard and the probe
+/// ran the whole thing: exit status: 0
+/// stdout:
+/// OK   with -D none:    10.0.2.2 (the replay on host 127.0.0.1:53 answered)
+/// OK   without it:      203.0.113.99 (pasta redirected port 53 to the host's own resolver)
+///   left: Some(0)
+///  right: Some(2)
+/// ```
+///
+/// Two OK lines about a pasta that was never executed.
+#[test]
+fn the_probe_refuses_a_pasta_bin_that_is_not_a_regular_file() {
+    require_tools();
+    let script = repo_root().join("scripts/probe-pasta-dns-gateway.sh");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("create stub bin");
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    let work_root = tmp.path().join("work");
+    std::fs::create_dir_all(&work_root).expect("create work root");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // What the caller hands over: a directory where a binary was meant to be,
+    // which is what a truncated path or an assets directory produces.
+    let dir = tmp.path().join("pasta-is-a-directory");
+    std::fs::create_dir_all(&dir).expect("create the directory to hand the guard");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .env("PATH", &path)
+        .env("TMPDIR", &work_root)
+        .env("PASTA_BIN", &dir)
+        .output()
+        .expect("run the probe");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // A probe that stopped on a missing tool exits 2 for a reason that says
+    // nothing about the guard, so the assertion below would pass vacuously.
+    assert!(
+        !stderr.contains("this probe cannot evaluate anything"),
+        "BLOCKED: the probe stopped on a missing tool, so this says nothing \
+         about the guard:\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a directory passed the guard and the probe ran the whole thing: {}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        !stdout.contains("OK ") && !stdout.contains("FAIL "),
+        "the probe rendered a verdict about a path that is not a \
+         program:\nstdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains(&dir.to_string_lossy().to_string()),
+        "a refusal must name the path it was given:\nstderr:\n{stderr}"
+    );
+}
+
 /// The probe runs to its normal end and leaves nothing behind.
 ///
 /// The pasta binary, the namespace entry and the query are stubbed: what is
@@ -215,31 +307,7 @@ fn the_probe_leaves_no_dns_responder_behind() {
     // A pasta that stays up until the probe kills it, so the probe follows its
     // ordinary path through both `ask` calls.
     write_exec(&bin.join("pasta"), "#!/bin/bash\nexec sleep 60\n");
-    // The probe reaches the guest through `nsenter -t <pid> -U -n -- <cmd>`,
-    // twice: once to wait for pasta0 to carry the guest address, once to ask
-    // the resolver. Both are answered here, the second from a counter so the
-    // two arms differ, because a real answer needs the VM-less pasta wiring
-    // this test is not measuring.
-    let calls = tmp.path().join("dig-calls");
-    write_exec(
-        &bin.join("nsenter"),
-        &format!(
-            "#!/bin/bash\n\
-             for a in \"$@\"; do\n\
-             \tcase \"$a\" in\n\
-             \t\tdig) n=$(cat {calls} 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >{calls}\n\
-             \t\t\t[ \"$n\" = 1 ] && echo 10.0.2.2 || echo 203.0.113.99\n\
-             \t\t\texit 0 ;;\n\
-             \t\tpasta0) echo '2: pasta0    inet 10.0.2.100/24 scope global pasta0' ; exit 0 ;;\n\
-             \tesac\n\
-             done\n\
-             exit 0\n",
-            calls = calls.display()
-        ),
-    );
-    // dig only has to exist: the probe's tool check looks it up before the
-    // namespace, and the query itself goes through the stub above.
-    write_exec(&bin.join("dig"), "#!/bin/bash\nexit 0\n");
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
 
     // The probe's work directory comes from `mktemp -d`, so pointing TMPDIR
     // here makes every responder's command line carry this path and nothing

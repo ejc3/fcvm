@@ -48,7 +48,10 @@ if [ "${1:-}" != "--inside" ]; then
     # than the runtime under review, which is worse than no verdict.
     [ -n "${PASTA_BIN:-}" ] \
         || { echo "BLOCKED: set PASTA_BIN to the pasta fcvm resolves for your config: <paths.assets_dir>/pasta/pasta-<sha>.bin, whose path 'fcvm setup' logs" >&2; exit 2; }
-    [ -x "$PASTA_BIN" ] \
+    # -f as well as -x: for a directory -x means "may traverse", so every
+    # directory the caller can enter passes -x alone, walks past this exit and
+    # fails at the invocation below, by which point the message is about DNS.
+    [ -f "$PASTA_BIN" ] && [ -x "$PASTA_BIN" ] \
         || { echo "BLOCKED: PASTA_BIN=$PASTA_BIN is not an executable file" >&2; exit 2; }
     # --pid --mount-proc makes the --inside shell init of a PID namespace, and
     # --kill-child ties that shell's life to this one. The two DNS responders
