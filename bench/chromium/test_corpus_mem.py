@@ -361,7 +361,36 @@ class CorpusExtraFailClosed(unittest.TestCase):
     def test_unknown_or_empty_phases_are_validated(self):
         source = self.source()
         self.assertIn("validate_phases", source)
-        self.assertLess(source.find("validate_phases"), source.find("mkdir -p \"$RESULTS\""))
+        self.assertLess(source.find("validate_phases"), source.find("claim_output_dirs"))
+
+    def test_output_directories_are_claimed_exclusively(self):
+        source = self.source()
+        helper = re.search(r'^claim_output_dir\(\) \{\n.*?^\}', source,
+                           re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(helper, "output ownership helper is gone")
+        self.assertLess(source.find("claim_output_dirs"),
+                        source.find("provenance.json"),
+                        "a reused directory can be modified before it is refused")
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = os.path.join(tmp, "existing")
+            os.mkdir(existing)
+            marker = os.path.join(existing, "prior-result")
+            with open(marker, "w") as handle:
+                handle.write("prior\n")
+            script = ("set -euo pipefail\n" + helper.group(0) + "\n"
+                      + f"claim_output_dir {existing!r} results\n")
+            proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                                  text=True, timeout=10)
+            self.assertNotEqual(proc.returncode, 0)
+            with open(marker) as handle:
+                self.assertEqual(handle.read(), "prior\n")
+
+    def test_all_critical_external_dependencies_are_preflighted(self):
+        source = self.source()
+        tools = re.search(r'^for tool in (.*?); do$', source,
+                          re.MULTILINE | re.DOTALL).group(1).replace("\\", "").split()
+        for required in ("git", "sha256sum", "systemctl"):
+            self.assertIn(required, tools)
 
     def test_outer_stray_preflight_distinguishes_no_match_from_error(self):
         source = self.source()
@@ -369,7 +398,7 @@ class CorpusExtraFailClosed(unittest.TestCase):
         self.assertRegex(source, r'case "\$rc" in\s*0\)')
         self.assertRegex(source, r'\s1\)')
         self.assertIn("pgrep", re.search(r'^for tool in .*?; do$', source,
-                                         re.MULTILINE).group(0))
+                                         re.MULTILINE | re.DOTALL).group(0))
 
     def test_replay_readiness_is_bound_to_this_server(self):
         source = self.source()
@@ -562,6 +591,22 @@ class CgroupLifecycle(unittest.TestCase):
              mock.patch("os.path.isdir", return_value=True):
             with self.assertRaises(RuntimeError):
                 cg.rm("leaf")
+
+
+class RunOutputOwnership(unittest.TestCase):
+    """A reused result path must not mix records from different runs."""
+
+    def test_results_directory_can_only_be_claimed_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "memory-run")
+            corpus_mem.claim_results_dir(results)
+            marker = os.path.join(results, "prior-result")
+            with open(marker, "w") as handle:
+                handle.write("prior\n")
+            with self.assertRaises(SystemExit):
+                corpus_mem.claim_results_dir(results)
+            with open(marker) as handle:
+                self.assertEqual(handle.read(), "prior\n")
 
 
 class SnapshotIdentity(unittest.TestCase):
