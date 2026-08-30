@@ -556,6 +556,21 @@ def cell_values(cell):
     return out
 
 
+def median_ms(values):
+    """The p50 of a list of milliseconds, as statistics.median.
+
+    hostcdp.sh and resummarize.py both write "p50_convention":
+    "statistics.median" into their records, because a ratio between a host p50
+    and a VM p50 means something only when both are computed the same way and a
+    reader of the record alone cannot otherwise tell. This arm used
+    sorted(v)[len(v) // 2], which on an even-length list is the upper of the two
+    middle values rather than their mean. On its own 42-record run that is
+    1643.5 against a median of 1486.0: 10.6% high, under a key named p50, set
+    beside a host mean.
+    """
+    return round(statistics.median(values), 1)
+
+
 def run_cputime(args, cg, fcvm_side, out_path):
     """CPU-seconds to produce one screenshot, on both sides, same corpus.
 
@@ -625,7 +640,7 @@ def run_cputime(args, cg, fcvm_side, out_path):
             serve_per_req = round((serve_cpu_after - serve_cpu_before) / 1000.0
                                   / args.cputime_reps, 1)
         vals = sorted(r["cpu_ms"] for r in per)
-        res["fcvm"] = {"n": len(vals), "per_request_cpu_ms_p50": round(vals[len(vals) // 2], 1),
+        res["fcvm"] = {"n": len(vals), "per_request_cpu_ms_p50": median_ms(vals),
                        "serve_cpu_ms_per_request": serve_per_req,
                        "per_request_cpu_ms_mean": round(statistics.mean(vals), 1),
                        "min": round(vals[0], 1), "max": round(vals[-1], 1),

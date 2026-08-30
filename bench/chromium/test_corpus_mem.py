@@ -301,6 +301,41 @@ class Resummarize(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
 
 
+class MedianConvention(unittest.TestCase):
+    """A field named p50 has to hold statistics.median.
+
+    hostcdp.sh and resummarize.py both write "p50_convention":
+    "statistics.median" into their records, because a ratio between a host p50
+    and a VM p50 is only meaningful when both are computed the same way, and a
+    reader of the record alone cannot otherwise tell. The fcvm CPU arm computed
+    sorted(v)[len(v) // 2] instead, which on an even-length list is the upper of
+    the two middle values.
+
+    Measured on this harness's own 42-record cputime run
+    (results/corpusextra-memory-20260830-181830/memory/cputime.json): the field
+    says 1643.5, the median of those records is 1486.0. 10.6% high, published
+    under a key named p50 and set beside a host mean.
+    """
+
+    def test_an_even_length_list_gets_the_median_not_the_upper_middle(self):
+        self.assertEqual(corpus_mem.median_ms([1.0, 2.0, 3.0, 4.0]), 2.5)
+
+    def test_the_recorded_cputime_run_medians_to_1486(self):
+        """The exact case that was published wrong."""
+        rec = os.path.join(
+            os.path.dirname(os.path.dirname(HERE)), "bench", "chromium", "results",
+            "corpusextra-memory-20260830-181830", "memory", "cputime.json")
+        if not os.path.exists(rec):
+            self.skipTest("the recorded cputime run is not in this tree")
+        with open(rec) as handle:
+            vals = [r["cpu_ms"] for r in json.load(handle)["fcvm"]["records"]]
+        self.assertEqual(len(vals), 42)
+        self.assertEqual(corpus_mem.median_ms(vals), 1486.0)
+
+    def test_an_odd_length_list_is_unchanged(self):
+        self.assertEqual(corpus_mem.median_ms([5.0, 1.0, 3.0]), 3.0)
+
+
 class ProvenanceNamesBytes(unittest.TestCase):
     """A provenance record that cites empty strings cites nothing.
 
