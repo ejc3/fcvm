@@ -78,8 +78,8 @@ class CgroupProcs(unittest.TestCase):
             write_cgroup(os.path.join(parent, "child"))
             self.assertEqual(sorted(report.cgroup_procs(parent)), [4001, 4002])
 
-    def test_one_unreadable_node_does_not_lose_its_siblings(self):
-        """Refusing to read one node must not silently zero the whole subtree."""
+    def test_one_unreadable_node_refuses_the_whole_process_set(self):
+        """A subtotal is not the process set charged by memory.current."""
         with tempfile.TemporaryDirectory() as tmp:
             parent = write_cgroup(os.path.join(tmp, "parent"))
             write_cgroup(os.path.join(parent, "good"), [4011])
@@ -87,15 +87,11 @@ class CgroupProcs(unittest.TestCase):
             os.makedirs(bad)
             with open(os.path.join(bad, "cgroup.procs"), "w") as handle:
                 handle.write("not-a-pid\n")
-            self.assertEqual(sorted(report.cgroup_procs(parent)), [4011])
+            with self.assertRaises(report.CgroupReadError):
+                report.cgroup_procs(parent)
 
-    def test_a_partly_unparseable_node_contributes_nothing_rather_than_a_prefix(self):
-        """All-or-nothing per node.
-
-        A total summed over a partial process set is indistinguishable from a
-        complete one, so a node that cannot be read whole contributes nothing
-        and its siblings still do.
-        """
+    def test_a_partly_unparseable_node_refuses_the_whole_process_set(self):
+        """Dropping one node still produces an incomplete subtree total."""
         with tempfile.TemporaryDirectory() as tmp:
             parent = write_cgroup(os.path.join(tmp, "parent"))
             write_cgroup(os.path.join(parent, "good"), [4011])
@@ -103,12 +99,78 @@ class CgroupProcs(unittest.TestCase):
             os.makedirs(torn)
             with open(os.path.join(torn, "cgroup.procs"), "w") as handle:
                 handle.write("4031\nnot-a-pid\n")
-            self.assertEqual(sorted(report.cgroup_procs(parent)), [4011])
+            with self.assertRaises(report.CgroupReadError):
+                report.cgroup_procs(parent)
 
     def test_a_path_that_is_not_a_cgroup_reports_no_processes(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(report.cgroup_procs(os.path.join(tmp, "absent")), [])
             self.assertEqual(report.cgroup_procs(write_cgroup(os.path.join(tmp, "empty"))), [])
+
+
+class CgroupBytes(unittest.TestCase):
+    """A missing memory.current is no memory measurement."""
+
+    def test_unreadable_memory_current_refuses_the_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(report.CgroupReadError):
+                report.cgroup_bytes(tmp)
+
+
+class StableProcessSet(unittest.TestCase):
+    """The PSS process set must not change while memory.current is sampled."""
+
+    def test_a_disappeared_cgroup_cannot_be_measured_as_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(report.CgroupReadError):
+                report.measure_complete_cgroup(os.path.join(tmp, "gone"))
+
+    def test_an_empty_owned_cgroup_cannot_be_measured_as_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = write_cgroup(os.path.join(tmp, "owned"))
+            with self.assertRaises(report.CgroupReadError):
+                report.measure_complete_cgroup(empty)
+
+    def test_process_arrival_refuses_the_sample(self):
+        with mock.patch.object(report, "cgroup_procs", side_effect=([4001], [4001, 4002])), \
+             mock.patch.object(report, "cgroup_bytes", return_value=4096), \
+             mock.patch.object(report, "pss_kb_of_pid", return_value=64), \
+             mock.patch.object(report, "cgroup_stat", return_value={
+                 "anon": 1, "file": 2, "kernel": 3, "sock": 4,
+             }):
+            with self.assertRaises(report.CgroupReadError):
+                report.measure_complete_cgroup("/owned")
+
+    def test_duplicate_pid_from_a_move_refuses_the_sample(self):
+        with mock.patch("os.path.isdir", return_value=True), \
+             mock.patch("os.walk", return_value=[
+                 ("/owned", [], ["cgroup.procs"]),
+                 ("/owned/child", [], ["cgroup.procs"]),
+             ]), \
+             mock.patch("builtins.open", mock.mock_open(read_data="4001\n")):
+            with self.assertRaises(report.CgroupReadError):
+                report.cgroup_procs("/owned")
+
+
+class ProcessPss(unittest.TestCase):
+    """One unreadable process cannot become a plausible nonzero subtotal."""
+
+    def test_unreadable_smaps_refuses_the_process_set(self):
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            with self.assertRaises(report.CgroupReadError):
+                report.pss_kb_of_pid(4001)
+
+    def test_malformed_smaps_refuses_the_process_set(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data="Pss: nope kB\n")):
+            with self.assertRaises(report.CgroupReadError):
+                report.pss_kb_of_pid(4001)
+
+    def test_malformed_memory_current_refuses_the_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "memory.current"), "w") as handle:
+                handle.write("not-bytes\n")
+            with self.assertRaises(report.CgroupReadError):
+                report.cgroup_bytes(tmp)
 
 
 class PodmanCgroupIdentity(unittest.TestCase):

@@ -63,24 +63,38 @@ class MemoryCellSchedule(unittest.TestCase):
 
     def test_memory_cells_are_interleaved_by_recorded_seed(self):
         sides = ["fcvm", "container"]
-        schedule = corpus_mem.build_cell_schedule(sides, [1, 2, 4], 2, seed=9182)
+        schedule = corpus_mem.build_cell_schedule(
+            sides, [1, 2, 4, 8], 2, seed=9182, url_count=14)
         self.assertEqual(schedule,
-                         corpus_mem.build_cell_schedule(sides, [1, 2, 4], 2, seed=9182))
+                         corpus_mem.build_cell_schedule(
+                             sides, [1, 2, 4, 8], 2, seed=9182, url_count=14))
         expected = sorted((side, n, rep)
-                          for n in (1, 2, 4)
+                          for n in (1, 2, 4, 8)
                           for rep in (1, 2)
                           for side in sides)
-        self.assertEqual(sorted(schedule), expected)
+        self.assertEqual(sorted((side, n, rep) for side, n, rep, _urls in schedule),
+                         expected)
+        covered = set()
         for offset in range(0, len(schedule), len(sides)):
             pair = schedule[offset:offset + len(sides)]
-            self.assertEqual({side for side, _n, _rep in pair}, set(sides))
-            self.assertEqual(len({(n, rep) for _side, n, rep in pair}), 1,
+            self.assertEqual({side for side, _n, _rep, _urls in pair}, set(sides))
+            self.assertEqual(len({(n, rep) for _side, n, rep, _urls in pair}), 1,
                              f"matched sides were separated in {pair}")
+            self.assertEqual(pair[0][3], pair[1][3],
+                             f"matched sides rendered different pages in {pair}")
+            covered.update(pair[0][3])
+        self.assertEqual(covered, set(range(14)),
+                         "the default N/repetition grid omits corpus members")
 
         with open(os.path.join(HERE, "corpus_mem.py")) as handle:
             source = handle.read()
         self.assertIn('"schedule_seed"', source,
                       "the seed needed to reproduce the cell order is not recorded")
+        main = source[source.index("def main():"):]
+        self.assertIn("schedule = build_cell_schedule(", main,
+                      "main can bypass the interleaved schedule the test exercises")
+        self.assertIn("for side_name, n, rep, url_indices in schedule:", main)
+        self.assertRegex(main, r"run_cell\(\s*sides\[side_name\], args, n, rep, url_indices, out\)")
 
 
 class RunScopedContainerCleanup(unittest.TestCase):
@@ -98,7 +112,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
         side = corpus_mem.ContainerSide(SimpleNamespace(), "a" * 32)
         owned = {"name": side.prefix("host1r1") + "0"}
 
-        def shell(cmd, **_kwargs):
+        def shell(cmd, *_args, **_kwargs):
             if cmd[:3] == ["podman", "ps", "-a"]:
                 return Completed(0, "cbmem-peer-run-host1r1-0\n", "")
             return Completed()
@@ -119,14 +133,62 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 side.tear_down([owned])
         self.assertNotIn(caught.exception.code, (0, None))
 
-    def test_outer_cleanup_does_not_enumerate_every_benchmark_container(self):
+    def test_outer_cleanup_reaps_only_its_run_after_a_signal(self):
         with open(EXTRA) as handle:
             source = handle.read()
         match = re.search(r'^cleanup\(\) \{\n(.*?)^\}', source,
                           re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(match, "corpus_extra cleanup function is gone")
-        self.assertNotIn("podman ps", match.group(1),
-                         "the outer trap still enumerates and deletes peer resources")
+        self.assertIn("cleanup_owned_containers", match.group(1),
+                      "SIGTERM can leave this run's detached containers alive")
+        cleanup = re.search(r'^cleanup_owned_containers\(\) \{\n.*?^\}', source,
+                            re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(cleanup, "run-owned container cleanup is gone")
+        owner = "a" * 32
+        peer = "b" * 32
+        names = (
+            f"cbmem-{owner}-host1r1-0",
+            f"hostcdp-{owner}-free",
+            f"cbmem-cpu-{owner}",
+            f"cbmem-{peer}-host1r1-0",
+            f"hostcdp-{peer}-free",
+            f"cbmem-cpu-{peer}",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            removed = os.path.join(tmp, "removed")
+            podman = os.path.join(tmp, "podman")
+            with open(podman, "w") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    "case $1 in\n"
+                    f"  ps) printf '%s\\n' {' '.join(names)} ;;\n"
+                    "  rm) printf '%s\\n' \"$4\" >>\"$REMOVED\" ;;\n"
+                    "  *) exit 64 ;;\n"
+                    "esac\n")
+            os.chmod(podman, 0o755)
+            script = ("set -euo pipefail\n"
+                      f"RUN_ID={owner}\n"
+                      + cleanup.group(0) + "\n"
+                      + "cleanup_owned_containers\n")
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"],
+                       REMOVED=removed)
+            proc = subprocess.run(["bash", "-c", script], env=env,
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(removed) as handle:
+                actual = set(handle.read().splitlines())
+        self.assertEqual(actual, set(names[:3]),
+                         "cleanup crossed the run ownership boundary")
+        self.assertIn('--run-id "$RUN_ID"', source,
+                      "the child and outer cleanup do not share an owner ID")
+        self.assertIn("stop_active_phase", match.group(1),
+                      "cleanup can race a child that is still creating containers")
+        self.assertLess(match.group(1).find("stop_active_phase"),
+                        match.group(1).find("cleanup_owned_containers"),
+                        "the child must stop before its owned containers are enumerated")
+        self.assertIn('setsid "$@"', source,
+                      "killing only the phase parent can leave its VMM children running")
+        self.assertIn('kill -TERM -- "-$pid"', source)
 
     def test_shared_replay_ports_are_locked_before_dnsmasq_is_touched(self):
         with open(EXTRA) as handle:
@@ -138,6 +200,31 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertLess(lock, dnsmasq,
                         "the shared-port lease starts after host DNS is already changed")
 
+    def test_shared_replay_ports_use_one_host_wide_lock(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        self.assertIn('CORPUS_EXTRA_LOCK="/run/lock/fcvm-corpus-extra.lock"', source,
+                      "different UIDs can mutate the same host ports and dnsmasq concurrently")
+        self.assertIn(
+            'sudo -n install -d -o root -g root -m 0755 "$CORPUS_EXTRA_LOCK"',
+            source,
+            "the first caller can leave a lock inode another UID cannot open")
+        self.assertIn('exec 9<"$CORPUS_EXTRA_LOCK"', source,
+                      "opening a shared regular file with O_CREAT is denied across UIDs")
+
+    def test_empty_phases_refuse_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            logs = os.path.join(tmp, "logs")
+            env = dict(os.environ, PHASES="", RUN_ID="0" * 32,
+                       RESULTS=results, LOGDIR=logs)
+            result = subprocess.run(
+                ["bash", EXTRA], env=env, capture_output=True, text=True,
+                timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(os.path.exists(results))
+            self.assertFalse(os.path.exists(logs))
+
     def test_host_control_name_is_derived_from_its_run_id(self):
         with open(HOSTCDP) as handle:
             source = handle.read()
@@ -145,6 +232,159 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertIn("$RUNID", match.group(1))
         self.assertNotIn("$$", match.group(1))
+
+    def test_host_control_readiness_proves_its_container_owns_cdp(self):
+        with open(HOSTCDP) as handle:
+            source = handle.read()
+        self.assertIn("container_owns_cdp", source)
+        readiness = source[source.index("until "):source.index("log \"warm marker up")]
+        self.assertIn("container_owns_cdp", readiness)
+
+    def test_standalone_host_control_refuses_both_vmm_processes_fail_closed(self):
+        with open(HOSTCDP) as handle:
+            source = handle.read()
+        self.assertIn("for process in fcvm firecracker", source)
+        self.assertRegex(source, r'case "\$rc" in\s*0\)')
+        self.assertRegex(source, r'\s1\)')
+
+    def test_container_render_outputs_are_removed_before_sampling(self):
+        args = SimpleNamespace(image="image", urls=["https://example.com/"])
+        side = corpus_mem.ContainerSide(args, "a" * 32)
+        calls = []
+
+        def shell(cmd, *_args, **_kwargs):
+            calls.append(cmd)
+            return Completed(0, "container-id\n", "")
+
+        with mock.patch.object(corpus_mem, "sh", shell), \
+             mock.patch.object(corpus_mem, "sh_bounded", shell):
+            side.bring_up(1, "host1r1", [0])
+        cleanup_calls = [cmd for cmd in calls
+                         if cmd[:4] == ["podman", "exec", side.prefix("host1r1") + "0", "rm"]]
+        self.assertTrue(cleanup_calls,
+                        "render.py's JPEG and DOM remain charged to the container cgroup")
+
+    def test_failed_podman_listing_cannot_report_cleanup_complete(self):
+        side = corpus_mem.ContainerSide(SimpleNamespace(), "a" * 32)
+        name = side.prefix("host1r1") + "0"
+        side.owned.add(name)
+
+        def bounded(cmd, _timeout):
+            if cmd[:3] == ["podman", "ps", "-a"]:
+                return Completed(125, "", "podman unavailable")
+            return Completed(125, "", "remove failed")
+
+        with mock.patch.object(corpus_mem, "sh_bounded", bounded, create=True):
+            with self.assertRaises(SystemExit) as caught:
+                side.tear_down([{"name": name}])
+        self.assertNotIn(caught.exception.code, (0, None))
+        self.assertIn(name, side.owned,
+                      "failed cleanup discarded the only record of its live container")
+
+    def test_failed_podman_run_keeps_the_name_owned_for_final_cleanup(self):
+        args = SimpleNamespace(image="image", urls=["https://example.com/"])
+        side = corpus_mem.ContainerSide(args, "a" * 32)
+        name = side.prefix("host1r1") + "0"
+        with mock.patch.object(
+                corpus_mem, "sh_bounded",
+                return_value=Completed(125, "", "runtime failed after create")):
+            with self.assertRaises(SystemExit):
+                side.bring_up(1, "host1r1", [0])
+        self.assertIn(name, side.owned)
+
+    def test_failed_cputime_container_run_keeps_the_name_owned(self):
+        args = SimpleNamespace(run_id="a" * 32, image="image",
+                               container_resolve_to="127.0.0.1")
+        side = corpus_mem.ContainerSide(args, args.run_id)
+        result = Completed(125, "", "runtime failed after create")
+        with mock.patch.object(corpus_mem, "sh_bounded", return_value=result):
+            rec = {"host": None}
+            corpus_mem.cputime_host_arm(args, rec, side)
+        self.assertIn("cbmem-cpu-" + args.run_id, side.owned)
+
+    def test_failed_clone_readiness_keeps_the_process_owned_for_final_cleanup(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        args = SimpleNamespace(
+            results="/tmp", fcvm="fcvm", state_dir="/state", cdp_port=9222,
+            urls=["https://example.com/"], tag="tag",
+        )
+        cg = mock.Mock()
+        cg.leaf.return_value = "/cgroup/leaf"
+        side = corpus_mem.FcvmSide(args, cg, "a" * 32)
+        with mock.patch.object(corpus_mem, "spawn_in_cgroup", return_value=proc), \
+             mock.patch.object(corpus_mem, "find_clone_state", return_value=None):
+            with self.assertRaises(SystemExit):
+                side.bring_up(1, "fcvm1r1", [0])
+        self.assertIn("mem-" + "a" * 32 + "-fcvm1r1-0", side.owned)
+
+    def test_one_cleanup_failure_does_not_skip_the_other_resources(self):
+        calls = []
+
+        class Side:
+            def __init__(self, label, *methods):
+                self.label = label
+                for method in methods:
+                    setattr(self, method, self.stop)
+
+            def stop(self):
+                calls.append(self.label)
+                raise RuntimeError(self.label)
+
+        class Cgroup:
+            def rm_all(self):
+                calls.append("cgroup")
+                raise RuntimeError("cgroup")
+
+        class Output:
+            def close(self):
+                calls.append("output")
+                raise RuntimeError("output")
+
+        with self.assertRaises(RuntimeError):
+            corpus_mem.cleanup_harness_resources(
+                Side("container", "stop_all"),
+                Side("fcvm", "stop_all", "stop_serve"),
+                Cgroup(), Output())
+        self.assertEqual(calls,
+                         ["container", "fcvm", "fcvm", "cgroup", "output"])
+
+
+class CorpusExtraFailClosed(unittest.TestCase):
+    """The shell driver cannot publish after a preflight or replay failure."""
+
+    @classmethod
+    def source(cls):
+        with open(EXTRA) as handle:
+            return handle.read()
+
+    def test_unknown_or_empty_phases_are_validated(self):
+        source = self.source()
+        self.assertIn("validate_phases", source)
+        self.assertLess(source.find("validate_phases"), source.find("mkdir -p \"$RESULTS\""))
+
+    def test_outer_stray_preflight_distinguishes_no_match_from_error(self):
+        source = self.source()
+        self.assertIn("find_stray_vmms", source)
+        self.assertRegex(source, r'case "\$rc" in\s*0\)')
+        self.assertRegex(source, r'\s1\)')
+        self.assertIn("pgrep", re.search(r'^for tool in .*?; do$', source,
+                                         re.MULTILINE).group(0))
+
+    def test_replay_readiness_is_bound_to_this_server(self):
+        source = self.source()
+        launch = source[source.index('SERVE_PIDFILE='):source.index('# Every corpus member')]
+        self.assertIn('sudo kill -0 "$SERVE_PID"', launch)
+        self.assertIn('[ "$answer" = "10.0.2.2" ]', launch)
+        self.assertIn('[ "$code" = "200" ]', launch)
+
+    def test_replay_nonzero_exit_prevents_success(self):
+        source = self.source()
+        final_records = source.rfind('say "records:')
+        stop = source.rfind("stop_corpus_serve", 0, final_records)
+        require = source.rfind("require_corpus_serve_clean", 0, final_records)
+        self.assertGreater(stop, source.index('if [[ ",$PHASES,"'))
+        self.assertGreater(require, stop)
 
 
 class StrayPreflight(unittest.TestCase):
@@ -293,6 +533,128 @@ class BoundedAttempt(unittest.TestCase):
             self.assertTrue(fn == "sh_bounded" or "timeout=" in call,
                             f"unbounded podman exec: {call!r}")
 
+    def test_every_podman_lifecycle_call_carries_a_bound(self):
+        with open(os.path.join(HERE, "corpus_mem.py")) as handle:
+            src = handle.read()
+        for operation in ("rm", "ps", "logs", "inspect"):
+            for match in re.finditer(
+                    rf'(sh(?:_bounded)?)\(\[\s*"podman",\s*"{operation}"', src):
+                self.assertEqual(match.group(1), "sh_bounded",
+                                 f"unbounded podman {operation} at byte {match.start()}")
+
+
+class CgroupLifecycle(unittest.TestCase):
+    """A stale or unremovable cgroup is contamination, not cleanup success."""
+
+    def test_setup_refuses_an_existing_run_cgroup(self):
+        cg = corpus_mem.CgroupSet("/sys/fs/cgroup/cbmem-existing.slice")
+        with mock.patch("os.path.exists", return_value=True), \
+             mock.patch.object(corpus_mem, "sh_bounded") as run:
+            with self.assertRaises(SystemExit):
+                cg.setup()
+        run.assert_not_called()
+
+    def test_failed_rmdir_is_reported_while_the_cgroup_still_exists(self):
+        cg = corpus_mem.CgroupSet("/sys/fs/cgroup/cbmem-owned.slice")
+        with mock.patch.object(
+                corpus_mem, "sh_bounded",
+                return_value=Completed(1, "", "Device or resource busy")), \
+             mock.patch("os.path.isdir", return_value=True):
+            with self.assertRaises(RuntimeError):
+                cg.rm("leaf")
+
+
+class SnapshotIdentity(unittest.TestCase):
+    """A tag's existence does not identify the image or resolver it captured."""
+
+    @staticmethod
+    def generation(**overrides):
+        record = {
+            "image": "localhost/chromium-bench-req",
+            "image_id": "sha256:" + "a" * 64,
+            "guest_dns": "10.0.2.2",
+            "dns_server": "10.0.2.2",
+            "guest_env": [],
+        }
+        record.update(overrides)
+        return record
+
+    def test_matching_snapshot_identity_is_accepted(self):
+        corpus_mem.validate_snapshot_for_benchmark(
+            self.generation(), "localhost/chromium-bench-req",
+            "sha256:" + "a" * 64, "10.0.2.2")
+
+    def test_snapshot_of_another_image_is_refused(self):
+        with self.assertRaises(SystemExit):
+            corpus_mem.validate_snapshot_for_benchmark(
+                self.generation(), "localhost/chromium-bench-req",
+                "sha256:" + "b" * 64, "10.0.2.2")
+
+    def test_snapshot_without_the_replay_resolver_is_refused(self):
+        with self.assertRaises(SystemExit):
+            corpus_mem.validate_snapshot_for_benchmark(
+                self.generation(guest_dns=None, dns_server="127.0.0.53"),
+                "localhost/chromium-bench-req", "sha256:" + "a" * 64,
+                "10.0.2.2")
+
+
+class ArgumentValidation(unittest.TestCase):
+    """An empty measurement grid is not a successful run."""
+
+    @staticmethod
+    def args(**overrides):
+        args = SimpleNamespace(
+            urls=["https://example.com/"], ns=[1, 2, 4, 8], reps=2,
+            cputime_reps=42, settle=5.0, quiet_limit=1.0,
+            quiet_wait=300.0, run_id="a" * 32,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def assert_refused(self, **overrides):
+        with self.assertRaises(SystemExit) as caught:
+            corpus_mem.validate_args(self.args(**overrides))
+        self.assertNotIn(caught.exception.code, (0, None))
+
+    def test_empty_or_nonpositive_grids_are_refused(self):
+        for overrides in ({"ns": []}, {"ns": [0, 2]}, {"ns": [-1]},
+                          {"reps": 0}, {"reps": -1}, {"urls": []}):
+            with self.subTest(overrides=overrides):
+                self.assert_refused(**overrides)
+
+    def test_invalid_run_id_is_refused(self):
+        for value in ("", "short", "A" * 32, "a/b", "has space", "a" * 100):
+            with self.subTest(run_id=value):
+                self.assert_refused(run_id=value)
+
+    def test_valid_arguments_are_accepted(self):
+        corpus_mem.validate_args(self.args())
+
+    def test_csv_parsing_rejects_empty_members(self):
+        for value in ("", ",", "one,", ",one", "one,,two"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    corpus_mem.parse_csv(value, "--values")
+        self.assertEqual(corpus_mem.parse_csv("one,two", "--values"),
+                         ["one", "two"])
+
+
+class CanonicalImageIdentity(unittest.TestCase):
+    """Podman prints bare IDs while snapshot provenance stores sha256: IDs."""
+
+    def test_bare_and_prefixed_ids_have_one_identity(self):
+        digest = "a" * 64
+        self.assertEqual(corpus_mem.canonical_image_id(digest), "sha256:" + digest)
+        self.assertEqual(corpus_mem.canonical_image_id("sha256:" + digest),
+                         "sha256:" + digest)
+
+    def test_malformed_image_id_is_refused(self):
+        for value in ("", "a" * 63, "sha256:" + "g" * 64):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    corpus_mem.canonical_image_id(value)
+
 
 class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
     """The fcvm arm costs 42 clone lifecycles. The host arm must not take it.
@@ -322,21 +684,24 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
             urls = ["https://example.com/"]
         tmp = tempfile.mkdtemp()
         out = os.path.join(tmp, "cputime.json")
+        exit_code = None
         try:
             corpus_mem.run_cputime(Args(), object(), object(), out)
-        except SystemExit:
-            pass
-        return out
+        except SystemExit as exc:
+            exit_code = exc.code
+        return out, exit_code
 
     def assert_fcvm_arm_survived(self, rec):
         self.assertEqual(rec["fcvm"], self.FCVM_ARM,
                          "the measured fcvm arm did not reach the record")
 
     def test_a_host_arm_that_refuses_still_leaves_the_record(self):
-        def refuse(_args, res):
+        def refuse(_args, res, *_rest):
             res["host_error"] = "podman reports no container cgroup"
             corpus_mem.die("a CPU figure read from the root cgroup would be the whole machine")
-        out = self.run_with_failing_host(refuse)
+        out, exit_code = self.run_with_failing_host(refuse)
+        self.assertNotIn(exit_code, (0, None),
+                         "host:null was written by a successful benchmark")
         self.assertTrue(os.path.exists(out), "cputime.json was not written")
         with open(out) as handle:
             rec = json.load(handle)
@@ -352,10 +717,11 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
         reader cannot tell them apart. The host arm's own refusals carry their
         text.
         """
-        def refuse(_args, _res):
+        def refuse(_args, _res, *_rest):
             raise corpus_mem.HostArmRefused(
                 "podman reports no container cgroup for cbmem-cpu-abc")
-        out = self.run_with_failing_host(refuse)
+        out, exit_code = self.run_with_failing_host(refuse)
+        self.assertNotIn(exit_code, (0, None))
         with open(out) as handle:
             rec = json.load(handle)
         self.assertIn("no container cgroup", rec["host_error"],
@@ -363,14 +729,36 @@ class CputimeRecordSurvivesTheHostArm(unittest.TestCase):
         self.assert_fcvm_arm_survived(rec)
 
     def test_a_host_arm_that_raises_still_leaves_the_record(self):
-        def crash(_args, _res):
+        def crash(_args, _res, *_rest):
             raise RuntimeError("podman went away")
-        out = self.run_with_failing_host(crash)
+        out, exit_code = self.run_with_failing_host(crash)
+        self.assertNotIn(exit_code, (0, None))
         self.assertTrue(os.path.exists(out), "cputime.json was not written")
         with open(out) as handle:
             rec = json.load(handle)
         self.assertIsNone(rec["host"])
         self.assert_fcvm_arm_survived(rec)
+
+
+class ExactHostListener(unittest.TestCase):
+    """A generic host port can belong to another Chromium process."""
+
+    def test_listener_probe_runs_inside_the_named_container(self):
+        seen = []
+
+        def bounded(cmd, timeout):
+            seen.append((cmd, timeout))
+            return Completed(0, "", "")
+
+        with mock.patch.object(corpus_mem, "sh_bounded", bounded):
+            self.assertTrue(corpus_mem.container_owns_tcp_listener("owned", 9222))
+        self.assertEqual(seen[0][0][:3], ["podman", "exec", "owned"])
+        self.assertIn("9222", seen[0][0])
+
+    def test_listener_probe_rejects_an_unowned_port(self):
+        with mock.patch.object(corpus_mem, "sh_bounded",
+                               return_value=Completed(1, "", "not owned")):
+            self.assertFalse(corpus_mem.container_owns_tcp_listener("owned", 9222))
 
 
 class Resummarize(unittest.TestCase):
@@ -621,7 +1009,8 @@ class ProvenanceNamesBytes(unittest.TestCase):
 
     @staticmethod
     def block():
-        src = open(EXTRA).read()
+        with open(EXTRA) as handle:
+            src = handle.read()
         m = re.search(r"(\{\n *echo \"\{\".*?\n\} > \"\$RESULTS/provenance\.json\"\n.*?\n)(?=\n)",
                       src, re.S)
         assert m, "the provenance block is gone"
@@ -637,8 +1026,10 @@ class ProvenanceNamesBytes(unittest.TestCase):
         for name in ("hostcdp.sh", "cdpdrive.py", "render.py", "corpus_mem.py",
                      "corpus_serve.py", "report.py"):
             if bench_has_files:
-                open(os.path.join(bench, name), "w").write(name)
-        open(os.path.join(tmp, "repo", "target", "release", "fcvm"), "w").write("x")
+                with open(os.path.join(bench, name), "w") as handle:
+                    handle.write(name)
+        with open(os.path.join(tmp, "repo", "target", "release", "fcvm"), "w") as handle:
+            handle.write("x")
         stub = os.path.join(tmp, "bin")
         os.makedirs(stub)
         with open(os.path.join(stub, "podman"), "w") as f:
