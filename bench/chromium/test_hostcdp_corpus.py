@@ -41,12 +41,49 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SH = os.environ.get("HOSTCDP_SH", os.path.join(HERE, "hostcdp.sh"))
 URLS = ["https://a.example/", "https://b.example/", "https://c.example/"]
+CONTAINER_ID = "c" * 64
+CONTAINER_OWNER_TOKEN = "1" * 32
 
 
 def write_exec(path, body):
     with open(path, "w") as handle:
         handle.write(body)
     os.chmod(path, 0o755)
+
+
+def staged_runtime(directory):
+    runtime = os.path.join(directory, "runtime")
+    os.makedirs(runtime)
+    payload = os.path.join(runtime, "payload")
+    with open(payload, "w") as handle:
+        handle.write("sealed\n")
+    payload_digest = hashlib.sha256(b"sealed\n").hexdigest()
+    manifest = os.path.join(runtime, "REQBENCH_MANIFEST.sha256")
+    with open(manifest, "w") as handle:
+        handle.write(f"{payload_digest}  payload\n")
+    with open(manifest, "rb") as handle:
+        identity = hashlib.sha256(handle.read()).hexdigest()
+    return manifest, identity
+
+
+def write_podman_stub(path, run_argv=None):
+    record_argv = ""
+    if run_argv is not None:
+        record_argv = f'''printf '%s\\0' "$@" > "{run_argv}"\n'''
+    write_exec(path, f'''#!/bin/bash
+case "$1" in
+  run)
+    {record_argv}    echo {CONTAINER_ID}
+    ;;
+  inspect)
+    case "$*" in
+      *'.Image'*) echo sha256:{"a" * 64} ;;
+      *'Config.Labels'*) echo {CONTAINER_ID}'|'{CONTAINER_OWNER_TOKEN} ;;
+    esac
+    ;;
+esac
+exit 0
+''')
 
 
 class HostCdpCorpusSchedule(unittest.TestCase):
@@ -56,13 +93,7 @@ class HostCdpCorpusSchedule(unittest.TestCase):
         binx = os.path.join(d, "bin")
         os.makedirs(binx)
         seen = os.path.join(d, "cdpdrive-urls")
-        write_exec(os.path.join(binx, "podman"), '''#!/bin/bash
-case "$1" in
-  run) echo 0123456789ab ;;
-  inspect) echo sha256:''' + "c" * 64 + ''' ;;
-esac
-exit 0
-''')
+        write_podman_stub(os.path.join(binx, "podman"))
         write_exec(os.path.join(binx, "python3"), f'''#!/bin/bash
 case "${{1:-}}" in
   *cdpdrive.py) printf '%s\\n' "$3" >> {seen}; echo '{{"stub": true}}'; exit 0 ;;
@@ -73,6 +104,11 @@ exec {sys.executable} "$@"
         with open(loadavg, "w") as handle:
             handle.write("1.23 0.50 0.40 1/100 999\n")
         env = dict(os.environ)
+        env.pop("CPUS", None)
+        env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+        env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+        env.pop("SOURCE_REVISION", None)
+        manifest, runtime_identity = staged_runtime(d)
         env.update({
             "PATH": binx + os.pathsep + env["PATH"],
             "ALLOW_BUSY": "1",
@@ -81,6 +117,11 @@ exec {sys.executable} "$@"
             "URL": url_spec,
             "REPS": str(reps),
             "WARMUP": str(warmup),
+            "COMPARISON_LABEL": "corpus",
+            "CPU_BUDGET": "unlimited",
+            "CONTAINER_OWNER_TOKEN": CONTAINER_OWNER_TOKEN,
+            "REQBENCH_RUNTIME_MANIFEST": manifest,
+            "REQBENCH_RUNTIME_BUNDLE_SHA256": runtime_identity,
         })
         if existing_results:
             os.makedirs(env["RESULTS"])
@@ -234,9 +275,9 @@ class HostCdpCpuBudget(unittest.TestCase):
     """The host control's CPU budget has to be settable and recorded.
 
     A host baseline run on every core, compared against a 2-vCPU VM arm, is two
-    variables. CPUS names the budget, hostcdp.sh passes it to podman as --cpus,
-    and run.json records it so a reader of the record can tell which budget the
-    baseline ran under (null when unset, which is the whole machine).
+    variables. CPU_BUDGET names the comparison semantics, CPUS carries the
+    finite vm-matched limit to podman, and run.json records both. An unlimited
+    arm has a null cpus field rather than pretending it had a numeric limit.
     """
 
     def _run(self, cpus):
@@ -245,13 +286,7 @@ class HostCdpCpuBudget(unittest.TestCase):
         binx = os.path.join(d, "bin")
         os.makedirs(binx)
         run_argv = os.path.join(d, "podman-run-argv")
-        write_exec(os.path.join(binx, "podman"), f'''#!/bin/bash
-case "$1" in
-  run) printf '%s\\0' "$@" > {run_argv} ; echo 0123456789ab ;;
-  inspect) echo sha256:{"c" * 64} ;;
-esac
-exit 0
-''')
+        write_podman_stub(os.path.join(binx, "podman"), run_argv)
         write_exec(os.path.join(binx, "python3"), f'''#!/bin/bash
 case "${{1:-}}" in
   *cdpdrive.py) echo '{{"stub": true}}'; exit 0 ;;
@@ -260,6 +295,10 @@ exec {sys.executable} "$@"
 ''')
         env = dict(os.environ)
         env.pop("CPUS", None)
+        env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+        env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+        env.pop("SOURCE_REVISION", None)
+        manifest, runtime_identity = staged_runtime(d)
         env.update({
             "PATH": binx + os.pathsep + env["PATH"],
             "ALLOW_BUSY": "1",
@@ -267,6 +306,11 @@ exec {sys.executable} "$@"
             "URL": URLS[0],
             "REPS": "3",
             "WARMUP": "1",
+            "COMPARISON_LABEL": "cpu-budget",
+            "CPU_BUDGET": "vm-matched" if cpus is not None else "unlimited",
+            "CONTAINER_OWNER_TOKEN": CONTAINER_OWNER_TOKEN,
+            "REQBENCH_RUNTIME_MANIFEST": manifest,
+            "REQBENCH_RUNTIME_BUNDLE_SHA256": runtime_identity,
         })
         if cpus is not None:
             env["CPUS"] = cpus
@@ -283,12 +327,15 @@ exec {sys.executable} "$@"
         argv, meta = self._run("2")
         self.assertIn("--cpus", argv)
         self.assertEqual(argv[argv.index("--cpus") + 1], "2")
-        self.assertEqual(meta["cpus"], "2")
+        self.assertEqual(meta["cpu_budget"], "vm-matched")
+        self.assertEqual(meta["cpus"], 2)
+        self.assertIsInstance(meta["cpus"], int)
 
     def test_unset_cpus_leaves_the_budget_alone_and_records_null(self):
         """Unset means the whole machine, and the record says so rather than lying."""
         argv, meta = self._run(None)
         self.assertNotIn("--cpus", argv)
+        self.assertEqual(meta["cpu_budget"], "unlimited")
         self.assertIsNone(meta["cpus"])
 
 

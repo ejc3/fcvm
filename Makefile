@@ -304,7 +304,7 @@ help:
 	@echo "  bench-webkit-request-diag      WebKit twin of bench-chromium-request-diag (TAG=, BACKEND=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
 	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=)"
 	@echo "  bench-stop                    Stop all bench processes, reap stray VMs, restore dnsmasq"
-	@echo "  bench-chromium-hostcdp         Host-container direct-CDP baseline (no VM; BENCH_RESOLVE_ALL_TO=)"
+	@echo "  bench-chromium-hostcdp         Host direct-CDP baseline (COMPARISON_LABEL=standalone CPU_BUDGET=unlimited; CPUS= needs CPU_BUDGET=vm-matched)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
 	@echo "  test-chromium          Run ALL bench unit tests (what CI runs)"
@@ -1066,7 +1066,9 @@ bench-chromium-corpus: require-clean-tree build setup-default
 # pool on the host. Needs only the container image, not VM assets.
 bench-chromium-hostcdp: bench-chromium-request-build
 	@echo "==> Running host-container direct-CDP baseline..."
-	@bash bench/chromium/hostcdp.sh
+	@COMPARISON_LABEL="$${COMPARISON_LABEL-standalone}" \
+		CPU_BUDGET="$${CPU_BUDGET-unlimited}" \
+		bash bench/chromium/hostcdp.sh
 
 # Per-request guest page-fault count/cost per memory backend. Requires the
 # bench.sh goldens (cb-golden-*) to exist; cells without one are skipped.

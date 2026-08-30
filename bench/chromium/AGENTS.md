@@ -64,6 +64,10 @@ entries change what the snapshot does, so such a golden needs its own `TAG=`.
 The host control takes the same variable directly:
 `make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
 `resolve_all_to` in its `run.json` (null when unset).
+The Make entry point supplies `COMPARISON_LABEL=standalone` and
+`CPU_BUDGET=unlimited` when those variables are unset. A finite control must
+name both parts explicitly, for example
+`make bench-chromium-hostcdp COMPARISON_LABEL=cpu2 CPU_BUDGET=vm-matched CPUS=2`.
 
 `URL=` on the host control names one url or a comma-separated list, and a list
 is cycled the way `reqbench.url_for_rep` cycles the VM arm's: `urls[rep %
@@ -85,10 +89,11 @@ jsonl row carries `loadavg1` the way `reqbench.py` stamps it, summarised over
 the measured reps as `loadavg1_measured`. `run.json` also carries the producer's
 `run_id`, and every jsonl row carries the SHA-256 of the exact `run.json` bytes;
 comparison and resummarization refuse rows that are missing that binding or
-name different metadata. `CPUS=` bounds the container's CPU budget
-(`podman run --cpus`) and is recorded as `cpus` in `run.json`, null when unset,
-which means the whole machine: a host baseline on every core compared against a
-2-vCPU VM arm is two variables, not one.
+name different metadata. `CPU_BUDGET=` records whether the arm is `unlimited`
+or `vm-matched`. `CPUS=` carries a positive finite limit for the latter to
+`podman run --cpus` and is recorded as a JSON number in `run.json`; an unlimited
+arm requires CPUS to be unset and records null. A host baseline on every core
+compared against a 2-vCPU VM arm is two variables, not one.
 
 `RESULTS=` is an ownership claim, not a resume directory. `hostcdp.sh` creates
 its final component atomically and refuses an existing directory before writing

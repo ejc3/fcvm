@@ -6007,6 +6007,27 @@ class HostCdpQuietGate(unittest.TestCase):
 
     SH = os.path.join(HERE, "hostcdp.sh")
 
+    @staticmethod
+    def producer_contract_env(directory):
+        runtime = os.path.join(directory, "runtime")
+        os.makedirs(runtime)
+        payload = os.path.join(runtime, "payload")
+        with open(payload, "w") as handle:
+            handle.write("sealed\n")
+        payload_digest = hashlib.sha256(b"sealed\n").hexdigest()
+        manifest = os.path.join(runtime, "REQBENCH_MANIFEST.sha256")
+        with open(manifest, "w") as handle:
+            handle.write(f"{payload_digest}  payload\n")
+        with open(manifest, "rb") as handle:
+            runtime_identity = hashlib.sha256(handle.read()).hexdigest()
+        return {
+            "COMPARISON_LABEL": "quiet-gate",
+            "CPU_BUDGET": "unlimited",
+            "CONTAINER_OWNER_TOKEN": "1" * 32,
+            "REQBENCH_RUNTIME_MANIFEST": manifest,
+            "REQBENCH_RUNTIME_BUNDLE_SHA256": runtime_identity,
+        }
+
     def test_the_gate_reads_a_leading_zero_window_as_decimal(self):
         # Same octal trap as reqbench's guard_quiet (CodeRabbit on #865):
         # "08" must be an eight-second window, not a bash arithmetic error.
@@ -6033,6 +6054,11 @@ class HostCdpQuietGate(unittest.TestCase):
                 ALLOW_BUSY="0",
                 RESULTS=os.path.join(d, "results"),
             )
+            env.pop("CPUS", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+            env.pop("SOURCE_REVISION", None)
+            env.update(self.producer_contract_env(d))
             helper = subprocess.Popen(
                 ["bash", "-c",
                  f'sleep 2; printf "0.10 0 0 1/1 1\\n" > {loadavg}'],
@@ -6077,6 +6103,11 @@ class HostCdpQuietGate(unittest.TestCase):
                 ALLOW_BUSY="0",
                 RESULTS=os.path.join(d, "results"),
             )
+            env.pop("CPUS", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+            env.pop("SOURCE_REVISION", None)
+            env.update(self.producer_contract_env(d))
             helper = subprocess.Popen(
                 ["bash", "-c",
                  f'sleep 2; printf "0.10 0 0 1/1 1\\n" > {loadavg}'],
@@ -6126,6 +6157,11 @@ class HostCdpQuietGate(unittest.TestCase):
                     ALLOW_BUSY="0",
                     RESULTS=os.path.join(d, "results"),
                 )
+                env.pop("CPUS", None)
+                env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+                env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+                env.pop("SOURCE_REVISION", None)
+                env.update(self.producer_contract_env(d))
                 result = subprocess.run(
                     ["bash", self.SH], env=env,
                     capture_output=True, text=True, timeout=60,
@@ -7478,6 +7514,18 @@ class MakefileBenchGraph(unittest.TestCase):
         fp = self.prereqs("bench-chromium-fault")
         self.assertIn("build", fp)
         self.assertIn("setup-default", fp)
+
+    def test_hostcdp_entrypoint_supplies_standalone_comparison_semantics(self):
+        """The Make entry point must satisfy hostcdp.sh's explicit producer
+        contract while preserving command-line overrides.
+
+        A bare `bash hostcdp.sh` reaches the producer with no comparison label
+        or CPU-budget meaning and is refused before it can measure anything.
+        """
+        recipe = "\n".join(self.recipes.get("bench-chromium-hostcdp", []))
+        self.assertIn("${COMPARISON_LABEL-standalone}", recipe)
+        self.assertIn("${CPU_BUDGET-unlimited}", recipe)
+        self.assertIn("bash bench/chromium/hostcdp.sh", recipe)
 
     def test_phase_indirection_is_gone(self):
         # NO LEGACY: the PHASE?=run single target could not express
@@ -9698,4 +9746,3 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 "replay-queries.log", "summary.json",
             },
         )
-
