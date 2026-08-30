@@ -1,0 +1,1 @@
+The VM/host ratios are withdrawn because the legacy host rows carry no run_id, run.json digest, per-repetition load, boot identity, or producer seal.
