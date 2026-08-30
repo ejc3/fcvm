@@ -546,15 +546,21 @@ HOSTCDP_ARMS="${HOSTCDP_ARMS:-free,cpu2}"
 if [[ ",$PHASES," == *",hostcdp,"* ]]; then
     for arm in $(printf '%s' "$HOSTCDP_ARMS" | tr ',' ' '); do
         case "$arm" in
-            free) cpus="" ;;
-            cpu2) cpus=2 ;;
+            free) cpus=""; cpu_budget=unlimited ;;
+            cpu2) cpus=2; cpu_budget=vm-matched ;;
             *) echo "BLOCKED: unknown hostcdp arm '$arm'" >&2; exit 2 ;;
         esac
         say "hostcdp/$arm over the corpus: $REPS measured reps plus $WARMUP warmup, cpus=${cpus:-<all>}, resolver rule -> 127.0.0.1"
         run_logged "$LOGDIR/hostcdp-$arm.log" env \
             URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" IMAGE="$RUNTIME_IMAGE" CPUS="$cpus" \
             RUNID="$RUN_ID-$arm" BENCH_RESOLVE_ALL_TO=127.0.0.1 SETTLE_WAIT_SECS=300 \
+            COMPARISON_LABEL="$arm" CPU_BUDGET="$cpu_budget" \
             CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
+            SOURCE_REVISION="$SOURCE_REVISION" \
+            REQBENCH_RUNTIME_MANIFEST="$BENCH/REQBENCH_MANIFEST.sha256" \
+            REQBENCH_RUNTIME_BUNDLE_SHA256="$REQBENCH_RUNTIME_BUNDLE_SHA256" \
+            CORPUS_EXTRA_RUNTIME_MANIFEST="$BENCH/MANIFEST.sha256" \
+            CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" \
             RESULTS="$RESULTS/hostcdp-$arm" bash "$BENCH/hostcdp.sh"
     done
 fi

@@ -30,6 +30,11 @@ OWNER_LABEL_KEY="io.fcvm.bench.owner"
 readonly OWNER_LABEL_KEY
 COMPARISON_LABEL="${COMPARISON_LABEL:-}"
 CPU_BUDGET="${CPU_BUDGET:-}"
+SOURCE_REVISION="${SOURCE_REVISION:-}"
+REQBENCH_RUNTIME_MANIFEST="${REQBENCH_RUNTIME_MANIFEST:-}"
+REQBENCH_RUNTIME_BUNDLE_SHA256="${REQBENCH_RUNTIME_BUNDLE_SHA256:-}"
+CORPUS_EXTRA_RUNTIME_MANIFEST="${CORPUS_EXTRA_RUNTIME_MANIFEST:-}"
+CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="${CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256:-}"
 CONTAINER_ID=
 
 [[ "$RUNID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$ ]] \
@@ -65,8 +70,7 @@ case "$CPU_BUDGET" in
 esac
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-REPO=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) \
-    || { log "REFUSING: $HERE is not in a git worktree"; exit 2; }
+REPO=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) || REPO=""
 
 compute_harness_sha256() {
     python3 - "$HERE" <<'PY'
@@ -89,8 +93,81 @@ print(h.hexdigest())
 PY
 }
 
-source_revision=$(git -C "$REPO" rev-parse HEAD) \
-    || { log "REFUSING: cannot read source revision"; exit 2; }
+verify_runtime_manifest() {
+    local manifest=$1 expected=$2 label=$3 actual directory name
+    [ -f "$manifest" ] \
+        || { log "REFUSING: $label runtime manifest is missing: $manifest"; return 2; }
+    actual=$(sha256sum "$manifest" | cut -d' ' -f1) \
+        || { log "REFUSING: cannot hash $label runtime manifest"; return 2; }
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \
+        || { log "REFUSING: $label runtime identity is not a sha256"; return 2; }
+    [ "$actual" = "$expected" ] \
+        || { log "REFUSING: $label runtime manifest identity changed"; return 2; }
+    directory=$(dirname -- "$manifest")
+    name=${manifest##*/}
+    (cd "$directory" && sha256sum --check --strict --status "$name") \
+        || { log "REFUSING: $label runtime bytes changed"; return 2; }
+}
+
+compute_live_reqbench_bundle_sha256() {
+    python3 - "$HERE" "$REPO/target/release/fcvm" "$REPO/target/release/fc-agent" <<'PY'
+import hashlib
+import os
+import sys
+
+here, fcvm, fc_agent = sys.argv[1:]
+inputs = (
+    ("fcvm", fcvm),
+    ("fc-agent", fc_agent),
+    ("reqbench.sh", os.path.join(here, "reqbench.sh")),
+    ("reqbench.py", os.path.join(here, "reqbench.py")),
+    ("reqanalyze.py", os.path.join(here, "reqanalyze.py")),
+    ("cdpdrive.py", os.path.join(here, "cdpdrive.py")),
+    ("render.py", os.path.join(here, "render.py")),
+    ("wddrive.py", os.path.join(here, "wddrive.py")),
+)
+manifest = bytearray()
+for name, path in inputs:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    manifest.extend(f"{digest.hexdigest()}  {name}\n".encode())
+print(hashlib.sha256(manifest).hexdigest())
+PY
+}
+
+if [ -n "$SOURCE_REVISION" ]; then
+    [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] \
+        || { log "REFUSING: SOURCE_REVISION is not a 40- or 64-character commit ID"; exit 2; }
+    source_revision="$SOURCE_REVISION"
+else
+    [ -n "$REPO" ] || { log "REFUSING: $HERE is not in a git worktree"; exit 2; }
+    source_revision=$(git -C "$REPO" rev-parse HEAD) \
+        || { log "REFUSING: cannot read source revision"; exit 2; }
+fi
+readonly source_revision
+
+if [ -n "$REQBENCH_RUNTIME_MANIFEST" ]; then
+    verify_runtime_manifest "$REQBENCH_RUNTIME_MANIFEST" \
+        "$REQBENCH_RUNTIME_BUNDLE_SHA256" reqbench || exit 2
+    runtime_bundle_sha256="$REQBENCH_RUNTIME_BUNDLE_SHA256"
+else
+    [ -n "$REPO" ] \
+        || { log "REFUSING: a staged host run must name REQBENCH_RUNTIME_MANIFEST"; exit 2; }
+    runtime_bundle_sha256=$(compute_live_reqbench_bundle_sha256) \
+        || { log "REFUSING: cannot hash the live reqbench runtime"; exit 2; }
+fi
+[[ "$runtime_bundle_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || { log "REFUSING: reqbench runtime seal produced an invalid digest"; exit 2; }
+
+corpus_extra_runtime_bundle_sha256=""
+if [ -n "$CORPUS_EXTRA_RUNTIME_MANIFEST" ] \
+        || [ -n "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" ]; then
+    verify_runtime_manifest "$CORPUS_EXTRA_RUNTIME_MANIFEST" \
+        "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" corpus-extra || exit 2
+    corpus_extra_runtime_bundle_sha256="$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256"
+fi
 harness_sha256=$(compute_harness_sha256) \
     || { log "REFUSING: cannot hash request harness sources"; exit 2; }
 hostcdp_sha256=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
@@ -359,7 +436,8 @@ image_id=$(timeout 30 podman inspect --format '{{.Image}}' "$CONTAINER_ID") \
 python3 - "$RESULTS/run.json" "$RUNID" "$IMAGE" "$image_id" "$REPS" "$WARMUP" \
         "$URL" "$CDP_PORT" "$urls_json" "$cpus_json" "$resolve_json" "$la" \
         "$host_boot_id" "$host_machine" "$host_kernel" "$source_revision" \
-        "$harness_sha256" "$hostcdp_sha256" "$COMPARISON_LABEL" "$CPU_BUDGET" \
+        "$harness_sha256" "$hostcdp_sha256" "$runtime_bundle_sha256" \
+        "$corpus_extra_runtime_bundle_sha256" "$COMPARISON_LABEL" "$CPU_BUDGET" \
         "$CONTAINER_OWNER_TOKEN" "$CONTAINER_ID" <<'PY'
 import json
 import os
@@ -369,6 +447,7 @@ import tempfile
 (output_path, run_id, image, image_id, reps, warmup, url, cdp_port,
  urls_json, cpus_json, resolve_json, loadavg, host_boot_id, host_machine,
  host_kernel, source_revision, harness_sha256, hostcdp_sha256,
+ runtime_bundle_sha256, corpus_extra_runtime_bundle_sha256,
  comparison_label, cpu_budget, owner_token, container_id) = sys.argv[1:]
 urls = json.loads(urls_json)
 record = {
@@ -393,6 +472,9 @@ record = {
     "source_revision": source_revision,
     "harness_sha256": harness_sha256,
     "hostcdp_sha256": hostcdp_sha256,
+    "runtime_bundle_sha256": runtime_bundle_sha256,
+    "corpus_extra_runtime_bundle_sha256":
+        corpus_extra_runtime_bundle_sha256 or None,
     "comparison_label": comparison_label,
     "container_owner_token": owner_token,
     "container_id": container_id,
@@ -467,8 +549,12 @@ for rep in $(seq 0 $((TOTAL_REPS - 1))); do
     [ "$ok" = true ] || { log "rep $rep FAILED ($rep_url): $out"; exit 4; }
 done
 
-source_revision_after=$(git -C "$REPO" rev-parse HEAD) \
-    || { log "REFUSING: cannot re-read source revision"; exit 5; }
+if [ -n "$SOURCE_REVISION" ]; then
+    source_revision_after="$SOURCE_REVISION"
+else
+    source_revision_after=$(git -C "$REPO" rev-parse HEAD) \
+        || { log "REFUSING: cannot re-read source revision"; exit 5; }
+fi
 harness_sha256_after=$(compute_harness_sha256) \
     || { log "REFUSING: cannot re-hash request harness sources"; exit 5; }
 hostcdp_sha256_after=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
@@ -478,6 +564,21 @@ if [ "$source_revision_after" != "$source_revision" ] \
         || [ "$hostcdp_sha256_after" != "$hostcdp_sha256" ]; then
     log "REFUSING: producer source changed during the measured run"
     exit 5
+fi
+if [ -n "$REQBENCH_RUNTIME_MANIFEST" ]; then
+    verify_runtime_manifest "$REQBENCH_RUNTIME_MANIFEST" \
+        "$runtime_bundle_sha256" reqbench || exit 5
+else
+    runtime_bundle_sha256_after=$(compute_live_reqbench_bundle_sha256) \
+        || { log "REFUSING: cannot re-hash the live reqbench runtime"; exit 5; }
+    [ "$runtime_bundle_sha256_after" = "$runtime_bundle_sha256" ] || {
+        log "REFUSING: reqbench runtime changed during the measured run"
+        exit 5
+    }
+fi
+if [ -n "$CORPUS_EXTRA_RUNTIME_MANIFEST" ]; then
+    verify_runtime_manifest "$CORPUS_EXTRA_RUNTIME_MANIFEST" \
+        "$corpus_extra_runtime_bundle_sha256" corpus-extra || exit 5
 fi
 
 python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json" <<'PY'

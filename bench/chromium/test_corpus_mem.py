@@ -704,6 +704,9 @@ exec {real_timeout!r} "$duration" "$@"
             handle.write(f"{payload_digest}  payload\n")
         with open(manifest, "rb") as handle:
             runtime_digest = hashlib.sha256(handle.read()).hexdigest()
+        outer_manifest = os.path.join(runtime, "MANIFEST.sha256")
+        with open(manifest, "rb") as source, open(outer_manifest, "wb") as target:
+            target.write(source.read())
         revision = subprocess.check_output(
             ["git", "-C", os.path.dirname(os.path.dirname(HERE)),
              "rev-parse", "HEAD"], text=True).strip()
@@ -728,7 +731,8 @@ exec {real_timeout!r} "$duration" "$@"
             SOURCE_REVISION=revision,
             REQBENCH_RUNTIME_MANIFEST=manifest,
             REQBENCH_RUNTIME_BUNDLE_SHA256=runtime_digest,
-            CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="b" * 64,
+            CORPUS_EXTRA_RUNTIME_MANIFEST=outer_manifest,
+            CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256=runtime_digest,
             RUNTIME_PAYLOAD=payload,
         )
         env.pop("CPUS", None)
