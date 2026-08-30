@@ -1,0 +1,14 @@
+{
+ "git_head": "55756858d46347f00bac3f66f1f5cacf3411bbb8",
+ "git_dirty": " M bench/chromium/hostcdp.sh; M bench/chromium/report.py;",
+ "host_kernel": "6.17.0-1019-aws", "machine": "aarch64",
+ "image": "localhost/chromium-bench-req", "image_id": "334fc21f7c8c82c172a2981d9f5df98df73c3c667c4b96b1e4cdd62f001fb576",
+ "tag": "cb-req-corpus", "reps": 230, "warmup": 28,
+ "hostcdp.sh": "7ea77ec7e25759d9dcd955a968a71eff9c44dbd83acbbd63e982e8c973ba1d5c",
+ "cdpdrive.py": "8ba1299d6120c8beaa5f298497ccca42f58c9396cd90566d39f62ad8a0cd423c",
+ "render.py": "ef617c7929f853541bbc63b9b1ff1280a66af441b11a71099271a8c543cbf2d2",
+ "corpus_mem.py": "1cf129f7299fa620f14d23ae12aff027501963d036e2405b195a94955d1403e3",
+ "corpus_serve.py": "29c60ebdf1ae1ce4a46255e0bdd843b55e6d4dbc922dd8097adf72a2251d0428",
+ "report.py": "69961a1cbd6153bb9c0ef8825af709934b7191dab38b3230da2bdfdd0e7efce8",
+ "fcvm": "e18eae60578c5046c62b376fc34c5e193d1207088a30f5a2666068c5772c7e3c"
+}

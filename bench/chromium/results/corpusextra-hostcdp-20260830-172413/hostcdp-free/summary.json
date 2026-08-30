@@ -1,0 +1,94 @@
+{
+ "n": 202,
+ "p50_ms": 284.2,
+ "p95_ms": 1807.5,
+ "mean_ms": 441.3,
+ "failures": 0,
+ "p50_convention": "statistics.median",
+ "per_url": {
+  "https://example.com/": {
+   "n": 15,
+   "p50_ms": 137.5,
+   "p95_ms": 137.8,
+   "mean_ms": 136.4
+  },
+  "https://news.ycombinator.com/": {
+   "n": 15,
+   "p50_ms": 176.4,
+   "p95_ms": 192.7,
+   "mean_ms": 176.3
+  },
+  "https://developers.cloudflare.com/": {
+   "n": 15,
+   "p50_ms": 302.9,
+   "p95_ms": 325.9,
+   "mean_ms": 305.5
+  },
+  "https://blog.cloudflare.com/": {
+   "n": 15,
+   "p50_ms": 289.7,
+   "p95_ms": 300.6,
+   "mean_ms": 290.3
+  },
+  "https://en.wikipedia.org/": {
+   "n": 15,
+   "p50_ms": 408.4,
+   "p95_ms": 1192.0,
+   "mean_ms": 512.8
+  },
+  "https://developer.mozilla.org/en-US/": {
+   "n": 15,
+   "p50_ms": 303.0,
+   "p95_ms": 303.6,
+   "mean_ms": 299.8
+  },
+  "https://www.elmundo.es/": {
+   "n": 14,
+   "p50_ms": 2058.8,
+   "p95_ms": 2358.9,
+   "mean_ms": 2061.8
+  },
+  "https://www.rtp.pt/noticias/": {
+   "n": 14,
+   "p50_ms": 1151.8,
+   "p95_ms": 1266.2,
+   "mean_ms": 1156.5
+  },
+  "https://www.theguardian.com/international": {
+   "n": 14,
+   "p50_ms": 518.5,
+   "p95_ms": 519.6,
+   "mean_ms": 514.6
+  },
+  "https://todomvc.com/examples/javascript-es6/dist/": {
+   "n": 14,
+   "p50_ms": 155.0,
+   "p95_ms": 171.0,
+   "mean_ms": 157.7
+  },
+  "https://todomvc.com/examples/react/dist/index.html": {
+   "n": 14,
+   "p50_ms": 153.8,
+   "p95_ms": 157.1,
+   "mean_ms": 148.3
+  },
+  "https://todomvc.com/examples/vue/dist/": {
+   "n": 14,
+   "p50_ms": 146.1,
+   "p95_ms": 171.6,
+   "mean_ms": 153.3
+  },
+  "https://todomvc.com/examples/angular/dist/browser/": {
+   "n": 14,
+   "p50_ms": 206.2,
+   "p95_ms": 207.7,
+   "mean_ms": 206.4
+  },
+  "https://todomvc.com/examples/preact/dist/": {
+   "n": 14,
+   "p50_ms": 122.3,
+   "p95_ms": 138.2,
+   "mean_ms": 124.5
+  }
+ }
+}

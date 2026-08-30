@@ -1,0 +1,178 @@
+{
+  "backend": "uffd",
+  "engine": "chromium",
+  "limits": {
+    "expect_ips": [
+      "10.0.2.2"
+    ],
+    "max_load_ms": 15000
+  },
+  "passed": false,
+  "reps": 3,
+  "runtime_bundle_intact": true,
+  "runtime_bundle_sha256": "81ab7a2f0ebb8d4ddb599c1d3edecb6c37d0ce4c66bbb609dc2d82af7009e859",
+  "snapshot_config_sha256": "39df0df659be6242257225bff57a4e8dcef5048d73b63f7a9e36f4b7a69efdaa",
+  "snapshot_generation_id": "dfd71a7c-6c31-46e7-940a-fb127822e70d",
+  "tag": "cb-req-corpus",
+  "teardown_failures": 0,
+  "timestamp": "2026-08-30T16:40:19Z",
+  "uffd_mode": "minor",
+  "uffd_prefetch": "off",
+  "urls": {
+    "https://blog.cloudflare.com/": {
+      "errors": {},
+      "max_load_ms": 694.7733210001843,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 174
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developer.mozilla.org/en-US/": {
+      "errors": {},
+      "max_load_ms": 600.4127559999688,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 222
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developers.cloudflare.com/": {
+      "errors": {},
+      "max_load_ms": 684.0086980000706,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 93
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://en.wikipedia.org/": {
+      "errors": {},
+      "max_load_ms": 1227.5323089997983,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 108
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://example.com/": {
+      "errors": {},
+      "max_load_ms": 105.82244299985177,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 3
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://news.ycombinator.com/": {
+      "errors": {},
+      "max_load_ms": 228.6393220001628,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 21
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+      "errors": {},
+      "max_load_ms": 397.1754990000136,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 27
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+      "errors": {},
+      "max_load_ms": 291.6749510000045,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+      "errors": {},
+      "max_load_ms": 277.92774899990036,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+      "errors": {},
+      "max_load_ms": 294.3400459998884,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+      "errors": {},
+      "max_load_ms": 281.4748390001114,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.elmundo.es/": {
+      "errors": {
+        "net::ERR_ABORTED": 47,
+        "net::ERR_CONNECTION_RESET": 3
+      },
+      "max_load_ms": 3926.625682999884,
+      "max_pending_at_load": 5,
+      "remote_ips": {
+        "10.0.2.2": 547
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.rtp.pt/noticias/": {
+      "errors": {
+        "net::ERR_ABORTED": 6
+      },
+      "max_load_ms": 2953.8789660000475,
+      "max_pending_at_load": 3,
+      "remote_ips": {
+        "10.0.2.2": 597
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.theguardian.com/international": {
+      "errors": {
+        "net::ERR_ABORTED": 27
+      },
+      "max_load_ms": 1085.9928449999643,
+      "max_pending_at_load": 4,
+      "remote_ips": {
+        "10.0.2.2": 252
+      },
+      "renders_ok": 3,
+      "reps": 3
+    }
+  },
+  "violations": [
+    {
+      "detail": "1 of 203 traced request(s) name no remote address, first https://ping.chartbeat.net/ping?h=video%40noticias.rtp.pt&g=60571&p=liverepeatersmilrtpnHDsmilrtpplaylistm3u8token17866800008da58650df326b6f49fb284baccea4eb01587633&i=Direto%20RTP3%20-%20RTP%20Not%C3%ADcias&g0=RTP&g1=RTP&u=KFmhIBJdZGBCfPIHJ&t=DqYffKgaoWns8jCDDnT1M8WvOGg&x=0&y=0&V=152&n=1&b=2983&_vd=3600000&_vi=RTP%20Not%C3%ADcias&_vp=rtp.pt%2Fnoticias&_vh=rtp.pt&_pu=OT8BSCgy5lfD8jnFn&_pt=D2dUr0BcocNIBW9mr7DUEnaxCgv9k8&_pr=&_vdd=noticias.rtp.pt&_vt=ct&_vap=a1&_vs=s2&_vcs=1&_vbr=1024000&_vvs=5.012&_vpt=5099.999999999998&_vtn=https%3A%2F%2Fcdn-images.rtp.pt%2Fcommon%2Fimg%2Fchannels%2Flogos%2Fcolor%2Fhorizontal%2F64-042825131610.png&_vaup=auto&_vplt=radiantMP&_vce=5&c=0.08&W=0&R=1&I=0&E=5&j=20&tz=0&_",
+      "kind": "no_remote_ip",
+      "rep": 2,
+      "url": "https://www.rtp.pt/noticias/"
+    }
+  ]
+}

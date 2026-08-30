@@ -336,6 +336,35 @@ class MedianConvention(unittest.TestCase):
         self.assertEqual(corpus_mem.median_ms([5.0, 1.0, 3.0]), 3.0)
 
 
+class FrozenCopiesAreRecordsNotTests(unittest.TestCase):
+    """The sealed harness copies under results/ are provenance, not code CI runs.
+
+    A run freezes the scripts that produced it beside its records, and some of
+    those are test files. CI's Bench Harness Tests job is
+    `unittest discover -s bench/chromium -p 'test_*.py'`, so a frozen copy that
+    got loaded would run a stale test against the current tree: green or red for
+    reasons that have nothing to do with the commit under test. It does not
+    happen today because results/ holds no package, and this says so out loud
+    rather than leaving it to a property nobody wrote down.
+    """
+
+    def test_discovery_loads_nothing_from_results(self):
+        import unittest as ut
+        suite = ut.defaultTestLoader.discover(HERE, pattern="test_*.py")
+
+        def modules(t):
+            for item in t:
+                if isinstance(item, ut.TestSuite):
+                    yield from modules(item)
+                else:
+                    yield type(item).__module__
+
+        for mod in sorted(set(modules(suite))):
+            path = getattr(sys.modules.get(mod), "__file__", "") or ""
+            self.assertNotIn(os.sep + "results" + os.sep, path,
+                             f"CI would run the frozen copy {path}")
+
+
 class ProvenanceNamesBytes(unittest.TestCase):
     """A provenance record that cites empty strings cites nothing.
 

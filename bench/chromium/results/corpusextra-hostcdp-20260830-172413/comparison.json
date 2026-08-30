@@ -1,0 +1,472 @@
+{
+ "vm_run": "/home/ubuntu/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus",
+ "run_id": "b6c7c20926674e76aa8bdc8e329dd6aa",
+ "cell": {
+  "cpu": 2,
+  "memory_mib": 1024,
+  "backend": "uffd",
+  "uffd_mode": "minor",
+  "snapshot": "cb-req-corpus",
+  "image_id": "sha256:334fc21f7c8c82c172a2981d9f5df98df73c3c667c4b96b1e4cdd62f001fb576",
+  "source_revision": "55756858d46347f00bac3f66f1f5cacf3411bbb8",
+  "fcvm_sha256": "e18eae60578c5046c62b376fc34c5e193d1207088a30f5a2666068c5772c7e3c",
+  "runtime_bundle_sha256": "81ab7a2f0ebb8d4ddb599c1d3edecb6c37d0ce4c66bbb609dc2d82af7009e859",
+  "host_kernel_release": "6.17.0-1019-aws",
+  "host_machine": "aarch64"
+ },
+ "vm": {
+  "arm": "cdp",
+  "blocking_ms": {
+   "n": 202,
+   "p50": 712.6,
+   "p95": 3694.9,
+   "mean": 1046.4
+  },
+  "wall_ms": {
+   "n": 202,
+   "p50": 780.5,
+   "p95": 3812.5,
+   "mean": 1133.8
+  },
+  "driver_total_ms": {
+   "n": 202,
+   "p50": 669.7,
+   "p95": 3652.1,
+   "mean": 1000.3
+  },
+  "load_event_ms": {
+   "n": 202,
+   "p50": 383.4,
+   "p95": 3167.4,
+   "mean": 707.1
+  },
+  "per_url_blocking_p50": {
+   "https://example.com/": {
+    "n": 15,
+    "p50": 430.9
+   },
+   "https://news.ycombinator.com/": {
+    "n": 15,
+    "p50": 527.9
+   },
+   "https://developers.cloudflare.com/": {
+    "n": 15,
+    "p50": 873.3
+   },
+   "https://blog.cloudflare.com/": {
+    "n": 15,
+    "p50": 813.3
+   },
+   "https://en.wikipedia.org/": {
+    "n": 15,
+    "p50": 843.0
+   },
+   "https://developer.mozilla.org/en-US/": {
+    "n": 15,
+    "p50": 829.0
+   },
+   "https://www.elmundo.es/": {
+    "n": 14,
+    "p50": 3842.3
+   },
+   "https://www.rtp.pt/noticias/": {
+    "n": 14,
+    "p50": 2563.4
+   },
+   "https://www.theguardian.com/international": {
+    "n": 14,
+    "p50": 1188.6
+   },
+   "https://todomvc.com/examples/javascript-es6/dist/": {
+    "n": 14,
+    "p50": 553.6
+   },
+   "https://todomvc.com/examples/react/dist/index.html": {
+    "n": 14,
+    "p50": 549.9
+   },
+   "https://todomvc.com/examples/vue/dist/": {
+    "n": 14,
+    "p50": 555.6
+   },
+   "https://todomvc.com/examples/angular/dist/browser/": {
+    "n": 14,
+    "p50": 611.8
+   },
+   "https://todomvc.com/examples/preact/dist/": {
+    "n": 14,
+    "p50": 542.9
+   }
+  },
+  "per_url_load_p50": {
+   "https://example.com/": {
+    "n": 15,
+    "p50": 83.9
+   },
+   "https://news.ycombinator.com/": {
+    "n": 15,
+    "p50": 189.6
+   },
+   "https://developers.cloudflare.com/": {
+    "n": 15,
+    "p50": 551.7
+   },
+   "https://blog.cloudflare.com/": {
+    "n": 15,
+    "p50": 502.7
+   },
+   "https://en.wikipedia.org/": {
+    "n": 15,
+    "p50": 454
+   },
+   "https://developer.mozilla.org/en-US/": {
+    "n": 15,
+    "p50": 432.9
+   },
+   "https://www.elmundo.es/": {
+    "n": 14,
+    "p50": 3326.8
+   },
+   "https://www.rtp.pt/noticias/": {
+    "n": 14,
+    "p50": 2170.9
+   },
+   "https://www.theguardian.com/international": {
+    "n": 14,
+    "p50": 835.1
+   },
+   "https://todomvc.com/examples/javascript-es6/dist/": {
+    "n": 14,
+    "p50": 245.8
+   },
+   "https://todomvc.com/examples/react/dist/index.html": {
+    "n": 14,
+    "p50": 250.8
+   },
+   "https://todomvc.com/examples/vue/dist/": {
+    "n": 14,
+    "p50": 257.3
+   },
+   "https://todomvc.com/examples/angular/dist/browser/": {
+    "n": 14,
+    "p50": 324.3
+   },
+   "https://todomvc.com/examples/preact/dist/": {
+    "n": 14,
+    "p50": 251.3
+   }
+  }
+ },
+ "vm_noop": {
+  "blocking_ms": {
+   "n": 202,
+   "p50": 44.8,
+   "p95": 68.2,
+   "mean": 47.8
+  },
+  "wall_ms": {
+   "n": 202,
+   "p50": 340.0,
+   "p95": 384.4,
+   "mean": 343.3
+  }
+ },
+ "hosts": {
+  "host-free": {
+   "dir": "/home/ubuntu/fcvm/bench/chromium/results/corpusextra-hostcdp-20260830-172413/hostcdp-free",
+   "cpus": null,
+   "image_id": "334fc21f7c8c82c172a2981d9f5df98df73c3c667c4b96b1e4cdd62f001fb576",
+   "resolve_all_to": "127.0.0.1",
+   "reps": 230,
+   "warmup": 28,
+   "wall_ms": {
+    "n": 202,
+    "p50": 284.2,
+    "p95": 1807.5,
+    "mean": 441.3
+   },
+   "driver_total_ms": {
+    "n": 202,
+    "p50": 237.2,
+    "p95": 1760.0,
+    "mean": 394.1
+   },
+   "load_event_ms": {
+    "n": 202,
+    "p50": 113.6,
+    "p95": 1602.8,
+    "mean": 305.6
+   },
+   "per_url_wall_p50": {
+    "https://example.com/": {
+     "n": 15,
+     "p50": 137.5
+    },
+    "https://news.ycombinator.com/": {
+     "n": 15,
+     "p50": 176.4
+    },
+    "https://developers.cloudflare.com/": {
+     "n": 15,
+     "p50": 302.9
+    },
+    "https://blog.cloudflare.com/": {
+     "n": 15,
+     "p50": 289.7
+    },
+    "https://en.wikipedia.org/": {
+     "n": 15,
+     "p50": 408.4
+    },
+    "https://developer.mozilla.org/en-US/": {
+     "n": 15,
+     "p50": 303.0
+    },
+    "https://www.elmundo.es/": {
+     "n": 14,
+     "p50": 2058.8
+    },
+    "https://www.rtp.pt/noticias/": {
+     "n": 14,
+     "p50": 1151.8
+    },
+    "https://www.theguardian.com/international": {
+     "n": 14,
+     "p50": 518.5
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+     "n": 14,
+     "p50": 155.0
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+     "n": 14,
+     "p50": 153.8
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+     "n": 14,
+     "p50": 146.1
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+     "n": 14,
+     "p50": 206.2
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+     "n": 14,
+     "p50": 122.3
+    }
+   },
+   "per_url_load_p50": {
+    "https://example.com/": {
+     "n": 15,
+     "p50": 9.2
+    },
+    "https://news.ycombinator.com/": {
+     "n": 15,
+     "p50": 40.9
+    },
+    "https://developers.cloudflare.com/": {
+     "n": 15,
+     "p50": 154.9
+    },
+    "https://blog.cloudflare.com/": {
+     "n": 15,
+     "p50": 165.6
+    },
+    "https://en.wikipedia.org/": {
+     "n": 15,
+     "p50": 274.5
+    },
+    "https://developer.mozilla.org/en-US/": {
+     "n": 15,
+     "p50": 114.5
+    },
+    "https://www.elmundo.es/": {
+     "n": 14,
+     "p50": 1881.4
+    },
+    "https://www.rtp.pt/noticias/": {
+     "n": 14,
+     "p50": 1002.3
+    },
+    "https://www.theguardian.com/international": {
+     "n": 14,
+     "p50": 382.8
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+     "n": 14,
+     "p50": 42.4
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+     "n": 14,
+     "p50": 34.6
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+     "n": 14,
+     "p50": 32.7
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+     "n": 14,
+     "p50": 72.4
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+     "n": 14,
+     "p50": 21.7
+    }
+   }
+  },
+  "host-cpu2": {
+   "dir": "/home/ubuntu/fcvm/bench/chromium/results/corpusextra-hostcdp-20260830-172413/hostcdp-cpu2",
+   "cpus": "2",
+   "image_id": "334fc21f7c8c82c172a2981d9f5df98df73c3c667c4b96b1e4cdd62f001fb576",
+   "resolve_all_to": "127.0.0.1",
+   "reps": 230,
+   "warmup": 28,
+   "wall_ms": {
+    "n": 202,
+    "p50": 291.8,
+    "p95": 2043.0,
+    "mean": 471.1
+   },
+   "driver_total_ms": {
+    "n": 202,
+    "p50": 244.7,
+    "p95": 1995.4,
+    "mean": 424.2
+   },
+   "load_event_ms": {
+    "n": 202,
+    "p50": 115.3,
+    "p95": 1899.7,
+    "mean": 336.5
+   },
+   "per_url_wall_p50": {
+    "https://example.com/": {
+     "n": 15,
+     "p50": 137.3
+    },
+    "https://news.ycombinator.com/": {
+     "n": 15,
+     "p50": 176.2
+    },
+    "https://developers.cloudflare.com/": {
+     "n": 15,
+     "p50": 325.2
+    },
+    "https://blog.cloudflare.com/": {
+     "n": 15,
+     "p50": 316.2
+    },
+    "https://en.wikipedia.org/": {
+     "n": 15,
+     "p50": 392.1
+    },
+    "https://developer.mozilla.org/en-US/": {
+     "n": 15,
+     "p50": 319.6
+    },
+    "https://www.elmundo.es/": {
+     "n": 14,
+     "p50": 2113.6
+    },
+    "https://www.rtp.pt/noticias/": {
+     "n": 14,
+     "p50": 1454.5
+    },
+    "https://www.theguardian.com/international": {
+     "n": 14,
+     "p50": 568.8
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+     "n": 14,
+     "p50": 153.9
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+     "n": 14,
+     "p50": 139.3
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+     "n": 14,
+     "p50": 171.4
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+     "n": 14,
+     "p50": 206.4
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+     "n": 14,
+     "p50": 122.1
+    }
+   },
+   "per_url_load_p50": {
+    "https://example.com/": {
+     "n": 15,
+     "p50": 9.4
+    },
+    "https://news.ycombinator.com/": {
+     "n": 15,
+     "p50": 41.3
+    },
+    "https://developers.cloudflare.com/": {
+     "n": 15,
+     "p50": 160.5
+    },
+    "https://blog.cloudflare.com/": {
+     "n": 15,
+     "p50": 189.2
+    },
+    "https://en.wikipedia.org/": {
+     "n": 15,
+     "p50": 273.9
+    },
+    "https://developer.mozilla.org/en-US/": {
+     "n": 15,
+     "p50": 131.4
+    },
+    "https://www.elmundo.es/": {
+     "n": 14,
+     "p50": 1949.4
+    },
+    "https://www.rtp.pt/noticias/": {
+     "n": 14,
+     "p50": 1293.2
+    },
+    "https://www.theguardian.com/international": {
+     "n": 14,
+     "p50": 431.8
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+     "n": 14,
+     "p50": 42.9
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+     "n": 14,
+     "p50": 34.3
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+     "n": 14,
+     "p50": 32.4
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+     "n": 14,
+     "p50": 72.9
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+     "n": 14,
+     "p50": 21.9
+    }
+   }
+  }
+ },
+ "ratios": {
+  "host-free": {
+   "vm_blocking_over_host_wall": 2.51,
+   "vm_driver_total_over_host_driver_total": 2.82,
+   "vm_load_event_over_host_load_event": 3.38
+  },
+  "host-cpu2": {
+   "vm_blocking_over_host_wall": 2.44,
+   "vm_driver_total_over_host_driver_total": 2.74,
+   "vm_load_event_over_host_load_event": 3.33
+  }
+ }
+}

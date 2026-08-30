@@ -37,6 +37,29 @@ results/**
 # The withdrawal marker: its first line is why the run may never be quoted,
 # and campaign_summary refuses the run while it is present.
 !results/**/WITHDRAWN
+# The corpus-extra campaign (memory and per-render CPU, fcvm clones against host
+# containers): the analysis, the records it is recomputable from, and the bytes
+# that produced them. Its raw logs are deliberately absent -- see the commit that
+# added the run for what stayed on the box and why.
+!results/**/provenance.json
+!results/**/comparison.json
+!results/**/cputime.json
+!results/**/samples.jsonl
+!results/**/phase.log
+!results/**/corpus-serve.status
+!results/**/memory-cpu-analysis.md
+!results/**/recompute_memory_cpu.py
+# reqbench.jsonl is analysis.json's only input: analysis_identity.inputs pins it
+# by sha256 and every headline cites line ranges in it, so without it a published
+# number survives but stops being recomputable.
+!results/**/reqbench.jsonl
+# The scripts a run froze beside itself. provenance.json hashes them; this is the
+# copy those hashes name, and for a script that is not in the tree it is the only
+# record of what ran.
+!results/**/harness/*
+# A gate that fired: the diag summary of a campaign that was refused, kept so the
+# refusal is checkable rather than only remembered.
+!results/**/notes/*.json
 !results/**/cpuprobe-*-curated.json
 !results/**/webkit-host-probe.json
 __pycache__/

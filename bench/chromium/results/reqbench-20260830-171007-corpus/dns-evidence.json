@@ -1,0 +1,30 @@
+{
+  "run_id": "b6c7c20926674e76aa8bdc8e329dd6aa",
+  "serve_pid": 18128,
+  "dnsmasq_was_active_before": false,
+  "dnsmasq_active_after_restore": false,
+  "dnsmasq_state_after_restore": "inactive",
+  "sampler_alive_at_stop": true,
+  "samples": 40,
+  "sample_interval_s": 10,
+  "owner_log": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/dns-owner.log",
+  "load_max_1min": 2.87,
+  "load_samples": 40,
+  "first_mismatch": null,
+  "verify_files": [
+    "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/verify-dns-pre.json",
+    "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/verify-dns-before-run.json",
+    "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/verify-dns-after-run.json"
+  ],
+  "verify_file_sha256": {
+    "verify-dns-pre.json": "c769476621d97e795e00ab5d379e88e516bfdd4817cd1337dc585b5e8eaddcc3",
+    "verify-dns-before-run.json": "f965102e59903a6db53dfc3357fa42e28e965a8c6f6d3b79dc85fe0cfac7eb52",
+    "verify-dns-after-run.json": "91f769a80087b79b703e54c8de094a4851b709419f4a3c44e7be34ac43057c01"
+  },
+  "corpus_dns_log_sha256": "c54276e60c329e4b9f50840b90f698b9198ac0b7e188fbfc201c20399289c7f8",
+  "replay_queries_log_sha256": "ef74d7ac1c09ccbcf7d94a2869b4c8dfdfa7e6e4fc857e5eb5b047a366f7f9b0",
+  "corpus_access_log_sha256": "b205f24f5fa3508e818c3db46d79280d35dd92d7e32a07b5654ada278d41c201",
+  "corpus_serve_exit_status": 0,
+  "reason": null,
+  "verdict": "clean"
+}

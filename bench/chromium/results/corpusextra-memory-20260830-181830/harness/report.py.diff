@@ -1,0 +1,33 @@
+diff --git a/bench/chromium/report.py b/bench/chromium/report.py
+index 21638366..9e509d7b 100755
+--- a/bench/chromium/report.py
++++ b/bench/chromium/report.py
+@@ -73,11 +73,23 @@ def cgroup_bytes(cg_path):
+ 
+ 
+ def cgroup_procs(cg_path):
+-    try:
+-        with open(os.path.join(cg_path, "cgroup.procs")) as f:
+-            return [int(x) for x in f.read().split()]
+-    except (OSError, ValueError):
+-        return []
++    """Every pid in this cgroup SUBTREE.
++
++    Not just this node: rootless podman nests a container's processes one level
++    below the cgroup `podman inspect` names, so a single-node read returns an
++    empty list while memory.current still counts them, and PSS silently comes
++    back 0 for that side alone.
++    """
++    pids = []
++    for root, _dirs, files in os.walk(cg_path):
++        if "cgroup.procs" not in files:
++            continue
++        try:
++            with open(os.path.join(root, "cgroup.procs")) as f:
++                pids.extend(int(x) for x in f.read().split())
++        except (OSError, ValueError):
++            continue
++    return pids
+ 
+ 
+ def cgroup_stat(cg_path):
