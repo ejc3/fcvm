@@ -23,13 +23,41 @@ import time
 KITESURF_CONTEXT = """\
 ### Published comparator (context, not measured here)
 
-Kitesurf's published per-instance numbers for warm browser pools, quoted for
-context: **57.8 MiB** per screenshot-service instance and **271 MiB** per full
-Chromium instance; their CPU-time screenshot comparison was **380 ms vs 1173 ms**
-(~3x) with a **1.7-1.8x wall-clock advantage** for the lighter engine.
-Caveats: their numbers come from an AMD EPYC fleet and are CPU-time metrics;
-this report is wall-clock on a single ARM64 Graviton box that runs other test
-workloads concurrently. Directional comparison only."""
+Cloudflare publishes six rows comparing Kitesurf against a warm Chromium pool,
+medians of five Browser Run quick-action runs over a 14-URL corpus. Kitesurf
+spends more wall time in order to use far less CPU and memory. Chromium is the
+faster of the two on the stopwatch.
+
+| metric | Kitesurf | Chromium (warm pool) | Kitesurf, relative |
+|---|---|---|---|
+| CPU, screenshot | 380 ms | 1,173 ms | 3.1x less CPU |
+| CPU, HTML extraction | 229 ms | 877 ms | 3.8x less CPU |
+| memory, screenshot | 57.8 MiB | 271.0 MiB | 4.7x less memory |
+| memory, HTML extraction | 39.4 MiB | 273.7 MiB | 7.0x less memory |
+| wall, screenshot | 1,148 ms | 637 ms | 1.8x slower |
+| wall, HTML extraction | 820 ms | 472 ms | 1.7x slower |
+
+Their summary: "Kitesurf wins on the memory and CPU that drive your bill (by
+3-7x), while Chromium wins wall time because a warm just-in-time compiler beats
+a cold software renderer."
+
+Every figure above was verified on 2026-08-30 against
+https://developers.cloudflare.com/browser-run/kitesurf/, which carries the same
+table as https://blog.cloudflare.com/kitesurf/.
+
+Comparable: the workload. bench/chromium/corpus_mirror.sh mirrors the same
+public corpus they benchmarked (kitesurf.cloudflare.app/corpus.txt, 14 URLs),
+so both sides render the same page list rather than unrelated pages. Their two
+wall-time rows also measure the axis this report measures.
+
+Not comparable: everything else. Their page does not state what hardware
+produced these numbers; this report runs on a single ARM64 Graviton box that
+runs other test workloads concurrently, so absolutes do not transfer. Their CPU
+rows are CPU-time per operation, and their memory rows are per browser-engine
+instance, while this report accounts memory through cgroup and PSS bases over a
+whole process set. Their Chromium column is a warm pool, not a per-request
+isolate. Quoted context only; the numbers in this report are measured
+independently of it."""
 
 
 # ---------------------------------------------------------------------------
