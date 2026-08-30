@@ -2156,7 +2156,12 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
     SOURCES = (
         "corpus_extra.sh", "corpus_mem.py", "hostcdp.sh", "cdpdrive.py",
         "render.py", "corpus_serve.py", "report.py", "reqbench.py",
-        "owned_process.py", "corpus_campaign.sh",
+        "reqbench.sh", "reqanalyze.py", "wddrive.py", "owned_process.py",
+        "corpus_campaign.sh",
+    )
+    REQBENCH_SOURCES = (
+        "fcvm", "fc-agent", "reqbench.sh", "reqbench.py", "reqanalyze.py",
+        "cdpdrive.py", "render.py", "wddrive.py",
     )
 
     def test_staged_bundle_is_independent_of_later_repository_edits(self):
@@ -2182,20 +2187,32 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
             fcvm = os.path.join(repo, "target", "release", "fcvm")
             with open(fcvm, "w") as handle:
                 handle.write("original fcvm\n")
+            fc_agent = os.path.join(repo, "target", "release", "fc-agent")
+            with open(fc_agent, "w") as handle:
+                handle.write("original fc-agent\n")
             script = (
                 "set -euo pipefail\n"
                 f"SOURCE_BENCH={bench!r}\nREPO={repo!r}\nRESULTS={results!r}\n"
                 + match.group(0) + "\n"
-                + "stage_runtime_bundle\nprintf '%s\\n' \"$BUNDLE_DIR\"\n"
+                + "stage_runtime_bundle\nprintf '%s\\n%s\\n' \"$BUNDLE_DIR\" \"$REQBENCH_BUNDLE_SHA256\"\n"
             )
             proc = subprocess.run(["bash", "-c", script], capture_output=True,
                                   text=True, timeout=60)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            bundle = proc.stdout.strip().splitlines()[-1]
+            bundle, reqbench_digest = proc.stdout.strip().splitlines()[-2:]
             with open(os.path.join(bench, "corpus_mem.py"), "w") as handle:
                 handle.write("mutated after staging\n")
             with open(os.path.join(bundle, "corpus_mem.py")) as handle:
                 self.assertEqual(handle.read(), "original corpus_mem.py\n")
+            for name in self.SOURCES + ("fcvm", "fc-agent"):
+                self.assertTrue(os.path.isfile(os.path.join(bundle, name)), name)
+            with open(os.path.join(bundle, "REQBENCH_MANIFEST.sha256"), "rb") as handle:
+                manifest_bytes = handle.read()
+            self.assertEqual(hashlib.sha256(manifest_bytes).hexdigest(), reqbench_digest)
+            self.assertEqual(
+                [line.split()[-1].decode() for line in manifest_bytes.splitlines()],
+                list(self.REQBENCH_SOURCES),
+            )
             verified = subprocess.run(
                 ["sha256sum", "--check", "--status", "MANIFEST.sha256"],
                 cwd=bundle, capture_output=True, text=True, timeout=60)
