@@ -17,10 +17,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
@@ -28,6 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import corpus_mem  # noqa: E402
+import report as bench_report  # noqa: E402
 
 EXTRA = os.path.join(HERE, "corpus_extra.sh")
 CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
@@ -96,6 +99,46 @@ class MemoryCellSchedule(unittest.TestCase):
                       "main can bypass the interleaved schedule the test exercises")
         self.assertIn("for side_name, n, rep, url_indices in schedule:", main)
         self.assertRegex(main, r"run_cell\(\s*sides\[side_name\], args, n, rep, url_indices, out\)")
+
+
+class SnapshotGenerationLease(unittest.TestCase):
+    """Every measured clone must consume the generation recorded in run.json."""
+
+    def test_generation_is_read_under_a_shared_lease_held_by_the_caller(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            snapshots = os.path.join(data_root, "snapshots")
+            os.makedirs(snapshots)
+            lock_path = os.path.join(snapshots, "golden.lock")
+            open(lock_path, "a").close()
+            generation = {"generation_id": "generation-under-test"}
+            with mock.patch.object(corpus_mem, "snapshot_generation",
+                                   return_value=generation):
+                with ExitStack() as resources:
+                    actual = corpus_mem.snapshot_generation_under_lease(
+                        resources, data_root, "golden")
+                    probe = subprocess.run(
+                        ["flock", "-x", "-n", lock_path, "true"],
+                        capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(
+                        probe.returncode, 0,
+                        "a creator could replace the recorded generation during the run",
+                    )
+                    self.assertIs(actual, generation)
+                probe = subprocess.run(
+                    ["flock", "-x", "-n", lock_path, "true"],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+
+    def test_main_uses_the_whole_run_resource_stack_for_the_snapshot_lease(self):
+        with open(os.path.join(HERE, "corpus_mem.py")) as handle:
+            source = handle.read()
+        self.assertIn("def main_with_resources(resources", source)
+        body = source[source.index("def main_with_resources(resources"):]
+        lease = body.find("snapshot_generation_under_lease(resources")
+        serve = body.find("fcvm_side.start_serve()")
+        self.assertGreaterEqual(lease, 0)
+        self.assertGreater(serve, lease,
+                           "the serve can load a generation before the lease is held")
 
 
 class RunScopedContainerCleanup(unittest.TestCase):
@@ -190,6 +233,69 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertIn('setsid "$@"', source,
                       "killing only the phase parent can leave its VMM children running")
         self.assertIn('kill -TERM -- "-$pid"', source)
+
+    def test_a_phase_leader_cannot_leave_an_untracked_descendant(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        functions = []
+        for name in ("stop_active_phase", "run_logged"):
+            match = re.search(rf'^{name}\(\) \{{\n.*?^\}}', source,
+                              re.MULTILINE | re.DOTALL)
+            self.assertIsNotNone(match, f"{name} is gone")
+            functions.append(match.group(0))
+        with tempfile.TemporaryDirectory() as tmp:
+            child_pid = os.path.join(tmp, "child.pid")
+            log_path = os.path.join(tmp, "phase.log")
+            script = (
+                "set -uo pipefail\n"
+                "say() { :; }\n"
+                "ACTIVE_PHASE_PID=\n"
+                + "\n".join(functions) + "\n"
+                + "set +e\n"
+                + f"CHILD_PID={child_pid!r} run_logged {log_path!r} "
+                  "sh -c 'sleep 60 </dev/null >/dev/null 2>&1 & "
+                  "echo $! >\"$CHILD_PID\"'\n"
+                + "phase_rc=$?\n"
+                + f"child=$(cat {child_pid!r})\n"
+                + "if kill -0 \"$child\" 2>/dev/null; then "
+                  "echo SURVIVED; kill -KILL \"$child\" 2>/dev/null || true; fi\n"
+                + "exit \"$phase_rc\"\n"
+            )
+            proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                                  text=True, timeout=20)
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "run_logged reported success after its process group outlived the leader",
+        )
+        self.assertNotIn("SURVIVED", proc.stdout,
+                         "the descendant escaped both phase accounting and cleanup")
+
+    def test_a_failed_name_collision_never_makes_the_peer_owned(self):
+        args = SimpleNamespace(image="image", urls=["https://example.com/"],
+                               container_owner_token="a" * 32)
+        side = corpus_mem.ContainerSide(args, "b" * 32)
+        removed = []
+
+        def bounded(cmd, _timeout):
+            if cmd[:3] == ["podman", "run", "-d"]:
+                return Completed(125, "", "name is already in use")
+            if cmd[:3] == ["podman", "rm", "-f"]:
+                removed.append(cmd[-1])
+                return Completed()
+            if cmd[:3] == ["podman", "inspect", "--format"]:
+                return Completed(0, "peer-id peer-owner\n", "")
+            if cmd[:3] == ["podman", "container", "exists"]:
+                return Completed(0, "", "")
+            if cmd[:3] == ["podman", "ps", "-a"]:
+                return Completed(0, "", "")
+            return Completed()
+
+        with mock.patch.object(corpus_mem, "sh_bounded", bounded):
+            with self.assertRaises(SystemExit):
+                side.bring_up(1, "host1r1", [0])
+            side.stop_all()
+        self.assertEqual(removed, [],
+                         "cleanup deleted a same-name container this run did not create")
 
     def test_shared_replay_ports_are_locked_before_dnsmasq_is_touched(self):
         with open(EXTRA) as handle:
@@ -502,6 +608,12 @@ class ZeroBasis(unittest.TestCase):
         s = {"clones": 2, "clone_procs": 8, "clone_cgroup_kb": 500_000,
              "clone_pss_kb": 400_000}
         self.assertEqual(corpus_mem.empty_bases(s, "fcvm-clone"), [])
+
+    def test_an_unreadable_cgroup_root_is_not_a_zero_measurement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "disappeared")
+            with self.assertRaises(bench_report.CgroupReadError):
+                bench_report.measure_cgroup_set(missing, "serve-")
 
 
 class BoundedAttempt(unittest.TestCase):
@@ -1138,9 +1250,9 @@ class ComparePublicationGate(unittest.TestCase):
                 record["run_json_sha256"] = run_json_sha256
                 handle.write(json.dumps(record) + "\n")
 
-    def run_compare(self, run_dir, hosts=()):
-        out = os.path.join(run_dir, "comparison.json")
-        argv = [sys.executable, os.path.join(HERE, "compare.py"),
+    def run_compare(self, run_dir, hosts=(), out=None, script=None):
+        out = out or os.path.join(run_dir, "comparison.json")
+        argv = [sys.executable, script or os.path.join(HERE, "compare.py"),
                 "--vm-run", run_dir]
         for label, host_dir in hosts:
             argv.extend(["--host", f"{label}={host_dir}"])
@@ -1148,6 +1260,58 @@ class ComparePublicationGate(unittest.TestCase):
         return subprocess.run(
             argv,
             capture_output=True, text=True, timeout=60), out
+
+    def test_output_cannot_name_or_alias_any_input(self):
+        cases = ("analysis", "reqbench", "host-run", "host-rows",
+                 "analysis-symlink", "analysis-hardlink")
+        for case in cases:
+            with self.subTest(case=case):
+                run, host = self.valid_comparison()
+                inputs = {
+                    "analysis": os.path.join(run, "analysis.json"),
+                    "reqbench": os.path.join(run, "reqbench.jsonl"),
+                    "host-run": os.path.join(host, "run.json"),
+                    "host-rows": os.path.join(host, "hostcdp.jsonl"),
+                }
+                if case == "analysis-symlink":
+                    out = os.path.join(run, "output-link.json")
+                    os.symlink(inputs["analysis"], out)
+                    protected = inputs["analysis"]
+                elif case == "analysis-hardlink":
+                    out = os.path.join(run, "output-hardlink.json")
+                    os.link(inputs["analysis"], out)
+                    protected = inputs["analysis"]
+                else:
+                    out = inputs[case]
+                    protected = out
+                with open(protected, "rb") as handle:
+                    before = handle.read()
+                proc, _ = self.run_compare(run, [("host", host)], out=out)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"--out accepted an alias of {case}",
+                )
+                self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+                with open(protected, "rb") as handle:
+                    self.assertEqual(handle.read(), before,
+                                     f"--out destroyed or rewrote {case}")
+                if case.endswith(("symlink", "hardlink")):
+                    self.assertTrue(os.path.lexists(out),
+                                    "the refused alias itself was unlinked")
+
+    def test_output_cannot_alias_the_running_comparator(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        with tempfile.TemporaryDirectory() as tmp:
+            copied = os.path.join(tmp, "compare.py")
+            shutil.copyfile(os.path.join(HERE, "compare.py"), copied)
+            with open(copied, "rb") as handle:
+                before = handle.read()
+            proc, _ = self.run_compare(run, out=copied, script=copied)
+            self.assertNotEqual(proc.returncode, 0,
+                                "the comparator overwrote its own source")
+            self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+            with open(copied, "rb") as handle:
+                self.assertEqual(handle.read(), before)
 
     def test_a_run_that_failed_its_gate_is_refused(self):
         run = self.make_run(passed=False, vm_rows=[self.vm_rep(700.0)])
