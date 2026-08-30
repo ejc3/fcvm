@@ -11,8 +11,16 @@ axis this report also measures.
 The block is prose, so these assertions pin what a prose defect actually inverts: the
 per-row numbers bound to the engine they belong to, and the direction words that
 readers take away. A column swap or a re-inverted summary fails here.
+
+Every numeric assertion is made against one parsed table row, never against the
+flattened block. Checking membership and first-occurrence order over all the block's
+numbers is satisfied by a table whose pairs have traded rows, so the report can
+attribute both pairs to the wrong metrics with the suite green. Each row is compared
+whole, label and both cells and direction together, and each row's direction word and
+multiplier are recomputed from that row's own two values.
 """
 
+import datetime
 import os
 import re
 import sys
@@ -25,20 +33,53 @@ import report  # noqa: E402
 
 BLOCK = report.KITESURF_CONTEXT
 
-# Cloudflare's table, as published. (metric, kitesurf, chromium, kitesurf_is_lower)
+# Cloudflare's table, as published: one tuple per row, cell for cell. The row is
+# the unit of truth here. A label divorced from its two values says nothing, so
+# nothing below is asserted except against the row it was published on.
+HEADER = ["metric", "Kitesurf", "Chromium (warm pool)", "Kitesurf, relative"]
 PUBLISHED = [
-    ("CPU screenshot", 380.0, 1173.0, True),
-    ("CPU HTML extraction", 229.0, 877.0, True),
-    ("memory screenshot", 57.8, 271.0, True),
-    ("memory HTML extraction", 39.4, 273.7, True),
-    ("wall screenshot", 1148.0, 637.0, False),
-    ("wall HTML extraction", 820.0, 472.0, False),
+    ("CPU, screenshot", "380 ms", "1,173 ms", "3.1x less CPU"),
+    ("CPU, HTML extraction", "229 ms", "877 ms", "3.8x less CPU"),
+    ("memory, screenshot", "57.8 MiB", "271.0 MiB", "4.7x less memory"),
+    ("memory, HTML extraction", "39.4 MiB", "273.7 MiB", "7.0x less memory"),
+    ("wall, screenshot", "1,148 ms", "637 ms", "1.8x slower"),
+    ("wall, HTML extraction", "820 ms", "472 ms", "1.7x slower"),
 ]
+
+# Cloudflare rounds its own multipliers loosely: 273.7 / 39.4 = 6.95 is published
+# as "7.0x", the widest gap in the table at 0.053.
+RATIO_TOLERANCE = 0.06
 
 
 def numbers_in(text):
     """Every number in the text, commas stripped, as floats."""
     return [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", text)]
+
+
+def one_number_in(cell):
+    """The single number a value cell carries, or None if it does not carry one."""
+    nums = numbers_in(cell)
+    return nums[0] if len(nums) == 1 else None
+
+
+def table_rows(text):
+    """The Markdown table's rows, each a list of stripped cells, separators dropped."""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(set(c) <= set("-: ") and c for c in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+ROWS = table_rows(BLOCK)
+
+# The day the six rows above were last read off Cloudflare's page.
+VERIFIED = "2026-08-30"
 
 
 class ComparatorDirection(unittest.TestCase):
@@ -72,22 +113,78 @@ class ComparatorDirection(unittest.TestCase):
             "comparator does not say Chromium is the faster of the two on wall clock",
         )
 
-    def test_every_published_row_is_quoted_with_its_engines_in_order(self):
-        """Each row's pair must appear with the numbers bound to the right engine.
+    def test_the_table_is_the_six_published_rows_under_the_published_headers(self):
+        """Column order is what binds a value to an engine, so pin the header."""
+        self.assertTrue(ROWS, "no Markdown table found in the comparator block")
+        self.assertEqual(ROWS[0], HEADER, "comparator table headers changed")
+        self.assertEqual(
+            [r[0] for r in ROWS[1:]],
+            [row[0] for row in PUBLISHED],
+            "comparator table does not carry the six published rows, in order",
+        )
 
-        Catches a column swap, which is the numeric form of the same inversion.
+    def test_each_row_binds_its_metric_to_both_values_and_its_direction(self):
+        """A row is asserted whole: label, Kitesurf cell, Chromium cell, direction.
+
+        Checking the numbers against the flattened block instead would let a pair
+        move to another metric's row, or two pairs trade rows, with every value
+        still present and every comparison still true. The report would then
+        attribute the numbers to the wrong metrics and pass.
         """
-        nums = numbers_in(BLOCK)
-        for metric, kitesurf, chromium, kitesurf_lower in PUBLISHED:
-            with self.subTest(metric=metric):
-                self.assertIn(kitesurf, nums, f"{metric}: Kitesurf value missing")
-                self.assertIn(chromium, nums, f"{metric}: Chromium value missing")
-                i, j = nums.index(kitesurf), nums.index(chromium)
-                self.assertLess(i, j, f"{metric}: engines quoted out of column order")
+        by_label = {}
+        for row in ROWS[1:]:
+            by_label.setdefault(row[0], []).append(row)
+        for expected in PUBLISHED:
+            label = expected[0]
+            with self.subTest(metric=label):
+                rows = by_label.get(label, [])
+                self.assertEqual(len(rows), 1, f"{label}: expected exactly one row")
                 self.assertEqual(
-                    kitesurf < chromium,
-                    kitesurf_lower,
-                    f"{metric}: published direction contradicted",
+                    tuple(rows[0]), expected, f"{label}: row does not match the source"
+                )
+
+    def test_each_rows_direction_word_agrees_with_that_rows_own_two_values(self):
+        """The direction is read off the row that states it, not off a constant."""
+        for row in ROWS[1:]:
+            label, kitesurf_cell, chromium_cell, relative = row
+            with self.subTest(metric=label):
+                kitesurf = one_number_in(kitesurf_cell)
+                chromium = one_number_in(chromium_cell)
+                self.assertIsNotNone(kitesurf, f"{label}: Kitesurf cell has no value")
+                self.assertIsNotNone(chromium, f"{label}: Chromium cell has no value")
+                if "less" in relative:
+                    self.assertLess(
+                        kitesurf,
+                        chromium,
+                        f"{label}: row says {relative!r} while Kitesurf spends more",
+                    )
+                elif "slower" in relative:
+                    self.assertGreater(
+                        kitesurf,
+                        chromium,
+                        f"{label}: row says {relative!r} while Kitesurf spends less",
+                    )
+                else:
+                    self.fail(f"{label}: {relative!r} states no direction")
+
+    def test_each_rows_multiplier_matches_that_rows_own_two_values(self):
+        """The stated Nx must be the ratio of the two cells beside it."""
+        for row in ROWS[1:]:
+            label, kitesurf_cell, chromium_cell, relative = row
+            with self.subTest(metric=label):
+                kitesurf = one_number_in(kitesurf_cell)
+                chromium = one_number_in(chromium_cell)
+                self.assertIsNotNone(kitesurf, f"{label}: Kitesurf cell has no value")
+                self.assertIsNotNone(chromium, f"{label}: Chromium cell has no value")
+                m = re.match(r"([\d.]+)x\b", relative)
+                self.assertIsNotNone(m, f"{label}: {relative!r} states no multiplier")
+                stated = float(m.group(1))
+                actual = max(kitesurf, chromium) / min(kitesurf, chromium)
+                self.assertLessEqual(
+                    abs(stated - actual),
+                    RATIO_TOLERANCE,
+                    f"{label}: row claims {stated}x but its own cells "
+                    f"({kitesurf_cell}, {chromium_cell}) are {actual:.2f}x apart",
                 )
 
     def test_both_workloads_are_present(self):
@@ -96,9 +193,25 @@ class ComparatorDirection(unittest.TestCase):
         self.assertRegex(BLOCK, r"(?i)HTML extraction")
 
     def test_records_the_source_and_the_verification_date(self):
+        """The date is pinned, and the block reads it from the same constant.
+
+        A date-shaped regex accepts any year and impossible calendar days, so it
+        cannot tell a real re-check from a typo.
+        """
         self.assertIn("developers.cloudflare.com/browser-run/kitesurf", BLOCK)
-        self.assertRegex(
-            BLOCK, r"20\d\d-\d\d-\d\d", "no verification date recorded for the quote"
+        self.assertEqual(
+            report.KITESURF_VERIFIED,
+            VERIFIED,
+            "the recorded verification date moved; re-check the source, then pin it here",
+        )
+        try:
+            datetime.date.fromisoformat(report.KITESURF_VERIFIED)
+        except ValueError as exc:
+            self.fail(f"verification date is not a calendar date: {exc}")
+        self.assertIn(
+            f"verified on {report.KITESURF_VERIFIED} against",
+            BLOCK,
+            "the block's prose and KITESURF_VERIFIED have drifted apart",
         )
 
     def test_states_the_corpus_is_shared(self):

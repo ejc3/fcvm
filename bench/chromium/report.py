@@ -20,7 +20,12 @@ import statistics
 import sys
 import time
 
-KITESURF_CONTEXT = """\
+# The date the six quoted Cloudflare rows were last checked against their source.
+# The prose below and test_report_kitesurf.py both read this constant, so the
+# recorded date and the asserted date cannot drift apart.
+KITESURF_VERIFIED = "2026-08-30"
+
+KITESURF_CONTEXT = f"""\
 ### Published comparator (context, not measured here)
 
 Cloudflare publishes six rows comparing Kitesurf against a warm Chromium pool,
@@ -41,7 +46,7 @@ Their summary: "Kitesurf wins on the memory and CPU that drive your bill (by
 3-7x), while Chromium wins wall time because a warm just-in-time compiler beats
 a cold software renderer."
 
-Every figure above was verified on 2026-08-30 against
+Every figure above was verified on {KITESURF_VERIFIED} against
 https://developers.cloudflare.com/browser-run/kitesurf/, which carries the same
 table as https://blog.cloudflare.com/kitesurf/.
 
