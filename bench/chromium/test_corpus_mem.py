@@ -5932,6 +5932,109 @@ sys.stdin.read(1)
                 bench_compare.main()
         self.assertFalse(os.path.exists(out))
 
+    def assert_memory_revalidation_refuses_post_fstat_race(self, action):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "summary.json")
+            replacement = os.path.join(tmp, "replacement.json")
+            with open(path, "wb") as handle:
+                handle.write(b'{"run_id":"' + b"a" * 32 + b'"}\n')
+            with open(replacement, "wb") as handle:
+                handle.write(b'{"run_id":"' + b"b" * 32 + b'"}\n')
+            expected = bench_compare.artifact_identity(
+                bench_compare.read_artifact_nofollow(path)
+            )
+            real_fstat = os.fstat
+            target_fstats = 0
+
+            def race_after_final_fstat(fd):
+                nonlocal target_fstats
+                observed = real_fstat(fd)
+                if os.path.realpath(f"/proc/self/fd/{fd}") == path:
+                    target_fstats += 1
+                    if target_fstats == 2:
+                        if action == "replace":
+                            os.replace(replacement, path)
+                        else:
+                            os.unlink(path)
+                return observed
+
+            with mock.patch.object(
+                    bench_compare.os, "fstat",
+                    side_effect=race_after_final_fstat):
+                with self.assertRaises(
+                        bench_compare.Refusal,
+                        msg=f"memory path {action} after final fstat was accepted"):
+                    bench_compare.revalidate_artifact_identity(
+                        "memory summary", expected, nofollow=True
+                    )
+            self.assertEqual(target_fstats, 2)
+
+    def test_memory_revalidation_refuses_replace_after_final_fd_stat(self):
+        self.assert_memory_revalidation_refuses_post_fstat_race("replace")
+
+    def test_memory_revalidation_refuses_unlink_after_final_fd_stat(self):
+        self.assert_memory_revalidation_refuses_post_fstat_race("unlink")
+
+    def assert_memory_publication_rolls_back_path_race(self, action):
+        run, campaign, host, _memory = self.valid_campaign_memory_comparison()
+        changed = os.path.join(campaign, "memory", "summary.json")
+        replacement = changed + ".replacement"
+        with open(replacement, "wb") as handle:
+            handle.write(b'{"run_id":"' + b"b" * 32 + b'"}\n')
+        out = os.path.join(run, "comparison.json")
+        real_link = os.link
+        raced = False
+
+        def race_at_publication(source, destination, *args, **kwargs):
+            nonlocal raced
+            if not raced and destination == os.path.basename(out):
+                if action == "replace":
+                    os.replace(replacement, changed)
+                else:
+                    os.unlink(changed)
+                raced = True
+            return real_link(source, destination, *args, **kwargs)
+
+        argv = ["compare.py", "--vm-run", run,
+                "--host", f"free={host}", "--out", out]
+        with mock.patch.object(
+                bench_compare.os, "link", side_effect=race_at_publication), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(
+                    bench_compare.Refusal,
+                    msg=f"memory path {action} at publication was accepted"):
+                bench_compare.main()
+        self.assertTrue(raced)
+        self.assertFalse(os.path.exists(out))
+
+    def test_memory_publication_rolls_back_atomic_replace_race(self):
+        self.assert_memory_publication_rolls_back_path_race("replace")
+
+    def test_memory_publication_rolls_back_unlink_race(self):
+        self.assert_memory_publication_rolls_back_path_race("unlink")
+
+    def test_publication_rollback_preserves_replaced_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "comparison.json")
+            attacker = os.path.join(tmp, "attacker.json")
+            with open(attacker, "wb") as handle:
+                handle.write(b"attacker output\n")
+            target = bench_compare.open_output_target(out)
+            try:
+                def replace_output_then_refuse():
+                    os.replace(attacker, out)
+                    raise bench_compare.Refusal("input changed after publication")
+
+                with self.assertRaises(bench_compare.Refusal):
+                    bench_compare.write_json_atomic(
+                        out, {"result": "ours"}, target,
+                        after_publish=replace_output_then_refuse,
+                    )
+            finally:
+                os.close(target["directory_fd"])
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), b"attacker output\n")
+
     def test_campaign_memory_artifacts_are_protected_inputs(self):
         for name in ("complete.json", "run.json", "samples.jsonl", "summary.json"):
             for alias_kind in ("direct", "realpath", "symlink", "hardlink"):

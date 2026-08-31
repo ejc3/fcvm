@@ -110,6 +110,12 @@ def read_artifact_nofollow(path):
     if len(raw) != after.st_size:
         raise Refusal(f"{path} changed while it was being read")
     try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise Refusal(f"{path} changed while it was being read: {error}") from error
+    if not os.path.samestat(after, current):
+        raise Refusal(f"{path} changed while it was being read")
+    try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise Refusal(f"{path} is not UTF-8: {error}") from error
@@ -334,21 +340,37 @@ def rename_noreplace(directory_fd, source, destination):
         raise OSError(error_number, os.strerror(error_number), source)
 
 
-def write_json_atomic(path, value, output_target=None, before_publish=None):
+def write_json_atomic(path, value, output_target=None, before_publish=None,
+                      after_publish=None):
     if output_target is not None:
-        return write_json_atomic_at(output_target, value, before_publish)
+        return write_json_atomic_at(
+            output_target, value, before_publish, after_publish
+        )
     directory = os.path.dirname(os.path.abspath(path)) or "."
     fd, temporary = tempfile.mkstemp(prefix=".compare-", dir=directory)
+    published = False
+    written_stat = None
     try:
         with os.fdopen(fd, "w") as handle:
             json.dump(value, handle, indent=1, allow_nan=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+            written_stat = os.fstat(handle.fileno())
         if before_publish is not None:
             before_publish()
         os.replace(temporary, path)
+        published = True
+        if after_publish is not None:
+            after_publish()
     except BaseException:
+        if published:
+            try:
+                current = os.stat(path, follow_symlinks=False)
+                if os.path.samestat(current, written_stat):
+                    os.unlink(path)
+            except FileNotFoundError:
+                pass
         try:
             os.unlink(temporary)
         except FileNotFoundError:
@@ -356,7 +378,7 @@ def write_json_atomic(path, value, output_target=None, before_publish=None):
         raise
 
 
-def write_json_atomic_at(target, value, before_publish=None):
+def write_json_atomic_at(target, value, before_publish=None, after_publish=None):
     ensure_output_directory(target)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     while True:
@@ -405,6 +427,18 @@ def write_json_atomic_at(target, value, before_publish=None):
         linked = True
         os.unlink(temporary, dir_fd=target["directory_fd"])
         temporary_exists = False
+        current = os.stat(
+            target["name"],
+            dir_fd=target["directory_fd"],
+            follow_symlinks=False,
+        )
+        if not os.path.samestat(current, written_stat):
+            raise Refusal(f"output {target['path']} changed during publication")
+        ensure_output_directory(target)
+        # A successful publication linearizes at this post-link validation.
+        # Failure rolls back only the inode linked by this writer.
+        if after_publish is not None:
+            after_publish()
         current = os.stat(
             target["name"],
             dir_fd=target["directory_fd"],
@@ -1822,6 +1856,7 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
         out,
         output_target,
         before_publish=recheck_inputs_before_publication,
+        after_publish=recheck_inputs_before_publication,
     )
     print(json.dumps({k: out[k] for k in ("cell", "vm", "vm_noop", "ratios")}, indent=1)[:6000])
     print("\nper-URL wall/blocking p50 (ms)")
