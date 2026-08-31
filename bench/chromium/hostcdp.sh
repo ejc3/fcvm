@@ -10,6 +10,16 @@
 # premium must be (VM direct-CDP) / (host direct-CDP), same driver both sides.
 set -euo pipefail
 
+case "$#" in
+    0) HOSTCDP_PROCESS_ROLE=bootstrap ;;
+    1)
+        [ "$1" = --lifecycle-worker ] \
+            || { echo "REFUSING: unknown argument '$1'" >&2; exit 2; }
+        HOSTCDP_PROCESS_ROLE=worker
+        ;;
+    *) echo "REFUSING: hostcdp accepts no user arguments" >&2; exit 2 ;;
+esac
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${IMAGE:-localhost/chromium-bench-req}"
 IMAGE_ID="${IMAGE_ID:-}"
@@ -96,6 +106,213 @@ case "$CPU_BUDGET" in
 esac
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+# The worker only writes a hidden pending summary. The bootstrap calls this
+# after the detached supervisor has drained every descendant and its mandatory
+# finalizer has returned, so neither artifact can authorize a run whose outer
+# lifecycle later fails.
+publish_complete() {
+    python3 - "$RESULTS/complete.json" "$RUNID" \
+            "$RESULTS/run.json" "$RESULTS/hostcdp.jsonl" \
+            "$RESULTS/.summary.pending" "$RESULTS/summary.json" \
+            "$RESULTS/.summary.lock" "$RESULTS/WITHDRAWN" <<'PY'
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+
+(output_path, run_id, run_path, rows_path, pending_summary_path,
+ summary_path, lock_path, withdrawn_path) = sys.argv[1:]
+directory = os.path.dirname(output_path)
+
+
+def identity(path):
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return {"size": size, "sha256": digest.hexdigest()}
+
+
+def write_withdrawn(reason):
+    fd, temporary = tempfile.mkstemp(prefix=".withdrawn.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as target:
+            target.write(reason.replace("\n", " ") + "\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, withdrawn_path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+lock_fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+temporary = None
+try:
+    lock_stat = os.fstat(lock_fd)
+    if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+        raise RuntimeError("permanent summary lock is not one regular file")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    if os.path.exists(withdrawn_path):
+        raise RuntimeError("worker withdrew the run before publication")
+    if os.path.lexists(output_path) or os.path.lexists(summary_path):
+        raise RuntimeError("publication target already exists")
+    with open(pending_summary_path, "r") as source:
+        pending_summary = json.load(source)
+    if not isinstance(pending_summary, dict):
+        raise RuntimeError("pending summary is not a JSON object")
+
+    record = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "artifacts": {
+            "run.json": identity(run_path),
+            "hostcdp.jsonl": identity(rows_path),
+        },
+    }
+    os.replace(pending_summary_path, summary_path)
+    fd, temporary = tempfile.mkstemp(prefix=".complete.", dir=directory)
+    with os.fdopen(fd, "w") as target:
+        json.dump(record, target, sort_keys=True)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, output_path)
+    temporary = None
+    if os.environ.get("HOSTCDP_COMPLETE_FAIL_AFTER_RENAME") == "1":
+        raise OSError("injected failure after completion rename")
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException as error:
+    if temporary is not None:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    invalidation_error = None
+    for path in (output_path, summary_path, pending_summary_path):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            invalidation_error = invalidation_error or exc
+    try:
+        write_withdrawn(
+            f"hostcdp publication failed: {type(error).__name__}: {error}"
+        )
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        invalidation_error = invalidation_error or exc
+    if invalidation_error is not None:
+        raise RuntimeError(
+            f"publication failed and invalidation was incomplete: {invalidation_error}"
+        ) from error
+    raise
+finally:
+    os.close(lock_fd)
+PY
+}
+
+withdraw_guarded_run() {
+    local reason=$1
+    [ -d "$RESULTS" ] || return 0
+    python3 - "$RESULTS" "$reason" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+import tempfile
+
+directory, reason = sys.argv[1:]
+lock_path = os.path.join(directory, ".summary.lock")
+lock_fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+try:
+    lock_stat = os.fstat(lock_fd)
+    if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+        raise RuntimeError("permanent summary lock is not one regular file")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    for name in ("complete.json", "summary.json", ".summary.pending"):
+        try:
+            os.unlink(os.path.join(directory, name))
+        except FileNotFoundError:
+            pass
+
+    output_path = os.path.join(directory, "WITHDRAWN")
+    fd, temporary = tempfile.mkstemp(prefix=".withdrawn.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as target:
+            target.write(reason.replace("\n", " ") + "\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, output_path)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+finally:
+    os.close(lock_fd)
+PY
+}
+
+if [ "$HOSTCDP_PROCESS_ROLE" = bootstrap ]; then
+    export RUNID RESULTS CONTAINER_OWNER_TOKEN
+    create_lock_dir="${CONTAINER_CREATE_OPS_DIR:-$RESULTS/container-create-ops}"
+    create_lock_path="$create_lock_dir/hostcdp-$RUNID-$CONTAINER_OWNER_TOKEN.lock"
+    guardian_parent=$BASHPID
+    FCVM_FINALIZER_MODE=container \
+            FCVM_CONTAINER_NAME="$CNAME" \
+            FCVM_CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
+            FCVM_CONTAINER_CREATE_LOCK_PATH="$create_lock_path" \
+            python3 "$HERE/phase_supervisor.py" \
+                --detach --expected-parent "$guardian_parent" \
+                --finalizer "$HERE/host_resource_finalizer.py" \
+                --finalizer-timeout 180 -- \
+                bash "$HERE/hostcdp.sh" --lifecycle-worker &
+    guardian_pid=$!
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    set +e
+    wait "$guardian_pid"
+    guardian_rc=$?
+    set -e
+    trap - INT TERM
+    if [ "$guardian_rc" -eq 0 ]; then
+        if publish_complete; then
+            exit 0
+        else
+            guardian_rc=$?
+        fi
+    elif ! withdraw_guarded_run \
+            "hostcdp outer lifecycle exited $guardian_rc; raw completion is not authorized"; then
+        log "FAILED: outer lifecycle withdrawal was incomplete"
+    fi
+    exit "$guardian_rc"
+fi
+
 REPO=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) || REPO=""
 
 compute_harness_sha256() {
@@ -166,61 +383,6 @@ verify_container_image() {
         || { log "REFUSING: container $reference uses image $actual, expected $runtime_image_id"; return 2; }
 }
 
-publish_complete() {
-    python3 - "$RESULTS/complete.json" "$RUNID" \
-            "$RESULTS/run.json" "$RESULTS/hostcdp.jsonl" <<'PY'
-import hashlib
-import json
-import os
-import sys
-import tempfile
-
-output_path, run_id, run_path, rows_path = sys.argv[1:]
-
-
-def identity(path):
-    digest = hashlib.sha256()
-    size = 0
-    with open(path, "rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            size += len(chunk)
-            digest.update(chunk)
-    return {"size": size, "sha256": digest.hexdigest()}
-
-
-record = {
-    "schema_version": 1,
-    "run_id": run_id,
-    "artifacts": {
-        "run.json": identity(run_path),
-        "hostcdp.jsonl": identity(rows_path),
-    },
-}
-directory = os.path.dirname(output_path)
-fd, temporary = tempfile.mkstemp(prefix=".complete.", dir=directory)
-try:
-    with os.fdopen(fd, "w") as target:
-        json.dump(record, target, sort_keys=True)
-        target.write("\n")
-        target.flush()
-        os.fsync(target.fileno())
-    os.replace(temporary, output_path)
-    if os.environ.get("HOSTCDP_COMPLETE_FAIL_AFTER_RENAME") == "1":
-        raise OSError("injected failure after completion rename")
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-except BaseException:
-    try:
-        os.unlink(temporary)
-    except FileNotFoundError:
-        pass
-    raise
-PY
-}
-
 compute_live_reqbench_bundle_sha256() {
     python3 - "$HERE" "$REPO/target/release/fcvm" "$REPO/target/release/fc-agent" <<'PY'
 import hashlib
@@ -286,9 +448,12 @@ hostcdp_sha256=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
     || { log "REFUSING: cannot hash hostcdp.sh"; exit 2; }
 phase_supervisor_sha256=$(sha256sum "$HERE/phase_supervisor.py" | cut -d' ' -f1) \
     || { log "REFUSING: cannot hash phase_supervisor.py"; exit 2; }
+host_resource_finalizer_sha256=$(sha256sum "$HERE/host_resource_finalizer.py" | cut -d' ' -f1) \
+    || { log "REFUSING: cannot hash host_resource_finalizer.py"; exit 2; }
 [[ "$harness_sha256" =~ ^[0-9a-f]{64}$ \
         && "$hostcdp_sha256" =~ ^[0-9a-f]{64}$ \
-        && "$phase_supervisor_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        && "$phase_supervisor_sha256" =~ ^[0-9a-f]{64}$ \
+        && "$host_resource_finalizer_sha256" =~ ^[0-9a-f]{64}$ ]] \
     || { log "REFUSING: source seal produced an invalid digest"; exit 2; }
 read -r host_boot_id < /proc/sys/kernel/random/boot_id \
     || { log "REFUSING: cannot read host boot identity"; exit 2; }
@@ -489,7 +654,8 @@ withdraw_failed_run() {
             log "FAILED: could not lock refused run for withdrawal"
             exit 1
         fi
-        if ! rm -f -- "$RESULTS/complete.json" "$RESULTS/summary.json"; then
+        if ! rm -f -- "$RESULTS/complete.json" "$RESULTS/summary.json" \
+                "$RESULTS/.summary.pending"; then
             log "FAILED: could not remove derived authorization from refused run"
             invalidation_failed=true
         fi
@@ -572,6 +738,46 @@ quiesce_create_operation() {
         return 124
     fi
     CREATE_OP_QUIESCENT=true
+}
+
+# An empty lease means abnormal-exit cleanup must inspect Podman. Mark it
+# retired only after the create tree is drained and the exact ID is absent, so
+# a successful worker has no fallible container operation after publication.
+retire_create_operation() {
+    local retirement_fd marker_byte="" read_rc
+    if [ "$CREATE_OP_STARTED" != true ] \
+            || [ "$CREATE_OP_QUIESCENT" != true ] \
+            || [ "$CONTAINER_REMOVED" != true ]; then
+        log "FAILED: cannot retire a live or unproved container create operation"
+        return 1
+    fi
+    if ! exec {retirement_fd}<>"$CREATE_OP_LOCK_PATH"; then
+        log "FAILED: cannot open container create-operation lease for retirement"
+        return 1
+    fi
+    if ! flock -x -w "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS" \
+            "$retirement_fd"; then
+        log "FAILED: cannot lock container create-operation lease for retirement"
+        exec {retirement_fd}>&-
+        return 1
+    fi
+    if IFS= read -r -n 1 marker_byte <&"$retirement_fd"; then
+        log "FAILED: container create-operation lease was not empty before retirement"
+        exec {retirement_fd}>&-
+        return 1
+    else
+        read_rc=$?
+    fi
+    if [ "$read_rc" -ne 1 ] || [ -n "$marker_byte" ] \
+            || ! printf 'retired\n' >&"$retirement_fd"; then
+        log "FAILED: cannot retire container create-operation lease"
+        exec {retirement_fd}>&-
+        return 1
+    fi
+    if ! exec {retirement_fd}>&-; then
+        log "FAILED: cannot close retired container create-operation lease"
+        return 1
+    fi
 }
 
 cleanup() {
@@ -758,6 +964,7 @@ python3 - "$RESULTS/run.json" "$RUNID" "$IMAGE" "$runtime_image_id" "$REPS" "$WA
         "$URL" "$CDP_PORT" "$urls_json" "$cpus_json" "$resolve_json" "$la" \
         "$host_boot_id" "$host_machine" "$host_kernel" "$source_revision" \
         "$harness_sha256" "$hostcdp_sha256" "$phase_supervisor_sha256" \
+        "$host_resource_finalizer_sha256" \
         "$runtime_bundle_sha256" \
         "$corpus_extra_runtime_bundle_sha256" "$COMPARISON_LABEL" "$CPU_BUDGET" \
         "$CONTAINER_OWNER_TOKEN" "$CONTAINER_ID" <<'PY'
@@ -769,7 +976,7 @@ import tempfile
 (output_path, run_id, image, image_id, reps, warmup, url, cdp_port,
  urls_json, cpus_json, resolve_json, loadavg, host_boot_id, host_machine,
  host_kernel, source_revision, harness_sha256, hostcdp_sha256,
- phase_supervisor_sha256,
+ phase_supervisor_sha256, host_resource_finalizer_sha256,
  runtime_bundle_sha256, corpus_extra_runtime_bundle_sha256,
  comparison_label, cpu_budget, owner_token, container_id) = sys.argv[1:]
 urls = json.loads(urls_json)
@@ -796,6 +1003,7 @@ record = {
     "harness_sha256": harness_sha256,
     "hostcdp_sha256": hostcdp_sha256,
     "phase_supervisor_sha256": phase_supervisor_sha256,
+    "host_resource_finalizer_sha256": host_resource_finalizer_sha256,
     "runtime_bundle_sha256": runtime_bundle_sha256,
     "corpus_extra_runtime_bundle_sha256":
         corpus_extra_runtime_bundle_sha256 or None,
@@ -918,10 +1126,13 @@ hostcdp_sha256_after=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
     || { log "REFUSING: cannot re-hash hostcdp.sh"; exit 5; }
 phase_supervisor_sha256_after=$(sha256sum "$HERE/phase_supervisor.py" | cut -d' ' -f1) \
     || { log "REFUSING: cannot re-hash phase_supervisor.py"; exit 5; }
+host_resource_finalizer_sha256_after=$(sha256sum "$HERE/host_resource_finalizer.py" | cut -d' ' -f1) \
+    || { log "REFUSING: cannot re-hash host_resource_finalizer.py"; exit 5; }
 if [ "$source_revision_after" != "$source_revision" ] \
         || [ "$harness_sha256_after" != "$harness_sha256" ] \
         || [ "$hostcdp_sha256_after" != "$hostcdp_sha256" ] \
-        || [ "$phase_supervisor_sha256_after" != "$phase_supervisor_sha256" ]; then
+        || [ "$phase_supervisor_sha256_after" != "$phase_supervisor_sha256" ] \
+        || [ "$host_resource_finalizer_sha256_after" != "$host_resource_finalizer_sha256" ]; then
     log "REFUSING: producer source changed during the measured run"
     exit 5
 fi
@@ -947,8 +1158,9 @@ resolved_image_id_after=$(resolve_image_id "$IMAGE") || exit 5
 }
 verify_container_image "$CONTAINER_ID" || exit 5
 remove_owned_container || exit 5
+retire_create_operation || exit 5
 
-python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json" <<'PY'
+python3 - "$OUT" "$WARMUP" "$RESULTS/.summary.pending" <<'PY'
 import json
 import os
 import statistics
@@ -1031,4 +1243,3 @@ except BaseException:
     raise
 PY
 log "results in $RESULTS"
-publish_complete

@@ -14,6 +14,7 @@ Run: python3 -m unittest test_corpus_mem -v
 """
 
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -42,6 +43,7 @@ sys.path.insert(0, HERE)
 import corpus_mem  # noqa: E402
 import compare as bench_compare  # noqa: E402
 import campaign_summary as bench_campaign_summary  # noqa: E402
+import host_resource_finalizer  # noqa: E402
 import phase_supervisor  # noqa: E402
 import report as bench_report  # noqa: E402
 
@@ -51,6 +53,8 @@ CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
 HOSTCDP = os.path.join(HERE, "hostcdp.sh")
 OWNED_PROCESS = os.path.join(HERE, "owned_process.py")
 PHASE_SUPERVISOR = os.path.join(HERE, "phase_supervisor.py")
+HOST_RESOURCE_FINALIZER = os.path.join(HERE, "host_resource_finalizer.py")
+SERVE_GUARDIAN = os.path.join(HERE, "serve_guardian.py")
 
 
 def proc_state(pid):
@@ -614,7 +618,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
         with open(EXTRA) as handle:
             source = handle.read()
         lock = source.find("flock -n 9")
-        dnsmasq = source.find("sudo systemctl stop dnsmasq")
+        dnsmasq = source.find("systemctl stop dnsmasq")
         self.assertGreaterEqual(lock, 0, "the shared DNS/HTTP/HTTPS ports have no lease")
         self.assertGreaterEqual(dnsmasq, 0, "the dnsmasq handoff is gone")
         self.assertLess(lock, dnsmasq,
@@ -855,6 +859,12 @@ case "$cmd" in
   container)
     [ "${{1:-}}" = exists ] || exit 64
     : >"$PODMAN_EXISTS_CALLED_FILE"
+    if [ "${{PODMAN_MODE:-ok}}" = guardian-ambiguous ] \
+            && [ ! -e "$PODMAN_TEST_STATE.name" ] \
+            && [ -e "$RESULTS/complete.json" ]; then
+      : >"$PODMAN_POST_PUBLICATION_PROBE_FILE"
+      exit 125
+    fi
     [ -z "${{PODMAN_EXISTS_RC:-}}" ] || exit "$PODMAN_EXISTS_RC"
     [ -e "$PODMAN_TEST_STATE.name" ] && exit 0
     exit 1
@@ -1024,6 +1034,9 @@ if [ "${{1:-}}" = "$HOSTCDP_DRIVER" ]; then
   case "${{DRIVER_LOAD_ACTION:-}}" in
     numeric-read-error) : >"$LOAD_READ_FAILED_MARKER" ;;
   esac
+  if [ "${{DRIVER_LEAVE_DESCENDANT:-0}}" = 1 ]; then
+    setsid /bin/sleep 30 </dev/null >/dev/null 2>&1 &
+  fi
   printf '%s\n' '{{"ok":true,"url":"https://example.com/","stages":{{"total_ms":1.0}},"nav":{{"load_ms":1.0}}}}'
   exit 0
 fi
@@ -1127,6 +1140,8 @@ exec {real_date!r} "$@"
             PODMAN_INSPECT_CALLED_FILE=inspect_called,
             PODMAN_INSPECT_ONCE_MARKER=inspect_once,
             PODMAN_EXISTS_CALLED_FILE=exists_called,
+            PODMAN_POST_PUBLICATION_PROBE_FILE=os.path.join(
+                tmp, "post-publication-probe"),
             PODMAN_ESCAPED_STARTED_FILE=escaped_started,
             PODMAN_ESCAPED_RELEASE_FILE=escaped_release,
             PODMAN_LATE_COMMIT_FILE=late_commit,
@@ -1242,6 +1257,106 @@ exec {real_date!r} "$@"
                 if producer.poll() is None:
                     producer.kill()
                     producer.communicate(timeout=5)
+
+    def test_sigkill_after_start_reaps_the_standalone_container(self):
+        """The lifecycle guardian outlives the standalone producer.
+
+        RED BEFORE THE FIX: SIGKILL bypassed the shell EXIT trap after the
+        detached container started, leaving its state present and recording no
+        removal.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            started = os.path.join(tmp, "driver-started")
+            release = os.path.join(tmp, "driver-release")
+            env, removed, state = self.environment(
+                tmp, DRIVER_STARTED_FILE=started, DRIVER_WAIT_FILE=release,
+            )
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(started):
+                    if producer.poll() is not None:
+                        stdout, stderr = producer.communicate()
+                        self.fail(
+                            "hostcdp exited before the held rep: "
+                            + stdout + stderr)
+                    if time.monotonic() >= deadline:
+                        self.fail("hostcdp never started its container driver")
+                    time.sleep(0.01)
+
+                os.kill(producer.pid, signal.SIGKILL)
+                producer.wait(timeout=5)
+                deadline = time.monotonic() + 10
+                while (os.path.exists(state + ".name")
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
+
+                self.assertFalse(
+                    os.path.exists(state + ".name"),
+                    "SIGKILL left the standalone host container alive",
+                )
+                self.assertEqual(self.removed_ids(removed), [self.CONTAINER_ID])
+            finally:
+                with open(release, "w"):
+                    pass
+                if producer.poll() is None:
+                    producer.kill()
+                    producer.wait(timeout=5)
+                for pipe in (producer.stdout, producer.stderr):
+                    if pipe is not None:
+                        pipe.close()
+
+    def test_sigkill_during_create_commit_reaps_the_owned_container(self):
+        """Final cleanup waits for a committed create to become quiescent.
+
+        RED BEFORE THE FIX: the create supervisor drained its CLI after parent
+        death, but nothing surviving the producer inspected and removed the
+        container that had already committed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(tmp, mode="committed-wait")
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(env["PODMAN_CREATE_COMMITTED_FILE"]):
+                    if producer.poll() is not None:
+                        stdout, stderr = producer.communicate()
+                        self.fail(
+                            "hostcdp exited before create committed: "
+                            + stdout + stderr)
+                    if time.monotonic() >= deadline:
+                        self.fail("fake podman create did not commit")
+                    time.sleep(0.01)
+
+                os.kill(producer.pid, signal.SIGKILL)
+                with open(env["PODMAN_CREATE_RETURN_FILE"], "w"):
+                    pass
+                producer.wait(timeout=5)
+                deadline = time.monotonic() + 10
+                while (os.path.exists(state + ".name")
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
+
+                self.assertFalse(
+                    os.path.exists(state + ".name"),
+                    "SIGKILL between create commit and ID capture leaked the container",
+                )
+                self.assertEqual(self.removed_ids(removed), [self.CONTAINER_ID])
+            finally:
+                with open(env["PODMAN_CREATE_RETURN_FILE"], "w"):
+                    pass
+                if producer.poll() is None:
+                    producer.kill()
+                    producer.wait(timeout=5)
+                for pipe in (producer.stdout, producer.stderr):
+                    if pipe is not None:
+                        pipe.close()
 
     def test_failed_inspect_cannot_claim_absence_when_container_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1602,6 +1717,41 @@ exec {real_date!r} "$@"
             self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "complete.json")))
             self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
 
+    def test_success_retires_cleanup_before_publication(self):
+        """Published success has no fallible container proof after the worker."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, mode="guardian-ambiguous")
+            proc = self.run_host(env)
+            complete = os.path.join(env["RESULTS"], "complete.json")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(os.path.exists(complete))
+            self.assertFalse(
+                os.path.exists(env["PODMAN_POST_PUBLICATION_PROBE_FILE"]),
+                "guardian performed a fallible Podman proof after publication",
+            )
+
+    def test_outer_descendant_failure_cannot_leave_completion(self):
+        """The bootstrap authorizes only after the outer tree is drained."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, DRIVER_LEAVE_DESCENDANT="1")
+            proc = self.run_host(env)
+
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("phase leader exited with live descendants", proc.stderr)
+            self.assertTrue(
+                os.path.exists(os.path.join(env["RESULTS"], "WITHDRAWN")))
+            self.assertFalse(
+                os.path.exists(os.path.join(env["RESULTS"], "complete.json")),
+                "worker authorized the run before its outer lifecycle gate passed",
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+            self.assertFalse(
+                os.path.exists(os.path.join(env["RESULTS"], ".summary.pending")))
+
     def test_cleanup_failure_withdraws_every_authorizing_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             env, removed, _state = self.environment(tmp, PODMAN_RM_FAIL="1")
@@ -1622,44 +1772,48 @@ exec {real_date!r} "$@"
             self.assertIn("survived podman rm", proc.stderr)
             self.assertEqual(
                 self.removed_ids(removed),
-                [self.CONTAINER_ID, self.CONTAINER_ID],
-                "the main path and EXIT cleanup must target only the exact ID",
+                [self.CONTAINER_ID, self.CONTAINER_ID, self.CONTAINER_ID],
+                "all cleanup layers must target only the exact ID",
             )
             self.assertTrue(os.path.exists(os.path.join(env["RESULTS"], "WITHDRAWN")))
             self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "complete.json")))
             self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
 
-    def test_completion_is_atomic_and_is_the_final_action(self):
+    def test_completion_is_atomic_and_follows_the_outer_lifecycle(self):
         with open(HOSTCDP) as handle:
             source = handle.read()
         publisher = source.find("publish_complete() {")
         self.assertGreaterEqual(publisher, 0, "the producer has no completion publisher")
-        publish = source.rfind("\npublish_complete")
-        self.assertGreaterEqual(publish, 0, "the producer never publishes completion")
-        self.assertIn("os.replace(temporary, output_path)", source[publisher:publish])
+        bootstrap = source.find('if [ "$HOSTCDP_PROCESS_ROLE" = bootstrap ]')
+        worker = source.find("\nREPO=", bootstrap)
+        wait = source.find('wait "$guardian_pid"', bootstrap, worker)
+        publish = source.find("if publish_complete; then", wait, worker)
+        self.assertGreaterEqual(publish, 0, "the bootstrap never publishes completion")
+        self.assertIn("os.replace(temporary, output_path)",
+                      source[publisher:bootstrap])
+        self.assertIn("os.replace(pending_summary_path, summary_path)",
+                      source[publisher:bootstrap])
+        self.assertGreater(publish, wait,
+                           "completion precedes the outer lifecycle verdict")
+        self.assertIn('if [ "$guardian_rc" -eq 0 ]', source[wait:publish],
+                      "a failed outer lifecycle can publish completion")
         final_runtime = source.rfind(
             'verify_runtime_manifest "$CORPUS_EXTRA_RUNTIME_MANIFEST"',
-            publisher, publish,
+            worker,
         )
-        removal = source.rfind("remove_owned_container ||", publisher, publish)
+        removal = source.rfind("remove_owned_container ||", worker)
         summary = source.find(
-            'python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json"',
-            publisher, publish,
+            'python3 - "$OUT" "$WARMUP" "$RESULTS/.summary.pending"',
+            worker,
         )
-        trap_install = source.rfind("trap cleanup EXIT", publisher, publish)
-        trap_reset = source.rfind("trap - EXIT", trap_install, publish)
-        self.assertGreater(final_runtime, publisher,
-                           "completion precedes runtime verification")
+        self.assertGreater(final_runtime, worker,
+                           "the worker has no final runtime verification")
         self.assertGreater(removal, final_runtime,
                            "completion precedes exact container removal")
         self.assertGreater(summary, removal,
                            "completion precedes derived summary validation")
-        self.assertGreater(trap_install, publisher,
-                           "completion has no failure cleanup trap")
-        self.assertEqual(trap_reset, -1,
-                         "completion clears its failure cleanup trap before publication")
-        self.assertEqual(source[publish:].strip(), "publish_complete",
-                         "completion is not the producer's final action")
+        self.assertNotIn("\npublish_complete", source[worker:],
+                         "the worker can authorize before outer cleanup finishes")
 
     def test_mid_run_nonnumeric_load_is_raw_evidence_not_a_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1708,6 +1862,8 @@ exec {real_date!r} "$@"
                 producer_hash = hashlib.sha256(handle.read()).hexdigest()
             with open(os.path.join(HERE, "phase_supervisor.py"), "rb") as handle:
                 supervisor_hash = hashlib.sha256(handle.read()).hexdigest()
+            with open(HOST_RESOURCE_FINALIZER, "rb") as handle:
+                finalizer_hash = hashlib.sha256(handle.read()).hexdigest()
             import reqbench
             expected = {
                 "host_boot_id": boot_id,
@@ -1720,6 +1876,7 @@ exec {real_date!r} "$@"
                 "harness_sha256": reqbench.harness_sha256(),
                 "hostcdp_sha256": producer_hash,
                 "phase_supervisor_sha256": supervisor_hash,
+                "host_resource_finalizer_sha256": finalizer_hash,
                 "driver": "cdpdrive.py",
                 "network": "host (no VM, no DNAT)",
                 "comparison_label": "free",
@@ -1851,6 +2008,132 @@ exec {real_date!r} "$@"
         self.assertIn("revalidate_host_inputs(d, identities)", resummarizer)
         self.assertIn("validate_output_lock(lock_target, lock_fd)", resummarizer)
         self.assertIn("before_publish=recheck_inputs_before_publication", resummarizer)
+
+
+class HostResourceFinalizer(unittest.TestCase):
+    """Host-resource cleanup is bounded, exact, and fail-closed."""
+
+    def test_dnsmasq_finalizer_restores_and_verifies_the_prior_active_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            state = os.path.join(tmp, "dnsmasq.state")
+            calls = os.path.join(tmp, "systemctl.calls")
+            systemctl = os.path.join(bindir, "systemctl")
+            with open(systemctl, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "set -eu\n"
+                    "printf '%s\\n' \"$*\" >>\"$SYSTEMCTL_CALLS\"\n"
+                    "case \"$1\" in\n"
+                    "  start)\n"
+                    "    [ \"$2\" = dnsmasq ]\n"
+                    "    printf 'active\\n' >\"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  is-active)\n"
+                    "    [ \"$2\" = --quiet ]\n"
+                    "    [ \"$3\" = dnsmasq ]\n"
+                    "    grep -qx active \"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  *) exit 64 ;;\n"
+                    "esac\n"
+                )
+            os.chmod(systemctl, 0o755)
+            with open(state, "w") as handle:
+                handle.write("inactive\n")
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+                FCVM_FINALIZER_MODE="dnsmasq",
+                FCVM_DNSMASQ_WAS_ACTIVE="yes",
+                SYSTEMCTL_CALLS=calls,
+                SYSTEMCTL_STATE=state,
+            )
+
+            proc = subprocess.run(
+                [sys.executable, HOST_RESOURCE_FINALIZER], env=env,
+                capture_output=True, text=True, timeout=10,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(state) as handle:
+                self.assertEqual(handle.read(), "active\n")
+            with open(calls) as handle:
+                self.assertEqual(
+                    handle.read().splitlines(),
+                    ["start dnsmasq", "is-active --quiet dnsmasq"],
+                )
+
+    def test_missing_container_create_lock_never_queries_podman(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            calls = os.path.join(tmp, "podman.calls")
+            podman = os.path.join(bindir, "podman")
+            with open(podman, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "printf '%s\\n' \"$*\" >>\"$PODMAN_CALLS\"\n"
+                    "exit 99\n"
+                )
+            os.chmod(podman, 0o755)
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+                FCVM_FINALIZER_MODE="container",
+                FCVM_CONTAINER_NAME="hostcdp-run",
+                FCVM_CONTAINER_OWNER_TOKEN="a" * 32,
+                FCVM_CONTAINER_CREATE_LOCK_PATH=os.path.join(tmp, "missing.lock"),
+                PODMAN_CALLS=calls,
+            )
+
+            proc = subprocess.run(
+                [sys.executable, HOST_RESOURCE_FINALIZER], env=env,
+                capture_output=True, text=True, timeout=10,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(
+                os.path.exists(calls),
+                "cleanup queried a global container name before create began",
+            )
+
+    def test_retired_container_create_lock_never_queries_podman(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            calls = os.path.join(tmp, "podman.calls")
+            podman = os.path.join(bindir, "podman")
+            with open(podman, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "printf '%s\\n' \"$*\" >>\"$PODMAN_CALLS\"\n"
+                    "exit 99\n"
+                )
+            os.chmod(podman, 0o755)
+            lock_path = os.path.join(tmp, "create.lock")
+            with open(lock_path, "w") as handle:
+                handle.write("retired\n")
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+                FCVM_FINALIZER_MODE="container",
+                FCVM_CONTAINER_NAME="hostcdp-run",
+                FCVM_CONTAINER_OWNER_TOKEN="a" * 32,
+                FCVM_CONTAINER_CREATE_LOCK_PATH=lock_path,
+                PODMAN_CALLS=calls,
+            )
+
+            proc = subprocess.run(
+                [sys.executable, HOST_RESOURCE_FINALIZER], env=env,
+                capture_output=True, text=True, timeout=10,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(
+                os.path.exists(calls),
+                "retired cleanup performed a fallible post-publication Podman proof",
+            )
 
 
 class CorpusExtraFailClosed(unittest.TestCase):
@@ -4085,6 +4368,973 @@ os.fsync = _fsync
             self.assertIn(proc_state(phase_pid), (None, "Z"),
                           "parent death left the measured phase alive")
 
+    def test_phase_supervisor_finalizes_after_parent_sigkill(self):
+        """A registered finalizer runs after the phase has been reaped.
+
+        RED BEFORE THE FIX: phase_supervisor had no finalizer boundary, so a
+        resource released only by the killed parent could not be restored.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            phase_pid_path = os.path.join(tmp, "phase.pid")
+            ready_path = os.path.join(tmp, "phase.ready")
+            state_path = os.path.join(tmp, "resource.state")
+            finalizer = os.path.join(tmp, "finalizer")
+            with open(finalizer, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "set -eu\n"
+                    "phase_pid=$(cat \"$PHASE_PID_PATH\")\n"
+                    "[ ! -e \"/proc/$phase_pid\" ]\n"
+                    "printf 'active\\n' >\"$RESOURCE_STATE_PATH\"\n"
+                )
+            os.chmod(finalizer, 0o755)
+            phase_code = (
+                "import os,signal,time; "
+                "stop=lambda *_: (_ for _ in ()).throw(SystemExit(0)); "
+                "signal.signal(signal.SIGTERM, stop); "
+                f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                f"open({state_path!r}, 'w').write('inactive\\n'); "
+                f"open({ready_path!r}, 'w').write('ready\\n'); "
+                "time.sleep(60)"
+            )
+            parent_code = (
+                "import os,signal,subprocess,sys\n"
+                "command = [sys.executable, " + repr(PHASE_SUPERVISOR)
+                + ", '--expected-parent', str(os.getpid()), '--finalizer', "
+                + repr(finalizer)
+                + ", '--', sys.executable, '-c', " + repr(phase_code) + "]\n"
+                "supervisor = subprocess.Popen(command)\n"
+                "print(supervisor.pid, flush=True)\n"
+                "signal.pause()\n"
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-c", parent_code],
+                env=dict(
+                    os.environ,
+                    PHASE_PID_PATH=phase_pid_path,
+                    RESOURCE_STATE_PATH=state_path,
+                ),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            supervisor_pid = int(parent.stdout.readline())
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(ready_path):
+                    if parent.poll() is not None:
+                        stdout, stderr = parent.communicate()
+                        self.fail(
+                            "finalized phase never started: " + stdout + stderr)
+                    if time.monotonic() >= deadline:
+                        self.fail("finalized phase never became ready")
+                    time.sleep(0.01)
+                with open(phase_pid_path) as handle:
+                    phase_pid = int(handle.read())
+
+                os.kill(parent.pid, signal.SIGKILL)
+                parent.communicate(timeout=20)
+
+                with open(state_path) as handle:
+                    self.assertEqual(handle.read(), "active\n")
+                self.assertIn(proc_state(supervisor_pid), (None, "Z"))
+                self.assertIn(proc_state(phase_pid), (None, "Z"))
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.communicate(timeout=5)
+
+    def test_parent_death_after_finalizer_start_does_not_interrupt_cleanup(self):
+        """The completed phase no longer ties cleanup to its former parent.
+
+        RED BEFORE THE FIX: the supervisor kept its parent-death SIGTERM armed
+        while supervising the finalizer, so killing the expected parent after
+        finalizer readiness killed the finalizer before resource restoration.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            ready_path = os.path.join(tmp, "finalizer.ready")
+            release_path = os.path.join(tmp, "finalizer.release")
+            state_path = os.path.join(tmp, "resource.state")
+            finalizer_pid_path = os.path.join(tmp, "finalizer.pid")
+            finalizer = os.path.join(tmp, "finalizer")
+            os.mkfifo(release_path)
+            release_fd = os.open(
+                release_path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+            with open(state_path, "w") as handle:
+                handle.write("inactive\n")
+            with open(finalizer, "w") as handle:
+                handle.write(
+                    "#!/usr/bin/env python3\n"
+                    "import os\n"
+                    "with open(os.environ['FINALIZER_PID_PATH'], 'w') as out:\n"
+                    "    out.write(str(os.getpid()))\n"
+                    "with open(os.environ['FINALIZER_READY_PATH'], 'w') as out:\n"
+                    "    out.write('ready\\n')\n"
+                    "with open(os.environ['FINALIZER_RELEASE_PATH'], 'rb', "
+                    "buffering=0) as release:\n"
+                    "    if release.read(1) != b'R':\n"
+                    "        raise SystemExit(64)\n"
+                    "with open(os.environ['RESOURCE_STATE_PATH'], 'w') as out:\n"
+                    "    out.write('active\\n')\n"
+                )
+            os.chmod(finalizer, 0o755)
+            parent_code = (
+                "import os,signal,subprocess,sys\n"
+                "supervisor = subprocess.Popen([sys.executable, "
+                + repr(PHASE_SUPERVISOR)
+                + ", '--expected-parent', str(os.getpid()), "
+                "'--term-grace', '0', '--kill-grace', '1', "
+                "'--finalizer-timeout', '10', '--finalizer', "
+                + repr(finalizer)
+                + ", '--', sys.executable, '-c', 'pass'])\n"
+                "print(supervisor.pid, flush=True)\n"
+                "signal.pause()\n"
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-c", parent_code],
+                env=dict(
+                    os.environ,
+                    FINALIZER_PID_PATH=finalizer_pid_path,
+                    FINALIZER_READY_PATH=ready_path,
+                    FINALIZER_RELEASE_PATH=release_path,
+                    RESOURCE_STATE_PATH=state_path,
+                ),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            supervisor_pid = int(parent.stdout.readline())
+            supervisor_pidfd = os.pidfd_open(supervisor_pid)
+            finalizer_pidfd = None
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(ready_path):
+                    if parent.poll() is not None:
+                        self.fail("parent exited before finalizer readiness")
+                    if time.monotonic() >= deadline:
+                        self.fail("finalizer never became ready")
+                    time.sleep(0.01)
+                with open(finalizer_pid_path) as handle:
+                    finalizer_pid = int(handle.read())
+                finalizer_pidfd = os.pidfd_open(finalizer_pid)
+
+                os.kill(parent.pid, signal.SIGKILL)
+                parent.wait(timeout=5)
+                poller = select.poll()
+                poller.register(supervisor_pidfd, select.POLLIN)
+                self.assertEqual(
+                    poller.poll(1000), [],
+                    "late parent death terminated the mandatory finalizer",
+                )
+
+                os.write(release_fd, b"R")
+                self.assertTrue(
+                    poller.poll(5000),
+                    "supervisor did not finish after finalizer release",
+                )
+                with open(state_path) as handle:
+                    self.assertEqual(handle.read(), "active\n")
+                self.assertIn(proc_state(finalizer_pid), (None, "Z"))
+            finally:
+                try:
+                    os.write(release_fd, b"R")
+                except OSError:
+                    pass
+                os.close(release_fd)
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                if (finalizer_pidfd is not None
+                        and proc_state(finalizer_pid) not in (None, "Z")):
+                    signal.pidfd_send_signal(finalizer_pidfd, signal.SIGKILL)
+                if proc_state(supervisor_pid) not in (None, "Z"):
+                    signal.pidfd_send_signal(supervisor_pidfd, signal.SIGKILL)
+                if finalizer_pidfd is not None:
+                    os.close(finalizer_pidfd)
+                os.close(supervisor_pidfd)
+                for pipe in (parent.stdout, parent.stderr):
+                    if pipe is not None:
+                        pipe.close()
+
+    def test_dnsmasq_is_restored_after_the_campaign_parent_is_sigkilled(self):
+        """The real host finalizer closes the replay-server SIGKILL path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            state_path = os.path.join(tmp, "dnsmasq.state")
+            calls_path = os.path.join(tmp, "systemctl.calls")
+            ready_path = os.path.join(tmp, "serve.ready")
+            systemctl = os.path.join(bindir, "systemctl")
+            with open(systemctl, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "set -eu\n"
+                    "printf '%s\\n' \"$*\" >>\"$SYSTEMCTL_CALLS\"\n"
+                    "case \"$1\" in\n"
+                    "  stop)\n"
+                    "    [ \"$2\" = dnsmasq ]\n"
+                    "    printf 'inactive\\n' >\"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  start)\n"
+                    "    [ \"$2\" = dnsmasq ]\n"
+                    "    printf 'active\\n' >\"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  is-active)\n"
+                    "    [ \"$2\" = --quiet ]\n"
+                    "    [ \"$3\" = dnsmasq ]\n"
+                    "    grep -qx active \"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  *) exit 64 ;;\n"
+                    "esac\n"
+                )
+            os.chmod(systemctl, 0o755)
+            with open(state_path, "w") as handle:
+                handle.write("active\n")
+            phase = (
+                "systemctl stop dnsmasq && "
+                f"printf ready >{ready_path!r} && "
+                "exec sleep 60"
+            )
+            parent_code = (
+                "import os,signal,subprocess,sys\n"
+                "command = [sys.executable, " + repr(PHASE_SUPERVISOR)
+                + ", '--expected-parent', str(os.getpid()), '--finalizer', "
+                + repr(HOST_RESOURCE_FINALIZER)
+                + ", '--finalizer-timeout', '10', '--', 'bash', '-c', "
+                + repr(phase) + "]\n"
+                "supervisor = subprocess.Popen(command)\n"
+                "print(supervisor.pid, flush=True)\n"
+                "signal.pause()\n"
+            )
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+                FCVM_FINALIZER_MODE="dnsmasq",
+                FCVM_DNSMASQ_WAS_ACTIVE="yes",
+                SYSTEMCTL_CALLS=calls_path,
+                SYSTEMCTL_STATE=state_path,
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-c", parent_code], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            supervisor_pid = int(parent.stdout.readline())
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(ready_path):
+                    if parent.poll() is not None:
+                        stdout, stderr = parent.communicate()
+                        self.fail(
+                            "replay phase never stopped dnsmasq: "
+                            + stdout + stderr)
+                    if time.monotonic() >= deadline:
+                        self.fail("replay phase never stopped dnsmasq")
+                    time.sleep(0.01)
+
+                os.kill(parent.pid, signal.SIGKILL)
+                parent.communicate(timeout=20)
+                deadline = time.monotonic() + 10
+                state = None
+                while time.monotonic() < deadline:
+                    with open(state_path) as handle:
+                        state = handle.read()
+                    if state == "active\n" and proc_state(supervisor_pid) in (None, "Z"):
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(state, "active\n")
+                self.assertIn(proc_state(supervisor_pid), (None, "Z"))
+                with open(calls_path) as handle:
+                    self.assertEqual(
+                        handle.read().splitlines(),
+                        ["stop dnsmasq", "start dnsmasq",
+                         "is-active --quiet dnsmasq"],
+                    )
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.communicate(timeout=5)
+
+    def test_replay_lease_survives_campaign_process_group_sigkill(self):
+        """The host-wide lease covers the detached DNS finalizer.
+
+        RED BEFORE THE FIX: the campaign shell and its background serve job
+        were the only processes holding fd 9. Killing their process group
+        released the lease while the surviving root finalizer was still
+        restoring dnsmasq.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            lock_path = os.path.join(tmp, "corpus-extra.lock")
+            control_path = os.path.join(tmp, "serve.control")
+            guardian_ready = os.path.join(tmp, "guardian.ready")
+            guardian_pid_path = os.path.join(tmp, "guardian.pid")
+            serve_ready = os.path.join(tmp, "serve.ready")
+            serve_pid_path = os.path.join(tmp, "serve.pid")
+            supervisor_pgid_path = os.path.join(tmp, "supervisor.pgid")
+            status_path = os.path.join(tmp, "serve.status")
+            completion_path = os.path.join(tmp, "serve.completion")
+            completion_token = "c" * 32
+            state_path = os.path.join(tmp, "dnsmasq.state")
+            restore_started = os.path.join(tmp, "restore.started")
+            restore_release = os.path.join(tmp, "restore.release")
+            log_path = os.path.join(tmp, "guardian.log")
+            systemctl = os.path.join(bindir, "systemctl")
+            supervisor_wrapper = os.path.join(tmp, "supervisor-wrapper")
+            with open(lock_path, "w"):
+                pass
+            with open(completion_path, "w") as handle:
+                handle.write("complete " + "0" * 32 + "\n")
+            with open(state_path, "w") as handle:
+                handle.write("active\n")
+            with open(systemctl, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "set -eu\n"
+                    "case \"$1\" in\n"
+                    "  stop)\n"
+                    "    [ \"$2\" = dnsmasq ]\n"
+                    "    [ \"$(cat \"$SUPERVISOR_PGID_PATH\")\" "
+                    "!= \"$CAMPAIGN_PGID\" ]\n"
+                    "    printf 'inactive\\n' >\"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  start)\n"
+                    "    [ \"$2\" = dnsmasq ]\n"
+                    "    : >\"$RESTORE_STARTED\"\n"
+                    "    while [ ! -e \"$RESTORE_RELEASE\" ]; do sleep 0.01; done\n"
+                    "    printf 'active\\n' >\"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  is-active)\n"
+                    "    [ \"$2\" = --quiet ]\n"
+                    "    [ \"$3\" = dnsmasq ]\n"
+                    "    grep -qx active \"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  *) exit 64 ;;\n"
+                    "esac\n"
+                )
+            os.chmod(systemctl, 0o755)
+            with open(supervisor_wrapper, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "set -eu\n"
+                    "python3 -c 'import os; print(os.getpgrp())' "
+                    ">\"$SUPERVISOR_PGID_PATH\"\n"
+                    "exec python3 \"$PHASE_SUPERVISOR\" "
+                    "--expected-parent \"$PPID\" "
+                    "--control-path \"$CONTROL_PATH\" "
+                    "--return-command-status-on-signal "
+                    "--completion-path \"$COMPLETION_PATH\" "
+                    "--completion-token \"$COMPLETION_TOKEN\" "
+                    "--finalizer \"$HOST_RESOURCE_FINALIZER\" "
+                    "--finalizer-timeout 10 -- "
+                    "bash -c 'printf \"%s\\n\" \"$$\" "
+                    ">\"$SERVE_PID_PATH\" && systemctl stop dnsmasq && "
+                    ": >\"$SERVE_READY\" && exec sleep 60'\n"
+                )
+            os.chmod(supervisor_wrapper, 0o755)
+            launcher = (
+                "set -euo pipefail\n"
+                "export CAMPAIGN_PGID=$BASHPID\n"
+                "exec 9<\"$LOCK_PATH\"\n"
+                "flock -x 9\n"
+                "mkfifo -- \"$CONTROL_PATH\"\n"
+                "exec {control_fd}<>\"$CONTROL_PATH\"\n"
+                "python3 \"$SERVE_GUARDIAN\" --lease-fd 9 "
+                "--control-fd \"$control_fd\" "
+                "--ready-path \"$GUARDIAN_READY\" "
+                "--status-path \"$STATUS_PATH\" "
+                "--completion-path \"$COMPLETION_PATH\" "
+                "--completion-token \"$COMPLETION_TOKEN\" -- "
+                "\"$SUPERVISOR_WRAPPER\" "
+                ">\"$GUARDIAN_LOG\" 2>&1 &\n"
+                "guardian=$!\n"
+                "printf '%s\\n' \"$guardian\" >\"$GUARDIAN_PID_PATH\"\n"
+                "for _ in $(seq 1 500); do\n"
+                "  [ ! -e \"$GUARDIAN_READY\" ] || break\n"
+                "  sleep 0.01\n"
+                "done\n"
+                "[ -e \"$GUARDIAN_READY\" ]\n"
+                "wait \"$guardian\"\n"
+            )
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+                LOCK_PATH=lock_path,
+                CONTROL_PATH=control_path,
+                SERVE_GUARDIAN=SERVE_GUARDIAN,
+                GUARDIAN_READY=guardian_ready,
+                GUARDIAN_PID_PATH=guardian_pid_path,
+                STATUS_PATH=status_path,
+                COMPLETION_PATH=completion_path,
+                COMPLETION_TOKEN=completion_token,
+                GUARDIAN_LOG=log_path,
+                PHASE_SUPERVISOR=PHASE_SUPERVISOR,
+                HOST_RESOURCE_FINALIZER=HOST_RESOURCE_FINALIZER,
+                SUPERVISOR_WRAPPER=supervisor_wrapper,
+                SERVE_READY=serve_ready,
+                SERVE_PID_PATH=serve_pid_path,
+                SUPERVISOR_PGID_PATH=supervisor_pgid_path,
+                FCVM_FINALIZER_MODE="dnsmasq",
+                FCVM_DNSMASQ_WAS_ACTIVE="yes",
+                SYSTEMCTL_STATE=state_path,
+                RESTORE_STARTED=restore_started,
+                RESTORE_RELEASE=restore_release,
+            )
+            campaign = subprocess.Popen(
+                ["bash", "-c", launcher], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            guardian_pid = None
+            guardian_pidfd = None
+            detached_ready = False
+
+            def wait_for(path, description, timeout=10, campaign_must_live=True):
+                deadline = time.monotonic() + timeout
+                while not os.path.exists(path):
+                    if campaign_must_live and campaign.poll() is not None:
+                        stdout, stderr = campaign.communicate()
+                        log = ""
+                        if os.path.exists(log_path):
+                            with open(log_path) as handle:
+                                log = handle.read()
+                        self.fail(
+                            f"campaign exited before {description}: "
+                            f"{campaign.returncode}: {stdout}{stderr}{log}")
+                    if time.monotonic() >= deadline:
+                        self.fail(f"timed out waiting for {description}")
+                    time.sleep(0.01)
+
+            try:
+                wait_for(guardian_pid_path, "the guardian pid")
+                with open(guardian_pid_path) as handle:
+                    guardian_pid = int(handle.read())
+                wait_for(guardian_ready, "the guardian to detach")
+                detached_ready = True
+                guardian_pidfd = os.pidfd_open(guardian_pid)
+                wait_for(supervisor_pgid_path, "the root supervisor process group")
+                wait_for(serve_pid_path, "the replay phase pid")
+                wait_for(serve_ready, "the replay server to stop dnsmasq")
+                with open(serve_pid_path) as handle:
+                    serve_pid = int(handle.read())
+                with open(supervisor_pgid_path) as handle:
+                    supervisor_pgid = int(handle.read())
+                self.assertEqual(os.getpgid(guardian_pid), guardian_pid)
+                self.assertEqual(supervisor_pgid, guardian_pid)
+                self.assertEqual(os.getpgid(serve_pid), serve_pid)
+                self.assertNotEqual(os.getpgid(guardian_pid), campaign.pid)
+                self.assertNotEqual(supervisor_pgid, campaign.pid)
+                self.assertNotEqual(os.getpgid(serve_pid), campaign.pid)
+                with open(state_path) as handle:
+                    self.assertEqual(handle.read(), "inactive\n")
+
+                os.killpg(campaign.pid, signal.SIGKILL)
+                campaign.communicate(timeout=5)
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["flock", "-n", lock_path, "true"],
+                        capture_output=True, text=True, timeout=5,
+                    ).returncode,
+                    0,
+                    "campaign SIGKILL released the host lease before DNS restoration",
+                )
+                wait_for(
+                    restore_started,
+                    "the DNS finalizer to start",
+                    campaign_must_live=False,
+                )
+                with open(restore_release, "w"):
+                    pass
+                wait_for(
+                    status_path,
+                    "the replay guardian status",
+                    campaign_must_live=False,
+                )
+                poller = select.poll()
+                poller.register(guardian_pidfd, select.POLLIN)
+                self.assertTrue(
+                    poller.poll(5000),
+                    "the guardian retained the lease after its finalizer completed",
+                )
+                with open(state_path) as handle:
+                    self.assertEqual(handle.read(), "active\n")
+                with open(status_path) as handle:
+                    self.assertEqual(handle.read(), "143\n")
+                with open(completion_path) as handle:
+                    self.assertEqual(
+                        handle.read(), f"complete {completion_token}\n")
+                self.assertEqual(
+                    subprocess.run(
+                        ["flock", "-n", lock_path, "true"],
+                        capture_output=True, text=True, timeout=5,
+                    ).returncode,
+                    0,
+                    "the host lease remained held after DNS restoration completed",
+                )
+            finally:
+                with open(restore_release, "w"):
+                    pass
+                if campaign.poll() is None:
+                    os.killpg(campaign.pid, signal.SIGKILL)
+                    campaign.communicate(timeout=5)
+                if (detached_ready and guardian_pid is not None
+                        and proc_state(guardian_pid) not in (None, "Z")):
+                    try:
+                        os.killpg(guardian_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if guardian_pidfd is not None:
+                    os.close(guardian_pidfd)
+
+    def test_phase_supervisor_propagates_finalizer_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            completion_path = os.path.join(tmp, "completion")
+            token = "d" * 32
+            with self.assertRaisesRegex(RuntimeError, "phase finalizer exited 7"):
+                phase_supervisor.supervise(
+                    [sys.executable, "-c", "pass"],
+                    os.getppid(),
+                    finalizer=[sys.executable, "-c", "raise SystemExit(7)"],
+                    finalizer_timeout=5,
+                    completion_path=completion_path,
+                    completion_token=token,
+                )
+            with open(completion_path) as handle:
+                self.assertEqual(handle.read(), f"complete {token}\n")
+
+    def test_completion_stays_armed_without_a_finalizer_drain_certificate(self):
+        """A failed nested supervisor cannot certify an unknown process set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            completion_path = os.path.join(tmp, "completion")
+            token = "e" * 32
+            supervise_armed = phase_supervisor._supervise_armed
+            with mock.patch.object(
+                    phase_supervisor, "_supervise_armed",
+                    side_effect=RuntimeError(
+                        "finalizer supervision lost its process tree")):
+                with self.assertRaisesRegex(RuntimeError, "lost its process tree"):
+                    supervise_armed(
+                        [sys.executable, "-c", "pass"],
+                        finalizer=[sys.executable, "-c", "pass"],
+                        finalizer_timeout=5,
+                        completion_path=completion_path,
+                        completion_token=token,
+                    )
+            with open(completion_path) as handle:
+                self.assertEqual(handle.read(), f"armed {token}\n")
+
+    def test_replay_lease_waits_for_completion_after_sudo_parent_sigkill(self):
+        """A dead sudo parent cannot release the lease ahead of finalization.
+
+        RED BEFORE THE FIX: the guardian waited only for its direct sudo child,
+        so killing that child released fd 9 while the orphaned root supervisor
+        was still blocked in the DNS finalizer.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            lock_path = os.path.join(tmp, "corpus-extra.lock")
+            control_path = os.path.join(tmp, "serve.control")
+            guardian_ready = os.path.join(tmp, "guardian.ready")
+            guardian_pid_path = os.path.join(tmp, "guardian.pid")
+            sudo_pid_path = os.path.join(tmp, "sudo.pid")
+            supervisor_pid_path = os.path.join(tmp, "supervisor.pid")
+            serve_ready = os.path.join(tmp, "serve.ready")
+            status_path = os.path.join(tmp, "serve.status")
+            completion_path = os.path.join(tmp, "serve.completion")
+            completion_token = "a" * 32
+            state_path = os.path.join(tmp, "dnsmasq.state")
+            restore_started = os.path.join(tmp, "restore.started")
+            restore_release = os.path.join(tmp, "restore.release")
+            log_path = os.path.join(tmp, "guardian.log")
+            systemctl = os.path.join(bindir, "systemctl")
+            sudo_parent = os.path.join(tmp, "sudo-parent")
+            with open(lock_path, "w"):
+                pass
+            with open(state_path, "w") as handle:
+                handle.write("active\n")
+            with open(systemctl, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\n"
+                    "set -eu\n"
+                    "case \"$1\" in\n"
+                    "  stop)\n"
+                    "    [ \"$2\" = dnsmasq ]\n"
+                    "    printf 'inactive\\n' >\"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  start)\n"
+                    "    [ \"$2\" = dnsmasq ]\n"
+                    "    : >\"$RESTORE_STARTED\"\n"
+                    "    while [ ! -e \"$RESTORE_RELEASE\" ]; do sleep 0.01; done\n"
+                    "    printf 'active\\n' >\"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  is-active)\n"
+                    "    [ \"$2\" = --quiet ]\n"
+                    "    [ \"$3\" = dnsmasq ]\n"
+                    "    grep -qx active \"$SYSTEMCTL_STATE\"\n"
+                    "    ;;\n"
+                    "  *) exit 64 ;;\n"
+                    "esac\n"
+                )
+            os.chmod(systemctl, 0o755)
+            with open(sudo_parent, "w") as handle:
+                handle.write(
+                    "#!/usr/bin/env python3\n"
+                    "import os, subprocess, sys\n"
+                    "with open(os.environ['SUDO_PID_PATH'], 'w') as out:\n"
+                    "    out.write(str(os.getpid()))\n"
+                    "phase = (\"systemctl stop dnsmasq && \"\n"
+                    "         \": >\\\"$SERVE_READY\\\" && exec sleep 60\")\n"
+                    "command = [sys.executable, os.environ['PHASE_SUPERVISOR'],\n"
+                    "           '--expected-parent', str(os.getpid()),\n"
+                    "           '--term-grace', '0', '--kill-grace', '1',\n"
+                    "           '--completion-path', os.environ['COMPLETION_PATH'],\n"
+                    "           '--completion-token', os.environ['COMPLETION_TOKEN'],\n"
+                    "           '--finalizer', os.environ['HOST_RESOURCE_FINALIZER'],\n"
+                    "           '--finalizer-timeout', '10', '--',\n"
+                    "           'bash', '-c', phase]\n"
+                    "supervisor = subprocess.Popen(command)\n"
+                    "with open(os.environ['SUPERVISOR_PID_PATH'], 'w') as out:\n"
+                    "    out.write(str(supervisor.pid))\n"
+                    "raise SystemExit(supervisor.wait())\n"
+                )
+            os.chmod(sudo_parent, 0o755)
+            launcher = (
+                "set -euo pipefail\n"
+                "exec 9<\"$LOCK_PATH\"\n"
+                "flock -x 9\n"
+                "mkfifo -- \"$CONTROL_PATH\"\n"
+                "exec {control_fd}<>\"$CONTROL_PATH\"\n"
+                "python3 \"$SERVE_GUARDIAN\" --lease-fd 9 "
+                "--control-fd \"$control_fd\" "
+                "--ready-path \"$GUARDIAN_READY\" "
+                "--status-path \"$STATUS_PATH\" "
+                "--completion-path \"$COMPLETION_PATH\" "
+                "--completion-token \"$COMPLETION_TOKEN\" -- "
+                "\"$SUDO_PARENT\" >\"$GUARDIAN_LOG\" 2>&1 &\n"
+                "guardian=$!\n"
+                "printf '%s\\n' \"$guardian\" >\"$GUARDIAN_PID_PATH\"\n"
+                "for _ in $(seq 1 500); do\n"
+                "  [ ! -e \"$GUARDIAN_READY\" ] || break\n"
+                "  sleep 0.01\n"
+                "done\n"
+                "[ -e \"$GUARDIAN_READY\" ]\n"
+                "exec 9>&-\n"
+                "wait \"$guardian\"\n"
+            )
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+                LOCK_PATH=lock_path,
+                CONTROL_PATH=control_path,
+                SERVE_GUARDIAN=SERVE_GUARDIAN,
+                GUARDIAN_READY=guardian_ready,
+                GUARDIAN_PID_PATH=guardian_pid_path,
+                STATUS_PATH=status_path,
+                COMPLETION_PATH=completion_path,
+                COMPLETION_TOKEN=completion_token,
+                GUARDIAN_LOG=log_path,
+                SUDO_PARENT=sudo_parent,
+                SUDO_PID_PATH=sudo_pid_path,
+                SUPERVISOR_PID_PATH=supervisor_pid_path,
+                PHASE_SUPERVISOR=PHASE_SUPERVISOR,
+                HOST_RESOURCE_FINALIZER=HOST_RESOURCE_FINALIZER,
+                SERVE_READY=serve_ready,
+                FCVM_FINALIZER_MODE="dnsmasq",
+                FCVM_DNSMASQ_WAS_ACTIVE="yes",
+                SYSTEMCTL_STATE=state_path,
+                RESTORE_STARTED=restore_started,
+                RESTORE_RELEASE=restore_release,
+            )
+            campaign = subprocess.Popen(
+                ["bash", "-c", launcher], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            guardian_pid = None
+            sudo_pid = None
+            supervisor_pid = None
+
+            def wait_for(path, description, timeout=10):
+                deadline = time.monotonic() + timeout
+                while not os.path.exists(path):
+                    if campaign.poll() is not None:
+                        stdout, stderr = campaign.communicate()
+                        log = ""
+                        if os.path.exists(log_path):
+                            with open(log_path) as handle:
+                                log = handle.read()
+                        self.fail(
+                            f"campaign exited before {description}: "
+                            f"{campaign.returncode}: {stdout}{stderr}{log}")
+                    if time.monotonic() >= deadline:
+                        self.fail(f"timed out waiting for {description}")
+                    time.sleep(0.01)
+
+            try:
+                wait_for(guardian_pid_path, "the guardian pid")
+                wait_for(guardian_ready, "the guardian readiness record")
+                wait_for(sudo_pid_path, "the sudo parent pid")
+                wait_for(supervisor_pid_path, "the root supervisor pid")
+                wait_for(serve_ready, "the DNS stop")
+                with open(guardian_pid_path) as handle:
+                    guardian_pid = int(handle.read())
+                with open(sudo_pid_path) as handle:
+                    sudo_pid = int(handle.read())
+                with open(supervisor_pid_path) as handle:
+                    supervisor_pid = int(handle.read())
+                with open(state_path) as handle:
+                    self.assertEqual(handle.read(), "inactive\n")
+                with open(completion_path) as handle:
+                    self.assertEqual(
+                        handle.read(), f"armed {completion_token}\n")
+
+                os.kill(sudo_pid, signal.SIGKILL)
+                wait_for(restore_started, "the blocked DNS finalizer")
+                self.assertIsNone(campaign.poll())
+                self.assertNotIn(proc_state(guardian_pid), (None, "Z"))
+                self.assertNotIn(proc_state(supervisor_pid), (None, "Z"))
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["flock", "-n", lock_path, "true"],
+                        capture_output=True, text=True, timeout=5,
+                    ).returncode,
+                    0,
+                    "killed sudo released the lease before finalizer completion",
+                )
+
+                with open(restore_release, "w"):
+                    pass
+                deadline = time.monotonic() + 10
+                completion = None
+                while time.monotonic() < deadline:
+                    try:
+                        with open(completion_path) as handle:
+                            completion = handle.read()
+                    except FileNotFoundError:
+                        pass
+                    if completion == f"complete {completion_token}\n":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(
+                    completion, f"complete {completion_token}\n",
+                    "root supervisor did not acknowledge finalizer completion",
+                )
+                campaign.communicate(timeout=10)
+                self.assertEqual(campaign.returncode, 137)
+                with open(status_path) as handle:
+                    self.assertEqual(handle.read(), "137\n")
+                with open(state_path) as handle:
+                    self.assertEqual(handle.read(), "active\n")
+                self.assertEqual(
+                    subprocess.run(
+                        ["flock", "-n", lock_path, "true"],
+                        capture_output=True, text=True, timeout=5,
+                    ).returncode,
+                    0,
+                    "the lease remained held after the completion ack",
+                )
+            finally:
+                with open(restore_release, "w"):
+                    pass
+                if campaign.poll() is None:
+                    os.killpg(campaign.pid, signal.SIGKILL)
+                    campaign.communicate(timeout=5)
+                for pid in (guardian_pid, supervisor_pid, sudo_pid):
+                    if pid is not None and proc_state(pid) not in (None, "Z"):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_replay_guardian_does_not_wait_for_an_unarmed_startup_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = os.path.join(tmp, "lease")
+            ready_path = os.path.join(tmp, "guardian.ready")
+            status_path = os.path.join(tmp, "guardian.status")
+            completion_path = os.path.join(tmp, "completion")
+            token = "b" * 32
+            with open(lock_path, "w"):
+                pass
+            lease_fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC)
+            control_fd = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            fcntl.flock(lease_fd, fcntl.LOCK_EX)
+            guardian = subprocess.Popen(
+                [
+                    sys.executable, SERVE_GUARDIAN,
+                    "--lease-fd", str(lease_fd),
+                    "--control-fd", str(control_fd),
+                    "--ready-path", ready_path,
+                    "--status-path", status_path,
+                    "--completion-path", completion_path,
+                    "--completion-token", token,
+                    "--", "sh", "-c", "exit 23",
+                ],
+                pass_fds=(lease_fd, control_fd),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            os.close(lease_fd)
+            os.close(control_fd)
+            stdout, stderr = guardian.communicate(timeout=5)
+            self.assertEqual(guardian.returncode, 23, stdout + stderr)
+            with open(status_path) as handle:
+                self.assertEqual(handle.read(), "23\n")
+            self.assertFalse(os.path.exists(completion_path))
+
+    def test_replay_guardian_ignores_term_before_its_child_finishes(self):
+        """A control-plane signal cannot drop the host lease.
+
+        RED BEFORE THE FIX: signal handlers were installed only after the
+        direct child exited. TERM after readiness killed the guardian, released
+        fd 9, and left the child alive.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = os.path.join(tmp, "lease")
+            ready_path = os.path.join(tmp, "guardian.ready")
+            status_path = os.path.join(tmp, "guardian.status")
+            completion_path = os.path.join(tmp, "completion")
+            child_pid_path = os.path.join(tmp, "child.pid")
+            child_release = os.path.join(tmp, "child.release")
+            guardian_pid_path = os.path.join(tmp, "guardian.pid")
+            log_path = os.path.join(tmp, "guardian.log")
+            token = "e" * 32
+            with open(lock_path, "w"):
+                pass
+            launcher = (
+                "set -u\n"
+                "exec 9<\"$LOCK_PATH\"\n"
+                "flock -x 9\n"
+                "exec {control_fd}</dev/null\n"
+                "python3 \"$SERVE_GUARDIAN\" --lease-fd 9 "
+                "--control-fd \"$control_fd\" "
+                "--ready-path \"$READY_PATH\" "
+                "--status-path \"$STATUS_PATH\" "
+                "--completion-path \"$COMPLETION_PATH\" "
+                "--completion-token \"$COMPLETION_TOKEN\" -- "
+                "bash -c 'printf \"%s\\n\" \"$$\" >\"$CHILD_PID_PATH\"; "
+                "while [ ! -e \"$CHILD_RELEASE\" ]; do sleep 0.01; done; "
+                "exit 23' >\"$LOG_PATH\" 2>&1 &\n"
+                "guardian=$!\n"
+                "printf '%s\\n' \"$guardian\" >\"$GUARDIAN_PID_PATH\"\n"
+                "for _ in $(seq 1 500); do\n"
+                "  [ ! -e \"$READY_PATH\" ] || break\n"
+                "  sleep 0.01\n"
+                "done\n"
+                "[ -e \"$READY_PATH\" ] || exit 125\n"
+                "exec 9>&-\n"
+                "wait \"$guardian\"\n"
+            )
+            env = dict(
+                os.environ,
+                LOCK_PATH=lock_path,
+                SERVE_GUARDIAN=SERVE_GUARDIAN,
+                READY_PATH=ready_path,
+                STATUS_PATH=status_path,
+                COMPLETION_PATH=completion_path,
+                COMPLETION_TOKEN=token,
+                CHILD_PID_PATH=child_pid_path,
+                CHILD_RELEASE=child_release,
+                GUARDIAN_PID_PATH=guardian_pid_path,
+                LOG_PATH=log_path,
+            )
+            launcher_process = subprocess.Popen(
+                ["bash", "-c", launcher], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            guardian_pid = None
+            child_pid = None
+
+            def wait_for(path, description):
+                deadline = time.monotonic() + 10
+                while not os.path.exists(path):
+                    if launcher_process.poll() is not None:
+                        stdout, stderr = launcher_process.communicate()
+                        self.fail(
+                            f"launcher exited before {description}: "
+                            f"{launcher_process.returncode}: {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        self.fail(f"timed out waiting for {description}")
+                    time.sleep(0.01)
+
+            try:
+                wait_for(guardian_pid_path, "the guardian pid")
+                wait_for(ready_path, "guardian readiness")
+                wait_for(child_pid_path, "the long-lived child")
+                with open(guardian_pid_path) as handle:
+                    guardian_pid = int(handle.read())
+                with open(child_pid_path) as handle:
+                    child_pid = int(handle.read())
+
+                os.kill(guardian_pid, signal.SIGTERM)
+                time.sleep(0.1)
+                self.assertNotIn(
+                    proc_state(guardian_pid), (None, "Z"),
+                    "TERM killed the guardian before its child finished",
+                )
+                self.assertNotIn(proc_state(child_pid), (None, "Z"))
+                self.assertFalse(os.path.exists(status_path))
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["flock", "-n", lock_path, "true"],
+                        capture_output=True, text=True, timeout=5,
+                    ).returncode,
+                    0,
+                    "TERM released the replay lease while the child was alive",
+                )
+
+                with open(child_release, "w"):
+                    pass
+                launcher_process.communicate(timeout=10)
+                self.assertEqual(launcher_process.returncode, 23)
+                with open(status_path) as handle:
+                    self.assertEqual(handle.read(), "23\n")
+            finally:
+                with open(child_release, "w"):
+                    pass
+                for pid in (child_pid, guardian_pid):
+                    if pid is not None and proc_state(pid) not in (None, "Z"):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                if launcher_process.poll() is None:
+                    os.killpg(launcher_process.pid, signal.SIGKILL)
+                    launcher_process.communicate(timeout=5)
+
+    def test_dnsmasq_restore_is_registered_before_the_stop(self):
+        """The surviving replay supervisor owns both sides of the handoff.
+
+        RED BEFORE THE FIX: the campaign shell stopped dnsmasq before it
+        launched any process capable of restoring it after SIGKILL.
+        """
+        with open(EXTRA) as handle:
+            source = handle.read()
+        finalizer = source.find('--finalizer "$finalizer"')
+        completion = source.find('--completion-path "$completion_path"')
+        stop = source.find("systemctl stop dnsmasq")
+        self.assertGreaterEqual(finalizer, 0, "replay has no surviving finalizer")
+        self.assertGreaterEqual(
+            completion, 0, "replay has no root-supervisor completion ack")
+        self.assertGreaterEqual(stop, 0, "the dnsmasq handoff is gone")
+        self.assertLess(
+            finalizer, stop,
+            "dnsmasq can be stopped before its restore finalizer is armed",
+        )
+        self.assertLess(
+            completion, stop,
+            "dnsmasq can be stopped before completion tracking is armed",
+        )
+        self.assertIn("export FCVM_FINALIZER_MODE=dnsmasq", source)
+        self.assertIn(
+            'export FCVM_DNSMASQ_WAS_ACTIVE="$dnsmasq_was_active"', source)
+        self.assertIn('"$BENCH/host_resource_finalizer.py"', source)
+        guardian = source.find('python3 "$BENCH/serve_guardian.py"')
+        self.assertGreaterEqual(guardian, 0, "replay has no lease guardian")
+        self.assertLess(
+            guardian, stop,
+            "dnsmasq can be stopped before the lease guardian is launched",
+        )
+        self.assertIn('--lease-fd 9 --control-fd "$SERVE_CONTROL_FD"', source)
+        self.assertIn('--completion-path "$SERVE_COMPLETION_PATH"', source)
+        self.assertIn('--completion-token "$SERVE_COMPLETION_TOKEN"', source)
+
     def test_proc_state_readers_treat_disappearance_during_read_as_gone(self):
         class VanishedProcStat:
             def __enter__(self):
@@ -4266,6 +5516,12 @@ os.fsync = _fsync
                             os.close(pidfd)
 
     def test_outer_sigkill_closes_control_and_drains_the_phase(self):
+        """Campaign process-group death cannot orphan a detached phase.
+
+        RED BEFORE THE FIX: run_logged left its supervisor and tee in the
+        campaign process group while the measured phase was in a new session.
+        SIGKILL removed the cleanup owner and left the phase alive.
+        """
         with open(EXTRA) as handle:
             source = handle.read()
         run = self.shell_function(source, "run_logged")
@@ -4311,7 +5567,7 @@ os.fsync = _fsync
                 with open(phase_pid_path) as handle:
                     phase_pid = int(handle.read())
                 pidfd = os.pidfd_open(phase_pid)
-                os.kill(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate(timeout=5)
                 poller = select.poll()
                 poller.register(pidfd, select.POLLIN)
@@ -4332,8 +5588,7 @@ os.fsync = _fsync
                     os.close(pidfd)
             self.assertTrue(
                 drained,
-                "the async phase job inherited its own control writer and "
-                "survived the campaign shell",
+                "the measured phase survived campaign process-group SIGKILL",
             )
 
     def test_run_logged_captures_parent_before_async_bash_expansion(self):
@@ -4922,6 +6177,50 @@ sys.stdin.read(1)
         finally:
             if holder.poll() is None:
                 holder.communicate(input="x", timeout=5)
+
+    def test_pending_worker_summary_waits_for_bootstrap_publication(self):
+        """A reader yields when the worker is done but its guardian is not."""
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary_path = os.path.join(tmp, "summary.json")
+        completion_path = os.path.join(tmp, "complete.json")
+        pending_path = os.path.join(tmp, ".summary.pending")
+        with open(summary_path, "rb") as handle:
+            summary_bytes = handle.read()
+        with open(completion_path, "rb") as handle:
+            completion_bytes = handle.read()
+        os.replace(summary_path, pending_path)
+        os.unlink(completion_path)
+
+        original_acquire = bench_compare.acquire_output_lock
+        acquire_count = 0
+
+        def publish_on_reacquire(target, lock_fd, wait_seconds=5.0):
+            nonlocal acquire_count
+            original_acquire(target, lock_fd, wait_seconds)
+            acquire_count += 1
+            if acquire_count == 2:
+                os.replace(pending_path, summary_path)
+                temporary = completion_path + ".temporary"
+                with open(temporary, "wb") as handle:
+                    handle.write(completion_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, completion_path)
+
+        argv = ["resummarize.py", tmp]
+        with mock.patch.object(
+                bench_compare, "acquire_output_lock",
+                side_effect=publish_on_reacquire), \
+                mock.patch.object(sys, "argv", argv):
+            runpy.run_path(
+                os.path.join(HERE, "resummarize.py"), run_name="__main__"
+            )
+
+        self.assertEqual(acquire_count, 2)
+        with open(summary_path) as handle:
+            self.assertEqual(json.load(handle)["n"], 1)
 
     def test_summary_lock_refuses_symlinks_and_multiple_links(self):
         rows = [self.rep(0, warmup=True), self.rep(1)]
@@ -7834,6 +9133,7 @@ class ProvenanceNamesBytes(unittest.TestCase):
                      "cdpdrive.py", "render.py", "corpus_serve.py", "report.py",
                      "reqbench.py", "reqbench.sh", "reqanalyze.py", "wddrive.py",
                      "owned_process.py", "phase_supervisor.py",
+                     "host_resource_finalizer.py", "serve_guardian.py",
                      "corpus_campaign.sh", "fcvm"):
             if bench_has_files:
                 with open(os.path.join(bench, name), "w") as handle:
@@ -7881,7 +9181,8 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         "corpus_extra.sh", "corpus_mem.py", "hostcdp.sh", "cdpdrive.py",
         "render.py", "corpus_serve.py", "report.py", "reqbench.py",
         "reqbench.sh", "reqanalyze.py", "wddrive.py", "owned_process.py",
-        "phase_supervisor.py", "corpus_campaign.sh",
+        "phase_supervisor.py", "host_resource_finalizer.py", "serve_guardian.py",
+        "corpus_campaign.sh",
     )
     REQBENCH_SOURCES = (
         "fcvm", "fc-agent", "reqbench.sh", "reqbench.py", "reqanalyze.py",

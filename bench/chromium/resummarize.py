@@ -23,9 +23,11 @@ loadavg1_measured forward. That field is the answer to "was the box busy while
 this was measured", and a summary that dropped it cannot be checked against
 that question again.
 """
+import fcntl
 import os
 import statistics
 import sys
+import time
 
 from compare import (
     Refusal,
@@ -47,6 +49,42 @@ def pct(values, p):
     return values[max(0, -(-p * n // 100) - 1)]
 
 
+def await_producer_publication(target, lock_target, lock_fd, wait_seconds=5.0):
+    """Yield the summary lock while a successful worker awaits its guardian."""
+    deadline = time.monotonic() + wait_seconds
+
+    def entry_exists(name):
+        try:
+            os.stat(name, dir_fd=target["directory_fd"], follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise Refusal(
+                f"cannot inspect producer publication state {name}: {error}"
+            ) from error
+
+    while (
+        entry_exists(".summary.pending")
+        and not entry_exists("complete.json")
+        and not entry_exists("WITHDRAWN")
+    ):
+        validate_output_lock(lock_target, lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal(
+                "producer publication remained pending after its worker exited"
+            )
+        time.sleep(min(0.01, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal(
+                "producer publication remained pending after its worker exited"
+            )
+        acquire_output_lock(lock_target, lock_fd, wait_seconds=remaining)
+
+
 d = sys.argv[1]
 summary_path = os.path.join(d, "summary.json")
 try:
@@ -63,6 +101,7 @@ lock_fd = None
 try:
     lock_fd = open_output_lock(lock_target)
     acquire_output_lock(lock_target, lock_fd)
+    await_producer_publication(summary_target, lock_target, lock_fd)
 except Refusal as error:
     if lock_fd is not None:
         os.close(lock_fd)

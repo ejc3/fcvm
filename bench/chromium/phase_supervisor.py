@@ -13,6 +13,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -22,6 +23,12 @@ PR_SET_PDEATHSIG = 1
 PR_GET_PDEATHSIG = 2
 GRACE_SECONDS = 5.0
 KILL_REAP_SECONDS = 30.0
+FINALIZER_TIMEOUT_SECONDS = 180.0
+COMPLETION_STATES = frozenset(("armed", "complete"))
+
+
+class PhaseDrainError(RuntimeError):
+    """The supervisor could not prove that its complete process set exited."""
 
 
 def get_process_control(option):
@@ -53,6 +60,46 @@ def arm_parent_death(expected_parent):
         raise OSError(error, os.strerror(error))
     if os.getppid() != expected_parent:
         raise RuntimeError("parent changed while arming parent-death signal")
+
+
+def disarm_completed_parent():
+    """Close the parent-death delivery race before mandatory finalization."""
+    blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        set_process_control(PR_SET_PDEATHSIG, 0)
+        signal.sigtimedwait({signal.SIGTERM}, 0)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+
+
+def publish_completion_state(path, token, state):
+    """Atomically publish this supervisor's lifecycle state."""
+    if state not in COMPLETION_STATES:
+        raise ValueError(f"invalid completion state: {state}")
+    directory = os.path.dirname(path) or "."
+    prefix = "." + os.path.basename(path) + "."
+    fd, temporary = tempfile.mkstemp(prefix=prefix, dir=directory)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as handle:
+            fd = None
+            handle.write(f"{state} {token}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def read_process_stat(pid, proc_root="/proc"):
@@ -376,7 +423,10 @@ def emergency_cleanup(child, wake_read, term_grace, kill_grace,
 
 def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
                      command_timeout=None, control_path=None,
-                     return_command_status_on_signal=False):
+                     return_command_status_on_signal=False, finalizer=None,
+                     finalizer_timeout=FINALIZER_TIMEOUT_SECONDS,
+                     completion_path=None, completion_token=None,
+                     drain_certificate=None):
     term_grace = GRACE_SECONDS if term_grace is None else term_grace
     kill_grace = KILL_REAP_SECONDS if kill_grace is None else kill_grace
     wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -396,9 +446,18 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
     pidfd = None
     selector = None
     control_fd = None
+    finalizer_error = None
+    drain_error = None
+    completion_armed = False
+    phase_drained = False
+    finalizer_drained = finalizer is None
     try:
         if control_path is not None:
             control_fd = open_control_path(control_path)
+        if completion_path is not None:
+            publish_completion_state(
+                completion_path, completion_token, "armed")
+            completion_armed = True
         child = subprocess.Popen(argv, start_new_session=True,
                                  pass_fds=tuple(pass_fds))
         pidfd = os.pidfd_open(child.pid)
@@ -421,6 +480,9 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
             selector, wake_read, pending, external_signal, parent_pid,
             term_grace, kill_grace, control_fd)
         descendants_drained = True
+        phase_drained = True
+        if drain_certificate is not None:
+            drain_certificate[0] = True
 
         reap_available()
         if (external_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -432,16 +494,45 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
             return 1
         return result
     finally:
-        if child is not None and not descendants_drained:
+        if child is None:
+            phase_drained = True
+            if drain_certificate is not None:
+                drain_certificate[0] = True
+        elif not descendants_drained:
             try:
                 emergency_cleanup(
                     child, wake_read, term_grace, kill_grace, leader_reaped)
+                phase_drained = True
+                if drain_certificate is not None:
+                    drain_certificate[0] = True
             except BaseException as cleanup_error:
+                drain_error = PhaseDrainError(
+                    f"phase process set was not drained: {cleanup_error}")
                 print(
                     f"FAILED: phase supervisor emergency cleanup: {cleanup_error}",
                     file=sys.stderr,
                     flush=True,
                 )
+        if finalizer is not None:
+            finalizer_drain_certificate = [False]
+            try:
+                disarm_completed_parent()
+                finalizer_result = _supervise_armed(
+                    finalizer,
+                    term_grace=term_grace,
+                    kill_grace=kill_grace,
+                    command_timeout=finalizer_timeout,
+                    return_command_status_on_signal=True,
+                    drain_certificate=finalizer_drain_certificate,
+                )
+                if finalizer_result != 0:
+                    finalizer_error = RuntimeError(
+                        f"phase finalizer exited {finalizer_result}")
+            except PhaseDrainError as exc:
+                finalizer_error = exc
+            except BaseException as exc:
+                finalizer_error = exc
+            finalizer_drained = finalizer_drain_certificate[0]
         if selector is not None:
             selector.close()
         if pidfd is not None:
@@ -453,11 +544,20 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
             signal.signal(signum, handler)
         os.close(wake_read)
         os.close(wake_write)
+        if completion_armed and phase_drained and finalizer_drained:
+            publish_completion_state(
+                completion_path, completion_token, "complete")
+        if drain_error is not None:
+            raise drain_error
+        if finalizer_error is not None:
+            raise finalizer_error
 
 
 def supervise(argv, expected_parent, term_grace=None, kill_grace=None,
               pass_fds=(), command_timeout=None, control_path=None,
-              return_command_status_on_signal=False):
+              return_command_status_on_signal=False, finalizer=None,
+              finalizer_timeout=FINALIZER_TIMEOUT_SECONDS,
+              completion_path=None, completion_token=None):
     previous_subreaper = get_process_control(PR_GET_CHILD_SUBREAPER)
     previous_pdeathsig = get_process_control(PR_GET_PDEATHSIG)
     try:
@@ -465,7 +565,8 @@ def supervise(argv, expected_parent, term_grace=None, kill_grace=None,
         become_subreaper()
         return _supervise_armed(
             argv, term_grace, kill_grace, pass_fds, command_timeout,
-            control_path, return_command_status_on_signal,
+            control_path, return_command_status_on_signal, finalizer,
+            finalizer_timeout, completion_path, completion_token,
         )
     finally:
         # _supervise_armed drains and reaps the complete adopted process set
@@ -488,6 +589,14 @@ def main(argv=None):
     parser.add_argument("--control-path")
     parser.add_argument("--return-command-status-on-signal",
                         action="store_true")
+    parser.add_argument("--detach", action="store_true")
+    parser.add_argument("--finalizer")
+    parser.add_argument(
+        "--finalizer-timeout", type=float,
+        default=FINALIZER_TIMEOUT_SECONDS,
+    )
+    parser.add_argument("--completion-path")
+    parser.add_argument("--completion-token")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -496,13 +605,32 @@ def main(argv=None):
     if (not 0 <= args.term_grace < float("inf")
             or not 0 <= args.kill_grace < float("inf")
             or (args.timeout is not None
-                and not 0 < args.timeout < float("inf"))):
+                and not 0 < args.timeout < float("inf"))
+            or not 0 < args.finalizer_timeout < float("inf")):
         parser.error("supervisor deadlines must be finite and nonnegative")
+    if (args.completion_path is None) != (args.completion_token is None):
+        parser.error("completion path and token must be provided together")
+    if (args.completion_token is not None
+            and (len(args.completion_token) != 32
+                 or any(character not in "0123456789abcdef"
+                        for character in args.completion_token))):
+        parser.error("completion token must be 32 lowercase hexadecimal characters")
     try:
+        if args.detach:
+            if os.getppid() != args.expected_parent:
+                raise RuntimeError("expected parent is already gone")
+            try:
+                os.setsid()
+            except PermissionError:
+                if os.getsid(0) != os.getpid():
+                    raise
         return supervise(
             command, args.expected_parent, args.term_grace, args.kill_grace,
             args.pass_fd, args.timeout, args.control_path,
-            args.return_command_status_on_signal)
+            args.return_command_status_on_signal,
+            [args.finalizer] if args.finalizer else None,
+            args.finalizer_timeout, args.completion_path,
+            args.completion_token)
     except (OSError, RuntimeError) as exc:
         print(f"FAILED: phase supervisor: {exc}", file=sys.stderr)
         return 125

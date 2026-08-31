@@ -150,7 +150,8 @@ stage_runtime_bundle() {
     local sources=(
         corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py
         corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py
-        owned_process.py phase_supervisor.py corpus_campaign.sh
+        owned_process.py phase_supervisor.py host_resource_finalizer.py
+        serve_guardian.py corpus_campaign.sh
     )
     mkdir -- "$RESULTS/runtime"
     stage=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
@@ -296,7 +297,8 @@ campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.s
     echo " \"tag\": \"$TAG\", \"reps\": $REPS, \"warmup\": $WARMUP,"
     for f in corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py \
             corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py \
-            owned_process.py phase_supervisor.py corpus_campaign.sh; do
+            owned_process.py phase_supervisor.py host_resource_finalizer.py \
+            serve_guardian.py corpus_campaign.sh; do
         echo " \"$f\": \"$(sha256sum "$BENCH/$f" | cut -d' ' -f1)\","
     done
     echo " \"fcvm\": \"$(sha256sum "$BENCH/fcvm" | cut -d' ' -f1)\""
@@ -354,6 +356,9 @@ systemctl is-active --quiet dnsmasq 2>/dev/null && DNSMASQ_WAS_ACTIVE=yes
 SERVE_JOB_PID=""
 SERVE_CONTROL_FD=""
 SERVE_CONTROL_PATH=""
+SERVE_GUARDIAN_READY=""
+SERVE_COMPLETION_PATH=""
+SERVE_COMPLETION_TOKEN=""
 ACTIVE_PHASE_PID=""
 ACTIVE_PHASE_SIGNAL=""
 ACTIVE_PHASE_CONTROL_FD=""
@@ -379,14 +384,23 @@ run_logged() {
     trap 'ACTIVE_PHASE_SIGNAL=130' INT
     trap 'ACTIVE_PHASE_SIGNAL=143' TERM
     (
-        # The campaign shell is the only control writer. If it is SIGKILLed,
-        # EOF reaches the already-open supervisor and drains the phase tree.
+        # The supervisor detaches before it starts the phase and its tee. The
+        # campaign shell is the only control writer, so process-group death
+        # becomes FIFO EOF without killing the cleanup owner.
         exec {ACTIVE_PHASE_CONTROL_FD}>&-
         phase_parent=$BASHPID
-        set -o pipefail
-        python3 "$BENCH/phase_supervisor.py" --expected-parent "$phase_parent" \
-            --control-path "$ACTIVE_PHASE_CONTROL_PATH" -- "$@" 2>&1 \
-            | tee "$log_path"
+        set +e
+        python3 "$BENCH/phase_supervisor.py" --detach \
+            --expected-parent "$phase_parent" \
+            --control-path "$ACTIVE_PHASE_CONTROL_PATH" -- \
+            bash -c '
+                log_path=$1
+                shift
+                set -o pipefail
+                "$@" 2>&1 | tee "$log_path"
+            ' _ "$log_path" "$@"
+        phase_rc=$?
+        exit "$phase_rc"
     ) &
     ACTIVE_PHASE_PID=$!
     if [ -n "$ACTIVE_PHASE_SIGNAL" ]; then
@@ -782,11 +796,10 @@ cleanup() {
     cleanup_owned_containers || cleanup_rc=1
     stop_corpus_serve || cleanup_rc=1
     require_corpus_serve_clean || cleanup_rc=1
-    if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
-        for _ in $(seq 1 10); do sudo systemctl start dnsmasq >/dev/null 2>&1 && break; sleep 1; done
-        systemctl is-active --quiet dnsmasq || {
-            echo "FAILED: dnsmasq did not restart; this box has no DNS. Check: sudo ss -lnup 'sport = :53'" >&2
-            cleanup_rc=1; }
+    if [ "$DNSMASQ_WAS_ACTIVE" = yes ] \
+            && ! systemctl is-active --quiet dnsmasq; then
+        echo "FAILED: replay supervisor did not restore dnsmasq; check: sudo ss -lnup 'sport = :53'" >&2
+        cleanup_rc=1
     fi
     verify_runtime_bundle || cleanup_rc=1
     if [ "$original_rc" -ne 0 ] || [ "$cleanup_rc" -ne 0 ]; then
@@ -808,11 +821,13 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-[ "$DNSMASQ_WAS_ACTIVE" = yes ] && { say "stopping dnsmasq for 127.0.0.1:53"; sudo systemctl stop dnsmasq; }
-
 say "starting corpus_serve (DNS 127.0.0.1:53 -> 10.0.2.2, HTTP 80, HTTPS 443)"
 rm -f "$RESULTS/corpus-serve.status"
 SERVE_CONTROL_PATH="$LOGDIR/corpus-serve.control"
+SERVE_GUARDIAN_READY="$LOGDIR/corpus-serve-guardian.ready"
+SERVE_COMPLETION_PATH="$LOGDIR/corpus-serve-completion"
+SERVE_COMPLETION_TOKEN="$(tr -d - </proc/sys/kernel/random/uuid)"
+rm -f -- "$SERVE_GUARDIAN_READY"
 mkfifo -- "$SERVE_CONTROL_PATH" \
     || { echo "BLOCKED: cannot create corpus_serve control FIFO" >&2; exit 3; }
 if ! exec {SERVE_CONTROL_FD}<>"$SERVE_CONTROL_PATH"; then
@@ -821,32 +836,57 @@ if ! exec {SERVE_CONTROL_FD}<>"$SERVE_CONTROL_PATH"; then
     echo "BLOCKED: cannot open corpus_serve control FIFO" >&2
     exit 3
 fi
-# The background job closes its copy of the writer before sudo starts. The root
-# supervisor opens the FIFO before launching corpus_serve, so an outer process
-# exit becomes EOF and drains the complete privileged child tree.
-(
-    exec {SERVE_CONTROL_FD}>&-
-    set +e
+# The guardian starts a new session before it launches sudo. It holds fd 9 but
+# closes its control writer, so campaign process-group death becomes FIFO EOF
+# while the host-wide lease remains held through server drain and DNS restore.
+python3 "$BENCH/serve_guardian.py" \
+    --lease-fd 9 --control-fd "$SERVE_CONTROL_FD" \
+    --ready-path "$SERVE_GUARDIAN_READY" \
+    --status-path "$RESULTS/corpus-serve.status" \
+    --completion-path "$SERVE_COMPLETION_PATH" \
+    --completion-token "$SERVE_COMPLETION_TOKEN" -- \
     sudo -n sh -c '
-        exec python3 "$1" --expected-parent "$PPID" \
-            --control-path "$2" --return-command-status-on-signal -- \
-            python3 "$3" --root "$4" --port 80 --tls-port 443 \
-            --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 \
-            --dns-log "$5" --access-log "$6"
+        supervisor=$1
+        control_path=$2
+        finalizer=$3
+        completion_path=$4
+        completion_token=$5
+        dnsmasq_was_active=$6
+        phase_command=$7
+        export FCVM_FINALIZER_MODE=dnsmasq
+        export FCVM_DNSMASQ_WAS_ACTIVE="$dnsmasq_was_active"
+        exec python3 "$supervisor" --expected-parent "$PPID" \
+            --control-path "$control_path" --return-command-status-on-signal \
+            --completion-path "$completion_path" \
+            --completion-token "$completion_token" \
+            --finalizer "$finalizer" --finalizer-timeout 60 -- \
+            sh -c "$phase_command" _ "$dnsmasq_was_active" \
+                "$8" "$9" "${10}" "${11}"
     ' _ "$BENCH/phase_supervisor.py" "$SERVE_CONTROL_PATH" \
+        "$BENCH/host_resource_finalizer.py" \
+        "$SERVE_COMPLETION_PATH" "$SERVE_COMPLETION_TOKEN" \
+        "$DNSMASQ_WAS_ACTIVE" \
+        'if [ "$1" = yes ]; then
+            systemctl stop dnsmasq || exit $?
+         fi
+         exec python3 "$2" --root "$3" --port 80 --tls-port 443 \
+            --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 \
+            --dns-log "$4" --access-log "$5"' \
         "$BENCH/corpus_serve.py" "$BENCH/corpus-live" \
-        "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log"
-    serve_rc=$?
-    status_tmp=$(mktemp "$RESULTS/.corpus-serve-status.XXXXXX") || exit 125
-    if ! printf '%s\n' "$serve_rc" > "$status_tmp" \
-            || ! mv --no-target-directory \
-                "$status_tmp" "$RESULTS/corpus-serve.status"; then
-        rm -f -- "$status_tmp"
-        exit 125
-    fi
-    exit "$serve_rc"
-) > "$LOGDIR/corpus_serve.log" 2>&1 &
+        "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" \
+    > "$LOGDIR/corpus_serve.log" 2>&1 &
 SERVE_JOB_PID=$!
+for _ in $(seq 1 50); do
+    [ -f "$SERVE_GUARDIAN_READY" ] && break
+    [ ! -f "$RESULTS/corpus-serve.status" ] || break
+    sleep 0.1
+done
+[ -f "$SERVE_GUARDIAN_READY" ] || {
+    echo "BLOCKED: corpus_serve lease guardian did not detach" >&2
+    cat "$LOGDIR/corpus_serve.log" >&2
+    exit 3
+}
+rm -f -- "$SERVE_GUARDIAN_READY"
 for _ in $(seq 1 50); do
     grep -q "loaded [1-9]" "$LOGDIR/corpus_serve.log" && break
     [ ! -f "$RESULTS/corpus-serve.status" ] || break
