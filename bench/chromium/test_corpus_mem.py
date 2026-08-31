@@ -46,6 +46,7 @@ import campaign_summary as bench_campaign_summary  # noqa: E402
 import host_resource_finalizer  # noqa: E402
 import phase_supervisor  # noqa: E402
 import report as bench_report  # noqa: E402
+import serve_guardian  # noqa: E402
 
 EXTRA = os.path.join(HERE, "corpus_extra.sh")
 CORPUS_MEM = os.path.join(HERE, "corpus_mem.py")
@@ -4896,7 +4897,7 @@ os.fsync = _fsync
                     completion_token=token,
                 )
             with open(completion_path) as handle:
-                self.assertEqual(handle.read(), f"complete {token}\n")
+                self.assertEqual(handle.read(), f"armed {token}\n")
 
     def test_completion_stays_armed_without_a_finalizer_drain_certificate(self):
         """A failed nested supervisor cannot certify an unknown process set."""
@@ -5176,6 +5177,42 @@ os.fsync = _fsync
             with open(status_path) as handle:
                 self.assertEqual(handle.read(), "23\n")
             self.assertFalse(os.path.exists(completion_path))
+
+    def test_replay_guardian_never_publishes_success_after_completion_error(self):
+        """A verifier failure cannot preserve the child's zero status."""
+        published = []
+
+        class SuccessfulChild:
+            @staticmethod
+            def wait():
+                return 0
+
+        def record_publication(path, contents):
+            published.append((path, contents))
+
+        with mock.patch.object(
+                serve_guardian, "protect_lease_from_signals"), \
+                mock.patch.object(serve_guardian.os, "setsid"), \
+                mock.patch.object(serve_guardian.os, "fstat"), \
+                mock.patch.object(serve_guardian.fcntl, "flock"), \
+                mock.patch.object(serve_guardian.os, "close"), \
+                mock.patch.object(serve_guardian, "remove_record"), \
+                mock.patch.object(
+                    serve_guardian, "publish",
+                    side_effect=record_publication), \
+                mock.patch.object(
+                    serve_guardian.subprocess, "Popen",
+                    return_value=SuccessfulChild()), \
+                mock.patch.object(
+                    serve_guardian, "wait_for_completion",
+                    side_effect=RuntimeError("completion state unreadable")):
+            status = serve_guardian.guard(
+                ["true"], 9, 10, "ready", "status", "completion",
+                "f" * 32,
+            )
+
+        self.assertEqual(status, 125)
+        self.assertEqual(published, [("ready", mock.ANY), ("status", "125\n")])
 
     def test_replay_guardian_ignores_term_before_its_child_finishes(self):
         """A control-plane signal cannot drop the host lease.

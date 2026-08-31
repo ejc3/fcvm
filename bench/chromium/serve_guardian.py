@@ -199,6 +199,8 @@ def guard(command, lease_fd, control_fd, ready_path, status_path,
             )
             status = 125
     except BaseException as exc:
+        if status == 0:
+            status = 125
         print(f"FAILED: replay lease guardian: {exc}", file=sys.stderr, flush=True)
     finally:
         publish(status_path, f"{status}\n")

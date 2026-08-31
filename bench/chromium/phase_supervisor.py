@@ -544,7 +544,8 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
             signal.signal(signum, handler)
         os.close(wake_read)
         os.close(wake_write)
-        if completion_armed and phase_drained and finalizer_drained:
+        if (completion_armed and phase_drained and finalizer_drained
+                and finalizer_error is None):
             publish_completion_state(
                 completion_path, completion_token, "complete")
         if drain_error is not None:
