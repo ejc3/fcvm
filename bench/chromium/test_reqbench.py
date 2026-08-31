@@ -6039,7 +6039,12 @@ class HostCdpQuietGate(unittest.TestCase):
                 f.write("9.99 0 0 1/1 1\n")
             stubs = {
                 "pgrep": "#!/bin/bash\necho 0\nexit 1\n",
-                "podman": "#!/bin/bash\nexit 7\n",
+                "podman": ("#!/bin/bash\n"
+                           "if [ \"${1:-}\" = image ]; then "
+                           f"echo sha256:{'a' * 64}; exit 0; fi\n"
+                           "if [ \"${1:-}\" = container ] "
+                           "&& [ \"${2:-}\" = exists ]; then exit 1; fi\n"
+                           "exit 7\n"),
             }
             for name, body in stubs.items():
                 path = os.path.join(binx, name)
@@ -6088,7 +6093,12 @@ class HostCdpQuietGate(unittest.TestCase):
                 # Failing the container start right after the gate keeps the
                 # test to the gate itself; exit 7 is distinguishable from the
                 # gate's refusal exit 3.
-                "podman": "#!/bin/bash\nexit 7\n",
+                "podman": ("#!/bin/bash\n"
+                           "if [ \"${1:-}\" = image ]; then "
+                           f"echo sha256:{'a' * 64}; exit 0; fi\n"
+                           "if [ \"${1:-}\" = container ] "
+                           "&& [ \"${2:-}\" = exists ]; then exit 1; fi\n"
+                           "exit 7\n"),
             }
             for name, body in stubs.items():
                 path = os.path.join(binx, name)

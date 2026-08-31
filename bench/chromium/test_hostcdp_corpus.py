@@ -67,19 +67,33 @@ def staged_runtime(directory):
 
 
 def write_podman_stub(path, run_argv=None):
+    present = path + ".container-present"
     record_argv = ""
     if run_argv is not None:
         record_argv = f'''printf '%s\\0' "$@" > "{run_argv}"\n'''
     write_exec(path, f'''#!/bin/bash
 case "$1" in
-  run)
-    {record_argv}    echo {CONTAINER_ID}
+  image)
+    echo sha256:{"a" * 64}
+    ;;
+  create)
+    {record_argv}    : > "{present}"
+    echo {CONTAINER_ID}
+    ;;
+  start)
     ;;
   inspect)
     case "$*" in
       *'.Image'*) echo sha256:{"a" * 64} ;;
       *'Config.Labels'*) echo {CONTAINER_ID}'|'{CONTAINER_OWNER_TOKEN} ;;
     esac
+    ;;
+  container)
+    [ "${{2:-}}" = exists ] && [ -e "{present}" ] && exit 0
+    exit 1
+    ;;
+  rm)
+    rm -f -- "{present}"
     ;;
 esac
 exit 0

@@ -569,6 +569,7 @@ class HostCdpProducer(unittest.TestCase):
     CONTAINER_ID = "c" * 64
     PEER_ID = "d" * 64
     IMAGE_ID = "sha256:" + "a" * 64
+    OTHER_IMAGE_ID = "sha256:" + "e" * 64
 
     def environment(self, tmp, mode="ok", **overrides):
         bindir = os.path.join(tmp, "bin")
@@ -586,7 +587,22 @@ set -u
 cmd="${{1:-}}"
 [ "$#" -eq 0 ] || shift
 case "$cmd" in
-  run)
+  image)
+    [ "${{1:-}}" = inspect ] || exit 64
+    shift
+    target="${{@: -1}}"
+    [ "$target" = "${{IMAGE:-localhost/chromium-bench-req}}" ] || exit 65
+    printf '%s\n' "${{PODMAN_TAG_IMAGE_ID-{self.IMAGE_ID}}}"
+    ;;
+  container)
+    [ "${{1:-}}" = exists ] || exit 64
+    : >"$PODMAN_EXISTS_CALLED_FILE"
+    [ -z "${{PODMAN_EXISTS_RC:-}}" ] || exit "$PODMAN_EXISTS_RC"
+    [ -e "$PODMAN_TEST_STATE.name" ] && exit 0
+    exit 1
+    ;;
+  create)
+    launch_image="${{@: -1}}"
     name=
     owner=
     while [ "$#" -gt 0 ]; do
@@ -602,10 +618,67 @@ case "$cmd" in
       esac
     done
     [ "${{PODMAN_MODE:-ok}}" != collision ] || exit 125
+    if [ "${{PODMAN_MODE:-ok}}" = hung-create ]; then
+      : >"$PODMAN_CREATE_STARTED_FILE"
+      trap '' TERM
+      while :; do sleep 10; done
+    fi
+    if [ "${{PODMAN_MODE:-ok}}" = escaped-create ]; then
+      setsid bash -c '
+        trap "" TERM
+        printf "%s\n" "$BASHPID" >"$PODMAN_ESCAPED_STARTED_FILE"
+        while [ ! -e "$PODMAN_ESCAPED_RELEASE_FILE" ]; do sleep 0.01; done
+      ' >/dev/null 2>&1 &
+      exit 124
+    fi
+    if [ "${{PODMAN_MODE:-ok}}" = late-partial ]; then
+      : >"$PODMAN_CREATE_STARTED_FILE"
+      for fd in /proc/$$/fd/*; do
+        target=$(readlink "$fd" 2>/dev/null || true)
+        case "$target" in
+          "$CONTAINER_CREATE_OPS_DIR"/*.lock)
+            : >"$PODMAN_CREATE_LOCK_HELD_FILE"
+            break
+            ;;
+        esac
+      done
+      while [ ! -e "$PODMAN_CREATE_RELEASE_FILE" ]; do sleep 0.01; done
+    fi
+    if [ "${{PODMAN_MODE:-ok}}" = closed-fd-late ]; then
+      setsid bash -c '
+        name=$1
+        owner=$2
+        launch_image=$3
+        (
+          trap "" TERM
+          for descriptor_path in /proc/$BASHPID/fd/*; do
+            descriptor=${{descriptor_path##*/}}
+            case "$descriptor" in 0|1|2) ;; *) eval "exec $descriptor>&-" ;; esac
+          done
+          printf "%s\n" "$BASHPID" >"$PODMAN_ESCAPED_STARTED_FILE"
+          while [ ! -e "$PODMAN_ESCAPED_RELEASE_FILE" ]; do sleep 0.01; done
+          printf "%s\n" "$name" >"$PODMAN_TEST_STATE.name"
+          printf "%s\n" "$owner" >"$PODMAN_TEST_STATE.owner"
+          printf "%s\n" "$launch_image" >"$PODMAN_TEST_STATE.launch-image"
+          printf "%s\n" "$PODMAN_CONTAINER_IMAGE_ID" >"$PODMAN_TEST_STATE.image"
+          : >"$PODMAN_LATE_COMMIT_FILE"
+          while [ ! -e "$PODMAN_LATE_ACK_FILE" ]; do sleep 0.01; done
+        ) &
+        exit 0
+      ' bash "$name" "$owner" "$launch_image" >/dev/null 2>&1 &
+      while [ ! -e "$PODMAN_ESCAPED_STARTED_FILE" ]; do sleep 0.01; done
+      exit 124
+    fi
     printf '%s\n' "$name" >"$PODMAN_TEST_STATE.name"
-    printf '%s\n' "$owner" >"$PODMAN_TEST_STATE.owner"
+    printf '%s\n' "${{PODMAN_CONTAINER_OWNER_TOKEN-$owner}}" >"$PODMAN_TEST_STATE.owner"
+    printf '%s\n' "$launch_image" >"$PODMAN_TEST_STATE.launch-image"
+    printf '%s\n' "${{PODMAN_CONTAINER_IMAGE_ID-{self.IMAGE_ID}}}" >"$PODMAN_TEST_STATE.image"
+    [ "${{PODMAN_MODE:-ok}}" != partial ] || exit 124
+    [ "${{PODMAN_MODE:-ok}}" != late-partial ] || exit 124
+    [ "${{PODMAN_MODE:-ok}}" != inspect-error ] || exit 124
     printf '%s\n' '{self.CONTAINER_ID}'
     ;;
+  start) exit 0 ;;
   inspect)
     format=
     target=
@@ -616,13 +689,34 @@ case "$cmd" in
         *) target="$1"; shift ;;
       esac
     done
+    if [ "${{PODMAN_MODE:-ok}}" = inspect-once-error ] \
+        && [[ "$format" = *'Config.Labels'* ]] \
+        && [ ! -e "$PODMAN_INSPECT_ONCE_MARKER" ]; then
+      : >"$PODMAN_INSPECT_ONCE_MARKER"
+      exit 70
+    fi
+    [ "${{PODMAN_MODE:-ok}}" != inspect-error ] || exit 70
     if [ "${{PODMAN_MODE:-ok}}" = collision ]; then
       printf '%s|%s\n' '{self.PEER_ID}' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
       exit 0
     fi
-    [ -e "$PODMAN_TEST_STATE.name" ] || exit 1
+    if [ ! -e "$PODMAN_TEST_STATE.name" ]; then
+      : >"$PODMAN_INSPECT_CALLED_FILE"
+      [ "${{PODMAN_MODE:-ok}}" != closed-fd-late ] \
+        || : >"$PODMAN_PRIOR_ABSENCE_FILE"
+      if [ "${{PODMAN_MODE:-ok}}" = late-partial ]; then
+        exec 8>"$PODMAN_INSPECT_COUNT.lock"
+        flock -x 8
+        count=0
+        [ ! -e "$PODMAN_INSPECT_COUNT" ] || read -r count <"$PODMAN_INSPECT_COUNT"
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$PODMAN_INSPECT_COUNT"
+        [ "$count" -lt 10 ] || : >"$PODMAN_PRIOR_ABSENCE_FILE"
+      fi
+      exit 1
+    fi
     case "$format" in
-      *'.Image'*) printf '%s\n' '{self.IMAGE_ID}' ;;
+      *'.Image'*) cat "$PODMAN_TEST_STATE.image" ;;
       *'Config.Labels'*)
         printf '%s|%s\n' '{self.CONTAINER_ID}' "$(cat "$PODMAN_TEST_STATE.owner")"
         ;;
@@ -632,7 +726,10 @@ case "$cmd" in
   exec) exit 0 ;;
   rm)
     target="${{@: -1}}"
+    [ "${{PODMAN_RM_FAIL:-0}}" != 1 ] || exit 73
     printf '%s\n' "$target" >>"$PODMAN_REMOVED"
+    [ "${{PODMAN_RM_LEAVES_CONTAINER:-0}}" = 1 ] \
+      || rm -f -- "$PODMAN_TEST_STATE.name"
     exit 0
     ;;
   logs) exit 0 ;;
@@ -661,6 +758,9 @@ if [ "${{1:-}}" = "$HOSTCDP_DRIVER" ]; then
   case "${{DRIVER_RUNTIME_ACTION:-}}" in
     tamper) printf '%s\n' mutated >"$RUNTIME_PAYLOAD" ;;
   esac
+  case "${{DRIVER_LOAD_ACTION:-}}" in
+    numeric-read-error) : >"$LOAD_READ_FAILED_MARKER" ;;
+  esac
   printf '%s\n' '{{"ok":true,"url":"https://example.com/","stages":{{"total_ms":1.0}},"nav":{{"load_ms":1.0}}}}'
   exit 0
 fi
@@ -668,20 +768,38 @@ exec {sys.executable!r} "$@"
 ''')
         os.chmod(python, 0o755)
 
-        if mode == "partial":
-            real_timeout = shutil.which("timeout")
-            timeout = os.path.join(bindir, "timeout")
-            with open(timeout, "w") as handle:
-                handle.write(f'''#!/bin/bash
-duration="$1"
-shift
-if [ "${{1:-}}" = podman ] && [ "${{2:-}}" = run ]; then
-  "$@" >/dev/null
-  exit 124
+        real_cut = shutil.which("cut")
+        cut = os.path.join(bindir, "cut")
+        with open(cut, "w") as handle:
+            handle.write(f'''#!/bin/bash
+if [ "${{@: -1}}" = "$LOADAVG_FILE" ] \
+    && {{ [ "${{LOAD_READ_FAIL_FROM_START:-0}}" = 1 ] \
+         || {{ [ -n "${{LOAD_READ_FAILED_MARKER:-}}" ] \
+              && [ -e "$LOAD_READ_FAILED_MARKER" ]; }}; }}; then
+  printf '%s\n' '0.42'
+  exit 9
 fi
-exec {real_timeout!r} "$duration" "$@"
+exec {real_cut!r} "$@"
 ''')
-            os.chmod(timeout, 0o755)
+        os.chmod(cut, 0o755)
+
+        real_date = shutil.which("date")
+        wall_clock_state = os.path.join(tmp, "wall-clock-state")
+        date = os.path.join(bindir, "date")
+        with open(date, "w") as handle:
+            handle.write(f'''#!/bin/bash
+if [ "${{1:-}}" = '+%s.%N' ] && [ -n "${{WALL_CLOCK_STEPS:-}}" ]; then
+  index=0
+  [ ! -e {wall_clock_state!r} ] || read -r index < {wall_clock_state!r}
+  IFS=, read -r -a values <<<"$WALL_CLOCK_STEPS"
+  [ "$index" -lt "${{#values[@]}}" ] || exit 67
+  printf '%s\n' "${{values[$index]}}"
+  printf '%s\n' "$((index + 1))" > {wall_clock_state!r}
+  exit 0
+fi
+exec {real_date!r} "$@"
+''')
+        os.chmod(date, 0o755)
 
         runtime = os.path.join(tmp, "runtime")
         os.mkdir(runtime)
@@ -700,6 +818,20 @@ exec {real_timeout!r} "$duration" "$@"
         revision = subprocess.check_output(
             ["git", "-C", os.path.dirname(os.path.dirname(HERE)),
              "rev-parse", "HEAD"], text=True).strip()
+        create_ops = os.path.join(tmp, "container-create-ops")
+        os.mkdir(create_ops)
+        create_started = os.path.join(tmp, "create-started")
+        create_lock_held = os.path.join(tmp, "create-lock-held")
+        create_release = os.path.join(tmp, "create-release")
+        inspect_count = os.path.join(tmp, "inspect-count")
+        prior_absence = os.path.join(tmp, "prior-absence")
+        inspect_called = os.path.join(tmp, "inspect-called")
+        inspect_once = os.path.join(tmp, "inspect-once")
+        exists_called = os.path.join(tmp, "exists-called")
+        escaped_started = os.path.join(tmp, "escaped-started")
+        escaped_release = os.path.join(tmp, "escaped-release")
+        late_commit = os.path.join(tmp, "late-commit")
+        late_ack = os.path.join(tmp, "late-ack")
 
         env = dict(
             os.environ,
@@ -716,6 +848,24 @@ exec {real_timeout!r} "$duration" "$@"
             ALLOW_BUSY="1",
             SETTLE_WAIT_SECS="0",
             URL="https://example.com/",
+            IMAGE="localhost/chromium-bench-req",
+            IMAGE_ID=self.IMAGE_ID,
+            PODMAN_TAG_IMAGE_ID=self.IMAGE_ID,
+            PODMAN_CONTAINER_IMAGE_ID=self.IMAGE_ID,
+            PODMAN_CREATE_TIMEOUT_SECS="120",
+            CONTAINER_CREATE_OPS_DIR=create_ops,
+            PODMAN_CREATE_STARTED_FILE=create_started,
+            PODMAN_CREATE_LOCK_HELD_FILE=create_lock_held,
+            PODMAN_CREATE_RELEASE_FILE=create_release,
+            PODMAN_INSPECT_COUNT=inspect_count,
+            PODMAN_PRIOR_ABSENCE_FILE=prior_absence,
+            PODMAN_INSPECT_CALLED_FILE=inspect_called,
+            PODMAN_INSPECT_ONCE_MARKER=inspect_once,
+            PODMAN_EXISTS_CALLED_FILE=exists_called,
+            PODMAN_ESCAPED_STARTED_FILE=escaped_started,
+            PODMAN_ESCAPED_RELEASE_FILE=escaped_release,
+            PODMAN_LATE_COMMIT_FILE=late_commit,
+            PODMAN_LATE_ACK_FILE=late_ack,
             COMPARISON_LABEL="free",
             CPU_BUDGET="unlimited",
             SOURCE_REVISION=revision,
@@ -724,6 +874,8 @@ exec {real_timeout!r} "$duration" "$@"
             CORPUS_EXTRA_RUNTIME_MANIFEST=outer_manifest,
             CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256=runtime_digest,
             RUNTIME_PAYLOAD=payload,
+            LOAD_READ_FAILED_MARKER=os.path.join(tmp, "load-read-failed"),
+            WALL_CLOCK_STATE=wall_clock_state,
         )
         env.pop("CPUS", None)
         env.pop("CONTAINER_OWNER_TOKEN", None)
@@ -751,7 +903,30 @@ exec {real_timeout!r} "$duration" "$@"
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(
                 self.removed_ids(removed), [],
-                "a failed podman run made the pre-existing same-name container owned",
+                "a failed podman create made the pre-existing same-name container owned",
+            )
+
+    def test_successful_create_output_is_not_owned_until_the_token_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(
+                tmp, PODMAN_CONTAINER_OWNER_TOKEN="b" * 32)
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                self.removed_ids(removed), [],
+                "an exact ID without the private owner token was removed",
+            )
+            self.assertTrue(os.path.exists(state + ".name"))
+
+    def test_cleanup_retries_identity_after_post_create_inspect_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, _state = self.environment(tmp, mode="inspect-once-error")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("could not be inspected", proc.stderr)
+            self.assertEqual(
+                self.removed_ids(removed), [self.CONTAINER_ID],
+                "cleanup never retried the exact ID and owner-token proof",
             )
 
     def test_partial_create_timeout_adopts_only_its_labeled_exact_id(self):
@@ -763,6 +938,390 @@ exec {real_timeout!r} "$duration" "$@"
             with open(state + ".owner") as handle:
                 token = handle.read().strip()
             self.assertRegex(token, r"^[0-9a-f]{32}$")
+
+    def test_failed_inspect_cannot_claim_absence_when_container_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, _state = self.environment(
+                tmp, mode="inspect-error", PODMAN_EXISTS_RC="0")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(
+                os.path.exists(env["PODMAN_EXISTS_CALLED_FILE"]),
+                "an inspect error was treated as container absence",
+            )
+            self.assertIn("exists but its identity could not be inspected", proc.stderr)
+            self.assertEqual(self.removed_ids(removed), [])
+
+    def test_late_create_completion_is_reaped_without_touching_a_peer(self):
+        """A timed-out create client can return before its container commits."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(
+                tmp, mode="late-partial", PODMAN_CREATE_TIMEOUT_SECS="1")
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            deadline = time.monotonic() + 10
+            release_reason = None
+            while time.monotonic() < deadline:
+                if os.path.exists(env["PODMAN_CREATE_LOCK_HELD_FILE"]):
+                    self.assertFalse(
+                        os.path.exists(env["PODMAN_PRIOR_ABSENCE_FILE"]),
+                        "cleanup probed absence while the create operation was live",
+                    )
+                    release_reason = "locked-create"
+                    break
+                if os.path.exists(env["PODMAN_PRIOR_ABSENCE_FILE"]):
+                    release_reason = "prior-absence"
+                    break
+                if producer.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(release_reason, "create failpoint was never reached")
+            with open(env["PODMAN_CREATE_RELEASE_FILE"], "w"):
+                pass
+            stdout, stderr = producer.communicate(timeout=10)
+            self.assertEqual(release_reason, "locked-create", stdout + stderr)
+            self.assertTrue(os.path.exists(state + ".launch-image"), stdout + stderr)
+            self.assertNotEqual(producer.returncode, 0, stdout + stderr)
+            self.assertEqual(self.removed_ids(removed), [self.CONTAINER_ID])
+            self.assertNotIn(self.PEER_ID, self.removed_ids(removed))
+
+    def test_closed_fd_double_fork_cannot_commit_after_absence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(
+                tmp, mode="closed-fd-late", PODMAN_CREATE_TIMEOUT_SECS="1",
+                PODMAN_CREATE_KILL_AFTER_SECS="1",
+                PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="1")
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            escaped_pid = None
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if (os.path.exists(env["PODMAN_PRIOR_ABSENCE_FILE"])
+                            and os.path.exists(env["PODMAN_ESCAPED_STARTED_FILE"])):
+                        with open(env["PODMAN_ESCAPED_STARTED_FILE"]) as handle:
+                            escaped_pid = int(handle.read().strip())
+                        break
+                    if producer.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(
+                    escaped_pid, "closed-FD create descendant never reached reconciliation")
+                with open(env["PODMAN_ESCAPED_RELEASE_FILE"], "w"):
+                    pass
+                stdout, stderr = producer.communicate(timeout=10)
+                self.assertNotEqual(producer.returncode, 0, stdout + stderr)
+
+                outcome = None
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if os.path.exists(env["PODMAN_LATE_COMMIT_FILE"]):
+                        outcome = "late-commit"
+                        break
+                    if not os.path.exists(f"/proc/{escaped_pid}"):
+                        outcome = "reaped"
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(outcome, "reaped", stdout + stderr)
+                self.assertFalse(os.path.exists(state + ".name"),
+                                 "container committed after absence reconciliation")
+                self.assertEqual(self.removed_ids(removed), [])
+            finally:
+                with open(env["PODMAN_ESCAPED_RELEASE_FILE"], "w"):
+                    pass
+                with open(env["PODMAN_LATE_ACK_FILE"], "w"):
+                    pass
+                if producer.poll() is None:
+                    producer.terminate()
+                    producer.wait(timeout=5)
+                if escaped_pid is not None:
+                    deadline = time.monotonic() + 5
+                    while (os.path.exists(f"/proc/{escaped_pid}")
+                           and time.monotonic() < deadline):
+                        time.sleep(0.01)
+
+    def test_hung_create_is_terminated_and_reaped_within_the_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(
+                tmp, mode="hung-create", PODMAN_CREATE_TIMEOUT_SECS="1",
+                PODMAN_CREATE_KILL_AFTER_SECS="1",
+                PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="1")
+            started = time.monotonic()
+            proc = self.run_host(env)
+            elapsed = time.monotonic() - started
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertLess(elapsed, 5, f"create deadline took {elapsed:.3f}s")
+            self.assertTrue(os.path.exists(env["PODMAN_CREATE_STARTED_FILE"]))
+            self.assertFalse(os.path.exists(state + ".name"))
+            self.assertEqual(self.removed_ids(removed), [])
+            locks = os.listdir(env["CONTAINER_CREATE_OPS_DIR"])
+            self.assertEqual(len(locks), 1, locks)
+            lock = os.path.join(env["CONTAINER_CREATE_OPS_DIR"], locks[0])
+            self.assertEqual(
+                subprocess.run(["flock", "-n", lock, "true"]).returncode, 0,
+                "the killed create operation still holds its shared lock",
+            )
+
+    def test_escaped_lock_holder_is_reaped_before_absence_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(
+                tmp, mode="escaped-create",
+                PODMAN_CREATE_KILL_AFTER_SECS="1",
+                PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="1")
+            try:
+                started = time.monotonic()
+                proc = self.run_host(env)
+                elapsed = time.monotonic() - started
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertLess(elapsed, 5, f"escaped create drain took {elapsed:.3f}s")
+                self.assertIn("live descendants", proc.stderr)
+                self.assertTrue(os.path.exists(env["PODMAN_ESCAPED_STARTED_FILE"]))
+                with open(env["PODMAN_ESCAPED_STARTED_FILE"]) as handle:
+                    escaped_pid = int(handle.read().strip())
+                self.assertFalse(os.path.exists(f"/proc/{escaped_pid}"),
+                                 "create descendant survived reconciliation")
+                self.assertTrue(os.path.exists(env["PODMAN_INSPECT_CALLED_FILE"]))
+                self.assertFalse(os.path.exists(state + ".name"))
+                self.assertEqual(self.removed_ids(removed), [])
+            finally:
+                with open(env["PODMAN_ESCAPED_RELEASE_FILE"], "w"):
+                    pass
+                locks = os.listdir(env["CONTAINER_CREATE_OPS_DIR"])
+                if locks:
+                    lock = os.path.join(env["CONTAINER_CREATE_OPS_DIR"], locks[0])
+                    subprocess.run(["flock", "-w", "5", lock, "true"], check=True)
+
+    def test_create_supervisor_has_term_kill_and_bounded_quiescence(self):
+        with open(HOSTCDP) as handle:
+            source = handle.read()
+        create = source.index("podman create --name")
+        prefix = source[:create]
+        self.assertIn('python3 "$HERE/phase_supervisor.py"', prefix)
+        self.assertIn('--timeout "$PODMAN_CREATE_TIMEOUT_SECS"', prefix)
+        self.assertIn('--term-grace "$PODMAN_CREATE_KILL_AFTER_SECS"', prefix)
+        self.assertIn('--kill-grace "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS"', prefix)
+        self.assertIn('--pass-fd "$CREATE_OP_LOCK_FD"', prefix)
+        quiesce = source.index(
+            'flock -x -w "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS"', create)
+        outcome = source.index('if [ "$podman_create_rc" -eq 0 ]', create)
+        self.assertLess(quiesce, outcome)
+        ownership = source.index('inspect_owned_container "$CONTAINER_ID"', outcome)
+        start = source.index('podman start -- "$CONTAINER_ID"', ownership)
+        self.assertLess(ownership, start)
+
+    def test_logical_image_is_recorded_but_the_exact_id_is_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, state = self.environment(tmp)
+            proc = self.run_host(env)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(state + ".launch-image") as handle:
+                self.assertEqual(handle.read().strip(), self.IMAGE_ID)
+            with open(os.path.join(env["RESULTS"], "run.json")) as handle:
+                run = json.load(handle)
+            self.assertEqual(run["image"], env["IMAGE"])
+            self.assertEqual(run["image_id"], self.IMAGE_ID)
+
+    def test_image_identity_accepts_bare_and_prefixed_sha256_shapes(self):
+        shapes = (
+            (self.IMAGE_ID.removeprefix("sha256:"), self.IMAGE_ID,
+             self.IMAGE_ID.removeprefix("sha256:")),
+            (self.IMAGE_ID, self.IMAGE_ID.removeprefix("sha256:"),
+             self.IMAGE_ID),
+        )
+        for tag_shape, container_shape, supplied_shape in shapes:
+            with self.subTest(tag=tag_shape[:8], container=container_shape[:8],
+                              supplied=supplied_shape[:8]), \
+                    tempfile.TemporaryDirectory() as tmp:
+                env, _removed, state = self.environment(
+                    tmp, PODMAN_TAG_IMAGE_ID=tag_shape,
+                    PODMAN_CONTAINER_IMAGE_ID=container_shape,
+                    IMAGE_ID=supplied_shape)
+                proc = self.run_host(env)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                with open(state + ".launch-image") as handle:
+                    self.assertEqual(handle.read().strip(), self.IMAGE_ID)
+                with open(os.path.join(env["RESULTS"], "run.json")) as handle:
+                    self.assertEqual(json.load(handle)["image_id"], self.IMAGE_ID)
+
+    def test_image_identity_rejects_malformed_and_multiple_output(self):
+        malformed = (
+            "",
+            "a" * 63,
+            "A" * 64,
+            self.IMAGE_ID + "\n" + self.OTHER_IMAGE_ID,
+        )
+        for identity in malformed:
+            with self.subTest(identity=repr(identity)), \
+                    tempfile.TemporaryDirectory() as tmp:
+                env, removed, state = self.environment(
+                    tmp, PODMAN_TAG_IMAGE_ID=identity)
+                proc = self.run_host(env)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertFalse(os.path.exists(state + ".name"))
+                self.assertEqual(self.removed_ids(removed), [])
+
+        for identity in malformed:
+            with self.subTest(container_identity=repr(identity)), \
+                    tempfile.TemporaryDirectory() as tmp:
+                env, removed, _state = self.environment(
+                    tmp, PODMAN_CONTAINER_IMAGE_ID=identity)
+                proc = self.run_host(env)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.removed_ids(removed), [self.CONTAINER_ID])
+
+    def test_tag_must_resolve_to_the_supplied_exact_image_before_create(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(
+                tmp, PODMAN_TAG_IMAGE_ID=self.OTHER_IMAGE_ID)
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("image", proc.stderr.lower())
+            self.assertFalse(os.path.exists(state + ".name"),
+                             "container creation followed a failed image preflight")
+            self.assertEqual(self.removed_ids(removed), [])
+
+    def test_created_container_must_use_the_preflighted_exact_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, _state = self.environment(
+                tmp, PODMAN_CONTAINER_IMAGE_ID=self.OTHER_IMAGE_ID)
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("image", proc.stderr.lower())
+            self.assertEqual(self.removed_ids(removed), [self.CONTAINER_ID])
+
+    def test_wall_clock_steps_do_not_change_rep_elapsed_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, REPS="2", WALL_CLOCK_STEPS="1000,999,1000,1000000")
+            proc = self.run_host(env)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(os.path.join(env["RESULTS"], "hostcdp.jsonl")) as handle:
+                rows = [json.loads(line) for line in handle]
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                self.assertGreaterEqual(row["wall_ms"], 0, row)
+                self.assertLess(row["wall_ms"], 5000, row)
+            self.assertFalse(os.path.exists(env["WALL_CLOCK_STATE"]),
+                             "elapsed timing still reads CLOCK_REALTIME through date")
+
+    def test_numeric_output_from_a_failed_load_read_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, DRIVER_LOAD_ACTION="numeric-read-error")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("status=9", proc.stderr)
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+            with open(os.path.join(env["RESULTS"], "hostcdp.jsonl")) as handle:
+                row = json.loads(handle.readline())
+            self.assertEqual(row["loadavg1_raw"], "0.42")
+            self.assertEqual(row["loadavg1_read_status"], 9)
+            self.assertIsNone(row["loadavg1"])
+            self.assertIs(row["measurement_valid"], False)
+
+    def test_failed_initial_load_read_refuses_before_container_create(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(
+                tmp, LOAD_READ_FAIL_FROM_START="1")
+            proc = self.run_host(env)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("status=9", proc.stderr)
+            self.assertFalse(os.path.exists(state + ".name"))
+            self.assertEqual(self.removed_ids(removed), [])
+
+    def test_complete_manifest_binds_the_exact_raw_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(tmp)
+            proc = self.run_host(env)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(os.path.join(env["RESULTS"], "complete.json")) as handle:
+                complete = json.load(handle)
+            with open(os.path.join(env["RESULTS"], "run.json")) as handle:
+                run = json.load(handle)
+            self.assertEqual(complete["schema_version"], 1)
+            self.assertEqual(complete["run_id"], run["run_id"])
+            self.assertEqual(set(complete["artifacts"]), {"run.json", "hostcdp.jsonl"})
+            for name in complete["artifacts"]:
+                path = os.path.join(env["RESULTS"], name)
+                with open(path, "rb") as source:
+                    raw = source.read()
+                self.assertEqual(
+                    complete["artifacts"][name],
+                    {"size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()},
+                )
+
+    def test_post_rename_publication_failure_withdraws_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, HOSTCDP_COMPLETE_FAIL_AFTER_RENAME="1")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(os.path.exists(os.path.join(env["RESULTS"], "WITHDRAWN")))
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "complete.json")))
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+
+    def test_cleanup_failure_withdraws_every_authorizing_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, _state = self.environment(tmp, PODMAN_RM_FAIL="1")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("could not remove owned container", proc.stderr)
+            self.assertEqual(self.removed_ids(removed), [])
+            self.assertTrue(os.path.exists(os.path.join(env["RESULTS"], "WITHDRAWN")))
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "complete.json")))
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+
+    def test_successful_rm_must_be_followed_by_exact_absence_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, _state = self.environment(
+                tmp, PODMAN_RM_LEAVES_CONTAINER="1")
+            proc = self.run_host(env)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("survived podman rm", proc.stderr)
+            self.assertEqual(
+                self.removed_ids(removed),
+                [self.CONTAINER_ID, self.CONTAINER_ID],
+                "the main path and EXIT cleanup must target only the exact ID",
+            )
+            self.assertTrue(os.path.exists(os.path.join(env["RESULTS"], "WITHDRAWN")))
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "complete.json")))
+            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+
+    def test_completion_is_atomic_and_is_the_final_action(self):
+        with open(HOSTCDP) as handle:
+            source = handle.read()
+        publisher = source.find("publish_complete() {")
+        self.assertGreaterEqual(publisher, 0, "the producer has no completion publisher")
+        publish = source.rfind("\npublish_complete")
+        self.assertGreaterEqual(publish, 0, "the producer never publishes completion")
+        self.assertIn("os.replace(temporary, output_path)", source[publisher:publish])
+        final_runtime = source.rfind(
+            'verify_runtime_manifest "$CORPUS_EXTRA_RUNTIME_MANIFEST"',
+            publisher, publish,
+        )
+        removal = source.rfind("remove_owned_container ||", publisher, publish)
+        summary = source.find(
+            'python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json"',
+            publisher, publish,
+        )
+        trap_install = source.rfind("trap cleanup EXIT", publisher, publish)
+        trap_reset = source.rfind("trap - EXIT", trap_install, publish)
+        self.assertGreater(final_runtime, publisher,
+                           "completion precedes runtime verification")
+        self.assertGreater(removal, final_runtime,
+                           "completion precedes exact container removal")
+        self.assertGreater(summary, removal,
+                           "completion precedes derived summary validation")
+        self.assertGreater(trap_install, publisher,
+                           "completion has no failure cleanup trap")
+        self.assertEqual(trap_reset, -1,
+                         "completion clears its failure cleanup trap before publication")
+        self.assertEqual(source[publish:].strip(), "publish_complete",
+                         "completion is not the producer's final action")
 
     def test_mid_run_nonnumeric_load_is_raw_evidence_not_a_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -809,6 +1368,8 @@ exec {real_timeout!r} "$duration" "$@"
                  "rev-parse", "HEAD"], text=True).strip()
             with open(HOSTCDP, "rb") as handle:
                 producer_hash = hashlib.sha256(handle.read()).hexdigest()
+            with open(os.path.join(HERE, "phase_supervisor.py"), "rb") as handle:
+                supervisor_hash = hashlib.sha256(handle.read()).hexdigest()
             import reqbench
             expected = {
                 "host_boot_id": boot_id,
@@ -820,6 +1381,7 @@ exec {real_timeout!r} "$duration" "$@"
                     env["CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256"],
                 "harness_sha256": reqbench.harness_sha256(),
                 "hostcdp_sha256": producer_hash,
+                "phase_supervisor_sha256": supervisor_hash,
                 "driver": "cdpdrive.py",
                 "network": "host (no VM, no DNAT)",
                 "comparison_label": "free",

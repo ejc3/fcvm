@@ -12,6 +12,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${IMAGE:-localhost/chromium-bench-req}"
+IMAGE_ID="${IMAGE_ID:-}"
 # REPS is the MEASURED rep count and WARMUP is EXTRA, exactly as reqbench.py
 # reads --reps/--warmup ("for rep in range(args.warmup + args.reps)"), so the
 # campaign's REPS/WARMUP can be handed to both arms and produce the same
@@ -24,6 +25,10 @@ RUNID="${RUNID:-$(tr -d - </proc/sys/kernel/random/uuid)}"
 RESULTS="${RESULTS:-$HERE/results/hostcdp-$RUNID}"
 CNAME="hostcdp-$RUNID"
 LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
+PODMAN_CREATE_TIMEOUT_SECS="${PODMAN_CREATE_TIMEOUT_SECS:-120}"
+PODMAN_CREATE_KILL_AFTER_SECS="${PODMAN_CREATE_KILL_AFTER_SECS:-5}"
+PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="${PODMAN_CREATE_QUIESCE_TIMEOUT_SECS:-30}"
+CONTAINER_CREATE_OPS_DIR="${CONTAINER_CREATE_OPS_DIR:-}"
 CONTAINER_OWNER_TOKEN="${CONTAINER_OWNER_TOKEN:-$(tr -d - </proc/sys/kernel/random/uuid)}"
 readonly CONTAINER_OWNER_TOKEN
 OWNER_LABEL_KEY="io.fcvm.bench.owner"
@@ -36,6 +41,13 @@ REQBENCH_RUNTIME_BUNDLE_SHA256="${REQBENCH_RUNTIME_BUNDLE_SHA256:-}"
 CORPUS_EXTRA_RUNTIME_MANIFEST="${CORPUS_EXTRA_RUNTIME_MANIFEST:-}"
 CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="${CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256:-}"
 CONTAINER_ID=
+CONTAINER_OWNERSHIP_VERIFIED=false
+CREATE_OUTPUT_PATH=
+CREATE_OP_LOCK_FD=
+CREATE_OP_STARTED=false
+CREATE_OP_QUIESCENT=true
+CREATE_OUTCOME_CHECKED=false
+CONTAINER_REMOVED=false
 
 [[ "$RUNID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$ ]] \
     || { echo "REFUSING: RUNID must be 1-96 filename-safe characters" >&2; exit 2; }
@@ -45,12 +57,26 @@ CONTAINER_ID=
     || { echo "REFUSING: COMPARISON_LABEL must be 1-64 filename-safe characters" >&2; exit 2; }
 [[ "$REPS" =~ ^[0-9]+$ && "$WARMUP" =~ ^[0-9]+$ ]] \
     || { echo "REFUSING: REPS and WARMUP must be nonnegative integers" >&2; exit 2; }
+if ! [[ "$PODMAN_CREATE_TIMEOUT_SECS" =~ ^[0-9]+$ ]] \
+        || [ "$((10#$PODMAN_CREATE_TIMEOUT_SECS))" -lt 1 ]; then
+    echo "REFUSING: PODMAN_CREATE_TIMEOUT_SECS must be a positive integer" >&2
+    exit 2
+fi
+PODMAN_CREATE_TIMEOUT_SECS=$((10#$PODMAN_CREATE_TIMEOUT_SECS))
+for value_name in PODMAN_CREATE_KILL_AFTER_SECS PODMAN_CREATE_QUIESCE_TIMEOUT_SECS; do
+    value=${!value_name}
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$((10#$value))" -lt 1 ]; then
+        echo "REFUSING: $value_name must be a positive integer" >&2
+        exit 2
+    fi
+    printf -v "$value_name" '%d' "$((10#$value))"
+done
 if ! [[ "$CDP_PORT" =~ ^[0-9]+$ ]] \
         || [ "$CDP_PORT" -lt 1 ] || [ "$CDP_PORT" -gt 65535 ]; then
     echo "REFUSING: CDP_PORT must be in 1..65535" >&2
     exit 2
 fi
-for tool in awk cut date dirname flock git mkdir mktemp pgrep podman python3 sed \
+for tool in awk cut date dirname flock git mkdir mktemp pgrep podman python3 rm sed \
         seq sha256sum sleep timeout tr uname; do
     command -v "$tool" >/dev/null 2>&1 \
         || { echo "REFUSING: '$tool' missing" >&2; exit 2; }
@@ -107,6 +133,92 @@ verify_runtime_manifest() {
     name=${manifest##*/}
     (cd "$directory" && sha256sum --check --strict --status "$name") \
         || { log "REFUSING: $label runtime bytes changed"; return 2; }
+}
+
+canonicalize_image_id() {
+    local raw=$1 digest
+    if [[ "$raw" =~ ^sha256:([0-9a-f]{64})$ ]]; then
+        digest=${BASH_REMATCH[1]}
+    elif [[ "$raw" =~ ^([0-9a-f]{64})$ ]]; then
+        digest=${BASH_REMATCH[1]}
+    else
+        return 2
+    fi
+    printf 'sha256:%s\n' "$digest"
+}
+
+resolve_image_id() {
+    local reference=$1 raw resolved
+    raw=$(timeout 30 podman image inspect --format '{{.Id}}' "$reference") \
+        || { log "REFUSING: cannot resolve image identity for $reference"; return 2; }
+    resolved=$(canonicalize_image_id "$raw") \
+        || { log "REFUSING: image $reference resolved to an invalid identity"; return 2; }
+    printf '%s\n' "$resolved"
+}
+
+verify_container_image() {
+    local reference=$1 raw actual
+    raw=$(timeout 30 podman inspect --type container --format '{{.Image}}' "$reference") \
+        || { log "REFUSING: cannot inspect image identity for container $reference"; return 2; }
+    actual=$(canonicalize_image_id "$raw") \
+        || { log "REFUSING: container $reference reports an invalid image identity"; return 2; }
+    [ "$actual" = "$runtime_image_id" ] \
+        || { log "REFUSING: container $reference uses image $actual, expected $runtime_image_id"; return 2; }
+}
+
+publish_complete() {
+    python3 - "$RESULTS/complete.json" "$RUNID" \
+            "$RESULTS/run.json" "$RESULTS/hostcdp.jsonl" <<'PY'
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+output_path, run_id, run_path, rows_path = sys.argv[1:]
+
+
+def identity(path):
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return {"size": size, "sha256": digest.hexdigest()}
+
+
+record = {
+    "schema_version": 1,
+    "run_id": run_id,
+    "artifacts": {
+        "run.json": identity(run_path),
+        "hostcdp.jsonl": identity(rows_path),
+    },
+}
+directory = os.path.dirname(output_path)
+fd, temporary = tempfile.mkstemp(prefix=".complete.", dir=directory)
+try:
+    with os.fdopen(fd, "w") as target:
+        json.dump(record, target, sort_keys=True)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, output_path)
+    if os.environ.get("HOSTCDP_COMPLETE_FAIL_AFTER_RENAME") == "1":
+        raise OSError("injected failure after completion rename")
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
 }
 
 compute_live_reqbench_bundle_sha256() {
@@ -172,7 +284,11 @@ harness_sha256=$(compute_harness_sha256) \
     || { log "REFUSING: cannot hash request harness sources"; exit 2; }
 hostcdp_sha256=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
     || { log "REFUSING: cannot hash hostcdp.sh"; exit 2; }
-[[ "$harness_sha256" =~ ^[0-9a-f]{64}$ && "$hostcdp_sha256" =~ ^[0-9a-f]{64}$ ]] \
+phase_supervisor_sha256=$(sha256sum "$HERE/phase_supervisor.py" | cut -d' ' -f1) \
+    || { log "REFUSING: cannot hash phase_supervisor.py"; exit 2; }
+[[ "$harness_sha256" =~ ^[0-9a-f]{64}$ \
+        && "$hostcdp_sha256" =~ ^[0-9a-f]{64}$ \
+        && "$phase_supervisor_sha256" =~ ^[0-9a-f]{64}$ ]] \
     || { log "REFUSING: source seal produced an invalid digest"; exit 2; }
 read -r host_boot_id < /proc/sys/kernel/random/boot_id \
     || { log "REFUSING: cannot read host boot identity"; exit 2; }
@@ -193,6 +309,16 @@ exec {SUMMARY_LOCK_FD}>"$RESULTS/.summary.lock" \
     || { log "REFUSING: cannot open permanent summary lock"; exit 2; }
 flock -x "$SUMMARY_LOCK_FD" \
     || { log "REFUSING: cannot acquire permanent summary lock"; exit 2; }
+if [ -z "$CONTAINER_CREATE_OPS_DIR" ]; then
+    CONTAINER_CREATE_OPS_DIR="$RESULTS/container-create-ops"
+    mkdir -- "$CONTAINER_CREATE_OPS_DIR" \
+        || { log "REFUSING: cannot create container operation directory"; exit 2; }
+elif [ ! -d "$CONTAINER_CREATE_OPS_DIR" ]; then
+    log "REFUSING: CONTAINER_CREATE_OPS_DIR is not an existing directory: $CONTAINER_CREATE_OPS_DIR"
+    exit 2
+fi
+CREATE_OP_LOCK_PATH="$CONTAINER_CREATE_OPS_DIR/hostcdp-$RUNID-$CONTAINER_OWNER_TOKEN.lock"
+readonly CONTAINER_CREATE_OPS_DIR CREATE_OP_LOCK_PATH
 
 container_owns_cdp() {
     timeout 30 podman exec "$CONTAINER_ID" python3 -c '
@@ -247,33 +373,35 @@ record_owned_container_id() {
 }
 
 inspect_owned_container() {
-    local reference=$1 line inspected_id inspected_token extra
-    if ! line=$(timeout 30 podman inspect --type container \
+    local reference=$1 line inspect_status exists_status inspected_id inspected_token extra
+    if line=$(timeout 30 podman inspect --type container \
             --format '{{.Id}}|{{index .Config.Labels "io.fcvm.bench.owner"}}' \
             "$reference" 2>/dev/null); then
-        return 1
+        :
+    else
+        inspect_status=$?
+        if timeout 30 podman container exists "$reference" >/dev/null 2>&1; then
+            log "REFUSING: container $reference exists but its identity could not be inspected (inspect status=$inspect_status)"
+            return 3
+        else
+            exists_status=$?
+        fi
+        [ "$exists_status" -eq 1 ] && return 1
+        log "REFUSING: cannot establish whether container $reference exists (inspect status=$inspect_status exists status=$exists_status)"
+        return 3
     fi
     IFS='|' read -r inspected_id inspected_token extra <<<"$line"
     [ -z "$extra" ] || return 2
     [ "$inspected_token" = "$CONTAINER_OWNER_TOKEN" ] || return 2
-    record_owned_container_id "$inspected_id"
+    record_owned_container_id "$inspected_id" || return 2
+    CONTAINER_OWNERSHIP_VERIFIED=true
 }
 
-# A timed-out `podman run` can have committed its container before the client
-# lost its reply. Adopt by the private label, then keep only the exact 64-byte
-# container ID. A same-name peer has another token and is never adopted.
-adopt_partially_created_container() {
-    local rc
-    for _ in $(seq 1 10); do
-        if inspect_owned_container "$CNAME"; then
-            return 0
-        else
-            rc=$?
-        fi
-        [ "$rc" -ne 2 ] || return 2
-        sleep 0.1
-    done
-    return 1
+# Container creation is run to a definitive CLI completion while holding the
+# create-operation lock. Once it returns, one owner-token inspection is an
+# absence proof; there is no killed client left that can commit later.
+adopt_completed_create() {
+    inspect_owned_container "${CONTAINER_ID:-$CNAME}"
 }
 
 # URL may name ONE url (today's contract) or a comma-separated list. The list is
@@ -304,12 +432,18 @@ SETTLE_WAIT_SECS="${SETTLE_WAIT_SECS:-0}"
 [[ "$SETTLE_WAIT_SECS" =~ ^[0-9]+$ ]] \
     || { log "SETTLE_WAIT_SECS must be a whole number of seconds (got '$SETTLE_WAIT_SECS')"; exit 2; }
 quiet_sample() {
-    la=$(cut -d' ' -f1 "$LOADAVG_FILE" || true)
+    if la=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>&1); then
+        la_status=0
+    else
+        la_status=$?
+    fi
     # This function runs as an `until` condition, where set -e is suppressed
     # and awk reads an empty string as 0, so a missing, unreadable, or empty
     # LOADAVG_FILE would otherwise pass the gate without a load reading.
-    [[ "$la" =~ ^[0-9]+([.][0-9]+)?$ ]] \
-        || { log "REFUSING: no numeric 1-minute load readable from $LOADAVG_FILE (got '$la')"; exit 2; }
+    if [ "$la_status" -ne 0 ] || ! [[ "$la" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        log "REFUSING: no numeric 1-minute load readable from $LOADAVG_FILE (status=$la_status got '$la')"
+        exit 2
+    fi
     fc=0
     for process in fcvm firecracker; do
         if count=$(pgrep -c -x "$process" 2>&1); then rc=0; else rc=$?; fi
@@ -343,29 +477,102 @@ until quiet_sample; do
     sleep "$nap"
 done
 
+withdraw_failed_run() {
+    local reason=$1
+    rm -f -- "$RESULTS/complete.json" "$RESULTS/summary.json" \
+        || log "FAILED: could not remove derived authorization from refused run"
+    if ! python3 - "$RESULTS/WITHDRAWN" "$reason" <<'PY'
+import os
+import sys
+import tempfile
+
+output_path, reason = sys.argv[1:]
+directory = os.path.dirname(output_path)
+fd, temporary = tempfile.mkstemp(prefix=".withdrawn.", dir=directory)
+try:
+    with os.fdopen(fd, "w") as target:
+        target.write(reason.replace("\n", " ") + "\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, output_path)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+    then
+        log "FAILED: could not mark refused run WITHDRAWN"
+    fi
+}
+
+remove_owned_container() {
+    local exists_status
+    [ -n "$CONTAINER_ID" ] || return 0
+    [ "$CONTAINER_OWNERSHIP_VERIFIED" = true ] || return 0
+    [ "$CONTAINER_REMOVED" != true ] || return 0
+    if ! timeout 30 podman rm -f -- "$CONTAINER_ID" >/dev/null 2>&1; then
+        log "FAILED: could not remove owned container $CONTAINER_ID"
+        return 1
+    fi
+    if timeout 30 podman container exists "$CONTAINER_ID" >/dev/null 2>&1; then
+        log "FAILED: owned container $CONTAINER_ID survived podman rm"
+        return 1
+    else
+        exists_status=$?
+    fi
+    if [ "$exists_status" -ne 1 ]; then
+        log "FAILED: could not verify removal of owned container $CONTAINER_ID (exists status=$exists_status)"
+        return 1
+    fi
+    CONTAINER_REMOVED=true
+}
+
 cleanup() {
     original_rc=$?
     trap - EXIT
-    if [ -z "$CONTAINER_ID" ]; then
-        if adopt_partially_created_container; then
+    final_rc=$original_rc
+    if [ -n "$CREATE_OUTPUT_PATH" ] \
+            && ! rm -f -- "$CREATE_OUTPUT_PATH"; then
+        log "FAILED: could not remove container create output $CREATE_OUTPUT_PATH"
+        [ "$final_rc" -ne 0 ] || final_rc=1
+    fi
+    if [ "$CREATE_OP_STARTED" = true ] && [ "$CREATE_OP_QUIESCENT" != true ]; then
+        log "FAILED: container create operation did not reach quiescence; refusing an absence claim"
+        [ "$final_rc" -ne 0 ] || final_rc=1
+    elif [ "$CREATE_OP_STARTED" = true ] \
+            && [ "$CREATE_OUTCOME_CHECKED" != true ] \
+            && [ "$CONTAINER_OWNERSHIP_VERIFIED" != true ]; then
+        if adopt_completed_create; then
             :
         else
             adopt_rc=$?
             if [ "$adopt_rc" -eq 2 ]; then
                 log "leaving same-name container $CNAME: owner label is not this invocation"
-            elif [ "$original_rc" -eq 0 ]; then
+            elif [ "$final_rc" -eq 0 ]; then
                 log "FAILED: successful run lost its owned container identity"
-                exit 1
+                final_rc=1
             fi
         fi
+        CREATE_OUTCOME_CHECKED=true
     fi
-    if [ -n "$CONTAINER_ID" ] \
-            && ! timeout 30 podman rm -f -- "$CONTAINER_ID" >/dev/null 2>&1; then
-        log "FAILED: could not remove owned container $CONTAINER_ID"
-        [ "$original_rc" -ne 0 ] && exit "$original_rc"
-        exit 1
+    if [ "$CREATE_OP_QUIESCENT" = true ] && ! remove_owned_container; then
+        [ "$final_rc" -ne 0 ] || final_rc=1
     fi
-    exit "$original_rc"
+    if [ -n "$CREATE_OP_LOCK_FD" ]; then
+        exec {CREATE_OP_LOCK_FD}>&-
+        CREATE_OP_LOCK_FD=
+    fi
+    if [ "$final_rc" -ne 0 ]; then
+        withdraw_failed_run "hostcdp exited $final_rc; raw completion is not authorized"
+    fi
+    exit "$final_rc"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -384,7 +591,21 @@ resolve_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1] or Non
     "${BENCH_RESOLVE_ALL_TO:-}")
 urls_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${URLS[@]}")
 
-log "starting host container ($IMAGE) with CDP on $CDP_PORT"
+resolved_image_id=$(resolve_image_id "$IMAGE") || exit 2
+if [ -n "$IMAGE_ID" ]; then
+    requested_image_id=$(canonicalize_image_id "$IMAGE_ID") \
+        || { log "REFUSING: IMAGE_ID is not a sha256 identity"; exit 2; }
+    [ "$resolved_image_id" = "$requested_image_id" ] || {
+        log "REFUSING: image $IMAGE resolves to $resolved_image_id, expected IMAGE_ID=$IMAGE_ID"
+        exit 2
+    }
+    runtime_image_id="$requested_image_id"
+else
+    runtime_image_id="$resolved_image_id"
+fi
+readonly runtime_image_id
+
+log "starting host container ($IMAGE at $runtime_image_id) with CDP on $CDP_PORT"
 cpus_arg=()
 cpus_json=null
 if [ "$CPU_BUDGET" = vm-matched ]; then
@@ -397,21 +618,78 @@ if not math.isfinite(value) or value <= 0:
 print(json.dumps(int(value) if value.is_integer() else value))
 ' "$CPUS") || exit 2
 fi
-if podman_run_output=$(timeout 120 podman run -d --name "$CNAME" \
+
+supervisor_parent_pid=$BASHPID
+readonly supervisor_parent_pid
+exec {CREATE_OP_LOCK_FD}>"$CREATE_OP_LOCK_PATH" \
+    || { log "REFUSING: cannot open container create-operation lock"; exit 2; }
+flock -s "$CREATE_OP_LOCK_FD" \
+    || { log "REFUSING: cannot acquire container create-operation lock"; exit 2; }
+CREATE_OP_STARTED=true
+CREATE_OP_QUIESCENT=false
+# Container creation cannot leave an intentional runtime descendant. The
+# subreaper therefore treats every still-live create descendant as an
+# incomplete operation, including setsid/double-fork children that closed the
+# inherited lease FD. Starting the already-owned exact ID happens separately.
+CREATE_OUTPUT_PATH="$RESULTS/.container-create-output"
+if python3 "$HERE/phase_supervisor.py" \
+        --expected-parent "$supervisor_parent_pid" \
+        --timeout "$PODMAN_CREATE_TIMEOUT_SECS" \
+        --term-grace "$PODMAN_CREATE_KILL_AFTER_SECS" \
+        --kill-grace "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS" \
+        --pass-fd "$CREATE_OP_LOCK_FD" -- \
+        podman create --name "$CNAME" \
         --label "$OWNER_LABEL_KEY=$CONTAINER_OWNER_TOKEN" --network host \
-        "${cpus_arg[@]}" "${resolve_env[@]}" "$IMAGE"); then
-    if ! record_owned_container_id "$podman_run_output"; then
-        log "REFUSING: podman run returned no exact container ID: $podman_run_output"
+        "${cpus_arg[@]}" "${resolve_env[@]}" "$runtime_image_id" \
+        >"$CREATE_OUTPUT_PATH"; then
+    podman_create_rc=0
+else
+    podman_create_rc=$?
+fi
+exec {CREATE_OP_LOCK_FD}>&-
+CREATE_OP_LOCK_FD=
+# The subreaper is the create-completion proof. The exclusive lease is a
+# second boundary shared with the outer campaign sweep.
+exec {CREATE_OP_LOCK_FD}>"$CREATE_OP_LOCK_PATH" \
+    || { log "REFUSING: cannot reopen container create-operation lock"; exit 2; }
+if ! flock -x -w "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS" "$CREATE_OP_LOCK_FD"; then
+    log "REFUSING: container create operation did not quiesce within ${PODMAN_CREATE_QUIESCE_TIMEOUT_SECS}s"
+    exec {CREATE_OP_LOCK_FD}>&-
+    CREATE_OP_LOCK_FD=
+    exit 124
+fi
+CREATE_OP_QUIESCENT=true
+podman_create_output=$(<"$CREATE_OUTPUT_PATH")
+rm -f -- "$CREATE_OUTPUT_PATH" \
+    || { log "REFUSING: cannot remove container create output"; exit 2; }
+CREATE_OUTPUT_PATH=
+
+if [ "$podman_create_rc" -eq 0 ]; then
+    if ! record_owned_container_id "$podman_create_output"; then
+        log "REFUSING: podman create returned no exact container ID: $podman_create_output"
         exit 1
     fi
     if ! inspect_owned_container "$CONTAINER_ID"; then
         log "REFUSING: created container $CONTAINER_ID does not carry this invocation's owner label"
         exit 1
     fi
+    verify_container_image "$CONTAINER_ID" || exit 1
+    CREATE_OUTCOME_CHECKED=true
+    exec {CREATE_OP_LOCK_FD}>&-
+    CREATE_OP_LOCK_FD=
 else
-    podman_run_rc=$?
-    log "FAILED: podman run exited $podman_run_rc; cleanup will adopt only owner token $CONTAINER_OWNER_TOKEN"
-    exit "$podman_run_rc"
+    log "FAILED: podman create exited $podman_create_rc; cleanup will adopt only owner token $CONTAINER_OWNER_TOKEN"
+    exit "$podman_create_rc"
+fi
+
+if timeout --kill-after="${PODMAN_CREATE_KILL_AFTER_SECS}s" \
+        "${PODMAN_CREATE_TIMEOUT_SECS}s" \
+        podman start -- "$CONTAINER_ID" >/dev/null; then
+    :
+else
+    podman_start_rc=$?
+    log "FAILED: podman start exited $podman_start_rc for owned container $CONTAINER_ID"
+    exit "$podman_start_rc"
 fi
 
 # Ready = the same two conditions the VM golden gates on: warm marker file AND
@@ -431,12 +709,11 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP
 # Record the measured configuration beside the numbers, not in prose. Each row
 # below carries this file's exact SHA-256, so a copied jsonl cannot acquire a
 # different run's image, resolver, corpus, or count metadata by co-location.
-image_id=$(timeout 30 podman inspect --format '{{.Image}}' "$CONTAINER_ID") \
-    || { log "REFUSING: cannot inspect image identity for $CONTAINER_ID"; exit 1; }
-python3 - "$RESULTS/run.json" "$RUNID" "$IMAGE" "$image_id" "$REPS" "$WARMUP" \
+python3 - "$RESULTS/run.json" "$RUNID" "$IMAGE" "$runtime_image_id" "$REPS" "$WARMUP" \
         "$URL" "$CDP_PORT" "$urls_json" "$cpus_json" "$resolve_json" "$la" \
         "$host_boot_id" "$host_machine" "$host_kernel" "$source_revision" \
-        "$harness_sha256" "$hostcdp_sha256" "$runtime_bundle_sha256" \
+        "$harness_sha256" "$hostcdp_sha256" "$phase_supervisor_sha256" \
+        "$runtime_bundle_sha256" \
         "$corpus_extra_runtime_bundle_sha256" "$COMPARISON_LABEL" "$CPU_BUDGET" \
         "$CONTAINER_OWNER_TOKEN" "$CONTAINER_ID" <<'PY'
 import json
@@ -447,6 +724,7 @@ import tempfile
 (output_path, run_id, image, image_id, reps, warmup, url, cdp_port,
  urls_json, cpus_json, resolve_json, loadavg, host_boot_id, host_machine,
  host_kernel, source_revision, harness_sha256, hostcdp_sha256,
+ phase_supervisor_sha256,
  runtime_bundle_sha256, corpus_extra_runtime_bundle_sha256,
  comparison_label, cpu_budget, owner_token, container_id) = sys.argv[1:]
 urls = json.loads(urls_json)
@@ -472,6 +750,7 @@ record = {
     "source_revision": source_revision,
     "harness_sha256": harness_sha256,
     "hostcdp_sha256": hostcdp_sha256,
+    "phase_supervisor_sha256": phase_supervisor_sha256,
     "runtime_bundle_sha256": runtime_bundle_sha256,
     "corpus_extra_runtime_bundle_sha256":
         corpus_extra_runtime_bundle_sha256 or None,
@@ -506,16 +785,48 @@ run_json_sha256=$(sha256sum "$RESULTS/run.json" | cut -d' ' -f1)
 OUT="$RESULTS/hostcdp.jsonl"
 : > "$OUT"
 TOTAL_REPS=$((WARMUP + REPS))
+python3_command=$(command -v python3)
 for rep in $(seq 0 $((TOTAL_REPS - 1))); do
     rep_url="${URLS[$((rep % ${#URLS[@]}))]}"
-    t_start=$(date +%s.%N)
-    if out=$(python3 "$HERE/cdpdrive.py" "127.0.0.1:$CDP_PORT" "$rep_url" --format jpeg --nav-timing 2>&1); then
+    rep_tmp=$(mktemp -d "$RESULTS/.rep-${rep}.XXXXXX") \
+        || { log "REFUSING: cannot create timing workspace for rep $rep"; exit 5; }
+    if python3 - "$python3_command" "$HERE/cdpdrive.py" \
+            "127.0.0.1:$CDP_PORT" "$rep_url" \
+            "$rep_tmp/output" "$rep_tmp/wall_ms" <<'PY'
+import subprocess
+import sys
+import time
+
+(python_executable, driver, address, url,
+ output_path, elapsed_path) = sys.argv[1:]
+started = time.monotonic_ns()
+result = subprocess.run(
+    [python_executable, driver, address, url, "--format", "jpeg", "--nav-timing"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
+with open(output_path, "wb") as output:
+    output.write(result.stdout)
+with open(elapsed_path, "w") as timing:
+    timing.write(f"{elapsed_ms:.1f}\n")
+raise SystemExit(result.returncode)
+PY
+    then
         ok=true
     else
         ok=false
     fi
-    t_end=$(date +%s.%N)
-    wall_ms=$(python3 -c "print(f'{(${t_end}-${t_start})*1000:.1f}')")
+    if [ ! -f "$rep_tmp/output" ] || [ ! -f "$rep_tmp/wall_ms" ]; then
+        rm -rf -- "$rep_tmp"
+        log "REFUSING: monotonic timing wrapper produced no record for rep $rep"
+        exit 5
+    fi
+    out=$(<"$rep_tmp/output")
+    wall_ms=$(<"$rep_tmp/wall_ms")
+    rm -rf -- "$rep_tmp"
+    [[ "$wall_ms" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+        || { log "REFUSING: monotonic timing wrapper produced invalid elapsed time: $wall_ms"; exit 5; }
     warm=$([ "$rep" -lt "$WARMUP" ] && echo true || echo false)
     # Per-rep 1-minute load, the same field reqbench.py puts on every record
     # (rec["loadavg1"]) and reqanalyze reports as min/median/max "during run".
@@ -528,7 +839,8 @@ for rep in $(seq 0 $((TOTAL_REPS - 1))); do
     else
         la_rep_status=$?
     fi
-    if [[ "$la_rep_raw" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    if [ "$la_rep_status" -eq 0 ] \
+            && [[ "$la_rep_raw" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         la_rep=$(python3 -c 'import json,sys; print(json.dumps(float(sys.argv[1])))' \
             "$la_rep_raw")
         measurement_valid=true
@@ -559,9 +871,12 @@ harness_sha256_after=$(compute_harness_sha256) \
     || { log "REFUSING: cannot re-hash request harness sources"; exit 5; }
 hostcdp_sha256_after=$(sha256sum "$HERE/hostcdp.sh" | cut -d' ' -f1) \
     || { log "REFUSING: cannot re-hash hostcdp.sh"; exit 5; }
+phase_supervisor_sha256_after=$(sha256sum "$HERE/phase_supervisor.py" | cut -d' ' -f1) \
+    || { log "REFUSING: cannot re-hash phase_supervisor.py"; exit 5; }
 if [ "$source_revision_after" != "$source_revision" ] \
         || [ "$harness_sha256_after" != "$harness_sha256" ] \
-        || [ "$hostcdp_sha256_after" != "$hostcdp_sha256" ]; then
+        || [ "$hostcdp_sha256_after" != "$hostcdp_sha256" ] \
+        || [ "$phase_supervisor_sha256_after" != "$phase_supervisor_sha256" ]; then
     log "REFUSING: producer source changed during the measured run"
     exit 5
 fi
@@ -580,6 +895,13 @@ if [ -n "$CORPUS_EXTRA_RUNTIME_MANIFEST" ]; then
     verify_runtime_manifest "$CORPUS_EXTRA_RUNTIME_MANIFEST" \
         "$corpus_extra_runtime_bundle_sha256" corpus-extra || exit 5
 fi
+resolved_image_id_after=$(resolve_image_id "$IMAGE") || exit 5
+[ "$resolved_image_id_after" = "$runtime_image_id" ] || {
+    log "REFUSING: image $IMAGE changed from $runtime_image_id to $resolved_image_id_after during the run"
+    exit 5
+}
+verify_container_image "$CONTAINER_ID" || exit 5
+remove_owned_container || exit 5
 
 python3 - "$OUT" "$WARMUP" "$RESULTS/summary.json" <<'PY'
 import json
@@ -664,3 +986,4 @@ except BaseException:
     raise
 PY
 log "results in $RESULTS"
+publish_complete
