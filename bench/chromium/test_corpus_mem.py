@@ -2790,6 +2790,37 @@ class HostResourceFinalizer(unittest.TestCase):
                 host_resource_finalizer.finalize_memory_resource_set()
         self.assertEqual(calls, ["container", "cgroup"])
 
+    def test_unexpected_container_failure_still_runs_cgroup_finalization(self):
+        """Independent teardown continues after an unexpected exception.
+
+        RED BEFORE THE FIX: the raw OSError escaped immediately, so cgroup
+        cleanup never ran and its independent failure was not reported.
+        """
+        calls = []
+
+        def container_failure():
+            calls.append("container")
+            raise OSError(errno.EIO, "container descriptor failed")
+
+        def cgroup_failure():
+            calls.append("cgroup")
+            raise RuntimeError("cgroup cleanup failed")
+
+        with mock.patch.object(
+                host_resource_finalizer, "finalize_container_set",
+                side_effect=container_failure), mock.patch.object(
+                    host_resource_finalizer, "finalize_memory_cgroup",
+                    side_effect=cgroup_failure):
+            with self.assertRaises(
+                    host_resource_finalizer.FinalizerError) as raised:
+                host_resource_finalizer.finalize_memory_resource_set()
+        message = str(raised.exception)
+        self.assertIn("finalize_container_set: OSError", message)
+        self.assertIn("container descriptor failed", message)
+        self.assertIn("finalize_memory_cgroup: RuntimeError", message)
+        self.assertIn("cgroup cleanup failed", message)
+        self.assertEqual(calls, ["container", "cgroup"])
+
     def test_dnsmasq_finalizer_restores_and_verifies_the_prior_active_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             bindir = os.path.join(tmp, "bin")
@@ -5078,6 +5109,27 @@ os.fsync = _fsync
         elapsed = time.monotonic() - started
         self.assertEqual(result, 124)
         self.assertLess(elapsed, 5)
+
+    def test_memory_cgroup_requires_a_finalizer_before_claim(self):
+        """A cgroup claim is invalid without a process that will remove it.
+
+        RED BEFORE THE FIX: _supervise_armed called claim_memory_cgroup with
+        an absent or empty finalizer, leaving the claim with no cleanup owner.
+        """
+        for finalizer in (None, []):
+            with self.subTest(finalizer=finalizer), mock.patch.object(
+                    host_resource_finalizer, "claim_memory_cgroup",
+                    side_effect=AssertionError(
+                        "memory cgroup claim was reached")) as claim:
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        "memory_cgroup_base requires a finalizer"):
+                    phase_supervisor._supervise_armed(
+                        [sys.executable, "-c", "pass"],
+                        finalizer=finalizer,
+                        memory_cgroup_base="/unused/memory-cgroup",
+                    )
+                claim.assert_not_called()
 
     def test_phase_supervisor_restores_callers_process_controls(self):
         original_subreaper = phase_supervisor.get_process_control(

@@ -427,6 +427,8 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
                      finalizer_timeout=FINALIZER_TIMEOUT_SECONDS,
                      completion_path=None, completion_token=None,
                      drain_certificate=None, memory_cgroup_base=None):
+    if memory_cgroup_base is not None and not finalizer:
+        raise RuntimeError("memory_cgroup_base requires a finalizer")
     term_grace = GRACE_SECONDS if term_grace is None else term_grace
     kill_grace = KILL_REAP_SECONDS if kill_grace is None else kill_grace
     wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)

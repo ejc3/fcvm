@@ -866,11 +866,14 @@ def finalize_container_set() -> None:
 def finalize_memory_resource_set() -> None:
     """Run independent container and cgroup teardown before reporting errors."""
     errors = []
-    for finalizer in (finalize_container_set, finalize_memory_cgroup):
+    for name, finalizer in (
+        ("finalize_container_set", finalize_container_set),
+        ("finalize_memory_cgroup", finalize_memory_cgroup),
+    ):
         try:
             finalizer()
-        except FinalizerError as exc:
-            errors.append(str(exc))
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
     if errors:
         raise FinalizerError("; ".join(errors))
 
